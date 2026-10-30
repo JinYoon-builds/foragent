@@ -54,11 +54,22 @@ lane that sets `agent` (a lane without one has no agent file; its memory dir is 
 it removes `memory: project` (read as YAML, in any spelling) and the old "Record durable ... in
 your memory." line, and adds the append instruction for `MEMORY.new.md`. It keeps the rest of the
 agent (body, skills, model) and the bytes of `MEMORY.md`. Agent files with CRLF line ends or a
-byte-order mark keep them. In `.gitattributes` (read with Git's pattern rules), it removes
-`merge=union` from lines about lane `MEMORY.md` files and keeps their other attributes; a broader
-union line stays and is followed by `.claude/agent-memory/**/MEMORY.md !merge`. It adds the
-`MEMORY.new.md` union line unless that file already merges by union. Role agents are not changed.
-A second `fa init` changes nothing.
+byte-order mark keep them. When `memory: project` defines a YAML anchor another entry uses, the
+header is written again from its data so it stays readable.
+
+One function owns lane-memory merge settings in `.gitattributes` (`fa init`, a first
+`fa lanes add` and a re-run all call it). It does not interpret other lines; it appends a managed
+block that wins by Git's last-match rule over any earlier pattern, macro or driver: one
+`.claude/agent-memory/<lane memory dir>/MEMORY.md !merge` line per lane (curated memory merges as
+text) and the `MEMORY.new.md` union line. Role memory files are never named there, so they keep
+their merge setting. The line older versions wrote, `.claude/agent-memory/**/MEMORY.md merge=union`,
+is replaced in place by the same setting for each role memory file. A line naming one lane memory
+file exactly loses its merge setting and keeps its other attributes. A second `fa init` changes
+nothing.
+
+A lane whose `agent` is a role agent (for example `fa-docs`) uses that role's memory. The role
+keeps owning it: that lane gets no append-only instruction and never dreams. The default roles
+(orchestrator, architect, docs) count even in a project without a `roles:` block.
 
 ## Lane PRs opened before the split
 

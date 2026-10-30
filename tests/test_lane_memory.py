@@ -33,20 +33,31 @@ def test_migrate_skips_roles_and_missing_agents_and_moves_union(tmp_path):
                     roles={"docs": {"agent": "fa-docs"}})
     changes = lane_memory.migrate(tmp_path, config)
     assert sorted(changes) == [".claude/agents/fa-api.md", ".gitattributes"]
-    assert changes[".gitattributes"] == "*.txt text\n" + lane_memory.UNION + "\n*.md diff\n"
+    lm = lane_memory
+    # The old line covered every role's memory too (the default roles count without a roles block);
+    # each keeps its union in place. Lanes get their own text merge at the end.
+    assert changes[".gitattributes"] == (
+        "*.txt text\n.claude/agent-memory/fa-architect/MEMORY.md merge=union\n"
+        ".claude/agent-memory/fa-docs/MEMORY.md merge=union\n.claude/agent-memory/fa-orchestrator/MEMORY.md merge=union\n"
+        f"*.md diff\n{lm.CURATED_COMMENT}\n.claude/agent-memory/fa-api/MEMORY.md !merge\n"
+        f".claude/agent-memory/fa-web/MEMORY.md !merge\n{lm.UNION_COMMENT}\n{lm.UNION}\n")
     lane_memory.apply(tmp_path, changes)
     assert lane_memory.migrate(tmp_path, config) == {}
     assert (agents / "fa-docs.md").read_text() == role and not (agents / "fa-web.md").exists()
     assert not (tmp_path / ".claude/agent-memory").exists(), "Pending files are created lazily"
 
 
-@pytest.mark.parametrize("lanes", [{}, {"api": {"paths": ["api/**"]}}, {"api": {"agent": "fa-api"}}],
+@pytest.mark.parametrize("lanes, own", [({}, []), ({"api": {"paths": ["api/**"]}}, ["api"]),
+                                         ({"api": {"agent": "fa-api"}}, ["fa-api"])],
                          ids=["no-lanes", "agentless-lane", "missing-agent-file"])
-def test_every_project_gets_the_pending_union_line_once(tmp_path, lanes):
-    expected = {".gitattributes": f"{lane_memory.UNION_COMMENT}\n{lane_memory.UNION}\n"}
+def test_every_project_gets_the_pending_union_line_once(tmp_path, lanes, own):
+    lm = lane_memory
+    text = "".join(f"{lm.CURATED_COMMENT}\n" if i == 0 else "" for i in range(1)) + "".join(
+        f".claude/agent-memory/{name}/MEMORY.md !merge\n" for name in own) + f"{lm.UNION_COMMENT}\n{lm.UNION}\n"
+    expected = {".gitattributes": text}
     assert lane_memory.migrate(tmp_path, Config(lanes=lanes)) == expected
     lane_memory.apply(tmp_path, expected)
-    assert lane_memory.union_change(tmp_path) is None and lane_memory.migrate(tmp_path, Config(lanes=lanes)) == {}
+    assert lane_memory.union_change(tmp_path, Config(lanes=lanes)) is None and lane_memory.migrate(tmp_path, Config(lanes=lanes)) == {}
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -171,8 +182,9 @@ def test_migration_handles_crlf_and_bom_agent_files(newline, bom):
     custom = bom + newline.join(["---", "name: fa-api", "memory: 'project'  # native", "---", "Mine."])
     migrated = lane_memory.migrate_agent(custom, "fa-api")
     assert migrated == custom.replace("memory: 'project'  # native" + newline, "") + newline + lane_memory.instruction("fa-api") + newline
-    assert lane_memory.migrate_attributes("*.md diff" + newline + lane_memory.OLD_UNION + newline) == (
-        "*.md diff" + newline + lane_memory.UNION + newline)
+    assert lane_memory.migrate_attributes("*.md diff" + newline + lane_memory.OLD_UNION + newline, ("fa-api",)) == (
+        newline.join(["*.md diff", lane_memory.CURATED_COMMENT, ".claude/agent-memory/fa-api/MEMORY.md !merge",
+                      lane_memory.UNION_COMMENT, lane_memory.UNION, ""]))
 
 
 def test_a_lane_without_an_agent_shares_one_memory_directory_across_readers_and_the_dream(tmp_path):
@@ -355,26 +367,47 @@ def test_migration_replaces_the_second_split_instruction_once():
     ".claude/agent-memory/** merge=union\n",
     ".claude/agent-memory/**/MEMORY.md merge=union\r\n*.md text\r\n",
     "",
-], ids=["old-line", "more-attributes", "whitespace", "single-star", "basename", "whole-directory", "crlf", "empty"])
+    ".claude/agent-memory/fa-api/MEMORY.md merge=union\n.claude/agent-memory/api/MEMORY.md eol=lf merge=union\n",
+    ".claude/agent-memory/**/MEMORY.new.md merge=union\n.claude/agent-memory/fa-api/MEMORY.new.md -merge\n"
+    ".claude/agent-memory/api/MEMORY.new.md merge=text\n",
+    ".claude/agent-memory/**/MEMORY.new.md merge=union\n*.md -merge\n",
+    ".claude/**/fa-api/MEMORY.md merge=union\n",
+    "**/fa-api/MEMORY.md eol=lf merge=union\n",
+    "[attr]role-memory merge=union\n.claude/agent-memory/**/MEMORY.md role-memory\n",
+    ".claude/agent-memory/fa-docs/MEMORY.md merge=custom-driver\n.claude/agent-memory/** eol=lf\n",
+], ids=["old-line", "more-attributes", "whitespace", "single-star", "basename", "whole-directory", "crlf", "empty",
+        "per-agent-curated-union", "per-agent-pending-override", "later-broad-override", "claude-glob", "any-depth",
+        "macro", "role-custom-driver"])
 def test_attribute_migration_matches_git_for_every_spelling(git_history, attributes):
     from conftest import git_command
 
     root = git_history.clone
+    role = ".claude/agent-memory/fa-docs/MEMORY.md"
+    lanes, roles = ("fa-api", "api"), (role,)
     (root / ".gitattributes").write_bytes(attributes.encode())
-    migrated = lane_memory.migrate_attributes(attributes or None)
-    (root / ".gitattributes").write_bytes(migrated.encode())
 
     def attribute(name, path):
         return git_command(root, "check-attr", name, "--", path).rsplit(": ", 1)[1]
 
-    for lane in ("fa-api", "api"):
-        assert attribute("merge", f".claude/agent-memory/{lane}/MEMORY.md") != "union"
+    before = {path: {name: attribute(name, path) for name in ("merge", "eol", "role-memory")}
+              for path in (role, "docs/MEMORY.md", ".claude/agent-memory/fa-api/notes.md",
+                           ".claude/agent-memory/fa-api/MEMORY.md")}
+    migrated = lane_memory.migrate_attributes(attributes or None, lanes, roles)
+    (root / ".gitattributes").write_bytes(migrated.encode())
+    for lane in lanes:
+        assert attribute("merge", f".claude/agent-memory/{lane}/MEMORY.md") == "unspecified"
         assert attribute("merge", f".claude/agent-memory/{lane}/MEMORY.new.md") == "union"
-    if "eol=lf" in attributes:
-        assert attribute("eol", ".claude/agent-memory/fa-api/MEMORY.md") == "lf", "Other attributes stay"
-    if attributes.startswith("MEMORY.md"):
-        assert attribute("merge", "docs/MEMORY.md") == "union", "Files outside lane memory keep their merge"
-    assert lane_memory.migrate_attributes(migrated) == migrated
+    for path, values in before.items():  # Role memory and files outside lane memory keep every attribute.
+        for name, value in values.items():
+            if not (path.endswith("fa-api/MEMORY.md") and name in {"merge", "role-memory"}):
+                assert attribute(name, path) == value, (path, name)
+    assert lane_memory.migrate_attributes(migrated, lanes, roles) == migrated, "Running it twice changes nothing"
+    assert migrated.count(lane_memory.UNION) == 1
+    # A line naming one lane memory file exactly keeps no merge setting.
+    for line in migrated.splitlines():
+        if line.split()[:1] and line.split()[0] in {f".claude/agent-memory/{lane}/{file}" for lane in lanes
+                                                   for file in ("MEMORY.md", "MEMORY.new.md")}:
+            assert "merge" not in line or line.endswith("MEMORY.md !merge"), line
     assert ("\r\n" in migrated) == ("\r\n" in attributes) and ("\r\n" not in migrated or "\n" not in migrated.replace("\r\n", ""))
 
 
@@ -401,3 +434,50 @@ def test_native_memory_is_removed_in_every_yaml_spelling(header):
 def test_other_memory_scopes_are_not_native_lane_memory():
     text = "---\nname: fa-api\nmemory: user\n---\nBody.\n"
     assert not lane_memory.native(text) and "memory: user" in lane_memory.migrate_agent(text, "fa-api")
+
+
+def test_a_lane_that_names_a_role_agent_keeps_the_role_memory_contract(tmp_path):
+    from foragent.orch_dream import dream_due
+    from foragent.state import StateStore
+
+    config = Config(lanes={"docs": {"agent": "fa-docs"}, "api": {"agent": "fa-api"}},
+                    roles={"docs": {"agent": "fa-docs", "memory": ".claude/agent-memory/fa-docs/"}})
+    assert lane_memory.is_role_memory(config, "docs") and not lane_memory.is_role_memory(config, "api")
+    _, notes = run_lane_skills.lane_notes(config, "docs", tmp_path)
+    assert "MEMORY.consumed.ids" not in notes and "dream" not in notes, "No dream ownership for role memory"
+    assert "MEMORY.consumed.ids" in run_lane_skills.lane_notes(config, "api", tmp_path)[1]
+    assert run_lane_skills.lane_memory_notice(config, "docs", tmp_path) == ""
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path / "w", lane="docs")
+    store.finish_run(1, "merged", "")
+    store.start_run(2, branch="foragent/issue-2", worktree=tmp_path / "w2", lane="api")
+    store.finish_run(2, "merged", "")
+
+    class Empty:
+        def list_open_issues(self):
+            return []
+
+    assert dream_due(store, config, Empty(), None) == ["api"], "No dream curates a role's memory"
+
+
+def test_native_removal_keeps_yaml_anchors_readable():
+    import yaml
+
+    text = "---\nname: fa-api\nmemory: &scope project\ndescription: *scope\nmodel: m\n---\nBody.\n"
+    new = lane_memory.migrate_agent(text, "fa-api")
+    data = yaml.safe_load(new.split("---\n")[1])
+    assert data == {"name": "fa-api", "description": "project", "model": "m"} and not lane_memory.native(new)
+    assert lane_memory.migrate_agent(new, "fa-api") == new
+
+
+def test_projects_without_a_roles_block_still_have_the_default_roles(tmp_path):
+    config = Config(lanes={"docs": {"agent": "fa-docs"}, "api": {"agent": "fa-api"}})
+    assert config.roles == {}
+    assert lane_memory.is_role_memory(config, "docs") and not lane_memory.is_role_memory(config, "api")
+    (tmp_path / ".claude/agents").mkdir(parents=True)
+    role = "---\nname: fa-docs\nmemory: project\n---\n" + lane_memory.OLD_WRITER + "\n"
+    (tmp_path / ".claude/agents/fa-docs.md").write_text(role)
+    changes = lane_memory.migrate(tmp_path, config)
+    assert ".claude/agents/fa-docs.md" not in changes
+    assert ".claude/agent-memory/fa-docs/MEMORY.md !merge" not in changes[".gitattributes"]
+    assert "dream" not in run_lane_skills.lane_notes(config, "docs", tmp_path)[1]

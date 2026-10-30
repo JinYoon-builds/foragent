@@ -60,6 +60,8 @@ def _writer_contract(config: Config, lane: str, agent_text: str | None) -> str:
     """
     if _memory_folder(config, lane, Path(".")) is None:  # The same lanes whose memory is read.
         return ""
+    if lane_memory.is_role_memory(config, lane):  # A role owns that memory; its contract stays (#1000).
+        return ""
     contract = lane_memory.instruction(lane_memory.memory_dir(config, lane))
     return "" if agent_text is not None and contract in agent_text else "\n\n" + contract
 

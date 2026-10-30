@@ -154,9 +154,14 @@ def _without_native(header: str) -> str:
     """The frontmatter without its ``memory: project`` entry, other entries byte for byte.
 
     A top-level entry is a line at column 0 and the indented or blank lines after it; the entry
-    whose own YAML is ``memory: project`` (in any spelling) is removed. A header YAML cannot be
-    split this way (a flow mapping) is written again from its data.
+    whose own YAML is ``memory: project`` (in any spelling) is removed. The result must read as
+    the same mapping without ``memory``; when it does not (a flow mapping, or an anchor the entry
+    defined and another entry uses), the header is written again from its data.
     """
+    if not _native_header(header):
+        return header
+    data = _load(header)
+    expected = {key: value for key, value in data.items() if key != "memory"}
     lines = header.splitlines(keepends=True)
     entries: list[list[str]] = []
     for line in lines:
@@ -167,11 +172,9 @@ def _without_native(header: str) -> str:
             entries[-1].append(line)
     kept = [entry for entry in entries if _load("".join(entry)) != {"memory": "project"}]
     result = "".join("".join(entry) for entry in kept)
-    if _native_header(result):
-        data = _load(header)
+    if (_load(result) or {}) != expected:
         newline = "\r\n" if "\r\n" in header else "\n"
-        data.pop("memory", None)
-        result = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).replace("\n", newline) if data else ""
+        result = yaml.safe_dump(expected, sort_keys=False, allow_unicode=True).replace("\n", newline) if expected else ""
     return result
 
 
@@ -194,137 +197,112 @@ def migrate_agent(text: str, agent: str) -> str:
     return text + ("" if text.endswith("\n") or not text else newline) + managed + newline
 
 
-_CURATED_SAMPLE = f".claude/agent-memory/fa-lane/{CURATED}"
-_PENDING_SAMPLE = f".claude/agent-memory/fa-lane/{PENDING}"
-# Paths a line about lane curated memory does not cover; a line matching one of them is broader.
-_OTHER_SAMPLES = (_PENDING_SAMPLE, f"docs/{CURATED}", f"{CURATED}", ".claude/agent-memory/fa-lane/notes.md")
-CURATED_DEFAULT = f".claude/agent-memory/**/{CURATED} !merge"
-CURATED_DEFAULT_COMMENT = "# Only the lane's dream edits curated memory; it merges as ordinary text."
+# Comments earlier versions wrote above the union line; the managed block replaces them.
+_OLD_COMMENTS = ("# Lane memory indexes only gain lines; keep both sides when lane clones merge.",
+                 "# Only the lane's dream edits curated memory; it merges as ordinary text.",
+                 "# Role memory keeps its own merge setting.")
+CURATED_COMMENT = "# Only each lane's dream edits its curated memory; it merges as ordinary text."
+# A lane's own curated-memory line; the managed block writes one per lane memory directory.
+_LANE_CURATED = re.compile(r"\.claude/agent-memory/[A-Za-z0-9][A-Za-z0-9._-]*/" + re.escape(CURATED) + r" !merge")
 
 
-def _pattern_matches(pattern: str, path: str) -> bool:
-    """Git's gitattributes pattern rules, for a root .gitattributes and a file path."""
-    if pattern.startswith('"') and pattern.endswith('"') and len(pattern) > 1:
-        pattern = pattern[1:-1]
-    if "/" not in pattern.rstrip("/"):  # No slash: it matches the file name at any depth.
-        return re.fullmatch(_glob(pattern), path.rsplit("/", 1)[-1]) is not None
-    return re.fullmatch(_glob(pattern.lstrip("/")), path) is not None
+def _lane_curated(name: str) -> str:
+    return f"{directory(name)}/{CURATED} !merge"
 
 
-def _glob(pattern: str) -> str:
-    out, i = "", 0
-    while i < len(pattern):
-        if pattern.startswith("**/", i):
-            out, i = out + "(?:.*/)?", i + 3
-        elif pattern.startswith("/**", i) and i + 3 == len(pattern):
-            out, i = out + "/.*", i + 3
-        elif pattern.startswith("**", i):
-            out, i = out + ".*", i + 2
-        elif pattern[i] == "*":
-            out, i = out + "[^/]*", i + 1
-        elif pattern[i] == "?":
-            out, i = out + "[^/]", i + 1
-        elif pattern[i] == "[":
-            end = pattern.find("]", i + 1)
-            if end < 0:
-                out, i = out + re.escape("["), i + 1
-            else:
-                body = pattern[i + 1:end].replace("\\", "\\\\")
-                out, i = out + "[" + ("^" + body[1:] if body.startswith("!") else body) + "]", end + 1
-        else:
-            out, i = out + re.escape(pattern[i]), i + 1
-    return out
+def migrate_attributes(text: str | None, lanes: tuple[str, ...] = (), roles: tuple[str, ...] = ()) -> str:
+    """The .gitattributes text with lane memory merging by union only on MEMORY.new.md.
 
-
-def _split(line: str) -> tuple[str, list[str]] | None:
-    """A gitattributes line's pattern and attribute tokens; None for blanks, comments and macros."""
-    body = line.strip()
-    if not body or body.startswith("#") or body.startswith("[attr]"):
-        return None
-    if body.startswith('"'):
-        end = body.find('"', 1)
-        pattern, rest = (body[:end + 1], body[end + 1:]) if end > 0 else (body, "")
-    else:
-        pattern, _, rest = re.match(r"(\S+)(\s*)(.*)", body).groups()
-    return pattern, rest.split()
-
-
-def _merge_value(lines: list[str], path: str) -> str | None:
-    """The merge attribute Git applies to ``path``: the last matching line that sets it wins."""
-    value = None
-    for line in lines:
-        parsed = _split(line)
-        if parsed is None or not _pattern_matches(parsed[0], path):
-            continue
-        for token in parsed[1]:
-            name = token.lstrip("-!").split("=", 1)[0]
-            if name == "merge":
-                value = (token.split("=", 1)[1] if "=" in token else
-                         "unset" if token[0] == "-" else None if token[0] == "!" else "set")
-    return value
-
-
-def migrate_attributes(text: str | None) -> str:
-    """Union merges move from the curated file to the pending file.
-
-    Lines are read with Git's rules, so any spelling counts (pattern form, spacing, other
-    attributes). A line only about lane MEMORY.md files loses its ``merge=union`` and keeps its
-    other attributes; a broader line (for example ``MEMORY.md merge=union``, which also covers
-    files outside lane memory) stays, and a later ``!merge`` line restores the default merge for
-    lane MEMORY.md files. The pending union line is added unless MEMORY.new.md already merges by
-    union.
+    The one owner of lane-memory merge settings (D95): fresh init, re-init and ``fa lanes add``
+    call it, and running it twice changes nothing. It never interprets other lines; it appends a
+    managed block, which wins by Git's last-match rule whatever is written above it (any pattern,
+    macro or driver): each lane's own MEMORY.md merges as ordinary text (``!merge``, one line per
+    lane memory directory in ``lanes``) and every MEMORY.new.md by union. Role memory files are
+    never named, so they keep their merge setting. The one line earlier foragent versions wrote,
+    ``.claude/agent-memory/**/MEMORY.md merge=union``, is replaced in place by the same setting
+    for each role memory file in ``roles``.
     """
     lines = (text or "").splitlines(keepends=True)
     newline = "\r\n" if "\r\n" in (text or "") else "\n"
+    managed = {UNION, UNION_COMMENT, CURATED_COMMENT, *_OLD_COMMENTS}
     kept = []
+    own = {f"{directory(name)}/{file}" for name in lanes for file in (CURATED, PENDING)}
     for line in lines:
-        parsed = _split(line)
-        specific = (parsed is not None and _pattern_matches(parsed[0], _CURATED_SAMPLE)
-                    and not any(_pattern_matches(parsed[0], other) for other in _OTHER_SAMPLES))
-        if not specific or "merge=union" not in parsed[1]:
-            kept.append(line)
+        body = line.strip()
+        ending = line[len(line.rstrip("\r\n")):] or newline
+        if body in managed or (_LANE_CURATED.fullmatch(body) and body.split()[0] not in roles):
             continue
-        attributes = [token for token in parsed[1] if token != "merge=union"]
-        ending = line[len(line.rstrip("\r\n")):]
-        if attributes:
-            kept.append(" ".join([parsed[0], *attributes]) + ending)
-        elif line.strip() == OLD_UNION and not any(other.strip() == UNION for other in lines + kept):
-            kept.append(UNION + ending)  # The old line becomes the new one in place.
+        if body == OLD_UNION:
+            kept.extend(f"{path} merge=union{ending}" for path in roles)
+            continue
+        fields = body.split()
+        if fields and fields[0].strip('"').lstrip("/") in own:  # A line naming one lane memory file exactly.
+            attributes = [token for token in fields[1:] if token.lstrip("-!").split("=", 1)[0] != "merge"]
+            if attributes:
+                kept.append(" ".join([fields[0], *attributes]) + ending)
+            continue
+        kept.append(line)
     result = "".join(kept)
-
-    def add(*added: str) -> None:
-        nonlocal result
-        if result and not result.endswith("\n"):
-            result += newline
-        result += "".join(line + newline for line in added)
-
-    if _merge_value(result.splitlines(), _CURATED_SAMPLE) == "union":
-        add(CURATED_DEFAULT_COMMENT, CURATED_DEFAULT)
-    if _merge_value(result.splitlines(), _PENDING_SAMPLE) != "union":
-        add(UNION_COMMENT, UNION)
-    return result
+    block = [CURATED_COMMENT, *(_lane_curated(name) for name in sorted(set(lanes))), UNION_COMMENT, UNION]
+    if result and not result.endswith("\n"):
+        result += newline
+    return result + "".join(line + newline for line in block)
 
 
-def union_change(root: Path) -> str | None:
-    """The .gitattributes text with the pending-file union line, or None when it is already there.
+def _roles(config: Config) -> dict[str, dict]:
+    """The configured roles plus the default roles a project without a roles block still has."""
+    from foragent import roles
 
-    The one installer of the union merge for MEMORY.new.md: fresh init, re-init (migration) and
-    every lane added later call it. The line is a glob, so it covers lanes with and without an
-    agent alike.
+    found = {name: dict(entry or {}) for name, entry in (config.roles or {}).items()}
+    for name in roles.DEFAULT_ROLES:
+        found.setdefault(name, {"agent": f"fa-{name}", "memory": roles.memory_dir(name)})
+    return found
+
+
+def role_agents(config: Config) -> set[str]:
+    return {entry.get("agent") or f"fa-{name}" for name, entry in _roles(config).items()}
+
+
+def role_memory_files(config: Config) -> set[str]:
+    """Each role's MEMORY.md path; role memory keeps its own writer and merge (#1000 out of scope)."""
+    files = set()
+    for name, entry in _roles(config).items():
+        folder = entry.get("memory") or directory(entry.get("agent") or f"fa-{name}")
+        files.add(str(folder).strip("/") + f"/{CURATED}")
+    return files
+
+
+def is_role_memory(config: Config, lane: str) -> bool:
+    """Whether a lane's memory is a role's (by its agent or its directory): the role owns it."""
+    return (lane_agent(config, lane) in role_agents(config)
+            or f"{directory(memory_dir(config, lane))}/{CURATED}" in role_memory_files(config))
+
+
+def _memory_paths(config: Config) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The lanes' memory directory names (role memory excluded) and the role memory files."""
+    lanes = tuple(sorted({memory_dir(config, lane) for lane in config.lanes
+                          if not is_role_memory(config, lane)
+                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(memory_dir(config, lane)))}))
+    return lanes, tuple(sorted(role_memory_files(config)))
+
+
+def union_change(root: Path, config: Config) -> str | None:
+    """The .gitattributes text migrate_attributes gives, or None when it is already that.
+
+    Fresh init, re-init (migration) and every lane added later call it.
     """
     path = Path(root) / ATTRIBUTES
     current = path.read_bytes().decode("utf-8") if path.is_file() else None
-    new = migrate_attributes(current)
+    new = migrate_attributes(current, *_memory_paths(config))
     return None if new == current else new
 
 
 def _lane_agent_paths(root: Path, config: Config) -> list[str]:
     """The existing agent files of lanes with an explicit agent; role agents are never included."""
-    roles = {(entry or {}).get("agent") or f"fa-{name}" for name, entry in (config.roles or {}).items()}
     paths = []
     for lane in config.lanes:
         agent = lane_agent(config, lane)
-        if agent is not None and agent not in roles and (Path(root) / ".claude/agents" / f"{agent}.md").is_file():
+        if agent is not None and not is_role_memory(config, lane) and (Path(root) / ".claude/agents" / f"{agent}.md").is_file():
             paths.append(f".claude/agents/{agent}.md")
     return list(dict.fromkeys(paths))
 
@@ -351,7 +329,7 @@ def migrate(root: Path, config: Config) -> dict[str, str]:
         text = (root / relative).read_bytes().decode("utf-8")
         if (new := migrate_agent(text, agent)) != text:
             changes[relative] = new
-    if (attributes := union_change(root)) is not None:
+    if (attributes := union_change(root, config)) is not None:
         changes[ATTRIBUTES] = attributes
     return changes
 

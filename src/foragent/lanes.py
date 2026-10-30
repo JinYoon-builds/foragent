@@ -102,7 +102,7 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
         "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n",
         encoding="utf-8",
     )
-    if (attributes := lane_memory.union_change(root)) is not None:
+    if (attributes := lane_memory.union_change(root, load_config(root))) is not None:
         lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
     git.ensure_tracked(published)

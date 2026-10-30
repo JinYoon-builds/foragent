@@ -126,7 +126,11 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
     """Configured lanes due to dream, each once; a lane with any active run of its own is not due."""
     active = store.active_runs()
     due = []
+    from foragent import lane_memory
+
     for lane in config.lanes:
+        if lane_memory.is_role_memory(config, lane):
+            continue  # The lane uses a role's memory, which the role curates; no dream rewrites it.
         if any(run.lane == lane for run in active):
             continue  # Its dream is already running, or an issue run of the lane is.
         if (previous := store.get_dream(lane)) is not None and previous.process_identities:
