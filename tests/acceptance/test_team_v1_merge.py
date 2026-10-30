@@ -10,7 +10,8 @@ from test_orch_review_handoff import make_case
 from team_v1_support import invoke, legacy, person, snapshot
 
 
-def test_remote_merge_refuses_base_moved_on_another_machine():
+@pytest.mark.parametrize("proof", ["moved", "unreadable", "missing"])
+def test_remote_merge_refuses_base_moved_on_another_machine(proof):
     old, new, head = "a" * 40, "b" * 40, "c" * 40
     calls = []
     def gh(args, input=None):
@@ -18,19 +19,21 @@ def test_remote_merge_refuses_base_moved_on_another_machine():
         if args[:2] == ["pr", "view"]:
             return json.dumps({"title": "Feature", "baseRefName": "main", "headRefOid": head})
         if args[:1] == ["api"]:
+            if proof == "unreadable":
+                raise TrackerError("Remote base unavailable (HTTP 503)")
             return json.dumps({"object": {"sha": new}, "sha": new, "commit": {"sha": new}})
         return ""
     tracker = GhTracker("owner/repo", run=gh)
     # Omit the future keyword on old main so failure proves an unsafe merge,
     # rather than failing at Python argument binding.
     import inspect
-    kw = {"expected_base_sha": old} if "expected_base_sha" in inspect.signature(tracker.merge_pr).parameters else {}
+    kw = {"expected_base_sha": old} if proof != "missing" and "expected_base_sha" in inspect.signature(tracker.merge_pr).parameters else {}
     try:
         tracker.merge_pr(7, expected_head_sha=head, subject="Feature", **kw)
-    except TrackerError as exc:
+    except (TrackerError, TypeError) as exc:
         assert "base" in str(exc).lower()
     else:
-        pytest.fail("Remote main moved after verification but the adapter allowed merge")
+        pytest.fail("Absent, unreadable or stale base proof must never authorize a merge")
     assert not any(a[:2] == ["pr", "merge"] for a in calls), calls
 
 
