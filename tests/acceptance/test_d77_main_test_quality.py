@@ -79,7 +79,7 @@ def test_main_failures_compare_with_existing_daily_windows_and_keep_evidence(qua
     assert today["count"] == 3 and today["coverage"] == "complete", today
     assert previous["count"] == 1.5 and previous["coverage"] == "complete", previous
     assert "main_tests" in payload["worse"], payload
-    assert {"runs", "merge_rate", "median_minutes_to_merge", "review_returns"} <= payload["window"]["today"]
+    assert {"runs", "merge_rate", "median_minutes_to_merge", "review_returns"} <= payload["window"]["today"].keys()
     assert payload["window"]["today"]["runs"] == 1
     assert len(today["failures"]) == 3
     for expected in current:
