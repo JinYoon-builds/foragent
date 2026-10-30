@@ -146,19 +146,24 @@ def has_session_start_hook(settings):
 
 
 def without_session_start_hook(settings):
-    """Settings with Foragent's SessionStart hook (and containers it emptied) removed."""
+    """Settings with Foragent's own hooks (and containers they emptied) removed.
+
+    #1026 (2026-10-31): Foragent installs a SessionStart hook and a UserPromptSubmit hook, both
+    `fa statusline --...`; every event is cleaned the same way, user hooks stay.
+    """
     result = json.loads(json.dumps(settings))
     hooks = result.get("hooks") or {}
-    groups = []
-    for group in hooks.get("SessionStart") or []:
-        kept = [hook for hook in group.get("hooks") or []
-                if "fa statusline --session-start" not in hook.get("command", "")]
-        if kept:
-            groups.append({**group, "hooks": kept})
-    if groups:
-        hooks["SessionStart"] = groups
-    else:
-        hooks.pop("SessionStart", None)
+    for event in list(hooks):
+        groups = []
+        for group in hooks.get(event) or []:
+            kept = [hook for hook in group.get("hooks") or []
+                    if "fa statusline --" not in hook.get("command", "")]
+            if kept:
+                groups.append({**group, "hooks": kept})
+        if groups:
+            hooks[event] = groups
+        else:
+            hooks.pop(event, None)
     if "hooks" in result and not hooks:
         result.pop("hooks")
     return result
