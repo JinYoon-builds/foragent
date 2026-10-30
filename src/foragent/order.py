@@ -542,8 +542,11 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     childless = not plan["issues"] and not mapping
     if parent is None:
         parent = tracker.create_issue(plan["title"], parent_body(), [])
+        linked: set[int] = set()
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
+        # GitHub rejects re-adding an existing sub-issue, so read the links once.
+        linked = {issue.number for issue in tracker.sub_issues(parent)}
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
@@ -570,7 +573,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                            and label not in labels])
             tracker.add_labels(number, labels)
             recorded_blobs[str(number)] = blobs
-        tracker.add_sub_issue(parent, number)
+        if number not in linked:
+            tracker.add_sub_issue(parent, number)
+            linked.add(number)
         board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
