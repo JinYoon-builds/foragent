@@ -34,10 +34,12 @@ class Config:
     # Standing roles (#769); written only by foragent.roles.
     roles: dict[str, dict[str, Any]] = field(default_factory=dict)
     tiers: dict[str, dict[str, Any]] = field(default_factory=lambda: {
-        "s": {"codex_effort": "medium", "claude_model": None},
-        "m": {"codex_effort": "high", "claude_model": None},
-        "l": {"codex_effort": "xhigh", "claude_model": None},
+        "s": {"codex_model": None, "codex_effort": "medium", "claude_model": None, "claude_effort": None},
+        "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
+        "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None},
     })
+    # Usable quota share of the run's executor at which s and m issues start at tier l (#238).
+    tiers_headroom_ample: float = 0.5
     skill_libraries: list[Any] = field(default_factory=lambda: [{
         "name": "knowledge-work-plugins",
         "repo": "https://github.com/anthropics/knowledge-work-plugins",
@@ -76,6 +78,8 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    # A live orchestrator silent this long pushes once per silence episode (#952); 0 turns the push off.
+    orch_silent_alert_minutes: int = 30
     # `fa orch refresh-due`: either threshold (inclusive) makes a fresh orchestrator session due.
     orch_refresh_compactions: int = 4
     orch_refresh_hours: int = 24

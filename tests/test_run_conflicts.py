@@ -604,6 +604,19 @@ def test_conflict_resolution_has_full_budget_after_implementation_retries(confli
     assert c.store.load_flag(1) is None
 
 
+def test_conflict_resolution_turns_step_up_the_tier_like_failed_attempts(conflicting_lanes):
+    # #238: every executor turn, conflict resolution included, is counted as turn k.
+    c = conflicting_lanes
+    c.tracker.add_labels(1, ["size:s"])
+    c.ctx.config = replace(c.ctx.config, max_retries=5)
+    c.executor.steps.insert(0, {"cli.py": "commands = ['help']\n"})
+    c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "m", "3": "l", "4": "l"}
+    assert [call.get("effort") for call in c.executor.calls] == ["medium", "high", "xhigh", "xhigh"]
+    assert "Attempt 3 at tier l" in c.tracker.created_prs[0].body
+
+
 @pytest.mark.parametrize("before_push", [False, True])
 @pytest.mark.parametrize("scope", ["claude-local", "pr-body"])
 def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflicting_lanes, monkeypatch, before_push, scope):

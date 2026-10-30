@@ -28,6 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
@@ -45,9 +46,10 @@ def test_exact_defaults(repo):
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
-        "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
-                  "m": {"codex_effort": "high", "claude_model": None},
-                  "l": {"codex_effort": "xhigh", "claude_model": None}},
+        "tiers": {"s": {"codex_model": None, "codex_effort": "medium", "claude_model": None, "claude_effort": None},
+                  "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
+                  "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None}},
+        "tiers_headroom_ample": 0.5,
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -61,7 +63,8 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
     write_settings(global_path, {"tiers": {"s": {"claude_model": "small"}, "m": {"codex_effort": "xhigh"}}})
     write_settings(repo / ".foragent.yml", {"tiers": {"s": {"codex_effort": "low"}}})
     config = load_config(repo, global_path)
-    assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
+    assert config.tiers["s"] == {"codex_model": None, "codex_effort": "low",
+                                 "claude_model": "small", "claude_effort": None}
     assert config.tiers["m"]["codex_effort"] == "xhigh"
     assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
 
@@ -166,6 +169,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 @pytest.mark.parametrize("key,value", [
     ("orchestrator_timeout_minutes", 0), ("orchestrator_timeout_minutes", -1),
     ("orchestrator_timeout_minutes", True), ("orchestrator_timeout_minutes", "5"),
+    ("orch_silent_alert_minutes", -1), ("orch_silent_alert_minutes", 1441),
+    ("orch_silent_alert_minutes", True), ("orch_silent_alert_minutes", "30"),
     ("orch_refresh_compactions", 0), ("orch_refresh_hours", -1), ("orch_refresh_hours", True),
     ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
     ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),

@@ -13,16 +13,16 @@ To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass 
 ## Request box (D76)
 
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json`
-(planning requests) and `fa orch questions --json` (open human questions). Planning sessions add work
-with `fa orch request --from planning --text "..."`; mark progress with
-`fa orch request-status ID processing|done --note "..."`. Every request or question sent as a
-cross-session message is also written to the box, even when the message itself arrives, so nothing is
-lost on restart. Record each D71 question below with
-`fa orch ask --question "..." --option "..." --option "..." --recommend 1`; store the reply with
-`fa orch answer ID --text "..."`, which closes it. The planning session runs `fa plan heartbeat` and
-counts as alive for 120 seconds. If it is alive, also send the question to it as a cross-session
-message; `fa orch ask` then skips the push. If it is absent or its heartbeat is stale, `fa orch ask`
-sends the push itself, so do not add `fa notify`.
+(planning requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
+`fa orch request --from planning --text "..."`; mark progress with
+`fa orch request-status ID processing|done --note "..."`. Every request or question sent as a cross-session
+message is also written to the box, even when the message itself arrives, so nothing is lost on restart. Record
+each D71 question below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1`; store
+the reply with `fa orch answer ID --text "..."`, which closes it. The planning session runs `fa plan heartbeat`
+and counts as alive for 120 seconds. If it is alive, also send the question to it as a cross-session message;
+`fa orch ask` then skips the push. If it is absent or its heartbeat is stale, `fa orch ask` sends the push
+itself, so do not add `fa notify`. A session that may not be visible to the person asks through fa orch ask
+(which pushes) rather than AskUserQuestion alone.
 
 ## Ask only D71 choices
 
@@ -50,8 +50,8 @@ action. When the condition holds, wait quietly for a new event or user message.
 
 Keep `fa orch watch --follow` running in a Monitor for this session's whole life; it is the heartbeat and
 records this session, so the gate opens no second orchestrator. Restart it if it stops ([watch](references/watch.md)).
-Say you are watching only while it runs in this session and renews the heartbeat; else restart it. Check
-`fa orch refresh-due --json` too; a due session hands off and refreshes: [refresh](references/refresh.md).
+Say you are watching only while it runs in this session and renews the heartbeat; else restart it. Check `fa orch refresh-due --json` too; a due session hands off and refreshes: [refresh](references/refresh.md).
+If `fa orch watch --follow` refuses because another orchestrator holds the seat, end this session.
 
 ## Check loop (D80)
 

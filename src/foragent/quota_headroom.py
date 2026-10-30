@@ -1,9 +1,11 @@
 """Quota headroom (#186): which of Claude and Codex has more of its plan left per hour.
 
 Headroom is the minimum, over an executor's current windows, of (cap - used%) / hours to
-the reset. Claude's cap is its keep_percent (100 under ``fa quota mode burn``); the other's
-is 100. A window whose reset is unreadable is left out; a window that already reset is not
-current. A current window at 100% or more is used up: a hard limit until its reset.
+the reset. The cap is an executors-list keep_percent, else Claude's claude_quota keep_percent
+(100 under ``fa quota mode burn``), else 100. ``usable`` is the plain remaining fraction
+under the same cap; it chooses the implementation tier (#238). A window whose reset is
+unreadable is left out; a window that already reset is not current. A current window at
+100% or more is used up: a hard limit until its reset.
 """
 
 from __future__ import annotations
@@ -51,7 +53,20 @@ def headroom(usage: dict, name: str, now: datetime, cap: float) -> float | None:
     return min(rates, default=None)
 
 
+def usable(usage: dict, name: str, now: datetime, cap: float) -> float | None:
+    """The plain fraction left under ``cap`` at the tightest current window; None without current usage."""
+    return min(((cap - percent) / 100 for percent, _ in current_windows(usage, name, now)), default=None)
+
+
 def cap(config: Config, name: str, mode: str) -> float:
+    """``name``'s usage cap in percent: its own keep_percent in an executors list, else Claude's
+    claude_quota keep_percent (lifted to 100 by burn), else 100. Burn never lifts a listed share."""
+    from foragent.config import executors_explicit
+
+    if executors_explicit(config):
+        entry = next((entry for entry in config.executors if entry.get("name") == name), {})
+        keep = entry.get("keep_percent")
+        return float(keep) if isinstance(keep, (int, float)) and not isinstance(keep, bool) else 100.0
     if name == "claude" and mode != "burn":
         keep = config.claude_quota.get("keep_percent") if isinstance(config.claude_quota, dict) else None
         return float(keep) if isinstance(keep, (int, float)) else 100.0

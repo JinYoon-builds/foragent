@@ -47,11 +47,12 @@ def add(commands) -> None:
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
     stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
-    from foragent.commands import _orch_park
+    from foragent.commands import _orch_park, _orch_seat
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
     _orch_park.add_parsers(orch_actions)
+    _orch_seat.add_parsers(orch_actions)
     _add_inbox(orch_actions)
     add_orch(orch_actions)
 
@@ -109,14 +110,20 @@ def run(args) -> int:
         for event in orch.log(ctx):
             print(f"{event['at']} [{event['kind']}] {event['summary']}")
     elif args.action == "watch":
-        cli._open_lane_view(root)
+        from foragent import orch_seat
+
         unknown = False
-        try:
-            for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
+        try:  # #962: the seat comes before the view, any poll, print or heartbeat.
+            seat = orch_seat.take_for_watch(store, ctx.now()) if args.follow else None
+            cli._open_lane_view(root)
+            for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow, seat=seat):
                 print(cli.json.dumps(snapshot, ensure_ascii=False), flush=True)
                 unknown = bool(snapshot.get("unknown"))
         except KeyboardInterrupt:
             pass
+        except orch_seat.SeatHeld:
+            print(cli.text("orch_seat_refused", config.language), file=cli.sys.stderr, flush=True)
+            return 1
         if unknown and not args.follow:
             return 1
     elif args.action == "retry":

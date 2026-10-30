@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from foragent import orch_spawn
+from foragent import orch_seat, orch_spawn
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -38,6 +38,8 @@ def skip_reason(repo_root: Path, store: StateStore, now: datetime) -> str | None
         return "no_work"
     if orch_spawn._session_alive(store, repo_root.resolve()):
         return "session"
+    if orch_seat.blocks_spawn(store):  # #962: a live or unknown lease holder.
+        return "seat"
     return None
 
 
@@ -75,23 +77,26 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
     seen = _last_spawn(store)
     reason = skip_reason(repo_root, store, now)
     if reason is not None:
-        if reason == "session":
-            orch_spawn._note_silent(store, now)
+        orch_spawn.observe_silence(repo_root, store, config, now, reason)
         why.append(reason)
         return None
     root = repo_root.resolve()
     with _explicit_lock(store) as busy:
-        if (reason := skip_reason(root, store, now)) is not None:
-            why.append(reason)
-            return None
-        if _last_spawn(store) != seen or (busy and orch_spawn._spaced(store, now)):
+        reason = skip_reason(root, store, now)
+        if reason is None and (_last_spawn(store) != seen or (busy and orch_spawn._spaced(store, now))):
             why.append("raced")
             return None
-        planned = orch_spawn.plan_launch(root, store, now)
-        # The same record as the gate writes, so the gate's spacing also covers this spawn.
-        if planned is None or not orch_spawn.launch(root, store, now, planned):
-            why.append("failed")
-            return None
-        orch_spawn.adopt(store, planned, now)
+        if reason is None:
+            planned = orch_spawn.plan_launch(root, store, now)
+            # The same record as the gate writes, so the gate's spacing also covers this spawn.
+            if planned is None or not orch_spawn.launch(root, store, now, planned):
+                why.append("failed")
+                return None
+            orch_spawn.adopt(store, planned, now)
+    if reason is not None:
+        # The inner guard's facts take the same silence step, outside the openers' lock.
+        orch_spawn.observe_silence(repo_root, store, config, now, reason)
+        why.append(reason)
+        return None
     orch_spawn._opened(store, config, root, now, planned)
     return planned[0]

@@ -5,6 +5,8 @@ from typing import Any
 
 from foragent import review_perspectives
 
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
 
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
@@ -75,6 +77,9 @@ def _validate(values: dict[str, Any]) -> None:
             continue
         if type(values[key]) is not int or values[key] <= 0:
             raise ConfigError(f"{key} must be a positive integer")
+    alert = values["orch_silent_alert_minutes"]
+    if type(alert) is not int or not 0 <= alert <= 1440:
+        raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
     if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     review_perspectives.validate(values, ConfigError)
@@ -145,13 +150,22 @@ def _validate(values: dict[str, Any]) -> None:
     tiers = values["tiers"]
     if not isinstance(tiers, dict) or set(tiers) != {"s", "m", "l"}:
         raise ConfigError("tiers must define s, m, and l")
+    # Codex and Claude always have both keys; another listed executor may add its own (#238).
+    known = {f"{executor}_{key}" for executor in _EXECUTORS | listed for key in ("model", "effort")}
+    required = {f"{executor}_{key}" for executor in ("codex", "claude") for key in ("model", "effort")}
     for name, tier in tiers.items():
-        if not isinstance(tier, dict) or set(tier) != {"codex_effort", "claude_model"}:
-            raise ConfigError(f"tiers.{name} must contain codex_effort and claude_model")
-        if tier["codex_effort"] not in ("low", "medium", "high", "xhigh", "max"):
-            raise ConfigError(f"tiers.{name}.codex_effort is invalid")
-        if tier["claude_model"] is not None and not isinstance(tier["claude_model"], str):
-            raise ConfigError(f"tiers.{name}.claude_model must be a string or null")
+        if not isinstance(tier, dict) or not required <= tier.keys():
+            raise ConfigError(f"tiers.{name} must contain {', '.join(sorted(required))}")
+        for key in tier.keys() - known:
+            raise ConfigError(f"tiers.{name}.{key} is not a known key; use <executor>_model or <executor>_effort")
+        for key, value in tier.items():
+            if key.endswith("_effort") and value is not None and value not in _EFFORTS:
+                raise ConfigError(f"tiers.{name}.{key} must be one of {', '.join(_EFFORTS)} or null")
+            if key.endswith("_model") and value is not None and not isinstance(value, str):
+                raise ConfigError(f"tiers.{name}.{key} must be a string or null")
+    ample = values["tiers_headroom_ample"]
+    if not isinstance(ample, (int, float)) or isinstance(ample, bool) or not ample >= 0:
+        raise ConfigError("tiers_headroom_ample must be a number of at least 0")
     libraries = values["skill_libraries"]
     if not isinstance(libraries, list):
         raise ConfigError("skill_libraries must be a list of repository URLs or library mappings")

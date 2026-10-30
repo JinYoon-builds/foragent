@@ -28,9 +28,12 @@ class RunRecordsMixin:
             timestamp = self._timestamp()
             approval = self.load_approval(number)
             previous = self.get_run(number)
-            restarts = previous.restarts if previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"} else 0
+            # A gate restart (stall, crash) or limit-wait resume continues the run: its restarts and
+            # turn tiers survive, so the next turn is counted after them (#238). Only a limit-wait
+            # keeps the attempt number.
+            restarted = previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"}
+            restarts = previous.restarts if restarted else 0
             attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
-            resumed = previous is not None and previous.outcome == "limit-wait"
             session = {}
             if previous is not None:
                 reason = "\n".join(value for value in (
@@ -52,8 +55,8 @@ class RunRecordsMixin:
 
             identities = observe_tree(roots=(pid,)) if pid is not None else []
             run = _state.Run(number, branch, str(worktree), pid, timestamp, timestamp, attempts=attempts,
-                      restarts=restarts, lane=lane, tier=previous.tier if resumed else tier,
-                      attempt_tiers=previous.attempt_tiers if resumed else {},
+                      restarts=restarts, lane=lane, tier=previous.tier if restarted else tier,
+                      attempt_tiers=previous.attempt_tiers if restarted else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer,
                       executor=executor, reviewer=reviewer, **session)

@@ -3,7 +3,7 @@
 The gate calls ``ensure_orchestrator`` every tick. It opens one Claude session
 running ``/fa-orchestrator`` only when approved work exists, no orchestrator
 renewed its heartbeat lately, no recorded or gate-spawned orchestrator session
-is still running, and no spawn happened in the last two minutes.
+is still running, no live lease holder sits in the seat (``orch_seat``), and no spawn happened in the last two minutes.
 The session opens in the background: a new Orca tab without focus, a detached
 tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
 planning session, so nothing here splits a pane or switches focus.
@@ -18,7 +18,7 @@ import shlex
 import shutil
 from types import SimpleNamespace
 
-from foragent import orch_binding, orch_push, orch_stale_files, processes, watch_open
+from foragent import orch_binding, orch_push, orch_seat, orch_silent, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -69,6 +69,28 @@ def _note_silent(store: StateStore, now: datetime) -> None:
         store._write_json(path, {"at": now.isoformat()})
     append_event(store, now, None, "orch-silent",
                  "orchestrator alive without heartbeat; no second orchestrator opened")
+
+
+def observe_silence(repo_root: Path, store: StateStore, config: Config, now: datetime, reason: str) -> None:
+    """The one silence step (gate and ``fa orch ensure``) for why no orchestrator opened (#952).
+
+    A fresh heartbeat rearms; a live one without it (``session``/``seat``) gets
+    the hourly note, and only the seat holder may push (``orch_silent.check``).
+    """
+    if reason == "alive" or (reason in ("session", "seat") and _alive(store, now)):
+        orch_silent.rearm(store)
+    elif reason in ("session", "seat"):
+        _note_silent(store, now)
+        orch_silent.check(repo_root.resolve(), store, config, now)
+
+
+def _live_reason(store: StateStore, root: Path, now: datetime) -> str | None:
+    """Which live orchestrator evidence stops a spawn: ``alive``, ``session``, ``seat`` or None."""
+    if _alive(store, now):
+        return "alive"
+    if _session_alive(store, root):
+        return "session"
+    return "seat" if orch_seat.blocks_spawn(store) else None
 
 
 def _spaced(store: StateStore, now: datetime) -> bool:
@@ -182,19 +204,24 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
         return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
-    if _alive(store, now) or not _approved_work(store):
+    if not _approved_work(store) and not _alive(store, now):
         return None
-    if _session_alive(store, repo_root.resolve()):
-        _note_silent(store, now)
+    root = repo_root.resolve()
+    if (reason := _live_reason(store, root, now)) is not None:
+        observe_silence(root, store, config, now, reason)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):
             return None
-        root = repo_root.resolve()
-        planned = plan_launch(root, store, now)
-        if planned is None or not launch(root, store, now, planned):
-            return None
-        adopt(store, planned, now)
+        reason = _live_reason(store, root, now)
+        if reason is None:
+            planned = plan_launch(root, store, now)
+            if planned is None or not launch(root, store, now, planned):
+                return None
+            adopt(store, planned, now)
+    if reason is not None:  # The in-lock check's facts take the same silence step, outside the lock.
+        observe_silence(root, store, config, now, reason)
+        return None
     _opened(store, config, root, now, planned)
     return planned[0]
 
