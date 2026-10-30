@@ -1077,8 +1077,8 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
     store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
                         approved_at=BASE_TIME.isoformat())
     store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
-    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store)
-    attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log",
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME)
+    attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log", rebuilt=False,
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,

@@ -243,7 +243,7 @@ def _start_ready(
         # Every start, also one a GitHub limit stops, stores its pair and journals its switch (#186).
         ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
-            tier=scheduler.issue_size(issue.labels), executor=executor, reviewer=reviewer,
+            executor=executor, reviewer=reviewer,  # The runner's first turn writes the tier (#238).
             journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
                                                   ctx.config, lane, executor, reviewer),
         )

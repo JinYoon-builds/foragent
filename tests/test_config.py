@@ -46,9 +46,10 @@ def test_exact_defaults(repo):
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "executor_fallback_model": None,
         "transient_max_wait_minutes": 30, "limit_wait_minutes": 60, "usage_recheck_minutes": 10,
-        "tiers": {"s": {"codex_effort": "medium", "claude_model": None},
-                  "m": {"codex_effort": "high", "claude_model": None},
-                  "l": {"codex_effort": "xhigh", "claude_model": None}},
+        "tiers": {"s": {"codex_model": None, "codex_effort": "medium", "claude_model": None, "claude_effort": None},
+                  "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
+                  "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None}},
+        "tiers_headroom_ample": 0.5,
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -62,7 +63,8 @@ def test_tiers_merge_global_and_repository_fields(repo, tmp_path):
     write_settings(global_path, {"tiers": {"s": {"claude_model": "small"}, "m": {"codex_effort": "xhigh"}}})
     write_settings(repo / ".foragent.yml", {"tiers": {"s": {"codex_effort": "low"}}})
     config = load_config(repo, global_path)
-    assert config.tiers["s"] == {"claude_model": "small", "codex_effort": "low"}
+    assert config.tiers["s"] == {"codex_model": None, "codex_effort": "low",
+                                 "claude_model": "small", "claude_effort": None}
     assert config.tiers["m"]["codex_effort"] == "xhigh"
     assert config.tiers["l"] == DEFAULTS["tiers"]["l"]
 
