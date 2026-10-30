@@ -170,6 +170,24 @@ def _recorded_terminal(store: StateStore, root: Path, *, guarded: bool = False) 
     return executable, handle
 
 
+def record_terminal(store: StateStore, cwd: Path, executable: str, handle: str, now: datetime) -> bool:
+    """Record the person's Orca terminal in watch-terminal.json; False when skipped.
+
+    Role sessions (FORAGENT_ROLE) and sessions inside the gate's worktrees are not the
+    person's terminal, so they never replace the record.
+    """
+    if "FORAGENT_ROLE" in os.environ:  # Set at all, even empty: a role launched this session.
+        return False
+    with suppress(OSError, ValueError):
+        if cwd.resolve().is_relative_to((store.root / "worktrees").resolve()):
+            return False
+    store._write_json(store.root / "watch-terminal.json", {
+        "executable": executable, "handle": handle,
+        "recorded_at": now.isoformat(),
+    })
+    return True
+
+
 REOPEN_SPACING = timedelta(minutes=5)
 # Set while reopen calls open_view, which then skips the record reopen just wrote.
 # The dict notes when only the manual command was printed, which is not an attempt.
@@ -290,9 +308,9 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
         terminal = None
         if executable:
             executable = str(Path(executable).absolute())
-            store._write_json(store.root / "watch-terminal.json", {
-                "executable": executable, "handle": handle,
-            })
+            # Kept for the locked view tests that open with a handle, then without one;
+            # the SessionStart hook is the writer for the planning terminal.
+            record_terminal(store, Path.cwd(), executable, handle, datetime.now(UTC))
             terminal = executable, handle
         elif not handle:
             terminal = _recorded_terminal(store, root, guarded=True)

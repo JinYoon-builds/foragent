@@ -192,8 +192,12 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
     cwd = payload.get("cwd")
     session_id = payload.get("session_id")
     try:
-        message = presence.session_start_message(Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd(),
-                                                 session_id if isinstance(session_id, str) else None,
+        folder = Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
+    except OSError:  # The process folder is gone: neither step has a project to read.
+        return 0
+    presence.record_terminal(folder, datetime.now(UTC))
+    try:
+        message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
                                                  datetime.now(UTC))
     except Exception:  # A failed summary must never disturb the session that is starting.
         message = None
