@@ -93,3 +93,29 @@ def test_fixed_config_override_wins_over_recorded_file_plan(ctx, monkeypatch, ca
         _lane_clone_issue(ctx, number, [PATH])
     assert tick(ctx).skipped is None
     assert starts == [1]
+
+
+def test_file_expiry_cannot_expire_unrelated_human_plan_items(ctx, monkeypatch, capsys):
+    later = (ctx.now() + timedelta(days=1)).isoformat()
+    code, output = command(ctx, monkeypatch, capsys, "--width", "main=2",
+                           "--expires", later, "--by", "human", "--json")
+    assert code == 0, output
+    import json
+
+    before = json.loads(output)
+    set_file_plan(ctx, monkeypatch, capsys)
+    code, output = command(ctx, monkeypatch, capsys, "--json")
+    assert code == 0, output
+    after = json.loads(output)
+    for key in ("queues", "paused", "width", "expires_at"):
+        assert after[key] == before[key], "A file edit cannot change unrelated human policy"
+
+
+def test_equivalent_file_spelling_cannot_bypass_a_human_limit(ctx, monkeypatch, capsys):
+    set_file_plan(ctx, monkeypatch, capsys, value="1", by="human")
+    before = (ctx.store.root / "plan.json").read_bytes()
+    for path in ("./" + PATH, "src/foragent/../foragent/shared.py", "../outside.py"):
+        code, output = command(ctx, monkeypatch, capsys, "--overlap", f"{path}=5",
+                               "--why", WHY, "--by", "orchestrator", "--json")
+        assert code != 0, output
+        assert (ctx.store.root / "plan.json").read_bytes() == before
