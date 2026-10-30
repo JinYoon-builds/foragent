@@ -22,6 +22,8 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
+decision marker. Omitted keeps an issue's existing marker; [] clears its links.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.

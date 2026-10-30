@@ -11,6 +11,7 @@ import re
 from urllib.parse import quote
 
 from foragent import board, design, order_references
+from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -295,8 +296,13 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references"}, label)
+                                     "references", "decisions"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "decisions"}, label)
+            if "decisions" in item:
+                try:
+                    decision_links.validate(item["decisions"], f"{label}.decisions")
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
@@ -582,6 +588,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             labels.append("interactive")
         number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
+        existing = tracker.get_issue(number) if number is not None else None
+        body = decision_links.with_marker(body, item.get("decisions"), existing.body if existing else None)
         if number is None:
             number = tracker.create_issue(item["title"], body, labels)
             mapping[item["key"]] = number
@@ -589,7 +597,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
-            existing = tracker.get_issue(number)
             if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
@@ -614,7 +621,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+        body = decision_links.with_marker(
+            issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item)),
+            item.get("decisions"), existing.body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()

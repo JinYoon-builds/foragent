@@ -40,6 +40,8 @@ class IssueRefreshMixin:
                     **old, "number": issue.number, "title": issue.title, "body": issue.body,
                     "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
                     "state": issue.state,
+                    # Completion reason and observation time travel with the listing (#1025).
+                    "state_reason": getattr(issue, "state_reason", None), "observed_at": now.isoformat(),
                     "pr_number": None if complete_prs else old.get("pr_number"),
                     "merged": False if complete_prs else old.get("merged", False),
                     "merged_at": None if complete_prs else old.get("merged_at"),

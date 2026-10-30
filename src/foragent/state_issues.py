@@ -101,6 +101,14 @@ class IssueSnapshotMixin:
         rows = self._issue_record()["issues"].values()
         return [_copy(row) for row in sorted(rows, key=lambda row: row["number"])]
 
+    def confirmed_local_issues(self) -> list[dict[str, Any]]:
+        """Issue facts without undelivered local writes: a queued issue reads as its delivery baseline."""
+        record = self._issue_record()
+        pending = {str(entry["issue"]) for entry in record.get("outbox", [])}
+        rows = {key: record.get("outbox_base", {}).get(key, row) if key in pending else row
+                for key, row in record["issues"].items()}
+        return [_copy(row) for row in sorted(rows.values(), key=lambda row: row["number"])]
+
     def github_outbox(self) -> list[dict[str, Any]]:
         """Read pending GitHub writes in their persisted delivery order."""
         return _copy(self._issue_record().get("outbox", []))
@@ -235,10 +243,11 @@ class IssueSnapshotMixin:
             ):
                 return
             row = self._local_issue(snapshot, issue.number)
-            facts = dict(title=issue.title, body=issue.body, labels=sorted(issue.labels), state=issue.state)
+            facts = dict(title=issue.title, body=issue.body, labels=sorted(issue.labels), state=issue.state,
+                         state_reason=getattr(issue, "state_reason", None))
             if any(row.get(key) != value for key, value in facts.items()):
                 _state._forget_reads(row)
-            row.update(facts, lane=issue_lane(issue.labels, lanes))
+            row.update(facts, lane=issue_lane(issue.labels, lanes), observed_at=self._timestamp())
             self._save_local_issue(snapshot, row)
 
     def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:

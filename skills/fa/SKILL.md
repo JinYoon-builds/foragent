@@ -41,6 +41,10 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
      - **Current state (현재 상태):** `profile` (kind, stage, priority), `usage`, and
        `as_of`. If `stale` is true, say the facts may be old.
      Leave out empty parts in one phrase ("nothing running") rather than listing nothing.
+   - When the person wants to plan, `fa decisions --json` lists decisions in state
+     `decided, nothing ordered` (no linked issue yet). Mention them as candidates only
+     if they help the choice; a missing link does not prove the work was never done,
+     and nothing is ordered without the person.
    - When `scorecard_line` is not null, show it word for word as its own line after the
      four parts, just before the closing question. It names the metric that got most
      worse against recent days. When it is null, say nothing about the scorecard.

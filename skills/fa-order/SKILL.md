@@ -74,6 +74,11 @@ Use `fa order publish` below to perform the approved publication itself.
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
+- Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
+  no linked issue yet: context for what to propose, defer or discuss, not a work list.
+  A missing link is not proof the decision is unimplemented (older issues are linked only
+  by exact D-number citations in their published spec). Each row has `observed_at`, the
+  age of the issue facts behind its state. You decide what to order.
 - Build a **decision ledger** from the docs before asking questions: design docs,
   decision logs, README, CLAUDE.md/AGENTS.md and specs contain earlier answers.
   Give each entry its decision, reason, constraints, out of scope, source reference and
@@ -270,6 +275,10 @@ freeze a lane's private implementation.
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
   when the affected files are not yet known. The published issue lists these under `## Files`.
+- Set an issue's or edit's **`decisions`** (for example, `["D79"]`) to the ledger decisions
+  the work carries out, so `fa decisions` links them. Use heading IDs only (`D79`, not
+  `D79-1`). Omitting it on a republication or edit keeps the issue's existing links; `[]`
+  clears them. Decisions cited only as rationale do not go here.
 - Put the shared outcome and cross-issue constraints in the parent summary, not in children.
 
 Record the lane map before writing acceptance tests: chunk × goal / out of scope /
