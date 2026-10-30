@@ -150,20 +150,50 @@ def recorded_union(store) -> set[str]:
         return set()
 
 
+def file_limits(ctx) -> dict[str, int]:
+    """The plan's per-file limits in force, as escaped patterns; none under ``overlap_mode: fixed``."""
+    if ctx.config.overlap_mode == "fixed":
+        return {}
+    from foragent import orch_plan
+
+    now = ctx.now() if hasattr(ctx, "now") else ctx.store._now()
+    return {escape(path): limit for path, limit in orch_plan.file_limits(ctx.store, now).items()}
+
+
+def shared_limit(ctx, patterns: list[str], planned: dict[str, int]) -> int:
+    """How many runs may share the files that every one of ``patterns`` can touch.
+
+    A concrete path among them pins the shared files to that one file: its plan limit, else
+    overlap_per_file. Globs alone may share unplanned files too, so they meet the fallback and
+    every planned file they all cover. A file none of them shares never lends its limit.
+    """
+    hits = [limit for path, limit in planned.items() if intersects(ctx, *patterns, path)]
+    if any(not has_magic(pattern) for pattern in patterns):
+        return min(hits) if hits else ctx.config.overlap_per_file
+    return min([ctx.config.overlap_per_file, *hits])
+
+
 def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
-    """Count distinct runs sharing the same possible path, not matching patterns."""
+    """Count distinct runs sharing the same possible path, not matching patterns.
+
+    Each group of peers is checked against the limit of the files it shares with ``path``
+    (``shared_limit``), so a glob claim is held only where an overlapping file is full.
+    """
     if union is None:
         union = union_patterns(ctx, files, peers)
     files = [path for path in files if path not in union]
     peers = [Claim(peer.run, peer.parsed, [path for path in peer.files if path not in union])
              for peer in peers]
-    limit = ctx.config.overlap_per_file
+    planned = file_limits(ctx)
+    sizes = sorted({ctx.config.overlap_per_file, *planned.values()})
     for path in files:
         matching = [peer for peer in peers if any_overlap(ctx, [path], peer.files)]
-        for group in combinations(matching, limit):
-            for patterns in product(*(peer.files for peer in group)):
-                if intersects(ctx, path, *patterns):
-                    return True
+        for size in sizes:
+            for group in combinations(matching, size):
+                for patterns in product(*(peer.files for peer in group)):
+                    if intersects(ctx, path, *patterns) and shared_limit(
+                            ctx, [path, *patterns], planned) <= size:
+                        return True
     return False
 
 
