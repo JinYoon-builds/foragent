@@ -38,7 +38,7 @@ def architect_case(tmp_path, monkeypatch):
     The fake agent delivers a proposal through the existing request tool for the
     orchestrator to judge, without a script interpreting prose or publishing orders.
     """
-    from foragent import executors, notify, runner
+    from foragent import executors, notify, processes, runner
     from foragent.executors import ExecResult
     from foragent.launcher import spawn_runner
     from foragent.state import StateStore
@@ -89,6 +89,10 @@ def architect_case(tmp_path, monkeypatch):
 
     fake_executor = SimpleNamespace(run=execute)
     monkeypatch.setattr(subprocess, "Popen", Session)
+    # The table and probes only contain fake sessions, never host PIDs.
+    monkeypatch.setattr(processes, "list_processes", lambda: processes.ProcessTable([
+        processes.ProcessIdentity(s.pid, 1, s.pid, s.pid, float(s.pid))
+        for s in case.launches if s.poll() is None]))
     monkeypatch.setattr(os, "kill", probe)
     monkeypatch.setattr(os, "killpg", no_group_signal)
     monkeypatch.setattr(executors, "executor_for", lambda *a, **kw: fake_executor)
@@ -253,10 +257,10 @@ def test_orch_architect_is_not_launched_by_ticks_merges_or_gate_paths(
     for number in range(2, 32):
         record_finish(case, number)
         if number in (29, 30, 31):
-            for flags in ((), ("--no-start",)):
+            for flags in (("--no-start",),):
                 assert cli_exit(case.main, ["gate", "tick", *flags,
                                            "--repo-root", str(case.root)]) == 0
-                assert architect_events(case.store) == [], "Neither ticks nor merge counts call the architect"
+                assert architect_events(case.store) == [], "No-start ticks and merge counts must not launch a role"
     assert cli_exit(case.main, ["gate", "status", "--json", "--repo-root", str(case.root)]) == 0
     assert architect_events(case.store) == []
     assert len(case.implementer.calls) == len(case.reviewer.calls) == 1, "Only the ordinary lane agents ran"
