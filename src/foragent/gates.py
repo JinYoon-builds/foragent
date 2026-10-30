@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import shlex
 from typing import Any
 
 import yaml
@@ -260,6 +261,8 @@ def collect(now: datetime, *, current: Path | None = None, home: Path | None = N
             "interval_seconds": gate.interval,
             "stale": stale,
             "current": current is not None and gate.state_root == current,
+            # The latest launchd reload of this gate; None until one is attempted.
+            "reload": launchd.reload_fact(gate.state_root),
         })
     return sorted(rows, key=lambda row: (not row["current"], row["repo"]))
 
@@ -291,4 +294,23 @@ def human_lines(rows: list[dict[str, Any]], now: datetime, language: str) -> lis
         warning = f" ⚠ {text('gates_stale', language)}" if row["stale"] else ""
         lines.append(text("gates_row", language, repo=row["repo"], tick=tick,
                           running=row["running_runs"], scheduler=scheduler) + warning)
+        lines += _reload_lines(row, language)
+    return lines
+
+
+def _reload_lines(row: dict[str, Any], language: str) -> list[str]:
+    """The last failed reload, whether it recovered, and the command that reinstalls the gate."""
+    from foragent.i18n import text
+
+    fact = row.get("reload")
+    # A pending (unloaded) reload is a failure even when no error text was recorded.
+    if not isinstance(fact, dict) or not (fact.get("error") or fact.get("pending") or fact.get("loaded") is False):
+        return []
+    loaded = fact.get("loaded") is True and not fact.get("pending")
+    key = "gates_reload_recovered" if loaded else "gates_reload_failed"
+    error = " ".join(str(fact.get("error") or text("gates_reload_not_loaded", language)).split())
+    lines = [text(key, language, at=fact.get("at"), attempts=fact.get("attempts"), error=error)]
+    if row.get("repo_root"):
+        command = shlex.join(["fa", "gate", "install", "--repo-root", row["repo_root"]])
+        lines.append(text("gates_reload_command", language, command=command))
     return lines

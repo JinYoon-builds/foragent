@@ -172,7 +172,8 @@ def _language(root: Path | None) -> str:
 def _restart(root: Path, jobs: list[launchd.InstalledJob], language: str) -> str:
     """Restart one gate between ticks; return restarted, busy, failed or skipped."""
     try:
-        loaded = [job for job in jobs if job.loaded()]
+        # A job whose last reload ended unloaded is recorded pending: retry it too.
+        loaded = [job for job in jobs if job.loaded() or launchd.reload_pending(job)]
         if not loaded:
             print(text("update_gate_not_loaded", language, root=root))
             return "skipped"
@@ -215,14 +216,20 @@ def update(repo_root: Path | None = None) -> int:
     cache = {"checked_at": datetime.now(UTC).isoformat(), "latest": tag}
     with _machine_lock("update-check.lock"):
         saved = _read_cache()
-    pending = [root for root in installed_gates() if str(root) in (saved.get("pending_restart") or [])]
+    gates = installed_gates()
+    pending = [root for root in gates if str(root) in (saved.get("pending_restart") or [])]
+    # A reload that ended unloaded (from any restart, including the detached
+    # refresher) is pending too, though no fa update recorded it.
+    unloaded = {root: jobs for root, jobs in gates.items()
+                if any(launchd.reload_pending(job) for job in jobs)}
     # The tag names the version: a recorded successful install of it counts as current,
     # because package metadata need not change between releases.
     if _offer(tag, saved.get("installed")) is None and not pending:
         with _machine_lock("update-check.lock"):
             _write_cache({**_read_cache(), **cache})
         print(text("update_none", language, current=_newest(current_version(), saved.get("installed"))))
-        return 0
+        # The installed release is current: retry the unloaded gates without reinstalling.
+        return _restart_gates(unloaded, language, cache) if unloaded else 0
     # Otherwise install: a newer release, or an earlier update that left gates
     # unrestarted, which this run finishes by repeating the whole update.
     try:
