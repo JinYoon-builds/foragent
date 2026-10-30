@@ -33,7 +33,10 @@ Mark a summary of the agreement as the session's summary.
 
 Confirm scope with one question, e.g. "Is this what you wanted?" in English;
 ask the confirmation question in the person's language. The session settles
-reversible details itself and keeps them in the records. Reuse that confirmation
+reversible details itself and keeps them in the records. These are the reversible
+choices planning still owns (wording, ordering, scope edges); how the work is built is
+not planning's to settle: the lane session settles its reversible implementation
+details itself and records them in its PR. Reuse that confirmation
 while the scope still fits; ask again only when the scope changes.
 
 Approval must come first-hand from the person in the session that publishes. The planning
@@ -130,14 +133,15 @@ the records; explain the practical tradeoffs and evidence behind options in cont
 Refine a free answer into decision / reason / constraints / out of scope, and reflect it
 back for correction before treating an uncertain interpretation as settled.
 Ask only what changes product behaviour, scope, priority, UX or an approval boundary.
-Do not ask about reversible implementation details — decide them and note them in the spec.
+Do not ask about implementation details, and do not decide them in the plan: structure,
+internal names, values and data shapes belong to the lane (D98).
 - New project (no specs yet): find the goal first — who uses it, the first thing they do,
   what "done for now" means, what is explicitly not in this round.
 - Daily order: process decisions/feedback, then the new request. Keep it short.
 Keep **open questions** in the progress records; bring the next unresolved decision to
 the person with context. The interview ends when no open questions remain and all five
-cells per chunk are settled. Stop asking once remaining choices are reversible; decide
-those yourself and record the assumptions.
+cells per chunk are settled. Stop asking once remaining choices are reversible; settle
+the reversible WHAT choices yourself and record the assumptions, and leave HOW to the lane.
 
 ### Project profile
 Use `profile` from the context and the ledger as earlier answers, not a separate team
@@ -238,10 +242,16 @@ Split further when any of these differ: the result that can be merged alone, the
 verification environment, an approval boundary, or a part that can be blocked while the
 rest still completes. For each issue you must be able to write one sentence:
 "Close when <specific evidence>". If you cannot, split or ask.
+Plans and issues name only the goal, scope, observable behaviour and inter-issue
+contracts (what another issue relies on). HOW belongs to the lane: leave structure,
+internal names, values and data shapes to the lane, which proposes its approach in
+preread and records its choices. Do not prescribe them in the goal, plan or spec.
 When several issues depend on each other's code (shared interfaces, or one screen
 split into parts), the first issue is a skeleton that defines the shared names,
 signatures and data shapes in code. The order spec lists them under a Contracts
 heading. Every dependent issue lists the skeleton issue in `blocked_by`.
+A skeleton fixes only these real interfaces between issues; it is not a reason to
+freeze a lane's private implementation.
 - **Lane** = the area of the code it changes. Issues in one lane run one after another;
   lanes run in parallel. Use existing lanes; propose a new lane only for a genuinely new
   area (name, paths, confirmed fixed style skills from `fa skills catalog`). Never put two
@@ -275,7 +285,10 @@ cannot change them. Draft the acceptance tests and the spec in a temporary folde
 main checkout (for example `mktemp -d`), never in the shared working tree: other sessions
 use that checkout, and its files must stay untouched. Put the final contents into the plan's
 `acceptance_files` and `spec_markdown`, under their acceptance-dir paths. Test observable behaviour through the
-project's real entry points (CLI, HTTP, public functions), not internals. Each test must
+project's real entry points (CLI, HTTP, public functions), not internals. Locked checks
+do not import internal helpers or functions unless the issue explicitly declares that
+function as its contract (for example a skeleton signature listed under Contracts), and
+they do not pin internal names, values or shapes the lane is free to choose. Each test must
 fail today and pass only when the goal is met. Prefer 2–4 sharp cases including one edge.
 Judge every test by the break-it rule (from pstack's
 principle-test-behavior-not-implementation, MIT): Make the code return a wrong value, skip an
@@ -303,12 +316,18 @@ shows which seats changed specs.
 Keep the plan JSON in that state drafts folder (schema in `fa order publish --help`). Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
 Then run `fa order preread PLAN.json --json`. The implementer reads each issue read-only and
-lists what it would have to guess. Resolve unknowns from code, docs or settled decisions,
-and settle reversible details yourself, recording them in the plan. Bring only unknowns
-that need the person's decision to them, one at a time with context. Fold the answers into
-the plan, then run preread again until every issue has no unknowns.
-`--approve` refuses issues whose latest preread of the current content is missing or has
-unknowns; any plan edit needs a new preread. The dry-run is never blocked.
+answers with `APPROACH:` (its design), `DECIDE:` (implementation choices it will make) and
+`QUESTION:` lines (unknowns it cannot settle alone). Resolve each question about WHAT (goal,
+scope, observable behaviour or an inter-issue contract) from existing evidence: code, docs,
+the decision ledger and settled decisions. Fold those answers into the plan. A question
+about HOW means the plan said too little or too much: leave that choice to the lane in the
+issue text rather than answering it for the lane. Bring the person only the unresolved WHAT
+decisions, one at a time with context, and fold their answers into the plan.
+DECIDE lines are the lane's own choices: show them once in the restatement you present for
+approval, under "the lane will decide these" (in the person's language). They need no
+planning approval and no loop to remove every guess; the lane records them in its PR.
+`--approve` refuses issues whose latest preread of the current content is missing or still
+has open questions; any plan edit needs a new preread. The dry-run is never blocked.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
 so preread refuses them: after the person's first-hand approval here, publish once without
 `--approve` to create the lanes, run preread, then publish again with `--approve`. Reuse that
