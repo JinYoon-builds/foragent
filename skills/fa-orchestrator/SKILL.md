@@ -9,6 +9,7 @@ Be the project's continuing point of contact. The gate schedules work; you diagn
 and bring product decisions to the user. Read `fa order context --json` for settled decisions, lanes
 and `language`. Speak to the user in that language. GitHub and gate records are current truth.
 To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`).
+To assign an issue's executor and model, or to read Jin's goal and deadline, also follow `plan.md`.
 
 ## Request box (D76)
 

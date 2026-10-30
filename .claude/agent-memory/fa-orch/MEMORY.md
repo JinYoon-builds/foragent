@@ -223,5 +223,7 @@
 - [#970 ask through planning](project_970_ask_planning.md) — ask --kind, handoff text, statusline plan renewal, watch --follow inbox events
 - #979: 주문 카드 넘김 절차는 `references/order-card.md`에 있고 SKILL.md는 `For order drafts ...` 한 줄 안내만 둔다(인수 `test_orch_order_handoff.py`가 이 줄 모양·150줄을 검사). 문구 원본은 `docs/specs/2026-10-30-order-voice-and-handoff.md`의 "Proposed skill edits" diff. 스킬 독자 13개 인수 파일+`test_init` 패키지 데이터 시험이 Done when.
 - [#1027 file overlap plan](project_1027_file_overlap.md) — plan files entries, limit_for, overlap_mode measured|fixed, frozen-clock test setup traps
+- #1041(D77): main 시험 실패 측정은 `orch_scorecard_main_tests.py`; `--record-main-tests FILE`이 `<state>/main-test-observations.jsonl`에 추가만 하고 (change, check, result)로 중복 제거. 잠긴 인수 시험 82번째 줄이 `set <= dict`로 항상 TypeError라 QUESTION.md로 남김(한 줄 고친 사본에선 7개 통과). `test_orch_scorecard_unit`이 human 출력 줄 수를 세므로 새 줄은 끝에 붙이고 그 수를 갱신.
 - [#995 tick admission](project_995_tick_admission.md) — refresh-failure fallback, gh.Budget 10s/5s, board read only on changed listing, D69 lane conflict
 - #1055: refresh 첫 프롬프트 2번과 dream 권위 문구는 `orch_rules.current_rules(root)`(rules.md → decisions.md)로 대상 저장소·dream 작업공간에서 고르고 본문을 인용한다. test_lane_memory_writers 6개 실패는 범위 밖 기준선.
+- [#1042 D80 assign/goal](project_1042_assign_goal.md) — plan.json assignments/goal, decide() hook, Run.executor_model
