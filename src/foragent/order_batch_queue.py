@@ -51,12 +51,12 @@ def _mark(root: Path, kind: str, revisions: set[str], **fields) -> None:
 
 
 def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads: dict[str, str],
-               commit: str, token: str) -> None:
+               commit: str) -> None:
     """Record that the batch commit exists: later runs push and finish, never rewrite."""
     for revision, names in orders.items():
-        _mark(root, "orders", {revision}, status=COMMITTED, commit=commit, token=token,
+        _mark(root, "orders", {revision}, status=COMMITTED, commit=commit,
               blobs={name: heads[name] for name in names})
-    _mark(root, "notes", set(notes), status=COMMITTED, commit=commit, token=token)
+    _mark(root, "notes", set(notes), status=COMMITTED, commit=commit)
 
 
 def _revalidate(root: Path, git) -> None:
@@ -67,12 +67,12 @@ def _revalidate(root: Path, git) -> None:
         for row in [*current["orders"], *current["notes"]]:
             if row["status"] != COMMITTED:
                 continue
-            key = (row.get("commit"), row.get("token"))
-            if key not in found:
-                found[key] = journal.commit_of(git, *key) is not None
-            if not found[key]:
+            commit = row.get("commit")
+            if commit not in found:
+                found[commit] = journal.landed(git, commit)  # the same predicate as recovery
+            if not found[commit]:
                 row["status"] = WAITING
-                for field in ("commit", "token", "blobs"):
+                for field in ("commit", "blobs"):
                     row.pop(field, None)
 
     if any(row["status"] == COMMITTED for row in [*_load(root)["orders"], *_load(root)["notes"]]):

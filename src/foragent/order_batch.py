@@ -1,11 +1,12 @@
 """Waiting orders and planning notes, published together at a chosen boundary (D85).
 
 The queue is local control state in the repository's ignored ``.foragent/order-batch.json``
-(beside preread evidence), so waiting work never changes the shared checkout's content. A boundary is a name the person or agent chooses
-(for example ``next-code-merge``); ``flush`` publishes everything waiting for it in one
-commit and push, then runs each order's normal tracker publication. Every order keeps
-its own approval and preread requirements, and every step is safe to repeat after an
-interruption: notes carry an id marker in their file, orders reuse their issue markers.
+(beside preread evidence), so waiting work never changes the shared checkout's content.
+A boundary is a name the person or agent chooses (for example ``next-code-merge``);
+``flush`` publishes everything waiting for it in one commit and push, then runs each
+order's normal tracker publication. Every order keeps its own approval and preread
+requirements. An interrupted flush is finished or undone from its journal's recorded
+commit (``order_batch_journal``); issues are found again by their existing markers.
 """
 
 import hashlib
@@ -120,14 +121,18 @@ def pending(root: Path) -> dict:
             "notes": [dict(row) for row in state["notes"]]}
 
 
-def _check_new_lanes(plans: list[dict], config: Config) -> None:
+def _check_new_lanes(plans: list[dict], config: Config, root: Path, manager=None) -> None:
     """Orders creating the same lane must agree on it, or the second would fail after the commit."""
-    seen: dict[str, dict] = {}
+    from foragent.lanes import resolve_skills
+
+    seen: dict[str, tuple] = {}
     for plan in plans:
         for lane in plan.get("new_lanes", []):
             if lane["name"] in config.lanes:
                 continue  # publish's own check compares it with the existing lane
-            if seen.setdefault(lane["name"], lane) != lane:
+            # Skills compare by installed name, the same resolver add_lane and publish use.
+            shape = (lane["paths"], resolve_skills(root, config, lane["skills"], manager))
+            if seen.setdefault(lane["name"], shape) != shape:
                 raise order.PlanError(text("batch_lane_conflict", config.language, lane=lane["name"]))
 
 
@@ -208,7 +213,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                 if name in combined and combined[name] != content:
                     raise order.PlanError(text("batch_path_conflict", config.language, path=name))
                 combined[name] = content
-        _check_new_lanes([entry["plan"] for entry, _ in prepared], config)
+        _check_new_lanes([entry["plan"] for entry, _ in prepared], config, root, manager)
         _require_base(git, config)
         with git.publish_lock():
             git.update_base(config.base_branch)
@@ -218,16 +223,15 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             planned = {**combined, **note_contents}
             written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
                        "notes": [row["id"] for row in applying]}
-            creating = [lane for entry, _ in prepared for lane in entry["plan"].get("new_lanes", [])
-                        if lane["name"] not in config.lanes]
+            lanes = journal.lane_writes(root, config, [lane for entry, _ in prepared
+                                                       for lane in entry["plan"].get("new_lanes", [])], manager)
             journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha(),
-                          lanes=journal.lane_writes(root, creating))
-
-            token = journal.token(directory)
+                          lanes=lanes)
 
             def committed(blobs: dict[str, str]) -> None:
-                journal.batch_done(directory, git)  # the sha first; the token also finds the commit
-                _committed(root, written["orders"], written["notes"], blobs, git.head_sha(), token)
+                # With nothing to commit, HEAD already holds the batch; record it the same way.
+                journal.batch_done(directory, git.head_sha())
+                _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
                 journal.clear(directory)
 
             deferred = _DeferredCommits(git)
@@ -238,11 +242,14 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                         # Later orders and the issue pass see the lane this order just created.
                         config = replace(config, lanes=load_config(root).lanes)
                 _write_notes(root, note_contents)
-                title = (f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
-                         f"\n\n{journal.marker(token)}")
+                title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
+                if unlisted := sorted(set(deferred.paths) - set(lanes["files"]) - set(planned)):
+                    # Rollback can only undo and unstage listed paths; never commit any other.
+                    raise order.PlanError(text("batch_manifest_missing", config.language, paths=", ".join(unlisted)))
                 # New lanes' files join this one commit: a single boundary to record and recover.
                 order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
-                                      after_commit=committed)
+                                      after_commit=committed,
+                                      record=lambda sha: journal.batch_done(directory, sha))
             except BaseException:
                 # Undo an uncommitted write now, so waiting work never stays in the checkout.
                 journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)

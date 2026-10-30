@@ -19,7 +19,7 @@ from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, late
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
-from foragent.lanes import add_lane, lane_files, validate_lane
+from foragent.lanes import add_lane, lane_files, resolve_skills, validate_lane
 from foragent.order_files import check_destinations, check_write, issue_body, validate_paths, write_atomic
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -458,14 +458,16 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
 
 
 def commit_and_push(config: Config, git: GitRepo, files: dict, title: str,
-                    after_commit=None) -> dict[str, str]:
+                    after_commit=None, record=None) -> dict[str, str]:
     """Commit the given written paths once, confirm HEAD has them all, and push the base.
 
     ``after_commit`` receives the committed blobs before the push, so a caller can record
     that the commit exists even when the push is interrupted."""
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
-    if changed:
+    if changed and record is not None:
+        git.commit_recorded(changed, title, record)  # ``record`` gets the sha before HEAD moves
+    elif changed:
         git.commit_paths(changed, title)
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
@@ -545,7 +547,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if lane["name"] in config.lanes:
             existing = config.lanes[lane["name"]]
             if (existing.get("paths", []) != lane["paths"] or existing.get("agent") != f"fa-{lane['name']}"
-                    or existing.get("skills", []) != [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]]):
+                    or existing.get("skills", []) != resolve_skills(root, config, lane["skills"], manager)):
                 raise PlanError(f"existing lane differs from plan: {lane['name']}")
         else:
             validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)

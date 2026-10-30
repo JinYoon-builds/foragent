@@ -44,21 +44,30 @@ def validate_lane(root: Path, config: Config, name: str, paths: list[str], skill
     if agent.exists():
         raise LaneError(f"agent already exists: {agent.relative_to(root)}")
     repo_path(root, ".foragent.yml")
+    return resolve_skills(root, config, skills, manager)
+
+
+def resolve_skills(root: Path, config: Config, skills: list[str], manager: SkillManager | None = None) -> list[str]:
+    """The installed names for these skill identities (aliases included); the one resolver for lanes."""
     manager = manager or (SkillManager(with_vendored_library(config, Path.cwd(), root)) if skills else None)
     return _check_skills(root, skills, manager)
 
 
-def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
+def lane_write_paths(name: str, skills: list[str]) -> list[str]:
+    """Every file add_lane may write for a lane with these installed skills (one list for all callers)."""
     paths = [".foragent.yml", f".claude/agents/fa-{name}.md"]
+    if skills:
+        paths.append(".gitignore")
+    return [*paths, lane_memory.ATTRIBUTES]  # add_lane installs the pending-memory union line.
+
+
+def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
     for skill in skills:
         directory = repo_path(root, f".claude/skills/{skill}")
         if not (directory / "SKILL.md").is_file():
             raise LaneError(f"installed lane skill is missing: {skill}")
-    if skills:
-        paths.append(".gitignore")
-    if repo_path(root, lane_memory.ATTRIBUTES).is_file():
-        paths.append(lane_memory.ATTRIBUTES)  # add_lane installs the pending-memory union line.
-    return paths
+    return [path for path in lane_write_paths(name, skills)
+            if path != lane_memory.ATTRIBUTES or repo_path(root, path).is_file()]
 
 
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,

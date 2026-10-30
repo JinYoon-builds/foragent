@@ -366,9 +366,47 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
-    def find_commit(self, marker: str) -> str | None:
-        """The newest commit in HEAD's history whose message contains ``marker`` verbatim."""
-        return self._call(["log", "-n", "1", "--format=%H", "--fixed-strings", f"--grep={marker}", "HEAD"]).strip() or None
+    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None]) -> str:
+        """Commit only ``paths`` (like commit_paths), handing the new sha to ``record`` before HEAD moves.
+
+        The commit is built from HEAD plus these paths in a private index, so other staged
+        changes stay out. After ``record`` returns, HEAD moves to it only if HEAD has not
+        moved meanwhile, and these paths' index entries are set to the new commit.
+        """
+        parent = self.head_sha()
+        git_dir = Path(self._call(["rev-parse", "--git-dir"]).strip())
+        index = (git_dir if git_dir.is_absolute() else self.root / git_dir) / "foragent-batch-index"
+        environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+
+        def git(*args: str) -> str:
+            try:
+                return subprocess.run(["git", *args], cwd=self.root, env=environment, check=True,
+                                      capture_output=True, text=True, timeout=120).stdout
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise GitError(getattr(exc, "stderr", "") or str(exc)) from exc
+
+        try:
+            git("read-tree", parent)
+            present = [path for path in paths if (self.root / path).exists()]
+            if present:
+                git("--literal-pathspecs", "add", "-f", "--", *present)
+            if missing := [path for path in paths if path not in present]:
+                git("--literal-pathspecs", "rm", "--cached", "-q", "--ignore-unmatch", "--", *missing)
+            tree = git("write-tree").strip()
+        finally:
+            index.unlink(missing_ok=True)
+        identity = []
+        for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
+            try:
+                value = self._call(["config", "--get", key]).strip()
+            except GitError:
+                value = ""
+            identity.extend(["-c", f"{key}={value or fallback}"])
+        sha = self._call([*identity, "commit-tree", tree, "-p", parent, "-m", title]).strip()
+        record(sha)
+        self._call(["update-ref", "-m", title.splitlines()[0], "HEAD", sha, parent])
+        self.restore_staged_paths("HEAD", paths)
+        return sha
 
     def is_ancestor(self, ancestor: str, head: str) -> bool:
         try:

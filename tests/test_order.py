@@ -49,7 +49,11 @@ class PublishingGit:
         self.branch = "main"
         self.history = [("published", None)]  # the base commit's tree is ``saved`` until a commit
         self.index = {}
-        self.messages = {}
+        self.serial = 0  # like real shas, a commit id is never reused, even after a failed commit
+
+    def _new_sha(self):
+        self.serial += 1
+        return f"commit-{self.serial}"
 
     def current_branch(self):
         return self.branch
@@ -100,7 +104,8 @@ class PublishingGit:
         if self.history[-1][1] is None:  # the base's tree is fixed once a commit follows it
             self.history[-1] = (self.history[-1][0], dict(self.saved))
 
-    def _commit(self, paths, title):
+    def _commit(self, paths, title, sha=None):
+        sha = sha or self._new_sha()
         self._freeze_base()
         contents = {path: self.index.pop(path) for path in paths}
         self.events.append(("commit", title, {path: text for path, text in contents.items() if text is not None}))
@@ -109,14 +114,20 @@ class PublishingGit:
                 self.saved.pop(path, None)
             else:
                 self.saved[path] = text
-        self.history.append((f"commit-{len(self.history)}", dict(self.saved)))
-        self.messages[self.head_sha()] = title
+        self.history.append((sha, dict(self.saved)))
 
-    def find_commit(self, marker):
-        for sha, _tree in reversed(self.history):
-            if marker in self.messages.get(sha, ""):
-                return sha
-        return None
+    def commit_recorded(self, paths, title, record):
+        """Like commit_paths, but the new sha goes to ``record`` before HEAD moves (``_commit``)."""
+        self.stage(paths)
+        if all(self.index[path] == self.saved.get(path) for path in paths):
+            for path in paths:
+                self.index.pop(path)
+            raise GitError("nothing to commit")
+        sha = self._new_sha()
+        record(sha)
+        self._commit(paths, title, sha)
+        assert self.head_sha() == sha
+        return sha
 
     def unrelated_commit(self, path, text):
         """Someone else's later commit on the base."""
@@ -126,7 +137,7 @@ class PublishingGit:
         self.stage([path])
         contents = {path: self.index.pop(path)}
         self.saved.update(contents)
-        self.history.append((f"commit-{len(self.history)}", dict(self.saved)))
+        self.history.append((self._new_sha(), dict(self.saved)))
 
     def reset_to(self, sha):
         """Move HEAD back, as a reset or a rewritten base would; later commits leave history."""
@@ -2268,6 +2279,7 @@ def test_batch_resume_recognizes_superseded_rule_replacements(publishing, plan, 
     from foragent import order_batch
 
     root, git = _rules_case(publishing, plan), publishing[3]
+    interrupt = {"commit_paths": "commit_recorded"}.get(interrupt, interrupt)  # the batch commit
     original = getattr(git, interrupt)
 
     def fail(*args):
@@ -2321,12 +2333,12 @@ def test_batch_failed_commit_leaves_the_checkout_and_a_later_boundary_cannot_str
 
     root, git = _rules_case(publishing, plan), publishing[3]
     before = _checkout(root)
-    original = git.commit_paths
-    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(GitError("interrupted")))
+    original = git.commit_recorded
+    monkeypatch.setattr(git, "commit_recorded", lambda *args: (_ for _ in ()).throw(GitError("interrupted")))
     with pytest.raises(GitError):
         _flush(publishing)
     assert _checkout(root) == before, "An uncommitted batch write is undone, specs and tests included"
-    monkeypatch.setattr(git, "commit_paths", original)
+    monkeypatch.setattr(git, "commit_recorded", original)
     order_batch.note(root, "rule", "- Unrelated. (D9)", "later", "en")
     _flush(publishing, "later")
     _flush(publishing)
@@ -2343,7 +2355,7 @@ def test_batch_killed_flush_is_settled_from_head_by_the_next_flush(publishing, p
     recover = order_batch_journal.recover
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # the process dies: no cleanup
     if stop == "before_commit":
-        monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+        monkeypatch.setattr(git, "commit_recorded", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
     else:
         monkeypatch.setattr(order_batch, "_committed", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
     with pytest.raises(SystemExit):
@@ -2368,7 +2380,7 @@ def test_batch_recovery_refuses_a_file_edited_after_the_killed_write(publishing,
 
     root, git = _rules_case(publishing, plan), publishing[3]
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
-    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    monkeypatch.setattr(git, "commit_recorded", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
     with pytest.raises(SystemExit):
         _flush(publishing)
     monkeypatch.undo()
@@ -2408,6 +2420,7 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
     value = _lane_plan(plan, "web0")
     value["new_lanes"][0]["skills"] = ["local:testing-strategy"]
     order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
+    attributes = (root / ".gitattributes").read_bytes() if (root / ".gitattributes").exists() else None
     stop = SystemExit(9)
     write_text, commit_paths = pathlib.Path.write_text, git.commit_paths
     write_bytes = pathlib.Path.write_bytes
@@ -2440,7 +2453,7 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
         monkeypatch.setattr(order_batch._DeferredCommits, "commit_paths", raise_stop)
     elif step == "batch_commit":
         # `git add` runs before the failing commit, so its paths are left staged.
-        monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), raise_stop()))
+        monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record: (git.stage(paths), raise_stop()))
     elif step == "batch_unrecorded":  # the batch commit landed; its sha is not recorded yet
         monkeypatch.setattr(order_batch_journal, "batch_done", raise_stop)
     else:
@@ -2457,6 +2470,8 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
         assert not (root / ".claude/agents/fa-web.md").exists()
         assert not (root / ".claude/skills/testing-strategy").exists()
         assert (root / ".gitignore").read_text() == "THIRD_PARTY_NOTICES.md\n"
+        # add_lane also writes the lane-memory attributes; they go back with the rest.
+        assert ((root / ".gitattributes").read_bytes() if (root / ".gitattributes").exists() else None) == attributes
     if not killed:
         assert git.index == {}, "rollback unstages lane and batch paths alike"
     stale = load_config(root)  # the CLI loads config before the flush settles the journal
@@ -2465,7 +2480,7 @@ def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan,
     assert (root / ".claude/agents/fa-web.md").is_file()
     assert (root / ".claude/skills/testing-strategy/SKILL.md").is_file()
     assert (root / ".gitignore").read_text().count("/.claude/skills/testing-strategy/") == 1
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore")
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes")
     issue, = [issue for issue in tracker.list_issues() if issue.title == "web0 web"]
     assert "lane:web" in issue.labels
     assert order_batch.pending(root)["orders"][0]["status"] == "published"
@@ -2610,7 +2625,7 @@ def test_batch_recovery_runs_only_on_the_branch_it_wrote_on(publishing, plan, mo
 
     root, git = _rules_case(publishing, plan), publishing[3]
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
-    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    monkeypatch.setattr(git, "commit_recorded", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
     with pytest.raises(SystemExit):
         _flush(publishing)
     monkeypatch.undo()
@@ -2718,7 +2733,7 @@ def test_batch_interrupted_at_each_step_resumes_from_recorded_facts(publishing, 
     elif step == "files_written":
         monkeypatch.setattr(order, "commit_and_push", _die)
     elif step == "commit_left_staged":  # `git add` ran, then the commit itself failed
-        monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), _die()))
+        monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record: (git.stage(paths), _die()))
     elif step == "batch_committed_unrecorded":  # died between the commit and recording its sha
         monkeypatch.setattr(order_batch_journal, "batch_done", _die)
     elif step == "batch_recorded":  # the sha is recorded; the queue checkpoint is not written
@@ -2795,11 +2810,11 @@ def test_batch_failed_commit_leaves_nothing_staged_in_a_real_repository(offline_
     order_batch.defer(plan, "next-code-merge", root, config, tracker, repo="owner/repo")
     before = git_command(root, "status", "--porcelain=v1", "--untracked-files=all")
 
-    def add_then_fail(paths, title):
-        git_command(root, "add", "-f", "--", *paths)  # what commit_paths does before committing
+    def add_then_fail(paths, title, record):
+        git_command(root, "add", "-f", "--", *paths)  # a failed commit can leave paths staged
         raise GitError("commit interrupted")
 
-    monkeypatch.setattr(git, "commit_paths", add_then_fail)
+    monkeypatch.setattr(git, "commit_recorded", add_then_fail)
     with pytest.raises(GitError, match="commit interrupted"):
         order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git)
     # Neither the index nor the working tree keeps the batch (no `AD docs/ideas.md`).
@@ -2823,7 +2838,7 @@ def test_batch_recovery_keeps_lane_files_someone_else_committed_meanwhile(publis
     (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
     git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
     _batch(publishing, _lane_plan(plan, "web0"))
-    monkeypatch.setattr(git, "commit_paths", lambda paths, title: (git.stage(paths), _die()))
+    monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record: (git.stage(paths), _die()))
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # killed before cleanup
     with pytest.raises(SystemExit):
         _flush(publishing)
@@ -2857,27 +2872,34 @@ def _notes_case(publishing, plan):
     return root, git
 
 
-def test_batch_unrecorded_commit_is_found_by_its_token_after_later_appends(publishing, plan, monkeypatch):
+@pytest.mark.parametrize("moved", [False, True], ids=["before_head_moves", "after_head_moves"])
+def test_batch_commit_sha_is_recorded_before_head_moves_so_later_appends_never_duplicate(
+        publishing, plan, monkeypatch, moved):
     from foragent import order_batch, order_batch_journal
 
     root, git = _notes_case(publishing, plan)
     events = publishing[4]
-    monkeypatch.setattr(order_batch_journal, "batch_done", _die)  # committed; sha never saved
+    if moved:  # HEAD holds the recorded commit; the queue checkpoint is not written yet
+        monkeypatch.setattr(order_batch, "_committed", _die)
+    else:  # the sha is recorded; the process dies before HEAD moves to that commit
+        monkeypatch.setattr(git, "_commit", _die)
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
     with pytest.raises(SystemExit):
         _flush(publishing)
     monkeypatch.undo()
     monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert json.loads((root / ".foragent/order-batch-journal.json").read_text())["batch_commit"]
     # Later commits append to the same files before the resume.
     for name, extra in (("docs/ideas.md", "Later idea.\n"), ("docs/decisions.md", "D10. Later.\n"),
                         ("docs/rules.md", "- Later rule. (D10)\n")):
-        git.unrelated_commit(name, (root / name).read_text() + extra)
+        current = git.saved[name] if not moved else (root / name).read_text()
+        git.unrelated_commit(name, current + extra)
     _flush(publishing)
     ideas, decisions, rules = ((root / name).read_text() for name in
                                ("docs/ideas.md", "docs/decisions.md", "docs/rules.md"))
-    assert ideas.count("An idea.") == 1 and ideas.endswith("Later idea.\n")
-    assert decisions.count("D9. A decision.") == 1 and decisions.endswith("D10. Later.\n")
-    assert rules == "# Rules\n- C. (D3)\n- Extra. (D4)\n- Later rule. (D10)\n"
+    assert ideas.count("An idea.") == 1 and decisions.count("D9. A decision.") == 1
+    assert "Later idea." in ideas and "D10. Later." in decisions and "- Later rule. (D10)" in rules
+    assert rules.count("- C. (D3)") == 1 and "- A. (D1)" not in rules
     assert [event[0] for event in events].count("commit") == 1
     state = order_batch.pending(root)
     assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
@@ -2917,15 +2939,85 @@ def test_batch_checkpoint_of_a_commit_that_left_history_waits_again(publishing, 
     assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
 
 
-def test_real_git_finds_a_batch_commit_by_its_marker_only_in_head_history(git_history):
-    base = git_history.tip
-    git_history.update({"a.txt": "b\n"}, message="Foragent batch x: 0 order(s)\n\nForagent-Batch: tok123")
-    batch = git_history.tip
-    git_history.update({"b.txt": "c\n"}, message="Later\n\nForagent-Batch: other9")
-    repo = GitRepo(git_history.origin)  # a bare repository: HEAD is refs/heads/main
-    assert repo.find_commit("Foragent-Batch: tok123") == batch
-    assert repo.find_commit("Foragent-Batch: other9") == git_history.tip
-    assert repo.find_commit("Foragent-Batch: missing") is None
-    git_command(git_history.origin, "update-ref", "refs/heads/elsewhere", batch)  # still reachable elsewhere
-    git_command(git_history.origin, "update-ref", "refs/heads/main", base)
-    assert repo.find_commit("Foragent-Batch: tok123") is None, "a commit outside HEAD's history does not count"
+def test_real_git_commit_recorded_hands_over_the_sha_before_head_moves(git_history):
+    root = git_history.clone
+    repo = GitRepo(root)
+    parent = repo.head_sha()
+    (root / "batch.txt").write_text("batch\n")
+    (root / "other.txt").write_text("someone else's staged work\n")
+    git_command(root, "add", "other.txt")
+    seen = []
+
+    def record(sha):
+        seen.append((sha, repo.head_sha()))
+
+    sha = repo.commit_recorded(["batch.txt"], "Foragent batch x", record)
+    assert seen == [(sha, parent)], "the sha is known while HEAD still points at the parent"
+    assert repo.head_sha() == sha and repo.is_ancestor(parent, "HEAD")
+    assert git_command(root, "show", "--name-only", "--format=", sha).split() == ["batch.txt"]
+    status = git_command(root, "status", "--porcelain=v1")
+    assert "A  other.txt" in status and "batch.txt" not in status, "others' staging stays; ours is clean"
+    (root / "batch.txt").write_text("again\n")
+
+    def dies(sha):
+        raise SystemExit(9)
+
+    with pytest.raises(SystemExit):
+        repo.commit_recorded(["batch.txt"], "Foragent batch y", dies)
+    assert repo.head_sha() == sha, "a death before recording never moves HEAD"
+
+
+def _aliased_manager(root):
+    """A library skill whose alias (its SKILL.md name) differs from its directory name."""
+    library = root.parent / f"{root.name}-aliases"
+    skill = library / "skills/testing-strategy"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: tester\ndescription: Tests\n---\nUse tests.\n")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
+    return SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
+                        run=lambda args: "a" * 40 + "\n")
+
+
+@pytest.mark.parametrize("second", ["local:tester", "local:testing-strategy"])
+def test_batch_new_lane_with_a_skill_alias_publishes_its_issues(publishing, plan, second):
+    from foragent import order_batch
+
+    root, config, tracker, git, events = publishing
+    manager = _aliased_manager(root)
+    plans = []
+    for index, identity in enumerate(["local:tester", second]):
+        value = _lane_plan(plan, f"web{index}")
+        value["new_lanes"][0]["skills"] = [identity]
+        order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
+        plans.append(value)
+    order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
+    assert load_config(root).lanes["web"]["skills"] == ["testing-strategy"]
+    titles = {issue.title for issue in tracker.list_issues()}
+    assert {"web0 web", "web1 web"} <= titles, "both orders name the same installed skill"
+    assert {row["status"] for row in order_batch.pending(root)["orders"]} == {"published"}
+
+
+def test_batch_existing_lane_files_are_in_the_manifest_and_unstaged_on_failure(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    root, config, tracker, git, events = publishing
+    git.saved[".foragent.yml"] = (root / ".foragent.yml").read_text()
+    value = _lane_plan(plan, "web0")
+    # An earlier interrupted publication left the lane configured but not committed.
+    from foragent.lanes import add_lane
+
+    add_lane(root, "web", ["web/**"], git=SimpleNamespace(current_branch=lambda: "main",
+                                                            ensure_tracked=lambda paths: None,
+                                                            commit_paths=lambda paths, title: None), push=False)
+    before = _checkout(root)
+    config = load_config(root)
+    order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo")
+    monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record: (git.stage(paths), _die()))
+    with pytest.raises(SystemExit):
+        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert git.index == {}, "every committed path is listed, so rollback unstages it"
+    assert _checkout(root) == before
+    order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git)
+    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
