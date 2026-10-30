@@ -93,8 +93,9 @@ def _opened(store: StateStore, config: Config, root: Path, now: datetime, planne
     screen = planned[0]
     language = config.language
     try:
-        notify.send(config, text("orch_spawn_title", language),
-                    text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
+        with notify.sending("status", root):
+            notify.send(config, text("orch_spawn_title", language),
+                        text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
     except Exception:  # noqa: BLE001 - the session opened even when its push fails
         pass
 

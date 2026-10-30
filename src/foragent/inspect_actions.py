@@ -86,6 +86,11 @@ def _push_item(item: Item) -> bool:
     )
 
 
+def _push_kind(item: Item) -> str:
+    """A PR to merge is a merge approval; an escalated or timed-out item is an open question."""
+    return "merge" if item.group == "review" and item.pr is not None else "question"
+
+
 def _item_line(item: Item, language: str) -> str:
     label = f"#{item.number} {item.title}"
     if item.group == "review" and item.pr is not None:
@@ -106,7 +111,7 @@ def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = No
         lines = []
         all_sent = True
 
-        def send(line: str, link: str, *, summary: bool = False) -> bool:
+        def send(line: str, link: str, *, kind: str, summary: bool = False) -> bool:
             title = f"Foragent {ctx.repo}"
             if summary:
                 title += " · 아침 요약이에요" if ctx.config.language == "ko" else " · Morning summary"
@@ -114,12 +119,13 @@ def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = No
             if notifier is not None:
                 notifier(line, title)
                 return True
-            return notifications.send(replace(ctx.config, repo=ctx.repo), title, line, link)
+            with notifications.sending(kind):
+                return notifications.send(replace(ctx.config, repo=ctx.repo), title, line, link)
 
         for item in inbox.items:
             if not _push_item(item) or item.notification_id is None or item.notification_id in delivered:
                 continue
-            if send(_item_line(item, ctx.config.language), item.url):
+            if send(_item_line(item, ctx.config.language), item.url, kind=_push_kind(item)):
                 delivered.add(item.notification_id)
                 # Persist each success: a later delivery failure must not repeat it.
                 ctx.store.update_inspect(notified_items=sorted(delivered))
@@ -129,7 +135,7 @@ def notify(ctx: InspectContext, notifier: Callable[[str, str], None] | None = No
         local_now = ctx.now().astimezone()
         today = local_now.date().isoformat()
         if local_now.hour == ctx.config.notify_summary_hour and state.summary_date != today:
-            if send(counts_line(inbox), f"https://github.com/{ctx.repo}/issues", summary=True):
+            if send(counts_line(inbox), f"https://github.com/{ctx.repo}/issues", kind="summary", summary=True):
                 ctx.store.update_inspect(summary_date=today)
             else:
                 all_sent = False
