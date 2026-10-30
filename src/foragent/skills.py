@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -28,6 +29,9 @@ class Library:
     name: str
     repo: str
     path: Path
+    # A vendored library is pinned to a recorded revision and lists its skills; sync never pulls it.
+    revision: str | None = None
+    members: tuple[str, ...] | None = None
 
     @property
     def prefix(self) -> str:
@@ -165,10 +169,18 @@ class SkillManager:
             name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if isinstance(entry, str) else entry["name"]
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
                 raise SkillError(f"invalid library name: {name}")
+            path = Path(entry["path"]).expanduser() if isinstance(entry, dict) and "path" in entry else directory / name
+            vendored = isinstance(entry, dict) and entry.get("revision")
+            library = Library(name, repo, path, entry["revision"] if vendored else None,
+                              tuple(entry.get("skills", ())) if vendored else None)
+            # Names and prefixes are public skill IDs; a pinned library's IDs never pass to another source.
+            pinned = next((lib for lib in self.libraries if lib.revision is not None
+                           and (lib.name == name or lib.prefix == library.prefix)), None)
+            if pinned is not None:
+                raise SkillError(f"library name {name} is taken by the vendored {pinned.name} library "
+                                 f"({pinned.path}); rename the configured library in skill_libraries")
             if any(lib.name == name for lib in self.libraries):
                 raise SkillError(f"duplicate library name: {name}")
-            path = Path(entry["path"]).expanduser() if isinstance(entry, dict) and "path" in entry else directory / name
-            library = Library(name, repo, path)
             if any(lib.prefix == library.prefix for lib in self.libraries):
                 raise SkillError(f"duplicate library prefix: {library.prefix}")
             self.libraries.append(library)
@@ -176,6 +188,10 @@ class SkillManager:
     def sync(self) -> list[str]:
         synced = []
         for library in self.libraries:
+            if library.revision is not None or _is_own_source(library):
+                continue  # Pinned or local libraries are their own source; pulling would move the checkout around them.
+            if library.path.exists() and not (library.path / ".git").exists():
+                continue  # Not a repository of its own: `git -C` would pull whatever checkout encloses it.
             if library.path.exists():
                 self.run(["git", "-C", str(library.path), "pull", "--ff-only"])
             else:
@@ -211,7 +227,8 @@ class SkillManager:
         groups: dict[tuple[str, ...], list[Path]] = {}
         # Copies of one skill share their path up to the skills folder, ignoring one hidden tool folder.
         # Prefer the shared copy when present; otherwise select a tool copy deterministically.
-        paths = _skill_files(library.path)
+        paths = (_skill_files(library.path) if library.members is None
+                 else [library.path / "skills" / name / "SKILL.md" for name in library.members])
         for path in sorted(paths, key=lambda path: (len(path.relative_to(library.path).parts), path)):
             base = path.relative_to(library.path).parts[:-3]
             if base and base[-1].startswith("."):
@@ -364,7 +381,7 @@ class SkillManager:
         return skill.path.name
 
     def _write_notice(self, skill: Skill, root: Path) -> None:
-        sha = self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
+        sha = skill.library.revision or self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
         license_file = skill.license_file
         license_text = license_file.read_text(encoding="utf-8") if license_file else ""
         source = skill.path.relative_to(skill.library.path).as_posix()
@@ -390,6 +407,50 @@ class SkillManager:
         if len(matches) > 1:
             raise SkillError(f"ambiguous skill: {name}; install one explicitly with fa skills install")
         return matches[0].path if matches else None
+
+
+def _is_own_source(library: Library) -> bool:
+    """A library registered by local path at that same path has no upstream of its own to pull."""
+    repo = Path(library.repo).expanduser()  # Relative paths resolve against the current directory, as git does.
+    return repo.exists() and repo.resolve() == library.path.expanduser().resolve()
+
+
+VENDORED_MANIFEST = "skills/pstack/library.yml"
+
+
+_CHECKOUT = Path(__file__).resolve().parents[2]
+
+
+def vendored_library(*roots: Path | None) -> dict[str, Any] | None:
+    """The library entry for skills vendored with Foragent at a pinned revision.
+
+    The given projects' own copies come first, in order, so a moved or copied checkout finds itself;
+    then Foragent's source checkout (editable installs), then the installed package data. Only the skills the manifest lists belong to it.
+    """
+    bases = [root for root in roots if root is not None]
+    bases += [_CHECKOUT, Path(sysconfig.get_path("data")) / "share/foragent"]
+    for base in bases:
+        manifest = base / VENDORED_MANIFEST
+        if not manifest.is_file():
+            continue
+        try:
+            data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise SkillError(f"could not read vendored library manifest {manifest}: {exc}") from exc
+        if (not isinstance(data, dict) or not all(isinstance(data.get(key), str) for key in ("name", "repo", "revision"))
+                or not isinstance(data.get("skills"), dict)):
+            raise SkillError(f"invalid vendored library manifest: {manifest}")
+        return {"name": data["name"], "repo": data["repo"], "path": str(base), "revision": data["revision"],
+                "skills": sorted(data["skills"])}
+    return None
+
+
+def with_vendored_library(config: Config, *roots: Path | None) -> Config:
+    """Put the vendored library before the configured ones, so a configured name cannot take its IDs."""
+    entry = vendored_library(*roots)
+    if entry is None or any(isinstance(item, dict) and item.get("revision") for item in config.skill_libraries):
+        return config
+    return replace(config, skill_libraries=[entry, *config.skill_libraries])
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:
