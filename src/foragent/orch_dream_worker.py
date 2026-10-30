@@ -13,7 +13,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any
 
 from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, record_published, worktree_path
-from foragent.lane_memory import PENDING
+from foragent.lane_memory import CONSUMED, PENDING, read_pending
 from foragent.orch_dream_publish import _dream_worktree, _publish, fingerprints  # noqa: F401
 from foragent import orch_rules
 
@@ -88,6 +88,10 @@ def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]
     """
     memory = memory_path(config, lane)
     pending = str(Path(memory).with_name(PENDING))
+    consumed = str(Path(memory).with_name(CONSUMED))
+    listed = read_pending(root / Path(memory).parent) if root is not None else ""
+    pending_text = (f"The pending lessons not yet consumed (from {pending} minus the ids in {consumed}):\n{listed}"
+                    if listed else "There are no pending lessons to consume.")
     media = media_root() / f"{lane}.md"
     since = last_dream_at(store, lane)
     lines = []
@@ -105,19 +109,23 @@ def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]
     rules, content = orch_rules.current_rules(root)
     rules_text = f"\n{orch_rules.quoted(rules, content)}\n" if content is not None else ""
     return f"""You are dreaming for the "{lane}" lane: tidy the lane's memory between work.
-Do not touch code. Do not edit, modify or change code or any file other than {memory}, {pending} and the media proposal below.
+Do not touch code. Do not edit, modify or change code or any file other than {memory}, {consumed} and the media proposal below.
 
 Memory file: {memory} (create it if it is missing). You alone curate it.
-Pending lessons: {pending}. Lane workers and people only append new lessons there; it may be missing or empty.
+Pending lessons: {pending}. Lane workers and people only append lessons there, one per line as
+`- [id:<id>] <lesson>` (an untagged line is its own id). Never edit {pending}: it only gains lines.
+Consumed ids: {consumed}. You alone append to it; never rewrite or remove its lines.
+{pending_text}
 Rules: {rules} is authoritative. Follow {rules} whenever a lesson disagrees with it.
 {rules_text}
 The lane's runs {scope}:
 {history}
 
 Steps:
-1. Read {pending}, then the run logs and review files listed above. Look at the review findings, the failure reasons and repeated pitfalls.
-2. Fold every pending lesson from {pending} into {memory}, and add new lessons the runs teach (project-specific patterns, pitfalls, commands) to {memory}.
-   Then remove from {pending} exactly the lines you folded, from its start; keep any line you did not read. Never move a lesson back.
+1. Read the pending lessons above, then the run logs and review files listed above. Look at the review findings, the failure reasons and repeated pitfalls.
+2. Fold the pending lessons into {memory}, and add new lessons the runs teach (project-specific patterns, pitfalls, commands) to {memory}.
+   Then append the id of every pending lesson you folded or judged not worth keeping to {consumed}, one id per line
+   (for an untagged line, the whole line without its line end). Leave the ids of lessons you did not handle out.
 3. Remove stale or outdated lessons that the code or the runs no longer support.
 4. Deduplicate: merge duplicate or overlapping lessons into one line.
 5. Resolve contradictions between lessons. Where a lesson conflicts with {rules}, prefer {rules}.
@@ -136,6 +144,23 @@ def _files(directory: Path) -> dict[str, bytes]:
     """Every file under the memory directory, read directly: .gitignore cannot hide a change."""
     return {path.relative_to(directory).as_posix(): path.read_bytes()
             for path in sorted(directory.rglob("*")) if path.is_file()} if directory.is_dir() else {}
+
+
+def _keep_worker_files(memory_dir: Path, before: dict[str, bytes]) -> None:
+    """The dream writes MEMORY.md and appends to MEMORY.consumed.ids; nothing else (D95).
+
+    A rewritten pending buffer is put back byte for byte, so the PR never carries it; a consumed
+    record that lost or changed earlier ids ends the dream without publishing.
+    """
+    path = memory_dir / PENDING
+    if path.exists() or PENDING in before:
+        if PENDING in before and (not path.is_file() or path.read_bytes() != before[PENDING]):
+            path.write_bytes(before[PENDING])
+        elif PENDING not in before:
+            path.unlink()
+    consumed = (memory_dir / CONSUMED).read_bytes() if (memory_dir / CONSUMED).is_file() else b""
+    if not consumed.startswith(before.get(CONSUMED, b"")):
+        raise RuntimeError(f"the dream rewrote {CONSUMED}; it may only append ids")
 
 
 def _changed_lines(before: str, after: str) -> int:
@@ -209,6 +234,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             outcome = "limit-wait" if classify_result(result) == "limit" else "error"
             final = (outcome, f"Dream executor ended without finishing (exit {result.exit_code}).")
             return 1
+        _keep_worker_files(memory_dir, before_files)
         proposal = worktree / ".foragent" / f"media-{lane}.md"
         if proposal.is_file():
             with log.open("a", encoding="utf-8") as stream:

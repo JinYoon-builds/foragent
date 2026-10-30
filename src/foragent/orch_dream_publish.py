@@ -10,7 +10,10 @@ from pathlib import Path
 import hashlib
 from typing import TYPE_CHECKING
 
-from foragent.lane_memory import CURATED, PENDING
+from foragent.lane_memory import CONSUMED, CURATED, PENDING
+
+# The dream's own files; MEMORY.new.md belongs to the workers.
+CHECKED = (CURATED, CONSUMED)
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -23,15 +26,15 @@ def _dream_worktree(ctx: RunContext, lane: str, worktree: Path):
 
 
 def check_base(git, base: str, memory: str, captured: dict[str, bytes]) -> None:
-    """Raise unless the base still holds the memory files the dream read (D95).
+    """Raise unless the base still holds the curated memory and consumed ids the dream read (D95).
 
-    The dream folded a captured prefix of MEMORY.new.md into MEMORY.md. If the base changed
-    either file since, the dream's diff could drop a late lesson or a hand edit; nothing is
-    pushed, the base keeps every input, and the lane dreams again from the new base.
+    Pending lessons appended on the base meanwhile are harmless: the buffer only gains lines and
+    the dream consumed ids, not positions. A changed MEMORY.md (a hand edit) or consumed record
+    would be overwritten; nothing is pushed, and the lane dreams again from the new base.
     """
     git.fetch("origin", base)
     folder = Path(memory).parent
-    for name in (CURATED, PENDING):
+    for name in CHECKED:
         sha = git.blob_sha(f"origin/{base}", (folder / name).as_posix())
         current = git.blob_bytes(sha.encode()) if sha is not None else b""
         if current != captured.get(name, b""):
@@ -40,24 +43,24 @@ def check_base(git, base: str, memory: str, captured: dict[str, bytes]) -> None:
 
 
 def fingerprints(files: dict[str, bytes]) -> dict[str, str | None]:
-    """Content digests of the two memory files; None for an absent file."""
-    return {name: hashlib.sha256(files[name]).hexdigest() if name in files else None for name in (CURATED, PENDING)}
+    """Content digests of the curated memory and consumed ids; None for an absent file."""
+    return {name: hashlib.sha256(files[name]).hexdigest() if name in files else None for name in CHECKED}
 
 
 def memory_moved(git, base: str, head: str, folder: str, inputs: dict, outputs: dict) -> list[str]:
-    """The memory files that no longer match what the dream read (on the base) or wrote (on its PR).
+    """The files that no longer match what the dream read (on the base) or wrote (on its PR).
 
     ``inputs`` and ``outputs`` are the digests recorded when the dream published; they never move
-    with Git history. A dream removes the pending lines it folded: merging it over a base that
-    appended to MEMORY.new.md, or a PR rebased over such a base (union merge), would bring the
-    folded lines back, and a changed MEMORY.md could lose a hand edit. Such a PR is closed and
-    the lane dreams again.
+    with Git history. A changed MEMORY.md on the base is a hand edit the dream would overwrite; a
+    changed head means the PR is no longer the dream's work. Such a PR is closed and the lane
+    dreams again. MEMORY.new.md is not compared: it only gains lines, and a union merge of it
+    cannot bring back a consumed id.
     """
     git.fetch("origin", base)
     git.fetch("origin", head)
     moved = []
     for ref, expected, where in ((f"origin/{base}", inputs, base), (f"origin/{head}", outputs, head)):
-        for name in (CURATED, PENDING):
+        for name in CHECKED:
             sha = git.blob_sha(ref, f"{folder}/{name}")
             found = hashlib.sha256(git.blob_bytes(sha.encode())).hexdigest() if sha is not None else None
             if name not in expected or found != expected[name]:
@@ -80,8 +83,9 @@ def _publish(ctx: RunContext, git, lane: str, memory: str, count: int,
     listed = git._call(["ls-remote", "--heads", "origin", f"refs/heads/{branch}"]).split()
     git.push(branch, lease=listed[0] if listed else "")
     title = f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}"
-    body = (f"The {lane} lane's dream tidied `{memory}` ({count} lines added or removed) and removed the "
-            f"lessons it folded from `{Path(memory).with_name(PENDING)}`.\n\n"
+    body = (f"The {lane} lane's dream tidied `{memory}` ({count} lines added or removed) and recorded the "
+            f"ids it folded in `{Path(memory).with_name(CONSUMED)}`; `{Path(memory).with_name(PENDING)}` "
+            "is unchanged.\n\n"
             "Only the lane's memory directory changes. The orchestrator merges it when CI passes "
             "(skills/fa-orchestrator/references/dreams.md).")
     return ctx.tracker.create_pr(head=branch, base=base, title=title, body=body)

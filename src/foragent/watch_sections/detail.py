@@ -33,11 +33,21 @@ def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 
     folder = watch.Path(repo_root) / lane_memory.directory(lane_memory.memory_dir(config, slug))
     shown = False
     for name, title in ((lane_memory.CURATED, None), (lane_memory.PENDING, "watch_pending_memory")):
-        try:
-            with (folder / name).open(encoding="utf-8", errors="replace") as stream:
-                lessons = [line.rstrip("\n") for line in watch.islice(stream, 3)]
-        except FileNotFoundError:
+        if name == lane_memory.PENDING:  # Derived: lessons whose id the dream has not consumed.
+            derived = [line for line in lane_memory.read_pending(folder).splitlines() if line.strip()]
+            if derived:  # No file path: MEMORY.new.md still holds consumed lessons.
+                lines.append(watch.text(title, language) + ":")
+                lines.extend(derived[:3])
+                if len(derived) > 3:
+                    lines.append(watch.text("watch_pending_more", language, count=len(derived) - 3))
+                shown = True
             continue
+        else:
+            try:
+                with (folder / name).open(encoding="utf-8", errors="replace") as stream:
+                    lessons = [line.rstrip("\n") for line in watch.islice(stream, 3)]
+            except FileNotFoundError:
+                continue
         if not any(line.strip() for line in lessons):
             continue
         if title is not None:

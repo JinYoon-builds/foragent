@@ -329,8 +329,8 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
     saved = json.loads((world.store.root / "orch-events.jsonl").read_text().splitlines()[-1])
     assert saved["memories"] == 2 and saved["pr"] == 7 and saved["kind"] == orch_dream.PUBLISHED
     import hashlib
-    assert saved["outputs"] == {"MEMORY.md": hashlib.sha256(b"one lesson\ntwo lesson\n").hexdigest(), "MEMORY.new.md": None}
-    assert saved["inputs"] == {"MEMORY.md": None, "MEMORY.new.md": None}, "The base had no memory files"
+    assert saved["outputs"] == {"MEMORY.md": hashlib.sha256(b"one lesson\ntwo lesson\n").hexdigest(), "MEMORY.consumed.ids": None}
+    assert saved["inputs"] == {"MEMORY.md": None, "MEMORY.consumed.ids": None}, "The base had no memory files"
     assert orch_dream.last_dream_at(world.store, "orch") is None, "An unmerged dream PR is not a completed dream"
     assert orch_dream.awaiting_pr(world.store, "orch")["pr"] == 7
     assert not worktree.exists()

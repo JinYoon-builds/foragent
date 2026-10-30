@@ -74,7 +74,12 @@ def _memory_folder(config: Config, lane: str, worktree: Path) -> Path | None:
 
 
 def _memory_sections(config: Config, lane: str, worktree: Path, full_text_dir: Path | None, *, curated: bool) -> str:
-    """The curated memory (when wanted) and the pending lessons, each cut at 200 lines."""
+    """The curated memory (when wanted) and the pending lessons.
+
+    Each is cut at 200 lines with a link to its full text. The pending lessons are derived, so
+    their link names a saved copy of the derived list, never MEMORY.new.md (which still holds
+    consumed lessons); without a directory for that copy they are not cut.
+    """
     folder = _memory_folder(config, lane, worktree)
     if folder is None:
         return ""
@@ -84,10 +89,21 @@ def _memory_sections(config: Config, lane: str, worktree: Path, full_text_dir: P
         ("Pending memory (MEMORY.new.md, not yet curated)", lane_memory.PENDING, "lane-memory-new.md", True),
     ):
         path = folder / name
-        text = path.read_text(encoding="utf-8", errors="replace") if wanted and path.is_file() else ""
-        if text.strip():
+        if not wanted:
+            text = ""
+        elif name == lane_memory.PENDING:  # Derived: the buffer without the ids the dream consumed.
+            text = lane_memory.read_pending(folder)
+        else:
+            text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+        if not text.strip():
+            continue
+        if name != lane_memory.PENDING:
             cut = cuts.head_lines(text, 200, full_text_dir, saved, full=path.absolute())
-            sections.append(f"\n\n{title}:\n{cut}")
+        elif full_text_dir is not None:  # The link names a saved copy of the derived list.
+            cut = cuts.head_lines(text, 200, full_text_dir, saved)
+        else:  # No place for a derived copy: MEMORY.new.md itself still holds consumed lessons.
+            cut = text
+        sections.append(f"\n\n{title}:\n{cut}")
     return "".join(sections)
 
 
