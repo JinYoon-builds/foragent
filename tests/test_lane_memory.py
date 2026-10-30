@@ -6,6 +6,7 @@ import pytest
 
 from foragent import lane_memory, orch_dream_publish, run_lane_skills
 from foragent.config import Config
+from test_init import setup  # noqa: F401
 
 OLD = ("---\nname: fa-api\ndescription: 'Lane api'\nmemory: project\nskills:\n- x\nmodel: m\n---\n"
        "Body first.\n" + lane_memory.OLD_WRITER + "\nBody last.\n")
@@ -39,12 +40,13 @@ def test_migrate_skips_roles_and_missing_agents_and_moves_union(tmp_path):
     assert not (tmp_path / ".claude/agent-memory").exists(), "Pending files are created lazily"
 
 
-def test_migrate_adds_union_only_for_projects_with_lane_agents(tmp_path):
-    assert lane_memory.migrate(tmp_path, Config(lanes={"api": {"agent": "fa-api"}})) == {}
-    (tmp_path / ".claude/agents").mkdir(parents=True)
-    (tmp_path / ".claude/agents/fa-api.md").write_text(lane_memory.migrate_agent(OLD, "fa-api"))
-    changes = lane_memory.migrate(tmp_path, Config(lanes={"api": {"agent": "fa-api"}}))
-    assert changes == {".gitattributes": f"{lane_memory.UNION_COMMENT}\n{lane_memory.UNION}\n"}
+@pytest.mark.parametrize("lanes", [{}, {"api": {"paths": ["api/**"]}}, {"api": {"agent": "fa-api"}}],
+                         ids=["no-lanes", "agentless-lane", "missing-agent-file"])
+def test_every_project_gets_the_pending_union_line_once(tmp_path, lanes):
+    expected = {".gitattributes": f"{lane_memory.UNION_COMMENT}\n{lane_memory.UNION}\n"}
+    assert lane_memory.migrate(tmp_path, Config(lanes=lanes)) == expected
+    lane_memory.apply(tmp_path, expected)
+    assert lane_memory.union_change(tmp_path) is None and lane_memory.migrate(tmp_path, Config(lanes=lanes)) == {}
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -181,8 +183,31 @@ def test_a_lane_without_an_agent_shares_one_memory_directory_across_readers_and_
     (tmp_path / ".claude/agents").mkdir(parents=True)
     (tmp_path / ".claude/agents/fa-api.md").write_text(OLD)  # Not the lane's agent: no executor reads it.
     assert orch_dream.memory_path(config, "api") == ".claude/agent-memory/api/MEMORY.md"
-    assert lane_memory.migrate(tmp_path, config) == {}, "Only an explicit lane agent gets the instruction"
+    assert list(lane_memory.migrate(tmp_path, config)) == [".gitattributes"], "Only an explicit lane agent gets the instruction"
     agent, notes = run_lane_skills.lane_notes(config, "api", tmp_path)
     assert agent is None and notes.count("Pending lesson.") == 1
     assert run_lane_skills.lane_memory_notice(config, "api", tmp_path).count("Pending lesson.") == 1
     assert render_detail(config, "api", tmp_path).count("Pending lesson.") == 1
+
+
+def test_rerun_publishes_a_migration_whose_commit_failed(setup):
+    import yaml
+    from conftest import git_command
+    from foragent.git import GitError
+
+    settings = {"repo": "owner/repo", "language": "en", "skill_libraries": [],
+                "lanes": {"api": {"agent": "fa-api", "paths": ["api/**"], "skills": []}}}
+    (setup.root / ".foragent.yml").write_text(yaml.safe_dump(settings))
+    (setup.root / ".claude/agents").mkdir(parents=True)
+    (setup.root / ".claude/agents/fa-api.md").write_text(OLD)
+    run = dict(no_push=True, no_launchd=True, no_board=True, approvers=["human"], executor="codex")
+    setup.commit_fails = True
+    with pytest.raises(GitError):
+        setup.init(**run)
+    assert lane_memory.migrate(setup.root, Config(lanes=settings["lanes"])) == {}, "The migration wrote its files"
+    setup.commit_fails = False
+    report = setup.init(**run)
+    assert report.committed
+    assert git_command(setup.root, "status", "--porcelain", "--", ".claude/agents", ".gitattributes") == ""
+    assert lane_memory.instruction("fa-api") in git_command(setup.root, "show", "HEAD:.claude/agents/fa-api.md")
+    assert lane_memory.UNION in git_command(setup.root, "show", "HEAD:.gitattributes")

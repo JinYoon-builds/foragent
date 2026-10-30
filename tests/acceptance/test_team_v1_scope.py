@@ -127,3 +127,53 @@ def test_foreign_mutation_verbs_refuse_before_work_or_writes(
     assert len(output.strip().splitlines()) == 1
     assert snapshot(case) == before
     assert case.implementer.calls == [] and case.reviewer.calls == []
+
+
+def test_foreign_outbox_does_not_block_owned_writes(git_history, tmp_path, monkeypatch):
+    case = make_case(git_history, tmp_path, monkeypatch)
+    legacy(case.ctx.config)
+    person(case.tracker, monkeypatch, "alice")
+    case.tracker.add_labels(1, ["by:bob"])
+    case.tracker.add_issue(2, "Owned work", labels=["by:alice"])
+    # These could have been queued by an earlier version or before a label edit.
+    foreign = case.tracker.list_comments(1)
+    case.store.queue_github_write(1, "comment", body="Old queued write")
+    case.store.queue_github_write(2, "comment", body="Owned queued write")
+    case.ctx.tracker.flush_outbox()
+    assert case.tracker.list_comments(1) == foreign, "Replayed a foreign write"
+    assert [c.body for c in case.tracker.list_comments(2)] == ["Owned queued write"]
+
+
+def test_gate_cleans_its_process_tree_after_owner_edit_without_foreign_writes(
+    git_history, tmp_path, monkeypatch, fake_processes,
+):
+    from datetime import timedelta
+    case, tree, _ = stop_case(git_history, tmp_path, monkeypatch, fake_processes)
+    legacy(case.ctx.config)
+    person(case.tracker, monkeypatch, "alice")
+    case.tracker.add_labels(1, ["by:bob"])
+    before = snapshot(case)
+    protected = fake_processes.live - {row.pid for row in tree}
+    case.clock[0] += timedelta(minutes=case.config.max_runtime_minutes + 11)
+    tick(stop_fakes.stop_context(case, fake_processes))
+    assert not {row.pid for row in tree} & fake_processes.live
+    assert protected <= fake_processes.live
+    after = snapshot(case)
+    assert after["issues"] == before["issues"] and after["comments"] == before["comments"]
+    assert after["prs"] == before["prs"] and after["merges"] == before["merges"]
+
+
+def test_issue_question_mentions_orderer_in_existing_thread(git_history, tmp_path, monkeypatch):
+    from foragent.runner import run_issue
+    case = make_case(git_history, tmp_path, monkeypatch)
+    legacy(case.ctx.config)
+    person(case.tracker, monkeypatch, "alice")
+    case.tracker.add_labels(1, ["by:alice"])
+    def ask(kwargs):
+        question = kwargs["worktree"] / ".foragent/QUESTION.md"
+        question.parent.mkdir(parents=True, exist_ok=True)
+        question.write_text("Which visible behaviour? Keep or change; recommend keep.\n")
+    case.implementer.steps = [ask]
+    assert run_issue(1, case.ctx) == "spec-question"
+    assert any("@alice" in c.body and "Which visible behaviour?" in c.body
+               for c in case.tracker.list_comments(1)), "Address the issue question to its orderer"

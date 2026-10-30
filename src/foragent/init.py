@@ -346,6 +346,8 @@ def init_repo(
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
         *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []), *migrated,
+        # Files an interrupted earlier run migrated but never committed are found by their state.
+        *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board

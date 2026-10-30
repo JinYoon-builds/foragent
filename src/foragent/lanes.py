@@ -56,6 +56,8 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
             raise LaneError(f"installed lane skill is missing: {skill}")
     if skills:
         paths.append(".gitignore")
+    if repo_path(root, lane_memory.ATTRIBUTES).is_file():
+        paths.append(lane_memory.ATTRIBUTES)  # add_lane installs the pending-memory union line.
     return paths
 
 
@@ -100,6 +102,8 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
         "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n",
         encoding="utf-8",
     )
+    if (attributes := lane_memory.union_change(root)) is not None:
+        lane_memory.apply(root, {lane_memory.ATTRIBUTES: attributes})
     published = lane_files(root, name, installed)
     git.ensure_tracked(published)
     git.commit_paths(published, f"Foragent lane {name}")

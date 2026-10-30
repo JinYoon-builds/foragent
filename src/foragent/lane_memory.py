@@ -98,31 +98,54 @@ def migrate_attributes(text: str | None) -> str:
     return result
 
 
+def union_change(root: Path) -> str | None:
+    """The .gitattributes text with the pending-file union line, or None when it is already there.
+
+    The one installer of the union merge for MEMORY.new.md: fresh init, re-init (migration) and
+    every lane added later call it. The line is a glob, so it covers lanes with and without an
+    agent alike.
+    """
+    path = Path(root) / ATTRIBUTES
+    current = path.read_bytes().decode("utf-8") if path.is_file() else None
+    new = migrate_attributes(current)
+    return None if new == current else new
+
+
+def _lane_agent_paths(root: Path, config: Config) -> list[str]:
+    """The existing agent files of lanes with an explicit agent; role agents are never included."""
+    roles = {(entry or {}).get("agent") or f"fa-{name}" for name, entry in (config.roles or {}).items()}
+    paths = []
+    for lane in config.lanes:
+        agent = lane_agent(config, lane)
+        if agent is not None and agent not in roles and (Path(root) / ".claude/agents" / f"{agent}.md").is_file():
+            paths.append(f".claude/agents/{agent}.md")
+    return list(dict.fromkeys(paths))
+
+
+def managed_paths(root: Path, config: Config) -> list[str]:
+    """Every file the split manages; init publishes any of them that differs from the commit.
+
+    A rerun after an interrupted setup finds the files an earlier migration wrote by their state
+    (uncommitted), not by whether they still need migrating.
+    """
+    return [*_lane_agent_paths(root, config), ATTRIBUTES]
+
+
 def migrate(root: Path, config: Config) -> dict[str, str]:
     """Each file the split changes and its new text; empty once the project is migrated.
 
     Only lanes with an explicit agent have an agent file the executors read; agent files that do
-    not exist are left absent, and role agents are skipped even when a lane names one. The union line is added only when the project has a lane agent or the
-    old curated union line.
+    not exist are left absent, and role agents are skipped even when a lane names one.
     """
     root = Path(root)
-    roles = {(entry or {}).get("agent") or f"fa-{name}" for name, entry in (config.roles or {}).items()}
     changes: dict[str, str] = {}
-    agents = False
-    for lane in config.lanes:
-        agent = lane_agent(config, lane)
-        path = root / ".claude/agents" / f"{agent}.md"
-        if agent is None or agent in roles or not path.is_file():
-            continue
-        agents = True
-        text = path.read_bytes().decode("utf-8")
+    for relative in _lane_agent_paths(root, config):
+        agent = Path(relative).stem
+        text = (root / relative).read_bytes().decode("utf-8")
         if (new := migrate_agent(text, agent)) != text:
-            changes[path.relative_to(root).as_posix()] = new
-    path = root / ATTRIBUTES
-    current = path.read_bytes().decode("utf-8") if path.is_file() else None
-    if agents or (current is not None and any(line.strip() == OLD_UNION for line in current.splitlines())):
-        if (new := migrate_attributes(current)) != current:
-            changes[ATTRIBUTES] = new
+            changes[relative] = new
+    if (attributes := union_change(root)) is not None:
+        changes[ATTRIBUTES] = attributes
     return changes
 
 

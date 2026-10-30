@@ -399,7 +399,8 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     assert "repository's api lane (api/**, shared/**)." in text
     assert "Append durable, project-specific lessons" in text and ".claude/agent-memory/fa-api/MEMORY.new.md" in text
     assert lane_memory.migrate_agent(text, "fa-api") == text, "A new lane needs no memory migration"
-    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore"]
+    assert lane_memory.UNION in (root / ".gitattributes").read_text().splitlines(), "The first lane installs the union line"
+    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore", ".gitattributes"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]
     before = (root / ".foragent.yml").read_text()
@@ -472,7 +473,7 @@ def test_nonfree_lane_skill_installs_locally_with_warning(two_libraries, tmp_pat
     assert lane["skills"] == ["frontend-design", "docx"]
     assert "unknown" in capsys.readouterr().err
     assert (root / ".claude/skills/docx/SKILL.md").is_file()
-    assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore"]
+    assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore", ".gitattributes"]
 
 
 @pytest.fixture
