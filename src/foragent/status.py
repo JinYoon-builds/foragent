@@ -76,7 +76,9 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
+        # Dreams hold no issue. This lists every running record with its pid, whatever its
+        # labels or worker, so a view can show a gone worker; working rows follow run_is_live.
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -117,6 +119,8 @@ def collect_lanes(
     store: StateStore, config: Config, now: datetime, *, titles: dict[int, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     """Keep queue entries while choosing the most urgent visible item per lane."""
+    from foragent.scheduler_stop import run_is_live
+
     lanes: dict[str, dict[str, Any]] = {}
     summary = dict(working=0, blocked=0, waiting_human=0, queued=0)
     priority = {"working": 0, "waiting-human": 1, "blocked": 2, "queued": 3, "idle": 4}
@@ -148,13 +152,14 @@ def collect_lanes(
         lane_row(slug)
     for issue in issues:
         run = store.get_run(issue.number)
-        active = run is not None and run.status == "running"
+        active = run_is_live(run)  # The same rule as fa orch stop and fa orch park (#435), labels aside.
         slug = run.lane if active else issue_lane(issue.labels, config.lanes)
         row = lane_row(slug)
         group, item = grouped[issue.number]
         if group in {RUNNING, READY}:
             row[group].append(item)
-        state = issue_state(issue.labels, active, group)
+        # A running label without a live run is stale, not working.
+        state = issue_state(set(issue.labels) - {RUNNING}, active, group)
         if state is None:
             continue
         summary[state.replace("-", "_")] += 1
@@ -168,7 +173,7 @@ def collect_lanes(
     # Runs recorded locally are working even when the snapshot predates them or is missing.
     seen = {issue.number for issue in issues}
     for run in store.active_runs():
-        if run.kind != "issue" or run.number in seen:  # A lane's dream is no issue row.
+        if run.kind != "issue" or run.number in seen or not run_is_live(run):  # A dream is no issue row.
             continue
         summary["working"] += 1
         show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])
