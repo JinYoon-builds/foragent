@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import threading
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from foragent import capacity, orch_github
 from foragent.actions import flag
@@ -35,13 +37,27 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
 
 
 def _remaining(n: int, ctx: RunContext) -> int:
-    run = ctx.store.get_run(n)
+    run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
     if run is None:
         raise KeyError(n)
     # The gate tick credits machine sleep to the run record; the runner never reads the sensor.
     elapsed = ((ctx.now() - datetime.fromisoformat(run.started_at)).total_seconds()
                - run.waited_seconds - run.slept_seconds)
     return max(0, int(ctx.config.max_runtime_minutes * 60 - elapsed))
+
+
+def _with_open_talk(run, now: datetime):
+    """The run as if its open talk had already been credited to ``waited_seconds``."""
+    if run is None:
+        return None
+    return replace(run, waited_seconds=run.waited_seconds + run.talk_pause_seconds(now))
+
+
+def paused_seconds(n: int, ctx: RunContext) -> float:
+    """All paused time of the run so far, including an open talk (for ``processes.extend_deadline``)."""
+    run = ctx.store.get_run(n)
+    now = ctx.now()
+    return run.waited_seconds + run.talk_pause_seconds(now)
 
 
 def _timeout(n: int, ctx: RunContext) -> str:
@@ -52,17 +68,16 @@ def _timeout(n: int, ctx: RunContext) -> str:
 @contextmanager
 def _test_slot(n: int, ctx: RunContext):
     """Hold a machine-wide test slot; credit the queue time as waited, not run time."""
-    run = ctx.store.get_run(n)
     started = ctx.now()
     waited = False
+    key = f"test-slot-{uuid4().hex}"
     wait = WaitPhase(n, ctx, "test-slot-wait", started)
 
-    def credit() -> datetime:
+    def credit(close: bool = False) -> datetime:
         now = ctx.now()
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0.0, (now - started).total_seconds()),
-            last_progress_at=now.astimezone(UTC).isoformat(),
-        )
+        # Its region through the union helper, so a talk or another wait over the same time counts once.
+        ctx.store.add_waited(n, key=key, start=started, end=now, close=close,
+                             last_progress_at=now.astimezone(UTC).isoformat())
         return now
 
     def waiting() -> None:
@@ -79,7 +94,7 @@ def _test_slot(n: int, ctx: RunContext):
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
         finally:
             if waited:
-                now = credit()
+                now = credit(close=True)
                 ctx.store.update_run(n, waiting_until=None)
                 wait.close(now)
         yield
@@ -164,8 +179,10 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
     started_mono = ctx.monotonic()
     wait = WaitPhase(n, ctx, "executor-wait", started)
     wait.open()
-    ctx.store.update_run(
-        n, waited_seconds=run.waited_seconds + seconds,
+    key = f"executor-wait-{uuid4().hex}"  # Concurrent reviewers back off under their own keys.
+    # Credited up front as the whole planned region, then corrected to the monotonic elapsed time.
+    ctx.store.add_waited(
+        n, key=key, start=started, end=started + timedelta(seconds=seconds),
         executor_waited_seconds=run.executor_waited_seconds + seconds,
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
@@ -174,8 +191,8 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         ctx.sleep(seconds)
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + elapsed,
+        ctx.store.add_waited(
+            n, key=key, start=started, end=started + timedelta(seconds=elapsed), close=True,
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
@@ -192,27 +209,27 @@ def _credited_wait(
     """
     from foragent import runner
 
-    run = ctx.store.get_run(n)
     started = ctx.monotonic()
     wait = WaitPhase(n, ctx, phase)
     if eager:
         wait.open()
+    key = f"lock-wait-{uuid4().hex}"
+    began = ctx.now()
+
+    def credit(close: bool = False, **fields):
+        # Its region: from the wall-clock start, as long as the monotonic clock says it has lasted.
+        elapsed = max(0, ctx.monotonic() - started)
+        ctx.store.add_waited(n, key=key, start=began, end=began + timedelta(seconds=elapsed), close=close, **fields)
 
     def progress(polled: bool = True):
         if polled:
             wait.open()
         now = ctx.now().astimezone(UTC)
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-            waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat(),
-        )
+        credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
 
     progress(polled=False)
     try:
         runner.poll_executor(acquire, progress)
     finally:
-        ctx.store.update_run(
-            n, waited_seconds=run.waited_seconds + max(0, ctx.monotonic() - started),
-            waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
-        )
+        credit(close=True, waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())
         wait.close()

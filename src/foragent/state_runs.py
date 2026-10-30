@@ -39,6 +39,7 @@ class RunRecordsMixin:
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
+                    "session_stale": previous.session_id is not None,  # not the worker's until resumed
                     "merge_conflicts": previous.merge_conflicts, "work_events": previous.work_events,
                     "resume_whole": previous.resume_whole, "moved_files": previous.moved_files,
                     "local_skill_paths": previous.local_skill_paths,
@@ -141,7 +142,8 @@ class RunRecordsMixin:
             value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        return _state.load_record(_state.Run, _state.json.loads(value))
+        data = _state.json.loads(value)  # Talk is derived from the events (D95), never stored.
+        return self._with_talk(_state.load_record(_state.Run, data), data.get("finished_at"))
 
     def record_merge_lock(self, number: int, seconds: float) -> None:
         run = self.get_run(number)
@@ -235,7 +237,7 @@ class RunRecordsMixin:
                 detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
-            # Every run exit closes its last open phase segment.
+            # Every run exit closes its last open phase segment; an open talk ends at finished_at (derived).
             finished = _state.replace(run, **self._close_phase(run, self._now(), outcome))
             finished = _state.replace(finished, status="finished", outcome=outcome, detail=detail,
                                       process_identities=observe_tree(run.process_identities))
