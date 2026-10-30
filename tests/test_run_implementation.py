@@ -94,14 +94,14 @@ def test_difficulty_escalates_per_failed_attempt_and_is_recorded(run_case, size,
 def test_a_tier_without_effort_does_not_keep_the_previous_turns_effort(run_case):
     # #238: effort is chosen per turn; None means the executor default, not the last turn's value.
     c = run_case
-    c.tracker.add_labels(1, ["size:s"])
+    c.tracker.add_labels(1, ["size:m"])
     tiers = {**c.ctx.config.tiers, "l": {**c.ctx.config.tiers["l"], "codex_effort": None}}
     c.ctx.config = replace(c.ctx.config, tiers=tiers)
     c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
     assert run_issue(1, c.ctx) == "merged"
-    assert [call.get("effort") for call in c.executor.calls] == ["medium", None]
+    assert [call.get("effort") for call in c.executor.calls] == ["high", None]
     assert "effort" not in c.executor.calls[1]
-    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "l"}
+    assert c.store.get_run(1).attempt_tiers == {"1": "m", "2": "l"}
 
 
 @pytest.mark.parametrize("lane_model,expected", [(None, ["small-model", "medium-model"]),

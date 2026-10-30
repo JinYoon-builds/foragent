@@ -93,19 +93,24 @@ def has_tier_keys(config: Config, name: str) -> bool:
         for tier in config.tiers.values())
 
 
-def ample_quota(ctx: RunContext) -> bool:
-    """Whether the run's executor has at least tiers_headroom_ample of its plan left (#238).
+def quota_left(ctx: RunContext) -> float | None:
+    """The run's executor's usable plan share (#238); None without current subscription usage.
 
     The run's executor (the pair the tick stored, else the lane's) owns the quota, never the
-    reviewer. Without current usage, or when it is not billed by subscription, it is not ample.
+    reviewer. An api, unlimited or unmeasured executor, or one without tier keys, has none.
     """
     config, name = ctx.config, ctx.config.executor
     if not has_tier_keys(config, name) or scheduler_quota.entry_for(config, name).get("quota") != "subscription":
-        return False
+        return None
     mode = scheduler_quota.quota_mode(ctx.store, config)[0]
-    left = quota_headroom.usable(scheduler_quota._usage(ctx.store), name, ctx.now(),
+    return quota_headroom.usable(scheduler_quota._usage(ctx.store), name, ctx.now(),
                                  quota_headroom.cap(config, name, mode))
-    return left is not None and left >= config.tiers_headroom_ample
+
+
+def ample_quota(ctx: RunContext) -> bool:
+    """Whether the run's executor has at least tiers_headroom_ample of its plan left."""
+    left = quota_left(ctx)
+    return left is not None and left >= ctx.config.tiers_headroom_ample
 
 
 def choose_tier(ctx: RunContext, run, size: str) -> tuple[str, str]:
@@ -114,15 +119,17 @@ def choose_tier(ctx: RunContext, run, size: str) -> tuple[str, str]:
     Turn k = len(attempt_tiers) + 1 counts every executor turn (implementation, conflict
     resolution, CI repair, rebuild, a turn again after a limit wait or restart). The base is
     turn 1's recorded tier, or, when there is none, l with ample quota of the run's executor,
-    else the size. Turn k is the base stepped up k - 1 times, capped at l, and l on the last
-    allowed attempt.
+    else the size. Turn k is the base stepped up k - 1 times, capped at l. The last allowed
+    attempt is l while the executor's usage is measured; without current usage nothing is
+    upgraded beyond the step (rule 3), as before #238.
     """
     k = len(run.attempt_tiers) + 1
     base = run.attempt_tiers.get("1")
+    left = quota_left(ctx)
     if base not in _TIERS:
-        base = "l" if ample_quota(ctx) else size
-    tier = "l" if run.attempts >= ctx.config.max_retries + 1 else attempt_tier(base, k)
-    return str(k), tier
+        base = "l" if left is not None and left >= ctx.config.tiers_headroom_ample else size
+    last = run.attempts >= ctx.config.max_retries + 1 and left is not None
+    return str(k), "l" if last else attempt_tier(base, k)
 
 
 def implementer_setup(

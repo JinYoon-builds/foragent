@@ -99,6 +99,25 @@ def test_a_turn_never_rewrites_a_recorded_key():
         assert choose_tier(ctx(config, usage(codex=90)), run(1, tiers), "s")[0] not in tiers
 
 
+@pytest.mark.parametrize("case", ["no-record", "other-executor-only", "expired", "unlimited", "api-claude"])
+def test_without_current_usage_the_last_attempt_only_steps_up(case, monkeypatch):
+    # Rule 3: no current usage means no upgrade, so the last attempt keeps the plain step.
+    # Locked test_retry_fixes_not_redoes (no usage, max_retries=1, size s) needs s -> m.
+    config = Config(executor="codex", max_retries=1)
+    used = {"no-record": {}, "other-executor-only": usage(claude=0)}.get(case, usage(codex=90))
+    if case == "expired":
+        past = (NOW - timedelta(minutes=1)).isoformat()
+        used = {"codex": {"windows": [{"name": "w", "used_percent": 90, "resets_at": past}]}}
+    elif case == "unlimited":
+        config = replace(config, executor_list=[{"name": "codex", "quota": "unlimited"}])
+    elif case == "api-claude":
+        config = replace(config, executor="claude")
+        used = usage(claude=90)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert choose_tier(ctx(config, used), run(2, {"1": "s"}), "s") == ("2", "m")
+
+
 @pytest.mark.parametrize("attempts,previous", [(2, {"1": "s"}), (2, {}), (3, {"1": "s", "2": "m"})])
 def test_the_last_allowed_attempt_is_l(attempts, previous):
     config = Config(executor="codex", max_retries=attempts - 1)
