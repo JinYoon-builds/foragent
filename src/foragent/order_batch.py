@@ -219,42 +219,47 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             git.update_base(config.base_branch)
             check_destinations(root, combined)
             applying = [row for row in notes if row["status"] != COMMITTED]
-            note_contents = _note_files(root, applying, config.language)  # may refuse; nothing written yet
-            planned = {**combined, **note_contents}
-            written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
-                       "notes": [row["id"] for row in applying]}
-            lanes = journal.lane_writes(root, config, [lane for entry, _ in prepared
-                                                       for lane in entry["plan"].get("new_lanes", [])], manager)
-            journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha(),
-                          lanes=lanes)
+            if not prepared and not applying:
+                # Only committed work is left: push the recorded commit. Nothing is written,
+                # staged or committed, so unrelated checkout changes stay out.
+                git.push_base(config.base_branch)
+            else:
+                note_contents = _note_files(root, applying, config.language)  # may refuse; nothing written yet
+                planned = {**combined, **note_contents}
+                written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
+                           "notes": [row["id"] for row in applying]}
+                lanes = journal.lane_writes(root, config, [lane for entry, _ in prepared
+                                                           for lane in entry["plan"].get("new_lanes", [])], manager)
+                journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha(),
+                              lanes=lanes)
 
-            def committed(blobs: dict[str, str]) -> None:
-                # With nothing to commit, HEAD already holds the batch; record it the same way.
-                journal.batch_done(directory, git.head_sha())
-                _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
-                journal.clear(directory)
+                def committed(blobs: dict[str, str]) -> None:
+                    # With nothing to commit, HEAD already holds the batch; record it the same way.
+                    journal.batch_done(directory, git.head_sha())
+                    _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
+                    journal.clear(directory)
 
-            deferred = _DeferredCommits(git)
-            try:
-                for entry, files in prepared:
-                    order.write_order_files(entry["plan"], root, config, deferred, files, manager)
-                    if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
-                        # Later orders and the issue pass see the lane this order just created.
-                        config = replace(config, lanes=load_config(root).lanes)
-                _write_notes(root, note_contents)
-                title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
-                if unlisted := sorted(set(deferred.paths) - set(lanes["files"]) - set(planned)):
-                    # Rollback can only undo and unstage listed paths; never commit any other.
-                    raise order.PlanError(text("batch_manifest_missing", config.language, paths=", ".join(unlisted)))
-                # New lanes' files join this one commit: a single boundary to record and recover.
-                order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
-                                      after_commit=committed,
-                                      record=lambda sha: journal.batch_done(directory, sha))
-            except BaseException:
-                # Undo an uncommitted write now, so waiting work never stays in the checkout.
-                journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
-                _revalidate(root, git)
-                raise
+                deferred = _DeferredCommits(git)
+                try:
+                    for entry, files in prepared:
+                        order.write_order_files(entry["plan"], root, config, deferred, files, manager)
+                        if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
+                            # Later orders and the issue pass see the lane this order just created.
+                            config = replace(config, lanes=load_config(root).lanes)
+                    _write_notes(root, note_contents)
+                    title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
+                    if unlisted := sorted(set(deferred.paths) - set(lanes["files"]) - set(planned)):
+                        # Rollback can only undo and unstage listed paths; never commit any other.
+                        raise order.PlanError(text("batch_manifest_missing", config.language, paths=", ".join(unlisted)))
+                    # New lanes' files join this one commit: a single boundary to record and recover.
+                    order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
+                                          after_commit=committed,
+                                          record=lambda sha: journal.batch_done(directory, sha))
+                except BaseException:
+                    # Undo an uncommitted write now, so waiting work never stays in the checkout.
+                    journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
+                    _revalidate(root, git)
+                    raise
         published = {row["id"] for row in notes}
         _mark(root, "notes", published, status=PUBLISHED, published_at=_now())
         parents: dict[str, int | None] = {}

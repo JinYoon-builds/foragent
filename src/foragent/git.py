@@ -366,13 +366,15 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
-    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None]) -> str:
+    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None]) -> str | None:
         """Commit only ``paths`` (like commit_paths), handing the new sha to ``record`` before HEAD moves.
 
         The commit is built from HEAD plus these paths in a private index, so other staged
         changes stay out. After ``record`` returns, HEAD moves to it only if HEAD has not
         moved meanwhile, and these paths' index entries are set to the new commit.
         """
+        if not paths:
+            return None  # an empty scope commits nothing and records nothing
         parent = self.head_sha()
         git_dir = Path(self._call(["rev-parse", "--git-dir"]).strip())
         index = (git_dir if git_dir.is_absolute() else self.root / git_dir) / "foragent-batch-index"
@@ -627,6 +629,8 @@ class GitRepo:
         return Path(self._call(["rev-parse", "--show-toplevel"]).strip()).resolve()
 
     def uncommitted_paths(self, paths: list[str]) -> list[str]:
+        if not paths:
+            return []  # no named path is no scope; never the whole checkout (pass "." for that)
         output = self._call([
             "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--", *paths,
         ])
