@@ -2,6 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from fnmatch import translate
@@ -11,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -34,6 +35,8 @@ from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
 
 TICK_JITTER = timedelta(milliseconds=500)
+OPTIONAL_GH_SECONDS = 10  # Batch reconciliation and parent following together, per tick.
+GH_CALL_SECONDS = 5  # One gh subprocess in those steps, or the fallback issue read before a start.
 BUSY_TICK = "another tick is running"
 
 
@@ -109,10 +112,18 @@ def tick(ctx: TickContext) -> TickReport:
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:
+    """Run one tick's steps; after a failed refresh every gh subprocess is capped (see _tick_steps)."""
+    with ExitStack() as fallback:
+        ctx._fallback = fallback
+        return _tick_steps(ctx)
+
+
+def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
+    ctx._refresh_failed = False
     with step("github_refresh"):
         # A listing taken this tick can confirm remembered per-issue reads. A periodic tick starts within
         # start-up jitter of its nominal 300 s cadence; stamped with its start, it is the next refresh tick.
@@ -121,9 +132,23 @@ def _tick_locked(ctx: TickContext) -> TickReport:
         if listing_current:
             # Keep an existing recorder; wrapping again would bypass its own state.
             recorder = ctx.tracker if isinstance(ctx.tracker, RecordingTracker) else RecordingTracker(ctx.tracker, ctx)
-            recorder.refresh_issues(observed_at=started)
-            board.refresh_cards(ctx, recorder)
-        ctx.tracker.flush_outbox()
+            try:
+                changed = recorder.refresh_issues(observed_at=started)
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
+                # The failure and the old as_of stay recorded; admission works from stored issues
+                # and re-reads each one just before its start.
+                ctx._refresh_failed, listing_current = True, False
+                # GitHub is failing: no later gh subprocess of this tick may wait longer than one fallback read.
+                ctx._fallback.enter_context(gh.bounded(float("inf"), GH_CALL_SECONDS))
+                report.actions.append(text("tick_refresh_failed", ctx.config.language,
+                                           error=ctx.store.issues_observation()["error"]))
+            else:
+                if changed:  # An unchanged listing costs no board reads (tick-github-budget).
+                    board.refresh_cards(ctx, recorder)
+        if not ctx._refresh_failed:  # The outbox is delivered only after a refresh.
+            ctx.tracker.flush_outbox()
     if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
     snapshot = current_snapshot()
@@ -131,9 +156,21 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     # Unknown liveness defers routine recovery while the queue keeps moving.
     if processes_available:
         with step("run_recovery"):
-            _recover_runs(ctx, report)
+            before = {run.number for run in ctx.store.active_runs()}
+            try:
+                _recover_runs(ctx, report)
+            except TrackerError as exc:
+                if exc.is_rate_limit or not ctx._refresh_failed:
+                    raise
+                report.actions.append(text("tick_step_deferred", ctx.config.language,
+                                           step="run_recovery", error=_one_line(exc)))
+            # Recovery read these issues from GitHub; after a failed refresh they start next tick, with one read.
+            recovered = before - {run.number for run in ctx.store.active_runs()}
+    else:
+        recovered = set()
+    optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
     with step("batch_reconcile"):
-        _reconcile_batches(ctx, report)
+        _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
 
@@ -145,86 +182,105 @@ def _tick_locked(ctx: TickContext) -> TickReport:
                     unknown.add(label)
         return issue_lane(issue.labels, ctx.config.lanes)
 
+    def consider(issue: Issue) -> None:
+        """Sync one stored issue's card and promote it to ready when it may start."""
+        if issue.state != "open":
+            # A manually closed card leaves its column; known cards only.
+            board.sync_status(ctx, issue, "closed", existing_only=True)
+            return
+        if processes_available:  # Cleans a left-over worktree; board writes skip parents.
+            repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
+            issue = _recover_orphan(ctx, issue, report)
+            if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
+                return  # Its repair read GitHub; a second read before a start waits for the next tick.
+        if ctx._refresh_failed and issue.number in recovered:
+            return
+        if issue.number in parents:
+            return  # Its column follows its children, whatever its own labels say.
+        issue = _escalate_overdue_blocker(ctx, issue, report)
+        if issue.state != "open":
+            board.sync_status(ctx, issue, "closed", existing_only=True)
+            return
+        lane = lane_for(issue)
+        waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
+        previous_flag = ctx.store.load_flag(issue.number) if waiting_labels else None
+        if waiting_labels and (
+            previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
+        ):
+            board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
+            return
+        if APPROVED not in issue.labels and not waiting_labels:
+            # Removing approval returns a known card to Backlog.
+            board.sync_status(ctx, issue, "unapproved", existing_only=True)
+            if READY not in issue.labels:
+                return
+            # Revoked but still ready (fa orch park): the label history shows a new approval first.
+        event, ignored = _latest_approval(
+            _label_events(ctx, issue.number, confirmed=listing_current), ctx.config.approvers,
+        )
+        if ignored:
+            report.actions.append(
+                f"#{issue.number} ignored approved label from non-approver(s): {', '.join(sorted(ignored))}"
+            )
+        if event is None:
+            return
+        if waiting_labels:
+            if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
+                return
+            if ctx._refresh_failed:
+                return  # A re-approval is new evidence; it is read and resumed after a successful refresh.
+            # A new approval is a new generation even between full refreshes.
+            issue = ctx.tracker.get_issue(issue.number)
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
+                return
+            ctx.tracker.remove_labels(issue.number, waiting_labels)
+            issue = replace(issue, labels=issue.labels - waiting_labels)
+            report.actions.append(f"#{issue.number} resumed after re-approval")
+
+        approval = ctx.store.load_approval(issue.number)
+        if approval is None or approval.approved_at != event.created_at:
+            if ctx._refresh_failed:
+                return  # Missing approval evidence: the snapshot needs a read; only stored approvals start now.
+            if not waiting_labels:
+                issue = ctx.tracker.get_issue(issue.number)
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
+                return
+            approval = _snapshot(ctx, issue, event, base_ref, report)
+            if approval is None:
+                return
+        elif not _check_integrity(ctx, issue, approval, base_ref, report):
+            return
+        if RUNNING in issue.labels:
+            board.sync_status(ctx, issue, "Running")
+            return
+        if not _check_prerequisites(ctx, issue, approval, report, confirmed=listing_current):
+            return
+        if READY in issue.labels:
+            board.sync_status(ctx, issue, "Ready")
+            ready.setdefault(lane, []).append(issue.number)
+            return
+
+        row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
+        if row.get("ready_approval") == approval.approved_at:
+            return  # This approval already promoted it; the remote removal wins.
+        ctx.tracker.add_labels(issue.number, [READY])
+        board.sync_status(ctx, issue, "Ready")
+        report.actions.append(f"#{issue.number} promoted to ready")
+        ready.setdefault(lane, []).append(issue.number)
+
     with step("board_sync"):
         parents = board_parents.order_parents(ctx.store.local_issues())  # Columns follow children.
         for issue in local_issue_models(ctx.store):
-            if issue.state != "open":
-                # A manually closed card leaves its column; known cards only.
-                board.sync_status(ctx, issue, "closed", existing_only=True)
-                continue
-            if processes_available:  # Cleans a left-over worktree; board writes skip parents.
-                issue = _recover_orphan(ctx, issue, report)
-            if issue.number in parents:
-                continue  # Its column follows its children, whatever its own labels say.
-            issue = _escalate_overdue_blocker(ctx, issue, report)
-            if issue.state != "open":
-                board.sync_status(ctx, issue, "closed", existing_only=True)
-                continue
-            lane = lane_for(issue)
-            waiting_labels = issue.labels & {BLOCKED, NEEDS_HUMAN}
-            previous_flag = ctx.store.load_flag(issue.number) if waiting_labels else None
-            if waiting_labels and (
-                previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
-            ):
-                board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
-                continue
-            if APPROVED not in issue.labels and not waiting_labels:
-                # Removing approval returns a known card to Backlog.
-                board.sync_status(ctx, issue, "unapproved", existing_only=True)
-                if READY not in issue.labels:
-                    continue
-                # Revoked but still ready (fa orch park): the label history shows a new approval first.
-            event, ignored = _latest_approval(
-                _label_events(ctx, issue.number, confirmed=listing_current), ctx.config.approvers,
-            )
-            if ignored:
-                report.actions.append(
-                    f"#{issue.number} ignored approved label from non-approver(s): {', '.join(sorted(ignored))}"
-                )
-            if event is None:
-                continue
-            if waiting_labels:
-                if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
-                    continue
-                # A new approval is a new generation even between full refreshes.
-                issue = ctx.tracker.get_issue(issue.number)
-                if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
-                    continue
-                ctx.tracker.remove_labels(issue.number, waiting_labels)
-                issue = replace(issue, labels=issue.labels - waiting_labels)
-                report.actions.append(f"#{issue.number} resumed after re-approval")
-
-            approval = ctx.store.load_approval(issue.number)
-            if approval is None or approval.approved_at != event.created_at:
-                if not waiting_labels:
-                    issue = ctx.tracker.get_issue(issue.number)
-                if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
-                    continue
-                approval = _snapshot(ctx, issue, event, base_ref, report)
-                if approval is None:
-                    continue
-            elif not _check_integrity(ctx, issue, approval, base_ref, report):
-                continue
-            if RUNNING in issue.labels:
-                board.sync_status(ctx, issue, "Running")
-                continue
-            if not _check_prerequisites(ctx, issue, approval, report, confirmed=listing_current):
-                continue
-            if READY in issue.labels:
-                board.sync_status(ctx, issue, "Ready")
-                ready.setdefault(lane, []).append(issue.number)
-                continue
-
-            row = next(row for row in ctx.store.local_issues() if row["number"] == issue.number)
-            if row.get("ready_approval") == approval.approved_at:
-                continue  # This approval already promoted it; the remote removal wins.
-            ctx.tracker.add_labels(issue.number, [READY])
-            board.sync_status(ctx, issue, "Ready")
-            report.actions.append(f"#{issue.number} promoted to ready")
-            ready.setdefault(lane, []).append(issue.number)
-
+            try:
+                consider(issue)
+            except TrackerError as exc:
+                # After a failed refresh GitHub is known to be failing: one issue's read does not stop the others.
+                if exc.is_rate_limit or not ctx._refresh_failed:
+                    raise
+                report.actions.append(text("tick_issue_deferred", ctx.config.language,
+                                           number=issue.number, error=_one_line(exc)))
         if listing_current:  # Children change only through observed facts and this tick's writes.
-            board_parents.follow_children(ctx, report)
+            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
@@ -249,3 +305,24 @@ def _tick_locked(ctx: TickContext) -> TickReport:
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
     _reopen_view(ctx, report)
     return report
+
+
+def _one_line(exc: Exception) -> str:
+    return " ".join(str(exc).split())
+
+
+def _optional_step(ctx: TickContext, report: TickReport, budget: gh.Budget, name: str, call: Callable[[], None]) -> None:
+    """Run batch or parent work within the tick's shared gh budget; a failure defers it, not the starts.
+
+    A GitHub rate limit still pauses the tick. The deferral stays visible in the
+    report and the orchestrator journal; the next tick runs the step again.
+    """
+    try:
+        with budget.spend():
+            call()
+    except TrackerError as exc:
+        if exc.is_rate_limit:
+            raise
+        line = text("tick_step_deferred", ctx.config.language, step=name, error=_one_line(exc))
+        report.actions.append(line)
+        append_event(ctx.store, ctx.now(), None, "tick-step-deferred", line)
