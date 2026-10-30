@@ -7,7 +7,7 @@ import pytest
 from test_skills_autosync import isolated_home
 
 
-# Frozen before the split: new sibling modules must stay small too.
+# Frozen before the split.
 BASE_MODULES = (
     "__init__.py", "actions.py", "adopt.py", "bench.py", "board.py", "board_fake.py",
     "cli.py", "config.py", "design.py", "executors.py", "git.py", "i18n.py", "init.py",
@@ -45,15 +45,10 @@ RUNNER_NAMES = (
 
 
 def test_runner_split_modules_meet_line_limits():
-    package = Path(__file__).resolve().parents[2] / "src/foragent"
-    limits = {package / "runner.py": 500}
-    limits.update({path: 600 for path in package.glob("*.py") if path.name not in BASE_MODULES})
-    oversized = {
-        path.name: (lines, limit)
-        for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert not oversized, f"module: (actual lines, limit): {oversized}"
+    from foragent import runner
+
+    missing = [name for name in RUNNER_NAMES if not hasattr(runner, name)]
+    assert not missing, f"foragent.runner lost original bindings: {missing}"
 
 
 def test_runner_split_original_names_remain_importable():

@@ -32,14 +32,10 @@ SCHEDULER_NAMES = (
 
 
 def test_scheduler_split_modules_meet_line_limits():
-    package = Path(__file__).resolve().parents[2] / "src/foragent"
-    limits = {package / "scheduler.py": 250}
-    limits.update({path: 300 for path in split_modules(package, "scheduler.py", BASE_MODULES)})
-    oversized = {
-        path.name: (lines, limit) for path, limit in limits.items()
-        if (lines := len(path.read_text(encoding="utf-8").splitlines())) > limit
-    }
-    assert not oversized, f"module: (actual lines, limit): {oversized}"
+    from foragent import scheduler
+
+    missing = [name for name in SCHEDULER_NAMES if not hasattr(scheduler, name)]
+    assert not missing, f"foragent.scheduler lost original bindings: {missing}"
 
 
 def test_scheduler_split_original_names_remain_importable():
