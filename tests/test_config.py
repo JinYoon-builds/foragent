@@ -25,7 +25,7 @@ def test_exact_defaults(repo):
     expected = {
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
-        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
+        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "orch_silent_alert_minutes": 30,
@@ -486,3 +486,14 @@ def test_roles_are_derived_when_the_config_has_no_roles_key(repo):
     assert role_drift(repo, config) == [], "Derived defaults have no stored entry to drift from"
     (repo / ".foragent.yml").write_text(yaml.safe_dump({"roles": {"security": {"agent": "fa-security"}}}))
     assert list(load_roles(load_config(repo))) == ["security"], "A stored block is the whole source"
+
+
+def test_personal_notify_filter_wins_over_the_repository_and_is_checked(tmp_path):
+    (tmp_path / ".foragent.yml").write_text("skill_libraries: []\nnotify_filter: all\n")
+    personal = tmp_path / "personal.yml"
+    personal.write_text("skill_libraries: []\nnotify_filter: decisions\n")
+    assert load_config(tmp_path, personal).notify_filter == "decisions"
+    assert load_config(tmp_path, tmp_path / "absent.yml").notify_filter == "all"
+    personal.write_text("skill_libraries: []\nnotify_filter: urgent\n")
+    with pytest.raises(ConfigError, match="notify_filter"):
+        load_config(tmp_path, personal)

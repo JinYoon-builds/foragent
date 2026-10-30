@@ -11,6 +11,8 @@ _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
 
+    if values["notify_filter"] not in ("decisions", "all"):
+        raise ConfigError("notify_filter must be decisions or all")
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
         raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
     board_map = values["board_map"]

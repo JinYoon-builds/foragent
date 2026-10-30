@@ -103,8 +103,9 @@ def check(root: Path, store: StateStore, config: Config, now: datetime) -> bool:
             return False
         language = config.language
         try:
-            sent = notify.send(config, text("orch_silent_title", language),
-                               text("orch_silent_alert", language, directory=root.name))
+            with notify.sending("silence", root):
+                sent = notify.send(config, text("orch_silent_title", language),
+                                   text("orch_silent_alert", language, directory=root.name))
         except Exception:  # noqa: BLE001 - a failed push is retried on the next check
             sent = False
         if sent is not True:
