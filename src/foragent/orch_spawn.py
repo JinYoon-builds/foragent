@@ -18,7 +18,7 @@ import shlex
 import shutil
 from types import SimpleNamespace
 
-from foragent import orch_binding, orch_push, orch_stale_files, processes, watch_open
+from foragent import orch_binding, orch_push, orch_silent, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -69,6 +69,20 @@ def _note_silent(store: StateStore, now: datetime) -> None:
         store._write_json(path, {"at": now.isoformat()})
     append_event(store, now, None, "orch-silent",
                  "orchestrator alive without heartbeat; no second orchestrator opened")
+
+
+def observe_silence(repo_root: Path, store: StateStore, config: Config, now: datetime, reason: str) -> None:
+    """The silence step shared by the gate and ``fa orch ensure`` for one skip ``reason``.
+
+    A fresh heartbeat rearms the silence push; a live session without one gets
+    the hourly note and, past ``orch_silent_alert_minutes``, one push (#952).
+    """
+    if reason == "alive" or (reason == "session" and _alive(store, now)):
+        # A heartbeat renewed since the caller's check is fresh too: rearm, no silence note.
+        orch_silent.rearm(store)
+    elif reason == "session":
+        _note_silent(store, now)
+        orch_silent.check(repo_root.resolve(), store, config, now)
 
 
 def _spaced(store: StateStore, now: datetime) -> bool:
@@ -182,10 +196,10 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
         return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
-    if _alive(store, now) or not _approved_work(store):
-        return None
-    if _session_alive(store, repo_root.resolve()):
-        _note_silent(store, now)
+    reason = ("alive" if _alive(store, now) else "no_work" if not _approved_work(store)
+              else "session" if _session_alive(store, repo_root.resolve()) else None)
+    if reason is not None:
+        observe_silence(repo_root, store, config, now, reason)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):

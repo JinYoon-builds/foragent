@@ -28,6 +28,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "run_hours": "always",
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
@@ -166,6 +167,8 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
 @pytest.mark.parametrize("key,value", [
     ("orchestrator_timeout_minutes", 0), ("orchestrator_timeout_minutes", -1),
     ("orchestrator_timeout_minutes", True), ("orchestrator_timeout_minutes", "5"),
+    ("orch_silent_alert_minutes", -1), ("orch_silent_alert_minutes", 1441),
+    ("orch_silent_alert_minutes", True), ("orch_silent_alert_minutes", "30"),
     ("orch_refresh_compactions", 0), ("orch_refresh_hours", -1), ("orch_refresh_hours", True),
     ("interview", "magic"), ("interview", None), ("interview", []), ("interview", True),
     ("ouroboros_version", 52), ("ouroboros_version", []), ("ouroboros_version", False),

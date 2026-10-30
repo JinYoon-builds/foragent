@@ -216,3 +216,4 @@
 - #794 재시도: 요청을 끝내는 동사는 `orch_inbox.set_request_status(..., check=fn)`으로 상태 확인과 완료 표시를 state lock 안에서 한 번에 한다(동시 답 경쟁). 스코어카드 역할 행은 설정 역할만이 아니라 열린 신호·창 안 신호가 있는 역할도 넣는다. 동시성 시험은 `_file_lock`이 호출마다 새 fd로 flock하므로 스레드 두 개로 재현된다. 작업공간 재생성 때 `.foragent/TRY.md`·`REBUTTAL.md`는 사라지므로 다시 써야 한다. "파일 이동" 안내는 오탐일 수 있으니 `git ls-tree origin/main`으로 확인한다.
 - #131 재시도: Goal(2026-10-29)이 묶음 나이를 finished_at, 없으면 묶음의 가장 새 파일 mtime으로 정했다(기간·크기 규칙 공통 `_group_age`). 병합 보존 일수는 `settings.read_machine()`의 log_retention_days(기본 7, conftest가 XDG_STATE_HOME 격리). main의 `orch_role_raise.tick`은 정상 종료 경로의 `done(..., finished=True)` 직전에 둔다.
 - [#413 orch refresh](project_413_refresh.md) — heartbeat session fields, orch_spawn_launch split, locked --bg argv, zsh ${=T}
+- [#952 silent push](project_952_silent_push.md) — observe_silence shared, orch-silent-alert.json identity, new Setting needs window label

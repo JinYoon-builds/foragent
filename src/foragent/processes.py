@@ -269,6 +269,22 @@ def orchestrator_process_alive(repo_root: Path, skill: str = "/fa-orchestrator")
     return False
 
 
+
+def orchestrator_process_starts(repo_root: Path, skill: str = "/fa-orchestrator") -> list[tuple[int, float]]:
+    """``(pid, start time)`` of every live process ``orchestrator_process_alive`` would match."""
+    try:
+        candidates = tuple(psutil.process_iter())
+    except (psutil.Error, OSError):
+        return []
+    found = []
+    for process in candidates:
+        try:
+            if skill in (process.cmdline() or ()) and _same_dir(_cwd(process), repo_root):
+                found.append((process.pid, float(process.create_time())))
+        except (psutil.Error, OSError, SystemError):
+            continue
+    return sorted(found)
+
 @dataclass(frozen=True)
 class IdentityEvidence:
     alive: bool | None  # None means unreadable, never permission to discard ownership.
