@@ -155,36 +155,181 @@ def _stalled_row(store, now, notes):
     path.write_text(json.dumps(record), encoding="utf-8")
 
 
-def test_a_malformed_note_is_ignored_on_its_own(stall_store):
+def _stall_hours(store, now):
     from datetime import timedelta
 
-    from foragent import presence
+    from foragent import orch_inbox, presence
+
+    stuck, _unreadable = presence.stalled(orch_inbox.scan(store, "requests")[0], now)
+    return [(now - since) // timedelta(hours=1) for _row, since in stuck]
+
+
+def test_a_malformed_note_is_ignored_on_its_own(stall_store):
+    from datetime import timedelta
 
     root, store, now = stall_store
     at = (now - timedelta(hours=2)).isoformat()
     _stalled_row(store, now, ["junk", {"status": "processing"}, {"at": at},
                               {"status": "processing", "at": at}, {"at": now.isoformat()}])
-    assert presence.statusline_segment(root, now) == STALL_BASE + " · Stuck requests: 1 (over 2 h) · fa orch inbox"
+    assert _stall_hours(store, now) == [2]
 
 
 def test_the_request_status_decides_even_after_a_note_naming_another_status(stall_store):
     from datetime import timedelta
 
-    from foragent import presence
-
     root, store, now = stall_store
     _stalled_row(store, now, [{"status": "processing", "at": (now - timedelta(hours=4)).isoformat()},
                               {"status": "done", "at": (now - timedelta(hours=3)).isoformat()}])
-    assert presence.statusline_segment(root, now) == STALL_BASE + " · Stuck requests: 1 (over 4 h) · fa orch inbox"
+    assert _stall_hours(store, now) == [4]
 
 
 def test_an_unreadable_requests_box_leaves_out_only_the_stall_fact(stall_store):
     from datetime import timedelta
 
-    from foragent import presence
+    from foragent import orch_inbox, presence
 
     root, store, now = stall_store
     _stalled_row(store, now, [{"status": "processing", "at": (now - timedelta(hours=4)).isoformat()}])
     store.start_run(7, branch="foragent/issue-7", worktree=store.worktree_path(7), lane="main")
     (store.root / "inbox" / "requests" / "r9.json").write_text("{not json", encoding="utf-8")
     assert presence.statusline_segment(root, now) == "🐿 1 lanes working · ✋ 0 · 0 merged today"
+    # The corrupt file is left out alone and named; the valid stall stays.
+    assert _stall_hours(store, now) == [4]
+    assert orch_inbox.scan(store, "requests")[1] == ['"inbox/requests/r9.json": unreadable (JSONDecodeError)']
+
+
+def test_statusline_counts_open_questions_only_in_the_planning_session(stall_store, monkeypatch):
+    from foragent import orch_inbox, presence
+
+    root, store, now = stall_store
+    assert presence.statusline_segment(root, now) == STALL_BASE
+    first = orch_inbox.ask(store, "One?", ["a", "b"], 1)
+    assert presence.statusline_segment(root, now) == (
+        STALL_BASE + " · 1 question needs your answer in the planning session")
+    orch_inbox.ask(store, "Two?", ["a", "b"], 1)
+    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    orch_inbox.answer(store, first["id"], "a")
+    assert presence.statusline_segment(root, now).endswith(" · 1 question needs your answer in the planning session")
+    monkeypatch.setenv("FORAGENT_ROLE", "orchestrator")
+    assert presence.statusline_segment(root, now) == STALL_BASE
+
+
+def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_store):
+    import json
+    from datetime import timedelta
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = stall_store
+    (root / ".git").mkdir()
+    (root / ".git/config").write_text('[remote "origin"]\n\turl = https://github.com/offline/stall.git\n')
+    store.root.mkdir(parents=True, exist_ok=True)
+    assert presence.bind_checkout(root, now) is True
+    assert presence.bind_checkout(root, now) is False, "the first binding stays"
+    assert presence.prompt_context(root, now) == (None, [])
+    store._now = lambda: now - timedelta(hours=25)
+    orch_inbox.record_notice(store, "sent", "Too old to show", channel="push", ref="q1")
+    store._now = lambda: now - timedelta(minutes=5)
+    event = orch_inbox.record_notice(store, "failed", "Push for q2\nfailed", channel="ntfy", ref="q2", issue=7)
+    assert {key: event[key] for key in ("kind", "status", "channel", "ref", "issue", "summary")} == {
+        "kind": "notice", "status": "failed", "channel": "ntfy", "ref": "q2", "issue": 7,
+        "summary": "Push for q2 failed"}
+    context, problems = presence.prompt_context(root, now)
+    assert problems == []
+    assert "Too old to show" not in context
+    assert f'- {event["at"]} "failed" (channel "ntfy" ref "q2") #7: "Push for q2 failed"' in context
+    with (store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"kind": "notice", "at": "broken", "summary": "x"}) + "\n")
+    context, problems = presence.prompt_context(root, now)
+    assert problems == ["orch-events.jsonl: 1 unreadable notice line(s)"]
+    assert "Push for q2 failed" in context and "Partial read" in context
+
+
+@pytest.mark.parametrize("broken", ['{', '[]', '{"seq":"bad"}', '{"id":"q9","seq":9,"status":"open","issues":"7"}'])
+def test_a_corrupt_question_file_hides_no_valid_question_count(stall_store, broken):
+    from foragent import orch_inbox, presence
+
+    root, store, now = stall_store
+    orch_inbox.ask(store, "Valid?", ["a", "b"], 1, issues=[5])
+    (store.root / "inbox" / "questions" / "broken.json").write_text(broken, encoding="utf-8")
+    question = " · 1 question needs your answer in the planning session"
+    if broken.startswith('{"id"'):  # well formed but with unusable links: counted, links ignored
+        question = " · 2 questions need your answer in the planning session"
+    assert presence.statusline_segment(root, now) == "🐿 0 lanes working · ✋ 1 · 0 merged today" + question
+    assert presence.session_start_message(root, None, now) == (
+        "since the last report: 0 merges · ✋ 1 · /fa for the report")
+
+
+def _bound_stall_store(stall_store):
+    from foragent import orch_inbox, presence
+
+    root, store, now = stall_store
+    (root / ".git").mkdir()
+    (root / ".git/config").write_text('[remote "origin"]\n\turl = https://github.com/offline/stall.git\n')
+    store.root.mkdir(parents=True, exist_ok=True)
+    assert presence.bind_checkout(root, now)
+    from datetime import timedelta
+
+    orch_inbox.ask(store, "Visible question", ["a", "b"], 1)
+    _stalled_row(store, now, [{"status": "processing", "at": (now - timedelta(hours=2)).isoformat()}])
+    return root, store, now
+
+
+@pytest.mark.parametrize("kind", ["requests", "questions"])
+@pytest.mark.parametrize("damage", ["unlistable", "file-in-place"])
+def test_an_unreadable_box_folder_is_a_failed_read_not_an_empty_box(stall_store, kind, damage):
+    import os
+    import shutil
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    folder = store.root / "inbox" / kind
+    if damage == "unlistable":
+        os.chmod(folder, 0)
+    else:
+        shutil.rmtree(folder)
+        folder.write_text("not a folder")
+    try:
+        rows, problems = orch_inbox.scan(store, kind)
+        context, notes = presence.prompt_context(root, now)
+    finally:
+        if damage == "unlistable":
+            os.chmod(folder, 0o755)
+    assert rows == [] and len(problems) == 1 and problems[0].startswith(f'"inbox/{kind}": unreadable (')
+    assert notes == problems and "Partial read" in context
+    other = '"opaque"' if kind == "questions" else "Visible question"
+    assert other in context, "the other box still reaches the planning turn"
+
+
+def test_a_missing_box_folder_is_an_empty_box(stall_store):
+    from foragent import orch_inbox
+
+    root, store, now = stall_store
+    assert orch_inbox.scan(store, "questions") == ([], [])
+
+
+def test_a_corrupt_binding_file_is_reported_not_silently_unbound(stall_store):
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    (store.root / presence.BINDING).write_text("{")
+    assert presence.prompt_context(root, now) == (None, ["checkout.json: unreadable (JSONDecodeError)"])
+    assert presence.bind_checkout(root, now), "the next session start repairs a corrupt binding"
+    assert "Visible question" in presence.prompt_context(root, now)[0]
+
+
+def test_an_unreadable_state_folder_is_reported(stall_store, monkeypatch):
+    from foragent import presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    real = presence.os.stat
+
+    def denied(path, *args, **kwargs):
+        if str(path) == str(store.root):
+            raise PermissionError(13, "Permission denied")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(presence.os, "stat", denied)
+    assert presence.prompt_context(root, now) == (
+        None, ["state folder: unreadable (PermissionError: Permission denied)"])

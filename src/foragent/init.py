@@ -210,6 +210,17 @@ def _preflight_language(root: Path, language: str | None) -> str:
         return "en"
 
 
+def _bind_checkout(root: Path) -> None:
+    """Bind this checkout to its repository's box when it is the first with that origin (#1026)."""
+    from datetime import UTC, datetime
+
+    from foragent import presence
+    try:
+        presence.bind_checkout(root, datetime.now(UTC))
+    except Exception:  # Optional upkeep: the session-start hook binds later instead.
+        logging.getLogger(__name__).debug("checkout binding skipped", exc_info=True)
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
@@ -419,6 +430,7 @@ def init_repo(
     if push_planned:
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
+    _bind_checkout(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)

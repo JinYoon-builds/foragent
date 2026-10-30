@@ -7,6 +7,7 @@ session restarts, so a new orchestrator reads the box before anything else.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,6 +50,48 @@ def _records(store: StateStore, kind: str) -> list[dict[str, Any]]:
         return []
     rows = [_read(path) for path in folder.glob("*.json")]
     return sorted(rows, key=lambda row: int(row.get("seq", 0)))
+
+
+def _name(kind: str, path: Path) -> str:
+    """A box file's name as one JSON string: a file name is outside input too."""
+    return json.dumps(f"inbox/{kind}/{path.name}", ensure_ascii=False)
+
+
+def scan(store: StateStore, kind: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Every well-formed row of one box, oldest first, and a note for each file left out.
+
+    A reader for the planning session's context and statusline: box files are outside
+    input, so one corrupt file is skipped alone instead of hiding the others, and the
+    notes let the caller tell a partial read from a complete empty box. No lock is
+    taken; writers replace whole files, so a reader never sees half a row.
+    """
+    folder = _folder(store, kind)
+    # os.scandir, not Path.glob: glob turns an unreadable folder into an empty one.
+    # Only a missing folder is an empty box; a folder that cannot be listed, or a
+    # file in its place, is a failed read.
+    try:
+        with os.scandir(folder) as entries:
+            names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return [], []
+    except OSError as exc:
+        where = json.dumps(f"inbox/{kind}", ensure_ascii=False)
+        return [], [f"{where}: unreadable ({type(exc).__name__}: {exc.strerror or exc})"]
+    paths = [folder / name for name in names]
+    rows, skipped = [], []
+    for path in paths:
+        try:
+            row = _read(path)
+        except (OSError, ValueError) as exc:
+            skipped.append(f"{_name(kind, path)}: unreadable ({type(exc).__name__})")
+            continue
+        if not (isinstance(row, dict) and isinstance(row.get("id"), str)
+                and type(row.get("seq")) is int and isinstance(row.get("status"), str)):
+            skipped.append(f"{_name(kind, path)}: not a {kind[:-1]} record")
+            continue
+        rows.append(row)
+    rows.sort(key=lambda row: row["seq"])
+    return [_public(row) for row in rows], skipped
 
 
 def _create(store: StateStore, kind: str, prefix: str, fields: dict[str, Any]) -> dict[str, Any]:
@@ -216,6 +259,61 @@ def answer(store: StateStore, question_id: str, text: str) -> dict[str, Any]:
     record = _update(store, "questions", question_id, change)
     append_event(store, store._now(), None, "answer", f"{question_id}: {text}")
     return _public(record)
+
+
+# A notice is one journal event about a notification's delivery (#1026; #1030 writes them):
+# {"at", "issue", "kind": "notice", "summary", "status", "channel", "ref"}.
+NOTICE_KIND = "notice"
+# The planning context reads only the journal's tail, so a long journal cannot delay a prompt.
+NOTICE_TAIL_BYTES = 256 * 1024
+
+
+def record_notice(store: StateStore, status: str, summary: str, *, channel: str | None = None,
+                  ref: str | None = None, issue: int | None = None) -> dict[str, Any]:
+    """Append one notification status fact to the journal.
+
+    ``status`` is what happened (for example "sent" or "failed"), ``channel`` where it
+    went, ``ref`` the box record it was about (a question or request id).
+    """
+    if not status.strip() or not summary.strip():
+        raise InboxError("a notice needs a status and a summary")
+    return append_event(store, store._now(), issue, NOTICE_KIND, summary,
+                        status=status, channel=channel, ref=ref)
+
+
+def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, Any]], list[str]]:
+    """Notices recorded after ``since``, oldest first, and a note for each line left out."""
+    path = store.root / "orch-events.jsonl"
+    try:
+        with path.open("rb") as stream:
+            size = stream.seek(0, 2)
+            stream.seek(max(0, size - NOTICE_TAIL_BYTES))
+            data = stream.read()
+    except FileNotFoundError:
+        return [], []
+    except OSError as exc:
+        return [], [f"orch-events.jsonl: unreadable ({exc.strerror or exc})"]
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > NOTICE_TAIL_BYTES and lines:
+        lines = lines[1:]  # the first line may start mid-record
+    notices, skipped = [], 0
+    for line in lines:
+        if f'"{NOTICE_KIND}"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+            at = datetime.fromisoformat(event["at"])
+        except (ValueError, TypeError, KeyError):
+            skipped += 1
+            continue
+        if not isinstance(event, dict) or event.get("kind") != NOTICE_KIND:
+            continue
+        if at.tzinfo is None or not isinstance(event.get("summary"), str):
+            skipped += 1
+            continue
+        if at > since:
+            notices.append(event)
+    return notices, ([f"orch-events.jsonl: {skipped} unreadable notice line(s)"] if skipped else [])
 
 
 class FollowEvents:
