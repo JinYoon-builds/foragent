@@ -446,10 +446,13 @@ def test_rerun_early_verification_failures_remain_blocked(review_case, monkeypat
 @pytest.mark.parametrize("action", ["retry", "rerun_review", "resolve", "escalate"])
 def test_running_work_cannot_be_overwritten(review_case, action):
     c = review_case
+    # Running is the live run record (#435), the same rule fa orch stop and the status row use.
     c.tracker.add_labels(1, ["running"])
+    c.store.start_run(1, branch="foragent/issue-1", worktree=c.store.worktree_path(1))
     args = {"retry": (), "rerun_review": (), "resolve": ("fail", "note"), "escalate": ("summary", "tried")}
     with pytest.raises(orch.OrchError, match="running"):
         getattr(orch, action)(c.ctx, 1, *args[action])
+    c.store.finish_run(1, "error")
     c.tracker.remove_labels(1, ["running"])
     assert c.tracker.get_issue(c.pr).state == "open"
 

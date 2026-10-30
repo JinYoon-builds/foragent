@@ -103,7 +103,7 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
-         role: str = ARCHITECT) -> str:
+         role: str = ARCHITECT, short: str | None = None) -> str:
     """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused."""
     language = config.language
     if _entry(config, role) is None:
@@ -112,6 +112,10 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
     why = why.strip()
     if not why:
         raise ArchitectRefused(_say("why_required", role, language))
+    # The caller writes the one-line reason; it is stored as given, never derived from why.
+    short = (short or "").strip() or None
+    if short is not None and "\n" in short:
+        raise ArchitectRefused(text("role_short_one_line", language))
     until = store.executor_pause_until(config.executor, now)
     if until is not None:
         raise ArchitectRefused(_say("paused", role, language, executor=config.executor,
@@ -133,9 +137,10 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
             )
         store._write_json(record_path(store, role), {
             "pid": process.pid, "start_time": _start_time(process.pid),
-            "started_at": started_at, "why": why,
+            "started_at": started_at, "why": why, **({"short": short} if short else {}),
         })
-    append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log))
+    append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
+                 **({"short": short} if short else {}))
     return _say("started", role, language, pid=process.pid, log=log)
 
 

@@ -7,6 +7,13 @@ MESSAGES = {
         "orch_plan_bad_time": "fa orch {action}: '{value}' is not an ISO time.",
         "orch_plan_bad_width": "fa orch plan --width: '{value}' must be LANE=N (N >= 1) or LANE=off; "
                                "to stop a lane, use fa orch pause.",
+        "orch_plan_bad_overlap": "fa orch plan --overlap: '{value}' must be PATH=N (N >= 1) or PATH=off.",
+        "orch_plan_why_without_overlap": "fa orch plan: --why goes with --overlap; record other reasons "
+                                         "with fa orch note.",
+        "orch_plan_overlap_and_width": "fa orch plan: set --overlap and --width in separate commands; "
+                                       "each has its own --expires.",
+        "orch_plan_file": "file:{path} overlap {limit} until {until} ({by}): {why}",
+        "orch_plan_file_no_expiry": "changed (no expiry)",
         "orch_plan_paused": "lane:{lane} paused until {until} ({by}): {why}",
         "orch_plan_resumed": "lane:{lane} resumed.",
         "orch_plan_not_paused": "lane:{lane} has no plan pause.",
@@ -24,6 +31,13 @@ MESSAGES = {
         "orch_plan_bad_time": "fa orch {action}: '{value}'는 ISO 시각이 아니에요.",
         "orch_plan_bad_width": "fa orch plan --width: '{value}'는 LANE=N(N은 1 이상) 또는 LANE=off여야 해요. "
                                "레인을 멈추려면 fa orch pause를 쓰세요.",
+        "orch_plan_bad_overlap": "fa orch plan --overlap: '{value}'는 PATH=N(N은 1 이상) 또는 PATH=off여야 해요.",
+        "orch_plan_why_without_overlap": "fa orch plan: --why는 --overlap과 함께 써요. 다른 이유는 "
+                                         "fa orch note로 남기세요.",
+        "orch_plan_overlap_and_width": "fa orch plan: --overlap과 --width는 따로 실행하세요. "
+                                       "--expires도 각각 정해요.",
+        "orch_plan_file": "file:{path} 겹침 {limit}, {until}까지({by}): {why}",
+        "orch_plan_file_no_expiry": "바꿀 때",
         "orch_plan_paused": "lane:{lane}을 {until}까지 멈췄어요({by}): {why}",
         "orch_plan_resumed": "lane:{lane}을 다시 시작했어요.",
         "orch_plan_not_paused": "lane:{lane}에는 계획 멈춤이 없어요.",

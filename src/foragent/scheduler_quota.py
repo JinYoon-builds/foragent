@@ -208,6 +208,7 @@ class Start(NamedTuple):
     switch: Switch | None
     held: bool
     reason: str | None = None  # Why the start waits, in the executor-wait words; None when it starts.
+    model: str | None = None  # The issue's assigned model (D80), stored with the run; None: ordinary choice.
 
 
 def decide(store: StateStore, config: Config, lane: str, now: datetime, number: int | None = None) -> Start:
@@ -220,12 +221,22 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     from foragent.config import lane_executors
     from foragent.run_implementation import lane_config
 
+    from foragent.orch_assign import assignment, runnable
+
+    # D80: an issue's live assignment replaces ordinary selection (headroom order, a kept
+    # implementer, keep_percent); hard limits, caps and the cross review still hold. One whose
+    # executor has no adapter (the config changed since) cannot run, so ordinary selection applies.
+    assigned = assignment(store, number, now) if number is not None else None
+    if assigned is not None and not runnable(assigned["executor"]):
+        assigned = None
     store = quota_view.view(store, now)  # Every question below reads one snapshot of the quota facts.
     adjusted = lane_config(config, lane)
     usage, mode = _usage(store), quota_mode(store, config)[0]
-    ranked = quota_headroom.order(adjusted, lane, usage, now, mode)
+    ranked = quota_headroom.order(adjusted, lane, usage, now, mode) if assigned is None else None
     order = ranked[0] if ranked is not None else fallback_order(adjusted)
     kept = kept_implementer(store, number, adjusted.executor) if number is not None else None
+    if assigned is not None:
+        order, kept = [entry_for(adjusted, assigned["executor"])], None
     switch, released = None, False
     if kept is not None:
         kept_entry = next((entry for entry in order if entry["name"] == kept), entry_for(adjusted, kept))  # Billed as listed.
@@ -240,7 +251,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     for entry in order:
         # A continued run (crashed, stalled-restart, limit-wait) keeps its implementer: only a hard
         # limit, cap or unmeasured spend holds it, never keep_percent, as #107 continuations did.
-        why, ask = blocked(entry, store, now, usage, mode, keep=kept is None)
+        why, ask = blocked(entry, store, now, usage, mode, keep=kept is None and assigned is None)
         if why is None:
             chosen = entry["name"]
             break
@@ -257,6 +268,9 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
     switch = replace(switch, target=chosen) if kept is None and switch is not None and (
         implementer is not None or released) else None
     chosen_config = run_config(store, adjusted, implementer, now)
+    model = assigned and assigned["model"]
+    if assigned is not None:
+        switch, chosen_config = None, assigned_model(chosen_config, model)
     reason = None
     reviewer = resolved_reviewer(chosen_config)
     if chosen_config.executor == adjusted.executor and reviewer != "none":
@@ -270,7 +284,7 @@ def decide(store: StateStore, config: Config, lane: str, now: datetime, number: 
         # A lane pause mirrors a limit of the lane's configured pair. One caused by an executor
         # this run no longer needs does not hold it; the pause itself stays in place.
         reason = f"lane {lane} is paused"
-    return Start(chosen_config, implementer, switch, reason is not None, reason)
+    return Start(chosen_config, implementer, switch, reason is not None, reason, model)
 
 
 def _ask_credits(store: StateStore, config: Config, name: str) -> None:
@@ -295,6 +309,6 @@ def run_start(store: StateStore, config: Config, lane: str, number: int,
 
 # Split out to stay under the module line limit; re-exported so callers keep their imports.
 from foragent import quota_headroom, quota_view  # noqa: E402
-from foragent.quota_reviewer import can_review, choose_reviewer, pair_config, run_config, switched_config  # noqa: E402,F401
+from foragent.quota_reviewer import assigned_model, can_review, choose_reviewer, pair_config, run_config, switched_config  # noqa: E402,F401
 from foragent.quota_spend import record_cost  # noqa: E402,F401
 from foragent.quota_events import choose_executor, start_journal, switch_journal, switch_line  # noqa: E402,F401

@@ -25,8 +25,12 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
+    from foragent.skills import with_vendored_library
+
     cli = facade()
-    manager = cli.SkillManager(cli.load_global_config())
+    # The catalog advertises the current project's copy; installing elsewhere keeps that source.
+    roots = [cli.Path.cwd()] + ([args.repo_root.resolve()] if getattr(args, "repo_root", None) else [])
+    manager = cli.SkillManager(with_vendored_library(cli.load_global_config(), *roots))
     if args.action == "sync":
         print("Synced: " + ", ".join(manager.sync()))
     elif args.action in {"catalog", "add"}:
