@@ -39,6 +39,8 @@ def turn_case(publish_case, monkeypatch):
     the real publication code and StateStore.merge_lock decide who can merge.
     """
     case = publish_case
+    # #459 (2026-10-30): merge groups default on; this file checks the one-PR FIFO turn.
+    object.__setattr__(case.config, "merge_group_max", 1)
     case.worker = local()
     case.merges = []
     case.wake = lambda: None

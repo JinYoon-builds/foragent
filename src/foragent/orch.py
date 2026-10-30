@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity
+from foragent import capacity, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -51,14 +51,18 @@ def _watch_snapshot(ctx: RunContext) -> dict:
     }
 
 
-def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iterator[dict]:
+def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
+          seat: dict | None = None) -> Iterator[dict]:
     """Yield an initial snapshot, then only changes to the watched sets/state.
 
     The persisted snapshot lets a Monitor until-loop invoke this repeatedly
     without receiving the same event. Titles, timestamps and logs are excluded.
     A failed read yields ``{"unknown": true, "error": ...}`` instead of empty
     sets, leaves the persisted snapshot alone, and makes the next good read
-    print even when it equals the last known snapshot.
+    print even when it equals the last known snapshot. With ``seat`` (#962, the
+    holder ``fa orch watch --follow`` took) every poll checks, in one locked
+    step with its heartbeat, that this lifetime still holds the seat, and
+    raises ``orch_seat.SeatHeld`` instead of writing once it does not.
     """
     if not math.isfinite(interval) or interval <= 0:
         raise OrchError("interval must be a finite positive number")
@@ -68,10 +72,17 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False) -> Iter
     session = claude_session()  # The gate's spawn check trusts it past a stale heartbeat.
     # #413: the id its spawn gave this session; writes from a retired session are ignored.
     session_id = os.environ.get("FORAGENT_SESSION_ID")
+    def beat():
+        ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session, session_id=session_id)
+
     while True:
         try:  # Every read, changed or not, shows the orchestrator is alive.
-            ctx.store.write_heartbeat("orchestrator", ctx.now(), session=session,
-                                      session_id=session_id)
+            if seat is not None:  # #962: the seat check and the heartbeat are one step.
+                orch_seat.beat(ctx.store, seat, beat)
+            else:
+                beat()
+        except orch_seat.SeatHeld:
+            raise
         except Exception:
             pass  # a heartbeat is best effort; the read below reports state errors
         try:

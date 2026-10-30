@@ -65,6 +65,8 @@ def test_limit_wait_resume_cannot_reset_consumed_implementation_attempt(run_case
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(c.executor.calls) == 3
     assert (c.store.get_run(1).attempts, c.store.get_run(1).restarts) == (2, 1)
+    # #238: the turn again after the limit wait is a new turn with its own key.
+    assert c.store.get_run(1).attempt_tiers == {"1": "m", "2": "l", "3": "l"}
 
 
 @pytest.mark.parametrize("size,efforts,tiers", [
@@ -89,6 +91,19 @@ def test_difficulty_escalates_per_failed_attempt_and_is_recorded(run_case, size,
         assert f"Attempt {index} at tier {tier}" in c.tracker.created_prs[0].body
 
 
+def test_a_tier_without_effort_does_not_keep_the_previous_turns_effort(run_case):
+    # #238: effort is chosen per turn; None means the executor default, not the last turn's value.
+    c = run_case
+    c.tracker.add_labels(1, ["size:m"])
+    tiers = {**c.ctx.config.tiers, "l": {**c.ctx.config.tiers["l"], "codex_effort": None}}
+    c.ctx.config = replace(c.ctx.config, tiers=tiers)
+    c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert [call.get("effort") for call in c.executor.calls] == ["high", None]
+    assert "effort" not in c.executor.calls[1]
+    assert c.store.get_run(1).attempt_tiers == {"1": "m", "2": "l"}
+
+
 @pytest.mark.parametrize("lane_model,expected", [(None, ["small-model", "medium-model"]),
                                                     ("lane-model", ["lane-model"] * 2)])
 def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
@@ -98,8 +113,9 @@ def test_claude_tier_model_and_lane_precedence(run_case, lane_model, expected):
     tiers = {"s": {"codex_effort": "medium", "claude_model": "small-model"},
              "m": {"codex_effort": "high", "claude_model": "medium-model"},
              "l": {"codex_effort": "xhigh", "claude_model": "large-model"}}
+    # Two retries: the second attempt is not the last, so it steps up one tier only (#238).
     c.ctx.config = replace(c.ctx.config, executor="codex", executor_model="global-model", tiers=tiers,
-                           lanes={"api": {"executor": "claude", "model": lane_model}})
+                           lanes={"api": {"executor": "claude", "model": lane_model}}, max_retries=2)
     kinds = []
     c.ctx.executor_factory = lambda name: kinds.append(name) or c.executor
     c.executor.steps = [{"feature.txt": "wrong"}, {"feature.txt": "done"}]

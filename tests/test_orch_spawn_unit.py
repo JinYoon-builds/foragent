@@ -114,7 +114,7 @@ def test_explicit_call_checks_its_guards_again_inside_the_lock(tmp_path, monkeyp
 
 
 def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
-    """The gate checks liveness before the lock only and keeps its record shape."""
+    """The gate rechecks liveness inside the openers' lock (#962) and keeps its record shape."""
     from contextlib import contextmanager
     import json
 
@@ -130,6 +130,11 @@ def test_gate_path_is_unchanged_by_the_explicit_call(tmp_path, monkeypatch):
             yield
 
     monkeypatch.setattr(watch_open, "_opening", opening)
+    # A heartbeat renewed while the gate waited for the lock stops this spawn.
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) is None
+    assert calls == [] and not (store.root / "orch-spawn.json").exists()
+    monkeypatch.setattr(watch_open, "_opening", real)
+    (store.root / "orch-heartbeat.json").unlink()
     assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW) == "background"
     assert len(calls) == 1
     assert json.loads((store.root / "orch-spawn.json").read_text()) == {
@@ -315,3 +320,181 @@ def test_spawn_loads_the_orchestrator_role_agent_only_when_the_project_defines_i
     (root / ".claude/agents/fa-orchestrator.md").write_text("---\nname: fa-orchestrator\n---\n")
     argv = orch_spawn._command(root, store, "t")[1]
     assert argv[-3:] == ["--agent", "fa-orchestrator", "/fa-orchestrator"]
+
+
+def _pushed(store):
+    import json
+
+    path = store.root / "orch-silent-alert.json"
+    return path.exists() and json.loads(path.read_text()).get("pushed_at") is not None
+
+
+def _seated(tmp_path, monkeypatch, *, alive=True):
+    """A seat holder silent for 40 minutes, with no other live evidence (#952 on the #962 seat)."""
+    import json
+
+    from foragent import orch_seat, processes
+
+    store, repo, calls, pushes = _setup(tmp_path, monkeypatch)
+    store.write_heartbeat("orchestrator", NOW - timedelta(minutes=40))
+    (store.root / "orch-seat.json").write_text(json.dumps({"holder": {
+        "pid": 41, "start_time": 1.0, "taken_at": (NOW - timedelta(hours=2)).isoformat()}}))
+    state = {"alive": alive}
+    monkeypatch.setattr(processes, "orchestrator_process_alive", lambda root, skill="": False)
+    monkeypatch.setattr(orch_seat, "alive", lambda holder: state["alive"])
+    return store, repo, calls, pushes, state
+
+
+def test_spawn_off_turns_the_silence_check_off(tmp_path, monkeypatch):
+    store, repo, calls, pushes, _state = _seated(tmp_path, monkeypatch)
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    config = Config(repo="owner/repo", language="en")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW, spacing=False) is None
+    assert calls == pushes == [] and not (store.root / "orch-silent-note.json").exists()
+    (store.root / "orch-silent-alert.json").write_text('{"holder": [41, 1.0], "pushed_at": "x"}')
+    store.write_heartbeat("orchestrator", NOW)
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert (store.root / "orch-silent-alert.json").exists(), "Off means no rearm either"
+
+
+def test_unknown_liveness_counts_as_live_and_dead_or_corrupt_seat_pushes_nothing(tmp_path, monkeypatch):
+    store, repo, calls, pushes, state = _seated(tmp_path, monkeypatch, alive=None)
+    config = Config(repo="owner/repo", language="en")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert calls == [] and len(pushes) == 1 and _pushed(store)
+    record = (store.root / "orch-silent-alert.json").read_text()
+    (store.root / "orch-seat.json").write_text("{broken")  # Corrupt: no holder, the old record stays put.
+    monkeypatch.setattr(orch_spawn, "_session_alive", lambda store, root: True)
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW + timedelta(minutes=1)) is None
+    assert len(pushes) == 1 and (store.root / "orch-silent-alert.json").read_text() == record
+    from foragent import orch_silent
+
+    import json
+    (store.root / "orch-seat.json").write_text(json.dumps({"holder": {
+        "pid": 42, "start_time": 2.0, "taken_at": (NOW - timedelta(hours=2)).isoformat()}}))
+    state["alive"] = False  # A dead holder opens no episode, even through the check itself.
+    assert not orch_silent.check(repo, store, config, NOW + timedelta(minutes=2)) and len(pushes) == 1
+
+
+def test_no_work_keeps_an_open_episode_open_but_a_fresh_heartbeat_rearms(tmp_path, monkeypatch):
+    store, repo, _calls, pushes, _state = _seated(tmp_path, monkeypatch)
+    config = Config(repo="owner/repo", language="en")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None and _pushed(store)
+    for path in (store.root / "approvals").glob("*.json"):
+        path.unlink()
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW + timedelta(minutes=5)) is None
+    assert _pushed(store) and len(pushes) == 1
+    store.write_heartbeat("orchestrator", NOW + timedelta(minutes=6))
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW + timedelta(minutes=6)) is None
+    assert not (store.root / "orch-silent-alert.json").exists(), "Fresh rearms without work too"
+
+
+def test_explicit_ensure_and_its_cli_share_the_silence_step(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from foragent.commands import _orch_box
+
+    store, repo, calls, pushes, _state = _seated(tmp_path, monkeypatch)
+    config = Config(repo="owner/repo", language="en")
+    why = []
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW, spacing=False, why=why) is None
+    assert why == ["seat"] and len(pushes) == 1 and "orch: repo" in pushes[0]
+    store.write_heartbeat("orchestrator", NOW)
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW, spacing=False) is None
+    assert not (store.root / "orch-silent-alert.json").exists()
+    store.write_heartbeat("orchestrator", NOW - timedelta(hours=1))
+    _orch_box._ensure(SimpleNamespace(repo_root=repo), store, config)
+    from foragent.i18n import text
+
+    assert capsys.readouterr().out == text("orch_ensure_seat", "en") + "\n", "The output stays as today"
+    assert calls == [] and len(pushes) == 2, "fa orch ensure takes the same silence step"
+
+
+def _inner_reason(monkeypatch, module, name, first):
+    """``first`` for the call before the openers' lock, the real answer after it."""
+    real = getattr(module, name)
+    seen = []
+
+    def answer(*args):
+        seen.append(args)
+        return first if len(seen) == 1 else real(*args)
+
+    monkeypatch.setattr(module, name, answer)
+
+
+def test_in_lock_reasons_take_the_shared_silence_step(tmp_path, monkeypatch):
+    """Class: skipped shared observation (the in-lock ``seat`` and ``alive`` returns, gate and explicit)."""
+    for explicit in (False, True):
+        module, name = (orch_ensure, "skip_reason") if explicit else (orch_spawn, "_live_reason")
+        real = getattr(module, name)
+        for fresh in (False, True):
+            store, repo, calls, pushes, _state = _seated(tmp_path / f"{explicit}-{fresh}", monkeypatch)
+            config = Config(repo="owner/repo", language="en")
+            if fresh:  # The heartbeat turns fresh between the outer check and the in-lock one.
+                (store.root / "orch-silent-alert.json").write_text('{"holder": [41, 1.0], "pushed_at": "x"}')
+                store.write_heartbeat("orchestrator", NOW)
+            _inner_reason(monkeypatch, module, name, None)
+            assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW, spacing=not explicit) is None
+            monkeypatch.setattr(module, name, real)
+            assert calls == []
+            if fresh:
+                assert not (store.root / "orch-silent-alert.json").exists(), "An in-lock fresh heartbeat rearms"
+            else:
+                assert len(pushes) == 1 and _pushed(store), "An in-lock seat reason is silence too"
+
+
+def test_concurrent_checks_push_one_episode_once_and_rearm_waits_for_the_record(tmp_path, monkeypatch):
+    """Class: concurrent episode updates (gate vs ``fa orch ensure``, check vs rearm)."""
+    import threading
+
+    from foragent import orch_silent
+
+    store, repo, _calls, pushes, _state = _seated(tmp_path, monkeypatch)
+    config = Config(repo="owner/repo", language="en")
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_send(config, title, line, link=None):
+        pushes.append(line)
+        entered.set()
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(notify, "send", slow_send)
+
+    def during_push(other):
+        entered.clear()
+        release.clear()
+        first = threading.Thread(target=orch_silent.check, args=(repo, store, config, NOW))
+        first.start()
+        assert entered.wait(5)
+        other.start()
+        other.join(0.3)
+        release.set()
+        first.join(5)
+        other.join(5)
+
+    during_push(threading.Thread(target=orch_silent.check, args=(repo, store, config, NOW)))
+    assert len(pushes) == 1, "Two concurrent checks must not both push one episode"
+    orch_silent.rearm(store)
+    during_push(threading.Thread(target=orch_silent.rearm, args=(store,)))
+    assert len(pushes) == 2
+    assert not (store.root / "orch-silent-alert.json").exists(), "A rearm during a push must not be overwritten"
+
+
+def test_freshness_is_read_again_where_the_episode_is_decided(tmp_path, monkeypatch):
+    """Class: inconsistent freshness observations (caller's read, observe_silence, the check's own lock)."""
+    from foragent import orch_silent
+
+    store, repo, _calls, pushes, _state = _seated(tmp_path, monkeypatch)
+    config = Config(repo="owner/repo", language="en")
+    assert orch_silent.check(repo, store, config, NOW) and _pushed(store)
+    note = store.root / "orch-silent-note.json"
+    # The caller saw a stale heartbeat; it was renewed before the silence step.
+    store.write_heartbeat("orchestrator", NOW + timedelta(hours=1))
+    orch_spawn.observe_silence(repo, store, config, NOW + timedelta(hours=1), "seat")
+    assert not (store.root / "orch-silent-alert.json").exists() and not note.exists()
+    assert orch_silent.check(repo, store, config, NOW + timedelta(hours=2))  # 60 minutes silent again.
+    store.write_heartbeat("orchestrator", NOW + timedelta(hours=3))
+    assert not orch_silent.check(repo, store, config, NOW + timedelta(hours=3))
+    assert not (store.root / "orch-silent-alert.json").exists() and len(pushes) == 2
