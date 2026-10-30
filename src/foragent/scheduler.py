@@ -212,7 +212,9 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         if APPROVED not in issue.labels and not waiting_labels:
             # Removing approval returns a known card to Backlog.
             board.sync_status(ctx, issue, "unapproved", existing_only=True)
-            return
+            if READY not in issue.labels:
+                return
+            # Revoked but still ready (fa orch park): the label history shows a new approval first.
         event, ignored = _latest_approval(
             _label_events(ctx, issue.number, confirmed=listing_current), ctx.config.approvers,
         )

@@ -72,7 +72,7 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
     """Stop issue N's run through scheduler._kill_run and return it to ready, keeping its work."""
     from foragent import scheduler
     from foragent.orch import OrchError
-    from foragent.scheduler_stop import _restore_stopped
+    from foragent.scheduler_stop import _restore_stopped, run_is_live
 
     language = ctx.config.language
     why = " ".join(why.split())
@@ -80,7 +80,9 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
         raise OrchError(text("orch_stop_why_required", language))
     with _tick_lock(ctx, n):
         run = ctx.store.get_run(n)
-        if run is None or run.status != "running" or (run.pid is None and run.executor_pgid is None):
+        # The same rule as fa orch park (#435); a record without any process is
+        # running there too, so the kill path finishes it here.
+        if not run_is_live(run):
             raise OrchError(text("orch_stop_not_running", language, n=n))
         if (unsafe := unsafe_target(run)) is not None:
             role, pid, rule = unsafe
