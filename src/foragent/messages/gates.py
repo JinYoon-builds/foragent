@@ -16,6 +16,10 @@ MESSAGES = {
         "gates_age_days": "{count} d ago",
         "gates_lane_heading": "Other gates:",
         "gates_lane_running": "{count} running",
+        "gates_reload_recovered": "    Reload failed at {at} ({error}); recovered after {attempts} attempts",
+        "gates_reload_failed": "    Reload failed at {at} ({error}) after {attempts} attempts; the gate is not loaded",
+        "gates_reload_command": "    To reinstall the gate: {command}",
+        "gates_reload_not_loaded": "launchd did not load the job",
         "status_help": "Show this repository's gate status and every gate installed on this machine",
     },
     "ko": {
@@ -33,6 +37,10 @@ MESSAGES = {
         "gates_age_days": "{count}일 전",
         "gates_lane_heading": "다른 게이트:",
         "gates_lane_running": "{count}개 실행 중",
+        "gates_reload_recovered": "    다시 불러오기가 {at}에 실패했지만({error}) {attempts}번 시도해서 복구했어요",
+        "gates_reload_failed": "    다시 불러오기가 {at}에 {attempts}번 모두 실패했어요({error}). 게이트가 멈춰 있어요",
+        "gates_reload_command": "    게이트를 다시 설치하려면: {command}",
+        "gates_reload_not_loaded": "launchd가 작업을 불러오지 않았어요",
         "status_help": "이 저장소의 게이트 상태와 이 기계에 설치된 모든 게이트를 보여 줘요",
     },
 }

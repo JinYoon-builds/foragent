@@ -65,7 +65,8 @@ def test_skills_add_approval_registers_roles_and_catalog_merges_tool_copies(
     assert any(entry["repo"] == str(source) for entry in saved["skill_libraries"])
     capsys.readouterr()
     assert main(["skills", "catalog", "--json"]) == 0
-    catalog = json.loads(capsys.readouterr().out)
+    # #1028 (2026-10-31): Foragent's vendored principles (library "pstack") may also be listed.
+    catalog = [item for item in json.loads(capsys.readouterr().out) if not item["id"].startswith("pstack:")]
     assert len(catalog) == 2
     polish, = [item for item in catalog if item["name"] == "polish"]
     tone, = [item for item in catalog if item["name"] == "tone"]
