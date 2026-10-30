@@ -217,7 +217,7 @@ def worker_world(world, executor_edit, publish):
     world.ctx.poll_hook = lambda execute, poll: execute()
     world.ctx.tracker = None
 
-    def fake_publish(ctx, git, lane, memory, count, **kwargs):
+    def fake_publish(ctx, git, lane, memory, count, captured=None):
         calls["published"].append(count)
         return publish()
 
@@ -319,7 +319,7 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
     world.ctx.poll_hook = lambda execute, poll: execute()
     world.ctx.tracker = None
     original = orch_dream_worker._publish
-    orch_dream_worker._publish = lambda ctx, git, lane, memory, count, **kw: published.append(count) or 7
+    orch_dream_worker._publish = lambda ctx, git, lane, memory, count, captured=None: published.append(count) or 7
     try:
         dreaming(world)
         assert orch_dream_worker.run_dream("orch", world.ctx) == 0
@@ -327,7 +327,12 @@ def test_new_memory_file_in_an_ignored_directory_is_published_and_counted(world,
         orch_dream_worker._publish = original
     assert committed == [[".claude/agent-memory/orch"]] and published == [2]
     saved = json.loads((world.store.root / "orch-events.jsonl").read_text().splitlines()[-1])
-    assert saved["memories"] == 2 and saved["pr"] == 7
+    assert saved["memories"] == 2 and saved["pr"] == 7 and saved["kind"] == orch_dream.PUBLISHED
+    import hashlib
+    assert saved["outputs"] == {"MEMORY.md": hashlib.sha256(b"one lesson\ntwo lesson\n").hexdigest(), "MEMORY.new.md": None}
+    assert saved["inputs"] == {"MEMORY.md": None, "MEMORY.new.md": None}, "The base had no memory files"
+    assert orch_dream.last_dream_at(world.store, "orch") is None, "An unmerged dream PR is not a completed dream"
+    assert orch_dream.awaiting_pr(world.store, "orch")["pr"] == 7
     assert not worktree.exists()
 
 
@@ -622,7 +627,7 @@ def test_publish_force_pushes_leased_on_the_remote_head_it_read(world, remote):
     assert pushes == [("foragent/dream-orch", remote or "")]
 
 
-def tick_start(world, monkeypatch, open_prs, lanes=("orch", "view")):
+def tick_start(world, monkeypatch, open_prs, lanes=("orch", "view"), merged=()):
     from foragent import scheduler as facade
 
     world.config = Config(repo="o/r", lanes={name: {"paths": [f"{name}/**"]} for name in lanes})
@@ -645,7 +650,12 @@ def tick_start(world, monkeypatch, open_prs, lanes=("orch", "view")):
             raise result
         return result
 
-    world.ctx.tracker = SimpleNamespace(find_pr=find_pr)
+    def list_prs(state, head_prefix):
+        assert state == "merged"
+        order.append(f"merged {head_prefix}")
+        return [SimpleNamespace(number=number) for number in merged]
+
+    world.ctx.tracker = SimpleNamespace(find_pr=find_pr, list_prs=list_prs)
     world.ctx.launcher = lambda **kwargs: 5100
     report = SimpleNamespace(actions=[])
     orch_dream.start(world.ctx, list(lanes), 2, report)
@@ -661,6 +671,26 @@ def test_tick_skips_a_lane_with_an_open_dream_pr_and_starts_the_next(world, monk
 def test_tick_starts_nothing_when_every_due_lane_has_an_open_dream_pr(world, monkeypatch):
     order, _ = tick_start(world, monkeypatch, {"foragent/dream-orch": 40, "foragent/dream-view": 41})
     assert order == ["foragent/dream-orch", "foragent/dream-view"] and world.store.active_runs() == []
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_published_dream_completes_only_when_its_pr_merged(world, monkeypatch, merged):
+    covered = NOW - timedelta(minutes=5)
+    orch_dream.record_published(world.store, "orch", 3, NOW, covered_until=covered, pr=40, inputs={}, outputs={})
+    order, report = tick_start(world, monkeypatch, {}, lanes=("orch",), merged=[40] if merged else [39])
+    assert order[:2] == ["foragent/dream-orch", "merged foragent/dream-orch"]
+    if merged:
+        assert orch_dream.last_dream_at(world.store, "orch") == covered and orch_dream.awaiting_pr(world.store, "orch") is None
+        assert world.store.active_runs() == [] and "merged" in report.actions[-1]
+    else:  # Closed without merging: the same runs are dreamed again from the base.
+        assert orch_dream.last_dream_at(world.store, "orch") is None
+        assert world.store.get_dream("orch").status == "running"
+
+
+def test_a_lane_without_a_published_dream_needs_no_merged_lookup(world, monkeypatch):
+    orch_dream.record_done(world.store, "orch", 0, "en")
+    order, _ = tick_start(world, monkeypatch, {}, lanes=("orch",))
+    assert order == ["foragent/dream-orch", "lock"]
 
 
 @pytest.mark.parametrize("rate_limit", [True, False])

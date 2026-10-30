@@ -6,7 +6,8 @@ then. A dream runs the lane's implementer at tier s in its own worktree on
 ``foragent/dream-<lane>``; it edits only ``.claude/agent-memory/<dir>/`` and may
 propose a cross-project media bundle that the worker copies outside the
 repository. A changed memory becomes a normal PR; an unchanged one makes no
-GitHub call. Only a completed dream (its ``dream-done`` event) resets the lane.
+GitHub call. Only a completed dream (its ``dream-done`` event) resets the lane; a dream
+that opened a PR completes when the tick sees that PR merged.
 """
 
 from __future__ import annotations
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
 
 DREAM_EVERY_MERGES = 10
 DONE = "dream-done"
+# A dream that opened a memory PR is complete only once that PR merges (D95); until then
+# its runs stay counted, and a closed PR lets the lane dream again.
+PUBLISHED = "dream-published"
 
 
 def dream_config(config: Config, lane: str) -> Config:
@@ -45,7 +49,9 @@ def dream_config(config: Config, lane: str) -> Config:
 
 def memory_dir(config: Config, lane: str) -> str:
     """The lane's agent name when the lane sets one (for example fa-orch), else the lane name."""
-    return (config.lanes.get(lane) or {}).get("agent") or lane
+    from foragent import lane_memory
+
+    return lane_memory.memory_dir(config, lane)
 
 
 def memory_path(config: Config, lane: str) -> str:
@@ -58,6 +64,17 @@ def media_root() -> Path:
 
 
 def _done_events(store: StateStore, lane: str) -> list[dict]:
+    return [event for event in _lane_events(store, lane) if event.get("kind") == DONE]
+
+
+def awaiting_pr(store: StateStore, lane: str) -> dict | None:
+    """The lane's latest published dream when no completed dream follows it."""
+    events = _lane_events(store, lane)
+    return events[-1] if events and events[-1].get("kind") == PUBLISHED else None
+
+
+def _lane_events(store: StateStore, lane: str) -> list[dict]:
+    """The lane's completed and published dream events, in journal order."""
     try:
         lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -68,7 +85,7 @@ def _done_events(store: StateStore, lane: str) -> list[dict]:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("kind") == DONE and event.get("lane") == lane:
+        if isinstance(event, dict) and event.get("kind") in {DONE, PUBLISHED} and event.get("lane") == lane:
             events.append(event)
     return events
 
@@ -187,6 +204,20 @@ def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -
         if open_pr is not None:
             report.actions.append(f"lane {lane} dream PR #{open_pr} is open; the lane does not dream")
             continue
+        if (published := awaiting_pr(ctx.store, lane)) is not None:
+            try:
+                merged = {pr.number for pr in ctx.tracker.list_prs("merged", f"foragent/dream-{lane}")}
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    scheduler.orch_github.pause(ctx, exc)
+                report.actions.append(f"lane {lane} dream not started: {' '.join(str(exc).split())[:200]}")
+                return
+            if published.get("pr") in merged:  # The dream completes now; the lane waits for new merges.
+                record_done(ctx.store, lane, int(published.get("memories") or 0), ctx.config.language,
+                            covered_until=datetime.fromisoformat(published["covered_until"]), pr=published["pr"])
+                report.actions.append(f"lane {lane} dream PR #{published['pr']} merged; the dream is complete")
+                continue
+            # Closed without merging: the lane dreams again from the current base.
         # Slot and start conditions again under the machine lock, which is the only lock held: the
         # record is written as an issue start's reservation is, never waiting on the state lock here.
         # A lane no longer admissible (its issue started this tick) gives way to the next due lane.
@@ -230,6 +261,25 @@ def record_done(store: StateStore, lane: str, count: int, language: str, at: dat
         f" Memory PR #{pr} waits for the orchestrator (skills/fa-orchestrator/references/dreams.md)." if pr else "")
     return append_event(store, at, None, DONE, summary, say, lane=lane, memories=count, pr=pr,
                         covered_until=(covered_until or at).astimezone().isoformat())
+
+
+def record_published(store: StateStore, lane: str, count: int, at: datetime, *,
+                     covered_until: datetime, pr: int, inputs: dict, outputs: dict) -> dict:
+    """The dream opened memory PR ``pr``; the lane's dream completes only when it merges.
+
+    ``inputs`` and ``outputs`` digest the memory files the dream read on the base and wrote on
+    its branch; the merge compares them, never Git ancestry, which a rebase rewrites.
+    """
+    summary = (f"Lane {lane} dream opened memory PR #{pr} ({count} memory lines); the dream completes "
+               "when the orchestrator merges it (skills/fa-orchestrator/references/dreams.md).")
+    return append_event(store, at, None, PUBLISHED, summary, lane=lane, memories=count, pr=pr,
+                        covered_until=covered_until.astimezone().isoformat(), inputs=inputs, outputs=outputs)
+
+
+def published_event(store: StateStore, lane: str, pr: int) -> dict | None:
+    """The recorded publication of dream PR ``pr``, with the digests of its inputs and outputs."""
+    found = [event for event in _lane_events(store, lane) if event.get("kind") == PUBLISHED and event.get("pr") == pr]
+    return found[-1] if found else None
 
 
 def run_dream(lane: str, ctx: RunContext) -> int:

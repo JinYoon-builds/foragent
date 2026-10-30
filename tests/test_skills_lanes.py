@@ -6,7 +6,7 @@ import subprocess
 import pytest
 import yaml
 
-from foragent import cli
+from foragent import cli, lane_memory
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
@@ -395,9 +395,10 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     text = (root / ".claude/agents/fa-api.md").read_text()
     header = yaml.safe_load(text.split("---")[1])
     assert header == {"name": "fa-api", "description": 'Foragent lane "api": implements issues in api/**, shared/**.',
-                      "memory": "project", "skills": ["testing-strategy"]}
+                      "skills": ["testing-strategy"]}
     assert "repository's api lane (api/**, shared/**)." in text
-    assert "Record durable, project-specific lessons" in text
+    assert "Append durable, project-specific lessons" in text and ".claude/agent-memory/fa-api/MEMORY.new.md" in text
+    assert lane_memory.migrate_agent(text, "fa-api") == text, "A new lane needs no memory migration"
     expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]

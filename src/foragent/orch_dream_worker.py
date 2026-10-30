@@ -1,4 +1,4 @@
-"""The lane dream worker (#189): one executor turn that tidies the lane's memory."""
+"""The lane dream worker (#189): one executor turn that folds pending lessons into the curated memory."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Any
 
-from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, worktree_path
-from foragent.orch_dream_publish import _dream_worktree, _publish  # noqa: F401
+from foragent.orch_dream import _runs_since, dream_config, last_dream_at, log_path, media_root, memory_path, record_done, record_published, worktree_path
+from foragent.lane_memory import PENDING
+from foragent.orch_dream_publish import _dream_worktree, _publish, fingerprints  # noqa: F401
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -81,6 +82,7 @@ def publish_media(proposal: Path, target: Path, snapshot: str | None) -> str:
 def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]) -> str:
     """Every run of the lane since its last dream (all of them before the first) and the whole bundle."""
     memory = memory_path(config, lane)
+    pending = str(Path(memory).with_name(PENDING))
     media = media_root() / f"{lane}.md"
     since = last_dream_at(store, lane)
     lines = []
@@ -96,17 +98,19 @@ def prompt(store: StateStore, config: Config, lane: str, bundle: dict[Path, str]
                   + "\n".join(f"--- {path} ---\n{content}" for path, content in bundle.items())
                   if bundle else f"The media bundle ({media_root()}/) has no files yet.")
     return f"""You are dreaming for the "{lane}" lane: tidy the lane's memory between work.
-Do not touch code. Do not edit, modify or change code or any file other than {memory} and the media proposal below.
+Do not touch code. Do not edit, modify or change code or any file other than {memory}, {pending} and the media proposal below.
 
-Memory file: {memory} (create it if it is missing).
+Memory file: {memory} (create it if it is missing). You alone curate it.
+Pending lessons: {pending}. Lane workers and people only append new lessons there; it may be missing or empty.
 Decisions: docs/decisions.md is authoritative. Follow docs/decisions.md whenever a lesson disagrees with it.
 
 The lane's runs {scope}:
 {history}
 
 Steps:
-1. Read the run logs and review files listed above. Look at the review findings, the failure reasons and repeated pitfalls.
-2. Add new lessons the runs teach (project-specific patterns, pitfalls, commands) to {memory}.
+1. Read {pending}, then the run logs and review files listed above. Look at the review findings, the failure reasons and repeated pitfalls.
+2. Fold every pending lesson from {pending} into {memory}, and add new lessons the runs teach (project-specific patterns, pitfalls, commands) to {memory}.
+   Then remove from {pending} exactly the lines you folded, from its start; keep any line you did not read. Never move a lesson back.
 3. Remove stale or outdated lessons that the code or the runs no longer support.
 4. Deduplicate: merge duplicate or overlapping lessons into one line.
 5. Resolve contradictions between lessons. Where a lesson conflicts with docs/decisions.md, prefer docs/decisions.md.
@@ -209,8 +213,12 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             count = _changed_lines(before, after)
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")
             # Completed only once the PR exists after the push; a failure here ends the dream as error.
-            pr = _publish(ctx, git, lane, memory, count)
-        record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until, pr=pr)
+            pr = _publish(ctx, git, lane, memory, count, before_files)
+        if pr is None:
+            record_done(store, lane, count, config.language, ctx.now(), covered_until=covered_until)
+        else:  # Not complete yet: the tick records completion once the PR merges.
+            record_published(store, lane, count, ctx.now(), covered_until=covered_until, pr=pr,
+                             inputs=fingerprints(before_files), outputs=fingerprints(_files(memory_dir)))
         final = ("dreamed", f"{count} memory lines tidied.")
         return 0
     except Exception as exc:

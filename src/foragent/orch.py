@@ -528,6 +528,19 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+            if current.head.startswith("foragent/dream-"):
+                from foragent.orch_dream import memory_path, published_event
+                from foragent.orch_dream_publish import memory_moved
+
+                lane = current.head.removeprefix("foragent/dream-")
+                if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
+                    raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
+                                    "dreams again from the base")
+                folder = str(Path(memory_path(ctx.config, lane)).parent)
+                if moved := memory_moved(ctx.git, current.base, current.head, folder,
+                                         published["inputs"], published.get("outputs") or {}):
+                    raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
+                                    "close it and the lane dreams again from the base")
             ci = ctx.tracker.pr_checks(n)
             if ci not in {"pass", "none"}:
                 raise OrchError(f"PR #{n} is not ready: CI {ci}")

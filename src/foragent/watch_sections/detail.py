@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Any
 
+from foragent import lane_memory
 from foragent.config import Config
 from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
@@ -12,7 +13,7 @@ KEEP = True  # A person asked for these details; they stay when the screen is sh
 
 
 def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 0) -> str:
-    """Show lane configuration and exactly the first three memory lines."""
+    """Show lane configuration and the first three lines of the curated and pending memory, each with its path."""
     from foragent import watch
 
     language = config.language
@@ -29,14 +30,22 @@ def render_detail(config: Config, slug: str, repo_root: Path, done_count: int = 
         watch.text("watch_done_count", language, count=done_count),
         watch.text("watch_memory", language) + ":",
     ]
-    agent = lane.get("agent") or f"fa-{slug}"
-    memory = watch.Path(repo_root) / ".claude" / "agent-memory" / agent / "MEMORY.md"
-    try:
-        with memory.open(encoding="utf-8", errors="replace") as stream:
-            lessons = [line.rstrip("\n") for line in watch.islice(stream, 3)]
-    except FileNotFoundError:
-        lessons = []
-    lines.extend(lessons or [watch.text("watch_no_memory", language)])
+    folder = watch.Path(repo_root) / lane_memory.directory(lane_memory.memory_dir(config, slug))
+    shown = False
+    for name, title in ((lane_memory.CURATED, None), (lane_memory.PENDING, "watch_pending_memory")):
+        try:
+            with (folder / name).open(encoding="utf-8", errors="replace") as stream:
+                lessons = [line.rstrip("\n") for line in watch.islice(stream, 3)]
+        except FileNotFoundError:
+            continue
+        if not any(line.strip() for line in lessons):
+            continue
+        if title is not None:
+            lines.append(watch.text(title, language) + ":")
+        lines.extend([*lessons, str((folder / name).absolute())])
+        shown = True
+    if not shown:
+        lines.append(watch.text("watch_no_memory", language))
     return "\n".join(watch._clean(line) for line in lines)
 
 

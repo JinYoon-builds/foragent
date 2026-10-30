@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from foragent import cuts
+from foragent import cuts, lane_memory
 from foragent.git import GitRepo
 from foragent.skills import SkillManager, copy_lane_skills
 
@@ -30,23 +30,46 @@ def lane_notes(
 ) -> tuple[str | None, str]:
     """The lane agent and its instructions and memory, as read from the worktree.
 
-    Memory keeps its 200-line limit; a longer memory ends with the cut notice,
-    linking a full copy under ``full_text_dir`` (or the memory file itself).
+    Memory is the curated MEMORY.md and the pending MEMORY.new.md (D95) in the lane's one memory
+    directory (lane_memory.memory_dir); each keeps the 200-line limit, and a longer one ends with
+    the cut notice, linking a full copy under ``full_text_dir`` (or the memory file itself).
+    A lane without an agent file still gets its memory.
     """
-    settings = _lane_settings(config, lane)
-    agent = settings.get("agent")
-    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
-        return None, ""
-    path = worktree / ".claude/agents" / f"{agent}.md"
-    if not path.is_file():
-        return None, ""
+    memory = _memory_sections(config, lane, worktree, full_text_dir, curated=True)
+    agent = _lane_settings(config, lane).get("agent")
+    path = worktree / ".claude/agents" / f"{agent}.md" if isinstance(agent, str) else None
+    if path is None or not re.fullmatch(r"fa-[a-z0-9-]+", agent) or not path.is_file():
+        return None, ("Lane notes:\n" + memory.strip() + "\n\n" if memory else "")
     body = path.read_text(encoding="utf-8", errors="replace")
-    body = re.sub(r"\A---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
-    memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
-    if memory.is_file():
-        text = memory.read_text(encoding="utf-8", errors="replace")
-        body += "\n\nMemory:\n" + cuts.head_lines(text, 200, full_text_dir, "lane-memory.md", full=memory.absolute())
-    return agent, "Lane notes:\n" + body.strip() + "\n\n"
+    body = re.sub(r"\A\ufeff?---\s*\n.*?\n---[^\S\n]*(?:\n|$)", "", body, count=1, flags=re.DOTALL)
+    return agent, "Lane notes:\n" + (body + memory).strip() + "\n\n"
+
+
+def _memory_folder(config: Config, lane: str, worktree: Path) -> Path | None:
+    if lane not in config.lanes:
+        return None
+    name = lane_memory.memory_dir(config, lane)
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        return None
+    return worktree / lane_memory.directory(name)
+
+
+def _memory_sections(config: Config, lane: str, worktree: Path, full_text_dir: Path | None, *, curated: bool) -> str:
+    """The curated memory (when wanted) and the pending lessons, each cut at 200 lines."""
+    folder = _memory_folder(config, lane, worktree)
+    if folder is None:
+        return ""
+    sections = []
+    for title, name, saved, wanted in (
+        ("Memory", lane_memory.CURATED, "lane-memory.md", curated),
+        ("Pending memory (MEMORY.new.md, not yet curated)", lane_memory.PENDING, "lane-memory-new.md", True),
+    ):
+        path = folder / name
+        text = path.read_text(encoding="utf-8", errors="replace") if wanted and path.is_file() else ""
+        if text.strip():
+            cut = cuts.head_lines(text, 200, full_text_dir, saved, full=path.absolute())
+            sections.append(f"\n\n{title}:\n{cut}")
+    return "".join(sections)
 
 
 # Claude loads only the start of an agent's MEMORY.md (first 200 lines or 25 KB, whichever comes first).
@@ -55,11 +78,23 @@ NATIVE_MEMORY_BYTES = 25 * 1024
 
 
 def lane_memory_notice(config: Config, lane: str, worktree: Path, full_text_dir: Path | None = None) -> str:
-    """For an executor that loads lane memory itself: the cut notice when memory exceeds what it loads."""
+    """For Claude, which reads the lane agent itself: the lane memory it does not load natively.
+
+    The pending lessons always come here. The curated memory comes here too, unless the agent
+    still loads it natively (``memory: project``); then only its cut notice is added.
+    """
     agent = _lane_settings(config, lane).get("agent")
-    if not isinstance(agent, str) or not re.fullmatch(r"fa-[a-z0-9-]+", agent):
-        return ""
-    memory = worktree / ".claude/agent-memory" / agent / "MEMORY.md"
+    definition = worktree / ".claude/agents" / f"{agent}.md" if isinstance(agent, str) else None
+    loaded = (definition is not None and re.fullmatch(r"fa-[a-z0-9-]+", agent) is not None and definition.is_file()
+              and lane_memory.native(definition.read_text(encoding="utf-8", errors="replace")))
+    folder = _memory_folder(config, lane, worktree)
+    notice = _native_cut_notice(folder, full_text_dir) if loaded and folder is not None else ""
+    sections = _memory_sections(config, lane, worktree, full_text_dir, curated=not loaded)
+    return notice + ("\n\nLane memory:" + sections + "\n" if sections else "")
+
+
+def _native_cut_notice(folder: Path, full_text_dir: Path | None) -> str:
+    memory = folder / lane_memory.CURATED
     if not memory.is_file():
         return ""
     text = memory.read_text(encoding="utf-8", errors="replace")
