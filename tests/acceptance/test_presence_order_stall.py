@@ -4,6 +4,7 @@ from datetime import timedelta
 from io import BytesIO, TextIOWrapper
 import json
 import sys
+import fcntl
 
 import pytest
 
@@ -13,7 +14,15 @@ from test_presence_session_start import _cli_argv, session_case  # noqa: F401
 from test_skills_autosync import cli_exit, isolated_home  # noqa: F401
 
 
-def prompt(case, monkeypatch):
+@pytest.fixture(autouse=True)
+def checkout_origin(report_case):
+    # A local origin identity, without Git processes or a real remote.
+    # Establish it before session_case exercises the real init/install path.
+    (report_case.root / ".git/config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:offline/reports.git\n')
+
+
+def prompt(case, monkeypatch, diagnostics=None):
     settings = json.loads(statusline.claude_settings_path().read_text())
     output = []
     for group in settings.get("hooks", {}).get("UserPromptSubmit", []):
@@ -34,12 +43,17 @@ def prompt(case, monkeypatch):
                 assert cli_exit(cli.main, argv) == 0
                 stdout.flush()
                 stderr.flush()
-                assert stderr.buffer.getvalue() == b""
+                error = stderr.buffer.getvalue().decode()
+                if diagnostics is not None and error.strip():
+                    diagnostics.append(error)
                 raw = stdout.buffer.getvalue().decode()
             if raw.strip():
                 value = json.loads(raw)
+                if diagnostics is not None and value.get("systemMessage"):
+                    diagnostics.append(value["systemMessage"])
                 context = value.get("hookSpecificOutput", {})
-                assert context.get("hookEventName") == "UserPromptSubmit"
+                if context:
+                    assert context.get("hookEventName") == "UserPromptSubmit"
                 output.append(context.get("additionalContext", ""))
     return "\n".join(output)
 
@@ -114,7 +128,13 @@ def test_gate_worktrees_and_exactly_sixty_minute_requests_do_not_receive_stalls(
     worktree = case.store.worktree_path(123)
     worktree.mkdir(parents=True, exist_ok=True)
     (worktree / ".foragent.yml").write_bytes((case.root / ".foragent.yml").read_bytes())
+    (worktree / ".git").mkdir()
+    (worktree / ".git/config").write_bytes((case.root / ".git/config").read_bytes())
     case.root = worktree
+    assert old["text"] not in prompt(case, monkeypatch)
+    alias = worktree.parent / "gate-alias"
+    alias.symlink_to(worktree, target_is_directory=True)
+    case.root = alias
     assert old["text"] not in prompt(case, monkeypatch)
 
 
@@ -149,3 +169,76 @@ def test_malformed_timestamp_is_isolated_and_legacy_creation_is_used(session_cas
                updated_at=case.clock[0].isoformat())
     path.write_text(json.dumps(row))
     assert bad["text"] in prompt(case, monkeypatch), "Legacy age comes from creation, not updated_at"
+
+
+@pytest.mark.parametrize("broken", ['{', '[]', '{"seq":"bad"}', '{"seq":1,"status":[]}'])
+@pytest.mark.parametrize("box", ["requests", "questions"])
+def test_corrupt_box_row_cannot_hide_valid_work(session_case, monkeypatch, broken, box):
+    case = session_case
+    valid = stalled(case)
+    (case.store.root / "inbox" / box / "broken.json").write_text(broken)
+    diagnostics = []
+    assert valid["text"] in prompt(case, monkeypatch, diagnostics)
+    assert diagnostics, "A partial read must be distinguishable from a complete empty box"
+
+
+@pytest.mark.parametrize("folder", ["non-project", "mismatched-origin", "copied-origin"])
+def test_global_hook_does_not_leak_a_copied_repo_box(session_case, monkeypatch, folder):
+    case = session_case
+    valid = stalled(case)
+    root = case.root.parent / folder
+    root.mkdir()
+    if folder != "non-project":
+        (root / ".foragent.yml").write_bytes((case.root / ".foragent.yml").read_bytes())
+        (root / ".git").mkdir()
+        origin = "other/project" if folder == "mismatched-origin" else "offline/reports"
+        (root / ".git/config").write_text(f'[remote "origin"]\nurl = https://github.com/{origin}.git\n')
+    case.root = root
+    assert valid["text"] not in prompt(case, monkeypatch)
+    assert case.question["question"] not in prompt(case, monkeypatch)
+
+
+def test_prompt_context_respects_existing_off_switch(session_case, monkeypatch):
+    case = session_case
+    valid = stalled(case)
+    case.configure(presence={"session_start": False})
+    assert valid["text"] not in prompt(case, monkeypatch)
+
+
+def test_installed_prompt_hook_has_deadline_and_never_waits_for_a_writer(session_case, monkeypatch):
+    case = session_case
+    valid = stalled(case)
+    settings = json.loads(statusline.claude_settings_path().read_text())
+    hooks = [hook for group in settings.get("hooks", {}).get("UserPromptSubmit", [])
+             for hook in group.get("hooks", []) if _cli_argv(hook.get("command", ""))]
+    assert hooks, "Existing opted-in installation must gain a prompt hook"
+    assert all(type(hook.get("timeout")) in (int, float) and hook["timeout"] > 0 for hook in hooks)
+
+    def busy(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            return
+        assert operation & fcntl.LOCK_NB, "Prompt delivery cannot wait on a writer lock"
+        raise BlockingIOError("Fixture writer owns the lock")
+
+    monkeypatch.setattr(fcntl, "flock", busy)
+    diagnostics = []
+    context = prompt(case, monkeypatch, diagnostics)
+    assert valid["text"] in context or diagnostics, "Busy state must not masquerade as an empty box"
+
+
+def test_prompt_hook_is_removed_with_foragent_hooks_and_preserves_user_hooks(session_case, monkeypatch):
+    case = session_case
+    path = statusline.claude_settings_path()
+    settings = json.loads(path.read_text())
+    assert any(_cli_argv(hook.get("command", ""))
+               for group in settings.get("hooks", {}).get("UserPromptSubmit", [])
+               for hook in group.get("hooks", [])), "Verify an installed Foragent hook is removed"
+    user = {"type": "command", "command": "user-prompt-observer"}
+    settings.setdefault("hooks", {}).setdefault("UserPromptSubmit", []).append({"hooks": [user]})
+    path.write_text(json.dumps(settings))
+    assert cli_exit(cli.main, ["statusline", "--uninstall"]) == 0
+    after = json.loads(path.read_text())
+    hooks = [hook for group in after.get("hooks", {}).get("UserPromptSubmit", [])
+             for hook in group.get("hooks", [])]
+    assert user in hooks
+    assert not any(_cli_argv(hook.get("command", "")) for hook in hooks)

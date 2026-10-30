@@ -2,11 +2,13 @@
 
 Order ID: `2026-10-31-decisions-stall-overlap-pstack`.
 
-This delivery is an unpublished order, not its implementation. Four independently
-verifiable medium issues use the existing order, view, orch and skills lanes in
+This review updates the published order (#1025–#1028), not its implementation.
+Keep the four published keys and test names. One additional medium notification
+issue uses the view lane because its delivery/configuration files differ.
+The five issues use the existing order, view, orch and skills lanes in
 `repo/.foragent.yml`. No new lane or fixed lane skill is needed. Each lane chooses
-its implementation and any useful on-demand skills. No live issues or running
-acceptance files are changed by preparing this order.
+its implementation and any useful on-demand skills. No live issue, main checkout
+or running acceptance file is changed by this local review.
 
 ## Shared constraints and evidence
 
@@ -55,6 +57,12 @@ link set rather than appending stale markers. The explicit marker, including an
 empty set, is authoritative for that issue. This issue need not add a plan-level
 decisions field as well.
 
+On edits and republication, omission preserves an existing explicit marker;
+an explicit empty list clears the links and remains authoritative over legacy
+fallback. IDs in that field identify ledger headings (`D79`); `D79-1` is a
+subclause citation of D79, not a separate decision. Legacy subclause references
+link the parent heading without matching unrelated D-number prefixes.
+
 Expose `fa decisions --json --repo-root ROOT` as an offline, read-only JSON list.
 Each row has `id`, sorted unique integer `issues`, and `state`. Include every
 decision heading. State is `decided, nothing ordered` when there are no linked
@@ -66,6 +74,15 @@ completion and merge facts through existing snapshot writers; do not add a
 second status file or fetch GitHub from this command. Missing/stale observations
 must remain distinguishable from observed completion.
 
+A current reopened issue is in progress even if an earlier run/PR merged.
+Expose `observed_at` on each row (oldest relevant successful issue observation,
+null if unavailable); command execution must not refresh this time or fabricate
+freshness. State describes the last observations, not live GitHub or semantic
+implementation. A failed refresh retains its last timestamp. Preserve that
+provenance through existing snapshot writers. With no readable ledger, distinguish
+unavailable input from a successfully read empty ledger in the CLI diagnostic;
+the lane decides the presentation. This command never edits a user's ledger.
+
 For older issues without an explicit decision marker, count exact D-number
 mentions in their published `docs/specs/*.md` order spec as links. Associate a
 spec with its issues using the existing plan-child id, parent issue map, or
@@ -73,6 +90,14 @@ published spec reference. An unassociated Markdown file is not a published issue
 link; an ordinary issue title/body mention is not this fallback. D74 must not
 match D740. Repeated citations and multiple associations do not duplicate links.
 Existing plan-child markers and filenames are enough; do not infer similarity.
+
+Legacy prose supplies reference evidence, not implementation intent. Keep the
+requested exact-reference fallback and do not classify mentions into principles
+versus implementation by keywords or a model in a script. The local measurement
+is 35 of 36 headings containing 미구현 cited somewhere in specs (only D90 is
+uncited); that raw citation count is not 35 verified published issue associations.
+Agents receive this limitation when using the nothing-ordered list. This order's
+`Decisions:` prose is rationale, never an automatic explicit decisions list.
 
 Remove hand-written implementation-status suffixes from decision headings,
 including partial/implemented suffixes where present; retain the actual decision
@@ -111,6 +136,30 @@ IDs, full questions, choices and recommendation. Do not rely on the agent seeing
 systemMessage or statusline output. Completed requests and answered questions
 disappear on the next turn. No deduplication that hides still-open work on a later
 turn. Existing heartbeat renewal and presence/session timestamps keep their owners.
+The context also exposes recorded notification-status facts; issue 5 supplies
+those facts through the existing local journal/box without adding human questions.
+
+Box contents are quoted, untrusted data with source/IDs; embedded instructions
+cannot grant approval or override D71. A global hook must not disclose another
+project's box just because its config copies a repo slug or origin: require the
+user-authorized checkout identity established by the existing init/install path,
+and check its origin identity before reading private content. Project-controlled
+config/origin alone is not authorization. Copied settings in another checkout
+and non-project folders receive no private box; the lane decides the trusted
+binding's representation with its existing owner, not a new hook writer.
+No origin identity means no private box injection. Keep planning disabled when
+the existing presence.session_start switch is false. Installing/upgrading through
+the existing opted-in installer adds the prompt hook idempotently; declining or
+uninstalling removes it along with Foragent's other hooks.
+
+Prompt submission must finish within a finite hook deadline even when local state
+is busy/unreadable; no waiting for state writer locks or network. A partial or
+failed read is visibly different from an empty box in hook diagnostics, while
+valid rows still reach context and the user's turn proceeds. Corrupt JSON,
+non-object rows, invalid seq and bad field types are isolated per row. The lane
+decides timeout, diagnostic wording and representation. For oversized boxes,
+bounded delivery may use explicit overflow counts and local retrieval references
+without silently losing pending work; the agent decides relevance and summarization.
 
 Reuse #980's factual age definition: processing for strictly more than 60 minutes;
 age is since the last actual transition into processing, falling back to creation
@@ -175,6 +224,16 @@ candidate. Expose the path, limit, author, reason and expiry in the public plan
 and record the change in the existing event journal. Reasons are opaque
 agent-supplied evidence, not text the command judges. Keep the existing single
 plan writer and the prohibition against the orchestrator replacing a human item.
+
+An overlap edit's expiry applies to the edited file entries, never changes the
+life of an unrelated human queue/width/expiry/file entry, and cannot evade their
+author protection. Without --expires, preserve an existing file expiry or leave
+a new entry without expiry; the public view makes that explicit. This extends
+the current whole-plan expiry interface only for overlap edits. --by records
+cooperative authorship, not an OS authentication boundary. Paths identify concrete
+repository-relative files under the same case policy as file claims: equivalent
+in-root spellings identify the same protected item; escaping the root is refused.
+Do not turn overlap keys into glob policies. The lane decides canonical storage.
 
 Without an applicable live file entry, use existing overlap_per_file as the
 fallback (including today's configured 3); expiration/clear restores that fallback.
@@ -243,6 +302,14 @@ substitute invented content or treat cached README metadata as verified SKILL.md
 bytes. If upstream cannot be fetched there, record the external blocker and keep
 the two already imported skills usable. No implementation download is done here.
 
+An external blocker leaves this issue open; it does not satisfy done_when or
+authorize invented source bytes. Use the existing external-blocker/handoff path
+instead of repeatedly retrying an unavailable fetch. Local vendored libraries
+are read-only to `fa skills sync`: syncing must not pull their enclosing checkout
+or move the pinned sources. Catalog IDs must install the source they advertised
+even with overlapping global/project names; report ambiguity rather than silently
+substituting a skill. The lane decides merge precedence and packaging.
+
 **D79-5 recorded comparison.** Use existing `fa orch scorecard --json`, existing
 run/skill-use records and an adoption note in the normal research/work log. At
 adoption record commit/time, baseline window, sample size, successful/total runs,
@@ -263,6 +330,55 @@ principles with MIT metadata; only the selected principle is installed even on a
 repeat install; attribution is retained; the original two are unchanged and the
 adoption note records a real baseline and a pending comparison boundary.
 
+## 5. Reliable, personal decision notifications — view / m
+
+**Decisions cited:** D36, D41, D71, D76, D80, D95, D98; Jin 2026-10-31.
+
+**Why / root cause.** 255 claude-push failures since 10-28 were reported. The
+CLI resolves origin, but the shared notify.send entry still requires config.repo;
+direct blocked/stopped/silence senders bypass the inspect decision-only policy.
+The CLI also ignores send's False result, reporting success after an outbox failure.
+Jin deliberately disabled pushes because of noise. Missing repository context
+and a missing shared personal policy, rather than message wording, cause these
+failures. No classifier or new notification service is needed.
+
+**Goal.** With config.repo absent, every notify caller resolves the checkout's
+git origin (including linked worktrees and calls from subdirectories), reusing
+the existing GitHub origin parser. An explicit config.repo stays authoritative.
+No usable origin produces an observable failed delivery/CLI nonzero diagnostic,
+never success without an outbox record. Preserve notify: none.
+
+Expose personal `notify_filter: decisions|all` in the existing `me` settings,
+with omitted value preserving the current all policy. In decisions mode only
+currently open D71 questions, merge approvals and order cards may reach pushes.
+Use explicit producer-supplied kinds `question`, `merge`, `order`, `blocked`,
+`orchestrator-stopped`, `silence`, `summary`, `status`; extend the public
+`fa notify --kind KIND` entry. An untyped alert is status in this mode, never
+classified from words. The personal policy is authoritative over project values.
+All shared senders honor it; question/merge/order producers must supply their
+facts and existing open-item/dedup rules remain. Status/digests do not push in
+decisions mode even when their text says “approval”. Keep all mode compatible.
+
+Suppressed blocked, stopped and silence facts reach the next planning turn via
+the existing local journal/box and #1026's context, with event identity/source/time
+and content. They are agent context, not new human questions. Preserve durable
+facts while no planning session is open. Do not consume the person's report
+cursor or drop status records when notify is off. The hook reader remains owned
+by #1026; this issue adds the facts through the existing state owner and tests
+their delivery using that interface. It depends on planning-box-context for that
+interface. The lane decides storage/format and producer migration details.
+
+Do not turn Jin's pushes on. After merge Jin selects decisions and enables the
+channel himself. The opt-in filter preserves existing notification compatibility.
+Close only
+when origin fallback and the personal filter produce the correct actual outbox
+contents through notify's public entry, and a suppressed status fact reaches
+planning context without creating a human question. The all/none compatibility
+cases and failures stay observable. No real push/network is used in tests.
+
+**Out of scope.** Automatically enabling pushes, guessing urgency from words,
+new notification transports, multiuser authentication and status-to-human escalation.
+
 ## Acceptance and review
 
 Each issue's acceptance_files contains the complete proposed Python source.
@@ -280,8 +396,11 @@ mode override; a vendored portable pstack set; seven-day comparison windows.
 These choices are the smallest reading that preserves agent judgment and fixes
 the observed missing context/tooling.
 
-The four issue file sets do not overlap. blocked_by is empty for each: none needs
-another's new interface. Decision IDs cited here are semantic references from the
+The four existing keys and all existing test function names are retained.
+The new notification issue consumes #1026's planning-context interface; its
+blocked_by names that key. Config and notification callers can overlap other
+file sets; existing file admission/merge protection handles this, not invented
+dependency links. Decision IDs cited here are semantic references from the
 person, not new dependencies. D79's old #232 prerequisite already has an existing
 partial-pack mechanism and targeted acceptance tests in this snapshot; do not
 add a stale blocker or query GitHub to rediscover it.
