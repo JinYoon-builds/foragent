@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
-from foragent import board, design
+from foragent import board, design, order_references
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -20,7 +20,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
-from foragent.order_files import issue_body, validate_paths
+from foragent.order_files import check_destinations, issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -259,8 +259,10 @@ def _strings(value, label: str, *, nonempty: bool = False) -> list[str]:
     return value
 
 
-def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
-    _object(plan, {"id", "title", "summary", "spec_markdown", "issues"}, {"new_lanes", "edits"}, "plan")
+def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | bytes]:
+    """Every file the order publishes: text as str, reference images as decoded bytes."""
+    _object(plan, {"id", "title", "summary", "spec_markdown", "issues"},
+            {"new_lanes", "edits", "reference_files"}, "plan")
     for key in ("id", "title", "summary", "spec_markdown"):
         _text(plan[key], f"plan.{key}")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", plan["id"]):
@@ -284,6 +286,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
         raise PlanError("duplicate new_lanes names")
     files = {f"docs/specs/{plan['id']}.md": plan["spec_markdown"]}
     repo_path(root, next(iter(files)))
+    references = order_references.validate(plan, root)
     acceptance = repo_path(root, config.acceptance_dir)
     keys, edits = set(), set()
     for kind in ("issues", "edits"):
@@ -291,12 +294,14 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
             label = f"{kind}[{index}]"
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
-            _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive"}, label)
+            _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
+                                     "references"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files", "exclusive", "references"}, label)
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
             validate_paths(item, root, label)
+            order_references.validate_selection(plan, item, label)
             _strings(item.get("checklist", []), f"{label}.checklist")
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
@@ -332,7 +337,8 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
                 if name in files and files[name] != content:
                     raise PlanError(f"conflicting file contents: {name}")
                 files[name] = content
-            body = issue_body(item, "owner/repo", config.base_branch)
+            body = issue_body(item, "owner/repo", config.base_branch,
+                              references=order_references.selected(plan, item))
             if parse_body(body).done_when_commands != item["done_when"]:
                 raise PlanError(f"{label}.done_when cannot contain Markdown code fences or trailing newlines")
     for kind in ("issues", "edits"):
@@ -342,6 +348,10 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
                     raise PlanError(f"Done when references missing acceptance file: {name}")
                 if name not in files:
                     files[name] = repo_path(root, name).read_text(encoding="utf-8")
+    for name, content in references.items():
+        if name in files and files[name] != content:
+            raise PlanError(f"conflicting file contents: {name}")
+        files[name] = content
     dependencies = {item["key"]: item.get("blocked_by", []) for item in plan["issues"]}
     visiting, visited = set(), set()
 
@@ -360,6 +370,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str]:
 
     for key in dependencies:
         visit(key)
+    check_destinations(root, files)
     return files
 
 
@@ -396,7 +407,7 @@ class PublishReport:
         return "\n".join(lines)
 
 
-def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str],
+def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
                    manager: SkillManager | None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
     for lane in plan.get("new_lanes", []):
@@ -412,10 +423,11 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             if pending:
                 git.commit_paths(pending, f"Foragent lane {lane['name']}")
     for name, content in files.items():
+        data = content.encode("utf-8") if isinstance(content, str) else content
         path = repo_path(root, name)
-        if not path.exists() or path.read_text(encoding="utf-8") != content:
+        if not path.exists() or path.read_bytes() != data:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            path.write_bytes(data)
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
@@ -529,7 +541,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     recorded_blobs = saved_blobs.copy()
 
     def acceptance_blobs(item: dict) -> dict[str, str]:
-        referenced = set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+        # Reference files an issue relies on revoke its approval when they change, like its tests.
+        referenced = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+                      | set(order_references.selected(plan, item)))
         return {name: published_blobs[name] for name in sorted(referenced)}
 
     def parent_body() -> str:
@@ -550,7 +564,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
-        body = issue_body(item, repo, config.base_branch, config.acceptance_dir) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+        body = (issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+                + "\n" + _child_marker(plan["id"], item["key"]) + "\n")
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
@@ -588,10 +603,11 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = issue_body(item, repo, config.base_branch, config.acceptance_dir)
+        body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
         blobs = acceptance_blobs(item)
-        referenced = set(blobs)
-        revision = body_hash(body + json.dumps({name: files[name] for name in sorted(referenced)}, sort_keys=True))
+        revision = body_hash(body + json.dumps({
+            name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
+            for name in sorted(blobs)}, sort_keys=True))
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
         prior = any(c.body == comment for c in tracker.list_comments(number))
@@ -631,7 +647,7 @@ def edit_view(item: dict, issue, config: Config) -> dict:
             "interactive": "interactive" in issue.labels, "edit": True}
 
 
-def preread_prompt(plan: dict, item: dict) -> str:
+def preread_prompt(plan: dict, item: dict, root: Path | None = None) -> str:
     """What the implementer would receive, asked read-only for its unknowns."""
     commands = "\n".join(item.get("done_when", []))
     tests = "".join(f"\n### {path}\n```\n{content}\n```\n"
@@ -643,6 +659,8 @@ def preread_prompt(plan: dict, item: dict) -> str:
     lanes = json.dumps(plan.get("new_lanes", []), ensure_ascii=False, sort_keys=True)
     heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
                else f"# Issue {item['key']}: {item['title']}")
+    # Selected reference text inline; images as absolute paths into the preread snapshot.
+    references = order_references.preread_section(plan, item, root) if root is not None else ""
     return (
         "You will implement the issue below later. Do not implement it now and do not change any file.\n"
         "Read the issue and the repository read-only, then list every unknown: a question whose answer\n"
@@ -662,7 +680,7 @@ def preread_prompt(plan: dict, item: dict) -> str:
         f"## Done when\n```sh\n{commands}\n```\n\n"
         f"## Checklist\n{checklist}\n\n"
         f"## Acceptance tests (locked){tests}"
-    )
+    ) + (f"\n{references}" if references else "")
 
 
 def preread_target(plan: dict, item: dict, config: Config, root: Path):
@@ -674,7 +692,7 @@ def preread_target(plan: dict, item: dict, config: Config, root: Path):
     from foragent.run_implementation import implementer_setup, lane_config
 
     setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
-    prompt = setup.notes + preread_prompt(plan, item) + setup.memory_notice
+    prompt = setup.notes + preread_prompt(plan, item, root) + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
@@ -730,9 +748,14 @@ def preread(plan: dict, root: Path, config: Config,
     for item in items:
         setup, prompt, digest = preread_target(plan, item, config, root)
         log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
-        result = executor_for(setup.executor).run(
-            worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
-            log_path=log, read_only=True, **setup.options)
+        # Readers see approved references only in this ignored snapshot, never at their destination.
+        snapshot = order_references.materialize(plan, item, root)
+        try:
+            result = executor_for(setup.executor).run(
+                worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+                log_path=log, read_only=True, **setup.options)
+        finally:
+            order_references.remove(snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)

@@ -12,15 +12,25 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
   "issues": [{"key": "login", "title": "Login API", "goal": "...", "out_of_scope": "...",
     "done_when": ["uv run pytest tests/acceptance/test_login.py"], "checklist": [],
     "lane": "api", "size": "m", "interactive": false, "blocked_by": [], "files": ["src/api/**"],
-    "acceptance_files": {"tests/acceptance/test_login.py": "..."}}],
+    "acceptance_files": {"tests/acceptance/test_login.py": "..."},
+    "references": ["docs/design/login/HANDOFF.md"]}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
-    "checklist": [], "files": [], "acceptance_files": {}}]
+    "checklist": [], "files": [], "acceptance_files": {}, "references": []}],
+  "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
+    "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
+      "base64": "<encoded image bytes>"}}
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
-files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.'''
+files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.
+reference_files carries approved design artifacts, published in the same commit as the spec and
+tests. Keys are normalized repository paths under docs/design/ (no absolute paths, .., symlinks).
+Text files are strings; png, jpg (jpeg) and gif images are objects with exactly "path" (equal to
+the key) and "base64" (strict base64). Each file may be at most 1048576 bytes (1 MiB), counted as
+UTF-8 text bytes or decoded image bytes. "references" on an issue or edit selects reference files
+for its ## References links and preread; omit it for all reference files, [] selects none.'''
 
 
 def _comma_keys(value: str) -> list[str]:

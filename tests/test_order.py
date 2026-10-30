@@ -1377,3 +1377,111 @@ def test_context_supplies_open_and_merged_pr_history(tmp_path):
         (pending, "open", False), (ours, "merged", True), (human, "merged", False)]
     assert [pr["title"] for pr in prs] == ["Open work", "Lane work", "Human docs"]
     assert all(pr["merged_at"] for pr in prs[1:]) and prs[0]["merged_at"] is None
+
+
+def test_reference_image_extension_rejects_plain_string_and_matches_case_insensitively(tmp_path):
+    import base64
+
+    from foragent import order_references
+
+    with pytest.raises(order.PlanError, match="path and base64"):
+        order_references.validate({"reference_files": {"docs/design/a/shot.PNG": "not an object"}}, tmp_path)
+    name = "docs/design/a/shot.JPEG"
+    data = b"\xff\xd8\xff\xd9"
+    files = order_references.validate(
+        {"reference_files": {name: {"path": name, "base64": base64.b64encode(data).decode()}}}, tmp_path)
+    assert files == {name: data}
+
+
+def test_preread_reference_snapshot_holds_only_selected_files_and_is_removed_after_reader(
+    publishing, plan, monkeypatch,
+):
+    import base64
+
+    root, config = publishing[0], publishing[1]
+    image = "docs/design/a/shot.gif"
+    plan["reference_files"] = {"docs/design/a/HANDOFF.md": "keep",
+                               image: {"path": image, "base64": base64.b64encode(b"GIF89a").decode()}}
+    for item in plan["issues"]:
+        item["references"] = [image]
+    snapshots = root / ".foragent/preread-references"
+    seen = []
+
+    class Reader:
+        def run(self, **kwargs):
+            seen.append(sorted(p.relative_to(snapshots).as_posix().split("/", 1)[1]
+                               for p in snapshots.rglob("*") if p.is_file()))
+            return SimpleNamespace(exit_code=0, timed_out=False, last_message="NONE")
+
+    monkeypatch.setattr(order, "executor_for", lambda name: Reader())
+    order.preread(plan, root, config)
+    assert seen == [[image]] * len(plan["issues"])
+    assert not any(snapshots.iterdir()) and not (root / image).exists()
+
+
+@pytest.mark.parametrize("names", [
+    ["docs/design/a", "docs/design/a/HANDOFF.md"],
+    ["docs/design/a/HANDOFF.md", "docs/design/a"],
+])
+def test_conflicting_reference_destinations_are_rejected_before_any_write(publishing, plan, names, monkeypatch):
+    root, config, tracker, git, events = publishing
+    plan["reference_files"] = {name: "approved" for name in names}
+    monkeypatch.setattr(order, "executor_for", lambda name: pytest.fail("no reader may start"))
+    with pytest.raises(order.PlanError, match="conflicting published paths: docs/design/a "):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    with pytest.raises(order.PlanError, match="conflicting published paths"):
+        order.preread(plan, root, config)
+    assert events == [] and not (root / "docs").exists()
+    assert not (root / ".foragent/preread-references").exists()
+
+
+@pytest.mark.parametrize("existing", ["directory", "file-ancestor", "dangling-ancestor", "symlink"])
+def test_reference_destination_blocked_on_disk_is_rejected_before_any_write(publishing, plan, existing):
+    root, config, tracker, git, events = publishing
+    name = "docs/design/a/HANDOFF.md"
+    (root / "docs/design").mkdir(parents=True)
+    if existing == "directory":
+        (root / name).mkdir(parents=True)
+    elif existing == "file-ancestor":
+        (root / "docs/design/a").write_text("a file")
+    elif existing == "dangling-ancestor":
+        (root / "docs/design/a").symlink_to(root / "missing")
+    else:
+        (root / "docs/design/a").mkdir()
+        (root / name).symlink_to(root / "docs/design/target.md")
+    plan["reference_files"] = {name: "approved", "docs/design/b.md": "other"}
+    with pytest.raises(order.PlanError, match="docs/design/"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert events == [] and not (root / "docs/design/b.md").exists()
+    assert not (root / f"docs/specs/{plan['id']}.md").exists()
+
+
+def test_acceptance_destination_that_is_a_directory_is_rejected_before_any_write(publishing, plan):
+    root, config, tracker, git, events = publishing
+    name = next(iter(plan["issues"][0]["acceptance_files"]))
+    (root / name).mkdir(parents=True)
+    with pytest.raises(order.PlanError, match="existing directory"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert events == [] and not (root / f"docs/specs/{plan['id']}.md").exists()
+
+
+def test_preread_snapshot_is_removed_when_materializing_fails(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from foragent import order_references
+
+    plan = {"reference_files": {"docs/design/a/one.md": "1", "docs/design/b/two.md": "2"}}
+    real = Path.write_bytes
+    calls = []
+
+    def failing(self, data):
+        calls.append(self)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", failing)
+    with pytest.raises(OSError):
+        order_references.materialize(plan, {}, tmp_path)
+    snapshots = tmp_path / order_references.SNAPSHOTS
+    assert len(calls) == 2 and (not snapshots.exists() or not any(snapshots.iterdir()))
