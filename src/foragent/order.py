@@ -295,8 +295,12 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references"}, label)
+                                     "references", "statements"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "statements"}, label)
+            if "statements" in item:
+                _strings(item["statements"], f"{label}.statements", nonempty=True)
+                if any("\n" in line or "\r" in line for line in item["statements"]):
+                    raise PlanError(f"{label}.statements items must each be a single line")
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
@@ -344,10 +348,15 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
     for kind in ("issues", "edits"):
         for item in plan.get(kind, []):
             for name in acceptance_paths(item["done_when"], config.acceptance_dir):
-                if name not in files and not repo_path(root, name).is_file():
+                if name in files:
+                    continue
+                if not repo_path(root, name).is_file():
+                    # A statement issue's tests are written in preparation; publication refuses
+                    # it until they are reviewed, so a draft may name tests not written yet.
+                    if "statements" in item:
+                        continue
                     raise PlanError(f"Done when references missing acceptance file: {name}")
-                if name not in files:
-                    files[name] = repo_path(root, name).read_text(encoding="utf-8")
+                files[name] = repo_path(root, name).read_text(encoding="utf-8")
     for name, content in references.items():
         if name in files and files[name] != content:
             raise PlanError(f"conflicting file contents: {name}")
@@ -528,15 +537,18 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
+    require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
+    # Statement issues take the reviewed-tests route instead of preread.
     new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
     require_clean_preread(plan, root, config, [
         *(item for item in plan["issues"]
-          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
-          or (new_numbers and item["key"] not in mapping)),
+          if "statements" not in item
+          and (approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
+               or (new_numbers and item["key"] not in mapping))),
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
-          if approve or item["number"] in selected_numbers),
+          if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
@@ -816,6 +828,22 @@ def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[lis
 
 NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent and skills exist, "
                   "then run fa order preread PLAN.json and publish again with --approve")
+
+
+def require_reviewed_tests(plan: dict) -> None:
+    """A statement issue is published only with tests its lane wrote and an independent reviewer passed.
+
+    The ``statements`` field selects this route for good, even once acceptance_files exist.
+    No reviewed-tests record is read or written here yet, so every statement issue is refused.
+    """
+    keys = [item["key"] for item in plan["issues"] if "statements" in item]
+    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" in item]
+    if keys:
+        raise PlanError(
+            f"cannot publish: statement issue(s) {', '.join(keys)} have no reviewed tests; "
+            "prepare them with fa order prepare PLAN.json so the lane writes the tests and the "
+            "configured reviewer reviews them, then publish again (fa order publish PLAN.json "
+            "--dry-run still previews the plan)")
 
 
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:
