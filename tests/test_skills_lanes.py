@@ -932,3 +932,51 @@ def test_catalog_follows_directory_symlinks_without_looping(library, tmp_path, l
     (outside / "skills/linked/loop").symlink_to(source, target_is_directory=True)
     copies = {item["name"]: item["copies"] for item in manager.catalog()}
     assert copies == {"testing-strategy": ["engineering/skills/testing-strategy"], "linked": [expected]}
+
+
+def _vendored(base, names=("principle-demo",)):
+    for name in names:
+        (base / "skills" / name).mkdir(parents=True)
+        (base / "skills" / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Pinned.\n---\nBody.\n")
+        (base / "skills" / name / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    (base / "skills/stray").mkdir(parents=True)
+    (base / "skills/stray/SKILL.md").write_text("---\nname: stray\ndescription: Not listed.\n---\n")
+    (base / "skills/pstack").mkdir(parents=True)
+    (base / "skills/pstack/library.yml").write_text(yaml.safe_dump({
+        "name": "pstack", "repo": "https://example.invalid/plugins", "revision": "abc123",
+        "skills": {name: f"pstack/skills/{name}/SKILL.md" for name in names}}))
+
+
+def test_vendored_library_prefers_project_then_installed_package_data(tmp_path, monkeypatch):
+    from foragent import skills
+
+    data = tmp_path / "data"
+    _vendored(data / "share/foragent")
+    monkeypatch.setattr(skills.sysconfig, "get_path", lambda name: str(data))
+    project = tmp_path / "project"
+    _vendored(project, ("principle-local",))
+    assert skills.vendored_library(project)["path"] == str(project)
+    entry = skills.vendored_library(tmp_path / "elsewhere")
+    assert entry["path"] == str(data / "share/foragent") and entry["revision"] == "abc123"
+    config = skills.with_vendored_library(Config(skill_libraries=[]), tmp_path / "elsewhere")
+    catalog = SkillManager(config).catalog()
+    assert [(row["id"], row["license"], row["copies"]) for row in catalog] == [
+        ("pstack:principle-demo", "MIT", ["skills/principle-demo"])]
+    configured = Config(skill_libraries=[{"name": "pstack", "repo": "x", "path": str(tmp_path)}])
+    assert skills.with_vendored_library(configured, project) is configured
+
+
+def test_sync_never_pulls_pinned_or_self_sourced_libraries(tmp_path, monkeypatch):
+    from foragent import skills
+
+    _vendored(tmp_path / "base")
+    local = tmp_path / "local"
+    local.mkdir()
+    config = Config(skill_libraries=[{"name": "local", "repo": str(local), "path": str(local)},
+                                     {"name": "remote", "repo": "https://example.invalid/r", "path": str(local)}])
+    commands = []
+    manager = SkillManager(skills.with_vendored_library(config, tmp_path / "base"),
+                           run=lambda args: commands.append(args) or "")
+    assert manager.sync() == ["remote"]
+    assert commands == [["git", "-C", str(local), "pull", "--ff-only"]]
+    assert manager._select("pstack:principle-demo").library.revision == "abc123"

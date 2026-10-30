@@ -89,7 +89,8 @@ def test_roles_need_approval_and_missing_source_leaves_no_registration(pack, tmp
     assert not path.exists() and not SkillManager().libraries_dir.exists()
 
 
-def test_approval_is_idempotent_and_preserves_settings_and_other_roles(pack, capsys):
+def test_approval_is_idempotent_and_preserves_settings_and_other_roles(pack, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # The catalog adds the project's vendored library; count only this pack.
     source, path, marker = pack
     write_config(path, language="ko", tiers={"s": {"claude_model": "small"}},
                  skill_roles={"other:existing": "tool"})

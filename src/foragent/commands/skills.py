@@ -25,8 +25,11 @@ def add(commands) -> None:
 
 
 def run(args) -> int:
+    from foragent.skills import with_vendored_library
+
     cli = facade()
-    manager = cli.SkillManager(cli.load_global_config())
+    root = args.repo_root.resolve() if getattr(args, "repo_root", None) else cli.Path.cwd()
+    manager = cli.SkillManager(with_vendored_library(cli.load_global_config(), root))
     if args.action == "sync":
         print("Synced: " + ", ".join(manager.sync()))
     elif args.action in {"catalog", "add"}:
