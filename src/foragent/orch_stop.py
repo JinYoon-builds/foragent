@@ -80,8 +80,8 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
         raise OrchError(text("orch_stop_why_required", language))
     with _tick_lock(ctx, n):
         run = ctx.store.get_run(n)
-        # The same rule as fa orch park and the status row (#435); a record without
-        # any process is running there too, so the kill path finishes it here.
+        # The same rule as fa orch park (#435); a record without any process is
+        # running there too, so the kill path finishes it here.
         if not run_is_live(run):
             raise OrchError(text("orch_stop_not_running", language, n=n))
         if (unsafe := unsafe_target(run)) is not None:

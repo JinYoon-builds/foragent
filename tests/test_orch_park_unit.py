@@ -123,18 +123,23 @@ def test_park_status_and_stop_agree_a_live_run_is_running(ctx, monkeypatch):
 
 
 def test_park_status_and_stop_agree_a_dead_run_is_not_running(ctx, monkeypatch):
-    """#435: a running label and record whose processes are all gone is not running anywhere."""
-    from foragent import orch_stop
+    """#435: stop, park and the status row agree a record whose processes are all gone is not running.
+
+    The status active_runs list still keeps the running record after park removes approved,
+    so a view can mark the gone worker ("no worker") instead of hiding the run.
+    """
+    from foragent import orch_stop, status
     from foragent.scheduler_stop import run_is_live
 
     _running(ctx, monkeypatch, alive=False, labels=("running", "approved"))
     assert not run_is_live(ctx.store.get_run(1))
-    assert _status_state(ctx) != "working"
     ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
     with pytest.raises(OrchError, match="not running"):
         orch_stop.stop(ctx, 1, "stuck")
     orch_park.park(ctx, 1, "wait")
     assert "approved" not in ctx.tracker.get_issue(1).labels
+    assert _status_state(ctx) != "working"
+    assert [run["number"] for run in status.collect(ctx.store, ctx.config, START)["active_runs"]] == [1]
 
 
 def test_park_status_and_stop_agree_a_record_without_processes_is_running(ctx, monkeypatch):
@@ -159,11 +164,13 @@ def test_park_status_and_stop_agree_a_record_without_processes_is_running(ctx, m
     assert stopped == [1]
 
 
-def test_status_active_runs_drop_a_run_whose_processes_are_gone(ctx, monkeypatch):
+def test_status_active_runs_keep_a_run_whose_processes_are_gone(ctx, monkeypatch):
+    """Defect class: a view filter hiding a running record. Neither liveness nor labels drop it."""
     from foragent import status
 
-    _running(ctx, monkeypatch, alive=False)
-    assert status.collect(ctx.store, ctx.config, START)["active_runs"] == []
+    _running(ctx, monkeypatch, alive=False, labels=())
+    assert status.collect(ctx.store, ctx.config, START)["active_runs"][0]["number"] == 1
+    assert _status_state(ctx) != "working"  # The row follows run_is_live; the list keeps the record.
 
 
 def _live_with(ctx, monkeypatch, rows, *, pid=42000, pgid=None, identities=((42000, 5.0),)):
@@ -215,3 +222,15 @@ def test_the_original_executor_group_after_its_leader_exits_is_running(ctx, monk
 def test_a_runner_without_a_birth_identity_is_running_while_present(ctx, monkeypatch):
     assert _live_with(ctx, monkeypatch, [(42000, 1, 42000, 42000, 99.0)], identities=())
     assert not _live_with(ctx, monkeypatch, [], identities=())
+
+
+def test_status_lane_fallback_for_an_unlisted_run_follows_the_shared_rule(ctx, monkeypatch):
+    """The local-run fallback (an issue missing from the listing) uses run_is_live too."""
+    from foragent.status import collect_lanes
+
+    _running(ctx, monkeypatch, alive=False, labels=())
+    lanes, summary = collect_lanes([], {}, {}, ctx.store, ctx.config, START)
+    assert lanes["main"]["state"] != "working" and summary["working"] == 0
+    _running(ctx, monkeypatch, alive=True, labels=())
+    lanes, summary = collect_lanes([], {}, {}, ctx.store, ctx.config, START)
+    assert lanes["main"]["state"] == "working" and summary["working"] == 1

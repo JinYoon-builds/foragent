@@ -47,8 +47,6 @@ def _reason(row: dict[str, Any]) -> str | None:
 
 def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     """Build the shared status JSON from local records only."""
-    from foragent.scheduler_stop import run_is_live
-
     observation = store.issues_observation()
     rows = store.local_issues()
     states = {row["number"]: row["state"] for row in rows}
@@ -78,8 +76,9 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        # Dreams hold no issue; a run is active by the one running rule (#435).
-        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue" and run_is_live(run)],
+        # Dreams hold no issue. This lists every running record with its pid, whatever its
+        # labels or worker, so a view can show a gone worker; working rows follow run_is_live.
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -153,13 +152,13 @@ def collect_lanes(
         lane_row(slug)
     for issue in issues:
         run = store.get_run(issue.number)
-        active = run_is_live(run)  # The same rule as fa orch stop and fa orch park.
+        active = run_is_live(run)  # The same rule as fa orch stop and fa orch park (#435), labels aside.
         slug = run.lane if active else issue_lane(issue.labels, config.lanes)
         row = lane_row(slug)
         group, item = grouped[issue.number]
         if group in {RUNNING, READY}:
             row[group].append(item)
-        # A running label without a live run record and worker is stale, not working.
+        # A running label without a live run is stale, not working.
         state = issue_state(set(issue.labels) - {RUNNING}, active, group)
         if state is None:
             continue

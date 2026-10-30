@@ -110,7 +110,9 @@ def runner_alive(run: Run, exists=None) -> bool | None:
 
 
 def run_is_live(run: Run | None) -> bool:
-    """The one "is this issue running" rule for fa orch stop, fa orch park and the status row.
+    """The one "is this issue running" rule for fa orch stop, fa orch park and the status row (#435).
+
+    The status active_runs list still keeps every running record, so a view can mark a gone worker.
 
     A run record that is running while a process it recorded is still the same process:
     a recorded PID or executor group counts only with its recorded start time (a reused
