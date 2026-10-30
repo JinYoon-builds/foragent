@@ -14,11 +14,14 @@ _CHECKLIST_LINE = re.compile(r"- \[[ xX]\] #\d+\b.*")
 
 
 def parent_summary(body: str) -> str:
-    """The summary section of a Foragent order parent: no checklist, no plan marker."""
+    """The summary section of a Foragent order parent: no checklist, no plan or owner-label marker."""
     if not _PLAN_MARKER.search(body):
         return ""
+    from foragent.ownership import OWNED_MARKER
+
     text = _PLAN_MARKER.sub("", body)
-    lines = [line for line in text.splitlines() if not _CHECKLIST_LINE.fullmatch(line.strip())]
+    lines = [line for line in text.splitlines()
+             if not _CHECKLIST_LINE.fullmatch(line.strip()) and line.strip() != OWNED_MARKER]
     return "\n".join(lines).strip()
 
 
