@@ -1,6 +1,6 @@
 ---
 name: fa-design-session
-description: Guide design mode in the planning session when the user wants to choose a visual direction, compare references or refine UI work. Start with a short design interview, open the research pack for the medium, build a local reference board, compare running drafts in the real medium, and leave an implementation handoff for the orchestrator.
+description: Guide design mode in the planning session when the user wants to choose a visual direction, compare references or refine UI work. Start with a short design interview, open the research pack for the medium, build a local reference board, compare running drafts in the real medium, leave an implementation handoff, and continue with fa-order in the same planning session.
 ---
 
 # fa-design-session
@@ -151,11 +151,13 @@ board server. It leaves draft sources, reference assets and picks available for
 later work. Draft application servers remain owned by the planning session;
 stop those explicitly when finished with them.
 
-Pass the handoff to the orchestrator with
-`fa orch request --from planning --text "Implement docs/design/<topic>/HANDOFF.md"`.
-This records a durable request; it does not publish or approve issues. The
-orchestrator reads the handoff, splits it into lane issues with visual Done when
-checks, and uses the normal order approval workflow. The user normally does not
-talk to the implementing worker: the draft and handoff provide the needed
-context. Keep later changes in the handoff and the order rather than requiring
-repeated explanations to workers.
+Then continue with fa-order (`skills/fa-order/SKILL.md`) in this same planning session.
+Put `HANDOFF.md`, the drafts, prototype sources and approved screenshots of the chosen
+draft in the plan's `reference_files` under `docs/design/<topic>/`, so they are published
+with the order and given to preread; visual issues select them with `references`.
+Third-party reference images stay in local state. Planning splits the handoff into lane
+issues with visual Done when checks and uses the normal first-hand order approval. Do not
+relay the handoff to the orchestrator with `fa orch request`. The user normally does not
+talk to the implementing worker: the draft and handoff provide the needed context. Keep
+later changes in the handoff and the order rather than requiring repeated explanations to
+workers.

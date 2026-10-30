@@ -217,6 +217,11 @@ establish the foundation and rebuild once the direction is known. Include
 `fa design lint` in visual issues' Done when checks, alongside accessibility and flow E2E.
 Carry the selected draft's run instructions and the same screen as the draft into
 visual Done when evidence so implementing workers can reproduce the agreed result.
+Put the approved drafts, runnable prototypes, `HANDOFF.md` and screenshots of the chosen
+draft in the plan's `reference_files` under `docs/design/<topic>/`, so they are published
+with the spec and given to preread. Visual issues point to the files they need with
+`references`; omitting it selects all reference files and `[]` selects none. Keep
+third-party research images local.
 
 ## 3. Restate and confirm
 Before splitting, give the session's summary in a few lines: the person's problem, what
