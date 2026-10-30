@@ -1043,6 +1043,118 @@ def test_preread_reads_and_gates_approved_edits(publishing, plan, monkeypatch):
     assert "approved" in tracker.get_issue(3).labels
 
 
+class _Proposing(_NoUnknowns):
+    reply = "APPROACH: Reuse the writer.\nDECIDE: Name the helper while implementing."
+
+    def run(self, **kwargs):
+        from foragent.executors import ExecResult
+
+        self.calls.append(kwargs)
+        return ExecResult(0, False, self.reply, kwargs["log_path"])
+
+
+def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishing, plan, monkeypatch):
+    from foragent.order_files import issue_body
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    rows = order.preread(plan, root, config)
+    assert rows[0] == {"key": "api", "unknowns": [], "decisions": ["Name the helper while implementing."],
+                       "approach": ["Reuse the writer."]}
+    item = plan["issues"][0]
+    body = issue_body(item, "owner/repo", "main") + "\n" + order._child_marker(plan["id"], "api") + "\n"
+    approved = {FILE: order._blob(item["acceptance_files"][FILE].encode())}
+    proposal = order.lane_proposal(root, 7, body, approved)
+    assert proposal["approach"] == ["Reuse the writer."]
+    assert proposal["decisions"] == ["Name the helper while implementing."]
+    other = issue_body(plan["issues"][1], "owner/repo", "main") + order._child_marker(plan["id"], "api") + "\n"
+    assert order.lane_proposal(root, 7, other, {}) is None, "another issue's content is not this proposal"
+    assert order.lane_proposal(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), approved) is None
+    changed = issue_body({**item, "goal": item["goal"] + " Also more."}, "owner/repo", "main")
+    assert order.lane_proposal(root, 7, changed + order._child_marker(plan["id"], "api"), approved) is None
+    fenced = issue_body({**item, "exclusive": ["api/**"]}, "owner/repo", "main")
+    assert order.lane_proposal(root, 7, fenced + order._child_marker(plan["id"], "api"), approved) is None
+
+
+def test_preread_of_changed_acceptance_tests_never_replaces_the_approved_handoff(publishing, plan, monkeypatch):
+    """Approval binds the acceptance files; a preread of other test contents is not the approved proposal."""
+    from foragent.order_files import issue_body
+
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    approved = {FILE: order._blob(item["acceptance_files"][FILE].encode())}
+    body = issue_body(item, "owner/repo", "main") + "\n" + order._child_marker(plan["id"], "api") + "\n"
+    _proposals(root, config, plan, [("s", "APPROACH: Approved plan.")])
+    changed = deepcopy(plan)
+    changed["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
+    _proposals(root, config, changed, [("s", "APPROACH: Plan for other tests.")])
+    assert order.lane_proposal(root, 7, body, approved)["approach"] == ["Approved plan."]
+    other = {FILE: order._blob(b"assert 1 == 1\n")}
+    assert order.lane_proposal(root, 7, body, other)["approach"] == ["Plan for other tests."]
+
+
+def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, monkeypatch):
+    from foragent.order_files import issue_body
+
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:l", "lane:api"])
+    edit = {"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
+            "checklist": [], "acceptance_files": {}}
+    plan["issues"], plan["edits"] = [], [edit]
+    worker = _Proposing()
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    order.preread(plan, root, config, lambda: tracker)
+    body = issue_body(edit, "owner/repo", "main")
+    assert order.lane_proposal(root, 3, body, {})["approach"] == ["Reuse the writer."]
+    assert order.lane_proposal(root, 4, body, {}) is None
+
+
+def _proposals(root, config, plan, replies):
+    """Preread the plan once per (summary, reply); a summary change gives a new digest, same issue content."""
+    for summary, reply in replies:
+        worker = _Proposing()
+        worker.reply = reply
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(order, "executor_for", lambda name: worker)
+            order.preread({**plan, "summary": summary}, root, config)
+
+
+APPROVED_API = {FILE: hashlib.sha1(b"blob 12\0assert True\n").hexdigest()}
+
+
+def test_preread_proposal_handover_follows_the_latest_write_even_within_one_second(publishing, plan):
+    from foragent.order_files import issue_body
+
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    body = issue_body(item, "owner/repo", "main") + order._child_marker(plan["id"], "api") + "\n"
+    first, second = "APPROACH: First plan.", "APPROACH: Second plan.\nDECIDE: Second choice."
+    _proposals(root, config, plan, [("one", first), ("two", second)])
+    assert order.lane_proposal(root, 7, body, APPROVED_API)["approach"] == ["Second plan."]
+    # Prereading the first digest again makes it the latest, although its key already exists.
+    _proposals(root, config, plan, [("one", "APPROACH: Third plan.")])
+    proposal = order.lane_proposal(root, 7, body, APPROVED_API)
+    assert proposal["approach"] == ["Third plan."] and proposal["decisions"] == []
+    # A newer answer with nothing to propose replaces the older proposal instead of reviving it.
+    _proposals(root, config, plan, [("two", "NONE")])
+    assert order.lane_proposal(root, 7, body, APPROVED_API) is None
+    _proposals(root, config, plan, [("three", "DECIDE: Only a choice.")])
+    proposal = order.lane_proposal(root, 7, body, APPROVED_API)
+    assert proposal["decisions"] == ["Only a choice."] and proposal["approach"] == []
+
+
+def test_preread_proposal_reaches_fresh_and_resumed_implementation_prompts(publishing, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".foragent").mkdir(parents=True)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    content = hashlib.sha256(order._issue_text(body).encode()).hexdigest()
+    (repo / order.PREREAD_FILE).write_text(json.dumps({"d": {
+        "key": "#1", "plan": "p", "content": content, "acceptance": {}, "unknowns": [],
+        "approach": ["Reuse the writer."], "decisions": ["Name the helper later."]}}))
+    seen = _implementation_setup(tmp_path, publishing[1], "main", "m", monkeypatch, real_prompts=True)
+    for prompt in (seen["prompt"], seen["resume_prompt"]):
+        assert prompt.count("Your lane's earlier plan") == 1
+        assert "- Reuse the writer." in prompt and "- Name the helper later." in prompt
+
+
 @pytest.mark.parametrize("change", ["blocked_by", "interactive", "new_lanes"])
 def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publishing, plan, change):
     config, item = publishing[1], plan["issues"][1]
@@ -1056,7 +1168,7 @@ def test_preread_evidence_follows_dependency_interactive_and_lane_changes(publis
     assert order.preread_target(plan, item, config, publishing[0])[2] != before
 
 
-def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
+def _implementation_setup(tmp_path, config, lane, size, monkeypatch, real_prompts=False):
     """What the runner's first implementation attempt passes to the executor."""
     from foragent import run_implementation, runner
 
@@ -1077,14 +1189,16 @@ def _implementation_setup(tmp_path, config, lane, size, monkeypatch):
     store.save_approval(1, body=body, body_sha="x", acceptance_blobs={}, approved_by="human",
                         approved_at=BASE_TIME.isoformat())
     store.start_run(1, branch="b", worktree=tmp_path / "w", lane=lane)
-    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME)
+    ctx = SimpleNamespace(config=run_implementation.lane_config(config, lane), store=store, now=lambda: BASE_TIME,
+                          repo_root=tmp_path / "repo")
     attempt = SimpleNamespace(n=1, ctx=ctx, worktree=tmp_path / "repo", log=tmp_path / "log", rebuilt=False,
                               size=size, options={}, missing_skills=[], native_claude=ctx.config.executor == "claude",
                               parsed=parse_body(body), baseline=None, executor=None,
                               approval=store.load_approval(1), review_feedback=False,
                               issue=SimpleNamespace(labels=set()))
-    monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
-    monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
+    if not real_prompts:
+        monkeypatch.setattr(run_implementation, "build_prompt", lambda *a, **kw: "PROMPT")
+        monkeypatch.setattr(run_implementation, "build_resume_prompt", lambda *a, **kw: "RESUME")
     with pytest.raises(Stop):
         run_implementation._implement(attempt, "")
     return seen

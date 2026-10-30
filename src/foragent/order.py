@@ -712,9 +712,82 @@ def _unknowns(message: str) -> list[str]:
     return unknowns
 
 
+def _tagged(message: str, tag: str) -> list[str]:
+    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
+            if re.match(rf"(?i)^{tag}:", line)]
+
+
 def _decisions(message: str) -> list[str]:
-    return [re.sub(r"(?i)^DECIDE:\s*", "", line) for line in _preread_lines(message)
-            if re.match(r"(?i)^DECIDE:", line)]
+    return _tagged(message, "DECIDE")
+
+
+def _approach(message: str) -> list[str]:
+    return _tagged(message, "APPROACH")
+
+
+_LINK_LINE = re.compile(r"\[[^\]\n]+\]\(https://github\.com/[^)\s]+\)")
+_CHILD_LINE = re.compile(r"<!-- foragent:plan-child id=(\S+) key=(\S+) -->")
+
+
+def _issue_text(body: str) -> str:
+    """The approved issue text without per-repository links and the plan-child marker.
+
+    Those lines name the repository and base branch, which preread does not know; the
+    acceptance files they point to are bound separately by their blob hashes.
+    """
+    lines = [line for line in body.replace("\r\n", "\n").splitlines()
+             if not _LINK_LINE.fullmatch(line.strip()) and not _CHILD_LINE.fullmatch(line.strip())]
+    return "\n".join(lines).strip()
+
+
+def _blob(data: bytes) -> str:
+    """Git's blob hash of a file's content, as stored in approval snapshots."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _binding(item: dict, root: Path, config: Config) -> dict:
+    """What approval binds for this item: the issue text and its acceptance files' contents."""
+    text = _issue_text(issue_body(item, "preread/preread", config.base_branch, config.acceptance_dir))
+    blobs = {}
+    for path in sorted(set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))):
+        if path in item.get("acceptance_files", {}):
+            blobs[path] = _blob(item["acceptance_files"][path].encode("utf-8"))
+        elif (root / path).is_file():
+            blobs[path] = _blob((root / path).read_bytes())
+        else:
+            blobs[path] = "missing"
+    return {"content": hashlib.sha256(text.encode("utf-8")).hexdigest(), "acceptance": blobs}
+
+
+def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str]) -> dict | None:
+    """The latest preread proposal recorded for this issue's approved snapshot, if any.
+
+    A record counts only when its key names this issue (plan child key in the same order,
+    or an edit of #n), its issue text equals the approved body's, and every acceptance file
+    the approval snapshot recorded has the content the preread saw. The preread writer keeps
+    records in write order, so the last match is the latest answer; when that answer
+    proposed nothing (NONE or questions only), there is no proposal to hand over.
+    """
+    try:
+        records = _preread_records(root)
+    except PlanError:
+        return None
+    content = hashlib.sha256(_issue_text(body).encode("utf-8")).hexdigest()
+    child = _CHILD_LINE.search(body)
+    latest = None
+    for record in records.values():
+        if not isinstance(record, dict) or record.get("content") != content:
+            continue
+        seen = record.get("acceptance")
+        if not isinstance(seen, dict) or any(
+                path in acceptance_blobs and acceptance_blobs[path] != sha for path, sha in seen.items()):
+            continue
+        if record.get("key") == f"#{n}" or (
+                child is not None and record.get("plan") == child[1] and record.get("key") == child[2]):
+            latest = record
+    if latest is None or not (latest.get("approach") or latest.get("decisions")):
+        return None
+    return latest
 
 
 def preread(plan: dict, root: Path, config: Config,
@@ -756,12 +829,18 @@ def preread(plan: dict, root: Path, config: Config,
         unknowns = _unknowns(result.last_message)
         records = _preread_records(root)
         decisions = _decisions(result.last_message)
-        records[digest] = {"key": item["key"], "unknowns": unknowns, "decisions": decisions,
+        approach = _approach(result.last_message)
+        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
+        records.pop(digest, None)
+        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(item, root, config),
+                           "unknowns": unknowns, "decisions": decisions, "approach": approach,
                            "at": datetime.now(UTC).isoformat(timespec="seconds")}
         temporary = root / (PREREAD_FILE + ".tmp")
         temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, root / PREREAD_FILE)
-        results.append({"key": item["key"], "unknowns": unknowns} | ({"decisions": decisions} if decisions else {}))
+        results.append({"key": item["key"], "unknowns": unknowns}
+                       | ({"decisions": decisions} if decisions else {})
+                       | ({"approach": approach} if approach else {}))
     return results
 
 

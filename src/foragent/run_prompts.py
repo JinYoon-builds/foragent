@@ -83,6 +83,17 @@ def parent_section(parent_context: str) -> str:
     return f"This issue is part of a larger order. Its shared outcome and constraints:\n{parent_context}"
 
 
+def lane_plan_section(approach: list[str], decisions: list[str]) -> str:
+    """The lane's own read-only preread proposal for the approved content, handed back to it."""
+    lines = ["Your lane's earlier plan (your read-only preread before approval; "
+             "follow it unless the repository shows a better way):"]
+    if approach:
+        lines += ["Approach:", *(f"- {line}" for line in approach)]
+    if decisions:
+        lines += ["Decisions you said you would settle yourself:", *(f"- {line}" for line in decisions)]
+    return "\n".join(lines)
+
+
 def moved_files_section(moved_files: list[str]) -> str:
     return ("The base branch moved or split files this branch edits (old -> new). "
             "Carry your edits to the new locations so none are orphaned:\n"
@@ -141,6 +152,7 @@ def build_prompt(
     full_text_dir: Path | None = None,
     moved_files: list[str] | None = None,
     procedure: str | None = None,
+    lane_plan: str = "",
 ) -> str:
     from foragent import runner
 
@@ -196,6 +208,8 @@ def build_prompt(
     )
     if procedure is not None:
         prompt += "\n" + procedure
+    if lane_plan:
+        prompt += "\n" + lane_plan + "\n"
     if previous_attempt:
         prompt += "\nPrevious attempt (from local records):\n" + previous_attempt + "\n"
     if reviewer_text is not None:
@@ -241,6 +255,7 @@ def build_resume_prompt(
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
     merge_conflicts: list[str] | None = None, review_feedback: bool = False, retry_default: bool = False,
     moved_files: list[str] | None = None, parent_context: str = "", procedure: str | None = None,
+    lane_plan: str = "",
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
     reviewer_text, orchestrator_hint = _without_notes(reviewer_text, orchestrator_hint)
@@ -248,6 +263,9 @@ def build_resume_prompt(
     if parent_context:
         # Always restated: the session may predate a newly read or re-approved parent text.
         parts.append(parent_section(parent_context))
+    if lane_plan:
+        # Always restated: a newer preread and approval may replace the plan the session saw.
+        parts.append(lane_plan)
     if previous_body is not None and previous_body != body:
         old, new = previous_body.splitlines(), body.splitlines()
         for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
