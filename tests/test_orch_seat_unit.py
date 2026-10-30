@@ -6,6 +6,7 @@ import json
 import pytest
 
 from foragent import orch_seat, processes
+from foragent.config import Config
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
@@ -167,7 +168,7 @@ def test_ensure_reports_seat_when_only_the_lease_stops_it(store, monkeypatch, tm
     monkeypatch.setattr(orch_spawn, "_session_alive", lambda store, root: False)
     assert orch_ensure.skip_reason(tmp_path, store, NOW) == "seat"
     why = []
-    assert orch_ensure.ensure_explicit(tmp_path, store, None, NOW, why) is None
+    assert orch_ensure.ensure_explicit(tmp_path, store, Config(), NOW, why) is None
     assert why == ["seat"] and (store.root / "orch-silent-note.json").is_file()
 
 
@@ -236,5 +237,5 @@ def test_ensure_inside_lock_seat_stop_writes_the_silent_event(store, monkeypatch
 
     monkeypatch.setattr(orch_ensure, "_explicit_lock", explicit_lock)
     why = []
-    assert orch_ensure.ensure_explicit(tmp_path, store, None, NOW, why) is None
+    assert orch_ensure.ensure_explicit(tmp_path, store, Config(), NOW, why) is None
     assert why == ["seat"] and len(silent_events(store)) == 1

@@ -240,8 +240,8 @@ def _ensure(args, store, config) -> None:
     root = args.repo_root.resolve()
     now = cli.datetime.now(cli.UTC)
     reason = orch_ensure.skip_reason(root, store, now)
-    if reason == "seat":  # #962: only the live lease stopped it, so the hourly event is due.
-        orch_ensure.note_silent(store, now, reason)
+    if reason is not None:  # The gate's silence step: rearm, or the hourly note and the #952 push.
+        orch_spawn.observe_silence(root, store, config, now, reason)
     if reason is None:
         why = []
         screen = orch_spawn.ensure_orchestrator(root, store, config, now=now, spacing=False, why=why)

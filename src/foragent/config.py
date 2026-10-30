@@ -78,6 +78,8 @@ class Config:
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
+    # A live orchestrator silent this long pushes once per silence episode (#952); 0 turns the push off.
+    orch_silent_alert_minutes: int = 30
     # `fa orch refresh-due`: either threshold (inclusive) makes a fresh orchestrator session due.
     orch_refresh_compactions: int = 4
     orch_refresh_hours: int = 24
