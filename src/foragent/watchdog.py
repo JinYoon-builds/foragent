@@ -46,19 +46,23 @@ def decide(facts: Facts) -> str:
     return "silent" if silent else "running"
 
 
-def stopped_check_kind(stop: str | None, run_elapsed: float, config) -> str:
+def stopped_check_kind(stop: str | None, silence_age: float | None, run_elapsed: float, config) -> str:
     """The run's kind for a check the watchdog stopped, decided with the run's own facts.
 
-    The check was silent (or reached its own safety net); the run's elapsed time is then
-    measured against the run's safety net and runtime limit, so decide()'s precedence holds:
-    a run past its safety net restarts, even when the check itself stopped as silent.
+    The check's silence age is measured against the run's silence window, and the run's
+    elapsed time against the run's safety net and runtime limit, so decide()'s precedence
+    holds: a run past its safety net restarts even when the check stopped as silent, and a
+    check silent for less than the run's window keeps its own kind instead of becoming a
+    runtime-limit. A stop with no recorded age is read as silent for the whole window.
     """
     from foragent.config import safety_net_seconds
 
-    return decide(Facts(silence_age=1, window_seconds=1,
+    window, _ = silence_window(config)
+    kind = decide(Facts(silence_age=float("inf") if silence_age is None else silence_age, window_seconds=window,
                         elapsed=float("inf") if stop == "safety-net" else run_elapsed,
                         safety_net=safety_net_seconds(config), cpu_known=True,
                         runtime_limit=runtime_limit_seconds(config)))
+    return (stop or "silent") if kind == "running" else kind
 
 
 def silence_window(config) -> tuple[float, str]:
@@ -90,6 +94,7 @@ class Decision:
     cpu_known: bool
     kind: str  # decide()'s kind
     outcome: str | None  # outcome_for(kind)
+    silence_age: float = 0.0  # Since the latest output, progress or tree CPU growth: what decide() read.
 
     def facts(self) -> dict:
         return asdict(self)
@@ -161,7 +166,8 @@ class SilenceWatchdog:
                             self.safety_net, cpu_known, self.runtime_limit))
         logged = "running" if kind == "running" else "safety-net" if kind == "safety-net" else "silent"
         self.last = Decision(kind != "running", logged, now - self.last_output_at, cpu_delta, self.window_seconds,
-                             self.window_source, grew, cpu_known, kind, outcome_for(kind))
+                             self.window_source, grew, cpu_known, kind, outcome_for(kind),
+                             now - self.last_activity_at)
         return self.last
 
     def state(self) -> dict:

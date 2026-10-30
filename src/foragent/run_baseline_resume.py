@@ -218,6 +218,7 @@ def capture_failure(result: CheckResult, message: str) -> AttemptFailure:
     failure = AttemptFailure(message)
     if result.timed_out:
         failure.watchdog_kind = result.stop or "silent"
+        failure.watchdog_silence_age = result.silence_age
     return failure
 
 

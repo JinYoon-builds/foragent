@@ -71,14 +71,32 @@ def after_check(n: int, ctx: RunContext, checks: list) -> None:
     ``outcome_for``, never by an implementation retry; every failure gathered so far is
     kept for the next run.
     """
-    from foragent import watchdog
-
     _progress(n, ctx)
     check = checks[-1] if checks else None
     if check is None or not check.timed_out:
         return
-    kind = watchdog.stopped_check_kind(getattr(check, "stop", None), _elapsed(n, ctx), ctx.config)
+    kind = run_kind(n, ctx, getattr(check, "stop", None), getattr(check, "silence_age", None))
     end_by_watchdog(n, ctx, kind, checks, f"The watchdog stopped a check ({kind}): {check.command}")
+
+
+def run_kind(n: int, ctx: RunContext, stop: str | None, silence_age: float | None) -> str:
+    """The run's kind for a stopped check; a kind the run's facts change is logged as a fact row."""
+    import json
+
+    from foragent import watchdog
+
+    elapsed = _elapsed(n, ctx)
+    kind = watchdog.stopped_check_kind(stop, silence_age, elapsed, ctx.config)
+    if kind != stop:
+        window, source = watchdog.silence_window(ctx.config)
+        row = {"decision": "safety-net" if kind == "safety-net" else "silent", "kind": kind,
+               "outcome": watchdog.outcome_for(kind), "check_kind": stop, "silence_age": silence_age,
+               "window_seconds": window, "window_source": source, "run_elapsed": elapsed}
+        log = ctx.store.log_path(n)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row) + "\n")
+    return kind
 
 
 def end_by_watchdog(n: int, ctx: RunContext, kind: str, checks: list, detail: str):

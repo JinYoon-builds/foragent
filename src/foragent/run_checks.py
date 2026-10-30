@@ -45,6 +45,7 @@ class CheckResult:
     seconds: float | None = None
     result_gaps: tuple[float, ...] = ()  # The watchdog's measured gaps between results (#435).
     stop: str | None = None  # The watchdog's kind when it stopped the check.
+    silence_age: float | None = None  # The silence the watchdog measured when it stopped the check.
 
 
 def _append(log: Path, text: str) -> None:
@@ -95,8 +96,9 @@ def _check(
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
     tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    stop = watch.last.kind if timed_out and watch.last is not None and watch.last.stop else None
-    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps, stop)
+    decided = watch.last if timed_out and watch.last is not None and watch.last.stop else None
+    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None, watch.result_gaps,
+                       decided and decided.kind, decided and decided.silence_age)
 
 
 def _pytest_command(command: str) -> str | None:

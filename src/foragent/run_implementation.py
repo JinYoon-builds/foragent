@@ -27,7 +27,7 @@ from foragent.run_parent import parent_context
 from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
-from foragent.run_waits import _elapsed, _phase, _timeout, end_by_watchdog
+from foragent.run_waits import _phase, _timeout, end_by_watchdog, run_kind
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -214,8 +214,7 @@ def capture_acceptance_baseline(
 def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception | None = None) -> None:
     """The #327 stop: no merge without a usable protected set."""
     if (kind := getattr(cause, "watchdog_kind", None)) is not None:  # Stopped by the watchdog (#435).
-        from foragent import watchdog
-        end_by_watchdog(n, ctx, watchdog.stopped_check_kind(kind, _elapsed(n, ctx), ctx.config), [], detail)
+        end_by_watchdog(n, ctx, run_kind(n, ctx, kind, getattr(cause, "watchdog_silence_age", None)), [], detail)
     _append(ctx.store.log_path(n), detail)
     reason = Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
     flag(ctx, n, reason, "acceptance baseline unavailable", detail)

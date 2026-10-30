@@ -50,11 +50,34 @@ def test_outcome_for_maps_each_stopping_kind():
 
 
 # A stopped check is decided with the run's own facts: safety net > runtime limit > silent.
-@pytest.mark.parametrize("stop,elapsed,kind", [
-    (None, 60, "silent"), ("silent", 6001, "runtime-limit"), ("silent", 86400, "safety-net"),
-    ("safety-net", 60, "safety-net")])
-def test_a_stopped_check_is_decided_with_the_run_facts(stop, elapsed, kind):
-    assert stopped_check_kind(stop, elapsed, Config()) == kind
+@pytest.mark.parametrize("stop,age,elapsed,kind", [
+    (None, None, 60, "silent"), ("silent", 600, 6001, "runtime-limit"), ("silent", 600, 86400, "safety-net"),
+    ("safety-net", 0, 60, "safety-net"), ("silent", 599, 6001, "silent")])
+def test_a_stopped_check_is_decided_with_the_run_facts(stop, age, elapsed, kind):
+    assert stopped_check_kind(stop, age, elapsed, Config()) == kind
+
+
+def test_a_check_silent_for_less_than_the_run_window_is_not_a_runtime_limit():
+    config = Config(silence_minutes=60, max_runtime_minutes=90)
+    assert stopped_check_kind("silent", 600, 110 * 60, config) == "silent"
+    assert stopped_check_kind("silent", 3600, 110 * 60, config) == "runtime-limit"
+
+
+def test_a_kind_the_run_promotes_is_logged_as_a_fact_row(tmp_path):
+    log = tmp_path / "issue-1.log"
+    started = datetime(2026, 10, 30, tzinfo=UTC)
+    run = SimpleNamespace(started_at=started.isoformat(), waited_seconds=0, slept_seconds=0,
+                          talk_pause_seconds=lambda now: 0)
+    run_ctx = SimpleNamespace(config=Config(max_runtime_minutes=90), now=lambda: started + timedelta(minutes=110),
+                              store=SimpleNamespace(log_path=lambda n: log, get_run=lambda n: run))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(run_waits, "_with_open_talk", lambda run, now: run)
+        assert run_waits.run_kind(1, run_ctx, "silent", 599) == "silent"
+        assert not log.exists(), "An unchanged kind adds no row"
+        assert run_waits.run_kind(1, run_ctx, "silent", 600) == "runtime-limit"
+    row = json.loads(log.read_text())
+    assert (row["decision"], row["kind"], row["outcome"], row["check_kind"], row["silence_age"],
+            row["run_elapsed"]) == ("silent", "runtime-limit", "killed", "silent", 600, 6600)
 
 
 def test_window_source_follows_whether_silence_minutes_is_set():
