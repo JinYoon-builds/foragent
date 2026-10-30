@@ -96,8 +96,9 @@ def reinstall_case(git_history, tmp_path, monkeypatch, *, project_name="foragent
     head = update_pr_tree(case, pr, head, files)
     merge = case.tracker.merge_pr
 
-    def merged(number, *, expected_head_sha, method="squash"):
-        result = merge(number, expected_head_sha=expected_head_sha, method=method)
+    def merged(number, *, expected_head_sha, method="squash", expected_base_sha=None):
+        result = merge(number, expected_head_sha=expected_head_sha, method=method,
+              **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
         # FakeTracker records the merge; also make origin's merged base contain it.
         git_command(case.history.origin, "update-ref", "refs/heads/main", expected_head_sha)
         case.history.tip = expected_head_sha

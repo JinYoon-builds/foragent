@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from test_orch_review_handoff import bind_cli, make_case
+from test_order_machine_budget import fake_workloads  # noqa: F401
 from test_skills_autosync import cli_exit, isolated_home
 
 
@@ -190,8 +191,16 @@ def assert_questions(payload, calls, *, failed=0):
 
 
 @pytest.mark.parametrize("risk_map_present", [True, False], ids=["with-risk-map", "without-risk-map"])
-def test_order_perspectives_default_seats_run_in_parallel_read_only(perspectives_case, capsys, risk_map_present):
+def test_order_perspectives_default_seats_run_in_parallel_read_only(perspectives_case, capsys, risk_map_present, monkeypatch):
     case = perspectives_case
+    # Parallelism is required when capacity is available, not beyond the machine budget.
+    from datetime import UTC, datetime
+    from foragent import capacity
+    monkeypatch.setattr(capacity, 'machine_root', lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, 'machine_load', lambda: ('normal', .5))
+    monkeypatch.setattr(capacity, 'kernel_pressure', lambda: 'normal')
+    (case.store.root.parent / 'machine.yml').write_text('max_parallel: 7\n')
+    capacity.write_state(case.store, len(SEATS), datetime.now(UTC))
     if risk_map_present:
         (case.root / ".foragent-risks.yml").write_text(RISK_MAP, encoding="utf-8")
     # All six calls must enter before any returns. A sequential implementation

@@ -107,13 +107,14 @@ def short_case(publish_case, monkeypatch):
 
     merge = case.tracker.merge_pr
 
-    def merge_into_main(pr, *, expected_head_sha, method="squash"):
+    def merge_into_main(pr, *, expected_head_sha, method="squash", expected_base_sha=None):
         assert case.holder == case.active, "The final merge must hold merge.lock"
         assert case.green_heads.get(pr) == expected_head_sha, "CI must pass on the merged head"
         assert case.tracker.pr_head_sha(pr) == expected_head_sha
         assert checks(pr) == "pass", "A previous head's green CI cannot authorize this merge"
         advance(2)
-        merge(pr, expected_head_sha=expected_head_sha, method=method)
+        merge(pr, expected_head_sha=expected_head_sha, method=method,
+              **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
         # FakeTracker records GitHub metadata; also advance the real offline
         # origin so the other runner must actually refresh its base.
         git_command(case.history.origin, "update-ref", "refs/heads/main", expected_head_sha)

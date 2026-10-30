@@ -196,10 +196,11 @@ def test_retry_restores_saved_files_before_implementer_and_squashes_on_merge(
 
     original_merge = case.tracker.merge_pr
 
-    def github_merge(pr, *, expected_head_sha, method="squash"):
+    def github_merge(pr, *, expected_head_sha, method="squash", expected_base_sha=None):
         merge_methods.append(method)
         merged_heads.append(expected_head_sha)
-        original_merge(pr, expected_head_sha=expected_head_sha, method=method)
+        original_merge(pr, expected_head_sha=expected_head_sha, method=method,
+              **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
         # FakeTracker records the request; model GitHub's squash in the local
         # bare origin so main's actual ancestry and tree can also be inspected.
         _import_commit(case.history.origin, "refs/heads/main", case.base,
