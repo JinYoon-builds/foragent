@@ -370,7 +370,8 @@ def _implement(
     ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier})
     full_text_dir = cuts.issue_dir(ctx.store.root, n)
     setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
-    model, notes = setup.model, setup.notes
+    # An issue assignment's model (D80), stored at start, wins over the lane and tier model.
+    model, notes = run.executor_model or setup.model, setup.notes
     # Effort and agent belong to this turn's tier; a tier without effort means the executor default.
     options = {**attempt.options, **setup.options}
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)

@@ -89,7 +89,8 @@ def test_roles_need_approval_and_missing_source_leaves_no_registration(pack, tmp
     assert not path.exists() and not SkillManager().libraries_dir.exists()
 
 
-def test_approval_is_idempotent_and_preserves_settings_and_other_roles(pack, capsys):
+def test_approval_is_idempotent_and_preserves_settings_and_other_roles(pack, capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # The catalog adds the project's vendored library; count only this pack.
     source, path, marker = pack
     write_config(path, language="ko", tiers={"s": {"claude_model": "small"}},
                  skill_roles={"other:existing": "tool"})
@@ -107,7 +108,7 @@ def test_approval_is_idempotent_and_preserves_settings_and_other_roles(pack, cap
     output = capsys.readouterr().out
     assert "Role\tRuns scripts\tCopies" in output and "domain\tyes" in output
     assert cli.main(["skills", "catalog", "--json"]) == 0
-    assert len(json.loads(capsys.readouterr().out)) == 2
+    assert len([row for row in json.loads(capsys.readouterr().out) if not row["id"].startswith("pstack:")]) == 2
     # Every selector resolves the same shared copy, including previously exposed tool IDs.
     for alias in ("polish", "origin:polish", "origin:.codex/polish"):
         selected = manager._select(alias)
