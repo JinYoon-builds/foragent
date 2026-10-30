@@ -104,9 +104,8 @@ def _envelope(message: str) -> dict | None:
     return None
 
 
-def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, protected: tuple[Path, ...],
-           before: dict | None = None) -> dict:
-    """Facts of one writer attempt: what it wrote, what was refused, and the resulting status."""
+def _failure(result, config: Config) -> dict | None:
+    """Why the writer did not finish normally (usage limit, timeout, nonzero exit), else None."""
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     if result.error_kind == "limit":
         return {"status": "waiting", "reason": say("prepare_limit")}
@@ -114,6 +113,17 @@ def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, pro
         return {"status": "interrupted", "reason": say(
             "prepare_failed", code=result.exit_code, timeout=", timed out" if result.timed_out else "",
             log=result.log_path)}
+    return None
+
+
+def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dict, config: Config,
+           protected: tuple[Path, ...], before: dict | None = None) -> dict:
+    """Facts of one writer attempt: what it wrote, what was refused, and the resulting status.
+
+    The tree is always inspected, also when the writer failed or stopped (``failure``): an
+    offending path is a QUESTION either way, and partial candidates are kept as facts only.
+    """
+    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     candidates, refused, ignored = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
     written, questions = {}, [say("prepare_refused_path", path=name, directory=config.acceptance_dir)
                               for name in refused]
@@ -122,12 +132,15 @@ def _judge(result, tree: Path, git: GitRepo, manifest: dict, config: Config, pro
             written[name] = data.decode("utf-8")
         except UnicodeDecodeError:
             questions.append(say("prepare_not_text", path=name))
-    reply = _envelope(result.last_message or "")
-    facts = {"written": written, "refused": refused, "ignored": ignored,
-             "done_when": reply["done_when"] if reply else []}
-    questions += reply["questions"] if reply else []
+    facts = {"written": written, "refused": refused, "ignored": ignored, "done_when": []}
     if questions:
         return facts | {"status": "question", "questions": questions, "reason": say("prepare_question")}
+    if failure is not None:
+        return facts | failure
+    reply = _envelope(result.last_message or "")
+    facts["done_when"] = reply["done_when"] if reply else []
+    if reply and reply["questions"]:
+        return facts | {"status": "question", "questions": reply["questions"], "reason": say("prepare_question")}
     if reply is None:
         return facts | {"status": "interrupted", "reason": say("prepare_bad_reply")}
     differ = sorted(name for name in written.keys() | reply["acceptance_files"].keys()
@@ -162,8 +175,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     entry = entries.setdefault(item["key"], {"key": item["key"], "holds": 0, "attempts": []})
     attempt = len(entry["attempts"]) + 1
     home = path.parent / _slug(plan["id"]) / _slug(item["key"].lstrip("#"))
-    for old in home.glob("attempt-*") if home.is_dir() else []:
-        order_scratch.remove(old)  # a new attempt supersedes earlier trees; their bytes stay recorded
+    # Earlier attempts' trees stay for inspection; each attempt gets its own new tree.
     tree, log = home / f"attempt-{attempt}" / "tree", home / f"attempt-{attempt}" / "writer.log"
     facts = {"attempt": attempt, "role": "writer", "started_at": _now(), "base_revision": base,
              "scratch": str(tree), "log": str(log)}
@@ -172,20 +184,21 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
                  updated_at=facts["started_at"], base_revision=base, scratch=str(tree))
     _write(path, record)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
-    outcome = {"status": "interrupted", "reason": say("prepare_stopped")}
+    failure = {"status": "interrupted", "reason": say("prepare_stopped")}
+    manifest = before = result = protected = None
     try:
         # One resolution feeds the tree, the setup, the prompt and the permissions.
         lane_config, overlay = setup.lane_context(plan, item, config, root)
-        manifest = order_scratch.build(git, base, tree, overlay | _references(plan, item))
-        start = setup.writer_setup(lane_config, item, tree)
         # Writes must never reach the checkout, its Git directory or this command's state.
         protected = order_scratch.protected(git, root, path.parent.parent)
+        manifest = order_scratch.build(git, base, tree, overlay | _references(plan, item))
+        start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)
         facts.update(executor=start.executor, model=start.model, options=start.options,
                      skills_missing=start.missing_skills)
         if start.missing_skills:
-            outcome = {"status": "waiting", "reason": say("prepare_missing_skills", skills=", ".join(start.missing_skills))}
+            failure = {"status": "waiting", "reason": say("prepare_missing_skills", skills=", ".join(start.missing_skills))}
             return
         _write(path, record)
         prompt = start.notes + writer_prompt(plan, item, lane_config, root, tree, base) + start.memory_notice
@@ -193,10 +206,16 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
         result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
                                                   timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
-        outcome = _judge(result, tree, git, manifest, config, protected, before)
+        failure = _failure(result, config)
     except (GitError, OSError, ValueError) as exc:
-        outcome = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
+        failure = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
     finally:
+        # Whatever stopped the writer, its tree is inspected once it exists.
+        try:
+            outcome = failure if manifest is None else _judge(
+                result, failure, tree, git, manifest, config, protected, before)
+        except (GitError, OSError, ValueError) as exc:
+            outcome = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
         facts.update(outcome, finished_at=_now())
         entry.update(status=outcome["status"], questions=outcome.get("questions", []),
                      reason=outcome["reason"], updated_at=facts["finished_at"],

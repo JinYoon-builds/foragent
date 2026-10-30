@@ -9,18 +9,45 @@ difference is reported by path so it can become a question, never silently dropp
 from __future__ import annotations
 
 import hashlib
-import io
 import os
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
-import tarfile
 
 from foragent.git import GitError, GitRepo
 
-# Test collection configuration: a new one under the acceptance directory changes how
-# every existing test there runs, so it is shared configuration, not an issue's own test.
-SHARED_TEST_CONFIG = frozenset({"conftest.py", "__init__.py", "pytest.ini"})
+# Files test runners and build tools discover by directory, so a new one under the acceptance
+# directory changes how existing tests there run: shared configuration, never an issue's test.
+# Beyond these names, `<x>.config.<ext>` / `<x>.conf.<ext>` files, any dot-named file or
+# directory, and any name a tracked file has in a directory above the acceptance directory
+# (the repository's own configuration files) count as well.
+SHARED_TEST_CONFIG = frozenset({
+    "conftest.py", "__init__.py", "pytest.ini", "pyproject.toml", "setup.cfg", "setup.py", "tox.ini",
+    "noxfile.py", "package.json", "tsconfig.json", "jsconfig.json", "deno.json", "deno.jsonc",
+    "bunfig.toml", "cargo.toml", "go.mod", "go.work", "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts", "gemfile", "rakefile", "composer.json", "phpunit.xml",
+    "phpunit.xml.dist", "makefile", "cmakelists.txt", "build", "build.bazel", "workspace", "justfile",
+})
+_CONFIG_NAME = re.compile(r".+\.(?:config|conf)\.[A-Za-z0-9]+")
+
+
+def shared_configuration(name: str, acceptance_dir: str, above: set[str], *, directories: bool = True) -> bool:
+    """Whether a path inside the acceptance directory is configuration other tests share.
+
+    Without ``directories`` a dot-named folder on the way does not count (tool caches).
+    """
+    parts = PurePosixPath(name).relative_to(PurePosixPath(acceptance_dir.strip("/"))).parts
+    base = parts[-1].lower()
+    return (base in SHARED_TEST_CONFIG or base in above or bool(_CONFIG_NAME.fullmatch(base))
+            or base.startswith(".") or directories and any(part.startswith(".") for part in parts))
+
+
+def _names_above(manifest: dict, acceptance_dir: str) -> set[str]:
+    """Names of tracked files in the directories above the acceptance directory, lower-cased."""
+    inside = PurePosixPath(acceptance_dir.strip("/"))
+    above = {str(parent) for parent in inside.parents} | {"."}
+    return {PurePosixPath(name).name.lower() for name in manifest if str(PurePosixPath(name).parent) in above}
 
 
 def blob(data: bytes) -> str:
@@ -37,44 +64,43 @@ def base_revision(git: GitRepo, branch: str) -> str:
         return git.ref_sha(f"refs/heads/{branch}")
 
 
-def _manifest(git: GitRepo, base: str) -> dict[str, tuple[str, str]]:
-    entries = {}
-    for entry in git._call(["ls-tree", "-r", "-z", "--full-tree", base]).split("\0"):
-        if not entry:
-            continue
-        metadata, name = entry.split("\t", 1)
-        mode, kind, sha = metadata.split()
-        if kind == "blob":
-            entries[name] = (mode, sha)
-    return entries
+def _remove_path(path: Path) -> None:
+    """Remove a file, link or directory without following any symlink."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
 
 
-def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes]) -> dict[str, tuple[str, str]]:
-    """Export ``base`` into the new directory ``tree`` and add the overlay files.
+def build(git: GitRepo, base: str, tree: Path, overlay: dict[str, bytes | None]) -> dict[str, tuple[str, str]]:
+    """Check ``base`` out into the new directory ``tree`` and apply the overlay; return the baseline.
 
-    The overlay is the lane context the writer reads (agent, memory, skills, references).
-    The returned manifest maps each path put into the tree to its (mode, blob).
+    The files are checked out as a checkout of ``base`` would have them (no export-ignore or
+    export-subst rewriting). In the overlay, ``None`` removes that file or directory first (the
+    checkout no longer has it) and bytes then write a file: the lane context the writer reads.
+    The baseline is read back from the finished tree, so it is exactly what the writer received.
     """
-    archive = subprocess.run(["git", "archive", "--format=tar", base], cwd=git.root,
-                             capture_output=True, check=False)
-    if archive.returncode != 0:
-        raise GitError(archive.stderr.decode("utf-8", "replace") or f"git archive {base} failed")
     tree.mkdir(parents=True)
-    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
-        bundle.extractall(tree, filter="tar")
-    manifest = _manifest(git, base)
-    for name, data in sorted(overlay.items()):
-        target = tree / name
+    index = tree.parent / "scratch.index"
+    environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+    try:
+        for command in (["read-tree", base], ["checkout-index", "--all", "--force", f"--prefix={tree}/"]):
+            done = subprocess.run(["git", *command], cwd=git.root, env=environment, capture_output=True, check=False)
+            if done.returncode != 0:
+                raise GitError(done.stderr.decode("utf-8", "replace") or f"git {command[0]} {base} failed")
+    finally:
+        index.unlink(missing_ok=True)
+    for name in sorted(name for name, data in overlay.items() if data is None):
+        _remove_path(tree / name)
+    for name, data in sorted((name, data) for name, data in overlay.items() if data is not None):
         for parent in reversed(PurePosixPath(name).parents[:-1]):
             directory = tree / parent
             if directory.is_symlink() or directory.exists() and not directory.is_dir():
                 directory.unlink()
             directory.mkdir(exist_ok=True)
-        if target.is_symlink() or target.exists():
-            target.unlink()
-        target.write_bytes(data)
-        manifest[name] = ("100644", blob(data))
-    return manifest
+        _remove_path(tree / name)
+        (tree / name).write_bytes(data)
+    return _entries(tree)
 
 
 def protected(git: GitRepo, root: Path, state: Path) -> tuple[Path, ...]:
@@ -154,6 +180,7 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
                               for parent in PurePosixPath(name).parents if str(parent) not in existing})
     ignored = _ignored(git, tree, [directory + "/" for directory in new_directories])
     inside = PurePosixPath(acceptance_dir.strip("/"))
+    above = _names_above(manifest, acceptance_dir)
     root = tree.resolve()
     candidates, refused, output = {}, [], set()
     for name in changed:
@@ -165,11 +192,11 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
         target = path.resolve()
         if name not in manifest and directory is not None and (target.is_relative_to(root) or not any(
                 target.is_relative_to(place.resolve()) for place in protected)) and not (
-                PurePosixPath(name).is_relative_to(inside) and PurePosixPath(name).name in SHARED_TEST_CONFIG):
+                PurePosixPath(name).is_relative_to(inside) and shared_configuration(name, acceptance_dir, above, directories=False)):
             output.add(directory)
         elif (name in manifest or found.get(name, ("",))[0] == "120000"
                 or not PurePosixPath(name).is_relative_to(inside)
-                or PurePosixPath(name).name in SHARED_TEST_CONFIG
+                or shared_configuration(name, acceptance_dir, above)
                 or any((tree / parent).is_symlink() for parent in PurePosixPath(name).parents)
                 or not path.resolve().is_relative_to(root)):
             refused.append(name)

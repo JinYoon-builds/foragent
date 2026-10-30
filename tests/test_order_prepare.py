@@ -112,9 +112,11 @@ def test_a_proposed_lane_gets_the_agent_and_library_skills_add_lane_would_instal
     assert b"web lane (web/**)" in files[".claude/agents/fa-web.md"]
     tree = tmp_path / "tree"
     tree.mkdir()
+    assert files[".claude/skills/tdd"] is None, "main's older copy of the skill is removed first"
     for name, data in files.items():
-        (tree / name).parent.mkdir(parents=True, exist_ok=True)
-        (tree / name).write_bytes(data)
+        if data is not None:
+            (tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / name).write_bytes(data)
     start = order_prepare_setup.writer_setup(replace(config, executor="codex"), {"lane": "web", "size": "s"}, tree)
     assert start.missing_skills == [] and ".claude/skills/tdd/SKILL.md" in start.notes
 
@@ -178,3 +180,87 @@ def test_a_source_file_edited_and_restored_during_the_run_is_refused(git_history
     assert refused == ["app.py", "tests/acceptance/conftest.py"]
     assert list(candidates) == ["tests/acceptance/test_new.py"]
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/")[1] == []
+
+
+def test_shared_test_configuration_of_any_tool_is_refused_but_data_fixtures_are_not(git_history, tmp_path):
+    git, tree, manifest = scratch(git_history, tmp_path, {
+        "app.py": "x = 1\n", "Makefile": "test:\n", "tests/acceptance/test_old.py": "assert True\n"})
+    refused_names = ["tests/acceptance/pyproject.toml", "tests/acceptance/setup.cfg", "tests/acceptance/tox.ini",
+                     "tests/acceptance/.pytest.ini", "tests/acceptance/jest.config.js",
+                     "tests/acceptance/web/package.json", "tests/acceptance/.tools/helper.py",
+                     "tests/acceptance/Makefile", "tests/acceptance/app.py"]
+    for name in [*refused_names, "tests/acceptance/data/sample.json", "tests/acceptance/test_new.py"]:
+        (tree / name).parent.mkdir(parents=True, exist_ok=True)
+        (tree / name).write_text("x\n")
+    candidates, refused, _ = order_scratch.changes(git, tree, manifest, "tests/acceptance/")
+    assert refused == sorted(refused_names)
+    assert sorted(candidates) == ["tests/acceptance/data/sample.json", "tests/acceptance/test_new.py"]
+
+
+def test_a_lane_without_an_agent_still_brings_its_checkout_memory(tmp_path):
+    from foragent import lane_memory
+
+    config = Config(lanes={"api": {"paths": ["api/**"]}})
+    memory = tmp_path / lane_memory.lane_directory(config, "api") / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("- lesson\n")
+    _config, files = order_prepare_setup.lane_context({}, {"lane": "api"}, config, tmp_path)
+    folder = memory.parent.relative_to(tmp_path).as_posix()
+    assert files == {folder: None, memory.relative_to(tmp_path).as_posix(): b"- lesson\n"}
+
+
+def test_scratch_is_the_checkout_view_and_drops_context_the_checkout_deleted(git_history, tmp_path):
+    from foragent import lane_memory
+
+    git_history.update({
+        ".gitattributes": "skipped.txt export-ignore\nversion.txt export-subst\n",
+        "skipped.txt": "kept in a checkout\n", "version.txt": "$Format:%H$\n",
+        ".claude/agents/fa-api.md": "---\nname: fa-api\n---\nSTALE MAIN NOTES\n",
+        ".claude/agent-memory/fa-api/MEMORY.md": "- old lesson\n",
+        ".claude/agent-memory/fa-api/gone.md": "- deleted in the checkout\n",
+        ".claude/skills/tdd/SKILL.md": "---\nname: tdd\ndescription: d\n---\nold\n",
+        ".claude/skills/tdd/old.md": "removed later\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "origin", "main")
+    git = GitRepo(root)
+    base = git.ref_sha("refs/remotes/origin/main")
+    # The checkout deleted the agent file and one memory file, and replaced the skill.
+    config = Config(lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["tdd"]}})
+    (root / lane_memory.lane_directory(config, "api")).mkdir(parents=True, exist_ok=True)
+    (root / lane_memory.lane_directory(config, "api") / "MEMORY.md").write_text("- lesson\n")
+    (root / ".claude/skills/tdd").mkdir(parents=True, exist_ok=True)
+    (root / ".claude/skills/tdd/SKILL.md").write_text("---\nname: tdd\ndescription: d\n---\nnew\n")
+    _config, overlay = order_prepare_setup.lane_context({}, {"lane": "api"}, config, root)
+    tree = tmp_path / "attempt/tree"
+    manifest = order_scratch.build(git, base, tree, overlay)
+    assert (tree / "skipped.txt").read_text() == "kept in a checkout\n"
+    assert (tree / "version.txt").read_text() == "$Format:%H$\n"
+    assert not (tree / ".claude/agents/fa-api.md").exists()
+    assert sorted(path.name for path in (tree / ".claude/agent-memory/fa-api").iterdir()) == ["MEMORY.md"]
+    assert sorted(path.name for path in (tree / ".claude/skills/tdd").iterdir()) == ["SKILL.md"]
+    assert "STALE MAIN NOTES" not in order_prepare_setup.writer_setup(
+        replace(config, executor="codex"), {"lane": "api", "size": "s"}, tree).notes
+    # Nothing the writer did not touch is reported, export attributes included.
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
+
+
+def test_a_failed_writer_still_reports_the_paths_it_changed(git_history, tmp_path):
+    from foragent.executors import ExecResult
+
+    git, tree, manifest = scratch(git_history, tmp_path, {"app.py": "x = 1\n"})
+    (tree / "app.py").write_text("x = 2\n")
+    (tree / "tests/acceptance").mkdir(parents=True, exist_ok=True)
+    (tree / "tests/acceptance/test_partial.py").write_text("assert")
+    config = Config(language="en")
+    for result in (ExecResult(1, False, "", tmp_path / "log"), ExecResult(0, True, "", tmp_path / "log"),
+                   ExecResult(1, False, "", tmp_path / "log", error_kind="limit")):
+        failure = order_prepare._failure(result, config)
+        outcome = order_prepare._judge(result, failure, tree, git, manifest, config, ())
+        assert outcome["status"] == "question" and "app.py" in outcome["questions"][0]
+    # Without an offending path the failure stands; the partial test is a fact, never promoted.
+    (tree / "app.py").unlink()
+    (tree / "app.py").write_text("x = 1\n")
+    stopped = {"status": "interrupted", "reason": "stopped"}
+    outcome = order_prepare._judge(None, stopped, tree, git, manifest, config, ())
+    assert outcome["status"] == "interrupted" and outcome["refused"] == []
+    assert outcome["written"] == {"tests/acceptance/test_partial.py": "assert"}
