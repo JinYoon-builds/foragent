@@ -14,6 +14,7 @@ MESSAGES = {
         "batch_rules_missing": "{path} does not exist; record the decision only and drop the rule note",
         "batch_recover_changed": "an interrupted batch wrote {path}, and it changed again before it was committed; "
                                  "compare it with the last commit, then delete .foragent/order-batch-journal.json",
+        "batch_recover_branch": "an interrupted batch was written on {branch}; switch to {branch} and run fa order flush again",
         "batch_lane_conflict": "two waiting orders create the lane {lane} differently; make them agree first",
         "batch_waiting": "Waiting for {boundary}: {title} ({approved} of {count} issue(s) approved). "
                          "Run fa order flush --boundary {boundary} when that boundary arrives.",
@@ -48,6 +49,7 @@ MESSAGES = {
         "batch_rules_missing": "{path}이(가) 없어요. 결정만 기록하고 규칙 기록은 빼 주세요",
         "batch_recover_changed": "중단된 일괄 올리기가 {path}을(를) 썼는데, 커밋 전에 다시 바뀌었어요. "
                                  "마지막 커밋과 비교한 다음 .foragent/order-batch-journal.json을 지워 주세요",
+        "batch_recover_branch": "중단된 일괄 올리기는 {branch} 브랜치에서 쓰였어요. {branch}로 바꾼 다음 fa order flush를 다시 실행해 주세요",
         "batch_lane_conflict": "기다리는 두 주문이 {lane} 레인을 서로 다르게 만들어요. 먼저 둘을 맞춰 주세요",
         "batch_waiting": "{boundary}을(를) 기다려요: {title} (이슈 {count}개 중 {approved}개 승인). "
                          "그때가 오면 fa order flush --boundary {boundary}를 실행하세요.",

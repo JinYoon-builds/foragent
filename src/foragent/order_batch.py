@@ -13,19 +13,18 @@ import json
 import os
 import tempfile
 import uuid
-from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from foragent import order, order_references
+from foragent import order
 from foragent import order_batch_journal as journal
 from foragent.config import Config, load_config
 from foragent.git import GitError
 from foragent.i18n import text
+from foragent.order_batch_journal import _directory, _lock
 from foragent.order_batch_notes import COMMITTED, NOTE_FILES, _note_files, _write_notes
 from foragent.order_files import check_destinations
-from foragent.state_locks import _file_lock
 
 QUEUE_FILE = "order-batch.json"
 WAITING, PUBLISHED = "waiting", "published"
@@ -33,26 +32,6 @@ WAITING, PUBLISHED = "waiting", "published"
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def _directory(root: Path) -> Path:
-    """The ignored local control directory; a planted symlink must not redirect it."""
-    directory = order_references.real_directory(root, ".foragent")
-    ignore = directory / ".gitignore"
-    if ignore.is_symlink():
-        raise order.PlanError(f"{ignore} must be a regular file, not a symlink")
-    if not ignore.exists():
-        ignore.write_text("*\n", encoding="utf-8")
-    return directory
-
-
-@contextmanager
-def _lock(root: Path, name: str):
-    path = _directory(root) / name
-    if path.is_symlink():
-        raise order.PlanError(f"{path} must be a regular file, not a symlink")
-    with _file_lock(path):
-        yield
 
 
 def _load(root: Path) -> dict:
@@ -111,7 +90,7 @@ def _approval(entry: dict) -> dict:
 
 def defer(plan: dict, boundary: str, root: Path, config: Config, tracker, *, repo: str,
           approve: bool = False, approve_keys: list[str] | None = None,
-          approve_numbers: list[int] | None = None) -> dict:
+          approve_numbers: list[int] | None = None, manager=None) -> dict:
     """Check an order exactly as publication would, then keep its content waiting."""
     boundary = _boundary(boundary, config.language)
     # Each queued version has its own revision; a time or plan id cannot tell versions apart.
@@ -120,7 +99,7 @@ def defer(plan: dict, boundary: str, root: Path, config: Config, tracker, *, rep
              "approve": approve, "approve_keys": list(approve_keys or []),
              "approve_numbers": list(approve_numbers or []), "queued_at": _now(), "plan": plan}
     # The same checks as publication, including a clean preread for approved issues.
-    order.publish(plan, root, config, tracker, repo=repo, check_only=True, **_approval(entry))
+    order.publish(plan, root, config, tracker, repo=repo, check_only=True, manager=manager, **_approval(entry))
     # Approval covers the files as they are now, including Done when tests read from disk.
     entry["files"] = _digests(order.validate_plan(plan, root, config))
 
@@ -192,6 +171,27 @@ def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads
     _mark(root, "notes", set(notes), status=COMMITTED)
 
 
+def _settle(root: Path, git, language: str) -> bool:
+    """Undo or finish a flush that stopped mid-write; True when there was one."""
+    directory = _directory(root)
+    if not (directory / journal.JOURNAL_FILE).exists():
+        return False
+    # A flush of any boundary that stopped mid-write is settled before anything reads files.
+    with git.publish_lock():
+        journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), language)
+    return True
+
+
+def recover(root: Path, git, language: str = "en") -> bool:
+    """Settle an interrupted flush using only the repository, Git and the journal.
+
+    It reads no configuration, because the interrupted write may have damaged
+    .foragent.yml; callers run it before loading configuration for a flush.
+    """
+    with _lock(root, "order-batch-flush.lock"):
+        return _settle(root, git, language)
+
+
 def _require_base(git, config: Config) -> None:
     if git.current_branch() != config.base_branch:
         raise GitError(f"order flush must run on the base branch {config.base_branch!r}")
@@ -208,11 +208,9 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
     boundary = _boundary(boundary, config.language)
     with _lock(root, "order-batch-flush.lock"):
         directory = _directory(root)
-        if (directory / journal.JOURNAL_FILE).exists():
-            # A flush of any boundary that stopped mid-write is settled before anything reads files.
-            _require_base(git, config)
-            with git.publish_lock():
-                journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
+        if _settle(root, git, config.language):
+            # Recovery may have undone a lane in .foragent.yml; the caller's config predates it.
+            config = replace(config, lanes=load_config(root).lanes)
         state = _load(root)
         orders = [row for row in state["orders"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
         notes = [row for row in state["notes"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
@@ -223,7 +221,8 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             if entry["status"] == COMMITTED:
                 continue  # its files are in a local commit; later edits to them must stay
             # Every order's own checks pass before anything is written for any of them.
-            order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, **_approval(entry))
+            order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, manager=manager,
+                          **_approval(entry))
             files = order.validate_plan(entry["plan"], root, config)
             _unchanged_inputs(entry, files, config.language)
             prepared.append((entry, files))
@@ -243,7 +242,10 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             planned = {**combined, **note_contents}
             written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
                        "notes": [row["id"] for row in applying]}
-            journal.write(directory, root, planned, **written)
+            creating = [lane for entry, _ in prepared for lane in entry["plan"].get("new_lanes", [])
+                        if lane["name"] not in config.lanes]
+            journal.write(directory, root, planned, **written, branch=config.base_branch,
+                          lanes=journal.lane_writes(root, creating))
 
             def committed(blobs: dict[str, str]) -> None:
                 _committed(root, written["orders"], written["notes"], blobs)
@@ -251,7 +253,8 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
 
             try:
                 for entry, files in prepared:
-                    order.write_order_files(entry["plan"], root, config, git, files, manager)
+                    order.write_order_files(entry["plan"], root, config, git, files, manager,
+                                            lane_done=lambda name: journal.lane_done(directory, root, name))
                     if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
                         # Later orders and the issue pass see the lane this order just created.
                         config = replace(config, lanes=load_config(root).lanes)

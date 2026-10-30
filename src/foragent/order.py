@@ -20,7 +20,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
-from foragent.order_files import check_destinations, check_write, issue_body, validate_paths
+from foragent.order_files import check_destinations, check_write, issue_body, validate_paths, write_atomic
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -408,8 +408,10 @@ class PublishReport:
 
 
 def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                      manager: SkillManager | None) -> None:
-    """Write this order's own paths (and new lanes) on the refreshed base, without committing them."""
+                      manager: SkillManager | None, lane_done=None) -> None:
+    """Write this order's own paths (and new lanes) on the refreshed base, without committing them.
+
+    ``lane_done(name)`` runs after each new lane's own commit, so a batch can checkpoint it."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
@@ -421,6 +423,8 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
     for lane in plan.get("new_lanes", []):
         if lane["name"] not in config.lanes:
             add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
+            if lane_done is not None:
+                lane_done(lane["name"])
         else:
             # Recover a lane whose files were written before an interrupted commit.
             paths = lane_files(root, lane["name"], config.lanes[lane["name"]].get("skills", []))
@@ -438,7 +442,7 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
             check_write(root, name, roots[name])
             order_references.real_directory(root, PurePosixPath(name).parent.as_posix())
             check_write(root, name, roots[name])
-            path.write_bytes(data)
+            write_atomic(root, name, data)
 
 
 def commit_and_push(config: Config, git: GitRepo, files: dict, title: str,

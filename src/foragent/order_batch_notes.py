@@ -4,7 +4,7 @@ from pathlib import Path, PurePosixPath
 
 from foragent import order, order_references
 from foragent.i18n import text
-from foragent.order_files import check_write
+from foragent.order_files import check_write, write_atomic
 from foragent.paths import repo_path
 
 # decision and idea notes append to their history; a rule note edits one current-rules line.
@@ -56,4 +56,4 @@ def _write_notes(root: Path, contents: dict[str, str]) -> None:
         check_write(root, name, own_root)
         order_references.real_directory(root, own_root)
         check_write(root, name, own_root)
-        path.write_text(content, encoding="utf-8")
+        write_atomic(root, name, content.encode("utf-8"))

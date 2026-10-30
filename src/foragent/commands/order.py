@@ -52,13 +52,13 @@ def _comma_numbers(value: str) -> list[int]:
         raise cli.argparse.ArgumentTypeError("expected comma-separated positive issue numbers") from exc
 
 
-def _help_language() -> str:
-    """The current repository's configured language for help text, else English."""
+def _help_language(root=None) -> str:
+    """The repository's configured language for help and queue text, else English."""
     from foragent.config import _read_yaml
 
-    # Only the repository file's language: building the parser must not load the full config.
+    # Only the repository file's language: this must not load (or need) the full config.
     try:
-        language = _read_yaml(facade().Path.cwd() / ".foragent.yml").get("language")
+        language = _read_yaml((root or facade().Path.cwd()) / ".foragent.yml").get("language")
     except Exception:  # Help must render even where no valid configuration exists.
         return "en"
     return language if isinstance(language, str) else "en"
@@ -193,10 +193,10 @@ def _batch_local(args, root) -> int:
     from foragent.i18n import text
 
     cli = facade()
-    config = cli.load_config(root)
-    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
+    language = _help_language(root)  # the queue stays usable while .foragent.yml is damaged
+    say = lambda key, **values: text(key, language, **values)  # noqa: E731
     if args.action == "note":
-        entry = order_batch.note(root, args.kind, args.text, args.defer, config.language,
+        entry = order_batch.note(root, args.kind, args.text, args.defer, language,
                                  replace=args.replace)
         print(cli.json.dumps(entry, ensure_ascii=False) if args.json else
               say("batch_note_waiting", boundary=entry["boundary"], kind=entry["kind"], id=entry["id"]))
@@ -266,6 +266,11 @@ def run(args) -> int:
     if args.action in {"note", "pending"}:
         return _batch_local(args, root)
     git = cli.GitRepo(root)
+    if args.action == "flush":
+        from foragent import order_batch
+
+        # An interrupted flush may have damaged .foragent.yml: settle it before reading it.
+        order_batch.recover(root, git, _help_language(root))
     config = cli.load_config(root)
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)

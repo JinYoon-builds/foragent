@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1667,18 +1668,21 @@ def test_publication_rechecks_each_destination_right_before_writing_it(publishin
 
     root, config, tracker, git, events = publishing
     plan["reference_files"] = {"docs/design/a/HANDOFF.md": "approved"}
+    from foragent import order_files
+
     elsewhere = root / "elsewhere"
     elsewhere.mkdir()
-    real = Path.write_bytes
+    real = order_files.os.replace
 
-    def write_then_swap(self, data):
-        result = real(self, data)
+    def write_then_swap(source, destination):
+        # Swap a parent for a link right after the first published file lands.
+        result = real(source, destination)
         if not (root / "docs/design").exists():
             (root / "docs").mkdir(exist_ok=True)
             (root / "docs/design").symlink_to(elsewhere, target_is_directory=True)
         return result
 
-    monkeypatch.setattr(Path, "write_bytes", write_then_swap)
+    monkeypatch.setattr(order_files.os, "replace", write_then_swap)
     with pytest.raises(order.PlanError, match="symlink"):
         order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert list(elsewhere.iterdir()) == [] and events == []
@@ -2105,3 +2109,244 @@ def test_batch_recovery_refuses_a_file_edited_after_the_killed_write(publishing,
         _flush(publishing)
     assert "- Hand edit." in (root / "docs/rules.md").read_text()
     assert (root / ".foragent/order-batch-journal.json").exists()
+
+
+def _skill_manager(root):
+    library = root.parent / f"{root.name}-library"
+    skill = library / "skills/testing-strategy"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Tests\n---\nUse tests.\n")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
+    return SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
+                        run=lambda args: "a" * 40 + "\n")
+
+
+LANE_STEPS = ["skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit",
+              "batch_commit", "push"]
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["raised", "killed"])
+@pytest.mark.parametrize("step", LANE_STEPS)
+def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan, monkeypatch, step, killed):
+    import pathlib
+
+    from foragent import lanes, order_batch, order_batch_journal, skills
+
+    root, config, tracker, git, events = publishing
+    (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
+    git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
+    manager = _skill_manager(root)
+    value = _lane_plan(plan, "web0")
+    value["new_lanes"][0]["skills"] = ["local:testing-strategy"]
+    order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
+    stop = SystemExit(9)
+    write_text, commit_paths = pathlib.Path.write_text, git.commit_paths
+    write_bytes = pathlib.Path.write_bytes
+
+    def raise_stop(*args, **kwargs):
+        raise stop
+
+    if step == "skill_copy":  # the process dies part way through copying the skill
+        def partial_copy(source, destination, *args, **kwargs):
+            destination.mkdir(parents=True)
+            (destination / "SKILL.md").write_text("---\nname: testing-str")
+            raise stop
+        monkeypatch.setattr(skills.shutil, "copytree", partial_copy)
+    elif step == "gitignore_written":  # .gitignore is cut short before .foragent.yml is saved
+        def truncated(path, data, *args, **kwargs):
+            if path.name == ".gitignore":
+                write_bytes(path, data[:len(data) // 2])
+                raise stop
+            return write_bytes(path, data, *args, **kwargs)
+        monkeypatch.setattr(pathlib.Path, "write_bytes", truncated)
+    elif step == "config_saved":  # .foragent.yml is saved; the agent file is not written yet
+        def agent_fails(path, *args, **kwargs):
+            if path.name == "fa-web.md":
+                raise stop
+            return write_text(path, *args, **kwargs)
+        monkeypatch.setattr(pathlib.Path, "write_text", agent_fails)
+    elif step == "agent_written":
+        monkeypatch.setattr(lanes, "lane_files", raise_stop)
+    elif step in {"lane_commit", "batch_commit"}:
+        prefix = "Foragent lane" if step == "lane_commit" else "Foragent batch"
+        monkeypatch.setattr(git, "commit_paths", lambda paths, title: raise_stop() if title.startswith(prefix)
+                            else commit_paths(paths, title))
+    else:
+        monkeypatch.setattr(git, "push_base", raise_stop)
+    if killed:
+        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    with pytest.raises(SystemExit):
+        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    if not killed and step in {"skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit"}:
+        assert "web" not in load_config(root).lanes, "An uncommitted lane is undone with the batch"
+        assert not (root / ".claude/agents/fa-web.md").exists()
+        assert not (root / ".claude/skills/testing-strategy").exists()
+        assert (root / ".gitignore").read_text() == "THIRD_PARTY_NOTICES.md\n"
+    if not killed and step == "batch_commit":  # the lane's own commit landed, so the lane stays
+        assert git.saved[".foragent.yml"] == (root / ".foragent.yml").read_text()
+    stale = load_config(root)  # the CLI loads config before the flush settles the journal
+    order_batch.flush("next-code-merge", root, stale, tracker, repo="owner/repo", git=git, manager=manager)
+    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
+    assert (root / ".claude/agents/fa-web.md").is_file()
+    assert (root / ".claude/skills/testing-strategy/SKILL.md").is_file()
+    assert (root / ".gitignore").read_text().count("/.claude/skills/testing-strategy/") == 1
+    titles = [event[1] for event in events if event[0] == "commit"]
+    assert titles.count("Foragent lane web") == 1 and len(titles) == 2, titles
+    issue, = [issue for issue in tracker.list_issues() if issue.title == "web0 web"]
+    assert "lane:web" in issue.labels
+    assert order_batch.pending(root)["orders"][0]["status"] == "published"
+    assert not (root / ".foragent/order-batch-journal.json").exists()
+
+
+@pytest.mark.parametrize("target", ["spec", "rules"])
+def test_batch_write_killed_mid_file_leaves_old_bytes_and_resumes(publishing, plan, monkeypatch, target):
+    import os
+
+    from foragent import order_batch, order_batch_journal, order_files
+
+    root = _rules_case(publishing, plan)
+    name = f"docs/specs/{plan['id']}.md" if target == "spec" else "docs/rules.md"
+    before = (root / name).read_bytes() if (root / name).exists() else None
+    replace = os.replace
+
+    def dies_before_rename(source, destination):
+        if Path(destination).name == Path(name).name:
+            raise SystemExit(9)  # the new bytes sit in the temporary file only
+        return replace(source, destination)
+
+    monkeypatch.setattr(order_files.os, "replace", dies_before_rename)
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    assert ((root / name).read_bytes() if (root / name).exists() else None) == before
+    # A killed process skips its own cleanup: the half-written temporary file stays behind.
+    order_files.temporary_path(root, name).write_bytes(b"# Rules\n- C. (D")
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    # Recovery alone settles the checkout, even if no later write touches this file.
+    order_batch_journal.recover(root / ".foragent", root, publishing[3], lambda *facts: None, "en")
+    assert not order_files.temporary_path(root, name).exists()
+    assert ((root / name).read_bytes() if (root / name).exists() else None) == before
+    _flush(publishing)
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- C. (D3)\n- Extra. (D4)\n"
+    assert {row["status"] for row in order_batch.pending(root)["notes"]} == {"published"}
+    leftovers = [p for p in root.rglob("*.foragent-tmp")]
+    assert leftovers == [], leftovers
+
+
+@pytest.mark.parametrize("killed", [False, True], ids=["raised", "killed"])
+def test_batch_second_new_lane_interrupted_keeps_the_committed_first_lane(publishing, plan, monkeypatch, killed):
+    import pathlib
+
+    from foragent import order_batch, order_batch_journal
+
+    root, config, tracker, git, events = publishing
+    git.saved[".foragent.yml"] = (root / ".foragent.yml").read_text()
+    value = _lane_plan(plan, "two")
+    value["new_lanes"].append({"name": "site", "paths": ["site/**"], "skills": []})
+    value["issues"].append(dict(value["issues"][0], key="site", title="two site", lane="site"))
+    _batch(publishing, value)
+    write_text = pathlib.Path.write_text
+
+    def second_agent_dies(path, *args, **kwargs):
+        if path.name == "fa-site.md":
+            raise SystemExit(9)
+        return write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", second_agent_dies)
+    if killed:
+        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    if not killed:
+        assert set(load_config(root).lanes) == {"api", "web"}, "the committed first lane stays"
+    order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git)
+    assert {"web", "site"} <= set(load_config(root).lanes)
+    titles = [event[1] for event in events if event[0] == "commit"]
+    assert titles.count("Foragent lane web") == 1 and titles.count("Foragent lane site") == 1, titles
+    assert order_batch.pending(root)["orders"][0]["status"] == "published"
+
+
+def _order_cli(publishing, monkeypatch):
+    """The real `fa order` CLI on the offline tracker and Git, reading .foragent.yml from disk."""
+    root, _config, tracker, git, _events = publishing
+    monkeypatch.setattr(cli, "GitRepo", lambda root: git)
+    monkeypatch.setattr(git, "remote_slug", lambda: "owner/repo", raising=False)
+    monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
+    monkeypatch.setenv("FORAGENT_VIEW", "off")
+    return lambda *args: cli.main(["order", *args, "--repo-root", str(root)])
+
+
+@pytest.mark.parametrize("damage", ["truncated", "empty"])
+def test_batch_cli_flush_recovers_a_damaged_configuration_before_reading_it(publishing, plan, monkeypatch,
+                                                                           capsys, damage):
+    from foragent import config as config_module, order_batch, order_batch_journal
+
+    root, config, tracker, git, events = publishing
+    original = (root / ".foragent.yml").read_text()
+    git.saved[".foragent.yml"] = original
+    _batch(publishing, _lane_plan(plan, "web0"))
+    save = config_module.LaneSettings.save
+
+    def dies_mid_save(self):  # a writer killed part way leaves damaged YAML behind
+        text = self.check()
+        self.path.write_text(text[:len(text) // 3] + "lanes: {web: [" if damage == "truncated" else "")
+        raise SystemExit(9)
+
+    real_recover = order_batch_journal.recover
+    monkeypatch.setattr(config_module.LaneSettings, "save", dies_mid_save)
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # killed: no cleanup
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.setattr(config_module.LaneSettings, "save", save)
+    monkeypatch.setattr(order_batch_journal, "recover", real_recover)
+    run = _order_cli(publishing, monkeypatch)
+    assert run("pending", "--json") == 0  # the queue stays visible while the file is damaged
+    capsys.readouterr()
+    assert run("flush", "--boundary", "next-code-merge") == 0, capsys.readouterr().err
+    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
+    assert order_batch.pending(root)["orders"][0]["status"] == "published"
+    assert [event[1] for event in events if event[0] == "commit"].count("Foragent lane web") == 1
+
+
+def test_lane_settings_save_is_atomic(tmp_path, monkeypatch):
+    import os
+
+    from foragent import config as config_module
+
+    path = tmp_path / ".foragent.yml"
+    path.write_text("lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
+    settings = config_module.LaneSettings(path)
+    settings.add_lane("web", {"paths": ["web/**"], "agent": "fa-web", "skills": []}, load_config(tmp_path).lanes)
+    replace = os.replace
+    monkeypatch.setattr(config_module.os, "replace", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    with pytest.raises(SystemExit):
+        settings.save()
+    assert path.read_text() == "lanes: {api: {paths: ['api/**'], agent: fa-api}}\n"
+    assert [p.name for p in tmp_path.iterdir()] == [".foragent.yml"]
+    monkeypatch.setattr(config_module.os, "replace", replace)
+    settings.save()
+    assert "web" in load_config(tmp_path).lanes
+
+
+def test_batch_recovery_runs_only_on_the_branch_it_wrote_on(publishing, plan, monkeypatch):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _rules_case(publishing, plan), publishing[3]
+    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    monkeypatch.setattr(git, "commit_paths", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    written = (root / "docs/rules.md").read_text()
+    git.branch = "feature"
+    with pytest.raises(order.PlanError, match="main"):
+        order_batch.recover(root, git)
+    assert (root / "docs/rules.md").read_text() == written
+    git.branch = "main"
+    assert order_batch.recover(root, git) is True
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- A. (D1)\n"

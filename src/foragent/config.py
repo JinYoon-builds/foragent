@@ -4,8 +4,11 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
+import os
 from pathlib import Path
 import re
+import stat
+import tempfile
 from tempfile import NamedTemporaryFile
 from typing import Any
 
@@ -275,7 +278,20 @@ class LaneSettings:
         return text
 
     def save(self) -> None:
-        self.path.write_bytes(self.check().encode("utf-8"))
+        """Replace the file all at once, so an interrupted save never leaves damaged YAML."""
+        data = self.check().encode("utf-8")
+        mode = stat.S_IMODE(self.path.stat().st_mode) if self.path.is_file() else 0o644
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, self.path)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
 
     def _mapping(self, lanes: dict[str, Any], indent: int, step: int) -> list[str]:
         lines = []
