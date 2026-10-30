@@ -1222,6 +1222,21 @@ def test_perspectives_decisions_cut_keeps_titles_and_latest_twenty(tmp_path):
     assert "Preamble" not in text
 
 
+@pytest.mark.parametrize("make_rules", [
+    lambda path: path.write_bytes(b"# Rules\n\xff\xfe broken\n"),
+    lambda path: path.mkdir(),
+], ids=["invalid-utf8", "directory"])
+def test_perspectives_unreadable_rules_never_falls_back_to_history(tmp_path, make_rules):
+    from foragent import order_perspectives
+
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/decisions.md").write_text("HISTORY_BEHIND_UNREADABLE_RULES\n", encoding="utf-8")
+    make_rules(tmp_path / "docs/rules.md")
+    prompt = order_perspectives.prompt("incidents", {}, tmp_path)
+    assert "HISTORY_BEHIND_UNREADABLE_RULES" not in prompt
+    assert "docs/rules.md exists but cannot be read" in prompt
+
+
 def test_perspectives_config_rejects_unknown_seat_or_executor():
     from foragent.config import ConfigError, DEFAULTS
     from foragent.config_validation import _validate
@@ -1910,3 +1925,50 @@ def test_batch_refuses_a_done_when_file_that_changed_after_deferral(publishing, 
     assert [event[0] for event in publishing[4]][:2] == ["commit", "push"]
     assert all("approved" in issue.labels for issue in publishing[2].list_issues()
                if issue.title in {item["title"] for item in plan["issues"]})
+
+
+def test_batch_rule_note_replaces_the_current_rule_line_once_with_its_order(publishing, plan):
+    from foragent import order_batch
+
+    root = publishing[0]
+    (root / "docs").mkdir()
+    (root / "docs/rules.md").write_text("# Rules\n- Publish at once. (D10)\n- Keep tests locked. (D11)\n")
+    _batch(publishing, plan)
+    order_batch.note(root, "decision", "D12. Batch publication (supersedes D10).", "next-code-merge", "en")
+    order_batch.note(root, "rule", "- Publish in batches. (D12)", "next-code-merge", "en",
+                     replace="- Publish at once. (D10)")
+    assert (root / "docs/rules.md").read_text().count("Publish at once") == 1  # waiting, unchanged
+    for _ in range(2):  # The second pass resumes after the push already happened.
+        _flush(publishing)
+        order_batch._update(root, lambda state: [row.update(status="waiting") for row in state["notes"]])
+    rules = (root / "docs/rules.md").read_text()
+    assert rules == "# Rules\n- Publish in batches. (D12)\n- Keep tests locked. (D11)\n"
+    assert (root / "docs/decisions.md").read_text().count("D12. Batch publication") == 1
+    commit, = [event for event in publishing[4] if event[0] == "commit"]
+    assert {"docs/rules.md", "docs/decisions.md", f"docs/specs/{plan['id']}.md"} <= commit[2].keys()
+
+
+@pytest.mark.parametrize("rules", [None, "# Rules\n- Something else. (D9)\n"])
+def test_batch_rule_note_without_its_line_is_refused_before_writes(publishing, plan, rules):
+    from foragent import order_batch
+
+    root = publishing[0]
+    (root / "docs").mkdir()
+    if rules is not None:
+        (root / "docs/rules.md").write_text(rules)
+    _batch(publishing, plan)
+    order_batch.note(root, "rule", "- New. (D12)", "next-code-merge", "en", replace="- Old. (D10)")
+    with pytest.raises(order.PlanError, match="docs/rules.md"):
+        _flush(publishing)
+    assert publishing[4] == [] and publishing[2].issues == {}
+    assert not (root / f"docs/specs/{plan['id']}.md").exists()
+
+
+@pytest.mark.parametrize("kind,text,replace", [
+    ("rule", "two\nlines", None), ("rule", "- New.", "old\nlines"), ("decision", "D12.", "- Old."),
+])
+def test_batch_rule_lines_are_single_and_replace_is_rule_only(publishing, kind, text, replace):
+    from foragent import order_batch
+
+    with pytest.raises(order.PlanError):
+        order_batch.note(publishing[0], kind, text, "next-code-merge", "en", replace=replace)

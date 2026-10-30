@@ -8,6 +8,10 @@ MESSAGES = {
         "batch_path_conflict": "two waiting orders write different content to {path}; publish one of them first",
         "batch_input_changed": "order {id} changed since it was deferred: {paths}; check it and run "
                                "fa order publish --defer again so its approval covers the current files",
+        "batch_replace_rule_only": "--replace is only for a rule note (--kind rule)",
+        "batch_rule_one_line": "a rule note and its --replace line must each be one non-empty line",
+        "batch_rule_line_missing": "{path} has no line {line!r} to replace; check the current rule and queue the rule note again",
+        "batch_rules_missing": "{path} does not exist; record the decision only and drop the rule note",
         "batch_lane_conflict": "two waiting orders create the lane {lane} differently; make them agree first",
         "batch_waiting": "Waiting for {boundary}: {title} ({approved} of {count} issue(s) approved). "
                          "Run fa order flush --boundary {boundary} when that boundary arrives.",
@@ -22,10 +26,11 @@ MESSAGES = {
         "batch_help_defer": "keep the checked order waiting for this named publication boundary instead of publishing now",
         "batch_help_urgent": "publish now even with --defer: the order was explicitly judged urgent",
         "batch_help_note": "Keep a planning decision or idea for a publication boundary without touching the checkout",
-        "batch_help_kind": "decision goes to docs/decisions.md, idea to docs/ideas.md",
+        "batch_help_kind": "decision goes to docs/decisions.md, idea to docs/ideas.md, rule edits one line of docs/rules.md",
         "batch_help_text": "the note text, appended as written",
         "batch_help_pending": "Show waiting and published orders and notes",
         "batch_help_flush": "Publish everything waiting for a boundary in one commit, then the orders' issues",
+        "batch_help_replace": "for a rule note: the current docs/rules.md line it replaces",
         "batch_help_boundary": "the boundary that has arrived, for example next-code-merge",
     },
     "ko": {
@@ -35,6 +40,10 @@ MESSAGES = {
         "batch_path_conflict": "기다리는 두 주문이 {path}에 다른 내용을 써요. 하나를 먼저 올려 주세요",
         "batch_input_changed": "주문 {id}이(가) 맡긴 뒤에 바뀌었어요: {paths}. 확인한 다음 "
                                "fa order publish --defer를 다시 실행해 승인이 지금 파일을 덮게 하세요",
+        "batch_replace_rule_only": "--replace는 규칙 기록(--kind rule)에만 써요",
+        "batch_rule_one_line": "규칙 기록과 --replace 줄은 각각 비어 있지 않은 한 줄이어야 해요",
+        "batch_rule_line_missing": "{path}에 바꿀 줄 {line!r}이(가) 없어요. 현재 규칙을 확인하고 규칙 기록을 다시 맡겨 주세요",
+        "batch_rules_missing": "{path}이(가) 없어요. 결정만 기록하고 규칙 기록은 빼 주세요",
         "batch_lane_conflict": "기다리는 두 주문이 {lane} 레인을 서로 다르게 만들어요. 먼저 둘을 맞춰 주세요",
         "batch_waiting": "{boundary}을(를) 기다려요: {title} (이슈 {count}개 중 {approved}개 승인). "
                          "그때가 오면 fa order flush --boundary {boundary}를 실행하세요.",
@@ -49,10 +58,11 @@ MESSAGES = {
         "batch_help_defer": "확인한 주문을 지금 올리지 않고 이 이름의 올릴 때까지 기다리게 해요",
         "batch_help_urgent": "--defer가 있어도 지금 올려요. 급하다고 명시적으로 판단한 주문에만 써요",
         "batch_help_note": "기획 결정이나 아이디어를 체크아웃을 건드리지 않고 올릴 때까지 보관해요",
-        "batch_help_kind": "decision은 docs/decisions.md, idea는 docs/ideas.md에 붙어요",
+        "batch_help_kind": "decision은 docs/decisions.md, idea는 docs/ideas.md에 붙고, rule은 docs/rules.md의 한 줄을 고쳐요",
         "batch_help_text": "기록 글. 쓴 그대로 붙어요",
         "batch_help_pending": "기다리는 주문·기록과 올린 주문·기록을 보여 줘요",
         "batch_help_flush": "이때를 기다리는 것을 커밋 하나로 올리고, 이어서 주문의 이슈를 올려요",
+        "batch_help_replace": "규칙 기록에서 바꿀 docs/rules.md의 현재 줄",
         "batch_help_boundary": "도착한 올릴 때. 예: next-code-merge",
     },
 }

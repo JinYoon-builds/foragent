@@ -27,7 +27,8 @@ from foragent.paths import repo_path
 from foragent.state_locks import _file_lock
 
 QUEUE_FILE = "order-batch.json"
-NOTE_FILES = {"decision": "docs/decisions.md", "idea": "docs/ideas.md"}
+# decision and idea notes append to their history; a rule note edits one current-rules line.
+NOTE_FILES = {"decision": "docs/decisions.md", "idea": "docs/ideas.md", "rule": "docs/rules.md"}
 WAITING, PUBLISHED = "waiting", "published"
 
 
@@ -134,16 +135,24 @@ def defer(plan: dict, boundary: str, root: Path, config: Config, tracker, *, rep
     return entry
 
 
-def note(root: Path, kind: str, note_text: str, boundary: str, language: str) -> dict:
+def note(root: Path, kind: str, note_text: str, boundary: str, language: str,
+         replace: str | None = None) -> dict:
     """Keep a planning decision or idea for the chosen boundary."""
     boundary = _boundary(boundary, language)
     if kind not in NOTE_FILES:
         raise order.PlanError(text("batch_bad_kind", language, kinds=", ".join(NOTE_FILES)))
     if not isinstance(note_text, str) or not note_text.strip():
         raise order.PlanError(text("batch_empty_note", language))
+    if replace is not None and kind != "rule":
+        raise order.PlanError(text("batch_replace_rule_only", language))
+    if kind == "rule" and any(value is not None and (not value.strip() or len(value.strip().splitlines()) != 1)
+                              for value in (note_text, replace)):
+        raise order.PlanError(text("batch_rule_one_line", language))
     # A random id: the same text recorded twice in one second is still two notes.
     entry = {"id": uuid.uuid4().hex, "kind": kind, "text": note_text.strip(), "boundary": boundary,
              "status": WAITING, "queued_at": _now()}
+    if replace is not None:
+        entry["replace"] = replace.strip()
     _update(root, lambda state: state["notes"].append(entry))
     return entry
 
@@ -161,15 +170,33 @@ def _note_marker(entry: dict) -> str:
     return f"<!-- foragent:note {entry['id']} -->"
 
 
-def _note_files(root: Path, notes: list[dict]) -> dict[str, str]:
-    """Each note file with the waiting notes it does not already contain appended once."""
+def _rule_lines(name: str, current: str, entry: dict, language: str) -> str:
+    """Replace (or add) one current-rules line; a line already in place counts as done."""
+    lines = current.splitlines()
+    if entry["text"] in lines:
+        return current
+    if "replace" not in entry:
+        return current + ("" if not current or current.endswith("\n") else "\n") + entry["text"] + "\n"
+    if entry["replace"] not in lines:
+        raise order.PlanError(text("batch_rule_line_missing", language, path=name, line=entry["replace"]))
+    lines[lines.index(entry["replace"])] = entry["text"]
+    return "\n".join(lines) + ("\n" if current.endswith("\n") else "")
+
+
+def _note_files(root: Path, notes: list[dict], language: str) -> dict[str, str]:
+    """Each note file with its waiting notes applied once; computed before any write."""
     contents: dict[str, str] = {}
     for entry in notes:
         name = NOTE_FILES[entry["kind"]]
         if name not in contents:
             path = repo_path(root, name)
+            if entry["kind"] == "rule" and not path.is_file():
+                # A project without current rules records the decision only.
+                raise order.PlanError(text("batch_rules_missing", language, path=name))
             contents[name] = path.read_text(encoding="utf-8") if path.is_file() else ""
-        if _note_marker(entry) not in contents[name]:
+        if entry["kind"] == "rule":
+            contents[name] = _rule_lines(name, contents[name], entry, language)
+        elif _note_marker(entry) not in contents[name]:
             current = contents[name]
             separator = "" if not current or current.endswith("\n\n") else "\n" if current.endswith("\n") else "\n\n"
             contents[name] = f"{current}{separator}{_note_marker(entry)}\n{entry['text']}\n"
@@ -228,12 +255,12 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
         with git.publish_lock():
             git.update_base(config.base_branch)
             check_destinations(root, combined)
+            note_contents = _note_files(root, notes, config.language)  # may refuse; nothing written yet
             for entry, files in prepared:
                 order.write_order_files(entry["plan"], root, config, git, files, manager)
                 if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
                     # Later orders and the issue pass see the lane this order just created.
                     config = replace(config, lanes=load_config(root).lanes)
-            note_contents = _note_files(root, notes)
             _write_notes(root, note_contents)
             title = f"Foragent batch {boundary}: {len(orders)} order(s), {len(notes)} note(s)"
             blobs = order.commit_and_push(config, git, {**combined, **note_contents}, title)

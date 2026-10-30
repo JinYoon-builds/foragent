@@ -37,13 +37,25 @@ The orchestrator calls you with `fa orch role docs` when one of your signals is 
    and link to it from the other. Keep each fact in one place. This is D95's rule against duplicated
    state, applied to docs.
 4. **One owner, one purpose.** Give each doc one owner and one purpose. Use this split:
-   - `docs/decisions.md` holds decisions, each with its why and its date.
+   - `docs/rules.md` holds the rules in force now, one short line each.
+   - `docs/decisions.md` is append-only history: decisions, each with its why and its date. Add
+     new entries at the end; never edit or remove old ones.
    - `README*` holds what the project is and how to use it.
    - `docs/voice.md` holds voice and wording rules.
    - Each other doc names its one purpose in its first line.
 
    When a fact is in the wrong doc, move it to the doc that owns it.
-5. **Follow docs/voice.md.** Write every change according to `docs/voice.md`. Apply its rules to
+5. **Keep docs/rules.md short at each order finish.** When an order finishes, update `docs/rules.md`
+   so it lists only the rules in force now. Keep it short: one line per rule.
+
+   When a decision supersedes a rule, replace the affected line in `docs/rules.md` with the current
+   rule. Do not keep the old line; its history stays in `docs/decisions.md`.
+
+   Only the person decides rules. You edit `docs/rules.md`; you never decide a rule. Every line in
+   `docs/rules.md` cites a decision ID that exists in `docs/decisions.md` and is not superseded. A
+   line without an ID does not belong in `docs/rules.md`. If a change you would make alters a rule's
+   meaning, do not edit it: send it as a question to the person through the orchestrator.
+6. **Follow docs/voice.md.** Write every change according to `docs/voice.md`. Apply its rules to
    each document's own language: Korean rules to Korean docs, English rules to English docs.
 
 ## Outcome

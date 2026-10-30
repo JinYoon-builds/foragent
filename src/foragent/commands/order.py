@@ -116,8 +116,9 @@ def add(commands) -> None:
     publish.add_argument("--urgent", action="store_true", help=say("batch_help_urgent"))
     note = order_actions.add_parser("note", help=say("batch_help_note"), description=say("batch_help_note"))
     note.add_argument("--defer", metavar="BOUNDARY", required=True, help=say("batch_help_boundary"))
-    note.add_argument("--kind", choices=("decision", "idea"), required=True, help=say("batch_help_kind"))
+    note.add_argument("--kind", choices=("decision", "idea", "rule"), required=True, help=say("batch_help_kind"))
     note.add_argument("--text", required=True, help=say("batch_help_text"))
+    note.add_argument("--replace", help=say("batch_help_replace"))
     note.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     note.add_argument("--json", action="store_true")
     pending = order_actions.add_parser("pending", help=say("batch_help_pending"), description=say("batch_help_pending"))
@@ -195,7 +196,8 @@ def _batch_local(args, root) -> int:
     config = cli.load_config(root)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     if args.action == "note":
-        entry = order_batch.note(root, args.kind, args.text, args.defer, config.language)
+        entry = order_batch.note(root, args.kind, args.text, args.defer, config.language,
+                                 replace=args.replace)
         print(cli.json.dumps(entry, ensure_ascii=False) if args.json else
               say("batch_note_waiting", boundary=entry["boundary"], kind=entry["kind"], id=entry["id"]))
         return 0

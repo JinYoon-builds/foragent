@@ -103,16 +103,21 @@ The person's current words take precedence over old documents and the ledger.
   ask once: "D18 says X; this request needs Y" with **Change / Keep / Exception this once**.
   Recommend the option that best fits the current request and explain the tradeoff.
   Apply the answer without repeating the conflict question.
-- For Change, update the decision ledger immediately and include the decision record
-  update in the approved order: append a dated replacement with its reason and mark the
-  old entry superseded, linking the two. Use the repository's decision log, or
-  `docs/decisions.md` if none exists. For Exception this once, record its scope in the
-  order spec and ledger without replacing the standing rule. For Keep, adapt the plan.
-  Persist changes with the approved order so lane agents read the current decision.
-- A decision or idea that belongs to no order waits for a publication boundary instead of
-  being edited into the shared checkout: `fa order note --defer <boundary> --kind decision|idea
-  --text "<text>"` keeps it, and the next `fa order flush` appends it to `docs/decisions.md`
-  or `docs/ideas.md` in the same commit as the waiting orders.
+- For Change, update the decision history and the current rule in the same approved order.
+  Queue both with the order's boundary (step 7); never edit the shared checkout for them.
+  Append a dated replacement with its reason and a "Supersedes" link to the old entry:
+  `fa order note --defer <boundary> --kind decision --text "<entry>"` adds it to
+  `docs/decisions.md`, and earlier entries stay as they are, because the history is
+  append-only. When the project has `docs/rules.md`, also replace the affected line with the
+  new rule so readers of current rules see it: `fa order note --defer <boundary> --kind rule
+  --replace "<current line>" --text "<new line>"`. If the project has no `docs/rules.md`,
+  queue the decision only and do not create the file. For Exception this once, record its
+  scope in the order spec and queue it as a decision note, without replacing the standing
+  rule or touching `docs/rules.md`. For Keep, adapt the plan. The notes land with the order
+  in one commit at `fa order flush`, so lane agents read the current decision with it.
+- A decision or idea that belongs to no order waits the same way:
+  `fa order note --defer <boundary> --kind decision|idea --text "<text>"` keeps it, and the
+  next `fa order flush` adds it to `docs/decisions.md` or `docs/ideas.md`.
 
 ## 2. Interview
 Native is the default interview. Read `interview.engine` from `fa order context --json`
@@ -361,7 +366,10 @@ ordinary order waits for the shared publication boundary the person chose (for e
 `next-code-merge`, or a named publication time), so several orders and notes reach main in one
 commit. Waiting runs every publication check now, including the clean preread, and never
 approves anything by itself. Add `--urgent` only when the person or you explicitly judged this
-order urgent; it then publishes immediately. `fa order pending --json` shows what waits.
+order urgent; it then publishes immediately. Queue an urgent order's decision and rule
+notes under a boundary of its own (for example `urgent-<order id>`) and run
+`fa order flush --boundary urgent-<order id>` right after it, so they land with it and
+ordinary waiting work keeps waiting. `fa order pending --json` shows what waits.
 When the boundary arrives (the next code merge lands, or the chosen time comes), run
 `fa order flush --boundary <boundary>`; rerunning it after an interruption finishes the rest
 without duplicate issues or notes. `fa order publish` places the
