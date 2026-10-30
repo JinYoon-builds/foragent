@@ -109,6 +109,39 @@ def runner_alive(run: Run, exists=None) -> bool | None:
     return (exists or _pid_exists)(run.pid)
 
 
+def run_is_live(run: Run | None) -> bool:
+    """The one "is this issue running" rule for fa orch stop, fa orch park and the status row.
+
+    A run record that is running while a process it recorded is still the same process:
+    a recorded PID or executor group counts only with its recorded start time (a reused
+    PID or PGID belongs to another process and is not ours). A record without any
+    process yet, an unreadable table or PID, and a process recorded without a birth
+    identity are unknown, which is never confirmed death (D95).
+    """
+    if run is None or run.status != "running":
+        return False
+    if run.pid is None and run.executor_pgid is None:
+        return True
+    if (table := _listing()) is None:
+        return True
+    identities = {item["pid"]: item.get("start_time") for item in run.process_identities}
+    if getattr(table, "unreadable", frozenset()) & {run.pid, run.executor_pgid, *identities}:
+        return True
+
+    def same(row) -> bool:  # A recorded birth identity must match; without one, presence is unknown.
+        return identities.get(row.pid) is None or identities[row.pid] == row.start_time
+
+    group = run.executor_pgid
+    # A PGID is not reused while its group has members (POSIX), so the group is a reused
+    # one only when its leader's PID now carries another start time.
+    reused_group = group is not None and any(row.pid == group and not same(row) for row in table)
+    return any(
+        ((row.pid in identities or row.pid in (run.pid, group)) and same(row))
+        or (group is not None and row.pgid == group and not reused_group)
+        for row in table
+    )
+
+
 def _run_processes_exist(run: Run) -> bool:
     """Whether any recorded process may remain; an unreadable pid or table counts (unknown is not gone)."""
     if (rows := _listing()) is None:
