@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 
 from foragent.config import Config
+from foragent.watch_cells import Style
 from foragent.watch_data import Snapshot
 
 
@@ -29,6 +30,113 @@ def color_pairs(colors: int) -> list[tuple[int, int]]:
             (curses.COLOR_GREEN, -1), (-1, -1),
             (curses.COLOR_MAGENTA, -1), (curses.COLOR_GREEN, -1),
             (curses.COLOR_BLUE, -1)]
+
+
+# xterm-256 index -> base ANSI colour 0..7 for structured art on an 8-colour terminal.
+# Fixed once by squared RGB distance (ties to the lower index); never probed per frame.
+ANSI8 = (
+    0, 1, 2, 3, 4, 5, 6, 7, 7, 1, 2, 3, 4, 5, 6, 7,  # 0..15
+    0, 4, 4, 4, 4, 4, 2, 6, 6, 6, 6, 6, 2, 6, 6, 6,  # 16..31
+    6, 6, 2, 6, 6, 6, 6, 6, 2, 6, 6, 6, 6, 6, 2, 6,  # 32..47
+    6, 6, 6, 6, 1, 5, 5, 5, 5, 5, 3, 3, 5, 5, 5, 7,  # 48..63
+    3, 3, 6, 6, 7, 7, 3, 3, 6, 7, 7, 7, 3, 3, 7, 7,  # 64..79
+    7, 7, 3, 7, 7, 7, 7, 7, 1, 5, 5, 5, 5, 5, 3, 3,  # 80..95
+    5, 5, 7, 7, 3, 3, 7, 7, 7, 7, 3, 3, 7, 7, 7, 7,  # 96..111
+    3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 1, 5, 5, 5,  # 112..127
+    5, 5, 3, 3, 5, 7, 7, 7, 3, 3, 7, 7, 7, 7, 3, 7,  # 128..143
+    7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7,  # 144..159
+    1, 5, 5, 5, 5, 5, 3, 3, 7, 7, 7, 7, 3, 7, 7, 7,  # 160..175
+    7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7,  # 176..191
+    7, 7, 7, 7, 1, 5, 5, 5, 5, 5, 3, 7, 7, 7, 7, 7,  # 192..207
+    3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7,  # 208..223
+    7, 7, 3, 7, 7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 3, 3,  # 224..239
+    3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,  # 240..255
+)
+
+
+def style_attribute(style: Style, *, styles: dict[str, int], pair: Callable[[int | None, int | None], int]) -> int:
+    """The curses attribute of one span's style: named styles by name, ("art", fg, bg) by pair."""
+    if isinstance(style, tuple):
+        return pair(style[1], style[2])
+    return styles.get(style, 0)
+
+
+class _Palette:
+    """Colour pairs beyond the seven base pairs, initialized only when first painted.
+
+    question/next/separator take pairs 8/9/10; structured colours (and working's
+    yellow) take cached pairs from 11 up to curses.COLOR_PAIRS. ``inks`` keeps each
+    painted style's normalized (fg, bg) for the links written after a refresh.
+    """
+
+    def __init__(self, curses, styles: dict[str, int]) -> None:
+        self.curses, self.styles = curses, styles
+        self.enabled = curses.has_colors()
+        self.extended = self.enabled and curses.COLORS >= 256
+        self.allocated: dict[tuple[int, int], int] = {}
+        self.next = 11
+        self.inks: dict[Style, tuple[int, int]] = {}
+        dim = curses.A_DIM
+        # Named styles: (pair, 256-colour fg, 8-colour fg, attributes on 8 colours or none).
+        self.named = {"question": (8, 203, curses.COLOR_RED, 0), "next": (9, 240, curses.COLOR_WHITE, dim),
+                      "separator": (10, 242, curses.COLOR_WHITE, dim)}
+        if not self.enabled:
+            styles.update({name: extra for name, (*_, extra) in self.named.items()})
+
+    def free(self, index: int) -> bool:
+        """Whether pair ``index`` exists; COLOR_PAIRS exists once start_color has run."""
+        return index < getattr(self.curses, "COLOR_PAIRS", 0)
+
+    def colour(self, value: int | None) -> int:
+        if value is None:
+            return -1
+        return value if self.extended else ANSI8[value]
+
+    def pair(self, foreground: int | None, background: int | None) -> int:
+        """A cached pair for two xterm-256 colours; 0 without colours or free pairs."""
+        if not self.enabled:
+            return 0
+        key = self.colour(foreground), self.colour(background)
+        if key not in self.allocated:
+            if not self.free(self.next):
+                return 0
+            self.curses.init_pair(self.next, *key)
+            self.allocated[key] = self.next
+            self.next += 1
+        return self.curses.color_pair(self.allocated[key])
+
+    def attribute(self, style: Style) -> int:
+        curses = self.curses
+        if self.enabled and isinstance(style, str) and style not in self.styles:
+            if style == "working":
+                self.styles[style] = self.pair(220, None)
+                if self.styles[style]:
+                    self.inks[style] = self.colour(220), -1
+            elif style in self.named:
+                index, extended, base, extra = self.named[style]
+                ink = extended if self.extended else base
+                if self.free(index):
+                    curses.init_pair(index, ink, -1)
+                    self.styles[style] = curses.color_pair(index) | (0 if self.extended else extra)
+                    self.inks[style] = ink, -1
+                else:
+                    self.styles[style] = extra  # No such pair: the text keeps its dim look.
+        attribute = style_attribute(style, styles=self.styles, pair=self.pair)
+        if isinstance(style, tuple):
+            if self.enabled and attribute:
+                self.inks[style] = self.colour(style[1]), self.colour(style[2])
+            if style[2] is not None:
+                attribute |= curses.A_BOLD  # An acorn body: bold text on its colour.
+        return attribute
+
+    def link(self, style: Style, attribute: int) -> str:
+        """SGR codes restoring a painted span's look, for a link written over it."""
+        curses = self.curses
+        codes = [code for flag, code in ((curses.A_BOLD, "1"), (curses.A_DIM, "2"), (curses.A_REVERSE, "7"))
+                 if attribute & flag]
+        foreground, background = self.inks.get(style, (-1, -1))
+        codes += [f"38;5;{foreground}"] * (foreground >= 0) + [f"48;5;{background}"] * (background >= 0)
+        return "\x1b[0m" + (f"\x1b[{';'.join(codes)}m" if codes else "")
 
 
 def _restart(cleanup: ExitStack) -> bool:
@@ -77,6 +185,12 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                       hit=curses.color_pair(4) | curses.A_BOLD, claude=curses.color_pair(5),
                       codex=curses.color_pair(6), blue=curses.color_pair(7))
         screen.bkgd(" ", styles["road"])
+    palette = _Palette(curses, styles)
+    if palette.enabled:
+        base = watch.color_pairs(curses.COLORS)
+        pairs = {"road": 1, "edge": 1, "divider": 2, "yellow": 2, "green": 3, "queue": 4, "hit": 4,
+                 "claude": 5, "codex": 6, "blue": 7}
+        palette.inks.update({name: base[index - 1] for name, index in pairs.items()})
     try:
         curses.curs_set(0)
     except curses.error:
@@ -174,7 +288,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 x = 0
                 # _frame already cut every line to the width; it is painted as it is.
                 for value, style in line:
-                    attribute = styles.get(style, 0) | (curses.A_REVERSE if y in marked else 0)
+                    attribute = palette.attribute(style) | (curses.A_REVERSE if y in marked else 0)
                     try:
                         screen.addstr(y, x, value, attribute)
                     except curses.error:
@@ -184,9 +298,9 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     for found in ISSUE_NUMBER.finditer(value):
                         url = watch.issue_url(config, int(found[1]))
                         if url is not None:
-                            look = ("\x1b[2m" if style == "dim" else "") + ("\x1b[7m" if y in marked else "")
-                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H{look}"
-                                         + watch.osc8(url, found[0]) + ("\x1b[0m" if look else ""))
+                            # The link keeps the span's colours, bold, dim and reverse, then resets.
+                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H"
+                                         + palette.link(style, attribute) + watch.osc8(url, found[0]) + "\x1b[0m")
                     x += watch._cells(value)
             screen.refresh()
             # Curses cannot write OSC 8, so every visible #n is written again as a link after
@@ -235,10 +349,12 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     watch.handle_key("enter", store, config, state=view_state)
                 continue
             elif key in keys:
-                if keys[key] in ("q", "Q") or (keys[key] == "esc" and view_state.get("issue") is None):
+                if keys[key] in ("q", "Q") or (keys[key] == "esc" and store is None):
                     return
                 if store is not None or keys[key] == "s":
-                    watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root)
+                    # Esc goes through handle_key: it closes a selection or box before it quits.
+                    if watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root):
+                        return
                 elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):
                     step = 1 if keys[key] in ("down", "up", "j", "k") else max(1, height - 2)
                     watch.scroll(view_state, -step if keys[key] in ("up", "k", "pageup") else step)

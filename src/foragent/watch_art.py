@@ -9,6 +9,8 @@ used. Consumers must map transparent foregrounds to the terminal background.
 
 from collections.abc import Mapping, Sequence
 
+from foragent.watch_cells import Line
+
 
 PixelGrid = Sequence[Sequence[str | None]]
 Cell = tuple[str, int | None, int | None]
@@ -17,6 +19,7 @@ Cell = tuple[str, int | None, int | None]
 PALETTE = {
     "K": 52, "O": 173, "R": 130, "W": 230, "E": 232, "N": 94,
     "A": 137, "C": 58, "P": 209, "T": 173, "Z": 147, "X": 221,
+    "D": 250,
 }
 
 
@@ -111,6 +114,81 @@ LANE_POSES = {
         '.TTOOOOO.',
     ], 9),
 }
+
+
+# A lane squirrel watching for work: 11 x 8 pixels (4 cell rows).
+_LOOKOUT = _pixels([
+    '....O.O....',
+    '...OOOO....',
+    '..OOOEO....',
+    'T..OOOO....',
+    'TT.OWWO....',
+    'TT.OWWO....',
+    '.TTOOOO....',
+    '...O..O....',
+], 11)
+
+# A lane squirrel asleep on its side: 9 x 8 pixels (4 cell rows).
+_LYING_ASLEEP = _pixels([
+    '.........',
+    '.........',
+    '.......Z.',
+    'WT.......',
+    'TT..O.O..',
+    'TT.OOOOO.',
+    'TTOOOKOOO',
+    '.TOOOOOO.',
+], 9)
+
+
+def lookout(tick: int) -> PixelGrid:
+    """The watching squirrel's frame for one animation tick."""
+    return _LOOKOUT
+
+
+def lying_asleep(tick: int) -> PixelGrid:
+    """The sleeping squirrel's frame for one animation frame (callers pass tick // 2)."""
+    return _LYING_ASLEEP
+
+
+def pixel_rows(grid: PixelGrid, palette: Mapping[str, int] = PALETTE) -> list[Line]:
+    """half_blocks as styled spans: ("art", fg, bg) per cell, never ANSI.
+
+    A bottom-only cell becomes a lower half-block in its own colour, so its upper half
+    is the terminal background rather than the default text colour.
+    """
+    rows = []
+    for cells in half_blocks(grid, palette):
+        row: Line = []
+        for glyph, upper, lower in cells:
+            if glyph == " ":
+                row.append((" ", ("art", None, None)))
+            elif upper is None:
+                row.append(("▄", ("art", lower, None)))
+            else:
+                row.append(("▀", ("art", upper, lower)))
+        rows.append(row)
+    return rows
+
+
+# Sideways acorn colours by canonical style: (stem and cap fg, body fg, body bg).
+_ACORN_COLOURS = {"working": (94, 232, 220), "question": (94, 232, 203), "next": (237, 252, 240)}
+_ACORN_STYLES = {"yellow": "working", "working": "working", "question": "question"}
+
+
+def sideways_acorn(number: int, word: str, style: str, *, tick: int = 0, ascii: bool = False) -> Line:
+    """One issue as a sideways acorn ``◖█#N word▌``, or ``[#N word]`` in ASCII.
+
+    yellow means working; parked and unknown styles use the next colours, so unknown
+    work never looks running.
+    """
+    style = _ACORN_STYLES.get(style, "next")
+    label = f"#{number} {word}" if word else f"#{number}"
+    if ascii:
+        return [(f"[{label}]", style)]
+    cap, ink, body = _ACORN_COLOURS[style]
+    return [("◖", ("art", cap, None)), ("█", ("art", cap, None)),
+            (label, ("art", ink, body)), ("▌", ("art", body, None))]
 
 
 def acorn_colour(done: bool) -> int:

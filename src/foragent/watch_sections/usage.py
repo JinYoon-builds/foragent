@@ -79,8 +79,12 @@ def _mode(snapshot: Snapshot, config: Config, state: dict[str, Any] | None) -> s
     return snapshot.meter.get("mode") or ("keep" if executors_explicit(config) else config.claude_quota["mode"])
 
 
-def _parts(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple[list[str], bool]:
-    """The usage line's parts, and whether Claude or Codex is below its cap."""
+def _parts(snapshot: Snapshot, config: Config, context: dict[str, Any], *,
+           include_capacity: bool = True) -> tuple[list[str], bool]:
+    """The usage line's parts, and whether Claude or Codex is below its cap.
+
+    ``include_capacity=False`` leaves out only the running/budget part.
+    """
     from foragent import watch
 
     language = config.language
@@ -105,9 +109,10 @@ def _parts(snapshot: Snapshot, config: Config, context: dict[str, Any]) -> tuple
     memory = meter.get("memory")
     if memory in ("warn", "critical"):
         parts.append(watch.text(f"usage_memory_{memory}", language))
-    running = meter.get("running", len(snapshot.status.get("active_runs", [])))
-    budget = meter.get("budget") or config.max_parallel or _initial()
-    parts.append(watch.text("usage_running", language, running=running, budget=budget))
+    if include_capacity:
+        running = meter.get("running", len(snapshot.status.get("active_runs", [])))
+        budget = meter.get("budget") or config.max_parallel or _initial()
+        parts.append(watch.text("usage_running", language, running=running, budget=budget))
     parts.append(f"keep {keep:g}%" if mode == "keep" and keep is not None else mode)
     return parts, left
 
