@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from foragent import orch_spawn
+from foragent import orch_seat, orch_spawn
 from foragent.config import Config
 from foragent.state import StateStore
 
@@ -38,6 +38,8 @@ def skip_reason(repo_root: Path, store: StateStore, now: datetime) -> str | None
         return "no_work"
     if orch_spawn._session_alive(store, repo_root.resolve()):
         return "session"
+    if orch_seat.blocks_spawn(store):  # #962: a live or unknown lease holder.
+        return "seat"
     return None
 
 
