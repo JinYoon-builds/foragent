@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
+import json
 from pathlib import Path
 import sys
 
@@ -11,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from foragent import runner  # noqa: E402
+from conftest import git_command  # noqa: E402
 from runner_support import batch_setup, enable_reviewer, run_case  # noqa: E402,F401
 from test_short_merge_lock import (  # noqa: E402,F401
     assert_merge_facts, assert_short_holds, publish_case, run, short_case,
@@ -159,6 +161,7 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
         return original_issue(number)
 
     polls = []
+    moved = []
 
     def checks(pr):
         polls.append(pr)
@@ -169,6 +172,7 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
         case.now[0] += timedelta(seconds=seconds)
         if change == "base":
             case.history.update({"docs/changed.md": "Moved base\n"})
+            moved.append(case.history.tip)
         elif change == "policy":
             case.tracker.add_labels(1, ["risk:high"])
         elif change == "approval":
@@ -184,14 +188,40 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
     monkeypatch.setattr(case.tracker, "pr_checks", checks)
     monkeypatch.setattr(case.tracker, "merge_pr", merge_pr)
     case.ctx.sleep = sleep
-    expected = {None: "merged", "base": "base-changed", "policy": "held", "approval": "hash-mismatch"}[change]
+    from foragent import run_review
+    verified = []
+    verify = run_review._verify_review_head
+
+    def observe_verify(n, ctx, git, parsed, head_sha, link):
+        verified.append(head_sha)
+        return verify(n, ctx, git, parsed, head_sha, link)
+
+    monkeypatch.setattr(run_review, "_verify_review_head", observe_verify)
+    # A moved base is merged in and re-verified on the turn, not a stop (#712).
+    expected = {None: "merged", "base": "merged", "policy": "held", "approval": "hash-mismatch"}[change]
     assert runner.review_only(1, case.ctx, verdict_head=head if verdict else None) == expected
     assert False in guards and True in guards
     record = case.store.get_run(1)
     assert record.last_review_pass_at == accepted_at.isoformat()
     assert record.waited_seconds == 19
-    assert record.review_pass_to_merge_seconds == (51 if change is None else None)
-    assert record.merge_lock_held_seconds == (2 if change is None else None)
+    merged = change in {None, "base"}
+    assert record.review_pass_to_merge_seconds == (51 if merged else None)
+    assert record.merge_lock_held_seconds == (2 if merged else None)
+    queue = [json.loads(line) for line in (case.store.root / "merge-queue.jsonl").read_text().splitlines()]
+    review_events = [row["event"] for row in queue if row.get("started_at") == record.started_at]
+    if merged:
+        # A merged run leaves no withdrawn entry; the turn passes when its run stops.
+        assert review_events == ["ready", "turn"]
+    if change == "base":
+        log = case.store.log_path(1).read_text()
+        assert log.count("re-verifying") == 1, "The moved base is merged in and re-verified once"
+        # The reviewed head and then the merged head both run their checks; the merge uses the new head.
+        assert len(verified) == 2 and verified[0] == head and verified[1] != head
+        assert case.tracker.pr_head_sha(2) == verified[1]
+        assert git_command(case.history.origin, "merge-base", "--is-ancestor", moved[-1], verified[1]) == ""
+        assert case.tracker.merged_prs == [2]
+    else:
+        assert verified == [head]
 
 
 def test_batch_child_uses_short_lock_and_records_hold_without_reviewer_pass(run_case, monkeypatch):
@@ -266,7 +296,7 @@ def test_lock_hold_includes_bookkeeping_after_acquisition(tmp_path, monkeypatch)
     store.start_run(1, branch="branch", worktree="worktree")
     ctx = SimpleNamespace(store=store, now=lambda: clock[0])
 
-    def credited_wait(number, context, acquire):
+    def credited_wait(number, context, acquire, phase, **options):
         acquire()
         clock[0] += timedelta(seconds=3)
 

@@ -589,7 +589,7 @@ def test_remote_conflicted_wip_is_rechecked_without_local_state(conflicting_lane
     monkeypatch.setattr(c.executor, "run", execute)
     assert run_issue(1, c.ctx) == "merged"
     assert len(c.executor.calls) == 5
-    assert "충돌 마커가 남음: cli.py:1" in c.executor.calls[-1]["prompt"]
+    assert "Conflict marker left: cli.py:1" in c.executor.calls[-1]["prompt"]
     assert git_command(c.history.origin, "show", f"{branch}:cli.py") == resolved.strip()
 
 
@@ -602,6 +602,19 @@ def test_conflict_resolution_has_full_budget_after_implementation_retries(confli
     assert len(c.executor.calls) == 4 and c.store.get_run(1).attempts == 2
     assert "Conflict markers remain in: cli.py" in c.executor.calls[-1]["prompt"]
     assert c.store.load_flag(1) is None
+
+
+def test_conflict_resolution_turns_step_up_the_tier_like_failed_attempts(conflicting_lanes):
+    # #238: every executor turn, conflict resolution included, is counted as turn k.
+    c = conflicting_lanes
+    c.tracker.add_labels(1, ["size:s"])
+    c.ctx.config = replace(c.ctx.config, max_retries=5)
+    c.executor.steps.insert(0, {"cli.py": "commands = ['help']\n"})
+    c.executor.steps += [{}, {"cli.py": "commands = ['help', 'base', 'issue']\n"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.store.get_run(1).attempt_tiers == {"1": "s", "2": "m", "3": "l", "4": "l"}
+    assert [call.get("effort") for call in c.executor.calls] == ["medium", "high", "xhigh", "xhigh"]
+    assert "Attempt 3 at tier l" in c.tracker.created_prs[0].body
 
 
 @pytest.mark.parametrize("before_push", [False, True])
@@ -757,20 +770,23 @@ def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypat
 
 
 def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
+    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it."""
     c = run_case
     moves = []
 
     def ci(pr):
         moves.append(pr)
+        c.now[0] += timedelta(minutes=20)
         c.history.update({f"parallel-{len(moves)}.txt": "fresh"})
         return "pass"
 
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
     assert run_issue(1, c.ctx) == "timeout"
-    assert len(moves) == 4
-    assert len([args for _, args in c.operations if "--no-edit" in args]) == 3
+    # Every result-affecting move is merged and re-verified once, past the old cap of three.
+    assert len(moves) == 5
+    assert len([args for _, args in c.operations if "--no-edit" in args]) == len(moves)
     assert c.store.load_flag(1).reason == Reason.TIMEOUT
-    assert "base kept moving" in c.tracker.list_comments(1)[-1].body
+    assert not any("base kept moving" in comment.body for comment in c.tracker.list_comments(1))
     assert c.tracker.merged_prs == []
 
 
@@ -815,3 +831,24 @@ def test_replay_own_files_come_from_branch_head_not_uncommitted_staged_work(run_
     assert "shared.txt" in c.tracker.list_comments(1)[-1].body
     # The stop keeps the PR's own work rather than the destination tree holding replay markers.
     assert git_command(c.history.origin, "show", "foragent/issue-1:shared.txt") == "child"
+
+
+def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lanes, monkeypatch):
+    c = conflicting_lanes
+    c.tracker.add_labels(1, ["bug"])
+    c.executor.steps.append({"cli.py": "commands = ['help', 'base', 'issue']\n"})
+    implement = c.executor.run
+
+    def run(**kwargs):
+        initial = not c.executor.calls
+        result = implement(**kwargs)
+        if initial:
+            c.move_target()
+        return result
+
+    monkeypatch.setattr(c.executor, "run", run)
+    assert run_issue(1, c.ctx) == "merged"
+    first, conflict = (call["prompt"] for call in c.executor.calls)
+    assert "This issue is a bug. Follow these steps:" in first
+    assert "Resolve the conflict markers" in conflict
+    assert "This issue is a bug. Follow these steps:" not in conflict

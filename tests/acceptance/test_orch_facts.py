@@ -340,29 +340,14 @@ def test_orch_facts_waste_shares_count_waits_and_explicit_repeats_without_a_hist
 
 
 def facts_without_plan(case, capsys, monkeypatch, *, human=False):
-    """Observe read-only facts while rejecting access to the unrelated plan.
+    """Observe read-only facts beside a plan that carries a throughput goal.
 
-    Take file snapshots outside the open guards: the test's own unchanged-file
-    check must be able to read the poison plan, while the command must not.
+    Facts may read plan.json (it also holds lane queues, #287), but must never
+    report its goal number; callers check the output for it. Nothing may change.
     """
-    import builtins
-    import io
-    from pathlib import Path
-
     before = files(case.files_root)
-    plan_path = (case.store.root / "plan.json").resolve()
-
-    def guarded(open_file):
-        def open_local(file, *args, **kwargs):
-            if isinstance(file, (str, os.PathLike)):
-                assert Path(file).resolve() != plan_path, "Facts must not read a plan throughput goal number"
-            return open_file(file, *args, **kwargs)
-        return open_local
-
     capsys.readouterr()
-    with monkeypatch.context() as guard:
-        guard.setattr(builtins, "open", guarded(builtins.open))
-        guard.setattr(io, "open", guarded(io.open))
+    with monkeypatch.context():
         code = cli_exit(case.main, ["orch", "facts", "--repo-root", str(case.root)] + ([] if human else ["--json"]))
     output = capsys.readouterr()
     assert files(case.files_root) == before and case.gh_calls == []

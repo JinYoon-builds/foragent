@@ -9,10 +9,7 @@ then restarts every installed gate between ticks under that gate's tick lock.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-import fcntl
 import importlib.metadata
 import json
 import os
@@ -23,11 +20,12 @@ import subprocess
 import sys
 from typing import Any
 
-from foragent import capacity, launchd, orch_reinstall
+from foragent import capacity, gh, launchd, tool_install
 from foragent.config import Config, ConfigError, load_config
 from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.state import StateStore
+from foragent.tool_install import machine_lock as _machine_lock
 
 RELEASE_API = "repos/JinYoon-builds/foragent/releases/latest"
 INSTALL_SOURCE = "git+https://github.com/JinYoon-builds/foragent@"
@@ -81,7 +79,7 @@ def _write_cache(record: dict[str, Any]) -> None:
 def lookup() -> str | None:
     """The latest release tag, or None when GitHub cannot say or the tag is not a version."""
     try:
-        result = subprocess.run(["gh", "api", RELEASE_API], capture_output=True, text=True,
+        result = gh.run(["api", RELEASE_API], capture_output=True, text=True,
                                 timeout=LOOKUP_SECONDS, check=True)
         tag = json.loads(result.stdout).get("tag_name")
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
@@ -132,22 +130,21 @@ def check(config: Config | None) -> dict[str, str] | None:
     return _offer(cache.get("latest"), cache.get("installed"))
 
 
+def cached(config: Config | None) -> dict[str, str] | None:
+    """The offer from the last recorded check only: no lookup, no lock, no write.
+
+    For commands that must not call GitHub (`fa brief --report`); while the cache is
+    fresh this is the same offer ``check`` returns.
+    """
+    if opted_out(config):
+        return None
+    cache = _read_cache()
+    return _offer(cache.get("latest"), cache.get("installed"))
+
+
 def offer_line(offer: dict[str, str], language: str) -> str:
     return text("update_offer", language, latest=offer["latest"], current=offer["current"],
                 command=offer["command"])
-
-
-@contextmanager
-def _machine_lock(name: str) -> Iterator[None]:
-    """Wait for an exclusive lock file in the machine data root."""
-    path = capacity.machine_root() / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def installed_gates() -> dict[Path, list[launchd.InstalledJob]]:
@@ -228,13 +225,12 @@ def update(repo_root: Path | None = None) -> int:
         return 0
     # Otherwise install: a newer release, or an earlier update that left gates
     # unrestarted, which this run finishes by repeating the whole update.
-    with _machine_lock("install.lock"):
-        try:
-            orch_reinstall._uv(["tool", "install", INSTALL_SOURCE + tag], cwd=Path.home())
-        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            reason = " ".join(str(exc).split()) or type(exc).__name__
-            print(text("update_install_failed", language, tag=tag, reason=reason), file=sys.stderr)
-            return 1
+    try:
+        tool_install.install(INSTALL_SOURCE + tag, cwd=Path.home(), revision=tag)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        reason = " ".join(str(exc).split()) or type(exc).__name__
+        print(text("update_install_failed", language, tag=tag, reason=reason), file=sys.stderr)
+        return 1
     print(text("update_installed", language, tag=tag))
     cache["installed"] = tag
     gates = installed_gates()

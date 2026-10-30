@@ -22,6 +22,8 @@ class ExecResult:
     session_id: str | None = None
     num_turns: int | None = None
     usage: dict | None = None
+    # What the session cost, as the executor reported it (Claude's total_cost_usd); None when unreported.
+    cost_usd: float | None = None
 
 
 def classify_result(result: ExecResult) -> str:
@@ -153,7 +155,8 @@ class Executor(Protocol):
 
 def codex_command(worktree: Path, output_path: Path, model: str | None = None,
                   effort: str | None = None, *, resume_session_id: str | None = None,
-                  read_only: bool = False, prompt: str | None = None) -> list[str]:
+                  read_only: bool = False, prompt: str | None = None,
+                  add_dirs: tuple[Path, ...] = ()) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
     # Resume has its own CLI options; cwd is supplied by run_logged.
@@ -165,6 +168,8 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
         "codex", "exec", "-", "-C", str(worktree), "-s", sandbox,
         "--skip-git-repo-check", "--json", "-o", str(output_path),
     ]
+    # Extra writable roots, e.g. the state directory for the architect's `fa orch request`.
+    args += [part for path in add_dirs for part in ("--add-dir", str(path))]
     return args + (["-m", model] if model is not None else []) + (
         ["-c", f"model_reasoning_effort={effort}"] if effort is not None else []
     )
@@ -173,6 +178,7 @@ def codex_command(worktree: Path, output_path: Path, model: str | None = None,
 def claude_command(
     model: str | None = None, settings_path: Path | None = None, agent: str | None = None,
     *, resume_session_id: str | None = None, read_only: bool = False, prompt: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if resume_session_id is not None and (prompt is None or not prompt.strip()):
         raise ValueError("Session resume requires a non-empty prompt")
@@ -185,6 +191,8 @@ def claude_command(
         args += ["--agent", agent]
     if resume_session_id is not None:
         args += ["--resume", resume_session_id]
+    if effort is not None:
+        args += ["--effort", effort]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -192,6 +200,21 @@ def claude_review_command(level: str, model: str | None = None, *, pr: int | Non
     target = f"{pr} " if pr is not None else ""
     args = ["claude", "-p", f"/code-review {target}{level}", "--permission-mode", "auto", "--output-format", "json"]
     return args + (["--model", model] if model is not None else [])
+
+
+def claude_cost(result: dict) -> float | None:
+    """Claude's reported ``total_cost_usd`` from a result event or review document (#786)."""
+    value = result.get("total_cost_usd") if isinstance(result, dict) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def claude_document(path: Path) -> dict:
+    """A review run's single JSON document; {} when it is not one."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def claude_stream_result(path: Path) -> dict:
@@ -208,13 +231,17 @@ class CodexExecutor:
         self, *, worktree: Path, prompt: str, model: str | None,
         timeout_s: int, log_path: Path, effort: str | None = None,
         resume_session_id: str | None = None, read_only: bool = False,
+        add_dirs: tuple[Path, ...] = (), events_path: Path | None = None,
     ) -> ExecResult:
         with tempfile.TemporaryDirectory(prefix="foragent-codex-") as temporary:
             output_path = Path(temporary) / "last-message.txt"
-            events_path = Path(temporary) / "events.jsonl"
+            # A caller that must keep the session's JSON events names a durable path.
+            events_path = events_path or Path(temporary) / "events.jsonl"
             options = {"resume_session_id": resume_session_id, "prompt": prompt} if resume_session_id is not None else {}
             if read_only:
                 options["read_only"] = True
+            if add_dirs:
+                options["add_dirs"] = tuple(add_dirs)
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
@@ -230,6 +257,10 @@ class CodexExecutor:
                           error_kind=error_kind, session_id=session_id, num_turns=turns)
 
 
+# A headless session that backgrounds a long command ends its turn and stalls (#712, #466).
+CLAUDE_SESSION_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+
+
 class ClaudeExecutor:
     def run(
         self, *, worktree: Path, prompt: str, model: str | None,
@@ -237,10 +268,12 @@ class ClaudeExecutor:
         settings_path: Path | None = None, review_level: str | None = None,
         agent: str | None = None, review_pr: int | None = None,
         resume_session_id: str | None = None,
-        goal: str | None = None, read_only: bool = False,
+        goal: str | None = None, read_only: bool = False, effort: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {}
+        if effort is not None:
+            options["effort"] = effort
         if read_only:
             options["read_only"] = True
         if agent is not None:
@@ -260,6 +293,7 @@ class ClaudeExecutor:
         code, timed_out, _ = run_logged(
             command, cwd=worktree, prompt=None if review_level is not None else prompt, timeout_s=timeout_s,
             log_path=log_path, capture_stdout=True, stdout_path=output_path,
+            env=CLAUDE_SESSION_ENV,
         )
         result = claude_stream_result(output_path) if review_level is None else {}
         value = result.get("result")
@@ -268,9 +302,12 @@ class ClaudeExecutor:
         turns = result.get("num_turns")
         error_kind = _structured_error_kind(output_path, "claude", document=review_level is not None)
         session_id = stream_session_id(output_path, "claude") if review_level is None else None
+        # The cost comes from the same output the adapter reads: the stream's result event,
+        # or a review's one JSON document, which carries no `type`.
+        cost = claude_cost(result if review_level is None else claude_document(output_path))
         return ExecResult(code, timed_out, message, log_path, message,
                           error_kind=error_kind, session_id=session_id,
-                          num_turns=turns if type(turns) is int else None)
+                          num_turns=turns if type(turns) is int else None, cost_usd=cost)
 
 
 def executor_for(name: str) -> Executor:

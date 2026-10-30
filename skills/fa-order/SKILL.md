@@ -63,6 +63,11 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
 - Never ask what the code, docs, specs or earlier decisions already answer.
+- A **starter order** (the person says `starter: ...` after `fa init`) is one tiny task
+  a lane can finish in about 10 minutes, to show the flow to a merged PR. Their example is
+  a suggestion: pick what fits this project from `repo`, `open_issues` and
+  `pull_requests` (open and recently merged; `foragent` marks Foragent branches), so it
+  neither repeats nor collides with existing work. It goes through the same approval.
 
 ### Current words win
 The person's current words take precedence over old documents and the ledger.
@@ -148,6 +153,24 @@ skill in the pack). Then refresh the catalog and apply confirmed style choices.
 If none fits or discovery is unavailable, state the reason and settle an explicit
 no-match or deferred choice with the person; do not invent candidates or hand them commands.
 
+### Roles: lightest fix first
+When someone asks for a new standing role (for example "a security owner"), first look
+for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
+1. A line in the lane memory: edit `.claude/agent-memory/fa-<lane>/MEMORY.md` of the lane
+   that owns the area directly. The orchestrator commits it in its next batched commit.
+2. A skill attached to the lane that owns the area: `fa lanes skills <lane> <skill-id>`
+   (the lanes code is the one writer of lane skills).
+3. A reviewer perspective scoped to paths: add a `review_perspectives` entry
+   (`{name, focus}`) whose focus names the paths, for example security on
+   `src/payment/**`. This needs no new schema.
+4. A new role only when the work must judge across areas and send proposals.
+In the multiple-choice confirmation, show the cheaper option first, with the reason it
+fits; offer the role after it. Only after the person confirms a role, run
+`fa role add <name> --scope "<paths>" --signal "paths:<paths>" --skill <skill-id> --why "<confirmed reason>"`
+with the name, scope, call conditions (repeat `--signal`) and skills (repeat `--skill`).
+Every role may be idle. Roles never message the person; everything goes through the
+orchestrator.
+
 ## Design first (D33)
 Use `ui.frameworks` and `ui.has_design_foundation` from the context alongside the request.
 For UI work without a foundation, first suggest the design interview (디자인 인터뷰); if the
@@ -226,6 +249,19 @@ When a behaviour cannot be checked by a machine (visual taste, real device), add
 checklist item and keep at least one executable command anyway (e.g. the build or a smoke
 check). Done when commands must run with the repo's normal tooling from the repo root.
 
+## 5b. Challenge the spec from other seats
+Once the spec is roughly formed, before you lock it for approval, write the plan JSON
+(schema in `fa order publish --help`) to a temp file and run
+`fa order perspectives PLAN.json --json`. Read-only agents question it in parallel from
+fixed seats: skeptic, first-time user, attacker, operator, maintainer in six months,
+incidents (risk map and decisions), and other users. A failed seat is listed under
+`failures`; the others still count. Merge duplicate questions across seats into one. Answer what the code, the
+docs or a settled decision already answers, and fold it into the spec yourself. Ask the
+person only the questions D71 leaves to them: behaviour, scope or approval. Then record
+each question once with `fa order perspectives mark ID --changed yes|no` (yes when it
+changed the spec; mark every id of a merged duplicate). `fa order perspectives stats --json`
+shows which seats changed specs.
+
 ## 6. One approval
 Write the plan JSON (schema in `fa order publish --help`) to a temp file. Run
 `fa order publish PLAN.json --dry-run`, fix validation errors, then record `progress check`.
@@ -246,6 +282,14 @@ This order: 7 issues
  docs/              README                                      [s]
  runs in parallel: api, web · skills: api=testing-strategy
 ```
+Before asking for approval, check every issue and fix the plan where a check fails:
+- (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
+  not enough? Name the measured gap.
+- (b) Bar: is the Done-when bar stricter than what the existing proven path meets? If so,
+  justify it with an incident.
+- (c) Reversibility (principle 10): if this fails, can it be undone? If yes, the Goal asks
+  for detection and recovery, not zero races; only irreversible failures (uncommitted work
+  deleted, permanent deletion, sending outside) are prevented structurally.
 Then AskUserQuestion: Approve all (recommended) / Approve some / Change something.
 Show the acceptance test of any issue the user asks about.
 Show which issues are interactive and why before asking for approval.
@@ -263,6 +307,20 @@ existing issues go into `edits`. Record `progress publish --issue <number>` for 
 published or updated issue in the result. Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
 `fa order progress end`.
+
+After publishing, check the orchestrator. This session is the planning session (D76). It never becomes the orchestrator and never
+takes over its work; it only makes sure one runs and talks to it:
+- Run `fa orch alive --json`. If it prints `"alive": false`, run `fa orch ensure`. It
+  opens one orchestrator in the background and prints one line; when it opened nothing,
+  tell the user that line. If the orchestrator is already alive, do not start a second one.
+- Open the lane view beside this planning session with `fa gate watch --open`.
+- Send every request to the orchestrator twice: as a cross-session message to the
+  `orch: <project>` session (SendMessage) and with
+  `fa orch request --from planning --text "<request>"`, so it survives a restart.
+- While this session is open, renew `fa plan heartbeat` about every minute, so
+  questions reach this session by message instead of a push notification.
+- Show the open questions from `fa orch questions` and record answers with
+  `fa orch answer <id> --text "<answer>"`.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
 issues that are already running, never merge.

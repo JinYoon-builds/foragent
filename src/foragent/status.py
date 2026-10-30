@@ -10,7 +10,8 @@ from datetime import datetime
 from typing import Any
 
 from foragent.config import Config
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, lane_display, lane_order
+from foragent.labels import (APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, WAITING_PERSON, issue_lane,
+                             lane_display, lane_order)
 from foragent.reasons import parse_reason
 from foragent.state import StateStore
 from foragent.tracker import Issue
@@ -75,7 +76,7 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "stale": observation["error"] is not None,
         "error": observation["error"],
         "failed_at": observation["failed_at"],
-        "active_runs": [asdict(run) for run in store.active_runs()],
+        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],  # Dreams hold no issue.
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
@@ -90,6 +91,27 @@ def summary_values(summary: dict[str, Any]) -> dict[str, Any]:
     return {key: "?" if value is None else value for key, value in summary.items()}
 
 
+def issue_state(labels: Any, active: bool, group: str | None = None) -> str | None:
+    """One issue's row state from its local facts, the same for status and the lane view.
+
+    A person (needs-human or waiting-person) comes first, then blocked, then a running
+    worker; an open PR waits for a person; approved or ready work is queued. None means
+    the issue is not shown.
+    """
+    labels = set(labels or ())
+    if {NEEDS_HUMAN, WAITING_PERSON} & labels:
+        return "waiting-human"
+    if BLOCKED in labels:
+        return "blocked"
+    if active or RUNNING in labels:
+        return "working"
+    if group == "pr-open":
+        return "waiting-human"
+    if APPROVED in labels or READY in labels:
+        return "queued"
+    return None
+
+
 def collect_lanes(
     issues: list[Issue], groups: dict[str, list[dict[str, Any]]], waiting: dict[int, list[int]],
     store: StateStore, config: Config, now: datetime, *, titles: dict[int, str] | None = None,
@@ -99,13 +121,16 @@ def collect_lanes(
     summary = dict(working=0, blocked=0, waiting_human=0, queued=0)
     priority = {"working": 0, "waiting-human": 1, "blocked": 2, "queued": 3, "idle": 4}
     grouped = {item["number"]: (group, item) for group, items in groups.items() for item in items}
+    # A lane dreams while its dream record runs; the tick owns that record's liveness.
+    dreaming = {run.lane for run in store.dream_runs() if run.status == "running"}
 
     def lane_row(slug: str) -> dict[str, Any]:
         return lanes.setdefault(slug, {
             "slug": slug, "lane_display": lane_display(config, slug, config.language),
             "state": "idle", "issue": None, "title": None, "phase": None,
             "elapsed_seconds": None, "last_activity_seconds": None, "waiting_for": [],
-            RUNNING: [], READY: [], "queued": [],
+            RUNNING: [], READY: [], "queued": [], "held": [],
+            "dreaming": slug in dreaming,
         })
 
     def show(row: dict[str, Any], state: str, number: int, title: str | None, run, waiting_for) -> None:
@@ -129,27 +154,21 @@ def collect_lanes(
         group, item = grouped[issue.number]
         if group in {RUNNING, READY}:
             row[group].append(item)
-        if NEEDS_HUMAN in issue.labels:
-            state = "waiting-human"
-        elif BLOCKED in issue.labels:
-            state = "blocked"
-        elif active or RUNNING in issue.labels:
-            state = "working"
-        elif group == "pr-open":
-            state = "waiting-human"
-        elif APPROVED in issue.labels or READY in issue.labels:
-            state = "queued"
-        else:
+        state = issue_state(issue.labels, active, group)
+        if state is None:
             continue
         summary[state.replace("-", "_")] += 1
         if state == "queued":
             row["queued"].append(item)
+        elif state in {"blocked", "waiting-human"} and not active:
+            # Every held issue, not only the lane's most urgent one, has a lane row.
+            row["held"].append({**item, "state": state})
         show(row, state, issue.number, issue.title, run if active else None,
              waiting.get(issue.number, []) if state == "queued" else [])
     # Runs recorded locally are working even when the snapshot predates them or is missing.
     seen = {issue.number for issue in issues}
     for run in store.active_runs():
-        if run.number in seen:
+        if run.kind != "issue" or run.number in seen:  # A lane's dream is no issue row.
             continue
         summary["working"] += 1
         show(lane_row(run.lane), "working", run.number, (titles or {}).get(run.number), run, [])

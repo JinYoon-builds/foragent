@@ -16,7 +16,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.watch_cells import Line
 
-ORDER = 15
+ORDER = 21
 BAR_CELLS = 20
 RATE_WINDOW = timedelta(hours=3)
 SIZES = ("s", "m", "l")
@@ -83,7 +83,7 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     rows = {row["number"]: row for row in store.local_issues()}
     history = store.read_history()
     starts: dict[int, list[datetime]] = {}
-    for run in [*history, *store.active_runs()]:
+    for run in [*history, *(run for run in store.active_runs() if run.kind == "issue")]:
         if (at := _time(run.started_at)) is not None:
             starts.setdefault(run.number, []).append(at)
     latest: dict[int, tuple[datetime, str, datetime | None]] = {}  # number -> (merged, size, started)
@@ -338,8 +338,10 @@ def render(snapshot: Any, config: Config, repo_root: Path, **context: Any) -> li
                 lines.append([(text("progress_no_evidence", language, count=0, remaining=remaining), "")])
                 if snapshot.today:
                     lines.append([(text("progress_today", language, count=snapshot.today), "")])
-                running = [f"#{run['number']}" + (f" {text(run['phase'], language)}" if run.get("phase") else "")
-                           for run in snapshot.status.get("active_runs", [])]
+                # In the frame each running issue already has its own lane row (#167).
+                running = [] if context.get("rows") else [
+                    f"#{run['number']}" + (f" {text(run['phase'], language)}" if run.get("phase") else "")
+                    for run in snapshot.status.get("active_runs", [])]
                 if running:
                     lines.append([(text("progress_running", language, items=" · ".join(running)), "")])
     if snapshot.quota:

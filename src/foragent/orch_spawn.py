@@ -3,7 +3,7 @@
 The gate calls ``ensure_orchestrator`` every tick. It opens one Claude session
 running ``/fa-orchestrator`` only when approved work exists, no orchestrator
 renewed its heartbeat lately, no recorded or gate-spawned orchestrator session
-is still running, and no spawn happened in the last two minutes.
+is still running, no live lease holder sits in the seat (``orch_seat``), and no spawn happened in the last two minutes.
 The session opens in the background: a new Orca tab without focus, a detached
 tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
 planning session, so nothing here splits a pane or switches focus.
@@ -16,10 +16,9 @@ import os
 from pathlib import Path
 import shlex
 import shutil
-import subprocess
 from types import SimpleNamespace
 
-from foragent import notify, orch_stale_files, processes, watch_open
+from foragent import orch_binding, orch_push, orch_seat, orch_silent, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
 from foragent.config import Config
 from foragent.i18n import text
@@ -29,6 +28,7 @@ from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
 SKILL = "/fa-orchestrator"
+AGENT = ".claude/agents/fa-orchestrator.md"
 # A live orchestrator without a fresh heartbeat is noted at most this often.
 SILENT_NOTE_SPACING = timedelta(hours=1)
 
@@ -71,6 +71,28 @@ def _note_silent(store: StateStore, now: datetime) -> None:
                  "orchestrator alive without heartbeat; no second orchestrator opened")
 
 
+def observe_silence(repo_root: Path, store: StateStore, config: Config, now: datetime, reason: str) -> None:
+    """The one silence step (gate and ``fa orch ensure``) for why no orchestrator opened (#952).
+
+    A fresh heartbeat rearms; a live one without it (``session``/``seat``) gets
+    the hourly note, and only the seat holder may push (``orch_silent.check``).
+    """
+    if reason == "alive" or (reason in ("session", "seat") and _alive(store, now)):
+        orch_silent.rearm(store)
+    elif reason in ("session", "seat"):
+        _note_silent(store, now)
+        orch_silent.check(repo_root.resolve(), store, config, now)
+
+
+def _live_reason(store: StateStore, root: Path, now: datetime) -> str | None:
+    """Which live orchestrator evidence stops a spawn: ``alive``, ``session``, ``seat`` or None."""
+    if _alive(store, now):
+        return "alive"
+    if _session_alive(store, root):
+        return "session"
+    return "seat" if orch_seat.blocks_spawn(store) else None
+
+
 def _spaced(store: StateStore, now: datetime) -> bool:
     try:
         last = datetime.fromisoformat(json.loads(_record_path(store).read_text(encoding="utf-8"))["spawned_at"])
@@ -89,8 +111,38 @@ def _record_session(store: StateStore, now: datetime, screen: str, pid) -> None:
         row = None
     if row is None:
         return
-    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen, "launched": True,
                                             "pid": pid, "start_time": row.start_time})
+
+
+def record_launch(store: StateStore, now: datetime, screen: str, result) -> None:
+    """After the launch command returns, add its outcome to the spawn record.
+
+    ``result`` is the finished process, or None when the command failed or timed
+    out (``launched: false``). The PID and start time are optional evidence, so a
+    failure to read them never hides a launch that happened.
+    """
+    store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen,
+                                            "launched": result is not None})
+    if result is not None:
+        try:
+            _record_session(store, now, screen, getattr(result, "pid", None))
+        except Exception:  # noqa: BLE001 - the identity is optional evidence
+            pass
+
+
+def _read_record(store: StateStore) -> dict | None:
+    try:
+        record = json.loads(_record_path(store).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def launched_since(store: StateStore, before: dict | None) -> bool:
+    """Whether the spawn record changed since ``before`` to a launch that ran (#129)."""
+    after = _read_record(store)
+    return after is not None and after != before and after.get("launched") is True
 
 
 def _approved_work(store: StateStore) -> bool:
@@ -108,50 +160,70 @@ def _orca(store: StateStore, root: Path) -> str | None:
     return None
 
 
-def _command(root: Path, store: StateStore, title: str) -> tuple[str, list[str]] | None:
+def _command(root: Path, store: StateStore, title: str, session_id: str | None = None,
+             prompt: str | None = None) -> tuple[str, list[str]] | None:
+    """The launch argv for the first available screen.
+
+    With ``session_id`` (#413) Claude gets ``--session-id`` and the role
+    environment as an ``env`` prefix in the Orca and tmux commands; the
+    background path takes that environment from ``_environment``. ``prompt``
+    follows ``/fa-orchestrator`` as its first message.
+    """
     claude = shutil.which("claude")
     if not claude:
         return None
-    session = shlex.join([claude, SKILL])
+    # The role agent loads its skill and project memory when the project defines it.
+    agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
+    named = ["--session-id", session_id] if session_id else []
+    first = [prompt] if prompt else []
+    prefix = ["env", *(f"{key}={value}" for key, value in _role_env(session_id).items())] if session_id else []
+    session = shlex.join([*prefix, claude, *agent, *named, SKILL, *first])
     if orca := _orca(store, root):
         return "orca", [orca, "terminal", "create", "--worktree", f"path:{root}",
                         "--title", title, "--command", session]
     tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
     if tmux:
         return "tmux", [tmux, "new-window", "-d", "-n", title, "-c", str(root), session]
-    return "background", [claude, "--bg", "-n", title, SKILL]
+    return "background", [claude, "--bg", "-n", title, *agent, *named, SKILL, *first]
 
 
-def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime) -> str | None:
-    """Open one orchestrator if needed; return the screen used, or None."""
+def _role_env(session_id: str) -> dict[str, str]:
+    return {"FORAGENT_ROLE": "orchestrator", "FORAGENT_SESSION_ID": session_id}
+
+
+def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
+                        spacing: bool = True, why: list | None = None) -> str | None:
+    """Open one orchestrator if needed; return the screen used, or None.
+
+    ``spacing=False`` is the explicit planning-session call (``fa orch ensure``,
+    see ``orch_ensure.ensure_explicit``, which appends why it opened nothing to ``why``);
+    the gate's default path below is unchanged.
+    """
+    if not spacing:
+        from foragent.orch_ensure import ensure_explicit  # Late: orch_ensure imports this module.
+        return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
         return None
-    if _alive(store, now) or not _approved_work(store):
+    if not _approved_work(store) and not _alive(store, now):
         return None
-    if _session_alive(store, repo_root.resolve()):
-        _note_silent(store, now)
+    root = repo_root.resolve()
+    if (reason := _live_reason(store, root, now)) is not None:
+        observe_silence(root, store, config, now, reason)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):
             return None
-        root = repo_root.resolve()
-        title = f"orch: {root.name}"
-        chosen = _command(root, store, title)
-        if chosen is None:
-            return None
-        screen, argv = chosen
-        # A failed or timed-out command may still open later, so it reserves the spacing too.
-        store._write_json(_record_path(store), {"spawned_at": now.isoformat(), "screen": screen})
-        try:
-            result = subprocess.run(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL, check=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        _record_session(store, now, screen, getattr(result, "pid", None))
-    language = config.language
-    notify.send(config, text("orch_spawn_title", language),
-                text("orch_spawn_opened", language, repo=config.repo or root.name, screen=screen))
-    return screen
+        reason = _live_reason(store, root, now)
+        if reason is None:
+            planned = plan_launch(root, store, now)
+            if planned is None or not launch(root, store, now, planned):
+                return None
+            adopt(store, planned, now)
+    if reason is not None:  # The in-lock check's facts take the same silence step, outside the lock.
+        observe_silence(root, store, config, now, reason)
+        return None
+    _opened(store, config, root, now, planned)
+    return planned[0]
 
 
 def on_tick(ctx, report):
@@ -180,6 +252,7 @@ def deciding(ctx, acquired: bool = True):
     that did not get the lock touches nothing; the tick holding it decides.
     """
     kept = []
+    ctx._push_ready = False  # #129: set by orch_push.refresh_waited once this tick passes its wait check.
 
     def keep(report):
         kept.append(report)
@@ -199,8 +272,29 @@ def deciding(ctx, acquired: bool = True):
         with step("orchestrator_spawn"):
             on_tick(ctx, SimpleNamespace(actions=[]))  # The tick's report is lost with the error.
         raise
+    with step("binding_record"):  # D96: the tick is the binding event's only writer.
+        orch_binding.record_tick(ctx)
     # Stale Files are facts for the orchestrator, so they are read before its spawn decision.
     with step("stale_files"):
         orch_stale_files.report(ctx)
+    report = kept[-1] if kept else SimpleNamespace(actions=[])
+    before = _read_record(ctx.store)
     with step("orchestrator_spawn"):
-        on_tick(ctx, kept[-1] if kept else SimpleNamespace(actions=[]))
+        on_tick(ctx, report)
+    # #129: only a tick past its GitHub refresh and wait check pushes, after the spawn decision.
+    if getattr(ctx, "_push_ready", False):
+        with step("blocked_push"):
+            language = ctx.config.language
+            spawned = launched_since(ctx.store, before)  # This tick's spawn, as the record says.
+            try:
+                if line := orch_push.tick_line(*orch_push.after_tick(ctx, spawned), language):
+                    report.actions.append(line)
+            except Exception as exc:  # noqa: BLE001 - the push must not fail a finished tick
+                report.actions.append(text("push_blocked_failed", language,
+                                           error=" ".join(str(exc).split())[:200]))
+
+
+# Launch steps live in orch_spawn_launch; imported last because it imports this module.
+from foragent.orch_spawn_launch import (  # noqa: E402,F401 - re-exported
+    _environment, _opened, adopt, launch, plan_launch, spawn_orchestrator, transcript_path,
+)

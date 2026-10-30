@@ -775,9 +775,15 @@ def test_review_returns_conflicted_pr_to_implementer_even_with_pass_verdict(run_
     c.executor.steps = [{"notes.txt": "resolved\n"}]
     assert review_only(1, c.ctx, verdict_head=head if resolved else None) == "merged"
     assert len(c.executor.calls) == 1
-    assert "충돌 마커가 남음: notes.txt:1" in c.executor.calls[0]["prompt"]
+    assert "Conflict marker left: notes.txt:1" in c.executor.calls[0]["prompt"]
     assert c.tracker.merged_prs == [pr]
     assert git_command(c.history.origin, "show", "foragent/issue-1:notes.txt") == "resolved"
+    journal = c.store.root / "orch-events.jsonl"
+    reviews = [event for line in journal.read_text().splitlines()
+               if (event := json.loads(line))["kind"] == "review"]
+    # The orchestrator's verdict for the PR head is journaled as its own review source.
+    assert ("orchestrator" in {event["source"] for event in reviews}) is resolved
+    assert all(event["verdict"] == "PASS" and event["findings"] == 0 for event in reviews)
 
 
 def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
@@ -787,3 +793,106 @@ def test_review_text_about_limits_uses_normal_review_failure_budget(run_case):
     assert run_issue(1, c.ctx) == "retries-exceeded"
     assert len(calls) == 2 and c.store.get_run(1).attempts == 2
     assert c.store.get_run(1).waited_seconds == 0
+
+
+def test_pr_head_verification_reports_every_failing_command(run_case):
+    """#420: PR-head checks run every Done-when command and keep each failure for the retry hint."""
+    from foragent import cuts
+    from foragent.runner import review_only
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["echo first-broken; exit 1", "echo second-broken; exit 2"])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Review")
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    enable_reviewer(c, ["VERDICT: PASS"])
+    assert review_only(1, c.ctx) == "checks-failed"
+    saved = cuts.failures_path(c.store.root, 1).read_text()
+    assert "first-broken" in saved and "second-broken" in saved
+    comment = c.tracker.list_comments(1)[-1].body
+    assert "first-broken" in comment and "second-broken" in comment
+
+
+def test_pr_head_timeout_saves_earlier_failures_and_the_timed_out_output(run_case, monkeypatch):
+    """#420: a timeout exit keeps everything this verification gathered."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult
+    from foragent.runner import review_only
+    from runner_support import set_done_when
+
+    c = run_case
+    set_done_when(c, ["check-one", "check-two", "check-three"])
+    c.tracker.edit_body(1, c.store.load_approval(1).body)
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done"})
+    head = c.history.tip
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="PR", body="Review")
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    results = {"check-one": CheckResult("check-one", 1, False, "first output"),
+               "check-two": CheckResult("check-two", None, True, "second output")}
+    ran = []
+    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: ran.append(command) or results[command])
+    enable_reviewer(c, ["VERDICT: PASS"])
+    review_only(1, c.ctx)
+    assert ran == ["check-one", "check-two"]
+    saved = cuts.failures_path(c.store.root, 1).read_text()
+    assert "first output" in saved and "second output" in saved and "Check timed out." in saved
+
+
+def test_pr_head_exception_keeps_the_failures_gathered_before_it(run_case, monkeypatch):
+    """#420: an exception on a later PR-head command still saves the earlier failure."""
+    from foragent import cuts, runner
+    from foragent.run_checks import CheckResult, _verify_review_head
+    from foragent.issue import parse_body
+    from foragent.git import GitRepo
+
+    c = run_case
+
+    def check(command, *args, **kwargs):
+        if len(calls) == 1:
+            raise OSError("cannot launch")
+        calls.append(command)
+        return CheckResult(command, 1, False, "first failed output")
+
+    calls = []
+    monkeypatch.setattr(runner, "_check", check)
+    parsed = parse_body(c.store.load_approval(1).body)
+    parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
+    with pytest.raises(OSError):
+        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+    assert "first failed output" in cuts.failures_path(c.store.root, 1).read_text()
+    c.store.finish_run(1, "error")
+    c.tracker.remove_labels(1, ["running"])
+
+
+def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monkeypatch):
+    """#420: a new PR-head verification whose first command cannot launch deletes nothing."""
+    from foragent import cuts, runner
+    from foragent.git import GitRepo
+    from foragent.issue import parse_body
+    from foragent.run_checks import CheckResult, _verify_review_head, save_failures
+
+    c = run_case
+    save_failures(c.store.root, 1, [CheckResult("one", 1, False, "earlier failure")])
+    monkeypatch.setattr(runner, "_check", lambda *a, **k: (_ for _ in ()).throw(OSError("cannot launch")))
+    parsed = parse_body(c.store.load_approval(1).body)
+    parsed = parsed.__class__(**{**parsed.__dict__, "done_when_commands": ["one", "two"]})
+    with pytest.raises(OSError):
+        _verify_review_head(1, c.ctx, GitRepo(c.ctx.repo_root), parsed, "head", "link")
+    assert "earlier failure" in cuts.failures_path(c.store.root, 1).read_text()
+    c.store.finish_run(1, "error")
+    c.tracker.remove_labels(1, ["running"])

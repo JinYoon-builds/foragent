@@ -16,9 +16,17 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
+try:
+    # The gate's locks need POSIX fcntl; only native Windows lacks it (WSL is Linux).
+    # Stop here, before launchd/git and the rest import it, with one clear line.
+    import fcntl  # noqa: F401
+except ImportError:
+    print("foragent: native Windows is not supported yet; use macOS, or Linux/WSL.", file=sys.stderr)
+    raise SystemExit(1) from None
+
 import yaml
 
-from foragent import __version__, adopt, bench, brief, capacity, design, design_session, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
+from foragent import __version__, adopt, bench, brief, brief_report, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_dream, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -39,7 +47,7 @@ from foragent.status import collect as collect_status, summary_values, unknown a
 from foragent.tracker import GhTracker, RecordingTracker, Tracker, TrackerError
 from foragent import commands
 from foragent.commands import _open_lane_view
-from foragent.commands.gate import _print_machine_budget, _print_status, _refresh_status, _status
+from foragent.commands.gate import _print_gates, _print_machine_budget, _print_status, _refresh_status, _status
 from foragent.commands.init import _offer_statusline
 from foragent.commands.inspect import _inspect
 from foragent.commands.order import _comma_keys, _comma_numbers

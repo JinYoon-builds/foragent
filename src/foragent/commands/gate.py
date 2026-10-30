@@ -26,6 +26,12 @@ def add(commands) -> None:
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=cli.Path, required=True)
+    run_dream = actions.add_parser("run-dream", help="Run one lane's memory dream")
+    run_dream.add_argument("lane")
+    run_dream.add_argument("--repo-root", type=cli.Path, required=True)
+    from foragent.commands._orch_architect import add_gate
+
+    add_gate(actions)
     done = actions.add_parser("check-done", help="Check Done when for a native Stop hook")
     done.add_argument("--snapshot", type=cli.Path, required=True)
     done.add_argument("--worktree", type=cli.Path, required=True)
@@ -36,9 +42,12 @@ def add(commands) -> None:
 
 
 def _status(tracker, store, config=None) -> dict:
-    """Local status; the tracker is accepted for compatibility and never read."""
+    """Local status and every gate on this machine; the tracker is accepted for compatibility and never read."""
     cli = facade()
-    return cli.collect_status(store, config or cli.Config(), cli.datetime.now(cli.UTC))
+    now = cli.datetime.now(cli.UTC)
+    status = cli.collect_status(store, config or cli.Config(), now)
+    status["installed_gates"] = cli.gates.collect(now, current=store.root)
+    return status
 
 
 def _refresh_status(tracker, store, config) -> None:
@@ -114,6 +123,14 @@ def _print_status(status: dict, language: str = "en") -> None:
     print("History (last 10):")
     for run in status["history"]:
         print(f"  #{run['number']} {run['outcome']} started={run['started_at']}")
+    if "installed_gates" in status:
+        _print_gates(status["installed_gates"], language)
+
+
+def _print_gates(rows: list, language: str) -> None:
+    cli = facade()
+    for line in cli.gates.human_lines(rows, cli.datetime.now(cli.UTC), language):
+        print(line)
 
 
 def _launchd(args, root) -> int:
@@ -154,6 +171,8 @@ def _tick(args, root, git, config, repo, tracker, store) -> None:
 
 
 def run(args) -> int:
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     cli = facade()
     if args.action == "check-done":
         return cli.check_done(args.snapshot.resolve(), args.worktree.resolve(), args.acceptance_dir)
@@ -165,6 +184,8 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     store = cli.StateStore.for_repo(repo)
+    # Status, watch and run gh calls count too, not only those inside a tick context.
+    cli.gh.set_recorder(store, lambda: cli.datetime.now(cli.UTC))
     if args.action == "tick":
         _tick(args, root, git, config, repo, tracker, store)
     elif args.action == "status":
@@ -193,6 +214,14 @@ def run(args) -> int:
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),
             )
+    elif args.action == "run-dream":
+        if (dream := store.get_dream(args.lane)) is None or dream.status != "running":
+            raise cli.ConfigError(f"no running dream record for lane {args.lane}")
+        store.update_run(dream.key, pid=cli.os.getpid(), process_identities=cli.observe_tree(roots=(cli.os.getpid(),)))
+        return cli.orch_dream.run_dream(args.lane, cli.RunContext(
+            repo=repo, repo_root=root, tracker=tracker, store=store,
+            config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
+        ))
     else:
         if store.get_run(args.number) is None:
             raise cli.ConfigError(f"no run record for issue #{args.number}")

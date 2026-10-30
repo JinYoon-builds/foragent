@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 import json
+import logging
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -12,6 +14,10 @@ import zlib
 from typing import Any, Literal, Protocol
 from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
+
+from foragent import cuts, gh
+
+log = logging.getLogger(__name__)
 
 
 IssueState = Literal["open", "closed"]
@@ -91,6 +97,7 @@ class Tracker(Protocol):
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
     def parent_of(self, n: int) -> int | None: ...
+    def parent_issue(self, n: int) -> Issue | None: ...
     def sub_issues(self, n: int) -> list[Issue]: ...
     def add_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
     def remove_labels(self, n: int, labels: Iterable[str]) -> Issue | None: ...
@@ -109,7 +116,7 @@ class Tracker(Protocol):
     def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
-    def pr_failed_logs(self, pr: int) -> str: ...
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
                  subject: str | None = None) -> None: ...
@@ -178,6 +185,10 @@ class RecordingTracker:
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
+        # GitHub calls made for this context count in its own store and clock.
+        store, now = getattr(context, "store", None), getattr(context, "now", None)
+        if store is not None and now is not None:
+            gh.set_recorder(store, now)
 
     @property
     def _now(self):
@@ -330,6 +341,36 @@ class RecordingTracker:
         prs = [PullRequest(record["number"], record["head"], record["base"], "", "",
                            record["merged_at"], record["url"]) for record in ordered]
         return prs, {"watermark": observed_at.isoformat(), "prs": ordered}
+
+    def observe_closed_issues(self, *, observed_at):
+        """Record issues closed since the stored watermark: one light read per tick.
+
+        Without a watermark the read starts at the last full listing, which
+        already showed every earlier close. Each closed issue the local record
+        does not show closed is recorded, including one created and closed
+        between listings, so this tick's board sync moves its card to Done.
+        """
+        read = getattr(self._tracker, "issues_closed_since", None)
+        if read is None:
+            return
+        store = self._context.store
+        start = store.closed_issue_watermark()
+        if start is None and (listed := store.issues_observation()["as_of"]) is not None:
+            start = datetime.fromisoformat(listed)
+        if start is not None:
+            since = (start if start.tzinfo else start.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
+            try:
+                issues = read(since)
+            except TrackerError as exc:
+                if exc.is_rate_limit:
+                    raise
+                log.warning("Could not read recently closed issues: %s", exc)
+                return  # Keep the watermark; the next tick reads this span again.
+            closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
+            for issue in issues:
+                if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
+                    store.record_issue(issue, self._context.config.lanes)
+        store.record_closed_issue_watermark(observed_at)
 
     def _issue_missing(self, number):
         """A missing write resource alone does not prove that its issue is gone."""
@@ -563,6 +604,13 @@ class FakeTracker:
         return [issue for issue in self.issues.values()
                 if not issue.is_pull_request and (state == "all" or issue.state == state)]
 
+    def issues_closed_since(self, since: datetime) -> list[Issue]:
+        """Closed issues updated at or after ``since``; an unknown time counts as recent."""
+        # Its own light read, not a full listing (like GhTracker's since-filtered call).
+        return [issue for issue in self.issues.values()
+                if issue.state == "closed" and not issue.is_pull_request
+                and ((updated := _parse_time(issue.updated_at)) is None or updated >= since)]
+
     def update_issue(self, n: int, *, title: str, body: str) -> None:
         self.edit_body(n, body)
         self.issues[n] = replace(self.get_issue(n), title=title)
@@ -612,6 +660,10 @@ class FakeTracker:
 
     def parent_of(self, n: int) -> int | None:
         return self._parents.get(n)
+
+    def parent_issue(self, n: int) -> Issue | None:
+        parent = self._parents.get(n)
+        return self.get_issue(parent) if parent is not None else None
 
     def sub_issues(self, n: int) -> list[Issue]:
         return [self.get_issue(child) for child, parent in self._parents.items() if parent == n]
@@ -715,7 +767,7 @@ class FakeTracker:
     def set_pr_failed_logs(self, pr: int, text: str) -> None:
         self._pr_failed_logs[pr] = text
 
-    def pr_failed_logs(self, pr: int) -> str:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str:
         return self._pr_failed_logs.get(pr, "")
 
     def set_pr_head_sha(self, pr: int, sha: str) -> None:
@@ -797,13 +849,16 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 class GhTracker:
-    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None):
+    def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
+                 sleep: Callable[[float], None] = time.sleep):
         self.repo = repo
         self._run = run or _run_gh
+        self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
+        gh.count_call()  # Every attempt counts, injected runners and retries included.
         try:
             output = self._run(args, input=input)
             return output.decode() if isinstance(output, bytes) and not binary else output
@@ -817,7 +872,10 @@ class GhTracker:
             raise TrackerError(str(exc)) from exc
 
     def rate_limit_reset(self) -> datetime | None:
+        """Also keeps the core requests remaining from the same response in ``rate_limit_remaining``."""
         data = json.loads(self._call(["api", "rate_limit"]))
+        remaining = (data.get("resources", {}).get("core") or {}).get("remaining")
+        self.rate_limit_remaining = remaining if type(remaining) is int and remaining >= 0 else None
         resets = [
             datetime.fromtimestamp(window["reset"], UTC)
             for window in data.get("resources", {}).values()
@@ -850,7 +908,7 @@ class GhTracker:
         if not issues:
             # GitHub sometimes answers a listing with an empty page by mistake.
             # One retry separates that hiccup from a repository that is empty.
-            time.sleep(_EMPTY_RETRY_DELAY)
+            self._sleep(_EMPTY_RETRY_DELAY)
             issues = self._fetch_issues(state)
         if issues:
             states = {issue.state for issue in issues}
@@ -876,6 +934,13 @@ class GhTracker:
 
     def _fetch_issues(self, state: str) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues?state={state}&per_page=100"]))
+        return [_issue(item) for item in data if "pull_request" not in item]
+
+    def issues_closed_since(self, since: datetime) -> list[Issue]:
+        """Closed issues updated since ``since``: one light read, no empty-listing retry."""
+        stamp = quote(since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        data = _items(self._call(["api", "--paginate",
+                                  f"{self._path}/issues?state=closed&since={stamp}&per_page=100"]))
         return [_issue(item) for item in data if "pull_request" not in item]
 
     def _evidence_of_issues(self, state: str) -> str | None:
@@ -964,6 +1029,15 @@ class GhTracker:
                 return None
             raise
 
+    def parent_issue(self, n: int) -> Issue | None:
+        """The parent issue with its body, read in one GitHub call."""
+        try:
+            return _issue(json.loads(self._call(["api", f"{self._path}/issues/{n}/parent"])))
+        except TrackerError as exc:
+            if re.search(r"\bHTTP\s+404\b", str(exc)):
+                return None
+            raise
+
     def sub_issues(self, n: int) -> list[Issue]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/sub_issues?per_page=100"]))
         return [_issue(item) for item in data]
@@ -1010,6 +1084,19 @@ class GhTracker:
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
+
+    def search_issues(self, query: str) -> Any:
+        """GitHub's issue search response for ``query``: ``items`` (up to 100), ``total_count``
+        and ``incomplete_results``, so a caller can tell a complete "no match" from a partial one.
+
+        GitHub matches titles, bodies and comments; text-match metadata (``text_matches``)
+        shows the matching fragments, including comment fragments a body check cannot see.
+        """
+        data = json.loads(self._call([
+            "api", "-X", "GET", "search/issues", "-H", "Accept: application/vnd.github.text-match+json",
+            "-f", f"q={query}", "-f", "per_page=100",
+        ]))
+        return data  # The caller checks the shape and words any problem for a person.
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         output = self._call(
@@ -1256,7 +1343,7 @@ class GhTracker:
                 raise
             raise TrackerError(f"Unusable acceptance artifacts: {exc}") from exc
 
-    def pr_failed_logs(self, pr: int) -> CIEvidence:
+    def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
         ``not_started`` is true only when every failed job never ran (no steps or a
@@ -1302,7 +1389,7 @@ class GhTracker:
                     if "log not found" not in f"{exc}\n{exc.stdout}".lower():
                         raise
                     output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(output[-4000:])
+                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
             parts.append("\n".join(lines))
         return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
 

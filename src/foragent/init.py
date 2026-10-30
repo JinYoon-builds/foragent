@@ -4,15 +4,18 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 import yaml
 
-from foragent import board, launchd
+from foragent import board, gh, launchd, role_agents, roles
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
 from foragent.git import GitError, GitRepo
+from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -85,6 +88,9 @@ class InitReport:
     board_id: str | None = None
     board_planned: bool = False
     removed: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    # The tracker setup used; fa init reuses it to look up starter-order facts.
+    tracker: object = field(default=None, repr=False, compare=False)
 
     def summary(self) -> str:
         lines = ["Foragent setup plan:" if self.dry_run else "Foragent setup:"]
@@ -107,11 +113,12 @@ class InitReport:
             lines.append("Would install launchd job.")
         elif self.launchd_label:
             lines.append(f"launchd installed: {self.launchd_label}")
+        lines.extend(self.notes)
         return "\n".join(lines)
 
 
 def _run_gh(args: list[str], input: str | None = None) -> str:
-    return subprocess.run(["gh", *args], input=input, check=True, capture_output=True, text=True).stdout
+    return gh.run(args, input=input, check=True, capture_output=True, text=True).stdout
 
 
 def _gh_call(run: Callable[..., str], args: list[str]) -> str:
@@ -133,6 +140,33 @@ def _add_config(path: Path, local: dict, added: dict) -> str:
     return original.rstrip("\n") + "\n" + yaml.safe_dump(added, sort_keys=False)
 
 
+def _config_text(path: Path, local: dict, added: dict, role_source: dict | None) -> str | None:
+    """The edited settings text, or None when nothing changes.
+
+    Other keys keep `_add_config`'s behaviour; roles go only through the roles writer, which
+    rewrites the roles block (or appends it) and keeps every other byte, line ends included.
+    """
+    if not added and role_source is None:
+        return None
+    # Bytes, not text mode, so CRLF line ends survive.
+    text = _add_config(path, local, added) if added else path.read_bytes().decode("utf-8")
+    if role_source is None:
+        return text
+    try:
+        return roles.edit_roles(text, role_source)
+    except roles.RoleError as exc:
+        # The role agents init creates derive from this source, so init stops before writing anything.
+        raise ConfigError(f"cannot add the default roles to .foragent.yml ({exc}); "
+                          "convert it to block-style YAML and re-run fa init") from exc
+
+
+def _report_keys(added: dict, role_source: dict | None, updated_config: str | None) -> list[str]:
+    """Config keys init adds or fills, for the report; roles is listed when its block was written."""
+    wrote_roles = role_source is not None and updated_config is not None and "roles" in (
+        yaml.safe_load(updated_config) or {})
+    return [*added, *(["roles"] if wrote_roles else [])]
+
+
 def _logged_in(tool: str) -> bool:
     command = ["codex", "login", "status"] if tool == "codex" else ["claude", "auth", "status"]
     try:
@@ -150,12 +184,38 @@ def _logged_in(tool: str) -> bool:
     return isinstance(status, dict) and status.get("loggedIn") is True
 
 
+def _claude_installed() -> bool:
+    try:
+        result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _claude_by_env() -> str | None:
+    """How an installed, logged-out Claude Code still runs (#889): ``oauth`` (a token, subscription)
+    before ``api`` (ANTHROPIC_API_KEY, billed); None otherwise. The key itself is never read."""
+    kind = ("oauth" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+            else "api" if os.environ.get("ANTHROPIC_API_KEY") else None)
+    return kind if kind is not None and _claude_installed() else None
+
+
+def _preflight_language(root: Path, language: str | None) -> str:
+    """Language for errors raised before setup: the flag, else the existing config, else English."""
+    if language is not None:
+        return language
+    try:
+        return load_config(root).language if (root / ".foragent.yml").exists() else "en"
+    except (ConfigError, OSError):
+        return "en"
+
+
 def init_repo(
     repo_root: Path, *, approvers: list[str] | None = None, review: str | None = None,
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
-    board_map: str | None = None,
+    board_map: str | None = None, claude_quota: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
@@ -168,18 +228,30 @@ def init_repo(
     if normalized_root is not None:
         root = top_level
         git = git.at(root)
+    preflight_language = _preflight_language(root, language)
     try:
         repo = git.remote_slug()
     except GitError as exc:
-        raise GitError(f"init requires an origin remote on github.com: {exc}") from exc
+        # A failed `git remote get-url` (non-zero exit) means no origin; a readable url that
+        # the remote parser rejects means origin is not GitHub.
+        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+        raise GitError(text(key, preflight_language, error=exc)) from exc
     run = gh_run or _run_gh
-    _gh_call(run, ["auth", "status"])
+    try:
+        run(["auth", "status"], input=None)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # OSError: gh cannot be started (not installed); non-zero exit: not logged in.
+        message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+        key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
+        raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
     base_branch = DEFAULTS["base_branch"]
     added = {}
     updated_config = None
+    role_source = None
+    notes: list[str] = []
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -187,15 +259,29 @@ def init_repo(
         explicit = {"approvers": approvers, "review": review, "executor": executor,
                     "run_hours": run_hours, "language": language}
         added = {key: value for key, value in explicit.items() if value is not None and key not in local}
+        if claude_quota is not None:  # Sets the mode and keeps the block's other keys.
+            block = local.get("claude_quota")
+            added["claude_quota"] = {**(block if isinstance(block, dict) else {}), "mode": claude_quota}
         if "checks" not in local:
             added["checks"] = initial_checks(repo, run, command=config.test_command or next(iter(detect_test_commands(root)), None))
+        # Existing role entries are kept; missing defaults are added to an existing roles block (#769).
+        # A config without a roles key stays byte-identical on re-init; the first fa role command
+        # writes the block from the defaults. The roles writer never goes through _add_config.
+        role_source = roles.with_defaults(root, local.get("roles") or {}) if "roles" in local else None
+        if role_source is not None:
+            _validate({**asdict(config), **added, "roles": role_source})
+            config = replace(config, roles=role_source)
         if added:
-            _validate({**asdict(config), **added})
-            config = replace(config, **added)
-            updated_config = _add_config(config_path, local, added)
+            full = {**added, **({"claude_quota": {**config.claude_quota, **added["claude_quota"]}}
+                                if "claude_quota" in added else {})}
+            _validate({**asdict(config), **full})
+            config = replace(config, **full)
+        updated_config = _config_text(config_path, local, added, role_source)
     else:
         codex_available = _logged_in("codex")
         claude_available = _logged_in("claude")
+        claude_env = None if claude_available else _claude_by_env()
+        claude_available = claude_available or claude_env is not None
         if not codex_available and not claude_available:
             raise ConfigError("No logged-in coding tool found; log in to Claude Code or Codex and retry.")
         if executor is None and not codex_available:
@@ -214,15 +300,30 @@ def init_repo(
         values = {key: DEFAULTS[key] if value is None else value for key, value in options.items()}
         values["approvers"] = approvers
         values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
+        values["roles"] = roles.with_defaults(root, {})
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers", "checks"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks", "roles"} or options[key] is not None or value != DEFAULTS[key]}
+        if claude_quota is not None:
+            minimal["claude_quota"] = {"mode": claude_quota}
+            _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
+            config = replace(config, claude_quota={**config.claude_quota, "mode": claude_quota})
         contents = {".foragent.yml": CONFIG_COMMENT + yaml.safe_dump(minimal, sort_keys=False), **contents}
+        if claude_env == "api":  # The key makes Claude available; spending stays the person's choice.
+            notes.append(text("init_api_key_hint", config.language))
     if config.checks == "ci":
         contents[WORKFLOW] = workflow_text(config)
     if not (root / "tests/acceptance").exists():
         contents["tests/acceptance/.gitkeep"] = ""
+    # Default role agents derive their skills from the roles source (#769).
+    role_skills = {entry.get("agent") or f"fa-{name}": entry.get("skills", [])
+                   for name, entry in config.roles.items() if name in roles.DEFAULT_ROLES}
+    role_files, invalid_agents = role_agents.missing_files(root, role_skills)
+    contents.update(role_files)
+    if invalid_agents:
+        print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
+              "memory: project and the skills of its roles entry.", file=sys.stderr)
 
     created = [path for path in contents if not (root / path).exists()]
     existed = [path for path in contents if (root / path).exists()]
@@ -241,8 +342,8 @@ def init_repo(
     # Also recover a deletion left uncommitted by an interrupted setup.
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
-        *created, *tracked_removals, *([".foragent.yml"] if added else []),
-        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *([WORKFLOW] if config.checks == "ci" else [])]),
+        *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []),
+        *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
     if (pending or (board_planned and not config.board)) and git.current_branch() != base_branch:
@@ -253,10 +354,11 @@ def init_repo(
         board_change = board_planned and not config.board
         return InitReport(created, existed, True, push_planned=push_planned or (board_change and not no_push),
                           commit_planned=bool(pending) or board_change, launchd_planned=not no_launchd,
-                          normalized_root=normalized_root, added_keys=list(added), board_planned=board_planned,
-                          removed=removed)
+                          normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_planned=board_planned,
+                          removed=removed, notes=notes)
 
-    tracker = tracker or GhTracker(repo, run=run)
+    # GhTracker counts its own attempts; its default runner must not count them again.
+    tracker = tracker or GhTracker(repo, run=gh_run)
     tracker.ensure_labels(LABELS)
     board_id = config.board
     if not no_board:
@@ -290,7 +392,7 @@ def init_repo(
         if board_changes:
             if config_path.exists():
                 added.update(board_changes)
-                updated_config = _add_config(config_path, local, added)
+                updated_config = _config_text(config_path, local, added, role_source)
             else:
                 contents[".foragent.yml"] += yaml.safe_dump(board_changes, sort_keys=False, allow_unicode=True)
             pending = list(dict.fromkeys([*pending, ".foragent.yml"]))
@@ -299,18 +401,24 @@ def init_repo(
         destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if path != WORKFLOW:
-            with destination.open("x", encoding="utf-8") as stream:
-                stream.write(contents[path])
+            data = contents[path]
+            # Copied skill files are bytes; text is written as UTF-8 bytes too, so line ends are exact.
+            with destination.open("xb") as stream:
+                stream.write(data if isinstance(data, bytes) else data.encode("utf-8"))
     for path in removed:
         (root / path).unlink()
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
-        config_path.write_text(updated_config, encoding="utf-8")
+        original = config_path.read_bytes().decode("utf-8")
+        config_path.write_bytes(updated_config.encode("utf-8"))
+        if role_source is not None:
+            roles.report_dropped_comments(original)
     if pending:
         git.commit_paths(pending, "Set up Foragent")
     if push_planned:
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     return InitReport(created, existed, False, bool(pending), push_planned, label,
-                      normalized_root=normalized_root, added_keys=list(added), board_id=board_id, removed=removed)
+                      normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
+                      notes=notes, tracker=tracker)

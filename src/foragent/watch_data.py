@@ -11,10 +11,11 @@ from typing import Any
 
 from foragent import orch_inbox
 from foragent.config import Config
-from foragent.labels import BLOCKED, NEEDS_HUMAN
+from foragent.labels import issue_lane
+from foragent.status import issue_state
 from foragent.state import StateStore
 from foragent.tracker import Issue, Tracker
-from foragent.watch_sections import progress
+from foragent.watch_sections import orch_panel, progress
 
 
 @dataclass
@@ -47,6 +48,44 @@ class Snapshot:
     today: int = 0
     # When each issue in ``done`` merged, from the local issue records; unknown times are absent.
     merged_at: dict[int, datetime] = field(default_factory=dict)
+    # The orchestrator note, its age in seconds and the fresh `fa inspect` count (orch_panel.collect).
+    panel: dict[str, Any] = field(default_factory=dict)
+    # Closed phase events (kind=phase, #224) by issue, and the latest journal event with a say line.
+    phases: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    say: dict[str, Any] | None = None
+    # From the local issue records and the full run history (status.history keeps only ten):
+    # each worker's title, each issue's latest recorded run start, and today's merges by lane
+    # (None when not collected; the lane rows then fall back to the order's done list).
+    titles: dict[int, str] = field(default_factory=dict)
+    run_starts: dict[int, str] = field(default_factory=dict)
+    # The phase each issue's latest recorded run was in when it stopped (finish_run keeps it).
+    run_phases: dict[int, str | None] = field(default_factory=dict)
+    today_done: dict[str, int] | None = None
+    # Order preparation facts from ``fa order progress`` (StateStore.order_progress); None when none.
+    prep: dict[str, Any] | None = None
+    # The usage line's facts, read once per refresh (``meter``): usage.json, the machine's
+    # running runs and budget, the effective Claude mode and memory pressure. Empty when not collected.
+    meter: dict[str, Any] = field(default_factory=dict)
+
+
+def meter(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
+    """One read of what the usage line shows; an unreadable record reads as missing."""
+    from foragent import capacity, scheduler_quota
+
+    found: dict[str, Any] = {"mode": scheduler_quota.quota_mode(store, config)[0],
+                             "memory": capacity.memory_pressure()}
+    try:
+        usage = store.usage()
+    except (OSError, ValueError):
+        usage = {}
+    found["usage"] = usage if isinstance(usage, dict) else {}
+    state = capacity.read_state(store)
+    found["budget"] = config.max_parallel or (int(state["parallel"]) if state else capacity.INITIAL_PARALLEL)
+    try:
+        found["running"] = capacity.machine_runs(store, now)
+    except OSError:
+        pass  # No machine state folder yet: the line counts this repository's active runs.
+    return found
 
 
 def recent_events(store: StateStore) -> list[dict[str, Any]]:
@@ -66,6 +105,30 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
     except FileNotFoundError:
         pass
     return list(reversed(events))
+
+
+def journal_facts(store: StateStore) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any] | None]:
+    """Every closed phase event by issue and the latest event with a say line, from the whole journal."""
+    from foragent import watch
+
+    phases: dict[int, list[dict[str, Any]]] = {}
+    say = None
+    try:
+        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = watch.json.loads(line)
+                except watch.json.JSONDecodeError:
+                    continue  # An append still being written.
+                if not isinstance(event, dict):
+                    continue
+                if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
+                    phases.setdefault(event["issue"], []).append(event)
+                if isinstance(event.get("say"), str) and event["say"].strip():
+                    say = event
+    except FileNotFoundError:
+        pass
+    return phases, say
 
 
 def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict[str, float], dict[int, float]]:
@@ -145,10 +208,21 @@ def collect(
             at = progress._time(rows[issue.number].get("merged_at"))
             if at is not None:  # Unseen merges are listed after the known times.
                 merged_at[issue.number] = at if at.tzinfo else at.replace(tzinfo=UTC)
-    finished = [end for *_, end in progress.merged_work(store) if end <= now]
+    merges = [(number, end) for number, *_, end in progress.merged_work(store) if end <= now]
+    finished = [end for _, end in merges]
     recent = sum(now - progress.RATE_WINDOW <= end for end in finished)
     midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     today = sum(midnight <= end for end in finished)
+    run_lanes = {run.number: run.lane for run in history}  # The latest run names the lane.
+    today_done: dict[str, int] = {}
+    for number, end in merges:
+        if midnight <= end:
+            lane = run_lanes.get(number) or issue_lane(rows.get(number, {}).get("labels", ()), config.lanes)
+            today_done[lane] = today_done.get(lane, 0) + 1
+    latest_runs = {run.number: run for run in history}  # History is oldest first; the last run wins.
+    run_starts = {number: run.started_at for number, run in latest_runs.items() if run.started_at}
+    run_phases = {number: run.phase for number, run in latest_runs.items()}
+    titles = {number: issue.title for number, issue in issues.items()}
     sizes = [progress.size_of(rows[number]["labels"]) for number in sorted(child_numbers)
              if rows[number]["state"] == "open" and progress.APPROVED in rows[number]["labels"]]
     found = progress.estimate(sizes, progress.learned(progress.machine_stores(store), now),
@@ -162,8 +236,22 @@ def collect(
     worker_states = {}
     for run in status["active_runs"]:
         labels = issues[run["number"]].labels if run["number"] in issues else frozenset()
-        worker_states[run["number"]] = ("waiting-human" if NEEDS_HUMAN in labels
-                                        else "blocked" if BLOCKED in labels else "working")
+        # The same mapping as status.collect_lanes, for a running worker.
+        worker_states[run["number"]] = issue_state(labels, True)
+    phases, say = journal_facts(store)
+    try:
+        prep = store.order_progress()
+    except (OSError, ValueError):
+        prep = None  # A half-written record must not take the whole view down.
+    if not isinstance(prep, dict):
+        prep = None
+    published = [number for number in (prep or {}).get("published", []) if isinstance(number, int)]
+    shown = {run["number"] for run in status["active_runs"]} | {
+        row["issue"] for row in lanes.values() if row.get("issue") is not None} | set(published)
+    titles = {number: title for number, title in titles.items() if number in shown}
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
-                          worker_states, eta_range, basis, today, merged_at)
+                          worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
+                          phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
+                          today_done=today_done, prep=prep,
+                          meter=meter(store, config, now))

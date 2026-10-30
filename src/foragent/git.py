@@ -1,5 +1,6 @@
 """Small, injectable Git adapter for approval integrity checks."""
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
@@ -16,6 +17,10 @@ from foragent.state import StateStore
 
 
 REVIEW_SCOPE_FILE = "CLAUDE.local.md"
+# A split part names its source when at least half of its added lines (of at
+# least this many, each this long once stripped) come from that source.
+SPLIT_MIN_LINES = 5
+SPLIT_MIN_LINE = 4
 ARTIFACT_PATHS = (".foragent",)
 
 
@@ -45,9 +50,12 @@ class GitError(RuntimeError):
 class PublicationError(GitError):
     """The proposed Git contents contain unresolved conflict markers."""
 
-    def __init__(self, markers: list[tuple[str, int]]):
+    def __init__(self, markers: list[tuple[str, int]], language: str = "en"):
+        from foragent.i18n import text
+
         self.markers = markers
-        super().__init__("\n".join(f"충돌 마커가 남음: {path}:{line}" for path, line in markers))
+        super().__init__("\n".join(text("conflict_marker_left", language, location=f"{path}:{line}")
+                                   for path, line in markers))
 
 
 @dataclass(frozen=True)
@@ -342,6 +350,79 @@ class GitRepo:
         self._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                     "merge", "--no-edit", *([] if commit else ["--no-commit"]), target])
 
+    def moved_by(self, target: str) -> list[tuple[str, str]]:
+        """Files this branch changed that ``target`` renamed or copied (split) since the merge base.
+
+        Git rename and copy detection pairs each such file with where its content went.
+        """
+        try:
+            base = self._call(["merge-base", "HEAD", target]).strip()
+        except GitError:
+            return []
+        mine = {path for path in self._call(["diff", "--name-only", "--no-renames", "-z", base, "HEAD"]).split("\0")
+                if path}
+        return self.moved_between(base, target, mine)
+
+    def moved_between(self, base: str, target: str, paths: Iterable[str]) -> list[tuple[str, str]]:
+        """Which of ``paths`` ``target`` renamed or copied since its merge base with ``base``: (old, new).
+
+        Copies from unchanged files count too, so a module split out while the original stays is named.
+        """
+        mine = set(paths)
+        if not mine:
+            return []
+        try:
+            base = self._call(["merge-base", base, target]).strip()
+        except GitError:
+            return []
+        fields = iter(self._call(["diff", "--name-status", "-M", "-C", "--find-copies-harder", "-z",
+                                  base, target]).split("\0"))
+        moved = []
+        for status in fields:
+            if status[:1] in ("R", "C"):
+                old, new = next(fields, ""), next(fields, "")
+                if old in mine:
+                    moved.append((old, new))
+            elif status:
+                next(fields, None)
+        found = set(moved)
+        return moved + [pair for pair in self._split_into(base, target, mine) if pair not in found]
+
+    def _split_into(self, base: str, target: str, mine: set[str]) -> list[tuple[str, str]]:
+        """Files whose added lines mostly come from one of ``mine``: parts of a split file.
+
+        Git's copy detection needs a whole-file similarity; a module split into
+        three parts leaves each part near a third and is not reported.
+        """
+        def lines(ref: str, path: str) -> list[str]:
+            try:
+                text = self._call(["show", f"{ref}:{path}"])
+            except (GitError, UnicodeDecodeError):
+                return []
+            return [line.strip() for line in text.splitlines() if len(line.strip()) >= SPLIT_MIN_LINE]
+
+        fields = iter(self._call(["diff", "--name-status", "--no-renames", "-z", base, target]).split("\0"))
+        changed = {}
+        for status in fields:
+            if status:
+                changed[next(fields, "")] = status[:1]
+        sources = {path: set(lines(base, path)) for path in sorted(mine) if changed.get(path) != "A"}
+        sources = {path: content for path, content in sources.items() if content}
+        pairs = []
+        for dest, status in sorted(changed.items()):
+            if status not in ("A", "M") or not sources:
+                continue
+            added = Counter(lines(target, dest))
+            if status == "M":
+                added -= Counter(lines(base, dest))
+            total = sum(added.values())
+            if total < SPLIT_MIN_LINES:
+                continue
+            for source, content in sources.items():
+                if source != dest and sum(count for line, count in added.items() if line in content) * 2 >= total:
+                    pairs.append((source, dest))
+        return pairs
+
     def merge_in_progress(self) -> bool:
         path = Path(self._call(["rev-parse", "--git-path", "MERGE_HEAD"]).strip())
         return (path if path.is_absolute() else self.root / path).is_file()
@@ -404,7 +485,16 @@ class GitRepo:
         """Validate staged PR contents in this branch's own changed files."""
         markers = self.conflict_marker_lines(self.changed_paths(base_ref))
         if markers:
-            raise PublicationError(markers)
+            raise PublicationError(markers, self._language())
+
+    def _language(self) -> str:
+        """Project language for diagnostics; English when the config cannot be read."""
+        from foragent.config import load_config
+
+        try:
+            return load_config(self.root).language
+        except Exception:
+            return "en"
 
     def has_staged_changes(self) -> bool:
         return self.staged_tree_sha() != self._call(["rev-parse", "HEAD^{tree}"]).strip()
@@ -443,6 +533,10 @@ class GitRepo:
     def push(self, branch: str, *, lease: str | None = None) -> None:
         force = "-f" if lease is None else f"--force-with-lease=refs/heads/{branch}:{lease}"
         self._call(["push", force, "origin", branch])
+
+    def push_head(self, branch: str, *, lease: str) -> None:
+        """Push a detached HEAD to ``branch`` only while the remote still has ``lease``."""
+        self._call(["push", f"--force-with-lease=refs/heads/{branch}:{lease}", "origin", f"HEAD:refs/heads/{branch}"])
 
     def check_worktree(self) -> None:
         try:
@@ -568,15 +662,72 @@ class GitRepo:
                     return None
             raise
 
+    def tree_files(self, ref: str) -> list[str]:
+        """Every file path tracked at ``ref``."""
+        return [path for path in self._call(["ls-tree", "-r", "--name-only", "-z", ref]).split("\0") if path]
+
+    def file_at(self, ref: str, path: str) -> str | None:
+        """A tracked file's text at ``ref``, or None when it is missing or not text."""
+        try:
+            return self._call(["show", f"{ref}:{path}"])
+        except (GitError, UnicodeDecodeError):
+            return None
+
     def blob_shas(self, ref: str, paths: Iterable[str]) -> dict[str, str]:
         return {path: self.blob_sha(ref, path) or "missing" for path in paths}
 
     def remote_slug(self, remote: str = "origin") -> str:
-        url = self._call(["remote", "get-url", remote]).strip()
-        match = re.fullmatch(
-            r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)"
-            r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url,
-        )
-        if match is None:
+        slug = slug_from_url(self._call(["remote", "get-url", remote]))
+        if slug is None:
             raise GitError(f"cannot determine owner/name from remote {remote}; set repo in .foragent.yml")
-        return f"{match[1]}/{match[2]}"
+        return slug
+
+
+def slug_from_url(url: str) -> str | None:
+    """``owner/name`` of a GitHub remote url, else None. The one url-to-slug rule."""
+    match = re.fullmatch(
+        r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)"
+        r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
+    )
+    return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def _common_git_dir(root: Path) -> Path:
+    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    line = dot_git.read_text(encoding="utf-8").strip()
+    if not line.startswith("gitdir:"):
+        raise OSError(f"not a git dir file: {dot_git}")
+    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
+    commondir = gitdir / "commondir"
+    if commondir.is_file():
+        return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
+    return gitdir
+
+
+def origin_slug_from_files(root: Path, remote: str = "origin") -> str | None:
+    """Like ``GitRepo.remote_slug`` but reads git's config file instead of running git.
+
+    None when the remote is missing, not GitHub, or the files cannot be read.
+    """
+    try:
+        text = (_common_git_dir(root) / "config").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    wanted = f'remote "{remote}"'
+    section = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("["):
+            header = line[1:line.find("]")] if "]" in line else ""
+            name, _, sub = header.partition(" ")
+            section = f"{name.strip().lower()} {sub.strip()}".strip()
+            continue
+        key, sep, value = line.partition("=")
+        if sep and section == wanted and key.strip().lower() == "url":
+            return slug_from_url(value.strip().strip('"'))
+    return None

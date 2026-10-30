@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from difflib import SequenceMatcher
+from pathlib import Path
 
+from foragent import cuts
 from foragent.issue import ParsedIssue
 
 
@@ -25,6 +28,10 @@ DEFAULT_RETRY_HINT = (
     "and state the class and the instances found."
 )
 
+BREAK_IT = ("Make the code return a wrong value, skip an effect, or do the effect twice. "
+            "If the test still passes, it proves nothing.")
+IMPLEMENTER_TEST_RULE = "When you write or fix a test, check it by the break-it rule: " + BREAK_IT
+
 PANEL_MERGE_PROMPT = (
     "Independent reviewers checked this change, each from its own share of the review perspectives. "
     "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
@@ -41,12 +48,23 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
+        "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
+        "conflict, not a defect: report it as one line "
+        "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
+        "instead of a finding.\n"
+        "A test that asserts nothing or proves nothing is a weakened check. Judge each new or changed "
+        f"test by the break-it rule: {BREAK_IT}\n"
+        "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
+        "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
+        "and are never a reason to FAIL.\n"
         + text("review_class_question", language)
     )
 
 
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
+    full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "",
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings."""
@@ -55,16 +73,55 @@ def build_review_prompt(
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
-        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{diff[:60000]}"
+        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
+
+
+def parent_section(parent_context: str) -> str:
+    return f"This issue is part of a larger order. Its shared outcome and constraints:\n{parent_context}"
+
+
+def moved_files_section(moved_files: list[str]) -> str:
+    return ("The base branch moved or split files this branch edits (old -> new). "
+            "Carry your edits to the new locations so none are orphaned:\n"
+            + "\n".join(f"- {line}" for line in moved_files))
 
 
 def goal_condition(acceptance_dir: str) -> str:
     prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
     suffix = " is modified, and no files outside this repository are changed. Or stop after 40 turns."
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
+
+
+BUG_FIX_REFERENCE = "skills/fa-orchestrator/references/bug-fix.md"
+# The D79 skeleton, adapted from pstack/playbooks/bug-fix.md (MIT); the full text is BUG_FIX_REFERENCE.
+BUG_FIX_STEPS = (
+    "This issue is a bug. Follow these steps:\n"
+    "1. Reproduce the bug on the surface where it was reported before changing anything.\n"
+    "2. Rule out hypotheses with runtime evidence until one survives. Do not guess; when the state is "
+    "unclear, add logging or instrumentation and read its output.\n"
+    "3. Plan the smallest fix of the root cause that the evidence justifies; revert changes "
+    "that refuted hypotheses motivated.\n"
+    "4. Confirm the bug at the same place as the reproduction after the fix.\n"
+    "5. Write a failing regression test first, and see it fail before you change the code.\n"
+    "6. Report the root cause and the evidence (failing-then-passing output) in your final message.\n"
+)
+
+
+def is_bug_label(label: str) -> bool:
+    name = label.strip().lower()
+    return name == "bug" or name.endswith((":bug", " bug"))
+
+
+def bug_fix_steps(labels: Iterable[str], worktree: Path) -> str | None:
+    """Return the bug-fix summary for a bug-labelled issue, else None."""
+    if not any(is_bug_label(label) for label in labels):
+        return None
+    if (worktree / BUG_FIX_REFERENCE).is_file():
+        return BUG_FIX_STEPS + f"The full procedure is in `{BUG_FIX_REFERENCE}`.\n"
+    return BUG_FIX_STEPS
 
 
 def build_prompt(
@@ -80,9 +137,15 @@ def build_prompt(
     previous_attempt: str = "",
     review_feedback: bool = False,
     retry_default: bool = False,
+    parent_context: str = "",
+    full_text_dir: Path | None = None,
+    moved_files: list[str] | None = None,
+    procedure: str | None = None,
 ) -> str:
     from foragent import runner
 
+    previous_attempt, reviewer_text, orchestrator_hint = _without_notes(
+        previous_attempt, reviewer_text, orchestrator_hint)
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     acceptance_rule = "" if acceptance_locked else f"- Do not modify anything under {acceptance_dir}. Those tests are fixed.\n"
     test_rule = (
@@ -97,12 +160,14 @@ def build_prompt(
     prompt = (
         f"You are implementing GitHub issue #{n} in this repository.\n"
         f"{parsed.goal}\n"
-        f"Out of scope (do not do these): {parsed.out_of_scope}\n"
+        + (parent_section(parent_context) + "\n" if parent_context else "")
+        + f"Out of scope (do not do these): {parsed.out_of_scope}\n"
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
         "Rules:\n"
         f"{acceptance_rule}"
         f"{test_rule}"
+        f"- {IMPLEMENTER_TEST_RULE}\n"
         "- If the issue needs a product decision you cannot make from the text and the code, do not guess:\n"
         "  write .foragent/QUESTION.md with the question, 2–3 options and your recommendation, then stop.\n"
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
@@ -129,13 +194,15 @@ def build_prompt(
         "  steps:\n"
         "  - <what to click or type>\n"
     )
+    if procedure is not None:
+        prompt += "\n" + procedure
     if previous_attempt:
         prompt += "\nPrevious attempt (from local records):\n" + previous_attempt + "\n"
     if reviewer_text is not None:
         prompt += "\nA reviewer said (verbatim):\n" + reviewer_text
     elif failure:
         prompt += "\nA previous attempt failed. Output of the failing check:\n" + (
-            failure if failure_limit is None else failure[-failure_limit:]
+            failure if failure_limit is None else cuts.tail(failure, failure_limit, full_text_dir, "failure.txt")
         )
     if review_feedback:
         prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n"
@@ -151,6 +218,8 @@ def build_prompt(
             + "\nPreserve both the features newly added on the base branch and the features for this issue. "
             "Do not commit. The runner will stage the resolution and create the merge commit."
         )
+    if moved_files:
+        prompt += "\n\n" + moved_files_section(moved_files)
     prompt += skill_catalog
     if orchestrator_hint is not None:
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
@@ -160,13 +229,25 @@ def build_prompt(
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
+def _without_notes(*texts: str | None) -> tuple[str | None, ...]:
+    """Feedback channels without reviewer NOTE lines: notes are recorded, never work to do."""
+    from foragent import review_notes
+
+    return tuple(None if text is None else review_notes.strip(text) for text in texts)
+
+
 def build_resume_prompt(
     n: int, previous_body: str | None, body: str, failure: str = "", *,
     reviewer_text: str | None = None, orchestrator_hint: str | None = None,
     merge_conflicts: list[str] | None = None, review_feedback: bool = False, retry_default: bool = False,
+    moved_files: list[str] | None = None, parent_context: str = "", procedure: str | None = None,
 ) -> str:
     """Deliver exact specification edits and feedback to an existing session."""
-    parts = [f"Continue implementing GitHub issue #{n} in this repository."]
+    reviewer_text, orchestrator_hint = _without_notes(reviewer_text, orchestrator_hint)
+    parts = [f"Continue implementing GitHub issue #{n} in this repository.", IMPLEMENTER_TEST_RULE]
+    if parent_context:
+        # Always restated: the session may predate a newly read or re-approved parent text.
+        parts.append(parent_section(parent_context))
     if previous_body is not None and previous_body != body:
         old, new = previous_body.splitlines(), body.splitlines()
         for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
@@ -177,6 +258,8 @@ def build_resume_prompt(
                 "\n".join(new[new_start:new_end]) if new_start != new_end else
                 "Remove these previous requirements:\n" + "\n".join(old[start:end])
             ))
+    if procedure is not None:
+        parts.append(procedure.rstrip("\n"))
     if reviewer_text is not None:
         parts.append("A reviewer said (verbatim):\n" + reviewer_text)
     elif failure:
@@ -189,4 +272,6 @@ def build_resume_prompt(
         parts.append("Orchestrator hint:\n" + orchestrator_hint)
     if merge_conflicts is not None:
         parts.append("Resolve the conflict markers in these files:\n" + "\n".join(merge_conflicts))
+    if moved_files:
+        parts.append(moved_files_section(moved_files))
     return "\n\n".join(parts)

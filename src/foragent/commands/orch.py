@@ -6,7 +6,8 @@ ORDER = 120
 # An orchestrator whose heartbeat is at most this old counts as alive.
 ALIVE_SECONDS = 30
 INBOX_ACTIONS = {"request", "inbox", "request-status", "ask", "questions", "answer", "note", "queue", "alive",
-                 "reviewers"}
+                 "reviewers", "ensure", "facts", "scorecard", "roles", "role-decision", "signal-answer", "pause", "resume",
+                 "plan", "refresh-due", "handoff", "refresh"}
 
 
 def add(commands) -> None:
@@ -40,185 +41,29 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
+    stop = orch_actions.add_parser("stop", help="Stop a running issue, keep its work and return it to ready")
+    stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    stop.add_argument("number", type=int)
+    stop.add_argument("--keep-work", action="store_true", required=True,
+                      help="Save unfinished changes as a WIP commit on the issue branch")
+    stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
+    from foragent.commands import _orch_park, _orch_seat
+    from foragent.commands._orch_architect import add_orch
+    from foragent.commands._orch_box import _add_inbox
+
+    _orch_park.add_parsers(orch_actions)
+    _orch_seat.add_parsers(orch_actions)
     _add_inbox(orch_actions)
+    add_orch(orch_actions)
 
 
-def _add_inbox(orch_actions) -> None:
-    cli = facade()
-    request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
-    request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
-    request.add_argument("--text", required=True)
-    inbox = orch_actions.add_parser("inbox", help="List requests in the box (read this first on start)")
-    inbox.add_argument("--pending", action="store_true", help="Hide requests marked done")
-    request_status = orch_actions.add_parser("request-status", help="Mark a request processing or done")
-    request_status.add_argument("id")
-    request_status.add_argument("status", choices=cli.orch_inbox.REQUEST_STATUSES)
-    request_status.add_argument("--note")
-    ask = orch_actions.add_parser("ask", help="Record a D71 human question in the box")
-    ask.add_argument("--question", required=True)
-    ask.add_argument("--option", action="append", default=[])
-    ask.add_argument("--recommend", type=int)
-    questions = orch_actions.add_parser("questions", help="List open human questions")
-    questions.add_argument("--all", action="store_true", help="Include answered questions")
-    answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
-    answer.add_argument("id")
-    answer.add_argument("--text", required=True)
-    note = orch_actions.add_parser("note", help="Record what the orchestrator does now, why, next and where")
-    note.add_argument("--now", required=True)
-    note.add_argument("--why")
-    note.add_argument("--next", dest="next_step")
-    note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
-    note.add_argument("--tmux-pane", help="tmux pane id when not taken from TMUX_PANE")
-    for command in (request, inbox, request_status, ask, questions, answer, note):
-        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-        if command in (inbox, questions):
-            command.add_argument("--json", action="store_true")
-    alive = orch_actions.add_parser("alive", help=cli.text("heartbeats_help"))
-    alive.add_argument("--json", action="store_true")
-    alive.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    queue = orch_actions.add_parser("queue", help="Set, show or clear a lane's or the cross-lane start order")
-    queue.add_argument("lane", nargs="?", help="Lane name; with --global, the first issue number")
-    queue.add_argument("--global", dest="global_", action="store_true",
-                       help="The cross-lane priority list instead of one lane's queue")
-    queue.add_argument("numbers", type=int, nargs="*", help="Issue numbers in start order; none shows the queue")
-    queue.add_argument("--clear", action="store_true")
-    queue.add_argument("--json", action="store_true")
-    queue.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
-    reviewers.add_argument("issue", type=int)
-    reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
-    reviewers.add_argument("--clear", action="store_true")
-    reviewers.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+def __getattr__(name):
+    """The box handlers live in _orch_box; `from foragent.commands.orch import _orch_inbox` keeps working."""
+    if name in ("_add_inbox", "_alive", "_orch_inbox"):
+        from foragent.commands import _orch_box
 
-
-def _reviewers(args, store, config) -> None:
-    """Per-issue reviewer count in the state directory; .foragent.yml is never written."""
-    from foragent import orch_reviewers
-    from foragent.i18n import text
-
-    language = config.language
-    if args.clear == (args.count is not None):
-        raise SystemExit(text("orch_reviewers_usage", language))
-    if args.clear:
-        orch_reviewers.clear(store, args.issue)
-        print(text("orch_reviewers_cleared", language, issue=args.issue,
-                   count=orch_reviewers.effective(store, config, args.issue)))
-        return
-    if args.count < 1:
-        raise SystemExit(text("orch_reviewers_invalid", language, count=args.count,
-                              current=orch_reviewers.effective(store, config, args.issue)))
-    orch_reviewers.set_count(store, args.issue, args.count)
-    print(text("orch_reviewers_set", language, issue=args.issue, count=args.count))
-
-
-def _global_queue(args, store, config) -> None:
-    """Cross-lane priority list in the state directory; argparse puts the first number in ``lane``."""
-    cli = facade()
-    text, language = cli.text, config.language
-    numbers = list(args.numbers)
-    if args.lane is not None:
-        try:
-            numbers.insert(0, int(args.lane))
-        except ValueError:
-            raise SystemExit(text("orch_queue_global_number", language, value=args.lane)) from None
-    if args.clear and numbers:
-        raise SystemExit(text("orch_queue_global_usage", language))
-    order = cli.orch_queue.set_global(store, []) if args.clear else (
-        cli.orch_queue.set_global(store, numbers) if numbers else cli.orch_queue.get_global(store))
-    if args.json:
-        print(cli.json.dumps({"lane": None, "order": order}))
-    elif order:
-        print(text("orch_queue_global_show", language, order=" ".join(f"#{n}" for n in order)))
-    else:
-        print(text("orch_queue_global_empty", language))
-
-
-def _orch_inbox(args, store, config, repo: str) -> None:
-    """Local request/question box; never reads GitHub or starts an executor."""
-    cli = facade()
-    box = cli.orch_inbox
-    if args.action == "reviewers":
-        _reviewers(args, store, config)
-        return
-    if args.action == "alive":
-        _alive(args, store, config)
-        return
-    if args.action == "queue":
-        if args.global_:
-            _global_queue(args, store, config)
-            return
-        if args.lane is None:
-            raise SystemExit(cli.text("orch_queue_lane_required", config.language))
-        if args.clear and args.numbers:
-            raise SystemExit("fa orch queue: give issue numbers or --clear, not both")
-        order = cli.orch_queue.set_order(store, args.lane, []) if args.clear else (
-            cli.orch_queue.set_order(store, args.lane, args.numbers) if args.numbers
-            else cli.orch_queue.get(store, args.lane))
-        if args.json:
-            print(cli.json.dumps({"lane": args.lane, "order": order}))
-        elif order:
-            print(f"lane:{args.lane} queue: " + " ".join(f"#{n}" for n in order))
-        else:
-            print(f"lane:{args.lane} queue is empty; issues start by number.")
-        return
-    if args.action == "request":
-        record = box.add_request(store, args.source, args.text)
-        print(f"Request {record['id']} saved ({record['status']}).")
-    elif args.action == "request-status":
-        record = box.set_request_status(store, args.id, args.status, args.note)
-        print(f"Request {record['id']}: {record['status']}.")
-    elif args.action == "note":
-        where = box.note_location(dict(cli.os.environ), args.where_title, args.tmux_pane)
-        record = box.write_note(store, args.now, args.why, args.next_step, where)
-        print(f"Note saved at {record['at']} ({where['kind']}).")
-    elif args.action == "ask":
-        record = box.ask(store, args.question, args.option, args.recommend)
-        pushed = box.route_question(store, config, repo, record)
-        print(f"Question {record['id']} saved (open)"
-              + ("; no planning session is alive, so a notification was sent." if pushed else "."))
-    elif args.action == "answer":
-        record = box.answer(store, args.id, args.text)
-        print(f"Question {record['id']} closed.")
-    elif args.action == "inbox":
-        rows = box.requests(store, pending=args.pending)
-        if args.json:
-            print(cli.json.dumps(rows, ensure_ascii=False))
-        elif not rows:
-            print("No requests.")
-        for row in [] if args.json else rows:
-            print(f"{row['id']} [{row['status']}] from {row['from']} · {row['created_at']}")
-            print(row["text"])
-            for note in row.get("notes", []):
-                print(f"  {note['at']} {note['status']}: {note['note']}")
-    else:
-        rows = box.questions(store, include_closed=args.all)
-        if args.json:
-            print(cli.json.dumps(rows, ensure_ascii=False))
-        elif not rows:
-            print("No open questions.")
-        for row in [] if args.json else rows:
-            print(f"{row['id']} [{row['status']}] {row['question']}")
-            for index, option in enumerate(row["options"], 1):
-                mark = " (recommended)" if index == row["recommend"] else ""
-                print(f"  {index}. {option}{mark}")
-            if row.get("answer"):
-                print(f"  answer: {row['answer']}")
-
-
-def _alive(args, store, config) -> None:
-    cli = facade()
-    last = store.heartbeats()["orchestrator"]
-    elapsed = None if last is None else (store._now() - last).total_seconds()
-    # Compare the exact elapsed time; the whole seconds below are only for display.
-    alive = elapsed is not None and elapsed <= ALIVE_SECONDS
-    age = None if elapsed is None else int(elapsed)
-    if args.json:
-        print(cli.json.dumps({"alive": alive, "last_seen": last and last.isoformat(), "age_seconds": age}))
-    elif last is None:
-        print(cli.text("heartbeats_never", config.language))
-    else:
-        key = "heartbeats_alive" if alive else "heartbeats_gone"
-        print(cli.text(key, config.language, age=age, at=last.isoformat()))
+        return getattr(_orch_box, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _list(ctx, args) -> None:
@@ -239,6 +84,8 @@ def _list(ctx, args) -> None:
 
 
 def run(args) -> int:
+    if handler := getattr(args, "handler", None):
+        return handler(args)
     cli = facade()
     root = args.repo_root.resolve()
     if args.action in cli.INBOX_ACTIONS:
@@ -253,20 +100,30 @@ def run(args) -> int:
     ctx = cli.RunContext(repo=repo, repo_root=root, tracker=tracker, store=store,
                          config=config, git=git, now=lambda: cli.datetime.now(cli.UTC))
     orch = cli.orch
+    from foragent.commands import _orch_park
+
+    if args.action in _orch_park.ACTIONS:
+        return _orch_park.run(ctx, args)
     if args.action == "list":
         _list(ctx, args)
     elif args.action == "log":
         for event in orch.log(ctx):
             print(f"{event['at']} [{event['kind']}] {event['summary']}")
     elif args.action == "watch":
-        cli._open_lane_view(root)
+        from foragent import orch_seat
+
         unknown = False
-        try:
-            for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow):
+        try:  # #962: the seat comes before the view, any poll, print or heartbeat.
+            seat = orch_seat.take_for_watch(store, ctx.now()) if args.follow else None
+            cli._open_lane_view(root)
+            for snapshot in orch.watch(ctx, interval=args.interval, follow=args.follow, seat=seat):
                 print(cli.json.dumps(snapshot, ensure_ascii=False), flush=True)
                 unknown = bool(snapshot.get("unknown"))
         except KeyboardInterrupt:
             pass
+        except orch_seat.SeatHeld:
+            print(cli.text("orch_seat_refused", config.language), file=cli.sys.stderr, flush=True)
+            return 1
         if unknown and not args.follow:
             return 1
     elif args.action == "retry":
@@ -289,4 +146,6 @@ def run(args) -> int:
         return 0 if report["ready"] else 1
     elif args.action == "merge":
         print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
+    elif args.action == "stop":
+        print(orch.stop(ctx, args.number, args.why))
     return 0

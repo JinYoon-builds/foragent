@@ -1,7 +1,9 @@
 """Sync skill libraries, inspect their metadata, and install selected skills."""
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+import os
 from pathlib import Path
 import re
 import shutil
@@ -59,8 +61,16 @@ def _normalized_license(text: str) -> str:
     return " ".join(text.split())
 
 
-def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
-    license_file = next((directory / name for directory in (skill, library) for name in ("LICENSE", "LICENSE.txt")
+def _license(skill: Path, library: Path, *, nearest: bool = False) -> tuple[str, Path | None]:
+    """Identify a skill's license from its own LICENSE, else the library's.
+
+    With ``nearest`` (library catalog skills), every folder between the skill and the library root is
+    tried in turn, and a standard text followed by unrelated appended text still counts as that license.
+    """
+    directories = [skill, library]
+    if nearest:
+        directories = [skill, *(parent for parent in skill.parents if parent.is_relative_to(library))]
+    license_file = next((directory / name for directory in directories for name in ("LICENSE", "LICENSE.txt")
                          if (directory / name).is_file()), None)
     if license_file is None:
         return "unknown", None
@@ -68,6 +78,14 @@ def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
         text = license_file.read_text(encoding="utf-8")
     except UnicodeError:
         return "unknown", license_file
+    normalized = _normalized_license(text)
+    standards = {identity: _normalized_license(standard) for identity, standard in STANDARD_LICENSES.items()}
+    if nearest:
+        # The leading standard text decides; appended content (SPDX lines included) cannot override it.
+        leading = next((identity for identity, expected in standards.items()
+                        if normalized == expected or normalized.startswith(expected + " ")), None)
+        if leading is not None:
+            return leading, license_file
     spdx = re.findall(
         r"^[ \t]*(?:(?:#|//|/\*|\*)[ \t]*)?SPDX-License-Identifier:[ \t]*([^\r\n]*)", text, re.M,
     )
@@ -77,11 +95,34 @@ def _license(skill: Path, library: Path) -> tuple[str, Path | None]:
             return "unknown", license_file
         identity = spdx[0].strip().removesuffix("*/").strip()
         return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == identity.casefold()), identity), license_file
-    normalized = _normalized_license(text)
-    for identity, standard in STANDARD_LICENSES.items():
-        if normalized == _normalized_license(standard):
-            return identity, license_file
-    return "unknown", license_file
+    return next((identity for identity, expected in standards.items() if normalized == expected), "unknown"), license_file
+
+
+def _skill_files(library: Path) -> list[Path]:
+    """Find <...>/skills/<name>/SKILL.md at any depth, skipping hidden folders and node_modules.
+
+    A hidden tool folder whose child is ``skills`` (``.claude/skills`` and similar) is still searched.
+    Directory symlinks are followed, as the earlier glob did; a link back into its own chain is not.
+    """
+    found = []
+    chains = {library: {os.path.realpath(library)}}
+    for directory, folders, files in os.walk(library, followlinks=True):
+        current = Path(directory)
+        parts = current.relative_to(library).parts
+        if "SKILL.md" in files and len(parts) >= 2 and parts[-2] == "skills":
+            found.append(current / "SKILL.md")
+        chain = chains.pop(current)
+        kept = []
+        for folder in sorted(folders):
+            if folder == "node_modules" or (folder.startswith(".") and not (current / folder / "skills").is_dir()):
+                continue
+            real = os.path.realpath(current / folder)
+            if real in chain:
+                continue
+            chains[current / folder] = chain | {real}
+            kept.append(folder)
+        folders[:] = kept
+    return found
 
 
 def _run(args: list[str]) -> str:
@@ -167,22 +208,29 @@ class SkillManager:
 
     def _scan(self, library: Library) -> tuple[list[Skill], list[dict[str, str]]]:
         """Return the library's valid skills and a one-line error for each unreadable SKILL.md."""
-        paths = {path for pattern in ("*/skills/*/SKILL.md", "skills/*/SKILL.md") for path in library.path.glob(pattern)}
-        groups: dict[str, list[Path]] = {}
+        groups: dict[tuple[str, ...], list[Path]] = {}
+        # Copies of one skill share their path up to the skills folder, ignoring one hidden tool folder.
         # Prefer the shared copy when present; otherwise select a tool copy deterministically.
+        paths = _skill_files(library.path)
         for path in sorted(paths, key=lambda path: (len(path.relative_to(library.path).parts), path)):
-            relative = path.relative_to(library.path).parts
-            identity = path.parent.name if len(relative) == 3 or relative[0].startswith(".") else f"{relative[0]}/{path.parent.name}"
-            groups.setdefault(identity, []).append(path.parent)
+            base = path.relative_to(library.path).parts[:-3]
+            if base and base[-1].startswith("."):
+                base = base[:-1]
+            groups.setdefault((*base, path.parent.name), []).append(path.parent)
+        # Today's id rule: the name at the root, else <first folder>/<name>; ids that clash use the folder path.
+        identities = {key: key[-1] if len(key) == 1 else f"{key[0]}/{key[-1]}" for key in groups}
+        counts = Counter(identities.values())
+        named = {(identities[key] if counts[identities[key]] == 1
+                   else copies[0].relative_to(library.path).as_posix()): copies for key, copies in groups.items()}
         result, skipped = [], []
-        for identity, copies in sorted(groups.items()):
+        for identity, copies in sorted(named.items()):
             path = copies[0] / "SKILL.md"
             try:
                 meta = _frontmatter(path)
             except SkillError as exc:
                 skipped.append({"path": path.relative_to(library.path).as_posix(), "error": " ".join(str(exc).split())})
                 continue
-            license_id, license_file = _license(path.parent, library.path)
+            license_id, license_file = _license(path.parent, library.path, nearest=True)
             skill_id = f"{library.prefix}:{identity}"
             result.append(Skill(skill_id, meta["name"], meta["description"], library, path.parent,
                                 license_id, license_file, tuple(copies), any(_runs_scripts(copy) for copy in copies),
@@ -261,8 +309,22 @@ class SkillManager:
             raise SkillError(f"ambiguous skill: {identity}; use one of: {', '.join(skill.id for skill in matches)}")
         raise SkillError(f"unknown skill: {identity}")
 
+    def _repo_skill(self, identity: str, root: Path) -> Skill | None:
+        """A product skill kept in the repository's skills/<name>/, which wins by name over libraries."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", identity) or identity in {".", ".."}:
+            return None
+        path = repo_path(root, f"skills/{identity}")
+        if not (path / "SKILL.md").is_file():
+            return None
+        meta = _frontmatter(path / "SKILL.md")
+        library = Library("repo", str(root), root)
+        license_id, license_file = _license(path, root)
+        skill_id = f"repo:{identity}"
+        return Skill(skill_id, meta["name"], meta["description"], library, path, license_id, license_file,
+                     (path,), _runs_scripts(path), self.config.skill_roles.get(skill_id))
+
     def check_install(self, identity: str, root: Path, *, commit: bool = False) -> Skill:
-        skill = self._select(identity)
+        skill = self._repo_skill(identity, root) or self._select(identity)
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
             raise SkillError(f"skill contains a symlink: {identity}")
         if commit and skill.license not in OPEN_SOURCE_LICENSES:
@@ -331,7 +393,7 @@ class SkillManager:
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:
-    """Copy local dependencies, leaving skills already in the checkout intact."""
+    """Copy repository product skills, local installs or cached library skills, leaving the checkout's own intact."""
     copied = []
     for name in dict.fromkeys(names):
         if not isinstance(name, str) or not name or Path(name).name != name or name in {".", ".."}:
@@ -340,7 +402,10 @@ def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: Skil
         destination = repo_path(worktree, relative)
         if destination.exists():
             continue  # In particular, preserve user-authored, committed skills.
-        source = repo_path(root, relative)
+        # Product skills in the repository's skills/ win by name over local installs and libraries.
+        source = repo_path(root, f"skills/{name}")
+        if not (source / "SKILL.md").is_file():
+            source = repo_path(root, relative)
         if not (source / "SKILL.md").is_file():
             source = manager.cached_skill(name)
         if source is None:

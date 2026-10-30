@@ -98,8 +98,10 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
 
     monkeypatch.setattr(c.tracker, "merge_pr", failed_merge)
     monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
-    assert runner.review_only(1, c.ctx) == "error"
-    assert_blocked(c, Reason.RETRIES_EXCEEDED)
+    c.ctx.config = replace(c.ctx.config, max_runtime_minutes=5)
+    # A refused merge rejoins the merge queue for later turns until the time budget ends (#712).
+    assert runner.review_only(1, c.ctx) == "timeout"
+    assert_blocked(c, Reason.TIMEOUT)
     assert "merge failed" in c.store.log_path(1).read_text()
     assert calls == []
 
@@ -307,7 +309,11 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
     if entry == "resolve" and failure in {"checks", "ci"}:
         assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"ready"}
         assert c.tracker.get_issue(c.pr).state == "closed"
-        assert "Verification:" in (c.store.root / "hints/1.txt").read_text()
+        hint = (c.store.root / "hints/1.txt").read_text()
+        assert "Verification:" in hint
+        if failure == "checks":  # #420: the next attempt reads the saved failing commands
+            from foragent.run_previous import saved_failures_section
+            assert "Broken feature" in saved_failures_section(c.store.root, 1)
     else:
         assert_blocked(c, reason)
     assert c.tracker.merged_prs == []
@@ -320,9 +326,12 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
 @pytest.mark.parametrize("change", ["base", "head", "body", "approval", "risk"])
 def test_rechecks_evidence_after_ci(review_case, monkeypatch, change):
     c = review_case
+    polls = []
     def ci(pr):
+        polls.append(pr)
         if change == "base":
-            c.history.update({"moved.txt": "new base"})
+            if len(polls) == 1:
+                c.history.update({"moved.txt": "new base"})
         elif change == "head":
             c.tracker.set_pr_head_sha(pr, "a" * 40)
         elif change == "body":
@@ -333,7 +342,21 @@ def test_rechecks_evidence_after_ci(review_case, monkeypatch, change):
             c.tracker.add_labels(1, ["risk:high"])
         return "pass"
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    from foragent import run_review
+    verified = []
+    verify = run_review._verify_review_head
+    monkeypatch.setattr(run_review, "_verify_review_head",
+                        lambda n, ctx, git, parsed, head, link: verified.append(head) or verify(n, ctx, git, parsed, head, link))
     orch.resolve(c.ctx, 1, "pass", "Head-specific review")
+    if change == "base":
+        # Checks ran on the reviewed head and again on the head with the new base merged in.
+        assert len(verified) == 2 and verified[0] != verified[1]
+        # The merge-turn holder merges a moved base into the head and re-verifies it (#712).
+        assert len(c.tracker.merged_prs) == 1
+        assert c.store.log_path(1).read_text().count("re-verifying") == 1
+        # First wait, the refreshed head's wait, and the final read under the merge lock.
+        assert len(polls) == 3, "The refreshed head's CI is checked again before merging"
+        return
     assert_blocked(c, Reason.HASH_MISMATCH if change in {"body", "approval"} else Reason.RISK_HIGH)
 
 
@@ -574,3 +597,18 @@ def test_cli_routes_all_verbs_to_injected_context(review_case, monkeypatch, caps
     assert c.tracker.get_issue(1).labels & {"blocked", "ready"} == {"ready"}
     assert cli.main(["orch", "log"]) == 0
     assert "resolved review fail" in capsys.readouterr().out
+
+
+def test_review_only_spec_conflict_stops_with_spec_question_and_keeps_pr_open(review_case):
+    c = review_case
+    conflict = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires X; the finding wants Y"
+    c.review_calls = enable_reviewer(c, [f"VERDICT: PASS\n{conflict}"])
+
+    assert runner.review_only(1, c.ctx) == "spec-question"
+
+    assert_blocked(c, Reason.SPEC_QUESTION)
+    question = [comment.body for comment in c.tracker.list_comments(1)
+                if comment.body.startswith("<!-- foragent:blocked reason=spec-question -->")]
+    assert len(question) == 1 and conflict in question[0]
+    events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [e["verdict"] for e in events if e["kind"] == "review"] == ["SPEC-CONFLICT"]

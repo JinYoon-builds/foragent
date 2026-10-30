@@ -70,6 +70,12 @@ def test_reconcile_consistent_live_records_are_unchanged_and_emit_no_event(git_h
 
     case, ctx = reconcile_case(git_history, tmp_path, monkeypatch)
     monkeypatch.setattr("foragent.scheduler.os.kill", lambda pid, signal: None)
+    try:  # #129's push journal is its own feature; this case pins reconcile events only.
+        from foragent import orch_push
+    except ImportError:
+        orch_push = None
+    if orch_push is not None and hasattr(orch_push, "after_tick"):
+        monkeypatch.setattr(orch_push, "after_tick", lambda *args, **kwargs: ([], False))
     run = case.store.get_run(1)
     approval = case.store.load_approval(1)
     labels = case.tracker.get_issue(1).labels

@@ -19,6 +19,14 @@ NOW = datetime(2026, 10, 20, 9, tzinfo=UTC)
 BODY = "## Done when\n```sh\ntrue\n```\n"
 
 
+class FixedClock(datetime):
+    """The fakes' clock for a command: the real one moves fixtures merged at NOW out of time windows."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return NOW if tz else NOW.replace(tzinfo=None)
+
+
 class FakeGit:
     def __init__(self):
         self.fetches = []
@@ -82,6 +90,15 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.launchd, "status", lambda root, **kwargs: launchd.LaunchdStatus(
         "dev.foragent.owner.repo", False, False,
     ))
+
+    class Clock(datetime):
+        """The command clock follows the tracker and store clock, so date windows never age out."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz else NOW.replace(tzinfo=None)
+
+    monkeypatch.setattr(cli, "datetime", Clock)
     return tmp_path, git, tracker, store, calls
 
 
@@ -589,7 +606,17 @@ def test_inspect_empty_output(app, capsys, json_output):
 @pytest.mark.parametrize("json_output", [False, True])
 def test_inspect_renders_card_prepared_results_and_language(app, monkeypatch, capsys, json_output):
     root, git, tracker, store, _ = app
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+
+    # inspect reads merges from the last 7 days of its clock; pin it to the tracker's NOW,
+    # so the merge below stays inside the window whatever today's date is.
+    monkeypatch.setattr(cli, "datetime", Clock)
     monkeypatch.setattr(cli, "load_config", lambda root: Config(language="ko"))
+    monkeypatch.setattr(cli, "datetime", FixedClock)  # The PR merged at NOW is inside inspect's 7-day window.
     card = "## What changed\n합계 표시\n## Try it\nkind: cli\n```sh\necho 합계:3\n```\n## Expect\n합계:3"
     number = tracker.create_pr(head="foragent/issue-7", base="main", title="합계", body="## Try it\n\n" + card)
     tracker.merge_pr(number, expected_head_sha=tracker.pr_head_sha(number))
@@ -649,9 +676,8 @@ def test_inspect_cli_records_answers_feedback_and_mark_seen(app, capsys, kicks):
     assert cli.main(args) == cli.main(args) == 0
     issue = tracker.get_issue(2)
     assert (issue.body, issue.labels) == ("Fix it\n\nAbout #1.", {"feedback"})
-    before = datetime.now(UTC)
     assert cli.main(["inspect", "mark-seen", "--repo-root", str(root)]) == 0
-    assert before <= datetime.fromisoformat(store.load_inspect().since) <= datetime.now(UTC)
+    assert datetime.fromisoformat(store.load_inspect().since) == NOW  # The command clock is pinned to NOW.
     assert "Decision recorded:" in capsys.readouterr().out
     assert git.fetches == [] and calls["launches"] == []
     assert kicks == [root, root]
@@ -896,3 +922,13 @@ def test_gate_commands_leave_macos_background_state(monkeypatch):
     calls.clear()
     assert cli.main(["update"]) == 0
     assert calls == []
+
+
+def test_gate_commands_count_gh_calls_outside_a_tick_in_the_repo_store(app, capsys):
+    from foragent import gh
+
+    root, git, tracker, store, calls = app
+    assert cli.main(["gate", "status", "--repo-root", str(root)]) == 0
+    capsys.readouterr()
+    gh.count_call()  # e.g. a live status refresh or update check after the command starts
+    assert [row["calls"] for row in store.github_calls()] == [1]

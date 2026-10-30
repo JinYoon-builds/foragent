@@ -24,8 +24,9 @@ from test_init import setup
 from test_skills_autosync import cli_exit, isolated_home
 
 def _skip_upstream(answer):
-    """#419 asks once about upstream reports; these tests count only statusline questions."""
-    return lambda prompt="": "n" if "upstream report" in prompt.lower() else answer(prompt)
+    """#419 asks about upstream reports and #848 offers a starter order; these tests count only statusline questions."""
+    return lambda prompt="": ("n" if "upstream report" in prompt.lower() or "starter order" in prompt.lower()
+                              else answer(prompt))
 
 
 
@@ -134,6 +135,35 @@ def test_statusline_wrapper_records_usage_and_preserves_command_io_and_exit(tmp_
     assert before <= seen <= after, "seen_at must record observation time, not a reset deadline"
 
 
+def _hook_commands(settings):
+    for group in (settings.get("hooks") or {}).get("SessionStart") or []:
+        for hook in group.get("hooks") or []:
+            yield hook.get("command", "")
+
+
+def has_session_start_hook(settings):
+    return any("fa statusline --session-start" in command for command in _hook_commands(settings))
+
+
+def without_session_start_hook(settings):
+    """Settings with Foragent's SessionStart hook (and containers it emptied) removed."""
+    result = json.loads(json.dumps(settings))
+    hooks = result.get("hooks") or {}
+    groups = []
+    for group in hooks.get("SessionStart") or []:
+        kept = [hook for hook in group.get("hooks") or []
+                if "fa statusline --session-start" not in hook.get("command", "")]
+        if kept:
+            groups.append({**group, "hooks": kept})
+    if groups:
+        hooks["SessionStart"] = groups
+    else:
+        hooks.pop("SessionStart", None)
+    if "hooks" in result and not hooks:
+        result.pop("hooks")
+    return result
+
+
 def test_statusline_wrapper_without_previous_command_prints_nothing(tmp_path):
     install_record(None)
     result = run_statusline(tmp_path, statusline_input())
@@ -192,7 +222,10 @@ def test_statusline_wrapper_init_installs_once_and_preserves_previous_command(
     assert len(prompts) == 1, "fa init must ask once before installing the Claude statusline wrapper"
     expected = {**original, "statusLine": {**original.get("statusLine", {}),
                                          "type": "command", "command": "fa statusline"}}
-    assert json.loads(settings_path().read_text()) == expected
+    installed = json.loads(settings_path().read_text())
+    # #755 (2026-10-27): the install also adds the SessionStart hook beside the statusline.
+    assert has_session_start_hook(installed), "fa init installs the SessionStart hook with the statusline"
+    assert without_session_start_hook(installed) == expected
     _, record = data_paths()
     assert json.loads(record.read_text()) == {"enabled": True, "previous_command": previous if has_previous else None}
     unchanged = (settings_path().read_bytes(), record.read_bytes())
@@ -244,8 +277,16 @@ def test_statusline_wrapper_init_keeps_existing_install_and_does_not_double_wrap
         pytest.fail("An already installed wrapper needs no question")
 
     monkeypatch.setattr("builtins.input", _skip_upstream(no_question))
+    before = json.loads(settings_path().read_text())
     assert cli_exit(main, argv) == 0
-    assert (settings_path().read_bytes(), record.read_bytes()) == unchanged
+    # #755: an install from before the hook gets it once, quietly; nothing else changes.
+    after = json.loads(settings_path().read_text())
+    assert has_session_start_hook(after) and without_session_start_hook(after) == without_session_start_hook(before)
+    assert record.read_bytes() == unchanged[1]
+    settled = settings_path().read_bytes()
+    assert cli_exit(main, argv) == 0
+    assert (settings_path().read_bytes(), record.read_bytes()) == (settled, unchanged[1]), (
+        "A second init adds nothing more")
     raw = statusline_input()
     result = run_statusline(tmp_path, raw)
     assert result.returncode == 0, "the installed wrapper must still call the original command after init"

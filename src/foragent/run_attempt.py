@@ -41,6 +41,12 @@ class AttemptFailure(Exception):
         super().__init__(message)
         self.target_branch = target_branch
 
+    @property
+    def failure(self) -> str:
+        """The failure text for the next attempt, keeping a WholeFailure whole."""
+        message = self.args[0] if self.args else ""
+        return message if isinstance(message, WholeFailure) else str(self)
+
 
 class ConflictBudgetExhausted(Exception):
     """In-place conflict resolution used its budget; the PR's own files decide on a rebuild."""
@@ -58,10 +64,24 @@ class CIFailure(AttemptFailure):
         self.target_branch = target_branch
 
 
+class WholeFailure(str):
+    """Failure text whose parts are already limited (each check tail, every review finding); kept whole."""
+
+
 class ExecutorStopped(Exception):
     def __init__(self, outcome: str, detail: str = ""):
         super().__init__(detail)
         self.outcome = outcome
+
+
+class ReviewerLimited(ExecutorStopped):
+    """A stored reviewer reached a hard limit before its session launched (#186).
+
+    The review runs again with the run's own executor (``quota_reviewer.moving_review``); it never waits.
+    """
+
+    def __init__(self, name: str):
+        super().__init__("limit-wait", f"{name} reached its limit before the review launched")
 
 
 @dataclass

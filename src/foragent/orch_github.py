@@ -20,9 +20,13 @@ def pause(ctx: WaitContext, error: TrackerError) -> datetime:
     if until is None:
         try:
             until = ctx.tracker.rate_limit_reset()
+            remaining = getattr(ctx.tracker, "rate_limit_remaining", None)
         except (TrackerError, ValueError, TypeError, AttributeError, OverflowError, OSError):
             # A failed reset lookup must not turn throttling into an issue failure.
-            until = None
+            until = remaining = None
+        if type(remaining) is int:
+            # The same response's count, timed by the local clock when it arrived (D93 facts).
+            ctx.store.record_github_remaining(remaining, ctx.now())
     now = ctx.now()
     if until is None or until <= now:
         until = now + timedelta(minutes=1)

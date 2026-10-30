@@ -7,19 +7,24 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING, Any
 
+from foragent import cuts
 from foragent.actions import flag
 from foragent.executors import ExecResult, classify_result
 from foragent.issue import parse_body
+from foragent import quota_headroom, scheduler_quota
 from foragent.labels import attempt_tier, issue_size
 from foragent.reasons import Reason
-from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation
+from foragent.run_attempt import AttemptFailure, CIFailure, ExecutorStopped, Implementation, WholeFailure
 from foragent.run_baseline import _capture_acceptance_baseline
 from foragent.run_checks import _append
 from foragent.run_execution import _available_executor, _write_claude_settings
-from foragent.run_lane_skills import lane_notes, lane_skill_names, lane_skills
+from foragent.run_lane_skills import lane_memory_notice, lane_notes, lane_skill_names, lane_skills
 from foragent.run_skill_catalog import available_skills, catalog_section, parse_skills_used
-from foragent.run_previous import consume_hint, pending_hint, previous_attempt_summary, record_stop_point
-from foragent.run_prompts import build_prompt, build_resume_prompt
+from foragent.run_previous import (
+    consume_hint, pending_hint, previous_attempt_summary, record_stop_point, saved_feedback_section,
+)
+from foragent.run_parent import parent_context
+from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
 from foragent.run_waits import _phase, _timeout
@@ -34,9 +39,12 @@ if TYPE_CHECKING:
 def lane_config(config: Config, lane: str) -> Config:
     """The configuration a run on this lane uses: the lane's executor and model win."""
     settings = config.lanes.get(lane, {}) if lane != "main" else {}
+    reviewer = settings.get("reviewer") or config.reviewer
     return replace(
         config, executor=settings.get("executor") or config.executor,
         executor_model=settings.get("model") if settings.get("model") is not None else config.executor_model,
+        # A lane-pinned reviewer wins; the global reviewer model belongs to the global reviewer only.
+        reviewer=reviewer, reviewer_model=config.reviewer_model if reviewer == config.reviewer else None,
     )
 
 
@@ -49,29 +57,100 @@ class ImplementerSetup:
     options: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
     missing_skills: list[str] = field(default_factory=list)
+    # What part of the lane memory an executor that loads it itself does not see.
+    memory_notice: str = ""
 
 
-def implementer_setup(config: Config, lane: str, tier: str, worktree: Path) -> ImplementerSetup:
+def tier_model_effort(config: Config, lane: str, tier: str) -> tuple[str | None, str | None]:
+    """The run's executor's model and effort at ``tier`` (#238); None means the executor default.
+
+    A lane model wins while the run is on the lane's executor (``lane_config`` made it the
+    executor_model; another executor's pair has none). Then the tier's ``<executor>_model``:
+    a name wins, an explicit empty string means the executor default, None falls back to
+    executor_model. An executor without tier keys (``has_tier_keys``) gets no model or effort.
+    """
+    name, settings = config.executor, config.tiers[tier]
+    if not has_tier_keys(config, name):
+        return None, None
+    lane_model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model")
+    tier_model = settings.get(f"{name}_model")
+    if lane_model and config.executor_model == lane_model:
+        model = lane_model
+    elif tier_model is not None:
+        model = tier_model or None
+    else:
+        model = config.executor_model
+    return model, settings.get(f"{name}_effort")
+
+
+_TIERS = ("s", "m", "l")
+
+
+def has_tier_keys(config: Config, name: str) -> bool:
+    """Codex and Claude always have tier keys; another executor only when a tier names it."""
+    return name in ("codex", "claude") or any(
+        isinstance(tier, dict) and (f"{name}_model" in tier or f"{name}_effort" in tier)
+        for tier in config.tiers.values())
+
+
+def quota_left(ctx: RunContext) -> float | None:
+    """The run's executor's usable plan share (#238); None without current subscription usage.
+
+    The run's executor (the pair the tick stored, else the lane's) owns the quota, never the
+    reviewer. An api, unlimited or unmeasured executor, or one without tier keys, has none.
+    """
+    config, name = ctx.config, ctx.config.executor
+    if not has_tier_keys(config, name) or scheduler_quota.entry_for(config, name).get("quota") != "subscription":
+        return None
+    mode = scheduler_quota.quota_mode(ctx.store, config)[0]
+    return quota_headroom.usable(scheduler_quota._usage(ctx.store), name, ctx.now(),
+                                 quota_headroom.cap(config, name, mode))
+
+
+def ample_quota(ctx: RunContext) -> bool:
+    """Whether the run's executor has at least tiers_headroom_ample of its plan left."""
+    left = quota_left(ctx)
+    return left is not None and left >= ctx.config.tiers_headroom_ample
+
+
+def choose_tier(ctx: RunContext, run, size: str) -> tuple[str, str]:
+    """The next executor turn's key and tier (#238, architect r42): derived, never looked up.
+
+    Turn k = len(attempt_tiers) + 1 counts every executor turn (implementation, conflict
+    resolution, CI repair, rebuild, a turn again after a limit wait or restart). The last
+    allowed attempt is l, whatever the usage or executor kind. Otherwise the base is turn 1's
+    recorded tier, or, when there is none, l with ample quota of the run's executor, else the
+    size; turn k is the base stepped up k - 1 times, capped at l.
+    """
+    k = str(len(run.attempt_tiers) + 1)
+    if run.attempts >= ctx.config.max_retries + 1:
+        return k, "l"
+    base = run.attempt_tiers.get("1")
+    if base not in _TIERS:
+        base = "l" if ample_quota(ctx) else size
+    return k, attempt_tier(base, int(k))
+
+
+def implementer_setup(
+    config: Config, lane: str, tier: str, worktree: Path, full_text_dir: Path | None = None,
+) -> ImplementerSetup:
     """Choose executor, model, lane agent, lane instructions and skills from a lane-adjusted config."""
     native_claude = config.executor == "claude"
-    settings = config.tiers[tier]
-    model = config.executor_model
-    options: dict[str, Any] = {}
-    if native_claude:
-        model = (config.lanes.get(lane, {}) if lane != "main" else {}).get("model") or settings["claude_model"] or model
-    else:
-        options["effort"] = settings["codex_effort"]
-    agent, notes = lane_notes(config, lane, worktree)
+    model, effort = tier_model_effort(config, lane, tier)
+    options: dict[str, Any] = {} if effort is None else {"effort": effort}
+    agent, notes = lane_notes(config, lane, worktree, full_text_dir)
     missing: list[str] = []
     if native_claude:
-        # Claude reads the lane agent itself; its notes are not prepended.
+        # Claude reads the lane agent and memory itself; only a cut notice is added, after the task.
         if agent is not None:
             options["agent"] = agent
+        memory_notice = lane_memory_notice(config, lane, worktree, full_text_dir) if agent is not None else ""
         notes = ""
     else:
         skill_notes, missing = lane_skills(config, lane, worktree, agent)
         notes += skill_notes
-    return ImplementerSetup(config.executor, model, options, notes, missing)
+        memory_notice = ""
+    return ImplementerSetup(config.executor, model, options, notes, missing, memory_notice)
 
 
 def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
@@ -140,6 +219,10 @@ def _baseline_unavailable(n: int, ctx: RunContext, detail: str, cause: Exception
     raise ExecutorStopped(reason.value, detail) from cause
 
 
+# Verification runs no baseline selectors once a base sync leaves none protected (#123).
+EMPTIED = "Acceptance baseline verification skipped (count=0): no protected node ids remain"
+
+
 def follow_base(attempt: Implementation) -> None:
     """Keep the protected set on the base the branch is built on (#483).
 
@@ -156,6 +239,31 @@ def follow_base(attempt: Implementation) -> None:
     if sha == attempt.baseline_sha:
         return
     previous = attempt.baseline
+    if previous is not None and not previous.node_ids:
+        # An empty protected set stays empty for the run: nothing to re-capture (#123).
+        attempt.baseline_sha = sha
+        return
+    owned: set[str] = set()
+    missing: set[str] = set()
+    if previous is not None and previous.node_ids:
+        # Collect the protected ids on the new base first; an id it does not
+        # collect drops as missing, and none left skips the re-capture (#123).
+        from foragent.run_baseline import collect_protected_ids, log_dropped_ids
+        try:
+            owned, missing = collect_protected_ids(attempt.n, attempt.ctx, previous, sha)
+        except AttemptFailure as exc:
+            # The run stops (#327) and drops nothing. #483 still measures the new
+            # base once; its unusable capture usually stops the run first.
+            capture_acceptance_baseline(attempt.n, attempt.ctx, attempt.git, attempt.target_branch, sha,
+                                        previous.test_command)
+            _baseline_unavailable(attempt.n, attempt.ctx, str(exc), exc)
+        if not set(previous.node_ids) - owned - missing:
+            log_dropped_ids(attempt.log, previous, (), owned, missing, None, False)
+            _append(attempt.log, "Acceptance baseline re-capture skipped: no protected node ids remain")
+            _append(attempt.log, EMPTIED)
+            attempt.baseline = replace(previous, node_ids=(), collected_ids=(), failing_ids=(), base_sha=sha)
+            attempt.baseline_sha = sha
+            return
     # Without an earlier protected set, the worktree holds the PR: read the base.
     command = previous.test_command if previous else (
         attempt.ctx.config.test_command or _detect_test_command_at(attempt.git, sha))
@@ -164,6 +272,14 @@ def follow_base(attempt: Implementation) -> None:
         # A run that had protection must not continue with none (#327).
         _baseline_unavailable(attempt.n, attempt.ctx,
                               f"acceptance baseline unavailable: no baseline could be captured for the new base {sha}")
+    if previous is not None and previous.node_ids:
+        from foragent.ci_mode import enabled
+        from foragent.run_baseline import log_dropped_ids
+        log_dropped_ids(attempt.log, previous, baseline.node_ids, owned, missing, baseline,
+                        enabled(attempt.ctx, attempt.target_branch))
+        if not baseline.node_ids:
+            # Every survivor fails on the new base: as final as protection lost by collection.
+            _append(attempt.log, EMPTIED)
     attempt.baseline, attempt.baseline_sha = baseline, sha
 
 
@@ -174,7 +290,7 @@ def _prepare_implementation(
     """Set up an implementer; a throwaway doctor task has no acceptance baseline to keep."""
     from foragent import runner
 
-    approval = ctx.store.load_approval(n)
+    approval = parent_context(ctx, n, ctx.store.load_approval(n))
     parsed = parse_body(approval.body)
     worktree = git.root
     branch = f"foragent/issue-{n}"
@@ -239,19 +355,32 @@ def _implement(
     if remaining <= 0:
         raise ExecutorStopped(_timeout(n, ctx))
     run = ctx.store.get_run(n)
-    tier = attempt_tier(attempt.size, run.attempts)
-    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, str(run.attempts): tier})
-    setup = implementer_setup(ctx.config, run.lane, tier, worktree)
+    # Every executor turn writes one new key; a key is never rewritten (#238).
+    key, tier = choose_tier(ctx, run, attempt.size)
+    ctx.store.update_run(n, tier=tier, attempt_tiers={**run.attempt_tiers, key: tier})
+    full_text_dir = cuts.issue_dir(ctx.store.root, n)
+    setup = implementer_setup(ctx.config, run.lane, tier, worktree, full_text_dir)
     model, notes = setup.model, setup.notes
-    attempt.options.update(setup.options)
+    # Effort and agent belong to this turn's tier; a tier without effort means the executor default.
+    options = {**attempt.options, **setup.options}
     attempt.missing_skills.extend(name for name in setup.missing_skills if name not in attempt.missing_skills)
     retry_default, hint = pending_hint(ctx.store.root, n)
     failure_context = str(failure) or run.resume_reason
+    # Each part of a check bundle or review is already limited; a saved one stays whole after restarts too.
+    whole = isinstance(failure, (CIFailure, WholeFailure)) or (not str(failure) and run.resume_whole)
+    moved_files = run.moved_files
+    # The saved review and failing checks reach every new attempt, fresh or resumed.
+    saved_feedback = saved_feedback_section(ctx.store.root, n, failure_context)
+    if str(failure):
+        # Save this turn's feedback first: a limit wait or restart before delivery must not lose it.
+        ctx.store.update_run(n, resume_reason=failure_context, resume_whole=whole)
     review_feedback = attempt.review_feedback
     attempt.review_feedback = False
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
+    # Bug-fix steps reach implementation turns (first, retries, resumes), not conflict resolution.
+    procedure = bug_fix_steps(attempt.issue.labels, worktree) if merge_conflicts is None else None
     fixed = lane_skill_names(ctx.config, run.lane, worktree, lane_notes(ctx.config, run.lane, worktree)[0])
     prompt = build_prompt(
         n, attempt.parsed, ctx.config.acceptance_dir, failure_context, ctx.config.language,
@@ -261,26 +390,32 @@ def _implement(
         orchestrator_hint=hint,
         test_command=test_command,
         acceptance_baseline=attempt.baseline.node_ids if attempt.baseline else (),
-        failure_limit=None if isinstance(failure, CIFailure) else 4000,
+        failure_limit=None if whole else 4000,
+        parent_context=attempt.approval.parent_context or "",
+        full_text_dir=full_text_dir,
+        moved_files=moved_files,
         skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
-        previous_attempt=(previous_attempt_summary(attempt)
-                          if failure_context or reviewer_text is not None else ""),
+        previous_attempt=(previous_attempt_summary(attempt, failure_context)
+                          if failure_context or reviewer_text is not None or saved_feedback else ""),
         review_feedback=review_feedback,
         retry_default=retry_default,
+        procedure=procedure,
     )
     offset = log.stat().st_size if log.exists() else 0
     result = None
     try:
         result = _available_executor(
             n, ctx, attempt.executor, worktree=worktree,
-            prompt=prompt if attempt.native_claude else notes + prompt,
+            prompt=notes + prompt + setup.memory_notice,
             session_body=attempt.approval.body,
             resume_prompt=build_resume_prompt(
                 n, run.session_body, attempt.approval.body, failure_context,
                 reviewer_text=reviewer_text, orchestrator_hint=hint, merge_conflicts=merge_conflicts,
                 review_feedback=review_feedback, retry_default=retry_default,
-            ),
-            model=model, timeout_s=remaining, log_path=log, **attempt.options,
+                moved_files=moved_files, parent_context=attempt.approval.parent_context or "",
+                procedure=procedure,
+            ) + (f"\n\n{saved_feedback}" if saved_feedback else "") + setup.memory_notice,
+            model=model, timeout_s=remaining, log_path=log, **options,
         )
     finally:
         # Every way a turn ends (result, limit wait, launch failure, interruption) leaves its stop point.
@@ -292,7 +427,9 @@ def _implement(
     # availability waits, launch failures and interruptions; acknowledge it
     # only once the implementer returns an ordinary execution result.
     if (retry_default or hint is not None) and classify_result(result) == "normal":
-        consume_hint(ctx.store.root, n)
+        consume_hint(ctx.store.root, n, hint)
+    if moved_files and classify_result(result) == "normal":
+        ctx.store.update_run(n, moved_files=[])  # named once, after delivery
     _record_skills_used(n, ctx, result)
     rebuttal = _read_rebuttals(worktree)
     if rebuttal.strip() and rebuttal not in attempt.rebuttals:
@@ -301,8 +438,8 @@ def _implement(
         raise ExecutorStopped(_timeout(n, ctx))
     question = worktree / ".foragent/QUESTION.md"
     if question.exists():
-        with question.open(encoding="utf-8", errors="replace") as stream:
-            details = stream.read(6000)
+        details = cuts.head(question.read_text(encoding="utf-8", errors="replace"), 6000,
+                            cuts.issue_dir(ctx.store.root, n), "QUESTION.md")
         flag(ctx, n, Reason.SPEC_QUESTION, "The executor needs a product decision.", details)
         raise ExecutorStopped("spec-question")
     wait_for_overlap(attempt)

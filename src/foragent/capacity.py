@@ -6,6 +6,7 @@ matters, and it holds new starts and new test slots without changing a budget.
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 from datetime import UTC, datetime, timedelta
 import fcntl
@@ -51,6 +52,9 @@ HELD_ENV = {TEST_SLOT_ENV: "held"}
 SLOT_POLL_SECONDS = 0.1
 # How often a waiting test command reports that it is still waiting.
 SLOT_HEARTBEAT_SECONDS = 10.0
+
+# Inside observing(), machine_load() reads the sensors without writing their baselines.
+_OBSERVING: ContextVar[bool] = ContextVar("foragent_capacity_observing", default=False)
 
 _DARWIN_PRESSURE = {1: "normal", 2: "warn", 4: "critical"}
 
@@ -179,7 +183,39 @@ class LoadSample(tuple[str, float]):
         sample.swapins = swapins
         sample.load_average_per_cpu = load_average_per_cpu
         sample.cpu_busy = cpu_busy
+        sample.disk_rates = dict.fromkeys(DISK_RATES.values())
         return sample
+
+
+# Cumulative psutil disk counters and the per-second rate each one becomes.
+DISK_RATES = {"read_bytes": "read_bytes_per_s", "write_bytes": "write_bytes_per_s",
+              "read_count": "read_ops_per_s", "write_count": "write_ops_per_s"}
+
+
+def _disk_rates(sensor: dict[str, Any]) -> dict[str, float | None]:
+    """Disk I/O rates since the saved counters; rebases ``sensor`` on the current ones.
+
+    The first reading, a counter reset (e.g. reboot) and an unreadable counter are unknown (None).
+    """
+    rates: dict[str, float | None] = dict.fromkeys(DISK_RATES.values())
+    try:
+        # nowrap=False: raw kernel counters, so a reset shows as a decrease instead of being
+        # added onto the values psutil cached earlier in this process.
+        counters = psutil.disk_io_counters(nowrap=False)
+    except (OSError, RuntimeError, AttributeError, NotImplementedError, psutil.Error):
+        counters = None
+    if counters is None:
+        sensor.pop("disk", None)
+        return rates
+    current = {key: getattr(counters, key) for key in DISK_RATES}
+    current["at"] = time.time()
+    previous = sensor.get("disk")
+    if isinstance(previous, dict) and all(type(previous.get(key)) in (int, float) for key in current):
+        elapsed = current["at"] - previous["at"]
+        if elapsed > 0 and all(current[key] >= previous[key] for key in DISK_RATES):
+            rates = {name: (current[key] - previous[key]) / elapsed for key, name in DISK_RATES.items()}
+    sensor["disk"] = current
+    return rates
 
 
 def load_per_cpu() -> float:
@@ -199,6 +235,31 @@ def _read_sensor(root: Path) -> dict[str, Any]:
         return {}
 
 
+def _busy_now(sensor: dict[str, Any]) -> tuple[float | None, dict[str, Any] | None]:
+    """The busy fraction from the current CPU counters against the saved ones.
+
+    Returns ``(busy, update)``: ``update`` is the new baseline to save, or None when
+    the interval is too short and the saved fraction is reused, as the gate does.
+    """
+    times = psutil.cpu_times()
+    # Linux guest time is already included in user/nice counters.
+    total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
+    idle = times.idle + getattr(times, "iowait", 0)
+    previous_total, previous_idle = sensor.get("cpu_total"), sensor.get("cpu_idle")
+    busy = None
+    if (type(previous_total) in (int, float) and type(previous_idle) in (int, float)
+            and 0 <= previous_idle <= previous_total):
+        elapsed, idle_elapsed = total - previous_total, idle - previous_idle
+        # Subtracting float counters can put an all-idle delta just above total.
+        if elapsed >= 0 and 0 <= idle_elapsed <= elapsed + 2 * math.ulp(total):
+            if elapsed < CPU_BUSY_MIN_SECONDS * (os.cpu_count() or 1):
+                busy = sensor.get("cpu_busy")
+                return (busy if type(busy) in (int, float) and 0 <= busy <= 1 else None), None
+            busy = max(0.0, min(1.0, 1 - idle_elapsed / elapsed))
+    # First samples and counter resets discard the old fraction and rebase.
+    return busy, {"cpu_total": total, "cpu_idle": idle, "cpu_busy": busy}
+
+
 def cpu_busy() -> float | None:
     """Busy fraction since the last persisted CPU sample; iowait is idle, steal is busy."""
     if os.environ.get("FORAGENT_CPU_BUSY") == "off":
@@ -206,31 +267,47 @@ def cpu_busy() -> float | None:
     try:
         root = machine_root()
         with _flock(root / SENSOR_LOCK):
-            times = psutil.cpu_times()
-            # Linux guest time is already included in user/nice counters.
-            total = sum(times) - getattr(times, "guest", 0) - getattr(times, "guest_nice", 0)
-            idle = times.idle + getattr(times, "iowait", 0)
             sensor = _read_sensor(root)
-            previous_total, previous_idle = sensor.get("cpu_total"), sensor.get("cpu_idle")
-            busy = None
-            if (type(previous_total) in (int, float) and type(previous_idle) in (int, float)
-                    and 0 <= previous_idle <= previous_total):
-                elapsed, idle_elapsed = total - previous_total, idle - previous_idle
-                # Subtracting float counters can put an all-idle delta just above total.
-                if elapsed >= 0 and 0 <= idle_elapsed <= elapsed + 2 * math.ulp(total):
-                    if elapsed < CPU_BUSY_MIN_SECONDS * (os.cpu_count() or 1):
-                        busy = sensor.get("cpu_busy")
-                        return busy if type(busy) in (int, float) and 0 <= busy <= 1 else None
-                    busy = max(0.0, min(1.0, 1 - idle_elapsed / elapsed))
-            # First samples and counter resets discard the old fraction and rebase.
-            sensor.update(cpu_total=total, cpu_idle=idle, cpu_busy=busy)
-            (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
+            busy, update = _busy_now(sensor)
+            if update is not None:
+                sensor.update(update)
+                (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
         return busy
     except (OSError, ValueError, TypeError, AttributeError, NotImplementedError, psutil.Error):
         return None
 
 
+@contextmanager
+def observing() -> Iterator[None]:
+    """Read machine_load() for display only: no lock, no sensor baseline written."""
+    token = _OBSERVING.set(True)
+    try:
+        yield
+    finally:
+        _OBSERVING.reset(token)
+
+
+def _observed_load() -> LoadSample:
+    """The sample the gate would take now, read-only: current counters against the saved ones.
+
+    The saved fraction is reused only where the gate reuses it (a too-short interval);
+    otherwise the busy fraction is measured now, so it matches the current load average.
+    """
+    busy = None
+    # FORAGENT_CPU_BUSY=off turns the busy fraction off, including a previously saved one.
+    if os.environ.get("FORAGENT_CPU_BUSY") != "off":
+        try:
+            busy, _ = _busy_now(_read_sensor(machine_root()))
+        except (OSError, ValueError, TypeError, AttributeError, NotImplementedError, psutil.Error):
+            busy = None
+    raw_load = load_per_cpu()
+    load = min(raw_load, busy / 0.6) if busy is not None else raw_load
+    return LoadSample(kernel_pressure(), load, None, load_average_per_cpu=raw_load, cpu_busy=busy)
+
+
 def machine_load() -> LoadSample:
+    if _OBSERVING.get():
+        return _observed_load()
     root = machine_root()
     with _flock(root / SENSOR_LOCK):
         pressure, total = kernel_pressure(), swapins_total()
@@ -241,11 +318,14 @@ def machine_load() -> LoadSample:
         # A reset (e.g. reboot) establishes a new baseline without negative activity.
         swapins = max(0, total - previous) if total is not None and previous is not None else None
         sensor["swapins_total"] = total
+        disk = _disk_rates(sensor)
         (root / SENSOR_FILE).write_text(json.dumps(sensor), encoding="utf-8")
     # Swap-ins are recorded as a fact; they never reclassify the kernel level.
     raw_load, busy = load_per_cpu(), cpu_busy()
     load = min(raw_load, busy / 0.6) if busy is not None else raw_load
-    return LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
+    sample = LoadSample(pressure, load, swapins, load_average_per_cpu=raw_load, cpu_busy=busy)
+    sample.disk_rates = disk
+    return sample
 
 
 def _within_grace(timestamp: str | None, now: datetime) -> bool:
@@ -359,12 +439,19 @@ def read_test_slots() -> dict[str, Any] | None:
     return value
 
 
-def effective_test_slots(ceiling: int) -> int:
-    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling."""
+def effective_test_slots(
+    ceiling: int, *, state: dict[str, Any] | None | bool = False, machine: dict[str, Any] | None = None,
+) -> int:
+    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling.
+
+    ``state`` and ``machine`` let a caller that already read test-slots.json and machine.yml
+    reuse those values instead of reading the files again.
+    """
     from foragent import machine_budget
 
-    ceiling = min(ceiling, machine_budget.values()["test_slots"])
-    state = read_test_slots()
+    ceiling = min(ceiling, (machine if machine is not None else machine_budget.values())["test_slots"])
+    if state is False:
+        state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
 
 
@@ -514,3 +601,106 @@ def hold_test_slot(ceiling: int, *, waiting: Callable[[], None] | None = None) -
     finally:
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         stream.close()
+
+
+SLEEP_BASELINES_FILE = "sleep-baselines.json"
+# A clock baseline is kept this long; a gate tick reads from its previous tick, minutes ago.
+SLEEP_BASELINES_KEEP = timedelta(hours=48)
+
+
+class _Timeval(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_usec", ctypes.c_int)]
+
+
+def _darwin_sleep_interval() -> tuple[datetime, datetime] | None:
+    """Read kern.sleeptime and kern.waketime in-process: the last sleep's wall times."""
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        times = []
+        for name in (b"kern.sleeptime", b"kern.waketime"):
+            value = _Timeval()
+            size = ctypes.c_size_t(ctypes.sizeof(value))
+            if libc.sysctlbyname(name, ctypes.pointer(value), ctypes.pointer(size), None, ctypes.c_size_t(0)) != 0:
+                return None
+            times.append(datetime.fromtimestamp(value.tv_sec + value.tv_usec / 1e6, UTC))
+    except (OSError, AttributeError, ValueError, OverflowError):
+        return None
+    return times[0], times[1]
+
+
+class _Timebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+def _darwin_asleep_total() -> float | None:
+    """Seconds asleep since boot: mach_continuous_time counts sleep, mach_absolute_time does not."""
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        continuous, absolute, timebase = libc.mach_continuous_time, libc.mach_absolute_time, _Timebase()
+        continuous.restype = absolute.restype = ctypes.c_uint64
+        if libc.mach_timebase_info(ctypes.pointer(timebase)) != 0 or not timebase.denom:
+            return None
+        return (continuous() - absolute()) * timebase.numer / timebase.denom / 1e9
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _sleep_offset() -> tuple[str, float]:
+    """A clock difference that grows only while the machine sleeps.
+
+    Linux CLOCK_MONOTONIC pauses in suspend and CLOCK_BOOTTIME does not. Python's
+    monotonic clock pauses in sleep, so wall minus monotonic is the fallback.
+    """
+    try:
+        return "boottime", time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+    except (AttributeError, OSError):
+        return "wall", time.time() - time.monotonic()
+
+
+def _sleep_baseline(since: datetime, kind: str, offset: float) -> float:
+    """The offset recorded at ``since``; the first read at a point records the current offset."""
+    root = machine_root()
+    path = root / SLEEP_BASELINES_FILE
+    key = f"{kind}@{since.astimezone(UTC).isoformat()}"
+    with _flock(root / f"{SLEEP_BASELINES_FILE}.lock"):
+        try:
+            baselines = json.loads(path.read_text(encoding="utf-8"))
+            baselines = baselines if isinstance(baselines, dict) else {}
+        except (OSError, ValueError):
+            baselines = {}
+        if isinstance(baselines.get(key), (int, float)):
+            return float(baselines[key])
+        baselines[key] = offset
+        # Pruned by age only, never by which runs are running.
+        cutoff = datetime.now(UTC) - SLEEP_BASELINES_KEEP
+        keep = {name: value for name, value in baselines.items()
+                if datetime.fromisoformat(name.split("@", 1)[1]) >= cutoff}
+        descriptor, temporary = tempfile.mkstemp(dir=root, prefix=f".{SLEEP_BASELINES_FILE}.")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(keep, stream)
+        os.replace(temporary, path)
+    return offset
+
+
+def slept_seconds(since: datetime) -> float:
+    """Seconds the machine slept after ``since`` (an aware datetime); reading consumes nothing.
+
+    macOS intersects the kernel's last sleep and wake times with [since, now] and
+    also compares its sleep-since-boot clock with its value at ``since``.
+    Elsewhere a sleep-counting clock offset is compared with its value at
+    ``since``, recorded in the machine data root by the first read at that point.
+    Only the gate tick reads it (``sleep_credit``), from the previous tick's time.
+    """
+    if sys.platform == "darwin":
+        # The kernel's last sleep pair, and the cumulative sleep since boot: the pair alone
+        # forgets an earlier sleep once the machine sleeps again.
+        interval = _darwin_sleep_interval()
+        latest = 0.0
+        if interval is not None and interval[0] < interval[1]:
+            latest = max(0.0, (min(interval[1], datetime.now(UTC)) - max(interval[0], since)).total_seconds())
+        total = _darwin_asleep_total()
+        if total is None:
+            return latest
+        return max(latest, total - _sleep_baseline(since, "mach", total))
+    kind, offset = _sleep_offset()
+    return max(0.0, offset - _sleep_baseline(since, kind, offset))

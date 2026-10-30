@@ -121,15 +121,28 @@ def test_board_status_groups_existing_team_board_saves_mapping_once_and_uses_it(
     original = status_field(case.tracker, board_id)
     user_config = isolated_home / ".config/foragent/config.yml"
     user_before = user_config.read_bytes()
-    monkeypatch.setattr("builtins.input", lambda *a: pytest.fail(
-        "--board-map supplies the answer; persisted mappings must not be asked again"))
+
+    def no_board_question(prompt="", *args):
+        # fa init may ask once about upstream reports (a personal setting); the
+        # board mapping itself must never be asked again.
+        if "upstream report" in str(prompt).lower():
+            return "n"
+        pytest.fail("--board-map supplies the answer; persisted mappings must not be asked again")
+
+    monkeypatch.setattr("builtins.input", no_board_question)
 
     assert cli_exit(main, [*argv, "--board-map", MAP_FLAG]) == 0, "fa init must accept --board-map"
     saved = yaml.safe_load((case.root / ".foragent.yml").read_text())
     assert saved["board"] == board_id and saved["board_map"] == TEAM_MAP
     assert main(argv) == 0
     assert yaml.safe_load((case.root / ".foragent.yml").read_text()) == saved
-    assert user_config.read_bytes() == user_before, "board_map belongs to the team"
+    def team_view(raw):
+        # The personal upstream-report answer may be saved; nothing else may change.
+        values = yaml.safe_load(raw) or {}
+        values.pop("upstream_reports", None)
+        return values
+
+    assert team_view(user_config.read_bytes()) == team_view(user_before), "board_map belongs to the team"
     assert status_field(case.tracker, board_id) == original
     assert card_column(case.tracker, board_id, 20) == "Review"
 

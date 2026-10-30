@@ -122,4 +122,17 @@
 - `.foragent/acceptance-exclusions.json`은 러너가 브랜치 커밋에 섞어 넣는다. PR이 이 파일을 건드리면 리뷰가 CI 약화로 지적하므로 `git show origin/main:<path> >` 로 main과 같게 둔다.
 - #503 gate 병합의 끝은 `finish_run` 시각이 아니다(병합 뒤 설치·정리가 끝난 시각). `record_merge`가 실행 기록 옆 키 `merged_at`을 저장하고, finish_run이 history로 옮기며, `StateStore.merge_times()`로 읽는다. 같은 이슈의 다음 실행 파일은 이전 키를 물려받으므로 실행 시작보다 이른 merged_at은 무시한다. 회귀: `tests/test_watch_progress.py -k recorded_merge`.
 - [#543 레인 화면 하나만](project_single_lane_view.md) — watch.lock flock, 모든 열기의 공유 시도 기록, execv 잠금 인계
+- [#172 오케스트레이터 메모 줄](project_orch_panel.md) — 140칸↑ 상자 36칸, 문제 푸는 중 줄 유지+지켜보는 중 추가, inspect 개수 파일은 폴더 있을 때만
 - [#114 주문 완료 구역](project_done_state.md) — done.py·빈 칸 숨김·0 숨김 요약·쉬는 레인 줄바꿈
+- [#167 레인 줄](project_lane_rows.md) — 머리줄·작업자 줄·24줄 예산·KEEP/SIDE, 옛 도로/표 고정 시험 14개 충돌
+- [#168 완료 불꽃](project_finished_fireworks.md) — GAP_AFTER·STAYS, state·calm(), render_frame 고정 인자 함정
+- [#171 준비 줄](project_prep_rows.md) — Snapshot.prep·prep 구역 ORDER 4·고정 시험 함정
+- [#756 보류·해제는 사건 기록만](project_hold_sources.md) — orch-events.jsonl의 다섯 보류·세 해제 종류+머지, flags·승인 스냅숏 금지
+- [#756 /fa는 GitHub 호출 없음](project_fa_offline.md) — --report는 캐시 안내만, 스킬 2단계는 FORAGENT_UPDATE_CHECK=off, 반박 반복되면 재설계
+- [#170 도토리 클릭·접기·스크롤](project_acorn_interact.md) — F 한 규칙 스크롤(_window), 화면 줄 hits, held 나열, 상자 상태/레인, 끝난 주문도 ▸
+- [#115 사용량 줄](project_usage_line.md) — ORDER 65·SHORT/APART, 바닥 줄을 고정한 시험 4종, Snapshot.meter, m 키
+- [#190 꿈꾸는 레인 줄](project_dream_row.md) — status lanes의 dreaming; watch_sections 도우미 모듈은 GAP=False(24줄 한도); fa test는 기준본 검사 불가
+- [#173 설정 창](project_settings_window.md) — 창 패키지·범위별 get·glyph 규칙; fa test는 ~/.cache/uv를 씀(UV_CACHE_DIR 필수)
+- [#308 runner_unit_tests 설정](project_settings_runner.md) — 새 팀 설정 추가 경로, auto 표시, max_parallel null 허용
+- #942 `watch_open._running`은 `psutil.Process(pid).create_time()`이 watch.pid mtime+2초보다 늦으면 재사용으로 본다(읽기 실패=살아 있음). `_opening`이 잠금 안에서 다시 확인해 Process가 두 번 불린다. 부수기 확인용 백업은 존재하는 폴더에 둔다.
+- #951 watch-terminal.json 기록은 `watch_open.record_terminal(store, cwd, exe, handle, now)` 하나로 한다(FORAGENT_ROLE은 빈 값도 존재로 판정·워크트리 안은 건너뜀). 훅은 `presence.record_terminal`, 시각은 호출자가 넘긴다(시험이 presence·statusline의 datetime만 바꿈).

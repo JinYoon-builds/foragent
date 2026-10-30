@@ -1,137 +1,340 @@
-"""Merge groups (#459): ready runs merge together after one joint check.
+"""Single-writer merge groups over #712's append-only merge queue (#459).
 
-A ready run records itself in merge-queue.json, claims the oldest unclaimed
-peers, checks main plus every member's head once outside merge.lock, and at
-the final lock merges the still-valid members in queue order.
+State ownership (one writer each, everything appended to merge-queue.jsonl):
+
+- a run's own ``ready`` rows carry its eligibility and check inputs; a changed
+  head appends a newer ready row and keeps the first row's FIFO place;
+- the FIFO turn holder that leads appends one ``group`` claim and one
+  ``verdict`` for it, and nothing else about other runs;
+- each member appends its own ``merged`` row after merging its own PR.
+
+Nobody rewrites, retires or completes another run's rows, PR, issue, run
+record or board card. Claim liveness and the turn are derived from the run
+records: an open claim (no verdict) reserves its members only while its
+leader's run is running. A member reuses a ``pass`` verdict only for its exact
+claimed head and only when every main commit since the claim's base is an
+earlier member's recorded merge or a result-neutral move.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+import json
 from pathlib import Path
 import shlex
 import tempfile
 from typing import TYPE_CHECKING, Any
+import uuid
 
-from foragent import board
-from foragent.git import GitError, PublicationError
-from foragent.issue import parse_body
-from foragent.labels import READY, RUNNING
+from foragent.git import GitError
+from foragent.run_base_move import BaseMove, base_move_is_neutral
 from foragent.run_checks import _append, _pytest_command, _related_unit_tests, trusts_ci
+from foragent.run_merge_turn import QUEUE, Seat, _append as append_row, _live, _waiting, latest_ready
 from foragent.run_waits import _progress, _test_slot
-from foragent.tracker import TrackerError
 
 if TYPE_CHECKING:
-    from foragent.git import GitRepo
     from foragent.run_attempt import Implementation
-    from foragent.run_publish import _MergeInputs
+    from foragent.state import StateStore
 
 
-@dataclass
-class Group:
-    base_sha: str
-    entries: list[dict[str, Any]]  # Queue order, including the leader.
+def rows(store: StateStore) -> list[dict]:
+    """Every event row in order, including group and verdict rows (which name no ``n``)."""
+    try:
+        raw = (store.root / QUEUE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    events = []
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            events.append(row)
+    return events
 
 
-@dataclass
-class Member:
-    entry: dict[str, Any]
-    git: GitRepo
-    inputs: _MergeInputs
+def _turn_rows(events: list[dict]) -> list[dict]:
+    """The rows #712's FIFO reads: per-run rows that name an issue."""
+    return [row for row in events if isinstance(row.get("n"), int)]
 
 
-def queue_in_use(ctx) -> bool:
-    """merge-queue.json is used only under local checks with groups of two or more."""
-    return getattr(ctx.config, "checks", "local") == "local" and getattr(ctx.config, "merge_group_max", 1) > 1
+def _claims(events: list[dict], target: str) -> list[tuple[dict, dict | None]]:
+    """(claim, its verdict or None) for ``target``, in append order."""
+    verdicts = {row.get("id"): row for row in events if row.get("event") == "verdict"}
+    return [(row, verdicts.get(row.get("id"))) for row in events
+            if row.get("event") == "group" and row.get("target") == target]
+
+
+def _covers(claim: dict, key: tuple[int, str | None]) -> dict | None:
+    """The claimed member entry for this run instance, if the claim names it."""
+    started = claim.get("started_at") or []
+    for index, member in enumerate(claim.get("members") or []):
+        if member.get("n") == key[0] and (started[index] if index < len(started) else None) == key[1]:
+            return member
+    return None
+
+
+def _eligible(row: dict | None, max_group: int) -> bool:
+    return bool(row and row.get("group") and row.get("checks") == "local" and row.get("auto")
+                and max_group > 1)
 
 
 def grouping_enabled(attempt: Implementation, automatic: bool) -> bool:
-    """Only automatic merges into the configured base under local checks join groups."""
-    ctx = attempt.ctx
-    # The configured mode decides, not whether a CI comparison is possible.
-    return (automatic and queue_in_use(ctx)
-            and attempt.target_branch == ctx.config.base_branch
+    """Only automatic merges into the configured base under configured local checks group."""
+    config = attempt.ctx.config
+    return (automatic and getattr(config, "merge_group_max", 1) > 1
+            and getattr(config, "checks", "local") == "local"
+            and attempt.target_branch == config.base_branch
             and attempt.target_branch != attempt.batch_branch)
 
 
-def _own_units(attempt: Implementation) -> tuple[str | None, list[str]]:
-    """The related-unit command and selection this run's own verification used."""
-    from foragent import runner
+class Membership:
+    """One run's view of merge groups during publication; it writes only its own rows."""
 
-    ctx, worktree = attempt.ctx, attempt.worktree
-    test_command = ctx.config.test_command
-    if test_command is None:
-        test_command = next(iter(runner.detect_test_commands(worktree)), None)
-    unit_command = _pytest_command(test_command) if test_command else None
-    units = _related_unit_tests(worktree, list(attempt.paths), ctx.config.acceptance_dir,
-                                own_only=ctx.config.runner_unit_tests != "all" and trusts_ci(worktree, ctx.config))
-    return unit_command, list(units)
+    def __init__(self, attempt: Implementation, place: Seat):
+        self.attempt, self.place = attempt, place
+        self.automatic = False
+        self.claim: dict | None = None  # A pass claim this run may still consume.
+        self.solo = False  # Left the group path: today's one-PR path for the rest of the run.
+        self.led = False
+        self.left = False
 
+    @property
+    def enabled(self) -> bool:
+        return not self.solo and grouping_enabled(self.attempt, self.automatic)
 
-def enqueue(attempt: Implementation, pr: int, head: str, base_sha: str, ready_at: float) -> None:
-    baseline = attempt.baseline
-    unit_command, unit_tests = _own_units(attempt)
-    attempt.ctx.store.enqueue_merge({
-        "number": attempt.n, "head_sha": head, "pr": pr, "branch": attempt.branch,
-        "base": attempt.target_branch, "base_sha": base_sha, "ready_at": ready_at,
-        "worktree": str(attempt.worktree), "body_sha": attempt.approval.body_sha,
-        "acceptance_blobs": attempt.approval.acceptance_blobs,
-        "baseline_command": baseline.command if baseline else None,
-        "baseline_ids": list(baseline.node_ids) if baseline else [],
-        "baseline_base_sha": baseline.base_sha if baseline else None,
-        "baseline_test_command": (baseline.test_command or ctx_test_command(attempt)) if baseline else None,
-        # The joint check keeps every member's own selection: it may only add checks.
-        "unit_command": unit_command, "unit_tests": unit_tests,
-    })
+    # ---- the run's own ready row -------------------------------------------------
+    def ready_fields(self) -> dict[str, Any]:
+        """This run's eligibility and the check inputs a leader needs, read from no other source."""
+        attempt, ctx = self.attempt, self.attempt.ctx
+        fields: dict[str, Any] = {"group": grouping_enabled(attempt, self.automatic),
+                                  "checks": getattr(ctx.config, "checks", "local"), "auto": self.automatic}
+        if not fields["group"]:
+            return fields
+        from foragent import runner
 
+        baseline = attempt.baseline
+        test_command = ctx.config.test_command
+        if test_command is None:
+            test_command = next(iter(runner.detect_test_commands(attempt.worktree)), None)
+        unit_command = _pytest_command(test_command) if test_command else None
+        units = _related_unit_tests(attempt.worktree, list(attempt.paths), ctx.config.acceptance_dir,
+                                    own_only=ctx.config.runner_unit_tests != "all"
+                                    and trusts_ci(attempt.worktree, ctx.config))
+        fields.update(
+            branch=attempt.branch, done_when=list(attempt.parsed.done_when_commands),
+            baseline_command=baseline.command if baseline else None,
+            baseline_ids=list(baseline.node_ids) if baseline else [],
+            baseline_base_sha=baseline.base_sha if baseline else None,
+            baseline_test_command=(baseline.test_command or test_command) if baseline else None,
+            unit_command=unit_command, unit_tests=list(units),
+        )
+        return fields
 
-def ctx_test_command(attempt: Implementation) -> str | None:
-    from foragent import runner
+    # ---- at the FIFO turn --------------------------------------------------------
+    def at_turn(self, head: str) -> None:
+        """Holding the turn: consume a pass verdict for this exact head, or lead a new group."""
+        if not self.enabled or self.claim is not None:
+            return
+        events = rows(self.attempt.ctx.store)
+        for claim, verdict in _claims(events, self.place.target):
+            member = _covers(claim, self.place.key)
+            if member is None or verdict is None:
+                continue
+            if verdict.get("result") == "pass" and member.get("head_sha") == head:
+                self.claim = claim
+                return
+            # A failed group (or one for an older head) is never permission to skip today's path.
+            self.solo = True
+            return
+        if not self.led:
+            self._lead(head)
 
-    return attempt.ctx.config.test_command or next(iter(runner.detect_test_commands(attempt.worktree)), None)
+    def _lead(self, head: str) -> None:
+        attempt, ctx, n = self.attempt, self.attempt.ctx, self.attempt.n
+        maximum = getattr(ctx.config, "merge_group_max", 1)
+        ctx.git.fetch("origin", self.place.target)
+        base_sha = ctx.git.ref_sha(f"origin/{self.place.target}")
+        with ctx.store._state_lock():
+            events = rows(ctx.store)
+            own = latest_ready(_turn_rows(events), self.place)
+            if not _eligible(own, maximum) or own.get("head_sha") != head:
+                return
+            members = [(self.place.key, own)] + self._candidates(events, maximum - 1)
+            if len(members) < 2:
+                return
+            claim = {"event": "group", "id": uuid.uuid4().hex, "leader": n, "target": self.place.target,
+                     "base_sha": base_sha,
+                     "members": [{"n": key[0], "head_sha": row["head_sha"]} for key, row in members],
+                     "started_at": [key[1] for key, _ in members], "at": ctx.now().isoformat()}
+            append_row(ctx.store, claim)
+        self.led = True
+        _append(attempt.log, "Merge group " + ", ".join(f"#{m['n']}" for m in claim["members"])
+                + f": joint check on {base_sha}")
+        passed = joint_check(attempt, [row for _, row in members], base_sha)
+        with ctx.store._state_lock():
+            append_row(ctx.store, {"event": "verdict", "id": claim["id"], "target": self.place.target,
+                                   "result": "pass" if passed else "fail", "culprits": [],
+                                   "at": ctx.now().isoformat()})
+        _append(attempt.log, f"Merge group joint check {'passed' if passed else 'failed'}")
+        if passed:
+            self.claim = claim
+        else:
+            self.solo = True
 
+    def _candidates(self, events: list[dict], room: int) -> list[tuple[tuple[int, str | None], dict]]:
+        """The oldest live, eligible ready others no live open or decided claim names."""
+        store, target = self.attempt.ctx.store, self.place.target
+        taken: set[tuple[int, str | None]] = set()
+        for claim, verdict in _claims(events, target):
+            leader = (claim.get("leader"), (claim.get("started_at") or [None])[0])
+            if verdict is not None or _live(store, leader):
+                taken.update((m.get("n"), s) for m, s in zip(claim.get("members") or [],
+                                                             claim.get("started_at") or []))
+        picked = []
+        for key in _waiting(_turn_rows(events), target):
+            if len(picked) >= room:
+                break
+            if key == self.place.key or key in taken or not _live(store, key):
+                continue
+            latest = latest_ready(_turn_rows(events), Seat(key[0], key[1], target))
+            if _eligible(latest, room + 1):
+                picked.append((key, latest))
+        return picked
 
-def form(attempt: Implementation) -> tuple[Group | None, bool]:
-    """Claim peers and check them jointly; return (passed group, joint check failed)."""
-    n, ctx = attempt.n, attempt.ctx
-    entries = ctx.store.claim_merge_group(n, attempt.target_branch, ctx.config.merge_group_max)
-    if not entries:
-        return None, False
-    members = ", ".join(f"#{entry['number']}" for entry in entries)
-    try:
-        # Pin the main tip when the group forms; the final lock compares against it.
-        ctx.git.fetch("origin", attempt.target_branch)
-        base_sha = ctx.git.ref_sha(f"origin/{attempt.target_branch}")
-        _append(attempt.log, f"Merge group {members}: joint check on {base_sha}")
+    # ---- reuse of a pass verdict -------------------------------------------------
+    def base_ok(self, target_sha: str) -> bool:
+        """Every main commit since the claim's base is an earlier member's merge or neutral."""
+        if self.claim is None:
+            return False
+        base = self.claim["base_sha"]
+        if target_sha == base:
+            return True
+        git = self.attempt.git
         try:
-            passed, entries = joint_check(attempt, entries, base_sha)
+            if not git.is_ancestor(base, target_sha):
+                return False
+            commits = git._call(["rev-list", "--reverse", "--first-parent", f"{base}..{target_sha}"]).split()
         except GitError:
-            if ctx.store.group_merged_head(n) is None:
-                raise
-            return None, False  # Another group merged this run meanwhile; the caller finishes it.
-    finally:
-        # Claims end after the joint check; the final lock re-reads every member.
-        ctx.store.release_merge_claims(n)
-    if len(entries) < 2:
-        return None, False  # Every peer went stale before the check: proceed alone.
-    members = ", ".join(f"#{entry['number']}" for entry in entries)
-    _append(attempt.log, f"Merge group {members}: joint check {'passed' if passed else 'failed'}")
-    return (Group(base_sha, entries), False) if passed else (None, True)
+            return False
+        merged = self._earlier_merges()
+        previous = base
+        for commit in commits:
+            if commit not in merged and not base_move_is_neutral(self.attempt, BaseMove(previous, commit)):
+                return False
+            previous = commit
+        return True
+
+    def _members(self) -> list[tuple[dict, str | None]]:
+        claim = self.claim or {}
+        return list(zip(claim.get("members") or [], claim.get("started_at") or []))
+
+    def _position(self) -> int:
+        return next(index for index, (member, started) in enumerate(self._members())
+                    if (member["n"], started) == self.place.key)
+
+    def _merged_rows(self) -> dict[tuple[int, str | None], dict]:
+        claim_id = (self.claim or {}).get("id")
+        return {(row["n"], row.get("started_at")): row for row in rows(self.attempt.ctx.store)
+                if row.get("event") == "merged" and row.get("group") == claim_id}
+
+    def _earlier_merges(self) -> set[str]:
+        """merged_sha of earlier members of this claim, each merged with its recorded head."""
+        merged, shas = self._merged_rows(), set()
+        for member, started in self._members()[:self._position()]:
+            row = merged.get((member["n"], started))
+            if row is not None and row.get("head_sha") == member["head_sha"] and row.get("merged_sha"):
+                shas.add(row["merged_sha"])
+        return shas
+
+    def _later_holder(self) -> bool:
+        """A later live member still holds this pass verdict for its exact head."""
+        store, merged = self.attempt.ctx.store, self._merged_rows()
+        turn_rows = _turn_rows(rows(store))
+        for member, started in self._members()[self._position() + 1:]:
+            key = (member["n"], started)
+            if key in merged or not _live(store, key):
+                continue
+            latest = latest_ready(turn_rows, Seat(key[0], key[1], self.place.target))
+            if latest is not None and latest.get("head_sha") == member["head_sha"]:
+                return True
+        return False
+
+    def covered(self) -> list[int] | None:
+        return [member["n"] for member, _ in self._members()] if self.claim else None
+
+    def size(self) -> int:
+        return len(self._members()) if self.claim else 1
+
+    def others(self) -> list[int]:
+        return [n for n in (self.covered() or []) if n != self.attempt.n]
+
+    def reinstall_now(self) -> bool:
+        """The last merging member of a group reinstalls once; a single run always does."""
+        return self.claim is None or not self._later_holder()
+
+    def merged(self, pr: int, head: str, base_sha: str) -> None:
+        """Append this run's own merged row; main is read under its own merge.lock.
+
+        The merge commit is the first main commit after the base re-read under the
+        lock, not main's tip: another push may already have landed on top of it.
+        """
+        if self.claim is None:
+            return
+        ctx = self.attempt.ctx
+        try:
+            ctx.git.fetch("origin", self.place.target)
+            tip = ctx.git.ref_sha(f"origin/{self.place.target}")
+            after = ctx.git._call(["rev-list", "--reverse", "--first-parent", f"{base_sha}..{tip}"]).split()
+            merged_sha = after[0] if after else None
+        except GitError:
+            merged_sha = None  # Later members then cannot prove this merge and re-check instead.
+        with ctx.store._state_lock():
+            append_row(ctx.store, {"n": self.place.n, "event": "merged", "started_at": self.place.started_at,
+                                   "target": self.place.target, "group": self.claim["id"], "head_sha": head,
+                                   "merged_sha": merged_sha, "pr": pr, "at": ctx.now().isoformat()})
+
+    def complete(self, pr: int, head: str, base_sha: str, *, reinstall: bool) -> str | None:
+        """After this run merged its own PR: its own facts and rows; the close comment for a group."""
+        from foragent import runner
+        from foragent.i18n import text
+        from foragent.orch_events import append_event
+
+        ctx, n = self.attempt.ctx, self.attempt.n
+        self.merged(pr, head, base_sha)
+        ctx.store.update_run(n, merge_group_size=self.size(), merge_group_bisect_checks=0)
+        if reinstall and self.reinstall_now():
+            runner.after_merge(ctx, pr, self.place.target)
+        others = ", ".join(f"#{other}" for other in self.others())
+        if not others:
+            return None
+        append_event(ctx.store, ctx.now(), n, "merge",
+                     text("merge_group_merged", "en", pr=pr, head=head, others=others))
+        return text("merge_group_closed", ctx.config.language, others=others)
+
+    def leave(self) -> None:
+        """Leave the group path without merging: reinstall earlier group merges if none follows."""
+        if self.claim is None or self.left:
+            self.solo = self.solo or self.claim is not None
+            return
+        self.left = True
+        try:
+            earlier = [row for key, row in self._merged_rows().items() if key != self.place.key]
+            if earlier and not self._later_holder():
+                from foragent import runner
+
+                runner.after_merge(self.attempt.ctx, earlier[-1]["pr"], self.place.target)
+        finally:
+            self.claim, self.solo = None, True
 
 
-def _stale(attempt: Implementation, entry: dict[str, Any]) -> bool:
-    """A queued peer that stopped, restarted or lost its worktree since it queued."""
-    return (entry["number"] != attempt.n
-            and (not attempt.ctx.store.merge_entry_current(entry) or not Path(entry["worktree"]).is_dir()))
+def joint_check(attempt: Implementation, members: list[dict[str, Any]], base_sha: str) -> bool:
+    """Pinned main plus every claimed head merged in queue order, with the union of checks.
 
-
-def joint_check(attempt: Implementation, entries: list[dict[str, Any]],
-                base_sha: str) -> tuple[bool, list[dict[str, Any]]]:
-    """Main plus every member's head in queue order, with the union of their checks.
-
-    Returns (passed, checked members). A peer that went stale (for example it merged
-    alone and its branch was deleted) is dropped before use instead of failing the check.
+    Runs in a fresh detached worktree outside merge.lock. Identical Done-when
+    commands run once, the baseline IDs union once (plus what passes on the
+    pinned main when a member's baseline ran on an older base), and the related
+    units once per command. Checks that modify tracked files fail the group.
     """
     from foragent import runner
 
@@ -141,29 +344,14 @@ def joint_check(attempt: Implementation, entries: list[dict[str, Any]],
         ctx.git.add_detached_worktree(worktree, base_sha)
         try:
             git = ctx.git.at(worktree)
-            checked = []
-            for entry in entries:
+            for row in members:
                 try:
-                    if _stale(attempt, entry):
-                        raise GitError("its run is no longer the queued execution")
-                    ctx.git.fetch("origin", entry["branch"])
+                    if row.get("branch"):
+                        ctx.git.fetch("origin", row["branch"])
+                    git.merge_base(row["head_sha"])
                 except GitError as exc:
-                    if entry["number"] == attempt.n:
-                        raise
-                    _append(log, f"Merge group: #{entry['number']} dropped as stale: {exc}")
-                    ctx.store.dequeue_merge(entry["number"])  # Never select it again.
-                    continue
-                checked.append(entry)
-            entries = checked
-            if len(entries) < 2:
-                return False, entries
-            for entry in entries:
-                try:
-                    git.merge_base(entry["head_sha"])
-                except GitError as exc:
-                    _append(log, f"Merge group: #{entry['number']} does not merge cleanly: {exc}")
-                    return False, entries
-            # The checks must verify exactly the contents that will be merged.
+                    _append(log, f"Merge group: #{row['n']} does not merge cleanly: {exc}")
+                    return False
             combined_head = git.head_sha()
             git.stage_changes()
             combined_tree = git.staged_tree_sha()
@@ -174,66 +362,54 @@ def joint_check(attempt: Implementation, entries: list[dict[str, Any]],
                 _progress(n, ctx)
                 return result
 
-            checks = []
-            for entry in entries:
-                approval = ctx.store.load_approval(entry["number"])
-                if approval is None:
-                    return False, entries
-                checks.extend(check(command) for command in parse_body(approval.body).done_when_commands)
-            command = next((entry["baseline_command"] for entry in entries if entry.get("baseline_command")), None)
-            ids = {node for entry in entries for node in entry.get("baseline_ids") or ()}
-            # Members' baselines ran on their own bases. When main moved since (for
-            # example another group merged the owner of a pending acceptance test),
-            # the tests that pass on this pinned main must be protected too.
-            fresh = _baseline_on(attempt, entries, base_sha)
+            results = [check(command) for command in dict.fromkeys(
+                command for row in members for command in row.get("done_when") or ())]
+            ids = {node for row in members for node in row.get("baseline_ids") or ()}
+            fresh = _baseline_on(attempt, members, base_sha)
             if fresh is None:
-                _append(log, "Merge group: no acceptance baseline on the pinned main; merging one at a time")
-                return False, entries
+                return False
             ids |= fresh
+            command = next((row["baseline_command"] for row in members if row.get("baseline_command")), None)
             if command and ids:
-                checks.append(check(f"{command} {shlex.join(sorted(ids))}"))
-            for unit_command, units in _unit_runs(attempt, entries, worktree, git, base_sha).items():
-                checks.append(check(f"{unit_command} {shlex.join(units)}", max(900, runner._remaining(n, ctx))))
+                results.append(check(f"{command} {shlex.join(sorted(ids))}"))
+            for unit_command, units in _unit_runs(attempt, members, worktree, git, base_sha).items():
+                results.append(check(f"{unit_command} {shlex.join(units)}", max(900, runner._remaining(n, ctx))))
             git.stage_changes()
             if git.head_sha() != combined_head or git.staged_tree_sha() != combined_tree:
                 _append(log, "Merge group: joint check commands modified tracked files")
-                return False, entries
-            return all(result.exit_code == 0 and not result.timed_out for result in checks), entries
+                return False
+            return all(result.exit_code == 0 and not result.timed_out for result in results)
         finally:
             ctx.git.remove_worktree(worktree)
 
 
-def _baseline_on(attempt: Implementation, entries: list[dict[str, Any]], base_sha: str) -> set[str] | None:
-    """Pass IDs of a fresh acceptance baseline on the pinned main, when any member's is older.
-
-    None means it could not be captured, so the group cannot be protected.
-    """
+def _baseline_on(attempt: Implementation, members: list[dict[str, Any]], base_sha: str) -> set[str] | None:
+    """Pass IDs on the pinned main when a member's baseline ran elsewhere; None if unavailable."""
     from foragent.run_baseline import _capture_acceptance_baseline
 
-    if all(entry.get("baseline_base_sha") in (None, base_sha) for entry in entries):
+    if all(row.get("baseline_base_sha") in (None, base_sha) for row in members):
         return set()
-    test_command = next((entry["baseline_test_command"] for entry in entries
-                         if entry.get("baseline_test_command")), None)
+    test_command = next((row["baseline_test_command"] for row in members if row.get("baseline_test_command")), None)
     if test_command is None:
         return set()
     try:
         baseline = _capture_acceptance_baseline(attempt.n, attempt.ctx, test_command, base_sha)
-    except Exception as exc:  # noqa: BLE001 - an unprotected group falls back to one at a time
+    except Exception as exc:  # noqa: BLE001 - an unprotected group fails over to one at a time
         _append(attempt.log, f"Merge group: acceptance baseline on {base_sha} failed: {exc}")
         return None
     return set(baseline.node_ids) if baseline else set()
 
 
-def _unit_runs(attempt: Implementation, entries: list[dict[str, Any]], worktree: Path,
-               git: GitRepo, base_sha: str) -> dict[str, list[str]]:
-    """Related units once per command: every member's own selection plus the combined one."""
+def _unit_runs(attempt: Implementation, members: list[dict[str, Any]], worktree: Path, git,
+               base_sha: str) -> dict[str, list[str]]:
+    """Each member's own unit selection plus the combined one, once per command."""
     from foragent import runner
 
     ctx = attempt.ctx
     runs: dict[str, set[str]] = {}
-    for entry in entries:
-        if entry.get("unit_command") and entry.get("unit_tests"):
-            runs.setdefault(entry["unit_command"], set()).update(entry["unit_tests"])
+    for row in members:
+        if row.get("unit_command") and row.get("unit_tests"):
+            runs.setdefault(row["unit_command"], set()).update(row["unit_tests"])
     test_command = ctx.config.test_command
     if test_command is None:
         test_command = next(iter(runner.detect_test_commands(worktree)), None)
@@ -242,205 +418,5 @@ def _unit_runs(attempt: Implementation, entries: list[dict[str, Any]], worktree:
                                 own_only=ctx.config.runner_unit_tests != "all" and trusts_ci(worktree, ctx.config))
     if combined and units:
         runs.setdefault(combined, set()).update(units)
-    # A member's own test file that a later member deleted no longer exists here.
     return {command: sorted(path for path in tests if (worktree / path).is_file())
             for command, tests in runs.items() if any((worktree / path).is_file() for path in tests)}
-
-
-def merged_by_group(attempt: Implementation, pr: int, head: str) -> bool:
-    """Another run's group already merged this exact head (run record and PR)."""
-    ctx = attempt.ctx
-    if ctx.store.group_merged_head(attempt.n) != head:
-        return False
-    return any(item.number == pr for item in ctx.tracker.list_prs("merged", attempt.branch))
-
-
-def member_inputs(attempt: Implementation, group: Group, base_sha: str) -> list[Member]:
-    """Re-read every borrowed member's merge inputs; invalid members are left out.
-
-    The caller merges borrowed members only when every member is still valid:
-    the joint PASS covers the whole combination, not any subset of it.
-    """
-    from foragent.run_publish import _final_merge_inputs, _policy_allows
-
-    ctx = attempt.ctx
-    members = []
-    for entry in group.entries:
-        number = entry["number"]
-        if number == attempt.n:
-            continue
-        saved = ctx.store.load_approval(number)
-        run = ctx.store.get_run(number)
-        # Only the execution that queued this entry may be merged by it.
-        if saved is None or run is None or run.started_at != entry.get("started_at") or _stale(attempt, entry):
-            ctx.store.dequeue_merge(number)  # Stale: never select it again.
-            continue
-        approval = replace(saved, body_sha=entry["body_sha"], acceptance_blobs=entry["acceptance_blobs"])
-        git = ctx.git.at(Path(entry["worktree"]))
-        try:
-            inputs = _final_merge_inputs(number, ctx, git, entry["pr"], entry["branch"], entry["base"],
-                                         entry["head_sha"], approval, entry["ready_at"], base_sha=base_sha)
-        except GitError as exc:
-            _append(attempt.log, f"Merge group: #{number} left out as stale: {exc}")
-            ctx.store.dequeue_merge(number)
-            continue
-        if (inputs.stop is None and inputs.status in {"pass", "none"}
-                and _policy_allows(inputs.decision, entry["base"], inputs.batch_branch)
-                and inputs.decision.kind == "merge"):
-            try:
-                git.check_publication(base_sha)
-            except (PublicationError, GitError) as exc:
-                _append(attempt.log, f"Merge group: #{number} left out: {exc}")
-                continue
-            members.append(Member(entry, git, inputs))
-    return members
-
-
-def merge_member(attempt: Implementation, member: Member) -> bool:
-    """Merge one borrowed member with its expected head; False leaves it out."""
-    from foragent.run_publish import retitle_for_merge
-
-    ctx, entry = attempt.ctx, member.entry
-    number, pr = entry["number"], entry["pr"]
-    current = next((item for item in ctx.tracker.list_prs("open", entry["branch"]) if item.number == pr), None)
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
-    subject = retitle_for_merge(
-        ctx, pr, title=title, current_title=current.title if current else None, base=entry["base"],
-        body=lambda: current.body if current else "", note=lambda line: _append(attempt.log, line),
-    )
-    try:
-        ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=entry["head_sha"], **subject)
-    except TrackerError as exc:
-        if exc.is_rate_limit:
-            raise
-        _append(attempt.log, f"Merge group: #{number} merge failed: {exc}")
-        return False
-    # Durable at once: the member's own run finishes merged even if the leader stops here.
-    ctx.store.record_merge(number, ctx.now())
-    ctx.store.record_group_merge(number, entry["head_sha"], entry.get("started_at"))
-    return True
-
-
-def merge_in_order(
-    attempt: Implementation, order: list[dict[str, Any]], members: dict[int, Member],
-    merge_leader: Callable[[], bool],
-) -> tuple[list[dict[str, Any]], bool, Exception | None]:
-    """Merge in queue order; return (borrowed merged, leader merged, error) without raising.
-
-    The caller finishes every merge that happened, then reports the error. A member
-    that fails stops the rest: they were checked only together with it.
-    """
-    borrowed: list[dict[str, Any]] = []
-    leader_merged = False
-    try:
-        for entry in order:
-            if entry["number"] != attempt.n:
-                if not merge_member(attempt, members[entry["number"]]):
-                    break
-                borrowed.append(entry)
-            elif merge_leader():
-                leader_merged = True
-            else:
-                break
-    except Exception as exc:  # noqa: BLE001 - returned so that merged PRs are finished first
-        return borrowed, leader_merged, exc
-    return borrowed, leader_merged, None
-
-
-def finish_group(attempt: Implementation, borrowed: list[dict[str, Any]], leader: tuple[int, str] | None,
-                 *, reinstall: bool, queue: bool) -> None:
-    """Finish every merge of a group, local facts first and fallible GitHub work last.
-
-    Durable local state (group fields, queue, reinstall, journal) never waits for
-    GitHub, and each member's closure is attempted even after another one failed;
-    a failed closure is queued for the outbox retry (close_merged). Never raises
-    for GitHub errors, so a caller always finalizes every merge that happened.
-    """
-    from foragent import runner
-    from foragent.orch_events import append_event
-
-    ctx, n = attempt.ctx, attempt.n
-    merged = [(entry["number"], entry["pr"], entry["head_sha"]) for entry in borrowed]
-    if leader is not None:
-        merged.append((n, *leader))
-    size = len(merged)
-    if not size:
-        return
-    numbers = [number for number, _, _ in merged]
-    for number in numbers:
-        ctx.store.update_run(number, merge_group_size=size, merge_group_bisect_checks=0)
-    if queue:
-        ctx.store.dequeue_merge(*numbers)
-    if reinstall:  # Once per group, after its last merge.
-        runner.after_merge(ctx, merged[-1][1], attempt.target_branch)
-    if size > 1:
-        for number, pr, head in merged:
-            others = ", ".join(f"#{other}" for other in numbers if other != number)
-            append_event(ctx.store, ctx.now(), number, "merge",
-                         f"PR #{pr}: merged {head} in a merge group with {others}")
-    for number in numbers:
-        if number == n:
-            continue  # The leader closes its own issue after this.
-        others = ", ".join(f"#{other}" for other in numbers if other != number)
-        close_merged(attempt, number, f"Merged in a merge group with {others}.")
-
-
-def _close_merged(ctx, number: int, comment: str | None) -> None:
-    """Close a merged issue and clear its labels; each step runs even if an earlier one failed."""
-    errors: list[BaseException] = []
-
-    def close() -> None:
-        if ctx.tracker.current_issue(number).state == "closed":
-            return
-        try:
-            if comment is None:
-                ctx.tracker.close_issue(number)
-            else:
-                ctx.tracker.close_issue(number, comment)
-        except TrackerError as exc:
-            if exc.is_rate_limit or ctx.tracker.current_issue(number).state != "closed":
-                raise
-
-    for step in (close, lambda: ctx.tracker.remove_labels(number, [READY, RUNNING]),
-                 lambda: board.sync_status(ctx, number, "Done")):
-        try:
-            step()
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-    if errors:
-        raise errors[0]
-
-
-def close_merged(attempt: Implementation, number: int, comment: str | None) -> bool:
-    """Close a merged issue, or queue the closure for the gate's outbox retry.
-
-    A failure is never silent: the closure and label removal wait in the GitHub
-    outbox (delivered by the next tick), and the journal and run record say so.
-    Returns whether the issue was finished now.
-    """
-    from foragent.orch_events import append_event
-
-    ctx = attempt.ctx
-    try:
-        _close_merged(ctx, number, comment)
-        return True
-    except Exception as exc:  # noqa: BLE001 - the merge happened; retry the closure instead
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            from foragent.orch_github import pause
-
-            pause(ctx, exc)  # The gate waits for the reset, then the outbox delivers.
-        lanes = getattr(getattr(ctx, "config", None), "lanes", None)
-        ctx.store.queue_github_write(number, "close_issue", lanes=lanes, body=comment)
-        ctx.store.queue_github_write(number, "remove_labels", lanes=lanes, labels=[READY, RUNNING])
-        detail = f"Merged; closing the issue failed and is queued for retry: {exc}"
-        _append(attempt.log, f"#{number}: {detail}")
-        append_event(ctx.store, ctx.now(), number, "close-pending", detail)
-        run = ctx.store.get_run(number)
-        if run is not None and run.status == "running":
-            ctx.store.update_run(number, detail=detail)
-        return False
-
-
-def finish_merged_self(attempt: Implementation) -> bool:
-    """A member merged by another group closes its own issue if the leader could not."""
-    return close_merged(attempt, attempt.n, "Merged in another run's merge group.")

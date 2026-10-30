@@ -19,8 +19,12 @@ def add(commands) -> None:
     init.add_argument("--no-board", action="store_true")
     init.add_argument("--board-map", help="Existing board columns: Backlog=Todo,Up next=Todo,In progress=Doing,Your turn=Review,Done=Done")
     init.add_argument("--dry-run", action="store_true")
+    init.add_argument("--claude-quota", choices=("keep", "burn"),
+                      help="Default Claude quota mode: keep stops at keep_percent, burn runs to the limit")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
+    init.add_argument("--starter", choices=("yes", "no"),
+                      help="Answer the starter order offer without a prompt")
 
 
 def _offer_statusline(answer: str | None) -> None:
@@ -36,6 +40,64 @@ def _offer_statusline(answer: str | None) -> None:
         print("Claude statusline: not installed; Foragent will not ask again.")
     elif outcome == "unanswered":
         print("Claude statusline: not asked (no terminal); rerun with --statusline yes|no.")
+    elif outcome == "hooked":
+        # Installed before the session-start summary existed: added quietly, said in one line.
+        cli = facade()
+        try:
+            language = cli.load_config(cli.Path.cwd()).language
+        except Exception:  # Outside a readable Foragent config, speak English.
+            language = "en"
+        print(cli.text("statusline_hook_added", language))
+
+
+def _offer_upstream_reports(root) -> None:
+    """Ask once, default no, whether upstream error reports may be proposed; remember either answer."""
+    from foragent.config import load_config, set_upstream_reports
+    from foragent.upstream_report import UPSTREAM
+
+    cli = facade()
+    try:
+        # Asked only after setup wrote a usable config; the answer itself is global.
+        # Read the file directly so the facade's config hook sees only the view's read.
+        language = load_config(root).language
+        if cli.load_global_config().upstream_reports is not None:
+            return
+    except cli.ConfigError:
+        return
+    try:
+        answer = input(cli.text("upstream_reports_question", language, upstream=UPSTREAM))
+    except (EOFError, OSError):
+        print(cli.text("upstream_reports_unanswered", language))
+        return
+    enabled = answer.strip().lower() in {"y", "yes"}
+    try:
+        set_upstream_reports(enabled)
+    except (OSError, cli.ConfigError) as exc:
+        # Setup itself succeeded; say so in the repository's language and ask again next time.
+        print(cli.text("upstream_reports_save_failed", language, error=" ".join(str(exc).split())[:300]))
+        return
+    print(cli.text("upstream_reports_on" if enabled else "upstream_reports_off", language))
+
+
+def _offer_starter(root, tracker, answer: str | None) -> None:
+    """Offer one tiny first order when the project has no Foragent work; store nothing."""
+    from foragent import starter
+    from foragent.config import load_config
+
+    cli = facade()
+    try:
+        language = load_config(root).language
+        if tracker is None or not starter.eligible(tracker):
+            return
+    except Exception:  # No readable config or tracker facts: skip the offer quietly.
+        return
+    if answer is None:
+        try:
+            answer = input(cli.text("starter_question", language))
+        except (EOFError, OSError):
+            return
+    if answer.strip().lower() in {"y", "yes"}:
+        print(cli.text("starter_next_step", language, example=cli.text("starter_example", language)))
 
 
 def run(args) -> int:
@@ -46,9 +108,13 @@ def run(args) -> int:
         run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
         dry_run=args.dry_run, language=args.language, no_board=args.no_board,
         board_map=args.board_map,
+        # Only an explicit flag reaches setup; without it no claude_quota block is written.
+        **({"claude_quota": args.claude_quota} if args.claude_quota else {}),
     )
     print(report.summary())
     if not args.dry_run:
         cli._offer_statusline(args.statusline)
+        _offer_upstream_reports(report.normalized_root or root)
+        _offer_starter(report.normalized_root or root, getattr(report, "tracker", None), args.starter)
         cli._open_lane_view(report.normalized_root or root)
     return 0

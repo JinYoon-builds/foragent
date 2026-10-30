@@ -72,11 +72,13 @@ def test_prompt_try_and_evidence_in_configured_language_on_every_attempt(run_cas
         assert all(heading in prompt for heading in ("## What changed", "## Try it", "## Expect", "## Web"))
 
 
-def test_review_prompt_truncates_only_diff_and_parse_limits_findings():
-    prompt = build_review_prompt(parse_body(BODY), "x" * 60000 + "TRUNCATED")
-    assert prompt.endswith("x" * 60000) and "TRUNCATED" not in prompt
+def test_review_prompt_truncates_only_diff_and_parse_limits_findings(tmp_path):
+    # The diff keeps its limit with the shared cut notice; findings are no longer limited (#420).
+    prompt = build_review_prompt(parse_body(BODY), "x" * 60000 + "TRUNCATED", full_text_dir=tmp_path)
+    assert prompt.endswith("x" * 60000 + f"[cut: 9 more chars; full text: {tmp_path / 'review-diff.patch'}]")
+    assert (tmp_path / "review-diff.patch").read_text() == "x" * 60000 + "TRUNCATED"
     review = parse_review("VERDICT: FAIL\n" + "\n".join(f"file:{i}: defect" for i in range(8)))
-    assert review.verdict == "FAIL" and len(review.findings.splitlines()) == 5
+    assert review.verdict == "FAIL" and len(review.findings.splitlines()) == 8
 
 
 def test_native_goal_condition_length_cap_preserves_instructions():
@@ -98,3 +100,49 @@ def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case,
     assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path", "effort"}
     assert call["effort"] == "high"
     assert not (c.store.root / "runs/issue-1").exists()
+
+
+@pytest.mark.parametrize("label,bug", [
+    ("bug", True), ("Bug", True), ("type: bug", True), ("kind:bug", True), (" BUG ", True),
+    ("debug", False), ("bugfix", False), ("bug-report", False), ("approved", False),
+])
+def test_bug_label_forms(label, bug):
+    from foragent.run_prompts import is_bug_label
+
+    assert is_bug_label(label) is bug
+
+
+def test_bug_fix_steps_only_for_bug_label_and_points_to_reference_when_present(tmp_path):
+    from foragent.run_prompts import BUG_FIX_REFERENCE, bug_fix_steps
+
+    assert bug_fix_steps({"approved", "running", "debug"}, tmp_path) is None
+    steps = bug_fix_steps({"approved", "type: bug"}, tmp_path)
+    assert steps is not None and "Reproduce" in steps and "failing regression test first" in steps
+    assert BUG_FIX_REFERENCE not in steps
+    reference = tmp_path / BUG_FIX_REFERENCE
+    reference.parent.mkdir(parents=True)
+    reference.write_text("# Bug fix\n", encoding="utf-8")
+    assert BUG_FIX_REFERENCE in bug_fix_steps(["bug"], tmp_path)
+
+
+def test_fresh_and_resume_prompts_carry_procedure_only_when_given():
+    from foragent.runner import build_resume_prompt
+
+    parsed = parse_body(BODY)
+    plain = build_prompt(1, parsed, "tests/acceptance/")
+    assert "This issue is a bug." not in plain
+    assert "This issue is a bug." in build_prompt(1, parsed, "tests/acceptance/", procedure="This issue is a bug.\n")
+    resume = build_resume_prompt(1, BODY, BODY, "check failed", procedure="This issue is a bug.\n")
+    assert "This issue is a bug." in resume
+    assert "This issue is a bug." not in build_resume_prompt(1, BODY, BODY, "check failed")
+
+
+@pytest.mark.parametrize("label", ["type: bug", "enhancement"])
+def test_bug_steps_reach_first_attempt_and_retry_for_bug_label_only(run_case, label):
+    c = run_case
+    c.tracker.add_labels(1, [label])
+    c.executor.steps = [{"feature.txt": "not done"}, {"feature.txt": "done"}]
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(c.executor.calls) == 2
+    for call in c.executor.calls:
+        assert ("This issue is a bug. Follow these steps:" in call["prompt"]) is (label == "type: bug")

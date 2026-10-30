@@ -803,6 +803,14 @@ def test_parent_and_paginated_sub_issues_gh():
     ]
 
 
+def test_parent_issue_gh_reads_parent_body_in_one_call():
+    run = ScriptedRun(json.dumps(issue_json(99, body="Shared outcome.")))
+    parent = GhTracker(REPO, run).parent_issue(1)
+    assert (parent.number, parent.body) == (99, "Shared outcome.")
+    assert run.calls == [(["api", "repos/owner/repo/issues/1/parent"], None)]
+    assert GhTracker(REPO, ScriptedRun(gh_error("gh: error (HTTP 404)"))).parent_issue(1) is None
+
+
 @pytest.mark.parametrize("code", [404, 403, 500])
 def test_only_missing_parent_is_none(code):
     tracker = GhTracker(REPO, ScriptedRun(gh_error(f"gh: error (HTTP {code})")))
@@ -1604,3 +1612,86 @@ def test_merged_prs_updated_since_accepts_pulls_without_updated_at():
     assert GhTracker(REPO, run).merged_prs_updated_since(NOW, "foragent/") == [{
         "number": 5, "head": "foragent/issue-5", "base": "main", "merged_at": NOW.isoformat(),
         "url": item["html_url"], "updated_at": None}]
+
+
+def test_gh_attempts_count_only_with_a_recorder_and_include_failures(tmp_path):
+    from foragent import gh
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path, now=lambda: datetime(2026, 10, 20, 9, 30, tzinfo=UTC))
+    attempts = []
+
+    def run(args, input=None):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="boom")
+        return "[]"
+
+    tracker = GhTracker("owner/repo", run=run, sleep=lambda seconds: None)
+    with pytest.raises(TrackerError):
+        tracker.list_open_issues()
+    assert store.github_calls() == []  # No recorder: nothing counts.
+    gh.set_recorder(store, lambda: datetime(2026, 10, 20, 9, 45, tzinfo=UTC))
+    tracker.list_open_issues()  # An empty listing is retried once: two attempts.
+    assert store.github_calls() == [{"hour": "2026-10-20T09:00:00+00:00", "calls": 2}]
+
+
+def test_recording_tracker_installs_its_context_as_the_gh_recorder(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import gh
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path)
+    when = datetime(2026, 10, 20, 11, tzinfo=UTC)
+    RecordingTracker(FakeTracker(), SimpleNamespace(store=store, now=lambda: when))
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: calls.append(argv) or
+                        subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    gh.run(["auth", "status"], capture_output=True, check=False)
+    assert calls == [["gh", "auth", "status"]]
+    assert store.github_calls() == [{"hour": "2026-10-20T11:00:00+00:00", "calls": 1}]
+
+
+def test_gh_issues_closed_since_is_one_filtered_listing_without_pull_requests():
+    items = [{"number": 4, "title": "t", "body": "", "labels": [], "state": "closed"},
+             {"number": 5, "title": "p", "body": "", "labels": [], "state": "closed", "pull_request": {}}]
+    calls = []
+    tracker = GhTracker(REPO, run=lambda args, input=None: calls.append(args) or json.dumps(items))
+    assert [issue.number for issue in tracker.issues_closed_since(NOW)] == [4]
+    assert calls == [["api", "--paginate",
+                      "repos/owner/repo/issues?state=closed&since=2026-10-20T09%3A00%3A00Z&per_page=100"]]
+
+
+def test_observe_closed_issues_starts_at_the_last_listing_and_records_unlisted_closes(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(1, "Work", "body")
+    remote.add_issue(2, "Other", "body")
+    ctx = SimpleNamespace(config=Config(), now=lambda: clock[0],
+                          store=StateStore(tmp_path, now=lambda: clock[0]))
+    tracker = RecordingTracker(remote, ctx)
+
+    def states():
+        return {row["number"]: row["state"] for row in ctx.store.local_issues()}
+
+    # Without a listing or a watermark there is no span to read yet.
+    tracker.observe_closed_issues(observed_at=clock[0])
+    assert states() == {} and ctx.store.closed_issue_watermark() == clock[0]
+
+    # Upgrading with a cached listing: the first read starts at that listing.
+    (tmp_path / "closed_issues.json").unlink()
+    tracker.refresh_issues()
+    clock[0] += timedelta(minutes=1)
+    remote.close_issue(1)
+    remote.add_issue(3, "Created and closed between listings", "body", state="closed")
+    tracker.observe_closed_issues(observed_at=clock[0])
+    assert states() == {1: "closed", 2: "open", 3: "closed"}
+    assert ctx.store.closed_issue_watermark() == clock[0]

@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime
 from hashlib import sha256
 import json
-from math import isfinite
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -22,10 +21,12 @@ from time import monotonic
 from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
-from foragent.records import load_record
+from foragent import cuts
+from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
+from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot
+from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
 
 if TYPE_CHECKING:
@@ -87,6 +88,8 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                     command, root, log, _baseline_capture_limit(ctx, log),
                     slot=capacity.hold_test_slot(ctx.config.test_slots)),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
+                # Locked test_baseline_prebuild (unusable "timeout") forbids caching a timed-out prebuild.
+                record_timeouts=False,
             )
         except Exception as exc:
             # No failure marker is cached: a later tick can reserve the key again.
@@ -105,7 +108,7 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots,
+        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }
@@ -134,14 +137,14 @@ def prebuild_acceptance_baseline(ctx: RunContext, target_ref: str, launch: Calla
     log = ctx.store.root / "baseline-build.log"
     build = _baseline_build(ctx, test_command, target_ref, log)
     cache = StateStore(ctx.store.root.parent / "baselines", now=ctx.now)
-    if cache.load_acceptance_baseline(build.key) is not None:
+    if load_reusable(cache, build.key) is not None:
         return
     lock = cache.lock_acceptance_baseline(build.key, blocking=False)
     if lock is None:
         return
     try:
         # A producer may have published between our initial read and reservation.
-        if cache.load_acceptance_baseline(build.key) is not None:
+        if load_reusable(cache, build.key) is not None:
             lock.close()
             return
         append_event(ctx.store, ctx.now(), None, "baseline-build",
@@ -209,7 +212,7 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
     cache, key = _baseline_cache(ctx, test_command, base_sha, excluded)
     scope = sha256(json.dumps(_baseline_identity(ctx, test_command, base_sha), sort_keys=True).encode()).hexdigest()
     for candidate in [cache.root / f"{key}.json", *sorted(cache.root.glob("*.json"))]:
-        saved = cache.load_acceptance_baseline(candidate.stem)
+        saved = load_reusable(cache, candidate.stem)
         if saved is None or not {"collected_ids", "failing_ids", "excluded"} <= saved.keys():
             continue
         if candidate.stem != key and saved.get("scope") != scope:
@@ -229,38 +232,8 @@ def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
 
 def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
     """Use this repository's latest successful capture, even after its cache expires."""
-    latest = None
-    for path in (ctx.store.root.parent / "baselines").glob("*.json"):
-        try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(saved, dict):
-                continue
-            report = path.with_suffix(".xml")
-            if "repository" in saved:
-                if saved["repository"] != str(ctx.repo_root.resolve()):
-                    continue
-            elif not report.is_file():
-                # Legacy entries lack repository tags; accept companion reports in this shared cache.
-                continue
-            if "duration_seconds" in saved:
-                duration = saved["duration_seconds"]
-            else:
-                junit = ET.parse(report).getroot()
-                suites = [junit] if junit.tag == "testsuite" else junit.findall("testsuite")
-                if junit.tag not in {"testsuite", "testsuites"} or not suites:
-                    continue
-                duration = sum(float(suite.attrib["time"]) for suite in suites)
-            created_at = datetime.fromisoformat(saved["created_at"])
-            if (isinstance(duration, bool) or not isinstance(duration, (int, float))
-                    or not isfinite(duration) or duration < 0 or created_at.tzinfo is None
-                    or created_at > ctx.now()):
-                continue
-            if latest is None or created_at > latest[0]:
-                latest = created_at, duration
-        except (OSError, ValueError, TypeError, KeyError, ET.ParseError):
-            continue
-    limit = 900 if latest is None else int(min(3600, max(900, 2 * latest[1])))
-    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest[1]:g}s"
+    limit, latest = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
+    reason = "default: no successful capture history" if latest is None else f"last successful capture={latest:g}s"
     if remaining is not None:
         limit = min(limit, remaining)
         reason += f", run remaining={remaining}s"
@@ -277,25 +250,39 @@ def _capture_acceptance_baseline(
         remaining = runner._remaining(n, ctx)
         if remaining <= 0:
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
+        # A capture (not a cache hit) is work on this base; a second capture of it repeats it.
+        try:
+            ctx.store.update_run(n, phase_work_id=f"baseline:{ctx.git.at(worktree).head_sha()}")
+        except GitError:
+            pass  # Without the base identity the capture is still measured, only not linked.
         result = runner._check(command, worktree, ctx.store.log_path(n),
                                _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
         _progress(n, ctx)
         return result
 
-    return _capture_baseline(
-        ctx, test_command, target_ref, log=ctx.store.log_path(n),
-        report=ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml", check=check,
-        prepare=lambda: _phase(n, ctx, "checking"),
-        wait=lambda acquire: _credited_wait(n, ctx, acquire),
-    )
+    def wait(acquire) -> None:
+        # Waiting for another run's build of the same baseline is its own phase.
+        _credited_wait(n, ctx, acquire, "baseline-wait")
+
+    previous = phase_identity(ctx.store.get_run(n))
+    try:
+        return _capture_baseline(
+            ctx, test_command, target_ref, log=ctx.store.log_path(n),
+            report=ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml", check=check,
+            prepare=lambda: _phase(n, ctx, "baseline"), wait=wait,
+        )
+    finally:
+        # The capture ends here: close it and give back the phase (and work) it interrupted.
+        restore_phase(n, ctx, previous)
 
 
 def _capture_baseline(
     ctx: RunContext, test_command: str | None, target_ref: str, *, log: Path, report: Path,
     check: Callable[[str, Path], CheckResult], prepare: Callable[[], None],
     wait: Callable[[Callable[[], object]], None], required_ids: frozenset[str] | None = None,
-    build: BaselineBuild | None = None, lock: IO[str] | None = None,
+    build: BaselineBuild | None = None, lock: IO[str] | None = None, record_timeouts: bool = True,
 ) -> AcceptanceBaseline | None:
     """Share capture, safety validation and cache identity across runner and premerge."""
     command = _pytest_command(test_command) if test_command else None
@@ -309,16 +296,20 @@ def _capture_baseline(
     cached_ids = cache.root / f"{key}.json"
 
     def save_baseline(node_ids: tuple[str, ...], collected_ids: tuple[str, ...],
-                      failing_ids: tuple[str, ...], duration_seconds: float | None = None) -> None:
+                      failing_ids: tuple[str, ...], duration_seconds: float | None = None,
+                      exit_code: int | None = None, timed_out: bool = False) -> None:
         saved = {
             "node_ids": node_ids, "collected_ids": collected_ids, "failing_ids": failing_ids,
-            "excluded": excluded,
-            "scope": build.scope,
-            "created_at": ctx.now().isoformat(),
+            "excluded": excluded, "scope": build.scope, "created_at": ctx.now().isoformat(),
+            # Tags for `fa orch facts` and the capture limit; the slug is omitted when unknown.
+            **({"repo": ctx.config.repo} if ctx.config.repo else {}),
+            "repository": str(ctx.repo_root.resolve()), "base_sha": base_sha, "exit_code": exit_code,
+            "timed_out": timed_out, **({} if duration_seconds is None else {"duration_seconds": duration_seconds}),
         }
-        if duration_seconds is not None:
-            saved.update(repository=str(ctx.repo_root.resolve()), duration_seconds=duration_seconds)
-        cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
+        if timed_out:
+            record_timeout(cache, cached_ids, saved)  # Partial ids; never reused (load_reusable).
+        else:
+            cache._atomic_write(cached_ids, json.dumps(saved) + "\n")
 
     prepare()
     if lock is None:
@@ -333,7 +324,7 @@ def _capture_baseline(
     else:
         ownership = nullcontext(lock)
     with ownership:
-        saved = cache.load_acceptance_baseline(key)
+        saved = load_reusable(cache, key)
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
@@ -377,7 +368,7 @@ def _capture_baseline(
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.
                 collected = None
-                cacheable = False
+                cacheable, collected_ids = False, ()
                 try:
                     with log.open(encoding="utf-8", errors="replace") as stream:
                         stream.seek(offset)
@@ -430,7 +421,9 @@ def _capture_baseline(
                     else:
                         report.unlink(missing_ok=True)
                 if cacheable:
-                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds)
+                    save_baseline(node_ids, collected_ids, failing_ids, duration_seconds, result.exit_code)
+                elif result.timed_out and record_timeouts:
+                    save_baseline(node_ids, collected_ids, (), duration_seconds, result.exit_code, timed_out=True)
                 _append(log, f"Acceptance baseline count={len(node_ids)}, exit_code={result.exit_code}, timed_out={result.timed_out}")
                 if not cacheable:
                     raise AttemptFailure(
@@ -442,19 +435,160 @@ def _capture_baseline(
                 ctx.git.remove_worktree(worktree)
 
 
-if __name__ == "__main__":
-    from datetime import UTC, datetime
-    from types import SimpleNamespace
-    from foragent.config import Config
-    from foragent.git import GitRepo
-    from foragent import capacity
+# Written into a throwaway checkout of the new base. It prints nothing, so the
+# configured command's terminal flags (-q, verbosity_test_cases, -p no:terminal)
+# cannot change the listing; the listing path is part of the source, not the environment.
+COLLECT_PLUGIN = """\
+import json
 
-    request = json.loads(sys.argv[1])
-    capacity.machine_root = lambda: Path(request["machine_root"])
-    root = Path(request["repo_root"])
-    context = SimpleNamespace(
-        repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
-        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"]),
-        now=lambda: datetime.now(UTC),
-    )
-    _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(sys.argv[2]), "a"))
+_ids, _errors = [], 0
+
+
+def pytest_collectreport(report):
+    global _errors
+    if report.failed:  # A collection error; an importorskip skip is not one.
+        _errors += 1
+
+
+def pytest_collection_finish(session):
+    _ids[:] = [item.nodeid for item in session.items]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    with open({listing!r}, "w", encoding="utf-8") as stream:
+        json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
+"""
+def _with_python_path(command: str, directory: str) -> str:
+    """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
+
+    Inline assignments win over outer ones, so the directory joins every
+    PYTHONPATH assignment before the command and right after an ``env``
+    launcher; without one it is added in front. Assignments keep NAME=
+    unquoted (a quoted 'NAME=v' is run as a command, exit 127).
+    """
+    words = shlex.split(command)
+
+    def assignment(word: str) -> bool:
+        return re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", word, re.S) is not None
+
+    # Positions of the leading assignments and of those right after each `env`.
+    positions: list[int] = []
+    index = 0
+    while True:
+        while index < len(words) and assignment(words[index]):
+            positions.append(index)
+            index += 1
+        if index < len(words) and Path(words[index]).name == "env":
+            index += 1
+            continue
+        break
+    joined = False
+    for position in positions:
+        name, value = words[position].split("=", 1)
+        if name == "PYTHONPATH":
+            words[position] = "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, value]))
+            joined = True
+    if not joined:
+        words.insert(0, "PYTHONPATH=" + os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")])))
+        positions = [0, *(position + 1 for position in positions)]
+    rendered = []
+    for position, word in enumerate(words):
+        if position in positions:
+            name, value = word.split("=", 1)
+            rendered.append(f"{name}={shlex.quote(value)}")
+        else:
+            rendered.append(shlex.quote(word))
+    return " ".join(rendered)
+
+
+def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
+                          sha: str) -> tuple[set[str], set[str]]:
+    """(owned, missing) ids of ``previous`` on base ``sha``, from one exact collection (#123).
+
+    One ``--collect-only`` over the acceptance directory of a checkout of
+    ``sha`` (with its exclusions) lists the exact collected node ids; an id is
+    missing only when it is not in that list. It always runs, also when every
+    id is owned by an open issue, so a broken collection still stops the run.
+    No tests collected (exit 5) or no acceptance directory means nothing is
+    collected. A collection error, another exit, a missing listing or a
+    timeout raises AttemptFailure. Runs locally with the capture time limit,
+    the run budget and a machine test slot.
+
+    The listing plugin is a module with a private random name
+    (``_foragent_nodeids_<hex>``, never a test or project module name) in a
+    temporary directory outside the checkout. Only the collection subprocess
+    gets that directory, through PYTHONPATH, and loads it with ``-p``; nothing
+    is added to the project's tree or import path. Like a capture, a
+    collection that modified tracked files raises AttemptFailure.
+    """
+    from foragent import runner
+
+    log = ctx.store.log_path(n)
+    excluded = _baseline_exclusions(ctx, sha, log)
+    owned = {node for node in previous.node_ids if node.split("::", 1)[0] in excluded}
+    selectable = set(previous.node_ids) - owned
+    acceptance_dir = ctx.config.acceptance_dir
+    with tempfile.TemporaryDirectory(prefix="foragent-protected-") as directory:
+        worktree = Path(directory) / "worktree"
+        listing = Path(directory) / "collected.json"
+        source = COLLECT_PLUGIN.format(listing=str(listing))
+        ctx.git.add_detached_worktree(worktree, sha)
+        try:
+            if not (worktree / acceptance_dir).is_dir():
+                return owned, selectable
+            remaining = runner._remaining(n, ctx)
+            if remaining <= 0:
+                raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
+            plugins = Path(directory) / "plugins"
+            plugins.mkdir()
+            plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
+            (plugins / f"{plugin}.py").write_text(source, encoding="utf-8")
+            selection = f"{previous.command} {shlex.quote(acceptance_dir)}"
+            selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+            command = _with_python_path(f"{selection} --collect-only -p {plugin}", str(plugins))
+            result = runner._check(command, worktree, log, _baseline_capture_limit(ctx, log, remaining),
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            _progress(n, ctx)
+            # Like a capture: a collection that changed tracked files proves nothing.
+            _validate_baseline_checkout(ctx.git.at(worktree), sha)
+            try:
+                found = json.loads(listing.read_text(encoding="utf-8"))
+                ids, errors, rootdir = list(found["ids"]), int(found["errors"]), Path(found["rootdir"])
+            except (OSError, ValueError, KeyError, TypeError):
+                ids, errors, rootdir = None, None, None
+            if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
+                raise AttemptFailure(
+                    f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
+                    f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
+                    f"collection_errors={'unknown' if errors is None else errors})")
+            # pytest's node ids are relative to its rootdir; baseline ids to the repository root.
+            prefix = rootdir.resolve().relative_to(worktree.resolve()).as_posix()
+            collected = {node if prefix == "." else f"{prefix}/{node}" for node in ids}
+        finally:
+            ctx.git.remove_worktree(worktree)
+    return owned, selectable - collected
+
+
+def log_dropped_ids(log: Path, previous: AcceptanceBaseline, protected: tuple[str, ...], owned: set[str],
+                    missing: set[str], new: AcceptanceBaseline | None, ci: bool) -> None:
+    """One audit line per id protected before a base sync and not after it (#123)."""
+    excluded = set(new.excluded) if new else set()
+    for node in previous.node_ids:
+        if node in protected:
+            continue
+        if node in owned or node.split("::", 1)[0] in excluded:
+            reason = "owned by an open issue"
+        elif node in missing:
+            reason = "missing on the new base"
+        elif (not ci and new is not None and new.collected_ids is not None and node in new.collected_ids
+              and new.failing_ids is not None and node in new.failing_ids):
+            reason = "failing on the new base"
+        else:
+            reason = "no longer protected on the new base"
+        _append(log, f"Acceptance baseline dropped protected node id {node}: {reason}")
+
+
+if __name__ == "__main__":
+    from foragent.run_baseline_process import main
+
+    main(sys.argv)

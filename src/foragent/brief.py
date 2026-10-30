@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox
+from foragent import orch_inbox, orch_scorecard
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
@@ -51,6 +51,8 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "usage": store.usage(),
         "as_of": status["as_of"],
         "stale": status["stale"],
+        # The worst metric against recent days, from the same local scorecard as `fa orch scorecard`.
+        "scorecard_line": orch_scorecard.worst_line(orch_scorecard.collect(store), config.language),
         "next": next_step(config.language),
     }
 
@@ -106,7 +108,7 @@ def _to_see(status: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _team(store: StateStore, config: Config) -> list[dict[str, Any]]:
     used: dict[str, list[str]] = {}
-    for run in [*store.read_history(), *store.active_runs()]:
+    for run in [*store.read_history(), *(run for run in store.active_runs() if run.kind == "issue")]:
         names = used.setdefault(run.lane, [])
         names.extend(name for name in run.skills_used if name not in names)
     slugs = list(config.lanes)
@@ -173,6 +175,8 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
                                  percent=f"{window['used_percent']:g}")
                             for window in record.get("windows") or [])
         lines.append(text("brief_usage_item", language, executor=executor, windows=windows or none))
+    if brief.get("scorecard_line"):
+        lines.append(brief["scorecard_line"])
     step = next_step(language)
     lines.append(" ".join([step["question"], *(f"[{choice['label']}]" for choice in step["choices"])]))
     return "\n".join(lines)

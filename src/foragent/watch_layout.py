@@ -5,6 +5,7 @@ The visible groups live in foragent/watch_sections/<name>.py; this module only
 discovers them, stacks them by ORDER and keeps the helpers they share.
 """
 
+from dataclasses import replace
 from datetime import datetime
 import importlib
 from pathlib import Path
@@ -17,7 +18,7 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 
-# Only the pickaxe moves. One hit every four 0.3-second frames.
+# The lane-road pickaxe frames; the lane rows (#167) no longer animate, but foragent.watch keeps the name.
 PICK = ("  ⛏ ", " ⛏  ", "⛏✦  ", " ⛏  ")
 
 
@@ -28,7 +29,9 @@ def _has_work(row: dict[str, Any]) -> bool:
 
 # Run phases in which the runner waits on checks, CI, a merge or a review.
 # Waits inside them (merge.lock, a test slot) need no phase of their own.
-WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait"})
+WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-wait",
+                            "test-slot-wait", "baseline", "baseline-wait", "executor-wait",
+                            "merge-lock-wait"})
 
 
 def _activity(
@@ -80,26 +83,6 @@ def _activity(
     return "●"
 
 
-def _widths(width: int) -> tuple[bool, int, int, int, int]:
-    """Side-by-side flag, orchestrator, road, work-table and events widths."""
-    side_by_side = width >= 100
-    orchestrator_width = 28 if side_by_side else width
-    road_width = width - orchestrator_width - 2 if side_by_side else width
-    table_width = (width - 2) * 3 // 5 if side_by_side else width
-    events_width = width - table_width - 2 if side_by_side else width
-    return side_by_side, orchestrator_width, road_width, table_width, events_width
-
-
-def _split(status: dict[str, Any]) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]]]:
-    """Lanes with and without work, numbered by their position among all lanes."""
-    from foragent import watch
-
-    rows = list(status["lanes"].values())
-    busy = [(index, row) for index, row in enumerate(rows, 1) if watch._has_work(row)]
-    idle = [(index, row) for index, row in enumerate(rows, 1) if not watch._has_work(row)]
-    return busy, idle
-
-
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Running runs by lane in start order; ties in start time break by issue number."""
     clones: dict[str, list[dict[str, Any]]] = {}
@@ -107,33 +90,6 @@ def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
-
-
-def _lane_name(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> str:
-    """The plain lane name; workers are told apart by their own road rows."""
-    return row["lane_display"]
-
-
-def _worker_rows(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[tuple[str, list[int]]]:
-    """One road row per running worker, named '<lane> N' in start order when there are several."""
-    workers = clones.get(row["slug"], [])
-    if len(workers) < 2:
-        return [(row["lane_display"], _lane_issues(row, clones))]
-    numbers = [run["number"] for run in workers]
-    # A blocked or waiting issue that is not a running worker keeps today's place on the first row.
-    extra = [number for number in _lane_issues(row, clones) if number not in numbers]
-    return [(f"{row['lane_display']} {position}", (extra if position == 1 else []) + [number])
-            for position, number in enumerate(numbers, 1)]
-
-
-def _lane_issues(row: dict[str, Any], clones: dict[str, list[dict[str, Any]]]) -> list[int]:
-    """The lane's shown issues: its current issue first, or its workers in start order when it has several."""
-    current = row["issue"] if row["state"] in {"working", "blocked", "waiting-human"} else None
-    workers = [run["number"] for run in clones.get(row["slug"], [])]
-    if len(workers) > 1:
-        return workers + ([current] if current is not None and current not in workers else [])
-    numbers = [current] if current is not None else []
-    return numbers + [number for number in workers if number not in numbers]
 
 
 def _sections() -> list[ModuleType]:
@@ -152,37 +108,208 @@ def _sections() -> list[ModuleType]:
     return [found[order] for order in sorted(found)]
 
 
+# A terminal's usual height; a plain frame keeps to it.
+SCREEN_ROWS = 24
+
+
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
-    selected: str | None, now: datetime, layout: dict[str, Any] | None = None,
+    selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = SCREEN_ROWS,
+    state: dict[str, Any] | None = None,
 ) -> list[Line]:
-    """Stack the sections by ORDER with one blank line between non-empty ones."""
+    """Stack the sections by ORDER with one blank line between non-empty ones.
+
+    Within ``height`` rows, sections marked KEEP (header, lane rows, details and
+    footer) always stay; the others give way from the bottom up. A section
+    marked STAYS (the fireworks band while it plays) stays too and is moved up into
+    the first screen when the KEEP sections push it below. ``state`` is the live view's
+    memory across frames (None for a stateless frame).
+    """
     from foragent import watch
 
-    hits: list[tuple[int, int, int, int, Any]] = []
-    frame: list[Line] = []
-    for section in _sections():
-        gap = bool(frame) and getattr(section, "GAP", True)
-        lines = section.render(
-            snapshot, config, repo_root, tick=tick, width=width, selected=selected, now=now,
-            layout=layout, top=len(frame) + gap, hits=hits,
-        )
-        if lines:
-            frame += [[]] * gap + list(lines)
+    from foragent.watch_sections import settings as settings_window
+
+    # The open settings window (#173) replaces everything between the header and the help line.
+    sections = settings_window.shown_sections(_sections(), state)
+    Hit = tuple[int, int, int, int, Any]
+    Mark = tuple[int, int, str | None]  # (row, issue number, its lane; None when not foldable)
+    rendered: list[tuple[ModuleType, list[Line], list[Hit], list[Mark]]] = []
+
+    def draw(section: ModuleType, *, drawn: Config | None = None,
+             **extra: Any) -> tuple[ModuleType, list[Line], list[Hit], list[Mark]]:
+        # A section draws from row 0; its click areas and issue rows move with it below.
+        own: list[Hit] = []
+        marks: list[Mark] = []
+        lines = section.render(snapshot, drawn or config, repo_root, tick=tick, width=width, selected=selected,
+                               now=now, layout=layout, top=0, hits=own, marks=marks, rows=True,
+                               height=height, state=state, **extra)
+        return section, list(lines), own, marks
+
+    for section in sections:
+        rendered.append(draw(section))
+    # From its SIDE width on, a section (the orchestrator box) stands to the right
+    # of the sections between the lane rows and itself.
+    side = next((index for index, (section, *_) in enumerate(rendered) if getattr(section, "SIDE", None)), None)
+    wide = side is not None and width >= rendered[side][0].SIDE
+    rows_end = max((index for index, (section, *_) in enumerate(rendered)
+                    if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
+
+    stays: list[tuple[int, int]] = []  # Row spans of the STAYS sections in the last assembly.
+
+    def assemble() -> tuple[list[Line], list[Hit], list[Mark]]:
+        hits: list[Hit] = []
+        marks: list[Mark] = []
+        frame: list[Line] = []
+        stays.clear()
+        mark = None  # Where the sections beside the SIDE section begin.
+        joined = False  # The previous section asked the next one to follow it directly.
+        for index, (section, lines, own, rows) in enumerate(rendered):
+            if not lines:
+                continue
+            gap = bool(frame) and getattr(section, "GAP", True) and not joined
+            joined = not getattr(section, "GAP_AFTER", True)
+            if wide and index == side and mark is not None and mark < len(frame):
+                left_width = width - max(watch._cells("".join(value for value, _ in line)) for line in lines) - 2
+                left = frame[mark:]
+                del frame[mark:]
+                frame += watch._beside(left, lines, left_width)
+                hits += [(x0 + left_width + 2, y0 + mark, x1 + left_width + 2, y1 + mark, target)
+                         for x0, y0, x1, y1, target in own]
+                marks += [(y + mark, number, lane) for y, number, lane in rows]
+                continue
+            top = len(frame) + gap
+            if wide and mark is None and rows_end < index < side:
+                mark = top
+            frame += [[]] * gap + lines
+            if section is settings_window and state is not None and "settings_focus_rel" in state:
+                first, last = state["settings_focus_rel"]
+                state["settings_focus"] = (top + first, top + last)
+            hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
+            marks += [(y + top, number, lane) for y, number, lane in rows]
+            if getattr(section, "STAYS", False):
+                stays.append((top, top + len(lines)))
+        return frame, hits, marks
+
+    if settings_window.is_open(state):
+        # The open window: the header in its one-line form (no big squirrel), and the window
+        # within the screen rows the header and the help line leave, so neither scrolls away.
+        calm_config = replace(config, animation=False)
+        rendered = [draw(section, drawn=calm_config) if section.__name__.endswith(".squirrels") else item
+                    for item in rendered for section in item[:1]]
+        screen = state.get("height")
+        if screen is not None and screen >= watch.MIN_SCREEN:
+            index = next(index for index, (section, *_) in enumerate(rendered) if section is settings_window)
+            others = len(assemble()[0]) - len(rendered[index][1])
+            rendered[index] = draw(settings_window, room=max(1, screen - others))
+    frame, hits, marks = assemble()
+    if height is not None and len(frame) > height:
+        # A folded lane's last finished row and toggle give way first.
+        for index, (section, *_) in enumerate(rendered):
+            if getattr(section, "TIGHT", False):
+                rendered[index] = draw(section, tight=True)
+        frame, hits, marks = assemble()
+    if height is not None and len(frame) > height:
+        # Lane rows win: the other sections give way from the bottom up.
+        order = reversed(range(len(rendered)))
+        for index in order:
+            section, lines, *_ = rendered[index]
+            if lines and not (getattr(section, "KEEP", False) or getattr(section, "STAYS", False)):
+                rendered[index] = (section, [], [], [])
+                if len(assemble()[0]) <= height:
+                    break
+        # The footer becomes one short line of the key letters.
+        for index, (section, *_) in enumerate(rendered):
+            if section.__name__.endswith(".help"):
+                rendered[index] = draw(section, short=True)
+        frame, hits, marks = assemble()
+    if height is not None:
+        # The live view shows the first height - 1 rows above the footer. A STAYS
+        # section pushed below them by the KEEP sections moves up to just above the
+        # footer, so it is on screen when the view opens; the rows it passes move down.
+        for start, end in stays:
+            size, target = end - start, height - 1 - (end - start)
+            if end <= height - 1 or target < 0:
+                continue
+            frame[target:end] = frame[start:end] + frame[target:start]
+            hits = [(x0, y0 + size, x1, y1 + size, item) if target <= y0 < start else (x0, y0, x1, y1, item)
+                    for x0, y0, x1, y1, item in hits]
+            marks = [(y + size, number, lane) if target <= y < start else (y, number, lane)
+                     for y, number, lane in marks]
     if layout is not None:
         layout["hits"] = hits
+        layout["offset"] = 0  # Hits are in F rows; a height render shifts them (``_window``).
+    if state is not None:
+        # Interaction data comes once from the final rows, never from a section draw that a
+        # later trim replaced: the frame's size, its issue rows for the highlight, and the
+        # lane of each foldable row (completion rows have none, so f does nothing there).
+        state["length"] = len(frame)
+        state["rows"] = sorted({(y, number) for y, number, _ in marks})
+        # Lanes belong to rows, not issue numbers: the same issue can show as a lane row
+        # (foldable) and again as a completion row (not foldable).
+        state["row_lanes"] = {y: lane for y, _, lane in marks if lane is not None}
+        state["lanes"] = list(snapshot.status.get("lanes", {}))
     return [watch._fit(list(line), width) for line in frame]
+
+
+def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width: int, language: str,
+            layout: dict[str, Any] | None = None) -> list[Line]:
+    """The rows a screen of ``height`` shows: one slice rule for render_frame and the live view.
+
+    ``frame`` is F, the heightless 24-row-trimmed frame (its footer row is an ordinary
+    row). When F fits, it is returned as it is. When it is taller, the screen shows
+    F[scroll : scroll + height - 1] and a position line with N = len(F); under
+    MIN_SCREEN (3) rows it is F as it is, as with no height. ``scroll``
+    stays within 0..len(F) - (height - 1), and ``layout['hits']`` moves to screen rows,
+    clipped to the visible rows.
+    """
+    from foragent import watch
+
+    state = {} if state is None else state
+    state.update(height=height, length=len(frame))
+    if height < watch.MIN_SCREEN or len(frame) <= height:
+        # F fits, or the screen is too short to scroll (under 3 rows counts as no height).
+        state["scroll"] = 0
+        return frame
+    rows = height - 1
+    top = state.get("scroll", 0)
+    focus = state.get("settings_focus") if state.get("settings") else None
+    if focus is not None:
+        # The open settings window ignores scroll keys: follow its selected row and the
+        # message, prompt and keys below it, keeping the row itself when all do not fit.
+        first, last = focus
+        top = min(first, max(top, last - rows))
+    top = state["scroll"] = max(0, min(top, watch.scroll_limit(state)))
+    if layout is not None:
+        layout["offset"] = top  # Screen row + offset = F row.
+        layout["hits"] = [(x0, max(0, y0 - top), x1, min(rows, y1 - top), target)
+                          for x0, y0, x1, y1, target in layout.get("hits", [])
+                          if max(0, y0 - top) < min(rows, y1 - top)]
+    position = watch.text("acorns_position", language, first=top + 1, last=min(len(frame), top + rows),
+                          total=len(frame))
+    line = watch._fit(watch._line(f"{position} · {watch.text('acorns_select', language)}", "dim"), width)
+    return frame[top:top + rows] + [line]
 
 
 def render_frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int = 0, width: int = 120,
     selected: str | None = None, now: datetime | None = None,
-    state: dict[str, Any] | None = None, layout: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None, layout: dict[str, Any] | None = None, height: int | None = None,
 ) -> str:
-    """A single plain-text frame, sharing the live view's layout and data."""
+    """A single plain-text frame, sharing the live view's layout and data.
+
+    With ``height``, only the rows a screen that tall shows (``_window``): F, the
+    heightless 24-row-trimmed frame, sliced at ``state['scroll']`` with a position
+    line when F is taller than the screen; hit boxes then use screen rows.
+    """
     from foragent import watch
 
-    return "\n".join("".join(value for value, style in line).rstrip() for line in watch._frame(
-        snapshot, config, repo_root, tick=tick, width=max(40, width), selected=selected,
+    if height is not None and state is not None:
+        state["height"] = height  # The settings window fits itself to this screen.
+    frame = watch._frame(
+        snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
-    ))
+        **({} if state is None else {"state": state}),
+    )
+    if height is not None:
+        frame = watch._window(frame, state, height, max(1, width), config.language, layout)
+    return "\n".join("".join(value for value, style in line).rstrip() for line in frame)

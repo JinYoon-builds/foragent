@@ -1,11 +1,11 @@
-"""Per-issue prerequisite reads, blocker escalation and batch reconciliation."""
+"""Per-issue prerequisite reads, blocker escalation, closed-issue catch-up and batch reconciliation."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from foragent import scheduler
+from foragent import orch_park, scheduler
 from foragent.records import load_record
 from foragent.state import Approval
 from foragent.tracker import Dependency, Issue, LabelEvent
@@ -121,9 +121,18 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
         )
     ]
     latest = max(comments, key=lambda c: (scheduler.datetime.fromisoformat(c.created_at), c.id), default=None)
-    if latest is None or ctx.now() - scheduler.datetime.fromisoformat(latest.created_at) <= scheduler.timedelta(
-        minutes=ctx.config.orchestrator_timeout_minutes,
-    ):
+    if latest is None:
+        return issue
+    # The runner's blocker comment can reach the local record after its run ends,
+    # so the clock starts at the later of the newest blocker and the newest run end.
+    since = max([scheduler.datetime.fromisoformat(latest.created_at)] + [
+        scheduler.datetime.fromisoformat(ended)
+        for (number, _), ended in ctx.store.finish_times().items() if number == issue.number
+    ])
+    if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
+        return issue
+    # A park newer than the clock's start is the orchestrator's response to these blockers.
+    if (parked := orch_park.parked_at(ctx.store, issue.number)) is not None and parked > since:
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")
@@ -140,6 +149,10 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
 
 
 def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
+    # Housekeeping first, on every tick: issues closed outside the gate since the
+    # last tick (one light read) reach this reconciliation and the board sync.
+    if (observe := getattr(ctx.tracker, "observe_closed_issues", None)) is not None:
+        observe(observed_at=ctx.now())
     issues = {issue.number: issue for issue in scheduler.local_issue_models(ctx.store) if issue.state == "open"}
     parents: set[int] = set()
     rows = ctx.store.local_issues()

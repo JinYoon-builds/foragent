@@ -22,11 +22,34 @@ def add(commands) -> None:
     fixed_skills.add_argument("name")
     fixed_skills.add_argument("ids", nargs="*", help="Skill IDs; omit to clear the lane's fixed skills")
     fixed_skills.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    talk = lane_actions.add_parser("talk", help="Open an issue's live log or session; optionally send a message")
+    talk.add_argument("number", type=int)
+    talk.add_argument("--message", help="Message for the worker (running) or first prompt (finished or blocked)")
+    talk.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    dreamed = lane_actions.add_parser("dreamed", help="Record that a lane's memory dream is done")
+    dreamed.add_argument("name")
+    dreamed.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action == "talk":
+        from foragent import lanes
+        from foragent.commands import repo_store
+
+        config, _, store = repo_store(root)
+        try:
+            print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root))
+        except lanes.LaneError as exc:
+            if getattr(exc, "stdout", ""):  # A message still delivered goes to stdout; the failure to stderr.
+                print(exc.stdout)
+            raise
+        return 0
+    if args.action == "dreamed":
+        config = cli.load_config(root)
+        store = cli.StateStore.for_repo(config.repo or cli.GitRepo(root).remote_slug())
+        return cli.orch_dream.dreamed_command(store, config, args.name)
     if args.action == "skills":
         lane = cli.set_lane_skills(root, args.name, args.ids)
         print(f"Updated lane:{args.name} skills: {', '.join(lane['skills']) or '(none)'}")

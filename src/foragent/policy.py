@@ -59,6 +59,7 @@ def merge_decision(*, changed_paths: list[str], issue_labels, config: Config,
     if RISK_HIGH in issue_labels:
         return Decision("hold", Reason.RISK_HIGH, "This issue is marked risk:high; a human must review this PR.")
     if NEEDS_HUMAN in issue_labels:
+        # A run waiting for a human decision never merges automatically (#459).
         return Decision("hold", Reason.RISK_HIGH, "This issue waits for a human decision; a human must review this PR.")
     mode = review_mode_for(changed_paths, config)
     return Decision("merge") if mode == "fast" else hold_mode(mode)

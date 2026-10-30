@@ -117,6 +117,9 @@ def run_case(git_history, tmp_path, monkeypatch):
                 source, destination = branch.split(":", 1)
                 sha = git_command(root, "rev-parse", source)
                 git_command(git_history.origin, "fetch", str(root), f"{sha}:{destination}")
+                # Like GitHub, a push to a PR's head branch moves the PR head (review-only refresh, #712).
+                if destination.startswith("refs/heads/") and (pr := tracker.find_pr(destination[11:])):
+                    tracker.set_pr_head_sha(pr, sha)
             else:
                 git_command(git_history.origin, "fetch", str(root), f"+refs/heads/{branch}:refs/heads/{branch}")
                 pr = tracker.find_pr(branch) or max(tracker.issues) + 1
@@ -258,6 +261,17 @@ def expected_review_rules(acceptance_dir):
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
+        "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
+        "conflict, not a defect: report it as one line "
+        "`SPEC-CONFLICT: <locked test path:line> <what the test requires>; <what the finding wants>` "
+        "instead of a finding.\n"
+        "A test that asserts nothing or proves nothing is a weakened check. Judge each new or changed "
+        "test by the break-it rule: Make the code return a wrong value, skip an effect, or do the effect "
+        "twice. If the test still passes, it proves nothing.\n"
+        "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
+        "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
+        "and are never a reason to FAIL.\n"
         "For each finding, say whether it is one instance of a broader defect class "
         "and where else to look in the change."
     )
