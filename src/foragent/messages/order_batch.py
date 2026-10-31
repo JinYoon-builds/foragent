@@ -13,6 +13,11 @@ MESSAGES = {
         "batch_rule_line_missing": "{path} has no line {line!r} to replace; check the current rule and queue the rule note again",
         "batch_rules_missing": "{path} does not exist; record the decision only and drop the rule note",
         "batch_wrong_branch": "fa order flush runs only on the base branch {branch}; nothing was changed",
+        "batch_queue_changed": "the waiting queue changed while flush prepared a batch; nothing was written. Run flush again",
+        "batch_flushed_unapproved": "{id}: the base changed its files during the rebase, so it was published without approval; check it and approve again",
+        "batch_path_changed": "someone changed {paths} after batch {id} was prepared, so nothing was written; "
+                              "make each file hold its \"before\" or \"batch\" text from fa order pending --json "
+                              "(keeping your edit for later), then run flush again",
         "batch_lanes_publish_now": "an order that adds lanes is not batched; publish it now, without --defer",
         "batch_lanes_published_now": "Published now instead of waiting for {boundary}: this order adds lanes, "
                                      "and orders that add lanes are never batched.",
@@ -48,6 +53,11 @@ MESSAGES = {
         "batch_rule_line_missing": "{path}에 바꿀 줄 {line!r}이(가) 없어요. 현재 규칙을 확인하고 규칙 기록을 다시 맡겨 주세요",
         "batch_rules_missing": "{path}이(가) 없어요. 결정만 기록하고 규칙 기록은 빼 주세요",
         "batch_wrong_branch": "fa order flush는 base 브랜치 {branch}에서만 돌아요. 아무것도 바꾸지 않았어요",
+        "batch_queue_changed": "flush가 일괄 처리를 준비하는 사이 대기열이 바뀌어서 아무것도 쓰지 않았어요. flush를 다시 돌려 주세요",
+        "batch_flushed_unapproved": "{id}: rebase 중 base가 이 주문의 파일을 바꿔서 승인 없이 올렸어요. 확인하고 다시 승인해 주세요",
+        "batch_path_changed": "일괄 처리 {id}를 준비한 뒤 누군가 {paths}를 바꿔서 아무것도 쓰지 않았어요. "
+                              "fa order pending --json의 \"before\" 또는 \"batch\" 글로 파일을 맞추고(바꾼 내용은 따로 두세요) "
+                              "flush를 다시 돌려 주세요",
         "batch_lanes_publish_now": "레인을 더하는 주문은 모아 올리지 않아요. --defer 없이 지금 발행해 주세요",
         "batch_lanes_published_now": "{boundary}을(를) 기다리지 않고 지금 발행했어요. 이 주문은 레인을 더하고, "
                                      "레인을 더하는 주문은 모아 올리지 않아요.",

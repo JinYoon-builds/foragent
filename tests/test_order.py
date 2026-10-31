@@ -53,7 +53,7 @@ class PublishingGit:
         self.serial = 0  # like real shas, a commit id is never reused, even after a failed commit
         self.messages = {}
         self.pushed = 0  # history up to this index is on origin/<base>
-        self.remote_moved = False  # set by a test: origin/<base> gained a commit we do not have
+        self.remote_moved = False  # set by a test: origin/<base> gained a commit (or {path: merged text})
 
     def _new_sha(self):
         self.serial += 1
@@ -131,12 +131,17 @@ class PublishingGit:
         """A moved remote base gives every unpushed commit a new sha, as a real rebase does."""
         if not self.remote_moved:
             return False
+        upstream = self.remote_moved if isinstance(self.remote_moved, dict) else {}
         self.remote_moved = False
         self.events.append(("rebase", branch))
         for index in range(self.pushed + 1, len(self.history)):
             old, tree = self.history[index]
-            self.history[index] = (self._new_sha(), tree)
+            # A clean merge: upstream's edits to these paths land in every replayed commit.
+            self.history[index] = (self._new_sha(), {**tree, **upstream})
             self.messages[self.history[index][0]] = self.messages.pop(old, "")
+        for path, content in upstream.items():
+            (self.root / path).write_text(content)
+        self.saved.update(upstream)
         return True
 
     def unrelated_commit(self, path, text):
@@ -2178,10 +2183,11 @@ def test_batch_redeferred_during_its_flush_in_the_same_second_stays_waiting(publ
     monkeypatch.setattr(tracker, "create_issue", redefer_once)
     _flush(publishing)
     rows = order_batch.pending(publishing[0])["orders"]
-    assert [(row["title"], row["status"]) for row in rows] == [("Login MVP v2", "waiting")]
+    # The batch member keeps its row (its committed files got their issues); the new version waits.
+    assert [(row["title"], row["status"]) for row in rows] == [("Login MVP", "published"), ("Login MVP v2", "waiting")]
     monkeypatch.setattr(tracker, "create_issue", original)
     _flush(publishing)
-    assert [row["status"] for row in order_batch.pending(publishing[0])["orders"]] == ["published"]
+    assert [row["status"] for row in order_batch.pending(publishing[0])["orders"]] == ["published", "published"]
     assert any(issue.title == "Login MVP v2" for issue in tracker.list_issues())
 
 
@@ -2976,3 +2982,183 @@ def test_real_git_batch_commit_is_looked_up_only_since_the_remote_base(git_histo
     repo = GitRepo(git_history.origin)
     assert repo.batch_commit("Foragent batch b new-id", "main") == git_history.tip
     assert repo.batch_commit("Foragent batch b old-id", "main") is None, "a pushed batch is not pending"
+
+
+def _other_order(plan):
+    other = deepcopy(plan)
+    other["id"], other["title"] = "2026-10-31-other", "Other"
+    return other
+
+
+@pytest.mark.parametrize("stop", ["after_commit_checkpoint", "after_first_order"])
+def test_batch_interrupted_between_checkpoints_publishes_every_member_once(publishing, plan, monkeypatch, stop):
+    from foragent import order_batch, order_batch_flush
+
+    root, tracker, events = publishing[0], publishing[2], publishing[4]
+    _batch(publishing, plan)
+    _batch(publishing, _other_order(plan))
+    if stop == "after_commit_checkpoint":  # the commit's sha is saved; nothing after it is
+        set_batch = order_batch_flush._set_batch
+        monkeypatch.setattr(order_batch_flush, "_set_batch",
+                            lambda root, **fields: (set_batch(root, **fields), "commit" in fields and _die()))
+    else:  # the first order's issues are created; the second order's are not
+        mark = order_batch_flush._mark
+        monkeypatch.setattr(order_batch_flush, "_mark", lambda root, kind, revisions, **fields: (
+            mark(root, kind, revisions, **fields), kind == "orders" and _die()))
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    _flush(publishing)
+    titles = sorted(issue.title for issue in tracker.list_issues() if issue.title in ("Login MVP", "Other"))
+    assert titles == ["Login MVP", "Other"], "each member's issues exactly once"
+    assert [event[0] for event in events].count("commit") == 1
+    state = order_batch.pending(root)
+    assert state["batch"] is None and {row["status"] for row in state["orders"]} == {"published"}
+
+
+def test_batch_redeferred_member_of_a_pending_batch_is_kept_and_published(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    root, tracker, git = publishing[0], publishing[2], publishing[3]
+    _batch(publishing, plan)
+    push = git.push_base
+    _push_fails(git, monkeypatch)
+    with pytest.raises(GitError):
+        _flush(publishing)
+    changed = deepcopy(plan)
+    changed["title"] = "Login MVP v2"
+    _batch(publishing, changed)  # a newer version, deferred while the first one's push failed
+    assert [row["title"] for row in order_batch.pending(root)["orders"]] == ["Login MVP", "Login MVP v2"]
+    monkeypatch.setattr(git, "push_base", push)
+    _flush(publishing)
+    rows = order_batch.pending(root)["orders"]
+    assert [(row["title"], row["status"]) for row in rows] == [("Login MVP", "published"), ("Login MVP v2", "published")]
+    assert all(row.get("parent") is not None for row in rows), "the committed version got its issues too"
+    assert any(issue.title == "Login MVP v2" for issue in tracker.list_issues())
+
+
+@pytest.mark.parametrize("written", [True, False])
+def test_batch_retry_never_overwrites_a_note_file_changed_meanwhile(publishing, monkeypatch, written):
+    from foragent import order_batch, order_batch_flush
+
+    root, git, events = _ideas_case(publishing), publishing[3], publishing[4]
+    if written:  # the batch wrote its text, then its commit failed
+        monkeypatch.setattr(git, "commit_paths", _die)
+    else:  # the process died before the batch wrote anything
+        monkeypatch.setattr(order_batch_flush, "_write_notes", _die)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    ideas = root / "docs/ideas.md"
+    ideas.write_text(ideas.read_text() + "\nAnother session's idea.\n")  # edited during the interruption
+    edited = ideas.read_bytes()
+    with pytest.raises(order.PlanError, match="docs/ideas.md"):
+        _flush(publishing)
+    assert ideas.read_bytes() == edited, "someone else's text is never overwritten"
+    assert [event[0] for event in events] == []
+    files = order_batch.pending(root)["batch"]["files"]["docs/ideas.md"]
+    assert files["before"] == "# Ideas\nMine, never committed.\n"
+    assert files["batch"] == "# Ideas\nMine, never committed.\n\nIdea one.\n"
+    ideas.write_text(files["batch"])  # the person puts the batch's text back
+    _flush(publishing)
+    assert git.saved["docs/ideas.md"] == files["batch"] and order_batch.pending(root)["batch"] is None
+
+
+def test_batch_retry_never_overwrites_an_order_file_changed_meanwhile(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    root, git = publishing[0], publishing[3]
+    _batch(publishing, plan)
+    monkeypatch.setattr(git, "commit_paths", _die)  # the order's files are written, the commit fails
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    spec = root / f"docs/specs/{plan['id']}.md"
+    spec.write_text(spec.read_text() + "A note someone added meanwhile.\n")
+    edited = spec.read_bytes()
+    with pytest.raises(order.PlanError, match=f"docs/specs/{plan['id']}.md"):
+        _flush(publishing)
+    assert spec.read_bytes() == edited and publishing[2].issues == {}
+    spec.write_text(order_batch.pending(root)["batch"]["files"][f"docs/specs/{plan['id']}.md"]["batch"])
+    _flush(publishing)
+    assert {row["status"] for row in order_batch.pending(root)["orders"]} == {"published"}
+
+
+def test_batch_redeferred_while_the_batch_is_prepared_refuses_before_any_write(publishing, plan, monkeypatch):
+    from foragent import order_batch, order_batch_flush
+
+    root, events = publishing[0], publishing[4]
+    _batch(publishing, plan)
+    changed = deepcopy(plan)
+    changed["title"] = "Login MVP v2"
+    check = order_batch_flush.check_destinations
+
+    def redefer_once(*args):
+        # The members were read; another session re-defers before the batch is saved.
+        if len(order_batch.pending(root)["orders"]) == 1 and order_batch.pending(root)["orders"][0]["title"] == "Login MVP":
+            _batch(publishing, changed)
+        return check(*args)
+
+    monkeypatch.setattr(order_batch_flush, "check_destinations", redefer_once)
+    with pytest.raises(order.PlanError, match="queue changed"):
+        _flush(publishing)
+    assert events == [] and order_batch.pending(root)["batch"] is None
+    assert not (root / f"docs/specs/{plan['id']}.md").exists(), "nothing written"
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    _flush(publishing)
+    rows = order_batch.pending(root)["orders"]
+    assert [(row["title"], row["status"]) for row in rows] == [("Login MVP v2", "published")]
+    assert any(issue.title == "Login MVP v2" for issue in publishing[2].list_issues())
+
+
+def test_batch_rebase_that_changes_an_approved_test_publishes_it_unapproved(publishing, plan, monkeypatch):
+    from foragent import order_batch
+
+    root, tracker, git = publishing[0], publishing[2], publishing[3]
+    _batch(publishing, plan, approve=True)
+    push = git.push_base
+    _push_fails(git, monkeypatch)
+    with pytest.raises(GitError):
+        _flush(publishing)
+    monkeypatch.setattr(git, "push_base", push)
+    weakened = "def test_login():\n    pass\n"
+    git.remote_moved = {FILE: weakened}  # upstream edited the test; the rebase merged cleanly
+    result = _flush(publishing)
+    assert git.saved[FILE] == weakened
+    assert result["unapproved"] == [plan["id"]]
+    titles = {item["title"] for item in plan["issues"]}
+    children = [issue for issue in tracker.list_issues() if issue.title in titles]
+    assert children and not any("approved" in issue.labels for issue in children), "merged bytes are not approved"
+    assert {row["status"] for row in order_batch.pending(root)["orders"]} == {"published"}
+
+
+def test_batch_rebase_that_keeps_the_approved_bytes_keeps_the_approval(publishing, plan, monkeypatch):
+    root, tracker, git = publishing[0], publishing[2], publishing[3]
+    _batch(publishing, plan, approve=True)
+    push = git.push_base
+    _push_fails(git, monkeypatch)
+    with pytest.raises(GitError):
+        _flush(publishing)
+    monkeypatch.setattr(git, "push_base", push)
+    git.remote_moved = {"docs/other.md": "Someone else's file.\n"}
+    result = _flush(publishing)
+    assert result["unapproved"] == []
+    titles = {item["title"] for item in plan["issues"]}
+    assert all("approved" in issue.labels for issue in tracker.list_issues() if issue.title in titles)
+
+
+def test_batch_done_when_file_changed_by_the_base_refresh_is_refused(publishing, plan, monkeypatch):
+    root, git = publishing[0], publishing[3]
+    existing = "tests/acceptance/test_existing.py"
+    (root / "tests/acceptance").mkdir(parents=True, exist_ok=True)
+    (root / existing).write_text("def test_strong():\n    assert False\n")
+    plan["issues"][1]["done_when"] = [f"uv run pytest -q {existing}"]
+    _batch(publishing, plan, approve=True)
+    # The fetch brings an upstream edit of the approved test; checks must see it.
+    monkeypatch.setattr(git, "update_base", lambda branch: (root / existing).write_text("def test_strong():\n    pass\n"))
+    with pytest.raises(order.PlanError, match=f"changed since.*{existing}"):
+        _flush(publishing)
+    assert publishing[4] == [] and publishing[2].issues == {}

@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from foragent import order, order_references
+from foragent.i18n import text
 from foragent.order_files import write_atomic
 from foragent.state_locks import _file_lock
 
@@ -83,5 +84,22 @@ def _set_batch(root: Path, **fields) -> None:
             current["batch"] = fields["batch"]
         elif current["batch"] is not None:
             current["batch"].update(fields)
+
+    _update(root, change)
+
+
+def _claim(root: Path, batch: dict, language: str) -> None:
+    """Save a new batch only if every member is still the same waiting row (one queue update).
+
+    The members were read before the batch was prepared; a re-defer or another flush in that
+    window replaced or took one, so nothing is saved and the flush stops before any write.
+    """
+    def change(current: dict) -> None:
+        orders = {row.get("revision"): row["status"] for row in current["orders"]}
+        notes = {row["id"]: row["status"] for row in current["notes"]}
+        if current["batch"] is not None or any(orders.get(revision) != WAITING for revision in batch["orders"]) \
+                or any(notes.get(identity) != WAITING for identity in batch["notes"]):
+            raise order.PlanError(text("batch_queue_changed", language))
+        current["batch"] = batch
 
     _update(root, change)

@@ -65,6 +65,8 @@ def flush(args, root, config, tracker, repo, git) -> int:
                   notes=len(result["notes"])))
         for identity, parent in result["parents"].items():
             print(say("batch_flushed_order", id=identity, parent=parent))
+        for identity in result.get("unapproved", []):
+            print(say("batch_flushed_unapproved", id=identity))
     if result["orders"]:
         cli._open_lane_view(root)
     return 0

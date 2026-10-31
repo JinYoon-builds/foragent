@@ -9,6 +9,7 @@ requirements. A batch commit is never undone: an interrupted flush finishes the 
 batch before anything new (``order_batch_flush``); issues are found again by their markers.
 """
 
+import base64
 import hashlib
 import uuid
 from datetime import UTC, datetime
@@ -74,9 +75,12 @@ def defer(plan: dict, boundary: str, root: Path, config: Config, tracker, *, rep
     entry["files"] = _digests(order.validate_plan(plan, root, config))
 
     def add(state: dict) -> None:
-        # A newer version of a still-waiting order replaces it; published history stays.
+        # A newer version of a still-waiting order replaces it; published history stays, and
+        # so does a member of the pending batch, whose committed files still await its issues.
+        members = set((state["batch"] or {}).get("orders", {}))
         state["orders"] = [row for row in state["orders"]
-                           if not (row["id"] == plan["id"] and row["status"] != PUBLISHED)]
+                           if not (row["id"] == plan["id"] and row["status"] != PUBLISHED
+                                   and row["revision"] not in members)]
         state["orders"].append(entry)
 
     _update(root, add)
@@ -105,19 +109,38 @@ def note(root: Path, kind: str, note_text: str, boundary: str, language: str,
     return entry
 
 
+def _text(data: str | None) -> str | None:
+    return None if data is None else base64.b64decode(data).decode("utf-8", errors="replace")
+
+
 def pending(root: Path) -> dict:
-    """Every queued order and note with its status; plan bodies stay in the queue file."""
+    """Every queued order and note with its status; plan bodies stay in the queue file.
+
+    A member of the pending batch shows that batch's status, derived from its one record.
+    """
     state = _load(root)
     keys = ("id", "revision", "title", "boundary", "status", "approve", "approve_keys", "approve_numbers",
             "queued_at", "published_at", "parent")
     batch = state["batch"]
-    return {"orders": [{key: row[key] for key in keys if key in row} for row in state["orders"]],
-            "notes": [dict(row) for row in state["notes"]],
+    status = None if batch is None else "committed" if batch.get("commit") else "writing"
+    members = set() if batch is None else set(batch["orders"]) | set(batch["notes"])
+
+    def row_view(row: dict, fields) -> dict:
+        view = {key: row[key] for key in fields if key in row}
+        if row.get("revision", row["id"]) in members and row["status"] != PUBLISHED:
+            view["status"] = status
+        return view
+
+    return {"orders": [row_view(row, keys) for row in state["orders"]],
+            "notes": [row_view(row, row) for row in state["notes"]],
             # The one pending batch: committed (with its sha) or still to commit, not yet published.
             "batch": None if batch is None else {
                 "id": batch["id"], "boundary": batch["boundary"], "commit": batch.get("commit"),
-                "pushed": batch.get("pushed", False), "status": "committed" if batch.get("commit") else "writing",
-                "paths": sorted(batch["contents"]), "orders": sorted(batch["orders"]), "notes": batch["notes"]}}
+                "pushed": batch.get("pushed", False), "status": status,
+                "paths": sorted(batch["contents"]), "orders": sorted(batch["orders"]), "notes": batch["notes"],
+                # Both versions of each path, for a person resolving an edit made meanwhile.
+                "files": {name: {"before": _text(batch.get("before", {}).get(name)), "batch": _text(data)}
+                          for name, data in sorted(batch["contents"].items())}}}
 
 
 def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git) -> dict:
