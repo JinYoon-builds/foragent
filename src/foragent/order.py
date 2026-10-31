@@ -701,8 +701,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
-    # The owner label exists before any file or issue does: without it, nothing is published.
-    tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
         # Another clone may have published or someone approved since the first check.
@@ -710,6 +708,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if affected:
             raise PlanError(text("order_locks_refused", config.language,
                                  owners="\n".join(_owner_lines(affected))))
+        # All refusal checks precede even repository label setup.
+        tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
         published_blobs = _publish_files(plan, root, config, git, files, manager)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
@@ -973,14 +973,12 @@ def _owner_lines(affected: dict[int, list[str]]) -> list[str]:
 
 def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo: str, config: Config,
                      base_git: Callable[[], GitRepo], *, fetch: bool) -> dict[int, list[str]]:
-    """``{issue: paths}`` for open approved issues outside ``own`` whose locked bytes ``files`` change.
+    """Approved owners outside ``own`` affected by the complete prospective push.
 
-    An issue's locked paths are the Done-when acceptance paths of its body (what any
-    gate snapshots, also for legacy issues and approvals snapshotted on other clones),
-    the acceptance maps every order's parent records for it, and this machine's
-    approval snapshot. Only paths this order writes count,
-    and only when the new bytes differ from the base: identical bytes change nothing.
-    The base is fetched (``fetch``) only when such an overlap exists.
+    Locks come from Done when (on every clone), parent maps and local snapshots.
+    Compare the fetched base with all unpushed changes plus the plan's final bytes;
+    publication pushes existing commits too. Fetch before discovering overlap, since
+    a stale tracking ref cannot tell us which commits remain unpublished.
     """
     # Every gate, on any clone, locks the Done-when acceptance paths of the issue body
     # (``scheduler_approval._snapshot``), whether or not an order recorded them.
@@ -1002,23 +1000,28 @@ def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo:
     for number, paths in locked.items():
         if (approval := store.load_approval(number)) is not None:
             paths.update(approval.acceptance_blobs)
-    # A lock on a directory (``pytest tests/acceptance``) is the Git tree of that directory:
-    # any written file beneath it changes it.
-    overlap = {number: covered for number, paths in sorted(locked.items())
-               if (covered := sorted(name for name in files if _under_lock(name, paths)))}
-    if not overlap:
+    if not any(locked.values()):
         return {}
     git = base_git()
     if fetch:
         git.fetch("origin", config.base_branch)
+    base = f"origin/{config.base_branch}"
+    # committed_paths excludes remote-only history when this clone is behind, and
+    # includes deletions. Inspect final HEAD bytes, so restored files are unchanged.
+    pending = git.committed_paths(base)
+    overlap = {number: covered for number, paths in sorted(locked.items())
+               if (covered := sorted(name for name in pending | files.keys() if _under_lock(name, paths)))}
     candidates = sorted({path for paths in overlap.values() for path in paths})
-    current = git.blob_shas(f"origin/{config.base_branch}", candidates)
-    changed = set()
+    if not candidates:
+        return {}
+    current = git.blob_shas(base, candidates)
+    proposed = git.blob_shas("HEAD", [path for path in candidates if path not in files])
     for path in candidates:
-        data = files[path].encode("utf-8") if isinstance(files[path], str) else files[path]
-        digest = hashlib.sha256 if len(current[path]) == 64 else hashlib.sha1
-        if digest(b"blob %d\0" % len(data) + data).hexdigest() != current[path]:
-            changed.add(path)
+        if path in files:
+            data = files[path].encode("utf-8") if isinstance(files[path], str) else files[path]
+            digest = hashlib.sha256 if len(current[path]) == 64 else hashlib.sha1
+            proposed[path] = digest(b"blob %d\0" % len(data) + data).hexdigest()
+    changed = {path for path in candidates if proposed[path] != current[path]}
     return {number: [path for path in paths if path in changed]
             for number, paths in overlap.items() if changed & set(paths)}
 
