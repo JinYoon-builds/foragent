@@ -54,7 +54,8 @@ def test_view_theme_colors_curses_setup_uses_public_palette_and_default_colors(t
     monkeypatch.setattr(curses, "has_colors", lambda: True)
     monkeypatch.setattr(curses, "start_color", lambda: None)
     monkeypatch.setattr(curses, "use_default_colors", lambda: defaults.append(True))
-    monkeypatch.setattr(curses, "init_pair", lambda index, fg, bg: calls.append((fg, bg)))
+    # #1062 (2026-10-31, spec v3.skeleton.05): the scene registers extra sprite pairs; observe base pairs 1..7 only.
+    monkeypatch.setattr(curses, "init_pair", lambda index, fg, bg: calls.append((fg, bg)) if index <= 7 else None)
     monkeypatch.setattr(curses, "color_pair", lambda index: 0)
     monkeypatch.setattr(curses, "curs_set", lambda visibility: None)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
