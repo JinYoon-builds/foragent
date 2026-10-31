@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import harness_guard, runner
+    from foragent import harness_guard, run_group_check, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -158,6 +158,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
     ci_wait = run_publish._CIWait(pr_ready_at)
     queued_status = None
+    group_checked: set = set()
     # Base moves are bounded only by the run's time budget, which refresh_base checks.
     while True:
         run_publish._phase(n, ctx, "ci")
@@ -183,6 +184,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             if stopped := publish_refresh(target_sha):
                 return stopped
             continue
+        # Consecutive ready FIFO runs share one complete check on this main, outside the merge lock.
+        run_group_check.check(n, ctx, place, verified_head_sha, verified_base_sha, group_checked)
 
         comparison = None
         if run_publish.enabled(ctx, attempt.target_branch):
