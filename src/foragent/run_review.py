@@ -336,15 +336,12 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
                                    risk_notes=review_perspectives.with_checklist(notes, ctx.config, share),
                                    lane_decisions=lane_decisions)
                for share in shares]
-    # Perspectives beyond the machine budget wait in the pool queue and run in later batches.
+    # Perspectives beyond the shared machine budget wait in the pool queue and run in later batches.
     at_once = max(1, min(workers, len(prompts), capacity.workload_budget(ctx.store)))
 
     def held(prompt: str, log_path: Path, k: int) -> ExecResult:
-        # One reviewer at a time runs in this run's own slot. Concurrent reviewers each hold one shared
-        # machine slot (the first reuses the run's slot); a slot wait spends the run's remaining time,
-        # and a timeout makes that reviewer UNUSABLE.
-        if at_once == 1:
-            return call(prompt, log_path)
+        # Every reviewer holds one shared machine slot (the first reuses this run's own slot); a slot
+        # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
         with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
                                     kind="review", issue=n, role=f"reviewer {k}"):
             return call(prompt, log_path)
