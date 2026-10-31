@@ -185,3 +185,51 @@ def test_panel_limited_response_keeps_its_own_notes(git_history, tmp_path, monke
     install_panel(case, LimitWithNotePanel(["VERDICT: PASS", "VERDICT: PASS"], at_merge=at_merge))
     assert run_issue(1, case.ctx) == "limit-wait"
     assert notes(case.store) == [NOTE]
+
+
+def _write_events(store, *events):
+    store.root.mkdir(parents=True, exist_ok=True)
+    with (store.root / "orch-events.jsonl").open("a") as stream:
+        for event in events:
+            stream.write(json.dumps(event) + "\n")
+
+
+def test_architect_gets_notes_since_its_last_clean_session_and_a_failed_session_uses_none(tmp_path):
+    from foragent.state import StateStore
+    store = StateStore(tmp_path / "state")
+    assert review_notes.architect_section(store) == ""
+    _write_events(
+        store,
+        {"at": "2026-10-30T10:00:00+00:00", "issue": 3, "kind": "review-note", "summary": "old", "note": "old",
+         "round": 1},
+        {"at": "2026-10-30T11:00:00+00:00", "issue": None, "kind": "architect-done", "exit_code": 0,
+         "started_at": "2026-10-30T10:30:00+00:00"},
+        {"at": "2026-10-30T10:45:00+00:00", "issue": 4, "kind": "review-note", "summary": "mid", "note": "mid",
+         "round": 2},
+        {"at": "2026-10-30T12:00:00+00:00", "issue": None, "kind": "architect-done", "exit_code": 1,
+         "started_at": "2026-10-30T11:30:00+00:00"},
+        {"at": "2026-10-30T13:00:00+00:00", "issue": 5, "kind": "review-note", "summary": "new", "note": "new"},
+    )
+    assert [note["note"] for note in review_notes.for_architect(store)] == ["mid", "new"]
+    section = review_notes.architect_section(store)
+    assert "- #5 (2026-10-30T13:00:00+00:00): new" in section
+    assert "- #4 (round 2, 2026-10-30T10:45:00+00:00): mid" in section
+    assert section.index("#5") < section.index("#4") and ": old" not in section
+    assert str(store.root / "orch-events.jsonl") in section
+
+
+def test_architect_section_caps_inline_notes_and_counts_the_rest(tmp_path):
+    from foragent.state import StateStore
+    store = StateStore(tmp_path / "state")
+    _write_events(store, *({"at": f"2026-10-30T10:{i:02d}:00+00:00", "issue": i, "kind": "review-note",
+                            "summary": f"n{i}", "note": f"n{i}"} for i in range(25)))
+    section = review_notes.architect_section(store)
+    assert section.count("\n- #") == review_notes.ARCHITECT_LIMIT
+    assert "n24" in section and ": n4\n" not in section and "5 older notes are not shown." in section
+
+
+def test_other_roles_keep_their_prompt_and_the_architect_appends_notes():
+    from foragent import orch_role_prompt
+    plain = orch_role_prompt.build_prompt("why")
+    assert orch_role_prompt.build_prompt("why", review_notes="") == plain
+    assert orch_role_prompt.build_prompt("why", review_notes="## Notes").endswith("## Notes\n")

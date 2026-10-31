@@ -56,7 +56,7 @@ def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
 def _recreate_worktree(attempt: Implementation) -> None:
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree = attempt.worktree
-    artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md")
+    artifacts = {name: path.read_bytes() for name in ("TRY.md", "REBUTTAL.md", "SEARCHED.md")
                  if (path := worktree / ".foragent" / name).is_file()}
     attempt.start_ref = git.ref_sha(attempt.start_ref)
     ctx.git.remove_worktree(worktree)
