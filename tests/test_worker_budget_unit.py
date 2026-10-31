@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
-from foragent import capacity, runner
+from foragent import capacity, review_perspectives, runner
 from foragent.executors import ExecResult
 from test_review_perspectives import perspective_case
 from test_board_status_groups import offline_github  # noqa: F401
@@ -24,12 +24,14 @@ def test_direct_rerun_panel_uses_n_slots_and_merges_once(git_history, tmp_path, 
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
     capacity.write_state(case.store, budget, case.clock[0])
     case.store.finish_run(1, "error")  # A person reruns a finished issue: no admitted run holds a slot.
+    # One whole-change reviewer per perspective (#1167); the reviewer count only caps concurrency.
+    panel = len(review_perspectives.shares(case.config))
     lock, pair = Lock(), Barrier(2, timeout=3)
     active, maximum, used, reviews, merges = [0], [0], [], [], []
 
     def review(**kw):
         with lock:
-            if len(reviews) >= 3:
+            if len(reviews) >= panel:
                 merges.append(kw)
                 used.append(capacity.machine_runs(case.store, case.clock[0]))
                 return ExecResult(0, False, "VERDICT: PASS", kw["log_path"])
@@ -55,6 +57,6 @@ def test_direct_rerun_panel_uses_n_slots_and_merges_once(git_history, tmp_path, 
     # A reviewer that can never be admitted fails within seconds instead of the default 600.
     monkeypatch.setattr(capacity, "hold_workload", lambda *a, **kw: hold(*a, **{**kw, "wait_s": 5}))
     assert runner.run_issue(1, case.ctx) == "merged"
-    assert len(reviews) == 3 and len(merges) == 1
+    assert panel >= 3 and len(reviews) == panel and len(merges) == 1
     assert maximum[0] <= budget and max(used) <= budget, "the runner and its reviewers took N+1 slots"
     assert capacity.machine_runs(case.store, case.clock[0]) == 0
