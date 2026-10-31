@@ -106,7 +106,7 @@ class Tracker(Protocol):
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
-    def close_issue(self, n: int, comment: str | None = None) -> None: ...
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
     def close_pr(self, pr: int, comment: str | None = None) -> None: ...
@@ -430,7 +430,8 @@ class RecordingTracker:
                     store.deliver_github_write(entry)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
-                    result = getattr(self._tracker, action)(number, payload)
+                    options = {"reason": entry["reason"]} if action == "close_issue" and entry.get("reason") else {}
+                    result = getattr(self._tracker, action)(number, payload, **options)
                     store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
             except TrackerError as exc:
                 try:
@@ -494,11 +495,12 @@ class RecordingTracker:
         if not queued:
             self._context.store.update_local_issue(n, title=title, body=body)
 
-    def close_issue(self, n, comment=None):
-        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), body=comment)
+    def close_issue(self, n, comment=None, *, reason=None):
+        options = {"reason": reason} if reason is not None else {}
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n, **options) if comment is None
+                               else self._tracker.close_issue(n, comment, **options), body=comment, **options)
         if not queued:
-            self._context.store.update_local_issue(n, state="closed")
+            self._context.store.update_local_issue(n, state="closed", state_reason=reason)
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)
@@ -724,10 +726,10 @@ class FakeTracker:
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         self.labels.update((spec.name, spec) for spec in specs)
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         if comment is not None:
             self.comment(n, comment)
-        self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
+        self.issues[n] = replace(self.get_issue(n), state="closed", state_reason=reason, updated_at=self._timestamp())
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
@@ -1131,8 +1133,10 @@ class GhTracker:
                     input=payload,
                 )
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         args = ["issue", "close", str(n), "-R", self.repo]
+        if reason is not None:
+            args.extend(["--reason", reason.replace("_", " ")])
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)

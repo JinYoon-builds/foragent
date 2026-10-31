@@ -2776,3 +2776,52 @@ def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(pub
     assert len(revisions()) == 2
     publish(publishing, changed)
     assert len(revisions()) == 2
+
+
+@pytest.mark.parametrize("value", [None, 41, "41", [True], [0], [-1], [41, 41], [{}]])
+def test_replacements_reject_invalid_numbers_before_writes(publishing, plan, value):
+    plan["issues"][0]["replaces"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[0\].replaces"):
+        publish(publishing, plan, approve=True)
+    assert publishing[-1] == []
+
+
+@pytest.mark.parametrize("target", ["missing", "pr", "running", "edited"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_replacement_conflicts_are_checked_together_before_writes(publishing, plan, target, dry_run):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    if target != "missing":
+        tracker.add_issue(42, "Conflicting work", "body", ["running"] if target == "running" else [],
+                          is_pull_request=target == "pr")
+    if target == "edited":
+        plan["edits"] = [{"number": 42, "goal": "Edit it", "out_of_scope": "Other work",
+                          "done_when": ["true"]}]
+    plan["issues"][0]["replaces"] = [41, 42]
+    with pytest.raises(order.PlanError, match="#42"):
+        publish(publishing, plan, approve=True, dry_run=dry_run)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == []
+    assert publishing[-1] == []
+
+
+def test_replacement_partial_approval_links_every_successor_and_respects_reopen(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Shared old work", "body")
+    tracker.add_issue(42, "Client old work", "body")
+    plan["issues"][0]["replaces"] = [41]
+    plan["issues"][1]["replaces"] = [41, 42]
+    report = publish(publishing, plan, approve_keys=["api"])
+    children = {row["title"]: row["number"] for row in report.rows}
+    old = tracker.get_issue(41)
+    assert old.state == "closed" and old.state_reason == "not_planned"
+    comments = tracker.list_comments(41)
+    assert len(comments) == 1
+    assert all(f"#{number}" in comments[0].body for number in children.values())
+    assert tracker.get_issue(42).state == "open"
+    tracker.issues[41] = replace(old, state="open", state_reason=None)
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == comments
+    assert tracker.get_issue(42).state_reason == "not_planned"
+    assert len(tracker.list_comments(42)) == 1

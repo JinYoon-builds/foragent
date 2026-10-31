@@ -138,6 +138,7 @@ class IssueSnapshotMixin:
             row.update(title=entry["title"], body=entry["body"])
         elif action == "close_issue":
             row["state"] = "closed"
+            row["state_reason"] = entry.get("reason")
         if action == "comment" or action == "close_issue" and entry.get("body") is not None:
             row["comments"] = row.get("comments", []) + [{
                 "id": -entry["id"], "body": entry["body"], "author": "foragent",

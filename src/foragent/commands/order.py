@@ -25,6 +25,8 @@ edits[].blocked_by names this plan's issue keys and replaces the edited issue's 
 dependencies ([] clears them); omit it to keep them.
 A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
 publication comments one line when it changes and nothing when it is unchanged.
+issues[].replaces optionally lists unique positive issue numbers (default []); approved replacements
+close them as not planned with a comment linking their successors. --dry-run previews closures.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route

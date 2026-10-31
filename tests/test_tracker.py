@@ -1723,3 +1723,40 @@ def test_bounded_gh_caps_each_call_and_starts_none_once_the_shared_budget_is_spe
             tracker.sub_issues(3)  # Nothing left: no subprocess at all.
     tracker.sub_issues(4)  # Outside a bounded block the usual timeout applies.
     assert timeouts == [4, 2, 120]
+
+
+def test_close_not_planned_gh_and_fake():
+    run = ScriptedRun("")
+    GhTracker(REPO, run).close_issue(41, "Replaced by #42", reason="not_planned")
+    assert run.calls == [(["issue", "close", "41", "-R", REPO,
+                           "--reason", "not planned", "--comment", "Replaced by #42"], None)]
+    tracker = FakeTracker()
+    tracker.add_issue(41, "Old work", "body")
+    tracker.close_issue(41, "Replaced by #42", reason="not_planned")
+    assert tracker.get_issue(41).state == "closed"
+    assert tracker.get_issue(41).state_reason == "not_planned"
+    assert [c.body for c in tracker.list_comments(41)] == ["Replaced by #42"]
+
+
+def test_close_not_planned_survives_recording_and_outbox(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    remote = FakeTracker()
+    remote.add_issue(41, "Old work", "body")
+    store.record_issue(remote.get_issue(41), {})
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+    # Force the same FIFO route that a rate-limited close takes, without an external service.
+    store.queue_github_write(41, "close_issue", body="Replaced by #42", reason="not_planned")
+    assert store.local_issues()[0]["state_reason"] == "not_planned"
+    tracker.flush_outbox()
+    assert store.github_outbox() == []
+    assert remote.get_issue(41).state_reason == "not_planned"
+    assert [c.body for c in remote.list_comments(41)] == ["Replaced by #42"]
+    remote.add_issue(42, "Other old work", "body")
+    store.record_issue(remote.get_issue(42), {})
+    tracker.close_issue(42, reason="not_planned")
+    assert next(row for row in store.local_issues() if row["number"] == 42)["state_reason"] == "not_planned"

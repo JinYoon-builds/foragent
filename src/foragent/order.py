@@ -1,7 +1,7 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import fcntl
 import hashlib
@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, order_waiting, ownership
+from foragent import board, capacity, design, order_replaces, order_references, order_waiting, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -304,7 +304,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references", "statements"} if kind == "issues"
+                                     "references", "statements", "replaces"} if kind == "issues"
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
                           "statements"}, label)
             if "statements" in item:
@@ -320,6 +320,10 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
             if kind == "issues":
+                try:
+                    order_replaces.validate(item, label, config.language)
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
                 if type(item.get("interactive", False)) is not bool:
                     raise PlanError(f"{label}.interactive must be a boolean")
                 _text(item["key"], f"{label}.key")
@@ -424,11 +428,13 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
+    closures: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
+        lines.extend(self.closures)
         lines.append("Files: " + ", ".join(self.paths))
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
             lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
@@ -688,8 +694,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
+    try:
+        closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    preview = order_replaces.preview(closures, config.language)
     if dry_run:
-        return PublishReport(plan["title"], parent, rows, sorted(files), True)
+        return PublishReport(plan["title"], parent, rows, sorted(files), True, preview)
     require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -826,6 +837,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
+    order_replaces.close_replaced(plan, closures, tracker, mapping, approved_numbers, config.language)
     if approved_numbers:
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
