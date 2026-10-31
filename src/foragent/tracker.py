@@ -126,10 +126,12 @@ class Tracker(Protocol):
 class TrackerError(RuntimeError):
     """A gh operation failed; the message contains its stderr."""
 
-    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None):
+    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None,
+                 stderr: str | None = None):
         super().__init__(message)
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr  # gh's own diagnostic; stdout (JSON, check names) never decides auth
 
     @property
     def is_rate_limit(self) -> bool:
@@ -138,6 +140,18 @@ class TrackerError(RuntimeError):
             r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
             diagnostic, re.I,
         ))
+
+    @property
+    def is_auth_failure(self) -> bool:
+        from foragent import auth_retry
+
+        return not self.is_rate_limit and auth_retry.is_auth_failure(
+            str(self) if self.stderr is None else self.stderr)
+
+    @property
+    def is_unavailable(self) -> bool:
+        """GitHub refused this process (rate limit or credential): a run must stop, not degrade."""
+        return self.is_rate_limit or self.is_auth_failure
 
     @property
     def is_not_found(self) -> bool:
@@ -871,18 +885,44 @@ def _parse_time(value: Any) -> datetime | None:
 
 class GhTracker:
     def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] | None = None):
         self.repo = repo
         self._run = run or _run_gh
-        self._sleep = sleep
+        self._injected_sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
 
+    def _sleep(self, seconds: float) -> None:
+        # Looked up at call time, so a patched time.sleep applies to the default.
+        (self._injected_sleep or time.sleep)(seconds)
+
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
+        from foragent import auth_retry
+
+        from foragent import gh_composite
+
+        if gh_composite.combines_effects(args):
+            # A later request can fail after an earlier one took effect, so this argv is
+            # sent once; after a refusal only the effects still missing are sent (#1208).
+            started = datetime.now(UTC)
+            try:
+                return self._attempt(args, input, binary)
+            except TrackerError as exc:
+                if not exc.is_auth_failure:
+                    raise
+            self._sleep(auth_retry.WAITS[0])
+            gh_composite.finish(self, args, started)
+            return ""
+        # One request refused with a 401 had no effect, so the call may retry (#1208).
+        return auth_retry.retry(lambda: self._attempt(args, input, binary),
+                                lambda exc: isinstance(exc, TrackerError) and exc.is_auth_failure,
+                                self._sleep)
+
+    def _attempt(self, args: list[str], input: str | None, binary: bool) -> str | bytes:
         try:
             gh.call_timeout(_GH_TIMEOUT)  # A bounded tick step that ran out starts no more gh.
         except gh.DeadlineExhausted as exc:
-            raise TrackerError(f"deferred: {exc}") from exc
+            raise TrackerError(f"deferred: {exc}", stderr="") from exc
         gh.count_call()  # Every attempt counts, injected runners and retries included.
         try:
             output = self._run(args, input=input)
@@ -891,10 +931,10 @@ class GhTracker:
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
             raise TrackerError(
-                stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
+                stderr or str(exc), stdout=stdout or "", returncode=exc.returncode, stderr=stderr or "",
             ) from exc
         except (OSError, subprocess.TimeoutExpired, gh.DeadlineExhausted) as exc:
-            raise TrackerError(str(exc)) from exc
+            raise TrackerError(str(exc), stderr="") from exc
 
     def authenticated_login(self, *, refresh: bool = False) -> str:
         """The lowercase login of the person gh is signed in as on this machine.
@@ -1292,7 +1332,7 @@ class GhTracker:
             # gh exposes display keys, so an ambiguous match must count too.
             return excluded - counted
         except (TrackerError, AttributeError, TypeError, KeyError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if isinstance(exc, TrackerError) and exc.is_unavailable:
                 raise
             return set()  # Unverifiable checks remain ordinary CI.
 

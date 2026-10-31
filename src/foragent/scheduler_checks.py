@@ -72,6 +72,14 @@ def _check_prerequisites(
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
         scheduler.board.sync_status(ctx, issue, "Done")
         return False
+    # auth-failed waits for `fa orch retry` (it adds ready) or a new approval (#1208). The current
+    # record carries the outcome before the runner drops `running`, so no tick sees a gap.
+    current = ctx.store.get_run(issue.number)
+    if (
+        current is not None and current.outcome == "auth-failed" and scheduler.READY not in issue.labels
+        and scheduler.datetime.fromisoformat(approval.approved_at) <= scheduler.datetime.fromisoformat(current.started_at)
+    ):
+        return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None
         and (latest_run is None or latest_run.outcome != "limit-wait")

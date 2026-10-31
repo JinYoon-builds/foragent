@@ -13,6 +13,7 @@ import stat
 import subprocess
 import time
 
+from foragent import auth_retry
 from foragent.state import StateStore
 
 
@@ -44,7 +45,23 @@ def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
 
 
 class GitError(RuntimeError):
-    """A Git command or remote URL could not be used."""
+    """A Git command or remote URL could not be used.
+
+    ``stderr`` is Git's own diagnostic when a command failed; the message may
+    also hold the argv, which must never decide the classification.
+    """
+
+    def __init__(self, message: str = "", *, stderr: str | None = None):
+        super().__init__(message)
+        self.stderr = stderr
+
+    @property
+    def is_auth_failure(self) -> bool:
+        return auth_retry.is_auth_failure(str(self) if self.stderr is None else self.stderr)
+
+
+# Commands that reach the remote; only these can fail on a credential.
+_REMOTE_COMMANDS = {"fetch", "push", "ls-remote", "pull", "clone"}
 
 
 class PublicationError(GitError):
@@ -71,6 +88,7 @@ class GitRepo:
         self._run = run or self._run_git
         self.local_skill_paths: set[str] = set()
         self.publication_paths: set[str] = set()
+        self._retries_auth = True
 
     def _run_git(self, args: list[str]) -> str:
         command = args
@@ -83,11 +101,21 @@ class GitRepo:
         ).stdout
 
     def _call(self, args: list[str]) -> str:
+        command = args
+        while command[:1] == ["-C"]:
+            command = command[2:]
+        if self._retries_auth and command[:1] and command[0] in _REMOTE_COMMANDS:
+            # A one-off credential failure retries here, so the run continues (#1208).
+            return auth_retry.retry(lambda: self._attempt(args), lambda exc: getattr(exc, "is_auth_failure", False))
+        return self._attempt(args)
+
+    def _attempt(self, args: list[str]) -> str:
         try:
             return self._run(args)
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-            raise GitError(message or str(exc)) from exc
+            stderr = (message or "") if isinstance(exc, subprocess.CalledProcessError) else ""
+            raise GitError(message or str(exc), stderr=stderr) from exc
 
     def fetch(self, remote: str = "origin", ref: str | None = None) -> None:
         refspec = f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}" if ref is not None else None
@@ -102,7 +130,9 @@ class GitRepo:
                 time.sleep(0.1 * (attempt + 1))
 
     def at(self, root: Path) -> "GitRepo":
-        return GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
+        child = GitRepo(root, lambda args: self._call(["-C", str(root), *args]))
+        child._retries_auth = False  # The parent's _call already retries; never multiply budgets.
+        return child
 
     def remove_worktree(self, path: Path) -> None:
         with ExitStack() as stack:

@@ -337,8 +337,8 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
         elif (column := board_column(status, ctx.config.board_map)) is not None:
             _current.get().set_values(issue, {"Status": column}, add=False)
     except Exception as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            raise
+        if isinstance(exc, TrackerError) and exc.is_unavailable:
+            raise  # a GitHub wait or an exhausted credential retry is the run's outcome, not a warning
         log.warning("Could not set board Status to %s for issue %s", status,
                     getattr(issue, "number", issue), exc_info=True)
     finally:
@@ -379,8 +379,8 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
                 break
             cursor = connection["pageInfo"]["endCursor"]
     except Exception as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            raise
+        if isinstance(exc, TrackerError) and exc.is_unavailable:
+            raise  # a GitHub wait or an exhausted credential retry is the run's outcome, not a warning
         log.warning("Could not read board cards for %s", ctx.repo, exc_info=True)
         return
     for row in ctx.store.local_issues():

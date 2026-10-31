@@ -3164,3 +3164,63 @@ def test_refresh_failure_with_queued_writes_starts_nothing(ctx, monkeypatch):
     assert "No run starts this tick: queued GitHub writes are not delivered yet" in report.actions
     assert {"approved", "ready"} <= ctx.tracker._tracker.get_issue(1).labels
     assert ctx.store.github_outbox()  # The queued write waits for a successful refresh.
+
+
+@pytest.mark.parametrize("label_left", [None, "running"])
+def test_auth_failed_issue_waits_for_orch_retry_instead_of_restarting(ctx, label_left):
+    """#1208: an exhausted authentication retry is neither re-promoted nor recovered as a crash."""
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    if label_left is not None:
+        ctx.tracker.add_labels(1, [label_left])  # the runner's best-effort removal failed
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "auth-failed", detail="authentication failed after 3 attempts: x")
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7001
+    ctx.start_runs = True
+    for _ in range(2):
+        report = tick(ctx)
+        assert "#1 promoted to ready" not in report.actions
+    assert launches == []
+    assert ctx.tracker.get_issue(1).labels == {"approved"}
+    assert [run.outcome for run in ctx.store.read_history() if run.number == 1] == ["auth-failed"]
+    ctx.tracker.add_labels(1, ["ready"])  # what `fa orch retry` does
+    tick(ctx)
+    assert launches == [1]
+
+
+def test_tick_between_label_removal_and_finish_does_not_promote_an_auth_failed_run(ctx):
+    """#1208: the runner records auth-failed before dropping `running`, before finish_run."""
+    approve(ctx)
+    tick(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.update_run(1, outcome="auth-failed", detail="authentication failed after 3 attempts: x")
+    ctx.tracker.remove_labels(1, ["ready"])
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    ctx.start_runs = True
+    report = tick(ctx)
+    assert "#1 promoted to ready" not in report.actions
+    assert "ready" not in ctx.tracker.get_issue(1).labels
+
+
+def test_orch_retry_over_a_stale_running_label_starts_the_auth_failed_issue(ctx):
+    """#1208: orphan cleanup drops the stale `running` label but keeps the retry's `ready`."""
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    ctx.tracker.add_labels(1, ["running"])
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "auth-failed", detail="authentication failed after 3 attempts: x")
+    ctx.tracker.add_labels(1, ["ready"])  # `fa orch retry` before any tick
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7001
+    ctx.start_runs = True
+    for _ in range(2):
+        tick(ctx)
+    assert launches == [1]

@@ -169,7 +169,7 @@ def _publish_reviewed_in_turn(
                     ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
-                    if exc.is_rate_limit:
+                    if exc.is_unavailable:
                         raise
                     if ctx.tracker.pr_head_sha(pr.number) != head:
                         inputs.stop = lambda: run_publish._hold_changed_head(n, ctx, link)
@@ -185,7 +185,7 @@ def _publish_reviewed_in_turn(
                         else:
                             ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
-                        if exc.is_rate_limit:
+                        if exc.is_unavailable:
                             raise
                         if ctx.tracker.current_issue(n).state != "closed":
                             raise
@@ -194,7 +194,7 @@ def _publish_reviewed_in_turn(
                         try:
                             run_publish._batch_pr(parent, ctx)
                         except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+                            if getattr(exc, "is_auth_failure", False) or isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
                                 raise
                             run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"

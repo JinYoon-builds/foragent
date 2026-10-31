@@ -288,8 +288,8 @@ def publish_hold(attempt) -> str:
             run_publish._update_open_pr(attempt, pr, title, body)
         where = f"https://github.com/{ctx.repo}/pull/{pr}"
     except (run_publish.GitError, run_publish.AttemptFailure, run_publish.TrackerError) as exc:
-        if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
-            raise  # the existing GitHub wait restarts the run, and the guard holds again
+        if getattr(exc, "is_auth_failure", False) or isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+            raise  # a GitHub wait or auth-failed ends the run; its retry holds again
         where = run_publish.text("harness_not_published", ctx.config.language,
                                  detail=" ".join(str(exc).split())[:300])
     run_publish.flag(ctx, n, run_publish.Reason.TEST_HARNESS_CHANGED,

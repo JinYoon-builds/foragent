@@ -145,8 +145,8 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     )
-    if run is not None and run.outcome == "merged":
-        ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
+    if run is not None and run.outcome in {"merged", "auth-failed"}:  # auth-failed keeps a retry's ready.
+        ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING][run.outcome != "merged":])
         return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome == "limit-wait":
         if not issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN}:

@@ -160,6 +160,8 @@ def check(
             finally:
                 ctx.git.remove_worktree(worktree)
     except (GitError, AttemptFailure) as exc:
+        if getattr(exc, "is_auth_failure", False):
+            raise  # A refused credential is no check result; the run ends auth-failed (#1208).
         error = str(exc).strip() or type(exc).__name__
     passed = error is None and all(r.exit_code == 0 and not r.timed_out for r in results)
     summary = (f"group check {'passed' if passed else 'failed'}: {numbers} on {base_sha}"

@@ -43,7 +43,7 @@ def _trusted_sha(git, tracker):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+        if isinstance(exc, TrackerError) and exc.is_unavailable:
             raise
         return None
 
@@ -77,7 +77,7 @@ class ComparisonEvidence:
                 return True  # Local evidence is pinned to the same base/head and scope.
             return self.reports == json.dumps(ctx.tracker.pr_acceptance_reports(head), sort_keys=True)
         except (AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if isinstance(exc, TrackerError) and exc.is_unavailable:
                 raise
             return False
 
@@ -324,7 +324,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
     except (UnusableComparison, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+        if isinstance(exc, TrackerError) and exc.is_unavailable:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
         # A local measurement is no substitute for current CI evidence.
