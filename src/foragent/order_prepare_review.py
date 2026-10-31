@@ -214,7 +214,8 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     number = len(entry["attempts"]) + 1
     directory = Path(entry["scratch"]).parent / f"review-{number}"
     tree = directory / "tree"
-    facts = {"attempt": number, "role": "reviewer", "cycle": entry.get("cycle"), "started_at": _now(),
+    facts = {"attempt": number, "role": "reviewer", "cycle": entry.get("cycle"),
+             "requirement": entry.get("requirement"), "started_at": _now(),
              "base_revision": entry.get("base_revision"), "scratch": str(tree),
              "log": str(directory / "reviewer.log")}
     entry["attempts"].append(facts)

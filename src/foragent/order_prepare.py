@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import re
 
-from foragent import order_prepare_setup as setup, order_scratch
+from foragent import order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -165,42 +165,26 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
     return facts | {"status": "written", "reason": say("prepare_written", count=len(written))}
 
 
-def _row(key: str, entry: dict | None, config: Config) -> dict:
-    from foragent.order_prepare_cycle import holds
-
-    entry = entry or {"status": "not_prepared", "reason": text("prepare_none", config.language)}
-    row = {"key": key, "status": entry["status"], "phase": entry.get("phase"),
-           "questions": entry.get("questions", []), "holds": len(holds(entry)),
-           "reason": entry.get("reason"), "updated_at": entry.get("updated_at"),
-           "base_revision": entry.get("base_revision")}
-    for name in ("scratch", "done_when", "ignored", "red", "coverage"):
-        if entry.get(name):
-            row[name] = entry[name]
-    if entry.get("written"):
-        row["written"] = sorted(entry["written"])
-    if entry.get("attempts"):
-        row["attempts"] = len(entry["attempts"])
-    return row
-
-
 def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRepo,
-                 path: Path, record: dict, base: str, cycle: str) -> None:
+                 path: Path, record: dict, base: str, cycle: str, asked: str | None = None) -> None:
     """One writer attempt in a new scratch tree; the record is saved before and after the agent."""
-    from foragent.order_prepare_cycle import revision_notes
+    from foragent.order_prepare_cycle import revision_notes, same_requirement
 
     entries = record["issues"]
     entry = entries.setdefault(item["key"], {"key": item["key"], "attempts": []})
-    revision = revision_notes(entry) if entry.get("cycle") == cycle else ""
+    revision = revision_notes(entry) if same_requirement(entry, cycle, asked) else ""
     attempt = len(entry["attempts"]) + 1
     home = path.parent / _slug(plan["id"]) / _slug(item["key"])
     # Earlier attempts' trees stay for inspection; each attempt gets its own new tree.
     tree, log = home / f"attempt-{attempt}" / "tree", home / f"attempt-{attempt}" / "writer.log"
-    facts = {"attempt": attempt, "role": "writer", "cycle": cycle, "started_at": _now(), "base_revision": base,
+    facts = {"attempt": attempt, "role": "writer", "cycle": cycle, "requirement": asked,
+             "started_at": _now(), "base_revision": base,
              "scratch": str(tree), "log": str(log)}
     entry["attempts"].append(facts)
     for stale in ("coverage", "red"):
         entry.pop(stale, None)
     entry.update(status="writing_tests", phase="writing_tests", questions=[], reason=None, cycle=cycle,
+                 requirement=asked,
                  updated_at=facts["started_at"], base_revision=base, scratch=str(tree))
     _write(path, record)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
@@ -279,18 +263,19 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
     path = _record_path(store, plan)
     legacy = {"status": "legacy", "phase": "preread", "reason": text("prepare_legacy", config.language)}
     if status:
-        entries = _read(path, plan)["issues"]
-        return [_row(item["key"], entries.get(item["key"]) if "statements" in item else legacy, config)
-                for item in items]
-    with _owner(path) as owned:
-        if not owned:
-            busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
-            return [_row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         record = _read(path, plan)
+        return [owners.row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy,
+                           config, record.get("owner")) for item in items]
+    with _owner(path) as owned:
+        record = _read(path, plan) if owned else None
+        if not owned or not owners.take(record, config):
+            busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
+            return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
+        _write(path, record)
         base = order_scratch.base_revision(git, config.base_branch) if any(
             "statements" in item for item in items) else None
         for item in items:
             if "statements" in item:
                 prepare_issue(plan, item, root, config, git, path, record, base, plan_path)
-        return [_row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy, config)
-                for item in items]
+        return [owners.row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy,
+                           config) for item in items]

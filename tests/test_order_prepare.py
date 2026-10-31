@@ -930,3 +930,112 @@ def test_writer_and_reviewer_read_every_other_issues_contract(tmp_path):
     changed = {**plan, "issues": [item, {**other, "goal": "Receipts are CSV."}, legacy]}
     assert order_prepare_cycle.identity(changed, item, config, tmp_path) != order_prepare_cycle.identity(
         plan, item, config, tmp_path)
+
+
+def _record(case):
+    return order_prepare._record_path(case.store, case.plan)
+
+
+def _stopped_owner():
+    """A process lifetime known to have ended: a child that already exited."""
+    import sys
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return {"pid": child.pid, "start_time": 1.0, "taken_at": "2026-10-31T00:00:00+00:00"}
+
+
+def _left_running(case, phase, **changes):
+    """The record as an owner leaves it when it stops during ``phase``: no finish, no outcome."""
+    path = _record(case)
+    record = json.loads(path.read_text())
+    entry = record["issues"]["notice"]
+    entry.update(status=phase, phase=phase, **changes)
+    for name in ("finished_at", "status", "reason"):
+        entry["attempts"][-1].pop(name, None)
+    record["owner"] = _stopped_owner()
+    path.write_text(json.dumps(record))
+    return path
+
+
+def test_a_stopped_review_shows_interrupted_and_resumes_from_the_written_bytes(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    case.reviewer_exit = 1
+    assert _cases.prepare(case, capsys)["status"] == "waiting"
+    path = _left_running(case, "reviewing_tests")
+    before, calls = path.read_bytes(), len(case.calls)
+    row = _cases.prepare(case, capsys, status=True)
+    # Status is a projection: the stopped owner's step is interrupted, the record is not rewritten.
+    assert row["status"] == "interrupted" and row["phase"] == "reviewing_tests" and row["holds"] == 0
+    assert "stopped" in row["reason"] and path.read_bytes() == before and len(case.calls) == calls
+    case.reviewer_exit = 0
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
+    assert case.calls[-1]["candidate"] == case.candidate
+    attempts = json.loads(path.read_text())["issues"]["notice"]["attempts"]
+    # The successor closed the stopped attempt as an interruption; it is no hold.
+    assert attempts[1]["status"] == "interrupted" and attempts[1]["finished_at"]
+    assert attempts[2]["status"] == "reviewed"
+
+
+def test_a_stopped_writer_never_promotes_its_partial_files(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    case.writer_exit = 1
+    _cases.prepare(case, capsys)
+    path = _left_running(case, "writing_tests", written={_cases.TEST_PATH: "PARTIAL\n"})
+    row = _cases.prepare(case, capsys, status=True)
+    assert row["status"] == "interrupted" and row["phase"] == "writing_tests"
+    case.writer_exit = 0
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    assert [call["role"] for call in case.calls] == ["writer", "writer", "reviewer"]
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+    attempts = json.loads(path.read_text())["issues"]["notice"]["attempts"]
+    assert attempts[0]["status"] == "interrupted" and attempts[1]["status"] == "written"
+
+
+def test_a_running_recorded_owner_keeps_its_preparation(request, capsys, monkeypatch):
+    from foragent import processes
+
+    case = request.getfixturevalue("lane_case")
+    case.reviewer_exit = 1
+    _cases.prepare(case, capsys)
+    path = _left_running(case, "reviewing_tests")
+    record = json.loads(path.read_text())
+    # A lifetime the (fake) process table still lists: e.g. the lock file was replaced under it.
+    monkeypatch.setattr(processes, "list_processes", lambda: (processes.ProcessIdentity(424242, 1, 424242, 424242, 5.0),))
+    record["owner"] = {"pid": 424242, "start_time": 5.0}
+    path.write_text(json.dumps(record))
+    before, calls = path.read_bytes(), len(case.calls)
+    assert _cases.prepare(case, capsys, status=True)["status"] == "reviewing_tests"
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "waiting" and "running" in row["reason"]
+    assert path.read_bytes() == before and len(case.calls) == calls
+
+
+def test_holds_and_a_question_survive_an_unrelated_issue_edit(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    legacy_path = "tests/acceptance/test_existing_notice.py"
+    legacy = {"key": "legacy", "title": "Legacy notice", "goal": "Keep the old contract.",
+              "out_of_scope": "New delivery.", "done_when": [f"python {legacy_path}"],
+              "lane": "api", "size": "s", "acceptance_files": {legacy_path: "assert True\n"}}
+    case.plan["issues"].append(legacy)
+    case.save()
+    case.verdicts = ["hold", "hold"]
+    first = _cases.prepare(case, capsys)
+    assert first["status"] == "hold" and first["holds"] == 1
+    # Another issue's edit is new context: new evidence is written, but the hold is not erased.
+    case.plan["issues"][1]["goal"] = "Keep the old contract, documented."
+    case.save()
+    second = _cases.prepare(case, capsys)
+    assert second["status"] == "question" and second["holds"] == 2
+    calls = len(case.calls)
+    case.plan["issues"][1]["goal"] = "Keep the old contract, documented twice."
+    case.save()
+    third = _cases.prepare(case, capsys)
+    assert third["status"] == "question" and len(case.calls) == calls
+    # Planning's clarification of this issue starts a new cycle; the earlier attempts stay inspectable.
+    # (The offline reviewer maps the fixture's one statement, so the goal carries the clarification.)
+    case.plan["issues"][0]["goal"] = _cases.STATEMENT + " The receipt holds exactly one line."
+    case.save()
+    fourth = _cases.prepare(case, capsys)
+    assert fourth["status"] == "reviewed" and fourth["holds"] == 0 and fourth["attempts"] == 6
