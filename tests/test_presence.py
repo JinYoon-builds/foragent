@@ -1,6 +1,5 @@
 import io
 import re
-from datetime import UTC, datetime
 
 import pytest
 import yaml
@@ -129,12 +128,10 @@ def test_project_without_a_repository_still_gets_its_first_minute_squirrel(proje
 STALL_BASE = "🐿 0 lanes working · ✋ 0 · 0 merged today"
 
 
-# The stall store's fixed clock; the prompt hook reads the same instant (see _hook).
-STALL_NOW = datetime(2026, 10, 30, 12, tzinfo=UTC)
-
-
 @pytest.fixture
 def stall_store(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
     from foragent.state import StateStore
 
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
@@ -142,7 +139,18 @@ def stall_store(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
     (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
-    now = STALL_NOW
+    now = datetime(2026, 10, 30, 12, tzinfo=UTC)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    from foragent import statusline
+
+    # The prompt hook reads the wall clock; pin it to the store's clock so time windows
+    # such as the 24-hour notice window do not expire as real days pass.
+    monkeypatch.setattr(statusline, "datetime", FixedClock)
     return root, StateStore.for_repo("offline/stall", now=lambda: now), now
 
 
@@ -340,7 +348,7 @@ def test_an_unreadable_state_folder_is_reported(stall_store, monkeypatch):
 
 
 def _hook(root, monkeypatch):
-    """Run the installed prompt hook entry at the stall store's time, with a strict UTF-8 stderr, as Claude Code's pipe is."""
+    """Run the installed prompt hook entry with a strict UTF-8 stderr, as Claude Code's pipe is."""
     import json
     import sys
 
@@ -349,14 +357,6 @@ def _hook(root, monkeypatch):
     stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
     out = io.BytesIO()
     monkeypatch.setattr(sys, "stderr", stderr)
-
-    class Clock(statusline.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return STALL_NOW.astimezone(tz)
-
-    # The hook reads the same fixed instant as the store, not the real clock.
-    monkeypatch.setattr(statusline, "datetime", Clock)
     assert statusline.prompt_context(io.BytesIO(json.dumps({"cwd": str(root)}).encode()), out) == 0
     stderr.flush()
     error = stderr.buffer.getvalue().decode("utf-8")
