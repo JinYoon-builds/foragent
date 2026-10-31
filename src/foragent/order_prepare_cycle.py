@@ -35,26 +35,71 @@ def _setup(config: Config, lane: str) -> dict:
             "acceptance_dir": resolved.acceptance_dir, "base_branch": resolved.base_branch}
 
 
-def identity(plan: dict, item: dict, config: Config) -> str:
-    """What the tests are written and reviewed for: the issue's requirements, the shared context
-    and the executor setup. A change starts a new cycle with the history retained."""
+def contracts(plan: dict, item: dict) -> dict:
+    """The other issues as this issue's writer and reviewer depend on them: every issue's and edit's
+    requirements, and the locked tests of legacy issues. A statement issue's tests are this
+    command's own output, bound by that issue's cycle; they are neither context nor shown."""
+    others = [other for other in plan["issues"] if other.get("key") != item["key"]]
+    others += [other for other in plan.get("edits", []) if f"#{other.get('number')}" != item["key"]]
+    return {str(other.get("key", f"#{other.get('number')}")): {
+        **{name: other.get(name) for name in _CYCLE_FIELDS + ("number",)},
+        "acceptance_files": None if "statements" in other else other.get("acceptance_files", {}),
+        "done_when": None if "statements" in other else other.get("done_when")} for other in others}
+
+
+def _lines(values) -> str:
+    return "".join(f"  - {value}\n" for value in values or []) or "  (none)\n"
+
+
+def other_issues(plan: dict, item: dict) -> str:
+    """Every other issue and edit of the order as the writer and reviewer read them: the same
+    ``contracts`` the cycle binds, so a contract declared only in another issue's words reaches both."""
+    blocks = []
+    for key, other in contracts(plan, item).items():
+        tests = "".join(f"\n#### {path} (locked)\n```\n{content}\n```\n"
+                        for path, content in (other["acceptance_files"] or {}).items())
+        commands = "" if other["done_when"] is None else f"Done when:\n{_lines(other['done_when'])}"
+        blocks.append(
+            f"### {'Edit of existing issue ' if other['number'] is not None else 'Issue '}{key}"
+            f"{': ' + other['title'] if other.get('title') else ''}\n"
+            f"Lane: {other.get('lane') or '(from the tracker)'}\n"
+            f"Goal: {other.get('goal') or '(unchanged)'}\n"
+            f"Behaviour statements:\n{_lines(other.get('statements'))}"
+            f"Out of scope: {other.get('out_of_scope') or '(unchanged)'}\n"
+            f"Checklist:\n{_lines(other.get('checklist'))}"
+            f"Blocked by: {', '.join(other.get('blocked_by') or []) or '(none)'}\n"
+            f"Files expected to change: {', '.join(other.get('files') or []) or '(not listed)'}\n"
+            f"{commands}{tests}")
+    return "\n".join(blocks) or "No other issue in this order."
+
+
+def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
+    """What the tests are written and reviewed for: the issue's requirements, every other issue's
+    requirements and legacy contracts, the shared spec and references, the risk guidance both agents
+    read, and the executor setup. A change starts a new cycle with the history retained."""
+    from foragent.order_prepare_prompt import _risk_notes
+
     shared = {"item": {name: item.get(name) for name in _CYCLE_FIELDS}, "title": plan.get("title"),
+              "risks": _risk_notes(root, config, item),
               "setup": _setup(config, item["lane"]),
               "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
               "new_lanes": plan.get("new_lanes"),
               "references": {name: hashlib.sha256(data).hexdigest()
                              for name, data in sorted(_references(plan, item).items())},
-              "contracts": {other["key"]: other.get("acceptance_files", {}) for other in plan["issues"]
-                            if other.get("key") != item["key"] and "statements" not in other}}
+              "contracts": contracts(plan, item)}
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def holds(entry: dict | None) -> list[str]:
-    """The reasons of this cycle's quality holds, oldest first."""
+    """The reasons of this cycle's quality holds, oldest first.
+
+    Counted from each review attempt's recorded outcome, never its raw verdict: a malformed reply,
+    an execution failure or a changed scratch tree is no quality decision and no hold.
+    """
     if not entry:
         return []
-    return [attempt.get("reason") or "" for attempt in entry.get("attempts", [])
-            if attempt.get("role") == "reviewer" and attempt.get("verdict") == "hold"
+    return [attempt["reason"] for attempt in entry.get("attempts", [])
+            if attempt.get("role") == "reviewer" and attempt.get("status") == "hold"
             and attempt.get("cycle") == entry.get("cycle")]
 
 
@@ -80,7 +125,7 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     from foragent import order_prepare_review as reviewing
     from foragent.order_prepare import _write, _write_tests
 
-    cycle = identity(plan, item, config)
+    cycle = identity(plan, item, config, root)
     entry = record["issues"].get(item["key"])
     current = entry is not None and entry.get("cycle") == cycle
     fresh = current and entry.get("base_revision") == base
@@ -120,7 +165,7 @@ def promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Config
     # An edit's title, lane and size come from the tracker, as when it was prepared.
     current = {**target, **{name: item.get(name) for name in ("key", "title", "lane", "size", "interactive", "edit")
                             if edit}}
-    if "statements" not in target or identity(plan, current, config) != entry.get("cycle"):
+    if "statements" not in target or identity(plan, current, config, root) != entry.get("cycle"):
         return False
     files, commands = dict(entry["written"]), list(entry["done_when"])
     if target.get("acceptance_files") == files and target.get("done_when") == commands:
@@ -130,27 +175,47 @@ def promote(plan_path: Path, item: dict, entry: dict, root: Path, config: Config
     return replace_unchanged(plan_path, before, (json.dumps(plan, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-def _link_back(kept: Path, path: Path) -> None:
-    """Put ``kept`` back at ``path`` unless a newer file already took the name; never overwrite."""
+def _release(name: Path, expected: bytes) -> bytes | None:
+    """Remove ``name`` and return its bytes if they are not ``expected``; None when nothing else was there.
+
+    The bytes are read through a descriptor opened before the name is removed, so the read comes after
+    the removal: a writer that still had the file open and wrote before that read is seen, never lost.
+    """
+    descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        os.link(kept, path)
-    except FileExistsError:
-        pass
-    kept.unlink()
+        os.unlink(name)
+        chunks = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    return None if data == expected else data
+
+
+def _park(path: Path, token: str, data: bytes) -> Path:
+    """Keep planning bytes that could not go back to ``path`` in a visible file beside it."""
+    kept = path.with_name(f"{path.name}.conflict-{token}")
+    with open(kept, "xb") as handle:
+        handle.write(data)
+    return kept
 
 
 def replace_unchanged(path: Path, before: bytes, after: bytes) -> bool:
     """Replace ``path`` with ``after`` only while it still holds ``before``; no other writer's bytes are lost.
 
     Planning edits the plan with its own tools and shares no lock, so this is a compare-and-swap built
-    from atomic steps. The plan is moved aside (so a later writer creates a new file, which wins), its
-    moved bytes are compared, and ours are linked in only if the name is still free (``os.link`` never
-    overwrites). A write into the moved file by a writer that still had it open is detected afterwards
-    and put back (should a newer plan already have replaced ours, that write stays beside it as
-    ``.<name>.prepare-*.old``). A conflict leaves planning's newest bytes at ``path`` and returns False.
+    from atomic steps, and no file that may hold planning's bytes is deleted after a separate read:
+    - the plan is moved aside, so a writer that saves now creates a new file, which wins;
+    - moved bytes that are not ``before`` go back under the plan's name (a newer plan already there
+      keeps the name; the moved file is renamed to ``<name>.conflict-*``, still the same file);
+    - ours are linked in only while the name is free (``os.link`` never overwrites);
+    - the moved plan is released with ``_release``; a write that reached it during promotion is put
+      back over ours, or kept as ``<name>.conflict-*`` when the plan changed yet again.
+    Every conflict returns False.
     """
-    stem = f".{path.name}.prepare-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    staged, held = path.with_name(stem + ".new"), path.with_name(stem + ".old")
+    token = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    staged, held = path.with_name(f".{path.name}.prepare-{token}.new"), path.with_name(f".{path.name}.prepare-{token}.old")
     with open(staged, "xb") as handle:
         handle.write(after)
     try:
@@ -159,24 +224,25 @@ def replace_unchanged(path: Path, before: bytes, after: bytes) -> bool:
         except FileNotFoundError:
             return False
         if held.read_bytes() != before:
-            _link_back(held, path)
+            try:
+                os.link(held, path)
+            except FileExistsError:
+                os.rename(held, path.with_name(f"{path.name}.conflict-{token}"))
+                return False
+            os.unlink(held)  # only a second name: the same file stays at ``path``
             return False
         try:
             os.link(staged, path)
         except FileExistsError:
-            held.unlink()  # planning wrote a new plan meanwhile; the moved one is older
+            if (late := _release(held, before)) is not None:
+                _park(path, token, late)
             return False
-        if held.read_bytes() != before:
-            # A writer that had the old plan open wrote into it: its bytes win over ours.
-            mine = path.with_name(stem + ".mine")
-            os.rename(path, mine)
-            if mine.read_bytes() == after:
-                mine.unlink()
-                _link_back(held, path)
-            else:
-                _link_back(mine, path)  # a newer plan replaced ours; the old-fd write stays beside it
-            return False
-        held.unlink()
-        return True
+        if (late := _release(held, before)) is None:
+            return True
+        # A writer that had the old plan open wrote into it during promotion: its bytes win over ours.
+        if not replace_unchanged(path, after, late):
+            _park(path, token, late)
+        return False
     finally:
+        # Our own file: once linked, ``path`` is a second name for it, so this removes no one's bytes.
         staged.unlink(missing_ok=True)

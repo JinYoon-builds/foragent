@@ -17,6 +17,8 @@ Review attempts are appended to the issue's ``attempts`` next to the writer's::
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 from foragent import order_prepare_setup as setup, order_scratch
@@ -25,8 +27,8 @@ from foragent.executors import executor_for
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_prepare import _envelope_text, _now, _write
-from foragent.order_prepare_cycle import HOLD_LIMIT, holds
-from foragent.order_prepare_prompt import _risk_notes
+from foragent.order_prepare_cycle import HOLD_LIMIT, holds, other_issues
+from foragent.order_prepare_prompt import _references, _risk_notes
 
 REVIEW_TIMEOUT_S = 30 * 60
 REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], '
@@ -50,17 +52,26 @@ def _reply(message: str) -> dict | None:
     return None
 
 
-def _changed(tree: Path, written: dict[str, str]) -> list[str]:
-    """Candidate paths whose bytes in the tree are not the recorded ones."""
-    changed = []
+def _place(tree: Path, written: dict[str, str]) -> None:
+    """Add the recorded candidates to a new scratch tree, never through a link."""
     for name, content in written.items():
-        try:
-            same = not (tree / name).is_symlink() and (tree / name).read_bytes() == content.encode("utf-8")
-        except OSError:
-            same = False
-        if not same:
-            changed.append(name)
-    return sorted(changed)
+        order_scratch._own_parents(tree, name, create=True)
+        descriptor = os.open(tree / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content.encode("utf-8"))
+
+
+def _integrity(git, tree: Path, manifest: dict, config: Config, protected, before, written: dict[str, str]) -> list[str]:
+    """Paths of the review tree that are not current main plus exactly the recorded candidates.
+
+    The writer's comparison (``order_scratch.changes``) is reused: any changed, removed or touched
+    file outside the candidates, and any candidate whose bytes differ, means the reviewer's runs
+    were not of current main with these tests.
+    """
+    candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
+    wrong = {name for name in candidates.keys() | written.keys()
+             if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
+    return sorted(set(refused) | wrong)
 
 
 def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dict) -> str:
@@ -68,9 +79,7 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
     statements = "\n".join(f"- {line}" for line in item["statements"])
     candidates = "".join(f"\n### {name}\n```\n{content}\n```\n" for name, content in sorted(entry["written"].items()))
     commands = "".join(f"- `{command}`\n" for command in entry.get("done_when", [])) or "(no command was given)\n"
-    locked = "".join(f"\n### {path} (issue {other['key']})\n```\n{content}\n```\n"
-                     for other in plan["issues"] if other.get("key") != item["key"]
-                     for path, content in other.get("acceptance_files", {}).items())
+    listed = lambda values: "\n".join(f"- {value}" for value in values or []) or "(none)"  # noqa: E731
     notes = _risk_notes(root, config, item) or "(no risk map entry matches this issue)"
     earlier = "".join(f"- {reason}\n" for reason in holds(entry)) or "(none)\n"
     return (
@@ -98,11 +107,18 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "red records every command below as you ran it: actual counts, exit code, an output excerpt and\n"
         "your reading of why it failed.\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n## Spec\n{plan.get('spec_markdown', '')}\n\n"
+        f"New lanes in this order (not created yet): "
+        f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
         f"# Issue {item['key']}: {item['title']}\nLane: {item['lane']}\n\n"
         f"## Behaviour statements\n{statements}\n\n## Goal\n{item['goal']}\n\n"
-        f"## Out of scope\n{item['out_of_scope']}\n\n## Candidate tests and helpers{candidates}\n"
+        f"## Out of scope\n{item['out_of_scope']}\n\n## Checklist\n{listed(item.get('checklist'))}\n\n"
+        f"## Blocked by\n{listed(item.get('blocked_by'))}\n\n"
+        f"## Files expected to change later\n{listed(item.get('files'))}\n\n"
+        f"## Candidate tests and helpers{candidates}\n"
         f"## Commands to run\n{commands}\n"
-        f"## Existing locked contracts{locked or ' No other issue in this order brings tests.'}\n\n"
+        "## Other issues of this order (contracts the tests may rely on)\nAnother issue's statements and goal\n"
+        "are its public contract; its locked tests must not be changed.\n\n"
+        f"{other_issues(plan, item)}\n\n"
         f"## Risk guidance\n{notes}\n\n## Earlier holds in this cycle\n{earlier}"
     )
 
@@ -114,8 +130,10 @@ def _options(reviewer: str, tree: Path, protected: tuple[Path, ...], config: Con
     return options | ({"read_only": True} if reviewer == "claude" else {})
 
 
-def _outcome(result, reply: dict | None, item: dict, entry: dict, tree: Path, writers: set[str],
+def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[str], writers: set[str],
              config: Config) -> dict:
+    """The attempt's outcome. Only a well-formed verdict from an intact tree can be a hold or a pass;
+    every other outcome carries no verdict, so it is never counted as a quality decision."""
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     if result.error_kind == "limit":
         return {"status": "waiting", "reason": say("prepare_review_limit")}
@@ -125,22 +143,23 @@ def _outcome(result, reply: dict | None, item: dict, entry: dict, tree: Path, wr
             log=result.log_path)}
     if result.session_id and result.session_id in writers:
         return {"status": "interrupted", "reason": say("prepare_review_same_session")}
-    if (changed := _changed(tree, entry["written"])):
+    if changed:
         return {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(changed))}
     if reply is None:
         return {"status": "interrupted", "reason": say("prepare_review_bad_reply")}
     facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", [])}
     if reply["verdict"] == "question":
-        if not any(question.strip() for question in reply["questions"]) and not reply["reason"].strip():
-            return facts | {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="questions")}
-        return facts | {"status": "question", "questions": reply["questions"] or [reply["reason"]],
+        questions = [question for question in reply["questions"] if question.strip()]
+        if not questions and not reply["reason"].strip():
+            return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="questions")}
+        return facts | {"status": "question", "questions": questions or [reply["reason"]],
                         "reason": say("prepare_review_question")}
     if not reply["reason"].strip():
-        return facts | {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="reason")}
+        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="reason")}
     if reply["verdict"] == "hold":
         return facts | {"status": "hold", "reason": reply["reason"]}
     if (missing := _evidence_gaps(item, entry, facts)):
-        return facts | {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
+        return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
     # The pass rests on every command failing now by collected, failing tests; reported facts saying
     # otherwise contradict it.
     runs = {run["command"]: run for run in facts["red"]}
@@ -184,12 +203,17 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
 
 
 def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict) -> None:
-    """One review attempt of the recorded candidates; the record is saved before and after it."""
+    """One review attempt of the recorded candidates; the record is saved before and after it.
+
+    Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
+    candidates, so nothing an earlier, interrupted reviewer changed reaches this one; the tree is
+    checked whole after the reviewer, before its verdict is read.
+    """
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     entry = record["issues"][item["key"]]
-    tree = Path(entry["scratch"])
     number = len(entry["attempts"]) + 1
-    directory = tree.parent / f"review-{number}"
+    directory = Path(entry["scratch"]).parent / f"review-{number}"
+    tree = directory / "tree"
     facts = {"attempt": number, "role": "reviewer", "cycle": entry.get("cycle"), "started_at": _now(),
              "base_revision": entry.get("base_revision"), "scratch": str(tree),
              "log": str(directory / "reviewer.log")}
@@ -198,17 +222,22 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     _write(path, record)
     outcome = {"status": "interrupted", "reason": say("prepare_review_stopped")}
     try:
-        lane_config, _context = setup.lane_context(plan, item, config, root)
+        lane_config, context = setup.lane_context(plan, item, config, root)
+        context.files.update(_references(plan, item))
         from foragent.run_implementation import lane_config as resolve
 
         lane_config = resolve(lane_config, item["lane"])
         reviewer, model = resolved_reviewer(lane_config), lane_config.reviewer_model
-        directory.mkdir(parents=True, exist_ok=True)
         facts.update(executor=reviewer, model=model)
-        if (changed := _changed(tree, entry["written"])):
-            outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(changed))}
-            return
         protected = order_scratch.protected(git, root, path.parent.parent)
+        if directory.exists():
+            raise ValueError(f"review scratch {directory} already exists")
+        manifest = order_scratch.build(git, entry["base_revision"], tree, context)
+        if context.refused:
+            outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(context.refused))}
+            return
+        _place(tree, entry["written"])
+        before = order_scratch.stamps(tree, manifest)
         writers = {attempt["session_id"] for attempt in entry["attempts"]
                    if attempt.get("role") == "writer" and attempt.get("session_id")}
         result = executor_for(reviewer).run(
@@ -216,7 +245,8 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             timeout_s=REVIEW_TIMEOUT_S, log_path=Path(facts["log"]),
             **_options(reviewer, tree, protected, lane_config, directory))
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
-        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, tree, writers, config)
+        changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
+        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config)
     except OSError as exc:
         outcome = {"status": "waiting", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     except (GitError, ValueError) as exc:
@@ -231,8 +261,5 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
                      updated_at=facts["finished_at"],
                      phase="writing_tests" if outcome["status"] == "hold" else "reviewing_tests")
         for name in ("coverage", "red"):
-            if name in facts or name in outcome:
-                entry[name] = outcome.get(name, facts.get(name))
+            entry[name] = outcome.get(name, [])
         _write(path, record)
-
-

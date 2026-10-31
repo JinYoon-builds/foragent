@@ -540,7 +540,7 @@ def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
 
 
-def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",)):
+def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",), changed=()):
     from foragent import order_prepare_review
 
     (tmp_path / "test_x.py").write_text("assert False\n")
@@ -548,7 +548,8 @@ def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",
                              log_path=tmp_path / "reviewer.log")
     item = {"statements": ["One delivery is reported."]}
     entry = {"written": {"test_x.py": "assert False\n"}, "done_when": list(commands)}
-    return order_prepare_review._outcome(result, reply, item, entry, tmp_path, {"writer-1"}, Config())
+    changed = list(changed)
+    return order_prepare_review._outcome(result, reply, item, entry, changed, {"writer-1"}, Config())
 
 
 RUN = {"command": "check", "collected": 1, "failed": 1, "exit_code": 1, "output": "AssertionError: 0 != 1",
@@ -621,7 +622,7 @@ def test_promotion_needs_the_reviewed_requirements_and_base(tmp_path):
     plan = {"id": "p", "title": "P", "summary": "x", "spec_markdown": "spec", "issues": [item]}
     config = Config(lanes={"api": {"paths": ["src/**"]}})
     path = tmp_path / "PLAN.json"
-    entry = {"cycle": order_prepare_cycle.identity(plan, item, config), "base_revision": "b1",
+    entry = {"cycle": order_prepare_cycle.identity(plan, item, config, tmp_path), "base_revision": "b1",
              "written": {"tests/acceptance/test_a.py": "assert False\n"},
              "done_when": ["pytest tests/acceptance/test_a.py"]}
     for changed in ({"goal": "other goal"}, {"out_of_scope": "less"}, {"statements": ["t"]}):
@@ -643,10 +644,13 @@ def test_promotion_needs_the_reviewed_requirements_and_base(tmp_path):
 def test_holds_are_counted_in_the_current_cycle_only():
     from foragent.order_prepare_cycle import holds
 
-    attempts = [{"role": "reviewer", "verdict": "hold", "cycle": "old", "reason": "a"},
+    attempts = [{"role": "reviewer", "verdict": "hold", "status": "hold", "cycle": "old", "reason": "a"},
                 {"role": "writer", "cycle": "new"},
-                {"role": "reviewer", "verdict": "hold", "cycle": "new", "reason": "b"},
-                {"role": "reviewer", "verdict": "question", "cycle": "new", "reason": "c"}]
+                {"role": "reviewer", "verdict": "hold", "status": "hold", "cycle": "new", "reason": "b"},
+                {"role": "reviewer", "verdict": "question", "status": "question", "cycle": "new", "reason": "c"},
+                # A malformed or failed review is no quality decision, whatever verdict it carried.
+                {"role": "reviewer", "verdict": "hold", "status": "interrupted", "cycle": "new", "reason": "d"},
+                {"role": "reviewer", "status": "waiting", "cycle": "new", "reason": "e"}]
     assert holds({"cycle": "new", "attempts": attempts}) == ["b"]
     assert holds({"cycle": "old", "attempts": attempts}) == ["a"]
     assert holds(None) == []
@@ -696,7 +700,7 @@ def test_promotion_never_loses_a_planning_edit_made_meanwhile(tmp_path, monkeypa
     config = Config(lanes={"api": {"paths": ["src/**"]}})
     (tmp_path / "tests/acceptance").mkdir(parents=True)
     path = tmp_path / "PLAN.json"
-    entry = {"cycle": order_prepare_cycle.identity(plan, item, config), "base_revision": "b1",
+    entry = {"cycle": order_prepare_cycle.identity(plan, item, config, tmp_path), "base_revision": "b1",
              "written": {"tests/acceptance/test_a.py": "assert False\n"}, "done_when": ["check"]}
     edited = json.dumps({**plan, "issues": [{**item, "goal": "planning's newer goal"}]})
     validate = order.validate_plan
@@ -736,10 +740,12 @@ def test_compare_and_swap_keeps_writes_that_race_each_step(tmp_path, monkeypatch
     assert not order_prepare_cycle.replace_unchanged(path, b"old", b"ours") and path.read_bytes() == b"planning"
     monkeypatch.setattr(order_prepare_cycle.os, "rename", real_rename)
 
-    def write_into_moved_file(source, target):  # an editor with the old plan open writes after the move
+    late = []
+
+    def write_into_moved_file(source, target):  # an editor with the old plan open writes once after the move
         real_link(source, target)
-        if Path(target) == path:
-            next(tmp_path.glob(".PLAN.json.prepare-*.old")).write_bytes(b"late edit")
+        if Path(target) == path and not late:
+            late.append(next(tmp_path.glob(".PLAN.json.prepare-*.old")).write_bytes(b"late edit"))
 
     path.write_bytes(b"old")
     monkeypatch.setattr(order_prepare_cycle.os, "link", write_into_moved_file)
@@ -759,3 +765,168 @@ def test_a_plan_changed_before_the_move_is_never_replaced_even_briefly(tmp_path,
     assert not order_prepare_cycle.replace_unchanged(path, b"old", b"ours")
     assert path.read_bytes() == b"planning's newer plan"
     assert (b"ours", path) not in linked
+
+
+def _editor_writes_at_removal(monkeypatch, cycle, editor, data, *, after_removal):
+    """An editor holding the old plan open flushes through its descriptor around the name's removal."""
+    real_unlink, done = cycle.os.unlink, []
+
+    def unlink(name, *args, **kwargs):
+        moved = ".prepare-" in str(name) and str(name).endswith(".old") and not done
+        if moved and not after_removal:
+            done.append((editor.write(data), editor.flush()))
+        real_unlink(name, *args, **kwargs)
+        if moved and after_removal:
+            done.append((editor.write(data), editor.flush()))
+
+    monkeypatch.setattr(cycle.os, "unlink", unlink)
+    return done
+
+
+def test_a_write_through_an_open_descriptor_during_removal_is_never_deleted(tmp_path, monkeypatch):
+    from foragent import order_prepare_cycle as cycle
+
+    for after_removal in (False, True):
+        path = tmp_path / f"PLAN-{after_removal}.json"
+        path.write_bytes(b"old")
+        with open(path, "r+b") as editor:  # the editor opened the plan before promotion
+            done = _editor_writes_at_removal(monkeypatch, cycle, editor, b"new", after_removal=after_removal)
+            assert not cycle.replace_unchanged(path, b"old", b"ours")
+        assert done and path.read_bytes() == b"new", after_removal
+        assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith((path.name, f".{path.name}"))) == [
+            path.name], after_removal
+
+
+def test_a_late_write_is_kept_beside_a_plan_that_planning_replaced_meanwhile(tmp_path, monkeypatch):
+    from foragent import order_prepare_cycle as cycle
+
+    path = tmp_path / "PLAN.json"
+    path.write_bytes(b"old")
+    real_rename = cycle.os.rename
+
+    def planning_saves_after_the_move(source, target):
+        real_rename(source, target)
+        if Path(source) == path:
+            path.write_bytes(b"planning")
+
+    monkeypatch.setattr(cycle.os, "rename", planning_saves_after_the_move)
+    with open(path, "r+b") as editor:
+        done = _editor_writes_at_removal(monkeypatch, cycle, editor, b"late", after_removal=True)
+        assert not cycle.replace_unchanged(path, b"old", b"ours")
+    assert done and path.read_bytes() == b"planning"
+    kept = [p.read_bytes() for p in tmp_path.glob("PLAN.json.conflict-*")]
+    assert kept == [b"late"] and not list(tmp_path.glob(".PLAN.json.prepare-*"))
+
+
+def test_moved_bytes_that_differ_are_renamed_never_deleted_when_the_name_is_taken(tmp_path, monkeypatch):
+    from foragent import order_prepare_cycle as cycle
+
+    path = tmp_path / "PLAN.json"
+    path.write_bytes(b"edited in place")
+    real_rename = cycle.os.rename
+
+    def planning_saves_after_the_move(source, target):
+        real_rename(source, target)
+        if Path(source) == path:
+            path.write_bytes(b"planning")
+
+    monkeypatch.setattr(cycle.os, "rename", planning_saves_after_the_move)
+    assert not cycle.replace_unchanged(path, b"old", b"ours")
+    assert path.read_bytes() == b"planning"
+    assert [p.read_bytes() for p in tmp_path.glob("PLAN.json.conflict-*")] == [b"edited in place"]
+
+
+def test_identity_binds_every_other_issue_and_the_risk_guidance(tmp_path):
+    from foragent import order_prepare_cycle
+
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api",
+            "size": "s", "done_when": ["true"], "blocked_by": []}
+    other = {**item, "key": "b", "title": "B", "statements": ["the other contract"]}
+    legacy = {key: value for key, value in item.items() if key != "statements"} | {
+        "key": "c", "acceptance_files": {"tests/acceptance/test_c.py": "assert False\n"}}
+    plan = {"id": "p", "title": "P", "summary": "x", "spec_markdown": "spec", "issues": [item, other, legacy],
+            "edits": [{"number": 7, "goal": "edit goal", "out_of_scope": "o", "statements": ["e"]}]}
+    config = Config(lanes={"api": {"paths": ["notice.py"]}})
+    first = order_prepare_cycle.identity(plan, item, config, tmp_path)
+    changes = [
+        {**plan, "issues": [item, {**other, "statements": ["a changed contract"]}, legacy]},
+        {**plan, "issues": [item, {**other, "goal": "another goal"}, legacy]},
+        {**plan, "issues": [item, other, {**legacy, "acceptance_files": {"tests/acceptance/test_c.py": "x\n"}}]},
+        {**plan, "issues": [item, other, {**legacy, "done_when": ["other"]}]},
+        {**plan, "edits": [{**plan["edits"][0], "statements": ["f"]}]},
+    ]
+    for changed in changes:
+        assert order_prepare_cycle.identity(changed, item, config, tmp_path) != first, changed
+    # Another statement issue's prepared tests are that issue's own output, bound by its own cycle.
+    promoted = {**plan, "issues": [item, {**other, "acceptance_files": {"tests/acceptance/test_b.py": "y\n"},
+                                          "done_when": ["pytest tests/acceptance/test_b.py"]}, legacy]}
+    assert order_prepare_cycle.identity(promoted, item, config, tmp_path) == first
+    (tmp_path / ".foragent-risks.yml").write_text("- paths: [notice.py]\n  guidance: fake process tables only\n")
+    assert order_prepare_cycle.identity(plan, item, config, tmp_path) != first
+
+
+def test_invalid_review_outcomes_carry_no_verdict(tmp_path):
+    for reply in ({"verdict": "hold", "reason": " ", "questions": []},
+                  {"verdict": "question", "reason": "", "questions": [" "]},
+                  {**PASS, "coverage": []}):
+        outcome = _review_outcome(tmp_path, reply)
+        assert outcome["status"] == "interrupted" and "verdict" not in outcome, reply
+    changed = _review_outcome(tmp_path, {"verdict": "hold", "reason": "weak", "questions": []}, changed=["notice.py"])
+    assert changed["status"] == "interrupted" and "verdict" not in changed
+
+
+def test_a_reviewer_changing_main_never_reaches_a_pass_or_the_next_review(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    seen = []
+
+    def corrupt(worktree):
+        seen.append((worktree / "notice.py").read_text())
+        (worktree / "notice.py").write_text(cases.NOTICE.replace('"deliveries": 0', '"deliveries": 1'))
+
+    case.reviewer_hook = corrupt
+    row = cases.prepare(case, capsys)
+    assert row["status"] == "interrupted" and "notice.py" in row["reason"] and row["holds"] == 0
+    assert "acceptance_files" not in cases.disk_plan(case)["issues"][0]
+    case.reviewer_exit = 1  # an interrupted reviewer that changed main: nothing it left may reach the retry
+    assert cases.prepare(case, capsys)["status"] == "waiting"
+    case.reviewer_hook = lambda worktree: seen.append((worktree / "notice.py").read_text())
+    case.reviewer_exit = 0
+    assert cases.prepare(case, capsys)["status"] == "reviewed"
+    assert seen == [cases.NOTICE] * 3
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer", "reviewer"]
+
+
+def test_writer_and_reviewer_read_every_other_issues_contract(tmp_path):
+    from foragent import order_prepare_cycle, order_prepare_prompt, order_prepare_review
+
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api",
+            "size": "s", "done_when": ["true"], "blocked_by": ["b"], "files": ["notice.py"],
+            "checklist": ["A person reads the receipt aloud."]}
+    other = {**item, "key": "b", "title": "Receipts", "goal": "Receipts are JSON lines named receipt.jsonl.",
+             "statements": ["Every send appends one line to receipt.jsonl."], "out_of_scope": "Rotation.",
+             "blocked_by": [], "files": ["receipts.py"], "checklist": [],
+             "acceptance_files": {"tests/acceptance/test_b.py": "PREPARED BY ITS OWN CYCLE\n"}}
+    legacy = {key: value for key, value in item.items() if key not in {"statements", "checklist"}} | {
+        "key": "c", "title": "Legacy", "goal": "legacy goal", "blocked_by": [],
+        "acceptance_files": {"tests/acceptance/test_c.py": "LEGACY LOCKED TEST\n"}}
+    plan = {"id": "p", "title": "P", "summary": "x", "spec_markdown": "spec", "issues": [item, other, legacy],
+            "edits": [{"number": 7, "goal": "The CLI exit code stays 0.", "out_of_scope": "Flags.",
+                       "statements": ["Sending exits with status 0."]}]}
+    config = Config(lanes={"api": {"paths": ["notice.py"]}})
+    entry = {"written": {"tests/acceptance/test_a.py": "assert False\n"}, "done_when": ["check"],
+             "base_revision": "b1"}
+    prompts = {"writer": order_prepare_prompt.writer_prompt(plan, item, config, tmp_path, tmp_path, "b1"),
+               "reviewer": order_prepare_review.review_prompt(plan, item, config, tmp_path, entry)}
+    for role, prompt in prompts.items():
+        for fact in ("Receipts are JSON lines named receipt.jsonl.", "Every send appends one line to receipt.jsonl.",
+                     "Rotation.", "receipts.py", "Issue b: Receipts", "legacy goal", "LEGACY LOCKED TEST",
+                     "Edit of existing issue #7", "The CLI exit code stays 0.", "Sending exits with status 0.",
+                     "A person reads the receipt aloud."):
+            assert fact in prompt, (role, fact)
+        # Another statement issue's prepared tests are its own cycle's output, never this one's context.
+        assert "PREPARED BY ITS OWN CYCLE" not in prompt, role
+    # What both read is what the cycle binds: changing the other issue's contract starts a new cycle.
+    changed = {**plan, "issues": [item, {**other, "goal": "Receipts are CSV."}, legacy]}
+    assert order_prepare_cycle.identity(changed, item, config, tmp_path) != order_prepare_cycle.identity(
+        plan, item, config, tmp_path)
