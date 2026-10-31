@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 from foragent import capacity, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
+from foragent.actions import repeats
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
@@ -24,7 +25,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
-from foragent.reasons import comment_order, flag_marker, one_line
+from foragent.reasons import ORCH_MARKER, comment_order, flag_marker, one_line
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
@@ -148,14 +149,22 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
            say: str | None = None, changed: bool = True) -> dict:
-    """Journal every verb; comment only when it changed public state (one line)."""
+    """Journal every verb; comment only when it changed public state (one line).
+
+    The comment carries the exact summary (the journal's copy has its spacing collapsed).
+    """
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if not changed or ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        tracker.comment(number, one_line("<!-- foragent:orch -->", event["summary"]))
+        tracker.comment(number, orch_record(summary))
     return event
+
+
+def orch_record(summary: str) -> str:
+    """The one-line orchestrator record comment for a verb."""
+    return one_line(ORCH_MARKER, summary)
 
 
 def list_blocked(ctx: RunContext) -> list[dict]:
@@ -267,12 +276,16 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
+    body = one_line("<!-- foragent:needs-human reason=escalated -->", "\n".join(lines))
+    # The same escalation again (already needs-human with this newest flag) adds no comment.
+    changed = not repeats(ctx.store, n, body, {NEEDS_HUMAN})
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    tracker.comment(n, one_line("<!-- foragent:needs-human reason=escalated -->", "\n".join(lines)))
+    if changed:
+        tracker.comment(n, body)
     tracker.add_labels(n, [NEEDS_HUMAN])
     tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
-    _event(ctx, n, "escalate", event_summary, say=say)
+    _event(ctx, n, "escalate", event_summary, say=say, changed=changed)
     return event_summary
 
 

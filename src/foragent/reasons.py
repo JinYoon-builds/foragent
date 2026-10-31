@@ -43,26 +43,34 @@ GROUP: dict[Reason, str] = {
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"
+ORCH_MARKER = "<!-- foragent:orch -->"
 
 
 FLAG_MARKER = re.compile(r"<!-- foragent:(blocked|needs-human) reason=([a-z-]+) -->(?=[ \r\n]|$)")
 
 
 SEPARATOR = " ↵ "
+_DECODE = re.compile(r" ↵ |↵↵")
 
 
 def one_line(marker: str, text: str = "") -> str:
     """A state-change comment: its marker and its whole text on one line.
 
-    Only line breaks change: each becomes " ↵ ", so `flag_text` gives the exact lines
-    back (spacing inside lines is kept). Blank lines at either end are dropped.
+    Each line break becomes " ↵ ", and a "↵" already in the text is written "↵↵", so
+    different texts never give the same line and `decode_line` returns the exact lines
+    (spacing inside lines is kept). Blank lines at either end are dropped.
     """
-    lines = text.splitlines()
+    lines = [line.replace("↵", "↵↵") for line in text.splitlines()]
     while lines and not lines[0].strip():
         lines.pop(0)
     while lines and not lines[-1].strip():
         lines.pop()
     return f"{marker} {SEPARATOR.join(lines)}" if lines else marker
+
+
+def decode_line(text: str) -> str:
+    """The exact lines of a one-line comment's text (the inverse of `one_line`)."""
+    return _DECODE.sub(lambda match: "\n" if match[0] == SEPARATOR else "↵", text)
 
 
 def flag_marker(body: str) -> tuple[str, str, str] | None:
@@ -79,8 +87,7 @@ def flag_text(body: str) -> tuple[str, str]:
     match = FLAG_MARKER.match(body or "")
     rest = body[match.end():] if match else "\n" + body.partition("\n")[2]
     if rest.startswith(" "):  # One-line form: give the evidence its exact lines back.
-        first, _, evidence = rest[1:].partition(SEPARATOR)
-        evidence = evidence.replace(SEPARATOR, "\n")
+        first, _, evidence = decode_line(rest[1:]).partition("\n")
     else:
         first, _, evidence = rest.strip().partition("\n")
         evidence = evidence.strip()
@@ -103,9 +110,15 @@ def format_comment(
     reason: Reason, summary: str, details: str | None = None, *,
     label: Literal["blocked", "needs-human"] = "needs-human",
 ) -> str:
-    summary = " ".join(summary.split())
+    # The summary's first line is the bold title. Any further lines (an error's text, say)
+    # lead the details exactly as written, so no two summaries collapse into one line.
+    lines = summary.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    title, rest = (lines[0].strip(), lines[1:]) if lines else ("", [])
+    evidence = "\n".join([*rest, *([details] if details else [])])
     return one_line(f"<!-- foragent:{label} reason={reason.value} -->",
-                    f"**{summary}**" + (f"\n{details}" if details else ""))
+                    f"**{title}**" + (f"\n{evidence}" if evidence.strip() else ""))
 
 
 def parse_reason(comment_body: str) -> Reason | None:

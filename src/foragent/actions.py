@@ -28,7 +28,7 @@ def flag(
     not escalate it again.
     """
     body = format_comment(reason, summary, details, label=NEEDS_HUMAN if needs_human else BLOCKED)
-    repeated = _repeats(ctx.store, n, body, {BLOCKED, NEEDS_HUMAN} if needs_human else {BLOCKED})
+    repeated = repeats(ctx.store, n, body, {BLOCKED, NEEDS_HUMAN} if needs_human else {BLOCKED})
     run = ctx.store.get_run(n)
     if run is not None and run.status == "running":
         ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary)
@@ -40,13 +40,21 @@ def flag(
         ctx.tracker.comment(n, body)
 
 
-def _repeats(store: StateStore, n: int, body: str, labels: set[str]) -> bool:
-    """Whether the last observed issue already carries these labels and this exact blocker."""
+def repeats(store: StateStore, n: int, body: str, labels: set[str] = frozenset(),
+            marker: str | None = None) -> bool:
+    """Whether the issue already carries these labels and, as its newest comment of this
+    kind, exactly this body, so posting it again would add no public fact.
+
+    The kind is a blocked/needs-human flag, or comments starting with ``marker``. It reads
+    the local issue copy, which includes writes still queued for GitHub, so a repeat during
+    a rate limit is caught too.
+    """
     row = next((row for row in store.local_issues() if row["number"] == n), None)
     if row is None or not labels <= set(row["labels"]):
         return False
-    flags = [c for c in row.get("comments", []) if flag_marker(c.get("body", "")) is not None]
-    latest = max(flags, key=comment_order, default=None)
+    same_kind = [c for c in row.get("comments", []) if (
+        c.get("body", "").startswith(marker) if marker else flag_marker(c.get("body", "")) is not None)]
+    latest = max(same_kind, key=comment_order, default=None)
     return latest is not None and latest["body"] == body
 
 

@@ -43,8 +43,12 @@ def test_reason_round_trip(reason, label):
 
 
 def test_optional_details_and_one_line_summary():
-    body = format_comment(Reason.STALLED, "  No progress\n for 30 minutes.  ")
-    assert body == "<!-- foragent:needs-human reason=stalled --> **No progress for 30 minutes.**"
+    assert format_comment(Reason.STALLED, "  No progress for 30 minutes.  ") == (
+        "<!-- foragent:needs-human reason=stalled --> **No progress for 30 minutes.**")
+    # Further summary lines (an error's text) lead the details exactly, never merged into the title.
+    body = format_comment(Reason.STALLED, "Stop refused: boom\n  at line 2")
+    assert body == "<!-- foragent:needs-human reason=stalled --> **Stop refused: boom** ↵   at line 2"
+    assert body != format_comment(Reason.STALLED, "Stop refused: boom at line 2")
 
 
 @pytest.mark.parametrize("body", [

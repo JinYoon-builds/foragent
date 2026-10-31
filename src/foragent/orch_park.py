@@ -10,7 +10,9 @@ from __future__ import annotations
 from datetime import datetime
 import json
 
+from foragent.actions import repeats
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, WAITING_PERSON
+from foragent.reasons import ORCH_MARKER
 from foragent.state import StateStore
 
 
@@ -53,7 +55,9 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     # Park revokes admission; only a new approval (fa order publish) lets the gate start it again.
     tracker.remove_labels(n, [APPROVED, BLOCKED, NEEDS_HUMAN])
     summary = f"#{n}: parked" + (" for a person's decision" if for_person else "") + f"; why: {why}"
-    orch._event(ctx, n, "parked", summary)
+    # Parking again for the same reason, with no newer orchestrator record, changes nothing public.
+    changed = not (is_parked(ctx.store, n) and repeats(ctx.store, n, orch.orch_record(summary), marker=ORCH_MARKER))
+    orch._event(ctx, n, "parked", summary, changed=changed)
     return summary
 
 
