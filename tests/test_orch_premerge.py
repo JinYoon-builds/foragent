@@ -457,3 +457,87 @@ def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_cas
     assert c.tracker.merged_prs == []
     assert c.tracker.list_comments(c.pr) == [], "Approval is recorded only for a fresh base"
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
+
+
+# #1105: an acceptance test that passes on the base must still pass on the merge result.
+SUITE_FILE = "tests/acceptance/test_kept.py"
+KEPT = f"{SUITE_FILE}::test_kept"
+NEIGHBOUR = f"{SUITE_FILE}::test_neighbour"
+UNIT_FILE = "tests/test_unit.py"
+BASE_SUITE = {
+    SUITE_FILE: "def test_kept():\n    assert True\n\ndef test_neighbour():\n    assert False, 'not built yet'\n",
+    UNIT_FILE: "def test_unit():\n    assert True\n",
+}
+SKIPPED = ("import pytest\n\n@pytest.mark.skip(reason='stopped checking')\ndef test_kept():\n    assert True\n\n"
+           "def test_neighbour():\n    assert False, 'not built yet'\n")
+REMOVED = "def test_neighbour():\n    assert False, 'not built yet'\n"
+
+
+def suite_case(git_history, tmp_path, head_files, *, mode, command=None):
+    """Real pytest on a real base and PR head; GitHub is the fake tracker."""
+    h = git_history
+    h.update(BASE_SUITE)
+    base = h.tip
+    h.update(head_files)
+    head = h.tip
+    git_command(h.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(h.origin, "update-ref", "refs/heads/main", base)
+    h.tip = base
+    h.update({"base.txt": "base advanced"})
+    tracker = FakeTracker(now=lambda: BASE_TIME)
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Issue", body="Body")
+    tracker.set_pr_head_sha(pr, head)
+    tracker.set_pr_checks(pr, "pass")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    config = Config(repo="owner/repo", runner_unit_tests=mode,
+                    test_command=command or f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider")
+    ctx = RunContext("owner/repo", h.clone, tracker, store, config, GitRepo(h.clone), now=lambda: BASE_TIME)
+    return SimpleNamespace(ctx=ctx, tracker=tracker, pr=pr)
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+@pytest.mark.parametrize("change", ["skipped", "removed"])
+@pytest.mark.parametrize("neighbour_fixed", [False, True], ids=["neighbour-fails", "green-head"])
+def test_base_passing_acceptance_that_stops_passing_blocks_merge(git_history, tmp_path, mode, change,
+                                                                 neighbour_fixed):
+    source = SKIPPED if change == "skipped" else REMOVED
+    if neighbour_fixed:  # A fully green head must still be compared with the base.
+        source = source.replace("assert False, 'not built yet'", "assert True")
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: source}, mode=mode)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["tests"] == "fail", report
+    assert report["broken"] == [KEPT], report
+    assert report["failing_on_base"] == ([] if neighbour_fixed else [NEIGHBOUR]), report
+    with pytest.raises(orch.OrchError, match=KEPT):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_base_failing_neighbour_alone_does_not_block(git_history, tmp_path, mode):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+    assert report["failing_on_base"] == [NEIGHBOUR], report
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
+
+
+def test_skipped_unit_test_is_left_to_ci(git_history, tmp_path):
+    skip = "import pytest\n\n@pytest.mark.skip(reason='moved')\ndef test_unit():\n    assert True\n"
+    c = suite_case(git_history, tmp_path, {UNIT_FILE: skip}, mode="all")
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+
+
+@pytest.mark.parametrize("command", ["non-pytest", "no-junit"])
+def test_without_per_test_results_the_exit_code_decides(git_history, tmp_path, monkeypatch, command):
+    programs = tmp_path / "programs"
+    programs.mkdir()
+    (programs / "pytest").write_text("#!/bin/sh\nexit 0\n")  # Green, but writes no JUnit report.
+    (programs / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: SKIPPED}, mode="all",
+                   command="true" if command == "non-pytest" else "pytest")
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 from tempfile import TemporaryDirectory
@@ -28,7 +28,7 @@ from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
-from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_checks import CheckResult, _passing_acceptance_ids, trusts_ci
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
@@ -307,6 +307,15 @@ class _Premerge:
 class _SuiteRun:
     passed: bool
     failing: frozenset[str] | None  # None: no per-test result to compare
+    passing: frozenset[str] = frozenset()  # no failure, error or skip; meaningful with `failing`
+
+
+def _protected(ids, acceptance_dir: str, excluded: list[str]) -> frozenset[str]:
+    """Acceptance ids a merge must keep passing; files owned by open issues are not protected."""
+    root, owned = PurePosixPath(acceptance_dir), set(excluded)
+    return frozenset(node for node in ids
+                     if PurePosixPath(file := node.split("::", 1)[0]).is_relative_to(root)
+                     and file not in owned)
 
 
 def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
@@ -347,7 +356,7 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     # Exit 1 is pytest's "some tests failed"; other codes are session failures.
     if code not in (0, 1) or (code == 1 and not failing):
         return _SuiteRun(False, None)
-    return _SuiteRun(passed, failing)
+    return _SuiteRun(passed, failing, frozenset(_passing_acceptance_ids(junit)))
 
 
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
@@ -432,15 +441,20 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             ctx.git.remove_worktree(worktree)
         tests = "pass"
         for i, (command, run, acceptance_only) in enumerate(runs):
-            if run.passed and not acceptance_only:
-                continue
-            if not run.passed and run.failing is None:
-                tests = "fail"
+            if run.failing is None:
+                # Without per-test results (not pytest, no usable JUnit) the exit code decides.
+                if not run.passed:
+                    tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            head_failing = run.failing or frozenset()
+            # Acceptance tests that pass on the base must also pass on the merge result:
+            # a skip or a removal blocks just like a new failure (#1105).
+            head_failing = run.failing
             base_failing = frozenset()
-            if acceptance_only:
+            base_passing = None
+            if acceptance_only or run.passed:
+                # A green head still needs the base's passing ids; a cached baseline costs no run.
+                # A cache that excluded more files leaves those files unprotected, not blocked.
                 try:
                     baseline = _capture_baseline(
                         ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
@@ -449,13 +463,17 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                         prepare=lambda: None, wait=wait, required_ids=head_failing,
                     )
                 except AttemptFailure:
-                    tests = "fail"
-                    broken.extend(sorted(head_failing))
+                    if acceptance_only:
+                        tests = "fail"
+                        broken.extend(sorted(head_failing))
+                    # A green full suite without usable base evidence keeps its exit-code verdict.
                     continue
                 if baseline is not None:
-                    base_failing = frozenset(baseline.failing_ids)
+                    base_failing = frozenset(baseline.failing_ids or ())
+                    base_passing = frozenset(baseline.node_ids)
             else:
                 selection = command
+                saved = None
                 if _pytest_command(command) is not None:
                     saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
                     if saved is not None:
@@ -470,9 +488,17 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 finally:
                     ctx.git.remove_worktree(worktree)
                 base_failing |= on_base.failing or frozenset()
-            broken.extend(sorted(head_failing - base_failing))
+                if saved is not None or on_base.failing is not None:
+                    base_passing = frozenset(saved["node_ids"] if saved is not None else ())
+                    if on_base.failing is not None:
+                        base_passing |= on_base.passing
+            lost = frozenset()
+            if base_passing is not None:
+                lost = _protected(base_passing, ctx.config.acceptance_dir, excluded) - run.passing
+            regressions = (head_failing - base_failing) | lost
+            broken.extend(sorted(regressions))
             failing_on_base.extend(sorted(head_failing & base_failing))
-            if head_failing - base_failing:
+            if regressions:
                 tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
