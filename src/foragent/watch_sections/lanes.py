@@ -79,6 +79,23 @@ def _kind(state: str, phase: str | None, question: str | None = None) -> tuple[s
     return "wait", "squirrel_turn"  # Queue, slot, overlap and limit waits.
 
 
+def row_words(state: str, phase: str | None, question: str | None, language: str) -> tuple[str, str]:
+    """(glyph kind, phase word) for one issue: the one rule every display of an issue's state uses.
+
+    ``question`` comes from the question projection (watch_questions), so a question
+    names its recipient and an answered one names nobody wherever the issue is shown.
+    """
+    from foragent import watch
+
+    kind, key = _kind(state, phase, question)
+    return kind, watch.text(key, language, who=watch.text("question_person", language))
+
+
+def person_turn(language: str) -> str:
+    """The words for a question waiting on the person ("waiting for you")."""
+    return row_words("waiting-human", None, "person", language)[1]
+
+
 def _time(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(value)
@@ -155,7 +172,7 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     language = config.language
     # Whatever the work state, a question names its recipient (#1160).
     question = (snapshot.questions or {}).get(number)
-    kind, words = _kind(state, phase, question)
+    kind, words = row_words(state, phase, question, language)
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The run behind the row: the active one, else (except for a queued issue, which has no
     # run yet) the issue's latest recorded run from the full history, then status.history.
@@ -186,8 +203,7 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     done = finished_acorns(phase, events, started, waiting_from)
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
-            "words": watch.text(words, language, who=watch.text("question_person", language)),
-            "activity": activity,
+            "words": words, "activity": activity,
             # Without a recorded time (a queued issue, a row with no run) the cell says so.
             "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}

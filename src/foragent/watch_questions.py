@@ -14,9 +14,17 @@ flags and run records; it never reads question wording and stores nothing.
   retry or a merge, ends it). An inbox question about the issue answered at or
   after the flag also ends it, since the answer wins over the older flag.
 - ``answered``: that spec or needs-human question was answered; the issue waits
-  to restart. The needs-human label may stay until someone acts on the answer, so
-  it is the person's again only when a needs-human marker comment is newer than
-  every answer about the issue.
+  to restart. The needs-human label may stay until someone acts on the answer.
+
+An answer ends only a question raised before it: an answer older than the issue's
+current question (its routing marker comment, its current spec flag or the start of
+its latest run, whichever is newest) belongs to an earlier question and is ignored.
+An answer also ends only a question of its own kind (``orch_inbox.QUESTION_KINDS``):
+a merge or order decision about the issue never ends its plain question, and a plain
+answer never ends a pending merge or order decision. A spec question is plain. A
+needs-human question takes its kind from the reason recorded in its newest routing
+marker (``reasons.GROUP``: a review is a merge decision, a re-approval an order
+decision, anything else plain); without a marker it is plain.
 
 "At or after the flag" compares the answer with the earlier of the flag's own time
 and when its file was written, so two writers' disagreeing clocks let the answer win;
@@ -32,8 +40,12 @@ ORCHESTRATOR = "orchestrator"
 ANSWERED = "answered"
 NEEDS_HUMAN = "needs-human"
 SPEC = "spec-question"
+# The inbox question kind of a plain question (a spec question, an escalation).
+PLAIN = "question"
 # The machine marker on the first line of a comment that routes an issue to the person.
-ROUTED = re.compile(r"<!-- foragent:needs-human reason=[a-z-]+ -->")
+ROUTED = re.compile(r"<!-- foragent:needs-human reason=([a-z-]+) -->")
+# A routed question's inbox kind by its recorded reason group; every other group is plain.
+KIND_BY_GROUP = {"review": "merge", "reapprove": "order"}
 
 
 class Questions(NamedTuple):
@@ -68,7 +80,7 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
     rows = store.local_issues()
     found: dict[int, str] = {}
     unlinked = 0
-    answers: dict[int, list[datetime]] = {}
+    answers: dict[int, list[tuple[datetime, str]]] = {}  # Issue -> (answered_at, question kind).
     for row in scan(store, "questions")[0]:
         linked = row.get("issues")
         numbers = [number for number in linked if type(number) is int] if isinstance(linked, list) else []
@@ -77,28 +89,36 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
             unlinked += not numbers
         elif (at := _time(row.get("answered_at"))) is not None:
             for number in numbers:
-                answers.setdefault(number, []).append(at)
+                answers.setdefault(number, []).append((at, row.get("kind") or PLAIN))
     history = list(history) if history is not None else None
     for row in rows:
         number = row["number"]
         if row.get("state") != "open" or number in found:
             continue
-        if NEEDS_HUMAN in (row.get("labels") or ()):
-            routed = _routed(row)
-            answered = bool(answers.get(number)) and (routed is None or max(answers[number]) >= routed)
-            found[number] = ANSWERED if answered else PERSON
-            continue
         try:
             flag = store.load_flag(number)
-            run = _latest_run(store, number, history) if flag is not None and flag.reason == SPEC else None
+            run = _latest_run(store, number, history)
         except (OSError, ValueError, TypeError, KeyError):
-            continue
-        if run is None or run.outcome != SPEC:  # A running or later run has moved on.
-            continue
-        flagged = _flagged(store, number, flag.flagged_at)
-        answered = flagged is not None and any(at >= flagged for at in answers.get(number, ()))
-        found[number] = ANSWERED if answered else ORCHESTRATOR
+            flag = run = None
+        # The current spec question: the flag says so and the latest run ended with it.
+        spec = flag is not None and flag.reason == SPEC and run is not None and run.outcome == SPEC
+        flagged = _flagged(store, number, flag.flagged_at) if spec else None
+        if NEEDS_HUMAN in (row.get("labels") or ()):
+            # Routed to the person: a decision of the question's own kind, made after it was raised.
+            routed, kind = _routed(row)
+            raised = [moment for moment in (routed, flagged, _time(run.started_at) if run else None) if moment]
+            found[number] = ANSWERED if _answered(answers.get(number, ()), kind, max(raised, default=None)) else PERSON
+        elif spec:
+            # Not routed yet: a plain answer after the flag ends it. The flag is saved when the
+            # run ends, after its start, so it is the question's newest fact.
+            answered = flagged is not None and _answered(answers.get(number, ()), PLAIN, flagged)
+            found[number] = ANSWERED if answered else ORCHESTRATOR
     return Questions(found, unlinked)
+
+
+def _answered(answers: Iterable[tuple[datetime, str]], kind: str, raised: datetime | None) -> bool:
+    """Whether a decision of ``kind`` came at or after the question was raised (unknown raise time: any)."""
+    return any(given == kind and (raised is None or at >= raised) for at, given in answers)
 
 
 def recipients(store, history: Iterable[Any] | None = None) -> dict[int, str]:
@@ -106,15 +126,18 @@ def recipients(store, history: Iterable[Any] | None = None) -> dict[int, str]:
     return collect(store, history).issues
 
 
-def _routed(row: dict[str, Any]) -> datetime | None:
-    """When the issue was last routed to the person: its newest needs-human marker comment, if recorded."""
-    times = []
+def _routed(row: dict[str, Any]) -> tuple[datetime | None, str]:
+    """(when, inbox kind) of the issue's newest needs-human marker comment; (None, plain) without one."""
+    from foragent.reasons import GROUP, Reason
+
+    markers = []
     for comment in row.get("comments") or ():
         body = comment.get("body") if isinstance(comment, dict) else None
-        if isinstance(body, str) and body and ROUTED.fullmatch(body.splitlines()[0].strip()):
-            if (at := _time(comment.get("created_at"))) is not None:
-                times.append(at)
-    return max(times, default=None)
+        match = ROUTED.fullmatch(body.splitlines()[0].strip()) if isinstance(body, str) and body else None
+        if match and (at := _time(comment.get("created_at"))) is not None:
+            group = GROUP.get(Reason(match[1])) if match[1] in Reason._value2member_map_ else None
+            markers.append((at, KIND_BY_GROUP.get(group or "", PLAIN)))
+    return max(markers, key=lambda marker: marker[0], default=(None, PLAIN))
 
 
 def _flagged(store, number: int, flagged_at: str) -> datetime | None:

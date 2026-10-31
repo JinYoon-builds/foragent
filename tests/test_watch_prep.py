@@ -27,7 +27,7 @@ def test_ledger_scene_lists_decisions_and_asks_for_confirmation(tmp_path):
     record(store, "ledger", add="D18 decisions live in the docs")
     lines = frame(store.order_progress(), language="en")
     assert lines[0] == "📝 Login · sorting the decisions"
-    assert lines[1:] == ["D18 decisions live in the docs", "Please confirm these decisions."]
+    assert lines[1:] == ["D18 decisions live in the docs", "waiting for you · Please confirm these decisions."]
 
 
 def test_chunk_table_marks_filled_empty_and_asked_cells_in_ascii(tmp_path):
@@ -42,7 +42,7 @@ def test_chunk_table_marks_filled_empty_and_asked_cells_in_ascii(tmp_path):
     assert row[header.index("Goal")] == "v"
     assert row[header.index("Lane")] == "."
     assert row[header.index("Skills")] == "?"
-    assert lines[3:] == ["4 empty cells left", "Auth · Skills: Which skill?"]
+    assert lines[3:] == ["4 empty cells left", "waiting for you · Auth · Skills: Which skill?"]
 
 
 def test_numbers_appear_only_after_publish_with_local_titles(tmp_path):
@@ -116,6 +116,7 @@ def test_preparation_stays_when_a_short_screen_drops_other_sections(tmp_path, mo
     config = replace(Config(), language="en", view_glyphs="ascii")
     lines = plain(watch_layout._frame(snapshot, config, None, tick=0, width=60, selected=None,
                                       now=None, height=24))
-    assert lines[:3] == ["[+] Login · sorting the decisions", "D18 decision", "Please confirm these decisions."]
+    assert lines[:3] == ["[+] Login · sorting the decisions", "D18 decision",
+                         "waiting for you · Please confirm these decisions."]
     # Shell: an explicit height drops nothing; the other rows stay reachable below.
     assert lines.count("filler") == 30

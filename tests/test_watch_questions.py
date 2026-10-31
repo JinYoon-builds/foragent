@@ -133,3 +133,72 @@ def test_a_question_names_its_recipient_whatever_the_work_state(tmp_path):
     assert rows[12] is not None and "waiting for you" in rows[12], frame
     assert rows[13] is None, "a folded lane still hides quiet queued work"
     assert presence._question_groups(store, "en") == " · questions: you 2"
+
+
+def test_the_issue_box_names_the_same_recipient_as_the_rows(tmp_path):
+    """Defect class: a display path (the issue box) bypassing the question projection."""
+    from foragent import watch
+    from foragent.config import Config
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    config = Config(language="en", view_glyphs="ascii", lanes={"api": {}})
+    _spec_question(store, tracker, 14, clock)
+    _spec_question(store, tracker, 15, clock)
+    _refresh(store, tracker, clock)
+    phase = lambda number: next(line for line in watch.issue_box(number, store, config) if line.startswith("Now:"))
+    assert "waiting for the orchestrator" in phase(14)
+    asked = orch_inbox.ask(store, "Which region?", ["Seoul", "Tokyo"], 1, issues=[14])
+    assert "waiting for you" in phase(14) and "waiting for the orchestrator" in phase(15)
+    clock[0] += timedelta(minutes=1)
+    orch_inbox.answer(store, asked["id"], "Seoul")
+    assert "waiting to restart" in phase(14) and "you" not in phase(14) and "orchestrator" not in phase(14)
+
+
+def test_an_older_answer_or_another_kind_of_decision_never_ends_the_current_question(tmp_path):
+    """Defect class: stale answers (earlier questions, other kinds) overriding current question facts."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    # An earlier question about #16, answered before its current run began.
+    old = orch_inbox.ask(store, "Earlier question?", ["a", "b"], 1, issues=[16])
+    orch_inbox.answer(store, old["id"], "a")
+    clock[0] += timedelta(minutes=5)
+    _spec_question(store, tracker, 16, clock)  # A new run that asks again.
+    os.utime(store.root / "flags" / "16.json", (clock[0].timestamp(),) * 2)
+    _refresh(store, tracker, clock)
+    assert watch_questions.recipients(store) == {16: watch_questions.ORCHESTRATOR}
+    # Routed to the person through needs-human, with no marker comment recorded.
+    tracker.add_labels(16, ["needs-human"])
+    _refresh(store, tracker, clock)
+    assert watch_questions.recipients(store) == {16: watch_questions.PERSON}
+    tracker.remove_labels(16, ["needs-human"])
+    _refresh(store, tracker, clock)
+    # A merge decision about the issue, made after the flag, does not answer its spec question.
+    clock[0] += timedelta(minutes=1)
+    merge = orch_inbox.ask(store, "Merge #16?", ["yes", "no"], 1, issues=[16], kind="merge")
+    orch_inbox.answer(store, merge["id"], "yes")
+    assert watch_questions.recipients(store) == {16: watch_questions.ORCHESTRATOR}
+    plain = orch_inbox.ask(store, "Which region?", ["a", "b"], 1, issues=[16])
+    orch_inbox.answer(store, plain["id"], "a")
+    assert watch_questions.recipients(store) == {16: watch_questions.ANSWERED}
+
+
+def test_only_a_decision_of_the_questions_own_kind_ends_a_routed_question(tmp_path):
+    """Defect class: unrelated decisions (merge, order, plain) suppressing a current question."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 17, clock)  # A spec question routed through needs-human, no marker.
+    tracker.add_labels(17, ["needs-human"])
+    tracker.add_issue(18, "Merge it?", labels=["approved", "needs-human", "lane:api"])
+    review = {"id": 3, "author": "foragent", "created_at": NOW.isoformat(),
+              "body": "<!-- foragent:needs-human reason=risk-high -->\nA risky change needs your merge decision."}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={18: [review]})
+    clock[0] += timedelta(minutes=1)
+    for number, kind in ((17, "merge"), (17, "order"), (18, "question"), (18, "order")):
+        asked = orch_inbox.ask(store, f"{kind} about #{number}?", ["yes", "no"], 1, issues=[number], kind=kind)
+        orch_inbox.answer(store, asked["id"], "no")
+    assert watch_questions.recipients(store) == {17: watch_questions.PERSON, 18: watch_questions.PERSON}
+    for number, kind in ((17, "question"), (18, "merge")):
+        asked = orch_inbox.ask(store, f"{kind} about #{number}?", ["yes", "no"], 1, issues=[number], kind=kind)
+        orch_inbox.answer(store, asked["id"], "yes")
+    assert watch_questions.recipients(store) == {17: watch_questions.ANSWERED, 18: watch_questions.ANSWERED}
