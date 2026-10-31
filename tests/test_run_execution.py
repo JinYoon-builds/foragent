@@ -9,6 +9,7 @@ import pytest
 
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
+from foragent.run_prompts import goal_condition
 from foragent.runner import run_issue
 from runner_support import COMMAND, enable_reviewer, run_case, scripted_results
 
@@ -128,9 +129,7 @@ def test_claude_native_goal_settings_and_independent_retry(run_case, acceptance_
     }
     assert not settings_path.is_relative_to(c.store.worktree_path(1))
     assert (settings_path.parent / "stop-block-count").read_text() == "0"
-    expected = ('Every command in the "Done when" list below exits 0 when run from the repository root, '
-                f'nothing under {acceptance_dir} is modified, and no files outside this repository are changed. '
-                'Or stop after 40 turns.')
+    expected = goal_condition(acceptance_dir)
     assert len(c.executor.calls) == 2
     for call in c.executor.calls:
         assert call["goal"] == expected
