@@ -216,8 +216,11 @@ class RecordingTracker:
         def observe(*args, **kwargs):
             started = self._started()
             result = value(*args, **kwargs)
+            # Any delegated read that returns issues (one or a filtered list) is an observation.
             if isinstance(result, Issue):
                 self._ingest([result], started)
+            elif isinstance(result, list) and result and all(isinstance(item, Issue) for item in result):
+                self._ingest(result, started)
             return result
 
         return observe
@@ -447,25 +450,41 @@ class RecordingTracker:
         row = next((row for row in self._context.store.local_issues() if row["number"] == n), None)
         return observed_facts(row) if row is not None else None
 
-    def _write(self, n, action, operation, started, **payload):
-        """Send now, or append an intent that counts from ``started`` against the issue as it was then."""
+    def _write(self, n, action, operation, started, *, queued=None, **payload):
+        """Every write is an intent first, counted from ``started`` against the issue as it was then.
+
+        It is sent now unless writes must wait (then ``queued`` replaces the
+        payload, e.g. the rest of a label removal). A sent intent is visible
+        to every later intent's premise while its send is in flight; the
+        result is appended as an attempt. A failure nobody retries is final.
+        Comments stay direct sends: they change no labels or state.
+        """
         store = self._context.store
         premise = self._premise(n)
         pending = store.github_outbox()
-        if not (any(entry["issue"] == n for entry in pending)
+        if (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
-            try:
-                return operation(), None
-            except TrackerError as exc:
-                if not self.queue_writes or not exc.is_rate_limit:
-                    raise
-                from foragent.orch_github import pause
-
-                pause(self._context, exc)
+            return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
+        entry = self._queue(n, action, started, premise, payload) if action != "comment" else None
+        try:
+            result = operation()
+        except TrackerError as exc:
+            retry = self.queue_writes and exc.is_rate_limit
+            if entry is None and retry:
                 entry = self._queue(n, action, started, premise, payload)
-                store.record_github_attempt(entry["id"], started, False)
-                return None, entry
-        return None, self._queue(n, action, started, premise, payload)
+            if entry is not None:
+                store.record_github_attempt(entry["id"], started, False, final=not retry,
+                                            labels=payload["labels"] if action == "remove_labels" else None)
+            if not retry:
+                raise
+            from foragent.orch_github import pause
+
+            pause(self._context, exc)
+            return None, entry
+        if entry is not None:
+            store.record_github_attempt(entry["id"], started, True,
+                                        labels=payload["labels"] if action == "remove_labels" else None)
+        return result, None
 
     def _queue(self, n, action, started, premise, payload):
         """Append the intent; a read made after it started may already have dropped it."""
@@ -528,37 +547,38 @@ class RecordingTracker:
                 pause(self._context, exc)
                 return
 
-    def _acknowledge(self, n, started, result, **facts):
-        """A direct write that succeeded is an observation at its start; any read during the send wins."""
+    def _acknowledge(self, n, started, result):
+        """A write's response that echoes the issue is an observation started with the write."""
         if isinstance(result, Issue):
             self._ingest([result], started)
-        if facts:
-            self._context.store.update_local_issue(n, observed_at=started, **facts)
 
     def add_labels(self, n, labels):
         labels = list(labels)
         if not labels:
             return
+        from foragent.labels import READY
+
         started = self._started()
+        # A ready label belongs to the approval current when the write started, not when it lands.
+        approval = self._context.store.load_approval(n) if READY in labels else None
+        approved = {"ready_approval": approval.approved_at if approval is not None else None} if READY in labels else {}
         result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), started,
-                                     labels=labels)
-        if queued:
-            return
-        self._acknowledge(n, started, result)
-        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes,
-                                          observed_at=started)
+                                     labels=labels, **approved)
+        if not queued:
+            self._acknowledge(n, started, result)
 
     def remove_labels(self, n, labels):
         labels = list(labels)
         for index, label in enumerate(labels):
             started = self._started()
             result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
-                                         started, labels=labels[index:])
+                                         started, labels=[label], queued={"labels": labels[index:]})
             if queued:
+                if queued["labels"] == [label] and labels[index + 1:]:
+                    # This label's send was rate-limited: the rest wait behind it, in order.
+                    self._queue(n, "remove_labels", started, self._premise(n), {"labels": labels[index + 1:]})
                 break
             self._acknowledge(n, started, result)
-            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes,
-                                              observed_at=started)
 
     def list_comments(self, n):
         comments = self._tracker.list_comments(n)
@@ -585,15 +605,13 @@ class RecordingTracker:
         started = self._started()
         _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
                                 started, title=title, body=body)
-        if not queued:
-            self._acknowledge(n, started, None, title=title, body=body)
+        del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
     def close_issue(self, n, comment=None):
         started = self._started()
         _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
                                else self._tracker.close_issue(n, comment), started, body=comment)
-        if not queued:
-            self._acknowledge(n, started, None, state="closed")
+        del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)

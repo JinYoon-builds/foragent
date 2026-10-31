@@ -4,6 +4,9 @@ import threading as _threading
 from datetime import datetime, timedelta
 from typing import Any
 
+import foragent.state_observations as _observations
+
+
 REFRESH_INTERVAL = timedelta(minutes=5)
 
 
@@ -126,7 +129,8 @@ class IssueSnapshotMixin:
         if action != "comment":
             _state._forget_reads(row)
         if action in {"add_labels", "remove_labels"}:
-            self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes)
+            self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes,
+                                ready_approval=entry.get("ready_approval", _observations._UNSET))
         elif action == "update_issue":
             row.update(title=entry["title"], body=entry["body"])
         elif action == "close_issue":
@@ -139,7 +143,8 @@ class IssueSnapshotMixin:
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
                            started_at: datetime | None = None, premise: dict[str, Any] | None = None,
-                           dropped: list[bool] | None = None, **payload: Any) -> dict[str, Any]:
+                           dropped: list[bool] | None = None, ready_approval: Any = _observations._UNSET,
+                           **payload: Any) -> dict[str, Any]:
         """Append one intent to the log.
 
         ``queued_at`` is when the write began (``started_at``, default now).
@@ -158,8 +163,13 @@ class IssueSnapshotMixin:
                 premise = _observations.observed_facts(self._visible(snapshot, row))
             entry = {"id": identity, "issue": number, "action": action,
                      "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
-            snapshot.setdefault("outbox", []).append({
-                **entry, "premise": premise, "attempts": [], "lanes": sorted(lanes or {})})
+            from foragent.labels import READY
+
+            record = {**entry, "premise": premise, "attempts": [], "lanes": sorted(lanes or {})}
+            if action in ("add_labels", "remove_labels") and READY in payload.get("labels", ()):
+                # The approval this ready-label write belongs to, fixed when the write started.
+                record["ready_approval"] = self._ready_approval(number, action == "remove_labels", ready_approval)
+            snapshot.setdefault("outbox", []).append(record)
             snapshot["outbox_sequence"] = identity
             facts, seen = _observations.latest(snapshot, number)
             # Only a read that started after the write judges it now; one stored at the same
@@ -209,8 +219,10 @@ class IssueSnapshotMixin:
             row = self._local_issue(snapshot, number)
             facts = {key: fields.pop(key) for key in _observations.FACTS if key in fields}
             if facts:
-                self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
-                              observed_at or self._now(), None, by_person=False)
+                outcome = self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
+                                        observed_at or self._now(), None, by_person=False)
+                if outcome == "stale" and not fields:
+                    return  # An older observation persists nothing.
                 row = self._local_issue(snapshot, number)
             if any(row.get(key) != value for key, value in fields.items()):
                 _state._forget_reads(row)
@@ -223,7 +235,7 @@ class IssueSnapshotMixin:
             self.ingest([issue], observed_at or self._now(), lanes)
 
     def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict,
-                      observed_at: datetime | None = None) -> None:
+                      observed_at: datetime | None = None, ready_approval: Any = _observations._UNSET) -> None:
         """A local label change, recorded as an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
@@ -231,15 +243,17 @@ class IssueSnapshotMixin:
                 return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
             changed = dict(row, labels=list(row["labels"]))
-            self._record_labels(changed, labels, remove=remove, lanes=lanes)
-            self._observe(snapshot, number, _observations.observed_facts(changed), observed_at or self._now(), lanes,
-                          by_person=False)
+            self._record_labels(changed, labels, remove=remove, lanes=lanes, ready_approval=ready_approval)
+            if self._observe(snapshot, number, _observations.observed_facts(changed), observed_at or self._now(),
+                             lanes, by_person=False) == "stale":
+                return  # An older observation persists nothing, not even its ready approval.
             row = self._local_issue(snapshot, number)
             if "ready_approval" in changed:
                 row["ready_approval"] = changed["ready_approval"]
             self._save_local_issue(snapshot, row)
 
-    def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict) -> None:
+    def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict,
+                       ready_approval: Any = _observations._UNSET) -> None:
         from foragent.labels import READY, issue_lane
 
         current = set(row["labels"])
@@ -248,8 +262,7 @@ class IssueSnapshotMixin:
             _state._forget_reads(row)
         row["lane"] = issue_lane(row["labels"], lanes)
         if READY in labels:
-            approval = self.load_approval(row["number"])
-            row["ready_approval"] = None if remove or approval is None else approval.approved_at
+            row["ready_approval"] = self._ready_approval(row["number"], remove, ready_approval)
 
     def record_comments(self, number: int, comments: list[dict], *, append: bool = False) -> None:
         with self._state_lock():
@@ -273,4 +286,3 @@ class IssueSnapshotMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
-import foragent.state_observations as _observations

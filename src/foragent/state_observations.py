@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 FACTS = ("title", "body", "labels", "state", "state_reason")
+_UNSET: Any = object()  # A recorded approval may itself be None.
 EARLIEST = datetime.min.replace(tzinfo=UTC)
 
 
@@ -95,6 +96,8 @@ def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any
         return None
     if facts is None:
         return "absent"
+    if abandoned(intent):
+        return "abandoned"
     if shows(expected, intent):
         return "shown"
     sent = sent_at(intent)
@@ -120,6 +123,16 @@ def issue_facts(issue: Any) -> dict[str, Any]:
             "state_reason": getattr(issue, "state_reason", None)}
 
 
+def known_numbers(snapshot: dict[str, Any]) -> set[int]:
+    """Every issue the store knows: observed rows, recorded absences and issues with intents.
+
+    An absence observation (a complete listing's omissions) must reach all of
+    them, including an issue whose only trace is an intent queued after it vanished.
+    """
+    return ({int(key) for key in snapshot["issues"]} | {int(key) for key in snapshot.get("absent", {})}
+            | {intent["issue"] for intent in snapshot.get("outbox", [])})
+
+
 def missing_since(snapshot: dict[str, Any], number: int) -> datetime | None:
     """When the issue was last observed missing: its absence record, or the latest
     complete listing if no read since observed it."""
@@ -143,11 +156,15 @@ def latest(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any] | None
 
 
 def tombstoned(snapshot: dict[str, Any], number: int, at: datetime) -> bool:
-    """A local change at ``at`` has no issue to change: it was found missing (any time), or a
-    complete listing that started after the change omitted it."""
+    """A local change at ``at`` has no issue to change: a read that started after it found the
+    issue missing. A change made after the absence is a newer observation and counts."""
     facts, seen = latest(snapshot, number)
-    return seen is not None and facts is None and (
-        str(number) in snapshot.get("absent", {}) or seen > at)
+    return seen is not None and facts is None and seen > at
+
+
+def abandoned(intent: dict[str, Any]) -> bool:
+    """A send failed in a way nobody will retry (the caller got the error): the write is not pending."""
+    return any(attempt.get("final") for attempt in intent.get("attempts", []))
 
 
 class IssueObservationsMixin:
@@ -169,10 +186,11 @@ class IssueObservationsMixin:
                 intent = {**intent, "premise": observed_facts(legacy)}
             reason = retirement(facts, at, intent, expected, by_person=by_person)
             if reason is None:
-                expected = effect(expected, intent) if expected is not None else None
+                if expected is not None and not abandoned(intent):
+                    expected = effect(expected, intent)
                 continue
             gone.add(intent["id"])
-            if reason in ("absent", "dropped") and sent_at(intent) is None:
+            if reason in ("absent", "dropped") and sent_at(intent) is None and not abandoned(intent):
                 dropped = True
             elif row is not None:
                 self._keep_local_record(row, intent)
@@ -191,9 +209,18 @@ class IssueObservationsMixin:
                 row["comments"] = row.get("comments", []) + [{
                     "id": identity, "body": intent["body"], "author": "foragent", "created_at": intent["queued_at"]}]
         if intent["action"] in {"add_labels", "remove_labels"} and READY in intent["labels"]:
-            approval = self.load_approval(row["number"])
-            row["ready_approval"] = (None if intent["action"] == "remove_labels" or approval is None
-                                     else approval.approved_at)
+            row["ready_approval"] = self._ready_approval(row["number"], intent["action"] == "remove_labels",
+                                                         intent.get("ready_approval", _UNSET))
+
+    def _ready_approval(self, number: int, remove: bool, recorded: Any = None) -> str | None:
+        """Which approval a ready-label write belongs to: the one recorded when the write
+        started; an intent written before this was recorded falls back to the current approval."""
+        if remove:
+            return None
+        if recorded is not _UNSET:
+            return recorded
+        approval = self.load_approval(number)
+        return approval.approved_at if approval is not None else None
 
     def _observe(self, snapshot: dict[str, Any], number: int, facts: dict[str, Any] | None, at: datetime,
                  lanes: dict | None, *, since_revision: int | None = None, by_person: bool = True) -> str:
@@ -217,11 +244,14 @@ class IssueObservationsMixin:
             return "stale"
         if facts is None:
             absent = snapshot.setdefault("absent", {})
+            before = (absent.get(key), len(snapshot.get("outbox", [])), key in snapshot["issues"])
             if missing is None or missing <= at:
                 absent[key] = at.isoformat()
             dropped = self._retire(snapshot, number, None, at)
             if not any(intent["issue"] == number for intent in snapshot.get("outbox", [])):
                 snapshot["issues"].pop(key, None)
+            if (absent.get(key), len(snapshot.get("outbox", [])), key in snapshot["issues"]) == before:
+                return "stale"  # Already known missing since then: this absence changes nothing.
             return "dropped" if dropped else "applied"
         snapshot.setdefault("absent", {}).pop(key, None)
         row = snapshot["issues"].setdefault(key, self._new_row(number))
@@ -243,24 +273,28 @@ class IssueObservationsMixin:
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            dropped, seen, changed = set(), set(), False
+            dropped, seen, applied, changed = set(), set(), set(), False
             for issue in issues:
                 if issue.is_pull_request:
                     continue
                 seen.add(issue.number)
                 outcome = self._observe(snapshot, issue.number, issue_facts(issue), started_at, lanes)
-                changed |= outcome != "stale"
+                if outcome != "stale":
+                    applied.add(issue.number)
                 if outcome == "dropped":
                     dropped.add(issue.number)
             if complete:
                 if (stamp(snapshot.get("complete_at")) or EARLIEST) <= started_at:
                     snapshot["complete_at"] = started_at.isoformat()
                     changed = True
-                for key in list(snapshot["issues"]):
-                    if int(key) not in seen and self._observe(snapshot, int(key), None, started_at, lanes) == "dropped":
-                        dropped.add(int(key))
-            if changed:
-                self._save_rows(snapshot, seen)
+                for number in sorted(known_numbers(snapshot) - seen):
+                    outcome = self._observe(snapshot, number, None, started_at, lanes)
+                    changed |= outcome != "stale"
+                    if outcome == "dropped":
+                        dropped.add(number)
+            if changed or applied:
+                # Only accepted observations are stamped; an older one persists nothing.
+                self._save_rows(snapshot, applied)
             return sorted(dropped)
 
     def ingest_absence(self, number: int, started_at: datetime) -> bool:
@@ -280,8 +314,12 @@ class IssueObservationsMixin:
         self._write_json(self.root / "issues.json", snapshot)
 
     def record_github_attempt(self, intent_id: int, started_at: datetime, ok: bool, *,
-                              labels: list[str] | None = None, comment: int | None = None) -> None:
-        """Append one send attempt to its intent; an intent already retired gains nothing."""
+                              labels: list[str] | None = None, comment: int | None = None,
+                              final: bool = False) -> None:
+        """Append one send attempt to its intent; an intent already retired gains nothing.
+
+        ``final`` marks a failure nobody retries: the intent is then neither visible nor pending.
+        """
         with self._state_lock():
             snapshot = self._issue_snapshot()
             intent = next((item for item in snapshot.get("outbox", []) if item["id"] == intent_id), None)
@@ -292,6 +330,8 @@ class IssueObservationsMixin:
                 attempt["labels"] = list(labels)
             if comment is not None:
                 attempt["comment_id"] = comment
+            if final:
+                attempt["final"] = True
             intent.setdefault("attempts", []).append(attempt)
             facts, seen = latest(snapshot, intent["issue"])
             if ok and seen is not None and seen > started_at:
@@ -305,6 +345,8 @@ class IssueObservationsMixin:
         visible = _copy(row)
         for intent in sorted((item for item in snapshot.get("outbox", []) if item["issue"] == row["number"]),
                              key=queue_order):
+            if abandoned(intent):
+                continue
             known = {name: {} for name in intent.get("lanes", [])}
             item = {**intent, "id": -comment_id(intent)}
             if any(comment["id"] == -item["id"] for comment in visible.get("comments", [])):
@@ -319,9 +361,9 @@ class IssueObservationsMixin:
         """Unretired intents without a successful send, in queue order, with the labels still to send."""
         pending = []
         for intent in sorted(snapshot.get("outbox", []), key=queue_order):
-            if sent_at(intent) is not None:
+            if sent_at(intent) is not None or abandoned(intent):
                 continue
-            entry = {key: _copy(value) for key, value in intent.items() if key not in ("premise", "attempts", "lanes")}
+            entry = {key: _copy(value) for key, value in intent.items() if key not in ("premise", "attempts", "lanes", "ready_approval")}
             if intent["action"] == "remove_labels":
                 entry["labels"] = [label for label in intent["labels"] if label not in sent_labels(intent)]
             pending.append(entry)

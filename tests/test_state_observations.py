@@ -149,11 +149,13 @@ def test_a_late_queued_write_is_judged_by_the_whole_latest_observation(case, new
     other = Issue(8, "Other", "", frozenset(), "open")
 
     def limited(*args, **kwargs):
-        case.clock[0] = at(2)
+        case.clock[0] = at(2)  # A read during the send reports what it drops.
         if newer == "complete listing":
-            case.store.ingest([other], at(2), {}, complete=True)
+            case.remote.issues = {8: other}
+            case.reader.list_issues()
         else:
-            case.store.ingest([Issue(7, "Title", "Body", frozenset({"base", "needs-human"}), "open")], at(2), {})
+            case.remote.issues[7] = Issue(7, "Title", "Body", frozenset({"base", "needs-human"}), "open")
+            case.reader.get_issue(7)
         case.clock[0] = at(3)
         raise TrackerError("API rate limit exceeded (HTTP 403)")
 
@@ -211,3 +213,172 @@ def test_a_read_older_than_a_partial_send_keeps_the_rest_of_the_removal_pending(
     # Started after the send of "a": "a" is gone by our own send, still no person's change.
     assert case.store.ingest([Issue(7, "Title", "Body", frozenset({"b"}), "open")], at(5), {}) == []
     assert [item["labels"] for item in case.store.github_outbox()] == [["b"]]
+
+
+READS = {
+    "list_issues": lambda case: case.reader.list_issues(),
+    "list_issues_open": lambda case: case.reader.list_issues("open"),
+    "list_open_issues": lambda case: case.reader.list_open_issues(),
+    "issues_closed_since": lambda case: case.reader.issues_closed_since(T0),
+    "get_issue": lambda case: case.reader.get_issue(7),
+    "sub_issues": lambda case: case.reader.sub_issues(9),
+    "parent_issue": lambda case: case.reader.parent_issue(10),
+    "observe_closed_issues": lambda case: case.reader.observe_closed_issues(observed_at=case.clock[0]),
+    "refresh_issues": lambda case: case.reader.refresh_issues(),
+}
+
+
+@pytest.mark.parametrize("read", sorted(READS))
+def test_every_read_returning_issues_goes_through_ingest(case, read):
+    case.remote.add_issue(9, "Parent")
+    case.remote.add_sub_issue(9, 7)
+    case.remote.add_issue(10, "Child")
+    case.remote.set_parent(10, 7)
+    case.store.record_closed_issue_watermark(T0)
+    case.store.queue_github_write(7, "add_labels", labels=["mine"])
+    closed = read in ("issues_closed_since", "observe_closed_issues")
+    case.clock[0] = at(1)
+    case.remote.issues[7] = Issue(7, "Newer", "Body", frozenset({"base", "mine"}), "closed" if closed else "open",
+                                  updated_at=at(1).isoformat())
+    READS[read](case)
+    assert row(case)["title"] == "Newer", f"{read} must record the newer facts"
+    assert case.store.github_outbox() == [], f"{read} must retire the intent its facts confirm"
+
+
+def saved_rows(case):
+    return json.loads((case.store.root / "issues.json").read_text(encoding="utf-8"))["issues"]
+
+
+def test_an_older_observation_in_a_listing_persists_nothing_for_that_issue(case):
+    case.store.ingest([Issue(7, "Newest", "Body", frozenset({"base"}), "open")], at(5), {})
+    before = saved_rows(case)["7"]
+    case.store.ingest([Issue(7, "Older", "Body", frozenset({"base"}), "open"), Issue(8, "New", "", frozenset(), "open")],
+                      at(2), {})
+    assert saved_rows(case)["7"] == before, "No seen-stamp, revision or updated_at for a rejected observation"
+    assert saved_rows(case)["8"]["title"] == "New"
+
+
+@pytest.mark.parametrize("local", ["facts", "labels", "facts_and_field"])
+def test_an_older_local_update_persists_nothing_of_its_facts(case, local):
+    case.store.ingest([Issue(7, "Newest", "Body", frozenset({"base"}), "open")], at(5), {})
+    path = case.store.root / "issues.json"
+    before, rows = path.read_bytes(), saved_rows(case)["7"]
+    if local == "facts":
+        case.store.update_local_issue(7, observed_at=at(2), title="Older")
+    elif local == "labels":
+        case.store.record_labels(7, ["ready"], remove=False, lanes={}, observed_at=at(2))
+    else:
+        case.store.update_local_issue(7, observed_at=at(2), title="Older", pr_number=4)
+    if local == "facts_and_field":
+        after = saved_rows(case)["7"]
+        assert (after["title"], after["observed_at"], after["pr_number"]) == ("Newest", rows["observed_at"], 4)
+    else:
+        assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_a_complete_listing_retires_an_intent_queued_for_an_issue_already_gone(case, bulk):
+    other = Issue(8, "Other", "", frozenset(), "open")
+    case.store.ingest_absence(7, at(1))
+    case.clock[0] = at(2)
+    case.store.queue_github_write(7, "add_labels", labels=["late"])  # A write after the absence counts.
+    if bulk:
+        dropped = case.store.refresh_local_issues([other], [], {}, at(3))
+    else:
+        dropped = case.store.ingest([other], at(3), {}, complete=True)
+    assert dropped == [7] and case.store.github_outbox() == []
+
+
+@pytest.mark.parametrize("older", ["absence", "complete listing"])
+def test_an_absence_older_than_a_stored_absence_persists_nothing(case, older):
+    case.store.ingest_absence(7, at(3))
+    path = case.store.root / "issues.json"
+    before = path.read_bytes()
+    if older == "absence":
+        assert case.store.ingest_absence(7, at(1)) is False
+    else:
+        case.store.ingest([Issue(8, "Other", "", frozenset(), "open")], at(5), {}, complete=True)
+        before = path.read_bytes()
+        case.store.ingest([Issue(8, "Other", "", frozenset(), "open")], at(4), {}, complete=True)
+    assert path.read_bytes() == before
+
+
+def approve(store, at_time):
+    store.save_approval(7, body="Body", body_sha="sha", acceptance_blobs={}, approved_by="person",
+                        approved_at=at_time.isoformat())
+
+
+@pytest.mark.parametrize("path", ["queued", "direct"])
+def test_a_ready_label_belongs_to_the_approval_current_when_its_write_started(case, path):
+    first, second = at(1), at(2)
+    approve(case.store, first)
+    if path == "queued":
+        case.store.queue_github_write(7, "add_labels", labels=["ready"])
+        approve(case.store, second)  # Reapproved while the write is pending.
+        assert row(case)["ready_approval"] == first.isoformat()
+        case.store.ingest([Issue(7, "Title", "Body", frozenset({"base", "ready"}), "open")], at(3), {})
+        assert case.store.github_outbox() == []
+    else:
+        add = case.remote.add_labels
+
+        def reapproved(*args):
+            result = add(*args)
+            approve(case.store, second)  # Reapproved while the send is in flight.
+            return result
+
+        case.remote.add_labels = reapproved
+        case.reader.add_labels(7, ["ready"])
+    assert row(case)["ready_approval"] == first.isoformat()
+
+
+@pytest.mark.parametrize("action", ["add_labels", "remove_labels", "close_issue"])
+def test_a_write_queued_during_a_direct_send_sees_that_send_in_its_premise(case, action):
+    case.remote.issues[7] = Issue(7, "Title", "Body", frozenset({"base", "gone"}), "open")
+    case.reader.list_issues()
+    send = getattr(case.remote, action)
+
+    def slow(*args, **kwargs):
+        send(*args, **kwargs)
+        case.clock[0] = at(2)  # Another writer queues a comment while this send waits.
+        case.store.queue_github_write(7, "comment", body="Evidence")
+        case.clock[0] = at(3)
+        return None
+
+    setattr(case.remote, action, slow)
+    case.clock[0] = at(1)
+    {"add_labels": lambda: case.reader.add_labels(7, ["mine"]),
+     "remove_labels": lambda: case.reader.remove_labels(7, ["gone"]),
+     "close_issue": lambda: case.reader.close_issue(7)}[action]()
+    case.clock[0] = at(4)
+    case.reader.get_issue(7)  # GitHub now shows the delivered write and nothing else.
+    assert [entry["action"] for entry in case.store.github_outbox()] == ["comment"]
+    assert case.events == []
+
+
+@pytest.mark.parametrize("local", ["update_local_issue", "record_labels", "direct update"])
+def test_a_change_made_after_an_absence_counts_as_newer(case, local):
+    case.store.ingest_absence(7, at(1))
+    case.clock[0] = at(2)
+    if local == "update_local_issue":
+        case.store.update_local_issue(7, observed_at=at(2), title="Back")
+        assert row(case)["title"] == "Back"
+    elif local == "record_labels":
+        case.store.record_labels(7, ["back"], remove=False, lanes={}, observed_at=at(2))
+        assert row(case)["labels"] == ["back"]
+    else:
+        case.reader.update_issue(7, title="Back", body="Back body")
+        assert row(case)["title"] == "Back"
+
+
+def test_a_direct_send_that_fails_for_good_is_neither_visible_nor_retried(case):
+    def broken(*args):
+        raise TrackerError("gh: validation failed (HTTP 422)")
+
+    case.remote.add_labels = broken
+    case.clock[0] = at(1)
+    with pytest.raises(TrackerError, match="422"):
+        case.reader.add_labels(7, ["mine"])
+    assert case.store.github_outbox() == [] and row(case)["labels"] == ["base"]
+    case.clock[0] = at(2)
+    case.reader.get_issue(7)
+    assert raw_intents(case) == [], "The next read clears the abandoned intent from the log"

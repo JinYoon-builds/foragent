@@ -54,10 +54,11 @@ class IssueRefreshMixin:
                     row.update(pr_number=None, merged=False, merged_at=None)
                 if issue.number in comments:
                     row["comments"] = comments[issue.number]
-            for key in list(previous):
-                if int(key) not in observed and self._observe(
-                        snapshot, int(key), None, at, lanes, since_revision=since_revision) == "dropped":
-                    dropped.add(int(key))
+            from foragent.state_observations import known_numbers
+
+            for number in sorted(known_numbers(snapshot) - observed):
+                if self._observe(snapshot, number, None, at, lanes, since_revision=since_revision) == "dropped":
+                    dropped.add(number)
             rows = snapshot["issues"]
             for number in fresh:
                 row = rows[number]
