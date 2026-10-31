@@ -139,3 +139,4 @@
 - [#1026 기획 차례 상자 소식](project_prompt_context.md) — 프롬프트 훅·체크아웃 바인딩·손상 행 격리·notice 형식
 - [#1058 m2 skeleton seams](project_m2_skeleton.md) — REPLACES/PIN, lazy pairs, COLOR_PAIRS after start_color, no state keys on click
 - [#1001 launchd 재불러오기 복구](project_launchd_reload.md) — D97 감싸기 도우미, 3회 bootstrap 순서, reload 사실 파일, pending 재시도
+- [#1059 m2 art](project_m2_art.md) — ansi_rows ▄ fix, pose frames; full suite blocked by sibling #1062/#1064 tests

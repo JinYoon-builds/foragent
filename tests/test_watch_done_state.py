@@ -30,11 +30,13 @@ def plain(lines):
 
 def test_collect_reads_each_done_issue_merge_time_from_local_records(tmp_path):
     tracker = FakeTracker()
-    store = StateStore(tmp_path, now=lambda: NOW)
+    clock = [NOW - timedelta(days=1)]  # Yesterday's gate merges add no merge time for today.
+    store = StateStore(tmp_path, now=lambda: clock[0])
     config = Config(lanes={"api": {"title": "Server"}})
     tracker.add_issue(90, "Order")
     finish(tracker, store, 1, 90)
     finish(tracker, store, 2, 90)
+    clock[0] = NOW
     rows = store.local_issues
     times = {1: "2026-10-21T08:00:00+00:00", 2: "not a time"}
     store.local_issues = lambda: [dict(row, merged_at=times.get(row["number"])) for row in rows()]
