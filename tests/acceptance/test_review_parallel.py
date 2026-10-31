@@ -24,12 +24,13 @@ class PanelExecutor:
     missing overlap at the test boundary, even if the runner catches exceptions.
     """
 
-    def __init__(self, messages, merged="VERDICT: PASS", *, failed=None, timed_out=False):
+    def __init__(self, messages, merged="VERDICT: PASS", *, failed=None, timed_out=False, overlap=1):
         self.messages = messages
         self.merged = merged
         self.failed = failed
         self.timed_out = timed_out
-        self.barrier = Barrier(len(messages))
+        self.barrier = Barrier(min(overlap, len(messages)))
+        self.active = self.maximum = 0
         self.lock = Lock()
         self.calls = []
         self.reviews = []
@@ -44,17 +45,21 @@ class PanelExecutor:
             self.calls.append(kwargs)
             if index < len(self.messages):
                 self.reviews.append(kwargs)
+                self.active += 1
+                self.maximum = max(self.maximum, self.active)
             else:
                 self.merges.append(kwargs)
                 self.early_merge |= len(self.completed) != len(self.messages)
         if index >= len(self.messages):
             return ExecResult(0, False, self.merged, kwargs["log_path"])
-        try:
-            self.barrier.wait(timeout=1.0)
-        except BrokenBarrierError:
-            with self.lock:
-                self.overlap_errors.append(index)
+        if index < len(self.messages) - len(self.messages) % self.barrier.parties:
+            try:
+                self.barrier.wait(timeout=5.0)
+            except BrokenBarrierError:
+                with self.lock:
+                    self.overlap_errors.append(index)
         with self.lock:
+            self.active -= 1
             self.completed.add(index)
         failed = index == self.failed
         # Timeout is an executor-result flag, with no process or signal path.
@@ -77,7 +82,7 @@ def install_panel(case, panel, *, implement=True):
 
 def assert_panel(panel, count):
     assert len(panel.reviews) == count, f"Expected {count} independent reviewers, got {len(panel.reviews)}"
-    assert not panel.overlap_errors, "Reviewers did not overlap at the N-party executor barrier"
+    assert not panel.overlap_errors, "Reviewers did not use the available concurrency before the next batch"
     assert len(panel.merges) == 1, f"Expected exactly one findings merge call, got {len(panel.merges)}"
     assert len(panel.calls) == count + 1
     assert not panel.early_merge, "Findings merge started before all reviewers returned"
@@ -87,14 +92,15 @@ def test_review_parallel_round_robin_reviews_overlap_and_merge_alone_decides(
     git_history, tmp_path, monkeypatch,
 ):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=3, review_max=0, max_retries=1)
-    messages = [f"VERDICT: FAIL\nfeature.txt:{index + 1} — RAW-CLAIM-{index}" for index in range(3)]
+    messages = [f"VERDICT: FAIL\nfeature.txt:{index + 1} — RAW-CLAIM-{index}" for index in range(len(CHECKLIST))]
     # The merger dismisses these claims. A union/majority of reviewer verdicts
     # would block; only the one merge result is authoritative.
-    panel = PanelExecutor(messages, merged="VERDICT: PASS")
+    panel = PanelExecutor(messages, merged="VERDICT: PASS", overlap=3)
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
-    assert_panel(panel, 3)
-    expected = [CHECKLIST[index::3] for index in range(3)]
+    assert_panel(panel, len(CHECKLIST))
+    assert panel.maximum == 3
+    expected = [[item] for item in CHECKLIST]
     shares = []
     for call in panel.reviews:
         prompt = call["prompt"]
@@ -102,7 +108,7 @@ def test_review_parallel_round_robin_reviews_overlap_and_merge_alone_decides(
         assert_checklist(prompt, share)
         shares.append(tuple(item["name"] for item in share))
     assert sorted(shares) == sorted(tuple(item["name"] for item in share) for share in expected)
-    for index in range(3):
+    for index in range(len(CHECKLIST)):
         assert f"RAW-CLAIM-{index}" in panel.merges[0]["prompt"], "Merger lost a reviewer's findings"
     assert outcome == "merged" and case.tracker.merged_prs, "Only merge-call blockers may block the PR"
 
@@ -118,10 +124,10 @@ def test_review_parallel_deduped_merge_findings_reach_blocked_comment_once(
     panel = PanelExecutor([
         "VERDICT: FAIL\n" + "\n".join((shared, left, dismissed)),
         "VERDICT: FAIL\n" + "\n".join((shared, right)),
-    ], merged="VERDICT: FAIL\n" + "\n".join((shared, left, right)))
+    ] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2), merged="VERDICT: FAIL\n" + "\n".join((shared, left, right)))
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
-    assert_panel(panel, 2)
+    assert_panel(panel, len(CHECKLIST))
     merge_prompt = panel.merges[0]["prompt"]
     for finding in (shared, left, right, dismissed):
         assert finding in merge_prompt, "All raw findings must reach the merge model for judgment"
@@ -145,7 +151,7 @@ def test_review_parallel_failed_or_timed_out_reviewer_cannot_silently_pass(
         case = perspective_case(history, root, monkeypatch, count=3, review_max=0, max_retries=1)
         # The first reviewer passes. Today's single-review path never observes
         # reviewer two's failed result and incorrectly merges the PR.
-        panel = PanelExecutor(["VERDICT: PASS"] * 3, failed=1, timed_out=mode == "timed-out")
+        panel = PanelExecutor(["VERDICT: PASS"] * len(CHECKLIST), failed=1, timed_out=mode == "timed-out", overlap=3)
         install_panel(case, panel)
         outcome = run_issue(1, case.ctx)
         results.append((mode, outcome, case, panel))
@@ -153,7 +159,7 @@ def test_review_parallel_failed_or_timed_out_reviewer_cannot_silently_pass(
         assert outcome != "merged" and case.tracker.merged_prs == [], (
             f"Parallel reviewer {mode} was silently ignored; outcome={outcome}"
         )
-        assert len(panel.reviews) == 3, "The failing reviewer must actually be invoked"
+        assert len(panel.reviews) == len(CHECKLIST), "The failing reviewer must actually be invoked"
         assert not panel.overlap_errors
         assert "blocked" in case.tracker.get_issue(1).labels, "Use today's failed-review handling"
 
@@ -167,7 +173,7 @@ def test_review_parallel_non_risk_stays_single_and_risk_count_is_capped(
         history = copy_history(git_history, root)
         case = perspective_case(history, root, monkeypatch, count=9, risk_paths=risk_paths,
                                 review_max=0, max_retries=1)
-        panel = PanelExecutor(["VERDICT: PASS"] * count)
+        panel = PanelExecutor(["VERDICT: PASS"] * count, overlap=count)
         install_panel(case, panel)
         results.append((run_issue(1, case.ctx), case, panel))
     ordinary_outcome, ordinary, single = results[0]
@@ -214,10 +220,11 @@ def test_review_parallel_cli_issue_override_persists_wins_and_clear_restores_con
     case.store.start_run(7, branch="foragent/issue-7", worktree=worktree)
 
     def observe(number, expected_count):
-        panel = PanelExecutor(["VERDICT: PASS"] * expected_count)
+        panel = PanelExecutor(["VERDICT: PASS"] * len(CHECKLIST), overlap=expected_count)
         install_panel(case, panel, implement=False)
         review = _review(number, case.ctx, git, parse_body(approval.body), "origin/main")
-        assert_panel(panel, expected_count)
+        assert_panel(panel, len(CHECKLIST))
+        assert panel.maximum == expected_count, "The issue override limits concurrency, not perspective coverage"
         assert review.verdict == "PASS"
 
     observe(1, 3)

@@ -14,15 +14,12 @@ from test_risk_map import copy_history, entry, offline, risk_case
 from test_skills_autosync import isolated_home
 
 
-NAMES = ("security", "concurrency", "failure", "compatibility", "realism", "docs", "performance")
+NAMES = ("goal-fidelity", "concurrency", "interruption-rollback", "test-quality")
 THEMES = (
-    ("spoof", "tamper", "provenance"),
-    ("race", "toctou", "stale"),
-    ("down", "slow", "partial", "odd"),
-    ("old data", "existing install", "old config"),
-    ("real environment", "api", "fake"),
-    ("behaviour", "readme", "docs/**", "skills", "same pr"),
-    ("hot path", "repeated", "unbounded"),
+    ("goal", "acceptance", "out of scope"),
+    ("race", "ordering", "stale"),
+    ("interrupt", "rollback", "partial"),
+    ("test", "wrong value", "skip", "twice"),
 )
 # Project overrides give prompt assertions distinct, known focus texts without
 # importing the missing API during collection or deriving the oracle from it.
@@ -92,9 +89,9 @@ def test_review_perspectives_defaults_have_exact_order_and_required_focus():
 
 
 def test_review_perspectives_project_appends_and_overrides_in_place(tmp_path):
-    override = {"name": "security", "focus": "PROJECT-SECURITY: verify signed input provenance"}
+    override = {"name": "goal-fidelity", "focus": "PROJECT-GOAL: verify the approved outcome"}
     path = tmp_path / ".foragent.yml"
-    # Put the addition first in YAML: it must still follow all seven defaults.
+    # Put the addition first in YAML: it must still follow all four defaults.
     path.write_text(yaml.safe_dump({
         "review_perspectives": [PROJECT, override], "review_reviewers": 3,
     }), encoding="utf-8")
@@ -152,12 +149,13 @@ def test_review_perspectives_single_risk_reviewer_receives_effective_checklist(
         # runner_support calls the implementer `executor`; risk_case names it
         # `implementer`. Adapt that fixture name before reusing its recorder.
         case.executor = case.implementer
-        calls = enable_reviewer(case, ["VERDICT: PASS"]) if reviewer == "codex" else case.reviewer.calls
+        calls = enable_reviewer(case, ["VERDICT: PASS"] * (len(expected) + 1)) if reviewer == "codex" else case.reviewer.calls
         assert run_issue(1, case.ctx) == "merged"
-        assert len(calls) == 1, "N=1 must make exactly one reviewer call and no merge call"
-        context = calls[0]["prompt"] if reviewer == "codex" else case.review_contexts[0]
+        assert len(calls) == len(expected) + 1, "N=1 queues all round-1 perspectives, then one merge"
+        context = calls[-1]["prompt"] if reviewer == "codex" else case.review_contexts[-1]
         assert case.tracker.merged_prs
         assert_checklist(context, expected)
+
 
 
 def test_review_perspectives_non_risk_prompt_omits_checklist_while_risk_prompt_has_it(
@@ -176,7 +174,7 @@ def test_review_perspectives_non_risk_prompt_omits_checklist_while_risk_prompt_h
     # that never emits any checklist must fail this test today and in future.
     matched = perspective_case(matched_history, matched_root, monkeypatch)
     assert run_issue(1, matched.ctx) == "merged"
-    assert len(matched.reviewer.calls) == 1
-    assert_checklist(matched.reviewer.calls[0]["prompt"], CHECKLIST)
+    assert len(matched.reviewer.calls) == len(CHECKLIST) + 1, "Risk round covers every perspective, then merges"
+    assert_checklist(matched.reviewer.calls[-1]["prompt"], CHECKLIST)
     for item in import_module("foragent.review_perspectives").DEFAULT_PERSPECTIVES:
         assert item["focus"] not in ordinary_prompt
