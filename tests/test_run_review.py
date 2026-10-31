@@ -1026,3 +1026,51 @@ def test_failed_review_retains_retry_ceiling_without_a_defect_hold(run_case, exi
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
     comments = "\n".join(comment.body for comment in c.tracker.list_comments(1))
     assert "Reviewer still found defects" not in comments
+
+
+def test_break_it_rejects_charging_unusable_reviews_as_defects(run_case, monkeypatch):
+    """The handoff regression check must reject the old defect-budget behavior."""
+    import inspect
+
+    from foragent import run_review, runner
+
+    source = inspect.getsource(run_review._review_implementation)
+    original = 'if review.verdict == "FAIL":'
+    assert source.count(original) == 1
+    broken = source.replace(original, 'if review.verdict != "PASS":', 1)
+    namespace = vars(run_review).copy()
+    exec(compile("from __future__ import annotations\n" + broken, "<wrong-review-budget>", "exec"), namespace)
+    monkeypatch.setattr(runner, "_review_implementation", namespace["_review_implementation"])
+    with pytest.raises(AssertionError, match="merged"):
+        test_repeated_unstructured_finding_normalizes_wrapping_after_rebuttal(run_case)
+
+
+def test_break_it_rejects_a_native_scope_without_the_verdict_contract(review_context, monkeypatch):
+    """The actual context check must catch a contract omitted from Claude's scope."""
+    from foragent import run_review
+    from foragent.run_prompts import REVIEW_VERDICT_CONTRACT
+
+    rules = run_review.review_scope_rules
+
+    def without_contract(*args, **kwargs):
+        return rules(*args, **kwargs).replace(REVIEW_VERDICT_CONTRACT, "", 1)
+
+    monkeypatch.setattr(run_review, "review_scope_rules", without_contract)
+    with pytest.raises(AssertionError):
+        test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
+
+
+def test_break_it_rejects_native_none_becoming_a_pass(run_case, monkeypatch):
+    """The receipt check must catch the old bare-(none)-means-PASS shortcut."""
+    from foragent import run_review
+
+    parse = run_review.parse_code_review
+
+    def none_passes(message):
+        if json.loads(message).get("result") == "(none)":
+            return run_review.ReviewResult("PASS", "")
+        return parse(message)
+
+    monkeypatch.setattr(run_review, "parse_code_review", none_passes)
+    with pytest.raises(AssertionError, match="UNUSABLE"):
+        test_empty_review_merges_without_rework_or_a_recorded_pass(run_case, True, "(none)")
