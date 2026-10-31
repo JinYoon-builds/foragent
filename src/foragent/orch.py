@@ -134,7 +134,7 @@ def _issue(ctx: RunContext, n: int) -> Issue:
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
 
-    if run_is_live(ctx.store.get_run(n)):  # The same rule as fa orch stop (#435).
+    if run_is_live(ctx.store.get_run(n)):  # Live workers, as the status lane row (#435).
         raise OrchError(f"issue #{n} is running; wait for its runner to finish")
     return issue
 
@@ -536,10 +536,13 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 if (refusal := orch_scope.current_refusal(ctx, issue)) is not None:
                     raise OrchError(refusal)
             if current.head.startswith("foragent/dream-"):
-                from foragent.orch_dream import memory_path, published_event
+                from foragent.orch_dream import memory_path, published_event, stale_for_redo
                 from foragent.orch_dream_publish import memory_moved
 
                 lane = current.head.removeprefix("foragent/dream-")
+                if stale_for_redo(ctx.store, lane, n):
+                    raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
+                                    "and the lane dreams again")
                 if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
                     raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
                                     "dreams again from the base")

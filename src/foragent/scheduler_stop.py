@@ -114,10 +114,17 @@ def runner_alive(run: Run, exists=None) -> bool | None:
     return (exists or _pid_exists)(run.pid)
 
 
-def run_is_live(run: Run | None) -> bool:
-    """The one "is this issue running" rule for fa orch stop, fa orch park and the status row (#435).
+def unfinished_runs(store) -> list[Run]:
+    """The running issue records: `fa gate status` lists them and `fa orch stop` accepts them (#1207)."""
+    return [run for run in store.active_runs() if run.kind == "issue"]
 
-    The status active_runs list still keeps every running record, so a view can mark a gone worker.
+
+def run_is_live(run: Run | None) -> bool:
+    """Whether a running record still has its workers: fa orch park and the status lane row (#435).
+
+    fa orch stop and the status active_runs list read the record alone (#1207): every
+    unfinished record is running there, and a stop of one whose workers are gone still
+    saves its work through the stop path.
 
     A run record that is running while a process it recorded is still the same process:
     a recorded PID or executor group counts only with its recorded start time (a reused

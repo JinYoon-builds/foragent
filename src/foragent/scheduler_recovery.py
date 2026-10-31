@@ -63,7 +63,7 @@ def _kill_run(
         if count_stall:
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         raise
-    if stopped != "stopped" or registered_since(ctx, run):  # A fresh read decides the last transition.
+    if stopped not in {"stopped", "gone" if outcome == "stopped" else "stopped"} or registered_since(ctx, run):  # Fresh read.
         if count_stall and stopped != "skipped":  # A skipped stop wrote nothing to undo.
             ctx.store.update_run(number, restarts=run.restarts, outcome=run.outcome)
         if stopped == "gone":
