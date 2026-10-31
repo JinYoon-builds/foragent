@@ -77,6 +77,7 @@ def test_unfolding_a_dreaming_lane_lists_its_finished_issues_below_the_bubble(tm
     first = list(config.lanes)[0]
     state = {"unfolded": [first]}
     frame = plain_frame(render_frame(dreaming(snapshot, first), config, tmp_path, width=80, state=state))
-    rows = lane_line(frame, config, first)
+    # The unbounded frame (shell) also keeps the done list, whose rows name the lane too.
+    rows = [row for row in lane_line(frame, config, first) if not row.startswith("#")]
     assert rows[0].startswith("💭") and len(rows) == 3, frame
     assert "#1" in rows[1] and "#2" in rows[2]

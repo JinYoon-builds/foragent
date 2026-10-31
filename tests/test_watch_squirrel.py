@@ -92,14 +92,17 @@ def test_rows_win_and_sections_give_way_from_the_bottom_on_a_short_screen(tmp_pa
     config = Config(language="en", lanes={f"lane{index}": {} for index in range(18)})
     tall = watch._frame(busy_snapshot(18), config, tmp_path, tick=0, width=100, selected=None, now=NOW,
                         height=None)
-    short = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100).splitlines()
-    assert len(tall) > 24 >= len(short)
-    assert sum(line.startswith("🐿") or line.startswith("[*]") for line in short) == 18
-    # On a short screen the key letters stay, directly above the usage line (#115),
-    # which ends with the quit key.
-    assert short[-2] == "j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close"
-    assert short[-1] == "Claude — · Codex — · running 0/2 · keep 80% · merge: batch · q quit"
-    assert "handled" not in "\n".join(short), "the events log below the rows gives way first"
+    # Shell: the heightless frame is unbounded, and a 24-row screen scrolls its body under a
+    # pinned top line, above the pinned usage and hint rows; no section is dropped.
+    whole = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100).splitlines()
+    short = watch.render_frame(busy_snapshot(18), config, tmp_path, width=100, height=24, state={}).splitlines()
+    assert len(tall) == len(whole) > 24 == len(short)
+    assert sum(line.startswith("🐿") or line.startswith("[*]") for line in whole) == 18
+    assert sum(line.startswith("🐿") or line.startswith("[*]") for line in short) == 18, "the rows come first"
+    assert short[0] == whole[0] and short[-2:] == whole[-2:]
+    assert short[-2] == "Claude — · Codex — · keep 80%"
+    assert short[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit"
+    assert "handled" in "\n".join(whole), "the events log stays reachable"
 
 
 def test_wide_screens_put_the_orchestrator_box_beside_the_sections(tmp_path):
@@ -311,7 +314,8 @@ def test_a_waiting_person_issue_without_a_run_waits_for_a_person_everywhere(tmp_
         assert row.startswith("[!]") and "waiting for a person" in row, frame
     # The header and gate status count both as waiting, none as queued.
     assert result.status["summary"]["waiting_human"] == 2 and result.status["summary"]["queued"] == 0
-    assert frame[0].startswith("today ✓0 · working 0 · waiting 2 · queued 0"), frame[0]
+    # The top line names no question for parked work (no needs-human issue).
+    assert frame[0].startswith("* running fine · today 0 issues merged"), frame[0]
     # One mapping decides every row, in collect_lanes order.
     assert [issue_state(labels, active) for labels, active in (
         ({"waiting-person"}, False), ({"needs-human", "blocked"}, True), ({"blocked"}, True),
