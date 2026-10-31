@@ -447,7 +447,8 @@ class RecordingTracker:
         """Deliver now or queue; either way the write counts from ``started``.
 
         Returns (result, queued entry). A queued write that a newer
-        observation already judged is not queued: (None, False).
+        observation or a later-started local write already decided is not
+        queued: (None, False).
         """
         store = self._context.store
         pending = store.github_outbox()
@@ -463,7 +464,7 @@ class RecordingTracker:
                 pause(self._context, exc)
         entry = store.queue_github_write(n, action, lanes=self._context.config.lanes, started_at=started, **payload)
         if entry is None:
-            self._outbox_dropped(n, "remote change")
+            self._outbox_dropped(n, "newer change")
             return None, False
         return None, entry
 

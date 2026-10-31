@@ -9,7 +9,7 @@ observation at or after a write's start retires it when it shows the write's
 effect, and drops it when it contradicts the write's baseline.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -65,7 +65,28 @@ def touches(entry: dict[str, Any]) -> set[str]:
         return {f"label:{label}" for label in entry["labels"]}
     if action == "update_issue":
         return {"title", "body"}
+    if action == "set_fields":  # A local field overlay; its labels replace the whole set.
+        fields = entry["fields"]
+        return {key for key in ("title", "body", "state") if key in fields} | (
+            {"label:*"} if "labels" in fields else set())
     return {"state"} if action == "close_issue" else set()
+
+
+def unsuperseded(snapshot: dict[str, Any], number: int, action: str, payload: dict[str, Any],
+                 started_at: datetime) -> dict[str, Any] | None:
+    """The part of a write that no later-started local write on the same field overrides.
+
+    A write that reaches the store late must not land on top of one that
+    started after it, locally or in delivery order. None if nothing is left.
+    """
+    later = set()
+    for item in [*snapshot.get("overlays", []), *snapshot.get("outbox", [])]:
+        if item["issue"] == number and write_order(item)[0] > started_at:
+            later |= touches(item)
+    if action in LABEL_WRITES:
+        labels = [label for label in payload["labels"] if "label:*" not in later and f"label:{label}" not in later]
+        return {**payload, "labels": labels} if labels else None
+    return None if touches({"action": action, **payload}) & later else payload
 
 
 def after(stamp: Any, revision: Any, at: datetime, since_revision: int | None) -> bool:
@@ -117,6 +138,17 @@ def advance_complete_listing(snapshot: dict[str, Any], at: datetime) -> None:
     """A complete listing started at ``at`` shows every issue it omits missing, known locally or not."""
     if not newer(snapshot.get("complete_at"), at):
         snapshot["complete_at"] = at.isoformat()
+
+
+def write_order(item: dict[str, Any]) -> tuple[datetime, int]:
+    """Where a local write sits among the others: by its start, not its completion.
+
+    A queued entry starts at ``queued_at``; a delivered entry keeps that place
+    (``order_at``); a direct write starts at ``started_at``. Equal clocks keep
+    store order (revision).
+    """
+    stamp = item.get("order_at") or item.get("queued_at") or item.get("started_at")
+    return stamp_time(stamp) or datetime.min.replace(tzinfo=UTC), item.get("revision") or 0
 
 
 def advance_absence(snapshot: dict[str, Any], key: str, at: datetime) -> None:
@@ -182,11 +214,12 @@ class IssueObservationMixin:
                "observed_at": at.isoformat(), "updated_at": self._timestamp(), **fields}
         if any(old.get(name) != value for name, value in facts.items()):
             _state._forget_reads(row)
-        for item in live:
-            self._apply_overlay(row, item, lanes)
         # Judge pending writes against what this read saw plus later deliveries it could not see.
-        seen = SimpleNamespace(title=row["title"], body=row["body"], labels=frozenset(row["labels"]),
-                               state=row["state"])
+        scratch = {**row, "labels": list(row["labels"])}
+        for item in sorted(live, key=write_order):
+            self._apply_field_effect(scratch, item, lanes)
+        seen = SimpleNamespace(title=scratch["title"], body=scratch["body"], labels=frozenset(scratch["labels"]),
+                               state=scratch["state"])
         retired, contradicted = self._judge_pending(snapshot, number, seen, at, since_revision)
         gone = {entry["id"] for entry in retired + contradicted}
         snapshot["outbox"] = [entry for entry in snapshot.get("outbox", []) if entry["id"] not in gone]
@@ -198,9 +231,21 @@ class IssueObservationMixin:
             # Writes still pending are next judged against what this read saw, not
             # against the facts when the first of them was queued.
             bases[key].update(title=seen.title, body=seen.body, labels=sorted(seen.labels), state=seen.state)
-        for entry in remaining:
-            self._apply_github_write(row, entry, lanes)
+        # Every live local write, in the order the writes started.
+        for item in sorted([*live, *remaining], key=write_order):
+            if "queued_at" in item:
+                self._apply_github_write(row, item, lanes)
+            else:
+                self._apply_overlay(row, item, lanes)
         return row, bool(contradicted)
+
+    def _apply_field_effect(self, row: dict[str, Any], item: dict[str, Any], lanes: dict) -> None:
+        """Apply a write's effect on issue fields only, never appending its comment again."""
+        if item["action"] == "comment":
+            return
+        if "queued_at" in item:
+            item = {key: value for key, value in item.items() if not (item["action"] == "close_issue" and key == "body")}
+        self._apply_overlay(row, item, lanes)
 
     def _apply_overlay(self, row: dict[str, Any], item: dict[str, Any], lanes: dict) -> None:
         from foragent.labels import issue_lane
@@ -324,6 +369,11 @@ class IssueObservationMixin:
                 **({"labels": list(payload["labels"])} if action in LABEL_WRITES else {}),
                 **({"title": payload["title"], "body": payload["body"]} if action == "update_issue" else {}))
             self._apply_overlay(row, overlay, lanes)
+            # A write that started later but finished first keeps the last word on its fields.
+            later = [item for item in [*snapshot.get("overlays", []), *snapshot.get("outbox", [])]
+                     if item["issue"] == number and item is not overlay and write_order(item) > write_order(overlay)]
+            for item in sorted(later, key=write_order):
+                self._apply_field_effect(row, item, lanes)
             self._save_local_issue(snapshot, row)
 
 

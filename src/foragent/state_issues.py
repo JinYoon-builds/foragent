@@ -153,7 +153,9 @@ class IssueSnapshotMixin:
         a direct attempt that is queued after a rate limit counts from its start.
         An observation newer than that start already judged the write, and
         an absence newer than it removed the issue, so nothing is queued
-        (None); a comment is judged by absence only.
+        (None); a comment is judged by absence only. The part of a late write
+        that a later-started local write on the same field overrides is not
+        queued either (``state_observe.unsuperseded``).
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
@@ -161,6 +163,10 @@ class IssueSnapshotMixin:
                     _observe.missing_after(snapshot, str(number), started_at)
                     or action != "comment" and _observe.judged_since(snapshot, number, started_at)):
                 return None
+            if started_at is not None:
+                payload = _observe.unsuperseded(snapshot, number, action, payload, started_at)
+                if payload is None:
+                    return None
             row = self._local_issue(snapshot, number)
             snapshot.setdefault("outbox_base", {}).setdefault(str(number), _state.deepcopy(row))
             identity = snapshot.get("outbox_sequence", 0) + 1
@@ -199,7 +205,9 @@ class IssueSnapshotMixin:
                 snapshot["outbox"] = [item for item in pending if item["id"] != entry["id"]]
             if started_at is not None and delivered["action"] != "comment" and not _observe.judged_since(
                     snapshot, delivered["issue"], started_at):
+                # Live from the delivery's start; ordered among other writes by its place in the queue.
                 self._add_overlay(snapshot, delivered["issue"], delivered["action"], started_at.isoformat(),
+                                  order_at=delivered["queued_at"],
                                   **{key: delivered[key] for key in ("labels", "title", "body") if key in delivered
                                      and not (delivered["action"] == "close_issue" and key == "body")})
             row = self._local_issue(snapshot, entry["issue"])
