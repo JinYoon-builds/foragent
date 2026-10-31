@@ -302,7 +302,8 @@ def route_question(store: StateStore, config: Config, repo: str, record: dict[st
     if planning_alive(store):
         return False
     title, line = _QUESTION_PUSH.get(config.language, _QUESTION_PUSH["en"])
-    notify.send(replace(config, repo=repo), title, line.format(**record))
+    with notify.sending("question"):
+        notify.send(replace(config, repo=repo), title, line.format(**record))
     return True
 
 

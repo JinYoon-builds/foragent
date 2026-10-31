@@ -117,4 +117,5 @@ def test_preparation_stays_when_a_short_screen_drops_other_sections(tmp_path, mo
     lines = plain(watch_layout._frame(snapshot, config, None, tick=0, width=60, selected=None,
                                       now=None, height=24))
     assert lines[:3] == ["[+] Login · sorting the decisions", "D18 decision", "Please confirm these decisions."]
-    assert "filler" not in lines
+    # Shell: an explicit height drops nothing; the other rows stay reachable below.
+    assert lines.count("filler") == 30

@@ -101,6 +101,11 @@ def add(commands) -> None:
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
+    prepare.add_argument("plan", type=cli.Path)
+    prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    prepare.add_argument("--status", action="store_true", help=say("prepare_help_status"))
+    prepare.add_argument("--json", action="store_true")
     perspectives = order_actions.add_parser("perspectives", help=say("perspectives_help"),
                                             description=say("perspectives_help"))
     perspectives.add_argument("target", help=say("perspectives_help_target"))
@@ -136,6 +141,24 @@ def _preread(args, root) -> int:
                                           f"{len(result['unknowns'])} unknown(s)"))
             for unknown in result["unknowns"]:
                 print(f"  - {unknown}")
+    return 0
+
+
+def _prepare(args, root) -> int:
+    from foragent import order_prepare
+
+    cli = facade()
+    config, repo, store = repo_store(root)
+    rows = order_prepare.prepare(cli.order.read_plan(args.plan), root, config, cli.GitRepo(root), store,
+                                 lambda: cli.GhTracker(repo), status=args.status, plan_path=args.plan)
+    if args.json:
+        print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+                           reason=row["reason"] or "-"))
+            for question in row["questions"]:
+                print(cli.text("prepare_row_question", config.language, text=question))
     return 0
 
 
@@ -195,6 +218,8 @@ def run(args) -> int:
         return _preread(args, root)
     if args.action == "perspectives":
         return _perspectives(args, root)
+    if args.action == "prepare":
+        return _prepare(args, root)
     git = cli.GitRepo(root)
     config = cli.load_config(root)
     repo = config.repo or git.remote_slug()

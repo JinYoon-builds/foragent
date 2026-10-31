@@ -23,8 +23,9 @@ TABS = ("team", "me", "computer")
 SCOPES = {"team": "team", "me": "me", "computer": "machine"}
 # Settings without fixed choices here: `fa settings set` changes them.
 READ_ONLY = frozenset({"always_human", "notify", "language", "max_parallel", "log_retention_days"})
-# Sections that stay while the window is open: the header and the help line.
-FRAMING = ("squirrels", "help")
+# Sections that stay while the window is open: the top line and the usage and hint rows
+# (the older header and help line where those still draw).
+FRAMING = ("lane_header", "lane_footer", "squirrels", "help")
 
 
 def is_open(state: dict[str, Any] | None) -> bool:
@@ -144,13 +145,15 @@ def _note(setting, store: Any, repo_root: Path | None, language: str) -> str | N
     return watch.text("settings_window_from_team", language) if found else None
 
 
-def _tabs(tab: str, config: Config) -> str:
+def _tabs(tab: str, config: Config, language: str | None = None) -> str:
+    """The tab line in the view's language (the saved files may name another one)."""
     from foragent import watch
 
+    language = language or config.language
     suffix = "_ascii" if getattr(config, "view_glyphs", "auto") == "ascii" else ""
     names = []
     for name in TABS:
-        label = watch.text(f"settings_window_tab_{name}{suffix}", config.language)
+        label = watch.text(f"settings_window_tab_{name}{suffix}", language)
         names.append(f"[{label}]" if name == tab else f" {label} ")
     return "  ".join(names)
 
@@ -189,7 +192,7 @@ def _parts(store: Any, config: Config, repo_root: Path | None, tab: str,
     elif state.get("settings_message"):
         closing.append(state["settings_message"])
     closing.append(watch.text("settings_window_keys", language))
-    return [_tabs(tab, config)], groups, selected, closing
+    return [_tabs(tab, config, language)], groups, selected, closing
 
 
 def settings_view(store: Any, config: Config, repo_root: Path | None, tab: str = "team",
@@ -333,10 +336,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     head = wrap(tabs, "bold")
     tail = [*wrap(closing[:-1], "yellow" if prompting else ""), *wrap(closing[-1:], "dim")]
     bodies = [wrap(group, "bold" if index == selected else "") for index, group in enumerate(groups)]
-    spacer: list[Line] = [[]]
+    from foragent.watch_sections.lanes import glyph_mode
+
+    # Full-width rules part the tabs, the rows and the keys (ASCII: '-').
+    spacer: list[Line] = [[(("-" if glyph_mode(config) == "ascii" else "━") * width, "separator")]]
     total = sum(map(len, bodies))
     if room is not None and len(head) + len(tail) + 2 + total > room:
-        spacer = []  # Short screen: the blank lines around the rows give way first.
+        spacer = []  # Short screen: the rules around the rows give way first.
     available = None if room is None else room - len(head) - len(tail) - 2 * len(spacer)
     first = last = selected
     if available is None or total <= available:
