@@ -180,3 +180,19 @@ def test_review_prompt_carries_lane_decisions_as_context_only_when_recorded():
     assert "not acceptance criteria" in section
     # Context sits with the issue text, before the diff the reviewer judges.
     assert prompt.index(section) < prompt.index("Done when commands:") < prompt.index("Diff:")
+
+
+def test_rework_prompts_ask_for_the_whole_class_and_a_searched_list_only_on_rework():
+    from foragent.run_prompts import SEARCHED_LIST_INSTRUCTIONS, build_resume_prompt
+
+    parsed = parse_body(BODY)
+    assert SEARCHED_LIST_INSTRUCTIONS not in build_prompt(1, parsed, "tests/acceptance/")
+    assert SEARCHED_LIST_INSTRUCTIONS not in build_resume_prompt(1, BODY, BODY, "check failed")
+    for prompt in (
+        build_prompt(1, parsed, "tests/acceptance/", reviewer_text="VERDICT: FAIL", review_feedback=True),
+        build_prompt(1, parsed, "tests/acceptance/", retry_default=True),
+        build_resume_prompt(1, BODY, BODY, reviewer_text="VERDICT: FAIL", review_feedback=True),
+        build_resume_prompt(1, BODY, BODY, retry_default=True),
+    ):
+        assert prompt.count(SEARCHED_LIST_INSTRUCTIONS) == 1
+    assert ".foragent/SEARCHED.md" in SEARCHED_LIST_INSTRUCTIONS

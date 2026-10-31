@@ -27,6 +27,11 @@ DEFAULT_RETRY_HINT = (
     "find every other instance of that class in the change, fix them all, "
     "and state the class and the instances found."
 )
+SEARCHED_LIST_INSTRUCTIONS = (
+    "Fix the whole defect class, not only the cited line: repair every instance across the changed code. "
+    "Then write `.foragent/SEARCHED.md` as a list of what you searched for, where you looked and what you found; "
+    "the runner puts that list in the pull request. The tools and the search order are yours to choose."
+)
 
 BREAK_IT = ("Make the code return a wrong value, skip an effect, or do the effect twice. "
             "If the test still passes, it proves nothing.")
@@ -261,7 +266,7 @@ def build_prompt(
             failure if failure_limit is None else cuts.tail(failure, failure_limit, full_text_dir, "failure.txt")
         )
     if review_feedback:
-        prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n"
+        prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n" + SEARCHED_LIST_INSTRUCTIONS + "\n"
     if acceptance_baseline:
         prompt += (
             f"\nThese acceptance tests already pass on the base and must keep passing ({len(acceptance_baseline)}):\n"
@@ -281,7 +286,7 @@ def build_prompt(
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
     if retry_default:
         # A queued retry's default always comes before any orchestrator hint.
-        prompt = "Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n\n" + prompt
+        prompt = "Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n" + SEARCHED_LIST_INSTRUCTIONS + "\n\n" + prompt
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
@@ -325,9 +330,9 @@ def build_resume_prompt(
     elif failure:
         parts.append("A previous attempt failed. Output or stop reason:\n" + failure)
     if review_feedback:
-        parts.append(REVIEW_FEEDBACK_INSTRUCTIONS)
+        parts.append(REVIEW_FEEDBACK_INSTRUCTIONS + "\n" + SEARCHED_LIST_INSTRUCTIONS)
     if retry_default:
-        parts.append("Retry instructions:\n" + DEFAULT_RETRY_HINT)
+        parts.append("Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n" + SEARCHED_LIST_INSTRUCTIONS)
     if orchestrator_hint is not None:
         parts.append("Orchestrator hint:\n" + orchestrator_hint)
     if merge_conflicts is not None:
