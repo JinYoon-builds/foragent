@@ -132,7 +132,8 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
         return issue
     # A park newer than the clock's start is the orchestrator's response to these blockers.
-    if (parked := orch_park.parked_at(ctx.store, issue.number)) is not None and parked > since:
+    parked = orch_park.parked_at(ctx.store, issue.number, comments=row.get("comments", []))
+    if parked is not None and parked > since:
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")
