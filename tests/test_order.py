@@ -1897,7 +1897,7 @@ def test_publication_rechecks_each_destination_right_before_writing_it(publishin
     assert list(elsewhere.iterdir()) == [] and events == []
 
 
-@pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp"])
+@pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp", "preread.json.lock"])
 def test_preread_local_files_never_write_through_symlinks(publishing, plan, monkeypatch, tmp_path, name):
     root, config = publishing[0], publishing[1]
     target = tmp_path / f"outside-{name}"
@@ -1909,7 +1909,7 @@ def test_preread_local_files_never_write_through_symlinks(publishing, plan, monk
             return SimpleNamespace(exit_code=0, timed_out=False, last_message="NONE")
 
     monkeypatch.setattr(order, "executor_for", lambda executor: Reader())
-    if name == ".gitignore":
+    if name in (".gitignore", "preread.json.lock"):
         with pytest.raises(order.PlanError, match="symlink"):
             order.preread(plan, root, config)
     else:
