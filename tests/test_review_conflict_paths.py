@@ -12,7 +12,7 @@ from foragent.run_review import spec_conflicts  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
 from runner_support import enable_native_reviewer, run_case  # noqa: E402,F401
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
+from test_review_perspectives import CHECKLIST, perspective_case, review_offline  # noqa: E402,F401
 from test_risk_map import copy_history, offline  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
 
@@ -59,7 +59,8 @@ def test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(ru
 
 def test_panel_member_conflict_stops_without_a_merge_call_that_could_drop_it(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = PanelExecutor(["VERDICT: PASS", f"VERDICT: FAIL\n{CONFLICT}"], merged="VERDICT: PASS")
+    panel = PanelExecutor(["VERDICT: PASS", f"VERDICT: FAIL\n{CONFLICT}"] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2),
+                          merged="VERDICT: PASS")
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "spec-question"
     assert panel.merges == [] and len(case.implementer.calls) == 1
@@ -105,7 +106,7 @@ class ConflictThenLimitPanel(PanelExecutor):
 
 def test_panel_member_conflict_wins_over_another_members_usage_limit(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = ConflictThenLimitPanel([f"VERDICT: FAIL\n{CONFLICT}", "VERDICT: PASS"])
+    panel = ConflictThenLimitPanel([f"VERDICT: FAIL\n{CONFLICT}"] + ["VERDICT: PASS"] * (len(CHECKLIST) - 1))
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "spec-question"
     assert panel.merges == [], "A member conflict needs no merge call"
