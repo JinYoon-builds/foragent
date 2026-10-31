@@ -221,7 +221,20 @@ def test_not_planned_child_keeps_parent_open_and_records_one_flag(parent_case, s
         state if state in {"completed", "not_planned"} else None for state in states
     ], "The gate must be able to observe child closure reasons through Tracker.sub_issues"
     gate_tick(case)
-    assert case.tracker.get_issue(10).state == "open", "A not_planned child must prevent parent completion"
+    if "unapproved" not in states:
+        # #1159 (2026-10-31, test owner): a not_planned child counts as ended, so an order whose
+        # children have all ended closes once, with one comment and no flag.
+        assert case.tracker.get_issue(10).state == "closed", "An order whose children all ended must close"
+        assert case.store.load_flag(10) is None, "Ended children must not flag the order"
+        comments = case.tracker.list_comments(10)
+        assert len(comments) == 1, "Closing the order leaves one comment"
+        case.store = StateStore(case.store.root, now=lambda: case.clock[0])
+        for _ in range(3):
+            gate_tick(case, refresh=True)
+            assert case.tracker.list_comments(10) == comments, "Unchanged children must not repeat comments"
+            assert len([entry for entry in case.tracker.closures if entry[0] == 10]) == 1, "The order closes once"
+        return
+    assert case.tracker.get_issue(10).state == "open", "An open sibling must keep the parent open"
     flag = case.store.load_flag(10)
     assert flag is not None and flag.reason == NOT_PLANNED_FLAG, (
         "A not_planned child must record parent-child-not-planned for the orchestrator"
@@ -258,9 +271,9 @@ def test_approved_issue_with_children_keeps_its_own_work_state(parent_case, stat
     assert case.store.load_flag(20) is None, "Child cancellations must not flag approved work"
     assert not any(number == 20 for number, reason in case.tracker.closures)
     if "not_planned" in states:
-        flag = case.store.load_flag(10)
-        assert flag is not None and flag.reason == NOT_PLANNED_FLAG, (
-            "The equivalent unapproved order must flag its cancelled child"
+        # #1159 (2026-10-31, test owner): cancelled and completed children have all ended.
+        assert case.tracker.get_issue(10).state == "closed", (
+            "The equivalent unapproved order must close once every child has ended"
         )
     elif "needs-human" in states:
         assert card_column(case.tracker, case.board_id, 10) == YOUR_TURN, (
