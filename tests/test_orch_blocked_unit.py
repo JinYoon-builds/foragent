@@ -36,7 +36,7 @@ def test_timeout_boundary_outside_run_hours_without_approval(ctx, seconds, escal
     assert not ctx.tracker.get_issue(1).labels & {"ready", "running"}
     if escalated:
         body = ctx.tracker.list_comments(1)[-1].body
-        assert body.startswith("<!-- foragent:needs-human reason=orchestrator-timeout -->\n")
+        assert body.startswith("<!-- foragent:needs-human reason=orchestrator-timeout --> ")
         assert "Choose a locale" in body
         tick(ctx)
         assert len(ctx.tracker.list_comments(1)) == 2
@@ -44,7 +44,7 @@ def test_timeout_boundary_outside_run_hours_without_approval(ctx, seconds, escal
 
 @pytest.mark.parametrize("body", [
     "", "Plain discussion", "\n<!-- foragent:blocked reason=stalled -->",
-    "<!-- foragent:blocked reason=stalled --> suffix",
+    "<!-- foragent:blocked reason=stalled -->suffix",
     "<!-- foragent:needs-human reason=stalled -->",
 ])
 def test_timeout_requires_a_blocked_comment_on_the_first_line(ctx, body):

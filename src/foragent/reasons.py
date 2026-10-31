@@ -1,5 +1,6 @@
 """Machine-readable comments for decisions and approval snapshots."""
 
+from datetime import datetime
 from enum import StrEnum
 import re
 from typing import Literal
@@ -42,24 +43,89 @@ GROUP: dict[Reason, str] = {
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"
+ORCH_MARKER = "<!-- foragent:orch -->"
+
+
+FLAG_MARKER = re.compile(r"<!-- foragent:(blocked|needs-human) reason=([a-z-]+) -->(?=[ \r\n]|$)")
+
+
+SEPARATOR = " ↵ "
+_DECODE = re.compile(r" ↵ |↵↵")
+
+
+def one_line(marker: str, text: str = "") -> str:
+    """A state-change comment: its marker and its whole text on one line.
+
+    Each line break becomes " ↵ ", and a "↵" already in the text is written "↵↵", so
+    different texts never give the same line and `decode_line` returns the exact lines
+    (spacing inside lines is kept). Blank lines at either end are dropped.
+    """
+    lines = [line.replace("↵", "↵↵") for line in text.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return f"{marker} {SEPARATOR.join(lines)}" if lines else marker
+
+
+def decode_line(text: str) -> str:
+    """The exact lines of a one-line comment's text (the inverse of `one_line`)."""
+    return _DECODE.sub(lambda match: "\n" if match[0] == SEPARATOR else "↵", text)
+
+
+def flag_marker(body: str) -> tuple[str, str, str] | None:
+    """(label, reason, text after the marker) of a blocked or needs-human comment.
+
+    Reads the one-line form and the older form with the marker on its own line.
+    """
+    match = FLAG_MARKER.match(body or "")
+    return (match[1], match[2], body[match.end():].strip()) if match else None
+
+
+def flag_text(body: str) -> tuple[str, str]:
+    """(bold summary, evidence) of a flag comment in either form; the evidence keeps its lines."""
+    match = FLAG_MARKER.match(body or "")
+    rest = body[match.end():] if match else "\n" + body.partition("\n")[2]
+    if rest.startswith(" "):  # One-line form: give the evidence its exact lines back.
+        first, _, evidence = decode_line(rest[1:]).partition("\n")
+    else:
+        first, _, evidence = rest.strip().partition("\n")
+        evidence = evidence.strip()
+    first = first.strip()
+    return first[2:-2] if first.startswith("**") and first.endswith("**") else first, evidence
+
+
+def comment_order(comment: dict | object) -> tuple[datetime, int, int]:
+    """Sort key for issue comments, oldest first, including queued ones.
+
+    A comment queued in the GitHub outbox has id -<queue id>: it is newer than a
+    delivered comment with the same time, and a larger queue id is newer.
+    """
+    created_at = comment["created_at"] if isinstance(comment, dict) else comment.created_at
+    identity = comment["id"] if isinstance(comment, dict) else comment.id
+    return datetime.fromisoformat(created_at), identity < 0, abs(identity)
 
 
 def format_comment(
     reason: Reason, summary: str, details: str | None = None, *,
     label: Literal["blocked", "needs-human"] = "needs-human",
 ) -> str:
-    summary = " ".join(summary.split())
-    body = f"<!-- foragent:{label} reason={reason.value} -->\n**{summary}**"
-    return f"{body}\n\n{details}" if details else body
+    # The summary's first line is the bold title. Any further lines (an error's text, say)
+    # lead the details exactly as written, so no two summaries collapse into one line.
+    lines = summary.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    title, rest = (lines[0].strip(), lines[1:]) if lines else ("", [])
+    evidence = "\n".join([*rest, *([details] if details else [])])
+    return one_line(f"<!-- foragent:{label} reason={reason.value} -->",
+                    f"**{title}**" + (f"\n{evidence}" if evidence.strip() else ""))
 
 
 def parse_reason(comment_body: str) -> Reason | None:
-    first_line = comment_body.split("\n", 1)[0].removesuffix("\r")
-    match = re.fullmatch(r"<!-- foragent:(?:blocked|needs-human) reason=([a-z-]+) -->", first_line)
-    if match is None:
+    if (found := flag_marker(comment_body)) is None:
         return None
     try:
-        return Reason(match[1])
+        return Reason(found[1])
     except ValueError:
         return None
 

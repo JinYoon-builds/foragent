@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from foragent import orch_park, scheduler
+from foragent.reasons import comment_order, flag_marker
 from foragent.records import load_record
 from foragent.state import Approval
 from foragent.tracker import Dependency, Issue, LabelEvent
@@ -115,12 +116,9 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     row = next((row for row in ctx.store.local_issues() if row["number"] == issue.number), {})
     comments = [
         comment for comment in (load_record(scheduler.Comment, item) for item in row.get("comments", []))
-        if scheduler.re.fullmatch(
-            r"<!-- foragent:blocked reason=[a-z-]+ -->",
-            comment.body.partition("\n")[0].removesuffix("\r"),
-        )
+        if (found := flag_marker(comment.body)) is not None and found[0] == scheduler.BLOCKED
     ]
-    latest = max(comments, key=lambda c: (scheduler.datetime.fromisoformat(c.created_at), c.id), default=None)
+    latest = max(comments, key=comment_order, default=None)
     if latest is None:
         return issue
     # The runner's blocker comment can reach the local record after its run ends,

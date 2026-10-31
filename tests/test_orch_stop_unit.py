@@ -40,7 +40,7 @@ class _Tracker:
         self.issue.labels = self.issue.labels - set(labels)
 
     def comment(self, n, body):
-        self.calls.append(("comment", body.splitlines()[0]))
+        self.calls.append(("comment", body.partition("-->")[0] + "-->"))  # The marker of a one-line comment.
 
 
 @pytest.fixture
