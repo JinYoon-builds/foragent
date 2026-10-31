@@ -738,6 +738,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         owned = existing is None or OWNED_MARKER in existing.body
         body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
                 + (f"{OWNED_MARKER}\n" if owned else ""))
+        # The written body itself records the wait it replaces, so the transition survives a lost comment.
+        body = order_waiting.stamp(existing.body if existing else None, body)
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
@@ -745,7 +747,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
-            order_waiting.announce(tracker, number, body)
+            order_waiting.announce(tracker, number, body, config.language)
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -755,7 +757,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
             # A record follows the fact it describes: announce the wait the body now holds.
-            order_waiting.announce(tracker, number, body)
+            order_waiting.announce(tracker, number, body, config.language)
             tracker.remove_labels(number, [label for label in existing.labels
                                            if (label.startswith(("lane:", "size:")) or label == "interactive")
                                            and label not in labels])
@@ -777,7 +779,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         number = item["number"]
         existing = tracker.get_issue(number)
         # An edit rewrites the whole body; the issue's owner-label contract survives it.
-        body = _with_contract(_published_body(plan, item, repo, config), existing.body)
+        body = order_waiting.stamp(existing.body, _with_contract(_published_body(plan, item, repo, config), existing.body))
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
@@ -805,7 +807,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 tracker.remove_blocked_by(number, blocker)
             for blocker in sorted(desired - edges):
                 tracker.add_blocked_by(number, blocker)
-        order_waiting.announce(tracker, number, body)
+        order_waiting.announce(tracker, number, body, config.language)
         if changed and not current:
             tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs

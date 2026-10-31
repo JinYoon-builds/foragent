@@ -2313,34 +2313,111 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "own turn" not in capsys.readouterr().err
 
 
+class _WaitIssue:
+    """One issue's body and comments, written the way publication writes them."""
+
+    def __init__(self, body=None):
+        from foragent import order_waiting
+        self.waiting = order_waiting
+        self.tracker = FakeTracker()
+        self.number = self.tracker.add_issue(1, "Wait", body or "", labels=[]).number
+        self.body = body
+
+    def write(self, after, language="en", comment=True):
+        self.body = self.waiting.stamp(self.body, after)
+        self.tracker.update_issue(self.number, title="Wait", body=self.body)
+        if comment:
+            self.waiting.announce(self.tracker, self.number, self.body, language)
+
+    def lines(self):
+        return [c.body for c in self.tracker.list_comments(self.number) if "foragent:waiting" in c.body]
+
+
 def test_waiting_section_is_read_raw_and_ends_at_the_next_heading():
     from foragent import order_waiting
     body = "## Goal\nShip.\n\n## Waiting\nReason: A\n### Detail\nNext: B\n\n## Out of scope\nX\n"
     assert order_waiting.section(body) == "Reason: A\n### Detail\nNext: B"
     assert order_waiting.section("## Waiting\nNone.\n<!-- foragent:child plan=p key=k -->") == "None."
     assert order_waiting.section("## Goal\nNo wait.") is None
-    line = order_waiting.comment_line("Reason: A\nNext: B")
+    line = order_waiting.comment_line("0" * 64, "Reason: A\nNext: B")
     assert len(line.splitlines()) == 1 and line.startswith("Waiting: Reason: A · Next: B <!--")
-    assert "cleared" in order_waiting.comment_line(None)
+    assert "cleared" in order_waiting.comment_line("0" * 64, None)
 
 
-def test_waiting_announcement_follows_the_latest_marker_on_the_issue():
+def test_bodies_without_a_wait_change_are_written_unchanged():
     from foragent import order_waiting
-    tracker = FakeTracker()
-    number = tracker.add_issue(1, "Wait", "", labels=[]).number
-    order_waiting.announce(tracker, number, "## Goal\nNo wait.\n")
-    assert tracker.list_comments(number) == []
-    order_waiting.announce(tracker, number, "## Waiting\nA\n")
-    order_waiting.announce(tracker, number, "## Waiting\nA\n")
-    assert len(tracker.list_comments(number)) == 1
-    order_waiting.announce(tracker, number, "## Goal\nDone.\n")
-    comments = tracker.list_comments(number)
-    assert len(comments) == 2 and comments[-1].body.startswith("Waiting: cleared")
-    order_waiting.announce(tracker, number, "## Goal\ny\n")
-    assert len(tracker.list_comments(number)) == 2
+    plain = "## Goal\nShip.\n<!-- foragent:plan-child id=p key=k -->\n"
+    assert order_waiting.stamp(None, plain) == plain
+    assert order_waiting.stamp(plain, plain) == plain
+    legacy = "## Goal\nShip.\n\n## Waiting\nOld\n"
+    assert order_waiting.stamp(legacy, legacy) == legacy
+
+
+def test_waiting_announcement_follows_the_transition_recorded_on_the_issue():
+    issue = _WaitIssue()
+    issue.write("## Goal\nNo wait.\n")
+    assert issue.lines() == []
+    issue.write("## Waiting\nA\n")
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 1
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 2 and issue.lines()[-1].startswith("Waiting cleared.")
+    issue.write("## Goal\ny\n")
+    assert len(issue.lines()) == 2
     # A wait identical to an older one, after a different one, is a new transition.
-    order_waiting.announce(tracker, number, "## Waiting\nA\n")
-    assert len(tracker.list_comments(number)) == 3
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 3
+
+
+def test_waiting_removed_from_an_issue_without_any_marker_comments_cleared():
+    """The issue's current body is a fact too: a hand-written wait never announced still clears."""
+    issue = _WaitIssue("## Waiting\nLegacy\n")
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1 and issue.lines()[0].startswith("Waiting cleared.")
+
+
+def test_cleared_hand_written_wait_survives_a_lost_comment():
+    """The body is written, the comment fails: the retry still owes the clearing line, once."""
+    issue = _WaitIssue("## Waiting\nLegacy\n")
+    issue.write("## Goal\nDone.\n", comment=False)
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1 and issue.lines()[0].startswith("Waiting cleared.")
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1
+
+
+def test_waiting_edited_by_hand_and_republished_back_comments_the_transition():
+    """The last line announced A, a person edited the body to C; writing A again is a real change."""
+    issue = _WaitIssue()
+    issue.write("## Waiting\nA\n")
+    issue.body = issue.body.replace("## Waiting\nA", "## Waiting\nC")
+    issue.write("## Waiting\nA\n", comment=False)
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 2 and issue.lines()[-1].startswith("Waiting: A ")
+
+
+def test_waiting_line_follows_the_configured_language_and_keeps_authored_text():
+    issue = _WaitIssue()
+    issue.write("## Waiting\nReason: locale pending\n", "ko")
+    issue.write("## Goal\nDone.\n", "ko")
+    first, second = issue.lines()
+    assert first.startswith("기다리는 중: Reason: locale pending <!-- foragent:waiting")
+    assert second.startswith("기다림이 풀렸어요. <!--")
+    assert "Waiting" not in first.split("<!--")[0] and "cleared" not in second
+
+
+def test_publication_waiting_comments_use_the_configured_language(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    korean = replace(config, language="ko")
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: locale pending\n"
+    order.publish(plan, root, korean, tracker, repo="owner/repo", git=git)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    plan["issues"][0]["goal"] = plan["issues"][0]["goal"].split("\n\n## Waiting")[0]
+    order.publish(plan, root, korean, tracker, repo="owner/repo", git=git)
+    lines = [c.body for c in tracker.list_comments(child) if "foragent:waiting" in c.body]
+    assert [line.split(" <!--")[0] for line in lines] == ["기다리는 중: Reason: locale pending", "기다림이 풀렸어요."]
+
 
 
 def test_edit_blocked_by_must_name_plan_keys(tmp_path, plan):
@@ -2428,8 +2505,9 @@ def test_waiting_comment_lost_after_edit_body_update_is_posted_on_retry(publishi
         return real_comment(n, text)
 
     # The body is already written by an earlier attempt that stopped before commenting.
-    tracker.update_issue(child, title="Edited", body=order._with_contract(
-        order._published_body(changed, edit, "owner/repo", config), body))
+    from foragent import order_waiting
+    tracker.update_issue(child, title="Edited", body=order_waiting.stamp(body, order._with_contract(
+        order._published_body(changed, edit, "owner/repo", config), body)))
     monkeypatch.setattr(tracker, "comment", failing)
     with pytest.raises(TrackerError):
         publish(publishing, changed)
@@ -2508,3 +2586,63 @@ def test_failed_edit_dependency_sync_leaves_no_revision_comment(publishing, plan
     publish(publishing, changed)
     assert len([c for c in tracker.list_comments(child) if "foragent:edit " in c.body]) == 1
     assert tracker.blocked_by(child) != []
+
+
+def test_republished_child_clears_a_hand_written_wait_with_no_marker(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    published = tracker.get_issue(child).body
+    tracker.update_issue(child, title="Login API", body=published + "\n## Waiting\nThe person asked to hold.\n")
+    assert not any("foragent:waiting" in c.body for c in tracker.list_comments(child))
+    publish(publishing, plan)
+    lines = [c.body for c in tracker.list_comments(child) if "foragent:waiting" in c.body]
+    assert len(lines) == 1 and lines[0].startswith("Waiting cleared.")
+    assert tracker.get_issue(child).body.startswith(published)
+    publish(publishing, plan)
+    assert len([c for c in tracker.list_comments(child) if "foragent:waiting" in c.body]) == 1
+
+
+def _fail_waiting_comments(tracker, monkeypatch):
+    real = tracker.comment
+
+    def failing(n, text):
+        if "foragent:waiting" in text:
+            raise TrackerError("comment failed")
+        return real(n, text)
+    monkeypatch.setattr(tracker, "comment", failing)
+    return real
+
+
+@pytest.mark.parametrize("path", ["child", "edit"])
+def test_cleared_hand_written_wait_is_announced_after_a_failed_comment(publishing, plan, monkeypatch, path):
+    """Publication clears a wait no marker announced, the comment fails; the retry owes it once."""
+    root, config, tracker, git, _ = publishing
+    if path == "child":
+        plan["issues"] = plan["issues"][:1]
+        publish(publishing, plan)
+        number = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+        changed = plan
+    else:
+        body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+        number = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+        edit = {"number": number, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title, body=issue.body + "\n## Waiting\nThe person asked to hold.\n")
+    real = _fail_waiting_comments(tracker, monkeypatch)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert order_waiting_section(tracker.get_issue(number).body) is None
+    monkeypatch.setattr(tracker, "comment", real)
+    publish(publishing, changed)
+    lines = [c.body for c in tracker.list_comments(number) if "foragent:waiting" in c.body]
+    assert len(lines) == 1 and lines[0].startswith("Waiting cleared.")
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(number) if "foragent:waiting" in c.body]) == 1
+
+
+def order_waiting_section(body):
+    from foragent import order_waiting
+    return order_waiting.section(body)
