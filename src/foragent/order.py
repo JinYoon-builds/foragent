@@ -3,12 +3,14 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import sys
 from urllib.parse import quote
 
@@ -917,6 +919,41 @@ def _preread_records(root: Path) -> dict:
     return records if isinstance(records, dict) else {}
 
 
+def _record_preread(root: Path, directory: Path, digest: str, record: dict) -> None:
+    """Merge one answer into the records under a lock, so concurrent prereads keep every answer.
+
+    The lock covers only re-reading, adding and replacing, never an agent turn. Each write
+    uses its own exclusively created temporary file, so no other writer can remove or
+    overwrite it before it replaces the records. Nothing here follows a symlink.
+    """
+    flags = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    path = directory / "preread.json.lock"
+    if path.is_symlink():
+        raise PlanError(f"{path} must be a regular file, not a symlink")
+    lock = os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        records = _preread_records(root)
+        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
+        records.pop(digest, None)
+        records[digest] = record
+        while True:
+            temporary = directory / f"preread.json.{secrets.token_hex(8)}.tmp"
+            try:
+                os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600))
+                break
+            except FileExistsError:
+                continue
+        try:
+            temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, directory / "preread.json")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    finally:
+        os.close(lock)  # closing releases the lock
+
+
 def _preread_lines(message: str) -> list[str]:
     if message.strip() == "NONE":
         return []
@@ -1102,18 +1139,12 @@ def preread(plan: dict, root: Path, config: Config,
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
-        records = _preread_records(root)
         decisions = _decisions(result.last_message)
         approach = _approach(result.last_message)
-        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
-        records.pop(digest, None)
-        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-                           "unknowns": unknowns, "decisions": decisions, "approach": approach,
-                           "at": datetime.now(UTC).isoformat(timespec="seconds")}
-        temporary = root / (PREREAD_FILE + ".tmp")
-        temporary.unlink(missing_ok=True)  # never write through a leftover link
-        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, root / PREREAD_FILE)
+        _record_preread(root, directory, digest, {
+            "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
+            "unknowns": unknowns, "decisions": decisions, "approach": approach,
+            "at": datetime.now(UTC).isoformat(timespec="seconds")})
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
