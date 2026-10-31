@@ -254,10 +254,10 @@ def test_session_prompt_stdin_closes_before_slow_observation_or_callbacks(
             assert fake_clis.ready_path.exists(), "Fake CLI did not start its stdin reader"
             time.sleep(TRACKING_DELAY_S)
 
-    def observe_tree(identities=(), roots=()):
+    def observe_tree(identities=(), roots=(), **options):  # #1179 (2026-11-01, test owner): current API passes shared/not_before
         if roots:
             delay("observe_tree")
-        return observed(identities, roots)
+        return observed(identities, roots, **options)
 
     def process_group(pid):
         if pid is not None:
