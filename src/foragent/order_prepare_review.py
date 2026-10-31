@@ -21,7 +21,7 @@ import json
 import os
 from pathlib import Path
 
-from foragent import order_prepare_setup as setup, order_scratch
+from foragent import capacity, order_prepare_setup as setup, order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import executor_for
 from foragent.git import GitError
@@ -202,7 +202,8 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
     return gaps
 
 
-def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict) -> None:
+def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
+           store=None) -> None:
     """One review attempt of the recorded candidates; the record is saved before and after it.
 
     Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
@@ -214,7 +215,8 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     number = len(entry["attempts"]) + 1
     directory = Path(entry["scratch"]).parent / f"review-{number}"
     tree = directory / "tree"
-    facts = {"attempt": number, "role": "reviewer", "cycle": entry.get("cycle"), "started_at": _now(),
+    facts = {"attempt": number, "role": "reviewer", "cycle": entry.get("cycle"),
+             "requirement": entry.get("requirement"), "started_at": _now(),
              "base_revision": entry.get("base_revision"), "scratch": str(tree),
              "log": str(directory / "reviewer.log")}
     entry["attempts"].append(facts)
@@ -240,10 +242,20 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
         before = order_scratch.stamps(tree, manifest)
         writers = {attempt["session_id"] for attempt in entry["attempts"]
                    if attempt.get("role") == "writer" and attempt.get("session_id")}
-        result = executor_for(reviewer).run(
-            worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry), model=model,
-            timeout_s=REVIEW_TIMEOUT_S, log_path=Path(facts["log"]),
-            **_options(reviewer, tree, protected, lane_config, directory))
+        admitted = False
+        try:
+            # The reviewer runs the checks: it holds a machine slot and a test slot, as gate work does.
+            with capacity.hold_workload(store, config, tests=True, kind="prepare", role=f"{item['key']} reviewer"):
+                admitted = True
+                result = executor_for(reviewer).run(
+                    worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry), model=model,
+                    timeout_s=REVIEW_TIMEOUT_S, log_path=Path(facts["log"]),
+                    **_options(reviewer, tree, protected, lane_config, directory))
+        except TimeoutError as exc:
+            if admitted:
+                raise
+            outcome = {"status": "waiting", "reason": say("prepare_admission", error=" ".join(str(exc).split()))}
+            return
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
         changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
         outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config)

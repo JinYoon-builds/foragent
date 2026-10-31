@@ -543,10 +543,13 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             if current.head.startswith("foragent/dream-"):
-                from foragent.orch_dream import memory_path, published_event
+                from foragent.orch_dream import memory_path, published_event, stale_for_redo
                 from foragent.orch_dream_publish import memory_moved
 
                 lane = current.head.removeprefix("foragent/dream-")
+                if stale_for_redo(ctx.store, lane, n):
+                    raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
+                                    "and the lane dreams again")
                 if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
                     raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
                                     "dreams again from the base")
