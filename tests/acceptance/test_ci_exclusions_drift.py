@@ -72,10 +72,11 @@ def test_ci_exclusions_drift_new_order_ignores_its_newly_locked_failure(recorded
     recorded = recorded_comparison
     recorded.reports[0]["report"]["head"]["passing_ids"].remove(FUTURE)
 
-    # The failure is real before the new order owns this file. The very same
-    # evidence must remain usable, with that failure ignored, after publishing.
+    # #1240 (2026-10-31, test owner): CI measured this test (it was not excluded
+    # when CI ran), so its regression still blocks after a later order locks the
+    # file. The evidence stays usable.
     assert compare(recorded, EXCLUDED) == ([FUTURE], DURATION)
-    assert compare(recorded, NOW_EXCLUDED) == ([], DURATION)
+    assert compare(recorded, NOW_EXCLUDED) == ([FUTURE], DURATION)
 
 
 def test_ci_exclusions_drift_cannot_omit_a_currently_required_file(recorded_comparison):
@@ -91,9 +92,11 @@ def test_ci_exclusions_drift_cannot_omit_a_currently_required_file(recorded_comp
             for key in ("collected_ids", "passing_ids"):
                 payload[side][key] = [node for node in payload[side][key] if node != KEEP]
 
+    # #1240 (2026-10-31, test owner): the exclusions CI recorded are the
+    # reference. A file CI excluded is not protected by this comparison even if
+    # today's list no longer excludes it; the evidence stays usable.
     for excluded in (EXCLUDED, NOW_EXCLUDED):
-        with pytest.raises(UnusableComparison):
-            compare(recorded, excluded, uncovered)
+        assert compare(recorded, excluded, uncovered) == ([], DURATION)
 
     # Pair rejection guards with valid drift evidence so rejecting all changed
     # exclusion lists cannot satisfy this test.
