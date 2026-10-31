@@ -12,7 +12,7 @@ import re
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, ownership
+from foragent import board, capacity, design, order_observed, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -552,7 +552,8 @@ def _unconfirmed(issue, mapped: set[int]) -> bool:
     return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
 
 
-def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
+def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str],
+                  on_created: Callable[[int], None] | None = None) -> int:
     """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
 
     GitHub silently drops labels a creator may not apply, so the label is read back.
@@ -567,6 +568,8 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     """
     label = owner_label(owner)
     number = tracker.create_issue(title, body, [label, *labels])
+    if on_created is not None:
+        on_created(number)
     confirmed = label in tracker.get_issue(number).labels
     if not confirmed:
         _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
@@ -574,19 +577,8 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     return number
 
 
-def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
-            git: GitRepo | None = None, manager: SkillManager | None = None,
-            approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
-    try:
-        files = validate_plan(plan, root, config)
-    except ValueError as exc:
-        raise PlanError(str(exc)) from exc
-    keys = {item["key"] for item in plan["issues"]}
-    selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
-    if selected_keys - keys:
-        raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
-    all_issues = tracker.list_issues()
+def _publication_targets(plan: dict, all_issues: list):
+    """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
@@ -637,6 +629,23 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     for number in edit_numbers | set(mapping.values()):
         if number not in by_number or number == parent:
             raise PlanError(f"issue #{number} does not exist or is the plan parent")
+    return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
+
+
+def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            git: GitRepo | None = None, manager: SkillManager | None = None,
+            approve: bool = False, approve_keys: list[str] | None = None,
+            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
+    try:
+        files = validate_plan(plan, root, config)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    keys = {item["key"] for item in plan["issues"]}
+    selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
+    if selected_keys - keys:
+        raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
+    all_issues = tracker.list_issues()
+    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
     unknown_numbers = selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
     if unknown_numbers & by_number.keys() or (unknown_numbers and keys <= mapping.keys()):
         raise PlanError("approve numbers must refer to this plan's existing children or edits")
@@ -676,6 +685,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    targets = {mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping} | edit_numbers
+    order_observed.check(root, plan["id"], [tracker.get_issue(n) for n in sorted(targets)], config.language)
     owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                          [by_number[n] for n in mapping.values()])
     git = git or GitRepo(root)
@@ -694,6 +705,13 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         tracker.ensure_labels([LabelSpec("interactive", "d4c5f9", "Work that needs substantial back-and-forth with the user.")])
 
     recorded_blobs = saved_blobs.copy()
+
+    def remember(number: int, title: str, body: str) -> None:
+        order_observed.save(root, plan["id"], {str(number): {"title": title, "body": body}}, config.language)
+
+    def update_target(number: int, *, title: str, body: str) -> None:
+        tracker.update_issue(number, title=title, body=body)
+        remember(number, title, body)
 
     def acceptance_blobs(item: dict) -> dict[str, str]:
         # Reference files an issue relies on revoke its approval when they change, like its tests.
@@ -731,7 +749,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             labels.append("interactive")
         blobs = acceptance_blobs(item)
         if number is None:
-            number = _create_owned(tracker, config, owner, item["title"], body, labels)
+            number = _create_owned(tracker, config, owner, item["title"], body, labels,
+                                   on_created=lambda n: remember(n, item["title"], body))
             mapping[item["key"]] = number
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
@@ -740,7 +759,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
-            tracker.update_issue(number, title=item["title"], body=body)
+            update_target(number, title=item["title"], body=body)
             tracker.remove_labels(number, [label for label in existing.labels
                                            if (label.startswith(("lane:", "size:")) or label == "interactive")
                                            and label not in labels])
@@ -772,7 +791,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         prior = any(c.body == comment for c in tracker.list_comments(number))
         if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
-            tracker.update_issue(number, title=existing.title, body=body)
+            update_target(number, title=existing.title, body=body)
             if not prior:
                 tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
@@ -1005,18 +1024,23 @@ def preread(plan: dict, root: Path, config: Config,
             tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
-    Edits need the tracker for each existing issue's title and lane; it is opened only then.
+    Existing children and edits expose their current GitHub fields to the reader.
     """
     try:
         published = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     items = list(plan["issues"])
-    if plan.get("edits"):
-        if tracker is None:
-            raise PlanError("prereading edits needs the tracker for the existing issues")
+    current = {}
+    if tracker is not None:
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+        _, mapping, _, _, _, _ = _publication_targets(plan, source.list_issues())
+        current = {item["key"]: source.get_issue(mapping[item["key"]])
+                   for item in plan["issues"] if item["key"] in mapping}
+        current.update({f"#{item['number']}": source.get_issue(item["number"]) for item in plan.get("edits", [])})
+        items += [edit_view(item, current[f"#{item['number']}"], config) for item in plan.get("edits", [])]
+    elif plan.get("edits"):
+        raise PlanError("prereading edits needs the tracker for the existing issues")
     waiting, lanes = _uncreated_lanes(plan, config, items)
     if waiting:
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
@@ -1040,6 +1064,9 @@ def preread(plan: dict, root: Path, config: Config,
         snapshot = order_references.materialize(plan, item, root)
         try:
             setup, prompt, digest = preread_target(plan, item, config, root, snapshot)
+            observed = current.get(item["key"])
+            if observed is not None:
+                prompt += order_observed.context(observed, config.language)
             log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
             if log.is_symlink():
                 log.unlink()
@@ -1072,6 +1099,8 @@ def preread(plan: dict, root: Path, config: Config,
         temporary.unlink(missing_ok=True)  # never write through a leftover link
         temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, root / PREREAD_FILE)
+        if observed is not None:
+            order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))

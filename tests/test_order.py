@@ -2030,6 +2030,8 @@ def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, pla
     publish(publishing, plan)
     for number in (1, 2, 3):  # An order published before owner labels existed.
         make_legacy(tracker, number)
+    # This pre-team fixture also predates locally observed issue bases.
+    (root / ".foragent/order-observed.json").unlink()
     tracker.login = "bob"
     plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
     order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
@@ -2204,6 +2206,8 @@ def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishi
         tracker.update_issue(1, title=parent.title, body=body)
         for number in (1, 2, 3):
             make_legacy(tracker, number)
+        # The interrupted legacy publisher did not record an observed base.
+        (root / ".foragent/order-observed.json").unlink()
     tracker.login = "bob"
     report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
     assert report.parent == 1, "The legacy parent is kept"
@@ -2308,3 +2312,120 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "Waiting for machine capacity" in err
     order.preread(plan, root, config)  # A free slot: no notice.
     assert "own turn" not in capsys.readouterr().err
+
+
+def test_observed_fields_preserve_raw_changes_and_keep_plans_separate(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import order_observed
+
+    issue = SimpleNamespace(number=7, title="Initial", body="Unstructured original")
+    order_observed.save(tmp_path, "first", {"7": order_observed.fields(issue)}, "en")
+    issue.title, issue.body = "Revised", "Unstructured current"
+    with pytest.raises(order.PlanError) as refusal:
+        order_observed.check(tmp_path, "first", [issue], "en")
+    for value in ("#7", "Title", "Body", "Initial", "Revised", "Unstructured original", "Unstructured current"):
+        assert value in str(refusal.value)
+    order_observed.check(tmp_path, "other", [issue], "en")
+    order_observed.save(tmp_path, "first", {"7": order_observed.fields(issue)}, "en")
+    order_observed.check(tmp_path, "first", [issue], "en")
+
+
+def test_observed_storage_refuses_links(tmp_path):
+    from foragent import order_observed
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    (tmp_path / ".foragent").mkdir()
+    (tmp_path / order_observed.FILE).symlink_to(outside)
+    with pytest.raises(order.PlanError):
+        order_observed.save(tmp_path, "plan", {"7": {"title": "Title", "body": "Body"}}, "en")
+    assert outside.read_text() == "{}"
+
+
+@pytest.mark.parametrize("route,stop", [
+    ("create", "confirmation"), ("create", "parent_map"),
+    ("republish", "labels"), ("republish", "next_child"), ("edit", "comment"),
+])
+def test_partial_publication_records_each_written_target_before_followup_failure(publishing, plan, monkeypatch, route, stop):
+    from foragent import order_observed
+    from foragent.tracker import TrackerError
+
+    root, config, tracker, _, _ = publishing
+    if route != "create":
+        publish(publishing, plan)
+    number = 2
+    if route == "edit":
+        item = plan["issues"][0]
+        plan["issues"] = []
+        plan["edits"] = [{"number": number, **{key: item[key] for key in ("goal", "out_of_scope", "done_when")}}]
+        plan["edits"][0]["goal"] = "Revised edit goal."
+        plan["id"] += "-edit"
+        monkeypatch.setattr(order, "executor_for", lambda name: _NoUnknowns())
+        order.preread(plan, root, config, lambda: tracker)
+    elif route == "republish":
+        plan["issues"][0].update(title="Revised child title", goal="Revised child goal.")
+    get_issue, update_issue = tracker.get_issue, tracker.update_issue
+    failed = False
+
+    def interrupt():
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise TrackerError("follow-up failed")
+
+    def get(n):
+        if stop == "confirmation" and n == number:
+            interrupt()
+        return get_issue(n)
+
+    def update(n, *, title, body):
+        if (stop == "parent_map" and n == 1 and '"api": 2' in body
+                or stop == "next_child" and n == 3):
+            interrupt()
+        return update_issue(n, title=title, body=body)
+
+    remove_labels, comment = tracker.remove_labels, tracker.comment
+
+    def labels(n, values):
+        if stop == "labels" and n == number and "Revised child goal." in get_issue(n).body:
+            interrupt()
+        return remove_labels(n, values)
+
+    def commented(n, body):
+        if stop == "comment" and n == number:
+            interrupt()
+        return comment(n, body)
+
+    monkeypatch.setattr(tracker, "get_issue", get)
+    monkeypatch.setattr(tracker, "update_issue", update)
+    monkeypatch.setattr(tracker, "remove_labels", labels)
+    monkeypatch.setattr(tracker, "comment", commented)
+    with pytest.raises(TrackerError, match="follow-up failed"):
+        publish(publishing, plan)
+    written = get_issue(number)
+    order_observed.check(root, plan["id"], [written], "en")
+    # Even a newly created target must already have a base when its follow-up fails.
+    update_issue(number, title=written.title + " external", body=written.body)
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        order_observed.check(root, plan["id"], [get_issue(number)], "en")
+    update_issue(number, title=written.title, body=written.body)
+    report = publish(publishing, plan)
+    assert number in {row["number"] for row in report.rows}
+    assert get_issue(number).title == written.title
+
+
+def test_observed_section_diagnostic_omits_unchanged_body(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import order_observed
+
+    body = "<!-- foragent:v1 -->\n## Goal\nA long unchanged goal.\n## Done when\n```sh\nold check\n```\n"
+    issue = SimpleNamespace(number=7, title="Same", body=body)
+    order_observed.save(tmp_path, "plan", {"7": order_observed.fields(issue)}, "en")
+    issue.body = body.replace("old check", "new check")
+    with pytest.raises(order.PlanError) as refusal:
+        order_observed.check(tmp_path, "plan", [issue], "en")
+    message = str(refusal.value)
+    assert "Done when" in message and "old check" in message and "new check" in message
+    assert "A long unchanged goal." not in message and "Body\n" not in message
