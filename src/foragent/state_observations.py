@@ -46,12 +46,6 @@ def sent_at(intent: dict[str, Any]) -> datetime | None:
     return max(starts)
 
 
-def comment_id(intent: dict[str, Any]) -> int:
-    ids = [attempt["comment_id"] for attempt in intent.get("attempts", [])
-           if attempt.get("ok") and attempt.get("comment_id") is not None]
-    return ids[-1] if ids else -intent["id"]
-
-
 def queue_order(intent: dict[str, Any]) -> tuple[datetime, int]:
     return stamp(intent["queued_at"]) or EARLIEST, intent["id"]
 
@@ -96,6 +90,10 @@ def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any
         return None
     if facts is None:
         return "absent"
+    if intent["action"] == "comment":
+        # Send-only entries end with an acknowledgement or an outbox drop.
+        premise = intent.get("premise")
+        return "dropped" if by_person and premise is not None and person_fields(premise) != person_fields(expected) else None
     if abandoned(intent):
         return "abandoned"
     if shows(expected, intent):
@@ -172,8 +170,8 @@ class IssueObservationsMixin:
                 at: datetime, *, by_person: bool = True) -> bool:
         """Apply the retirement rule to the issue's intents in queue order.
 
-        Retired intents leave the log; a sent comment or ready-label change is
-        kept on the row. Returns whether an intent was dropped unsent.
+        Retired intents leave the log; a confirmed ready-label change keeps
+        its approval attribution on the row. Returns whether an intent was dropped unsent.
         """
         intents = sorted((intent for intent in snapshot.get("outbox", []) if intent["issue"] == number),
                          key=queue_order)
@@ -192,23 +190,19 @@ class IssueObservationsMixin:
             gone.add(intent["id"])
             if reason in ("absent", "dropped") and sent_at(intent) is None and not abandoned(intent):
                 dropped = True
-            elif row is not None:
-                self._keep_local_record(row, intent)
+            elif row is not None and reason in {"shown", "sent"}:
+                self._keep_ready_approval(row, intent)
         snapshot["outbox"] = [intent for intent in snapshot.get("outbox", []) if intent["id"] not in gone]
         if not any(intent["issue"] == number for intent in snapshot["outbox"]):
             snapshot.get("outbox_base", {}).pop(str(number), None)
         return dropped
 
-    def _keep_local_record(self, row: dict[str, Any], intent: dict[str, Any]) -> None:
-        """A retired intent leaves what the issue facts do not show: its comment and ready approval."""
+    def _keep_ready_approval(self, row: dict[str, Any], intent: dict[str, Any]) -> None:
+        """Keep attribution only for a confirmed ready-label effect, never a failed write."""
         from foragent.labels import READY
 
-        if intent["action"] == "comment" or intent["action"] == "close_issue" and intent.get("body") is not None:
-            identity = comment_id(intent)
-            if all(comment["id"] != identity for comment in row.get("comments", [])):
-                row["comments"] = row.get("comments", []) + [{
-                    "id": identity, "body": intent["body"], "author": "foragent", "created_at": intent["queued_at"]}]
-        if intent["action"] in {"add_labels", "remove_labels"} and READY in intent["labels"]:
+        if (intent["action"] in {"add_labels", "remove_labels"} and READY in intent["labels"]
+                and (READY in row["labels"]) == (intent["action"] == "add_labels")):
             row["ready_approval"] = self._ready_approval(row["number"], intent["action"] == "remove_labels",
                                                          intent.get("ready_approval", _UNSET))
 
@@ -314,8 +308,7 @@ class IssueObservationsMixin:
         self._write_json(self.root / "issues.json", snapshot)
 
     def record_github_attempt(self, intent_id: int, started_at: datetime, ok: bool, *,
-                              labels: list[str] | None = None, comment: int | None = None,
-                              final: bool = False) -> None:
+                              labels: list[str] | None = None, final: bool = False) -> None:
         """Append one send attempt to its intent; an intent already retired gains nothing.
 
         ``final`` marks a failure nobody retries: the intent is then neither visible nor pending.
@@ -328,8 +321,6 @@ class IssueObservationsMixin:
             attempt: dict[str, Any] = {"started_at": started_at.astimezone(UTC).isoformat(), "ok": ok}
             if labels is not None:
                 attempt["labels"] = list(labels)
-            if comment is not None:
-                attempt["comment_id"] = comment
             if final:
                 attempt["final"] = True
             intent.setdefault("attempts", []).append(attempt)
@@ -345,16 +336,10 @@ class IssueObservationsMixin:
         visible = _copy(row)
         for intent in sorted((item for item in snapshot.get("outbox", []) if item["issue"] == row["number"]),
                              key=queue_order):
-            if abandoned(intent):
+            if intent["action"] == "comment" or abandoned(intent):
                 continue
             known = {name: {} for name in intent.get("lanes", [])}
-            item = {**intent, "id": -comment_id(intent)}
-            if any(comment["id"] == -item["id"] for comment in visible.get("comments", [])):
-                # A comment read already shows this sent comment.
-                if intent["action"] == "comment":
-                    continue
-                item.pop("body", None)
-            self._apply_github_write(visible, item, lanes or known)
+            self._apply_github_write(visible, intent, lanes or known)
         return visible
 
     def _pending(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:

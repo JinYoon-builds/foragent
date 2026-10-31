@@ -382,3 +382,158 @@ def test_a_direct_send_that_fails_for_good_is_neither_visible_nor_retried(case):
     case.clock[0] = at(2)
     case.reader.get_issue(7)
     assert raw_intents(case) == [], "The next read clears the abandoned intent from the log"
+
+
+@pytest.mark.parametrize("action", ["comment", "close_issue"])
+def test_a_rejected_post_leaves_no_comment_fact_before_or_after_a_read(case, action):
+    def rejected(*args, **kwargs):
+        raise TrackerError("gh: validation failed (HTTP 422)")
+
+    setattr(case.remote, action, rejected)
+    before = (case.store.root / "issues.json").read_bytes()
+    case.clock[0] = at(1)
+    with pytest.raises(TrackerError, match="422"):
+        getattr(case.reader, action)(7, "Unposted evidence")
+    assert row(case)["comments"] == []
+    assert case.store.github_outbox() == []
+    if action == "comment":
+        assert (case.store.root / "issues.json").read_bytes() == before
+    case.clock[0] = at(2)
+    case.reader.get_issue(7)
+    assert row(case)["comments"] == [] and raw_intents(case) == []
+
+
+@pytest.mark.parametrize("action", ["add_labels", "remove_labels"])
+@pytest.mark.parametrize("noop", [False, True])
+def test_an_abandoned_ready_write_never_changes_approval_attribution(case, action, noop):
+    if (action == "remove_labels") != noop:
+        case.remote.add_labels(7, ["ready"])
+        case.reader.get_issue(7)
+    case.store.update_local_issue(7, ready_approval="original approval")
+    approve(case.store, at(1))
+
+    def rejected(*args):
+        raise TrackerError("gh: validation failed (HTTP 422)")
+
+    setattr(case.remote, action, rejected)
+    case.clock[0] = at(2)
+    with pytest.raises(TrackerError, match="422"):
+        getattr(case.reader, action)(7, ["ready"])
+    assert row(case)["ready_approval"] == "original approval"
+    case.clock[0] = at(3)
+    case.reader.get_issue(7)
+    assert row(case)["ready_approval"] == "original approval"
+
+
+@pytest.mark.parametrize("action", ["comment", "close_issue"])
+def test_queued_posts_never_invent_comment_facts(case, action):
+    entry = case.store.queue_github_write(7, action, body="Queued evidence")
+    assert row(case)["comments"] == []
+    if action == "close_issue":
+        assert row(case)["state"] == "closed"
+    case.clock[0] = at(1)
+    case.reader.get_issue(7)
+    assert row(case)["comments"] == []
+    assert [item["id"] for item in case.store.github_outbox()] == [entry["id"]]
+
+
+def test_a_queued_comment_ends_on_ack_with_the_real_id_even_if_a_read_interleaves(case):
+    case.store.queue_github_write(7, "comment", body="Evidence")
+    post = case.remote.comment
+
+    def observed(n, body):
+        identity = post(n, body)
+        case.clock[0] = at(2)
+        case.reader.get_issue(n)  # This is not a comment acknowledgement.
+        assert [item["action"] for item in case.store.github_outbox()] == ["comment"]
+        case.reader.list_comments(n)  # The read already contains the real id.
+        return identity
+
+    case.remote.comment = observed
+    case.clock[0] = at(1)
+    case.reader.flush_outbox()
+    assert raw_intents(case) == [] and case.store.github_outbox() == []
+    assert [(item["id"], item["body"]) for item in row(case)["comments"]] == [(1, "Evidence")]
+
+
+def test_a_failed_queued_comment_stays_send_only_until_ack_or_drop(case):
+    entry = case.store.queue_github_write(7, "comment", body="Evidence")
+
+    def rejected(*args):
+        raise TrackerError("gh: validation failed (HTTP 422)")
+
+    case.remote.comment = rejected
+    case.clock[0] = at(1)
+    with pytest.raises(TrackerError, match="422"):
+        case.reader.flush_outbox()
+    assert row(case)["comments"] == [] and case.store.github_outbox() == [entry]
+    assert "attempts" not in raw_intents(case)[0]
+    case.clock[0] = at(2)
+    case.reader.get_issue(7)
+    assert case.store.github_outbox() == [entry] and row(case)["comments"] == []
+    case.store.ingest_absence(7, at(3))
+    assert case.store.github_outbox() == []
+
+
+def test_a_direct_comment_is_recorded_only_from_its_successful_returned_id(case):
+    assert case.reader.comment(7, "Posted evidence") == 1
+    assert raw_intents(case) == []
+    assert [(item["id"], item["body"]) for item in row(case)["comments"]] == [(1, "Posted evidence")]
+
+
+def test_a_direct_close_does_not_expose_its_comment_to_a_concurrent_flush(case):
+    close = case.remote.close_issue
+    active = [False]
+
+    def slow(n, comment=None):
+        if comment is not None and not active[0]:
+            active[0] = True
+            case.clock[0] = at(2)
+            case.reader.flush_outbox()
+            case.clock[0] = at(3)
+        close(n, comment)
+
+    case.remote.close_issue = slow
+    case.clock[0] = at(1)
+    case.reader.close_issue(7, "Closed with evidence")
+    assert [item.body for item in case.remote.list_comments(7)] == ["Closed with evidence"]
+    assert row(case)["state"] == "closed"
+    assert case.store.github_outbox() == []
+
+
+@pytest.mark.parametrize("path", ["queued", "direct"])
+def test_a_close_comment_becomes_a_fact_only_when_read(case, path):
+    if path == "queued":
+        case.store.queue_github_write(7, "close_issue", body="Closing evidence")
+        case.reader.flush_outbox()
+    else:
+        case.reader.close_issue(7, "Closing evidence")
+    assert row(case)["comments"] == []
+    case.clock[0] = at(1)
+    case.reader.refresh_issues()
+    assert [(item["id"], item["body"]) for item in row(case)["comments"]] == [(1, "Closing evidence")]
+
+
+@pytest.mark.parametrize("action", ["add_labels", "remove_labels"])
+def test_a_sent_ready_write_cannot_attribute_an_effect_the_read_does_not_show(case, action):
+    if action == "remove_labels":
+        case.remote.add_labels(7, ["ready"])
+        case.reader.get_issue(7)
+    case.store.update_local_issue(7, ready_approval="original approval")
+    approve(case.store, at(1))
+    entry = case.store.queue_github_write(7, action, labels=["ready"])
+    case.store.record_github_attempt(entry["id"], at(1), True)
+    case.clock[0] = at(2)
+    case.reader.get_issue(7)  # Retires by send time, but shows no ready-label effect.
+    assert case.store.github_outbox() == [] and raw_intents(case) == []
+    assert row(case)["ready_approval"] == "original approval"
+
+
+@pytest.mark.parametrize("known", [False, True])
+def test_queueing_a_comment_changes_neither_issue_facts_nor_provenance(case, known):
+    before = case.store.local_issues()
+    case.clock[0] = at(1)
+    number = 7 if known else 8
+    case.store.queue_github_write(number, "comment", body="Unsent")
+    assert case.store.local_issues() == before
+    assert case.store.github_outbox()[0]["issue"] == number

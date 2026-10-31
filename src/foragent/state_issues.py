@@ -108,6 +108,11 @@ class IssueSnapshotMixin:
         """Pending GitHub writes, derived from the intent log, in queue order."""
         return self._pending(self._issue_record())
 
+    def github_write_issues(self) -> set[int]:
+        """Issues with unretired writes, including sends awaiting their next observation."""
+        return {entry["issue"] for entry in self._issue_record().get("outbox", [])
+                if not _observations.abandoned(entry)}
+
     def local_board_value(self, number: int, project: str, field: str) -> Any:
         """The board value last recorded for an issue's card, copying only that value."""
         row = self._issue_record()["issues"].get(str(number)) or {}
@@ -124,7 +129,7 @@ class IssueSnapshotMixin:
         })
 
     def _apply_github_write(self, row: dict[str, Any], entry: dict[str, Any], lanes: dict) -> None:
-        """Apply the same write facts to local intent and its delivery baseline."""
+        """Apply an observed-field intent to the derived view; comments never enter it."""
         action = entry["action"]
         if action != "comment":
             _state._forget_reads(row)
@@ -135,11 +140,6 @@ class IssueSnapshotMixin:
             row.update(title=entry["title"], body=entry["body"])
         elif action == "close_issue":
             row["state"] = "closed"
-        if action == "comment" or action == "close_issue" and entry.get("body") is not None:
-            row["comments"] = row.get("comments", []) + [{
-                "id": -entry["id"], "body": entry["body"], "author": "foragent",
-                "created_at": entry["queued_at"],
-            }]
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
                            started_at: datetime | None = None, premise: dict[str, Any] | None = None,
@@ -165,7 +165,9 @@ class IssueSnapshotMixin:
                      "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
             from foragent.labels import READY
 
-            record = {**entry, "premise": premise, "attempts": [], "lanes": sorted(lanes or {})}
+            record = {**entry, "premise": premise}
+            if action != "comment":
+                record.update(attempts=[], lanes=sorted(lanes or {}))
             if action in ("add_labels", "remove_labels") and READY in payload.get("labels", ()):
                 # The approval this ready-label write belongs to, fixed when the write started.
                 record["ready_approval"] = self._ready_approval(number, action == "remove_labels", ready_approval)
@@ -178,11 +180,27 @@ class IssueSnapshotMixin:
                 snapshot, number, facts, seen)
             if dropped is not None:
                 dropped.append(bool(lost))
-            if not _observations.tombstoned(snapshot, number, when) and any(
+            if action != "comment" and not _observations.tombstoned(snapshot, number, when) and any(
                     intent["issue"] == number for intent in snapshot["outbox"]):
                 row = self._local_issue(snapshot, number)
-            self._save_rows(snapshot, (number,))
+            self._save_rows(snapshot, () if action == "comment" else (number,))
             return entry
+
+    def acknowledge_github_comment(self, entry: dict[str, Any], identity: int) -> None:
+        """A send acknowledgement removes a send-only entry and records the returned comment id."""
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            snapshot["outbox"] = [item for item in snapshot.get("outbox", []) if item["id"] != entry["id"]]
+            row = snapshot["issues"].get(str(entry["issue"]))
+            if row is not None:
+                self._append_comment(row, {"id": identity, "body": entry["body"], "author": "foragent",
+                                           "created_at": self._timestamp()})
+            self._save_rows(snapshot, (entry["issue"],))
+
+    @staticmethod
+    def _append_comment(row: dict[str, Any], comment: dict[str, Any]) -> None:
+        if all(item["id"] != comment["id"] for item in row.get("comments", [])):
+            row.setdefault("comments", []).append(comment)
 
     def issues_observation(self) -> dict[str, Any]:
         """When the snapshot was last read and whether a later read failed."""
@@ -267,11 +285,13 @@ class IssueSnapshotMixin:
     def record_comments(self, number: int, comments: list[dict], *, append: bool = False) -> None:
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if not append and any(entry["issue"] == number for entry in snapshot.get("outbox", [])):
-                return
             row = snapshot["issues"].get(str(number))
             if row is not None:
-                row["comments"] = row["comments"] + comments if append else comments
+                if append:
+                    for comment in comments:
+                        self._append_comment(row, comment)
+                else:
+                    row["comments"] = comments
                 self._save_local_issue(snapshot, row)
 
     def record_board_value(self, number: int, project: str, field: str, value: str) -> None:

@@ -306,7 +306,7 @@ class RecordingTracker:
 
         store = self._context.store
         revision = store.issues_revision()
-        pending = {entry["issue"] for entry in store.github_outbox()}
+        pending = store.github_write_issues()
         previous = {row["number"]: row for row in store.local_issues()}
         self._bulk_listing = threading.get_ident()
         try:
@@ -465,14 +465,20 @@ class RecordingTracker:
         if (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
-        entry = self._queue(n, action, started, premise, payload) if action != "comment" else None
+        # A direct combined close exposes only its field effect to concurrent flushes.
+        # Its comment is send-only; the composite payload enters the retry queue only on failure.
+        field_payload = {**payload, "body": None} if action == "close_issue" else payload
+        entry = self._queue(n, action, started, premise, field_payload) if action != "comment" else None
         try:
             result = operation()
         except TrackerError as exc:
             retry = self.queue_writes and exc.is_rate_limit
+            if entry is not None and retry and field_payload != payload:
+                store.record_github_attempt(entry["id"], started, False, final=True)
+                entry = None  # Retry the unsent composite close, preserving its original premise.
             if entry is None and retry:
                 entry = self._queue(n, action, started, premise, payload)
-            if entry is not None:
+            if entry is not None and action != "comment":
                 store.record_github_attempt(entry["id"], started, False, final=not retry,
                                             labels=payload["labels"] if action == "remove_labels" else None)
             if not retry:
@@ -481,7 +487,7 @@ class RecordingTracker:
 
             pause(self._context, exc)
             return None, entry
-        if entry is not None:
+        if entry is not None and action != "comment":
             store.record_github_attempt(entry["id"], started, True,
                                         labels=payload["labels"] if action == "remove_labels" else None)
         return result, None
@@ -529,11 +535,13 @@ class RecordingTracker:
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
                     result = getattr(self._tracker, action)(number, payload)
-                    store.record_github_attempt(entry["id"], started, True,
-                                                comment=result if action == "comment" else None)
+                    if action == "comment":
+                        store.acknowledge_github_comment(entry, result)
+                    else:
+                        store.record_github_attempt(entry["id"], started, True)
             except TrackerError as exc:
-                if started is not None:
-                    # Every send attempt is recorded, whatever its failure.
+                if started is not None and action != "comment":
+                    # Every field-send attempt is recorded, whatever its failure.
                     store.record_github_attempt(queued["id"], started, False,
                                                 labels=[label] if action == "remove_labels" else None)
                 try:
