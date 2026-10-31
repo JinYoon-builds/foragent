@@ -1000,6 +1000,22 @@ def test_preread_reply_lists_one_unknown_per_line(message, unknowns):
     assert order._unknowns(message) == unknowns
 
 
+@pytest.mark.parametrize("message,unknowns", [
+    ("Notes first.\nDECIDE: Use the catalog.\nNotes after.", []),
+    ("Plan notes.\n- APPROACH: Reuse the parser.\n* more notes", []),
+    ("Notes.\n1. QUESTION: Which locale?\nTrailing note.\nquestion: Which region?", ["Which locale?", "Which region?"]),
+    ("NONE\nDECIDE: Keep it.", []),
+])
+def test_structured_preread_reply_blocks_only_on_question_lines(message, unknowns):
+    assert order._unknowns(message) == unknowns
+
+
+def test_structured_preread_reply_keeps_decisions_and_approach():
+    message = "Note.\n- DECIDE: Use the catalog.\nAPPROACH: Reuse it.\nQUESTION: Which?"
+    assert order._decisions(message) == ["Use the catalog."]
+    assert order._approach(message) == ["Reuse it."]
+
+
 def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch):
     from foragent.executors import ExecResult
 
