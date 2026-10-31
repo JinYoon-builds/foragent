@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import BASE_TIME, git_command
+from conftest import ACCEPTANCE, BASE_TIME, git_command
 from foragent import orch
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
@@ -53,7 +53,13 @@ def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, mo
     record = tmp_path / "commands.txt"
     for name in ("uv", "pnpm", "go"):
         program = programs / name
-        program.write_text('#!/bin/sh\nprintf "%s:%s\\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD"\ntest -f suite-ok\n')
+        program.write_text(
+            '#!/bin/sh\n'
+            # Foragent's own fixed acceptance invocations (`-o addopts=`) are not the suites run.
+            'case " $* " in *" addopts= "*) ;; *) printf "%s:%s\\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD";; esac\n'
+            # Like pytest, report each test: an empty legacy JUnit report is a measured empty run.
+            'for arg; do case "$arg" in --junitxml=*) printf \'<testsuite tests="0"/>\' > "${arg#*=}";; esac; done\n'
+            'test -f suite-ok\n')
         program.chmod(0o755)
     monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("PREMERGE_RECORD", str(record))
@@ -478,3 +484,153 @@ def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
     with pytest.raises(orch.OrchError, match=f"dream PR #{pr} predates a redo of lane alpha"):
         orch.merge(c.ctx, pr, approved_by="jin")
     assert c.tracker.merged_prs == []
+
+
+# #1105: the run baseline's passing acceptance tests must keep passing on the merge result.
+SUITE_FILE = "tests/acceptance/test_kept.py"
+KEPT = f"{SUITE_FILE}::test_kept"
+NEIGHBOUR = f"{SUITE_FILE}::test_neighbour"
+UNIT_FILE = "tests/test_unit.py"
+NEIGHBOUR_SOURCE = "def test_neighbour():\n    assert False, 'not built yet'\n"
+BASE_SUITE = {
+    SUITE_FILE: "def test_kept():\n    assert True\n\n" + NEIGHBOUR_SOURCE,
+    UNIT_FILE: "def test_unit():\n    assert True\n",
+}
+CHANGES = {
+    "failed": "def test_kept():\n    assert False, 'broken by the PR'\n\n" + NEIGHBOUR_SOURCE,
+    "skipped": ("import pytest\n\n@pytest.mark.skip(reason='stopped checking')\ndef test_kept():\n"
+                "    assert True\n\n" + NEIGHBOUR_SOURCE),
+    "removed": NEIGHBOUR_SOURCE,
+}
+PYTEST = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
+
+
+def suite_case(git_history, tmp_path, head_files, *, mode="all", command=PYTEST, base_files=()):
+    """Real pytest on a real base and PR head; GitHub is the fake tracker."""
+    h = git_history
+    h.update({**BASE_SUITE, **dict(base_files)})
+    base = h.tip
+    h.update(head_files)
+    head = h.tip
+    git_command(h.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(h.origin, "update-ref", "refs/heads/main", base)
+    h.tip = base
+    h.update({"base.txt": "base advanced"})
+    tracker = FakeTracker(now=lambda: BASE_TIME)
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Issue", body="Body")
+    tracker.set_pr_head_sha(pr, head)
+    tracker.set_pr_checks(pr, "pass")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    config = Config(repo="owner/repo", runner_unit_tests=mode, test_command=command)
+    ctx = RunContext("owner/repo", h.clone, tracker, store, config, GitRepo(h.clone), now=lambda: BASE_TIME)
+    return SimpleNamespace(ctx=ctx, tracker=tracker, pr=pr,
+                           log=lambda: (store.root / "runs" / f"premerge-pr-{pr}.log").read_text())
+
+
+def assert_refused(c, report, broken):
+    assert report["ready"] is False and report["tests"] == "fail", report
+    assert report["broken"] == broken, report
+    with pytest.raises(orch.OrchError, match="not ready"):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+@pytest.mark.parametrize("change", ["failed", "skipped", "removed"])
+def test_protected_acceptance_test_must_still_pass_on_the_merge_result(git_history, tmp_path, mode, change):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES[change]}, mode=mode)
+    report = orch.premerge(c.ctx, c.pr)
+    assert_refused(c, report, [KEPT])  # Once, even when the head comparison also catches it.
+    assert report["failing_on_base"] == [NEIGHBOUR], report  # The failing neighbour stays nonblocking.
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_green_head_that_drops_a_protected_test_is_refused(git_history, tmp_path, mode):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: "def test_neighbour():\n    assert True\n"}, mode=mode)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), [KEPT])
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_memory_only_change_with_a_failing_neighbour_merges(git_history, tmp_path, mode):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+    assert report["failing_on_base"] == [NEIGHBOUR], report
+    assert "protected baseline head=" in c.log(), "The protected set ran on the merge result"
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
+
+
+def test_protected_ids_come_from_base_configuration_not_the_head_command(git_history, tmp_path):
+    """The base's own collection settings decide the protected set; the user command is not replayed."""
+    check = "tests/acceptance/check_kept.py"
+    base_files = {"pytest.ini": "[pytest]\npython_files = test_*.py check_*.py\n",
+                  check: "def test_check():\n    assert True\n"}
+    skipped = "import pytest\n\n@pytest.mark.skip(reason='gone')\ndef test_check():\n    assert True\n"
+    c = suite_case(git_history, tmp_path, {check: skipped}, base_files=base_files)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), [f"{check}::test_check"])
+
+
+def test_unreadable_protected_report_breaks_every_protected_test(git_history, tmp_path, monkeypatch):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"})
+
+    def unreadable(report):
+        raise OSError("no report")
+
+    monkeypatch.setattr(orch, "_passing_acceptance_ids", unreadable)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), sorted([f"{ACCEPTANCE}::test_feature", KEPT]))
+
+
+@pytest.mark.parametrize("case", ["not-pytest", "no-acceptance-directory", "nothing-passes"])
+def test_no_protected_set_skips_the_check(git_history, tmp_path, case):
+    if case == "not-pytest":
+        c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES["removed"]}, command="true")
+    elif case == "no-acceptance-directory":
+        c = suite_case(git_history, tmp_path, {"notes.md": "x\n"}, command=f"{PYTEST} {UNIT_FILE}")
+        c.ctx.config = replace(c.ctx.config, acceptance_dir="tests/absent")
+    else:
+        c = suite_case(git_history, tmp_path, {"notes.md": "x\n"}, base_files={
+            SUITE_FILE: NEIGHBOUR_SOURCE, ACCEPTANCE: "def test_feature():\n    assert False\n"})
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+    assert "protected baseline head=" not in c.log(), "No protected run without a protected set"
+
+
+def test_same_base_cache_with_wider_exclusions_is_reused(git_history, tmp_path):
+    """Spec answer (2026-10-31): a cached baseline of the same base is reused even when it was
+    captured with wider exclusions; tests excluded at capture time are not protected by it."""
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"})
+    c.ctx.store.save_approval(5, body="pending", body_sha="body", acceptance_blobs={SUITE_FILE: "blob"},
+                              approved_by="human", approved_at=BASE_TIME.isoformat())
+    first = orch.premerge(c.ctx, c.pr)
+    assert first["ready"] is True, first
+    (c.ctx.store.root / "approvals" / "5.json").unlink()  # The owner's exclusion goes away.
+    second = orch.premerge(c.ctx, c.pr)
+    assert second["ready"] is True and second["failing_on_base"] == [NEIGHBOUR], second
+    assert c.log().count("protected baseline base=") == 1, "The same-base cache was reused"
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_current_exclusions_override_the_reused_baseline(git_history, tmp_path, monkeypatch, mode):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES["skipped"]}, mode=mode)
+    first = orch.premerge(c.ctx, c.pr)
+    assert first["broken"] == [KEPT], first  # Warm a baseline with no exclusions.
+    capture = orch._capture_baseline
+
+    def capture_then_approve(*args, **kwargs):
+        baseline = capture(*args, **kwargs)
+        assert baseline is not None and SUITE_FILE not in baseline.excluded
+        assert "cache=hit" in c.log(), "Reuse the existing same-base measurement"
+        # Another issue claims the locked file after capture but before protection is checked.
+        # In CI mode the baseline is passed in; in full-suite mode the helper captures it.
+        c.ctx.store.save_approval(5, body="pending", body_sha="body",
+                                  acceptance_blobs={SUITE_FILE: "blob"}, approved_by="human",
+                                  approved_at=BASE_TIME.isoformat())
+        return baseline
+
+    monkeypatch.setattr(orch, "_capture_baseline", capture_then_approve)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+    monkeypatch.setattr(orch, "_capture_baseline", capture)
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
