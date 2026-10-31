@@ -2776,3 +2776,41 @@ def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(pub
     assert len(revisions()) == 2
     publish(publishing, changed)
     assert len(revisions()) == 2
+
+
+def test_planning_notes_replacement_and_interrupted_tail(tmp_path):
+    from foragent import order_notes
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    first = order_notes.append(store, kind="decision", boundary="chosen", content="Earlier decision")
+    path = store.root / "notes.jsonl"
+    before = path.read_bytes()
+    # Simulate a killed append, including a partial UTF-8 character.
+    with path.open("ab") as stream:
+        stream.write(b'{"text":"partial\xe2')
+    interrupted = path.read_bytes()
+    later = order_notes.append(store, kind="decision", boundary="later", content="New decision",
+                               replaces=first["id"])
+    assert path.read_bytes().startswith(interrupted)
+    rows = order_notes.pending(StateStore(store.root))["notes"]
+    assert [row["id"] for row in rows] == [first["id"], later["id"]]
+    assert rows[1]["replaces"] == first["id"]
+    assert all(row["status"] == "waiting" for row in rows)
+    assert b'"status"' not in path.read_bytes()
+    assert before in path.read_bytes()
+
+
+@pytest.mark.parametrize("kind,replaces", [("idea", "earlier"), ("decision", "missing")])
+def test_planning_notes_reject_invalid_replacement_without_writing(tmp_path, kind, replaces):
+    from foragent import order_notes
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    first = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this")
+    path = store.root / "notes.jsonl"
+    before = path.read_bytes()
+    with pytest.raises(order.PlanError):
+        order_notes.append(store, kind=kind, boundary="chosen", content="Replacement",
+                           replaces=first["id"] if replaces == "earlier" else replaces)
+    assert path.read_bytes() == before

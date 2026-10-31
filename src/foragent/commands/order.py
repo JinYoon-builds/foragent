@@ -105,6 +105,15 @@ def add(commands) -> None:
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    note = order_actions.add_parser("note", help=say("order_notes_help"))
+    note.add_argument("--defer", required=True, help=say("order_notes_defer_help"))
+    note.add_argument("--kind", choices=("decision", "idea"), required=True, help=say("order_notes_kind_help"))
+    note.add_argument("--text", required=True, help=say("order_notes_text_help"))
+    note.add_argument("--replaces", help=say("order_notes_replaces_help"))
+    pending = order_actions.add_parser("pending", help=say("order_notes_pending_help"))
+    for command in (note, pending):
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+        command.add_argument("--json", action="store_true")
     prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
     prepare.add_argument("plan", type=cli.Path)
     prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -211,6 +220,9 @@ def _perspectives(args, root) -> int:
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action in {"note", "pending"}:
+        from foragent import order_notes
+        return order_notes.run(args, root)
     if args.action == "progress":
         _config, _repo, store = repo_store(root)
         fields = {name: getattr(args, name) for name in
