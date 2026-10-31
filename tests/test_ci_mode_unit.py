@@ -15,7 +15,7 @@ from zipfile import ZipFile
 import pytest
 import yaml
 
-from foragent.ci_mode import UnusableComparison, comparison
+from foragent.ci_mode import StaleComparison, UnusableComparison, comparison
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, measurement_scope, read_exclusions, workflow_text, write_workflow
 from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
@@ -171,6 +171,67 @@ def test_rejects_unusable_shards(damage):
     checks[1]['report'] = '{' if damage == 'malformed' else payload
     with pytest.raises(UnusableComparison):
         compare(checks)
+
+
+@pytest.mark.parametrize("stale", ["base", "producer"])
+def test_only_freshness_mismatches_are_stale(stale):
+    checks = [report(), report(1)]
+    if stale == "base":
+        checks[0]['report']['base_sha'] = "moved"
+        field = "report.base_sha"
+    else:
+        checks[1]['run']['id'] = checks[1]['artifact']['workflow_run']['id'] = 41
+        field = "run.id"
+    with pytest.raises(StaleComparison, match=field):
+        compare(checks)
+    # A later shard's unrelated invalid field is never retryable.
+    checks[1]['report']['repository'] = "foreign/repo"
+    with pytest.raises(UnusableComparison, match="report.repository") as caught:
+        compare(checks)
+    assert not isinstance(caught.value, StaleComparison)
+
+
+KEEP_1 = "tests/acceptance/test_keep_1.py::test_keep"
+
+
+@pytest.mark.parametrize("damage,field,observed,expected", [
+    (lambda c: c[1]['report']['base'].update(complete=False), "report.base.complete", "false", "true"),
+    (lambda c: c[1]['report']['head'].pop('complete'), "report.head.complete", "missing", "true"),
+    (lambda c: c[1]['report']['base'].update(collected_ids="all"), "report.base.collected_ids", '"all"',
+     "list of test ids"),
+    (lambda c: c[1]['report']['head'].update(passing_ids=["no-separator"]), "report.head.passing_ids",
+     '"no-separator"', "'::'"),
+    (lambda c: c[1]['report']['base'].update(collected_ids=[KEEP_1, KEEP_1]), "report.base.collected_ids",
+     KEEP_1, "unique"),
+    (lambda c: c[1]['report']['head'].update(passing_ids=[KEEP_1, "t.py::extra"]), "report.head.passing_ids",
+     '"t.py::extra"', "report.head.collected_ids"),
+    (lambda c: c[1]['report'].update(base=c[0]['report']['base']), "report.base.collected_ids",
+     "tests/acceptance/test_keep_0.py::test_keep", "only one shard"),
+    (lambda c: c[1]['report'].pop('head'), "report.head", "missing", "object"),
+    (lambda c: c[1]['run'].pop('event'), "run.event", "missing", '"pull_request"'),
+    (lambda c: c.pop(), "report.shard_index", "[0]", "[0, 1]"),
+])
+def test_suite_and_listing_rejections_name_field_observed_and_expected(damage, field, observed, expected):
+    checks = [report(), report(1)]
+    damage(checks)
+    with pytest.raises(UnusableComparison) as caught:
+        compare(checks)
+    message = str(caught.value)
+    assert f"{field}: observed {observed}".replace('"', '') in message.replace('"', ''), message
+    assert expected in message, message
+
+
+def test_excluded_test_in_report_names_the_test_and_exclusions():
+    checks = [report(), report(1)]
+    excluded = ["tests/acceptance/test_keep_1.py"]
+    checks[1]['report']['excluded'] = checks[1]['report']['scope']['excluded'] = excluded
+    with pytest.raises(UnusableComparison) as caught:
+        comparison(checks, "owner/repo", "base", "head", excluded,
+                   expected_scope=measurement_scope(Config(ci_shards=2), Path('.'), excluded),
+                   expected_shards=range(2))
+    message = str(caught.value)
+    assert f'report.base.collected_ids: observed "{KEEP_1}"' in message, message
+    assert '["tests/acceptance/test_keep_1.py"]' in message, message
 
 
 @pytest.mark.parametrize("key,value", [
