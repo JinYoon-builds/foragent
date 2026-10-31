@@ -902,17 +902,9 @@ class GhTracker:
         from foragent import gh_composite
 
         if gh_composite.combines_effects(args):
-            # A later request can fail after an earlier one took effect, so this argv is
-            # sent once; after a refusal only reads decide whether it took effect (#1208).
-            try:
-                return self._attempt(args, input, binary)
-            except TrackerError as exc:
-                if not exc.is_auth_failure:
-                    raise
-                refused = exc
-            self._sleep(auth_retry.WAITS[0])
-            gh_composite.recover(self, args, refused)
-            return ""
+            # A later request can fail after an earlier one took effect: resend only while
+            # GitHub shows none of this command's writes (#1208).
+            return gh_composite.send(self, args, lambda: self._attempt(args, input, binary))
         # One request refused with a 401 had no effect, so the call may retry (#1208).
         return auth_retry.retry(lambda: self._attempt(args, input, binary),
                                 lambda exc: isinstance(exc, TrackerError) and exc.is_auth_failure,

@@ -3,7 +3,7 @@
 The transport adapters already retried within their budget. The run ends as
 ``auth-failed`` with one detail line and one journal event. It is neither
 blocked nor put back in the queue: the tick holds an issue whose last run is
-``auth-failed`` until ``fa orch retry`` adds ``ready`` (or a new approval), so
+``auth-failed`` until a later ``fa orch retry`` (or a new approval), so
 automatic restarts cannot spend quota on a broken credential.
 """
 
@@ -87,20 +87,35 @@ def recorded_detail(ctx: RunContext, n: int) -> str:
     return reasons[-1] if reasons else ""
 
 
-def held(store, n: int, approved_at: str) -> bool:
-    """An auth-failed execution waits for `fa orch retry` (its journal event) or a newer approval.
+def retry_requested_at(store, n: int) -> datetime | None:
+    """When `fa orch retry` asked for this issue, from the marker it writes before adding `ready`."""
+    from foragent.run_previous import retry_marker
 
-    A ``ready`` label proves nothing: the runner's own limit wait adds one too.
+    try:
+        return datetime.fromisoformat(retry_marker(store.root, n).read_text(encoding="utf-8").split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def held(store, n: int, approved_at: str) -> bool:
+    """An auth-failed execution waits for `fa orch retry` or a newer approval.
+
+    A ``ready`` label proves nothing (the runner's own limit wait adds one too),
+    and neither does a journal line written after the label. The retry counts
+    only when it was requested after this execution started: the request that
+    launched this execution is older than its start, so it cannot launch another.
     """
     run = store.get_run(n)
     if run is None or run.outcome != OUTCOME:
         return False
     try:
-        if datetime.fromisoformat(approved_at) > datetime.fromisoformat(run.started_at):
+        started = datetime.fromisoformat(run.started_at)
+        if datetime.fromisoformat(approved_at) > started:
             return False
+        requested = retry_requested_at(store, n)
+        return requested is None or not requested > started
     except (TypeError, ValueError):
         return True
-    return not any(event["kind"] == "retry" for event in _events_since(store, n, run.started_at))
 
 
 def record_after(n: int, ctx: RunContext, failure: object) -> None:

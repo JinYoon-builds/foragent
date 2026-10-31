@@ -177,8 +177,8 @@ def _publish_reviewed_in_turn(
                     else:
                         failed_merge = exc
                 else:
-                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         run_publish.run_auth_failed.record_after(n, ctx, runner.after_merge(ctx, pr.number, pr.base))
                     try:

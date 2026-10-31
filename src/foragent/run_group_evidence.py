@@ -65,7 +65,7 @@ def void_reason(ctx: RunContext, n: int, head_sha: str, base_sha: str,
     try:
         current = _current_head(ctx, n)
     except TrackerError as exc:
-        if exc.is_rate_limit:
+        if exc.is_unavailable:  # a GitHub wait or a refused credential is the run's outcome (#1208)
             raise
         return f"PR head unreadable: {exc}"
     if current != head_sha:
@@ -78,6 +78,8 @@ def void_reason(ctx: RunContext, n: int, head_sha: str, base_sha: str,
         lines = ctx.git._call(["log", "--first-parent", "--reverse", "--format=%H %T %P",
                                f"{group_base}..{base_sha}"]).splitlines()
     except (GitError, OSError) as exc:
+        if getattr(exc, "is_auth_failure", False):
+            raise
         return f"main history unreadable: {exc}"
     commits = [line.split() for line in lines if line.strip()]
     if len(commits) != len(trees):
@@ -121,7 +123,8 @@ def record_merge(n: int, ctx: RunContext, target: str, pre_tip: str, head_sha: s
     Only for a run named by a joint result that has later members (they are the
     only readers). Recorded as unattributed when anything else is in the way: a
     commit before it (an outsider racing the final read), a different tree, or an
-    unreadable history. Never raises; a missing record voids reuse, nothing more.
+    unreadable history. Never raises; a missing record voids reuse, nothing more. Call it after
+    ``store.record_merge`` so a refused credential is recorded on a merged run.
     """
     from foragent import orch_events
     from foragent.run_checks import _append
@@ -145,6 +148,9 @@ def record_merge(n: int, ctx: RunContext, target: str, pre_tip: str, head_sha: s
             commit = {"sha": first[0], "parent": pre_tip, "tree": expected}
     except (GitError, OSError, IndexError) as exc:
         reason = f"main unreadable after the merge: {str(exc).strip() or type(exc).__name__}"
+        from foragent import run_auth_failed
+
+        run_auth_failed.record_after(n, ctx, exc)  # a refused fetch keeps the run merged, with its reason (#1208)
     _append(ctx.store.log_path(n), f"\nObserved merge commit: {commit['sha'] if commit else f'none ({reason})'}")
     orch_events.append_event(ctx.store, ctx.now(), n, "group-merge",
                              f"merge of {head_sha} " + (f"is {commit['sha']}" if commit else f"unattributed ({reason})"),

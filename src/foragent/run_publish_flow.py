@@ -231,8 +231,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     else:
                         failed_merge = exc
                 else:
-                    run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
                     if inputs.decision.kind == "merge":
                         run_publish.run_auth_failed.record_after(n, ctx, runner.after_merge(ctx, pr, attempt.target_branch))
                     run_publish._progress(n, ctx)

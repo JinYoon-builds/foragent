@@ -3190,9 +3190,7 @@ def test_auth_failed_issue_waits_for_orch_retry_instead_of_restarting(ctx, label
     ctx.tracker.add_labels(1, ["ready"])  # a ready label alone (the runner's limit wait adds one too)
     tick(ctx)
     assert launches == [], "a ready label without `fa orch retry` restarted the auth-failed issue"
-    from foragent.orch_events import append_event
-
-    append_event(ctx.store, ctx.now(), 1, "retry", "#1: queued implementation retry")  # what `fa orch retry` journals
+    request_retry(ctx, ctx.now())  # what `fa orch retry` records before adding ready
     tick(ctx)
     assert launches == [1]
 
@@ -3221,10 +3219,8 @@ def test_orch_retry_over_a_stale_running_label_starts_the_auth_failed_issue(ctx)
     ctx.now = lambda: NOW + timedelta(minutes=1)
     ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
     ctx.store.finish_run(1, "auth-failed", detail="authentication failed after 3 attempts: x")
-    from foragent.orch_events import append_event
-
-    ctx.tracker.add_labels(1, ["ready"])  # `fa orch retry` before any tick
-    append_event(ctx.store, NOW + timedelta(minutes=1, seconds=30), 1, "retry", "#1: queued implementation retry")
+    request_retry(ctx, NOW + timedelta(minutes=1, seconds=30))  # `fa orch retry` before any tick
+    ctx.tracker.add_labels(1, ["ready"])
     ctx.now = lambda: NOW + timedelta(minutes=2)
     launches = []
     ctx.launcher = lambda number: launches.append(number) or 7001
@@ -3232,3 +3228,32 @@ def test_orch_retry_over_a_stale_running_label_starts_the_auth_failed_issue(ctx)
     for _ in range(2):
         tick(ctx)
     assert launches == [1]
+
+
+def request_retry(ctx, at):
+    from foragent.run_previous import retry_marker
+
+    marker = retry_marker(ctx.store.root, 1)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"retry {at.isoformat()}\n")
+
+
+def test_the_retry_that_launched_a_run_does_not_launch_another_after_auth_failed(ctx):
+    """#1208: `fa orch retry` writes its time before `ready`; that request is older than the run it started."""
+    approve(ctx)
+    tick(ctx)
+    ctx.tracker.remove_labels(1, ["ready"])
+    request_retry(ctx, NOW + timedelta(seconds=30))  # the retry that started the run below
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, "auth-failed", detail="authentication failed after 3 attempts: x")
+    from foragent.orch_events import append_event
+
+    append_event(ctx.store, NOW + timedelta(minutes=1, seconds=5), 1, "retry", "late journal line of that retry")
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    launches = []
+    ctx.launcher = lambda number: launches.append(number) or 7001
+    ctx.start_runs = True
+    tick(ctx)
+    assert launches == []
