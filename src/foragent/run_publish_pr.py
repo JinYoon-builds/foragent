@@ -42,11 +42,18 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
         missing_skills=attempt.missing_skills,
         skills_line=run_publish._skills_line(ctx.store.get_run(n)),
         rebuttals="\n\n".join(attempt.rebuttals),
+        searched=_searched(attempt),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
         language=ctx.config.language,
         risk_notes=run_publish.review_perspectives.with_checklist(run_publish._risk_notes(attempt), ctx.config) if pr_scope else "",
         lane_decisions=_lane_decisions(n, ctx, attempt.worktree) if pr_scope else "",
     )
+
+
+def _searched(attempt: Implementation) -> str:
+    """The latest `.foragent/SEARCHED.md` the lane wrote, if any."""
+    path = attempt.worktree / ".foragent/SEARCHED.md"
+    return path.read_bytes().decode("utf-8", errors="replace").strip() if path.is_file() else ""
 
 
 def _risk_notes(attempt: Implementation) -> str:
