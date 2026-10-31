@@ -123,21 +123,27 @@ def test_park_status_and_stop_agree_a_live_run_is_running(ctx, monkeypatch):
 
 
 def test_park_status_and_stop_agree_a_dead_run_is_not_running(ctx, monkeypatch):
-    """#435: stop, park and the status row agree a record whose processes are all gone is not running.
+    """#435: park and the status row agree a record whose processes are all gone has no worker.
 
     The status active_runs list still keeps the running record after park removes approved,
-    so a view can mark the gone worker ("no worker") instead of hiding the run.
+    so a view can mark the gone worker ("no worker") instead of hiding the run. fa orch
+    stop reads that same list (#1207), so it stops the record and keeps its work.
     """
-    from foragent import orch_stop, status
+    from foragent import orch_stop, scheduler, status
     from foragent.scheduler_stop import run_is_live
 
     _running(ctx, monkeypatch, alive=False, labels=("running", "approved"))
     assert not run_is_live(ctx.store.get_run(1))
-    ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
-    with pytest.raises(OrchError, match="not running"):
-        orch_stop.stop(ctx, 1, "stuck")
     orch_park.park(ctx, 1, "wait")
     assert "approved" not in ctx.tracker.get_issue(1).labels
+    assert [run["number"] for run in status.collect(ctx.store, ctx.config, START)["active_runs"]] == [1]
+    stopped = []
+    monkeypatch.setattr(scheduler, "_kill_run", lambda c, n, report, **kw: stopped.append(n) or True)
+    monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr("foragent.scheduler_stop._restore_stopped", lambda *a: None)
+    ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
+    orch_stop.stop(ctx, 1, "stuck")
+    assert stopped == [1]
     assert _status_state(ctx) != "working"
     assert [run["number"] for run in status.collect(ctx.store, ctx.config, START)["active_runs"]] == [1]
 
@@ -197,8 +203,10 @@ def test_a_reused_runner_pid_is_not_running_in_park_status_or_stop(ctx, monkeypa
     assert not _live_with(ctx, monkeypatch, [(42000, 1, 42000, 42000, 99.0)])
     assert _status_state(ctx) != "working"
     ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
-    with pytest.raises(OrchError, match="not running"):
+    # The record is unfinished (#1207), but #261 never signals a PID another process now has.
+    with pytest.raises(OrchError, match="a different process now has this PID"):
         orch_stop.stop(ctx, 1, "stuck")
+    assert ctx.store.get_run(1).status == "running"
     orch_park.park(ctx, 1, "wait")
     assert "approved" not in ctx.tracker.get_issue(1).labels
 
