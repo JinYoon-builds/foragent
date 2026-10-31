@@ -27,6 +27,9 @@ CONCENTRATION_RUNS = 8
 CONCENTRATION_IDLE = 2
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
          "lane_concentration")
+# Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
+# with ready work are explained by the binding constraint; every other kind is only its numbers.
+SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
