@@ -129,11 +129,15 @@ def test_open_window_replaces_the_rows_between_header_and_help(root, store):
     snapshot, config = done_snapshot()
     config = replace(config, review="careful")
     closed = render_frame(snapshot, config, root, width=120)
-    assert "머지: 하나씩" in closed.splitlines()[-1]
+    hints = "도토리를 누르면 설명해요 · s 설정 · m 사용량 모드 · q 끝내기"
+    assert "👥 팀" not in closed and closed.splitlines()[-1] == hints
     state = {"store": store}
     handle_key("s", store, config, state=state, repo_root=root)
     opened = render_frame(snapshot, config, root, width=120, state=state)
-    assert "👥 팀" in opened and "머지: 하나씩" not in opened.splitlines()[-1]
+    # The window stands between the top line and the usage and hint rows, which stay.
+    assert "👥 팀" in opened and opened.splitlines()[-1] == hints
+    assert opened.splitlines()[0] == closed.splitlines()[0]
+    assert opened.splitlines()[-2] == closed.splitlines()[-2] and "Claude" in opened.splitlines()[-2]
     calm = render_frame(snapshot, replace(config, animation=False), root, width=120)
     assert calm.splitlines()[0] == opened.splitlines()[0], "the header stays, in its one-line form"
     assert "Enter" in opened.splitlines()[-1] or any("Enter" in line for line in opened.splitlines()[-3:])
@@ -217,9 +221,11 @@ def test_short_screen_keeps_header_tabs_prompt_and_help_around_the_window(root, 
     assert len(lines) <= height
     closed = render_frame(snapshot, replace(load_config(root), animation=False), root, width=width).splitlines()
     assert lines[0] == closed[0], "the header stays first, in its one-line form"
-    assert lines[-1].startswith("1–2: 담당 보기"), "the help line stays last"
+    assert "도토리를 누르면 설명해요".startswith(lines[-1][:8]) and lines[-2].startswith("Claude"), (
+        "the usage and hint rows stay last")
     text = "\n".join(lines)
-    assert "팀" in text.split("\n")[2] and "› 리뷰어" in text and "팀 전체에 적용돼요" in text
+    # The tab line follows the top line directly (lane_header has no gap after it).
+    assert "팀" in text.split("\n")[1] and "› 리뷰어" in text and "팀 전체에 적용돼요" in text
     assert "위에" in text and "더 있어요" in text, "the hidden rows are named"
 
 
@@ -232,7 +238,7 @@ def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(ro
     press(["s", "2", "right", "enter"], root, store, state)
     assert load_config(root).claude_quota["mode"] == "burn"
     handle_key("s", store, load_config(root), state=state, repo_root=root)
-    last = render_frame(snapshot, load_config(root), root, width=120, state=state).splitlines()[-1]
+    last = render_frame(snapshot, load_config(root), root, width=120, state=state).splitlines()[-2]
     assert "burn" in last and "keep 80%" not in last
     seen = []
     refresh = _Refresh(seen.append, "old")
