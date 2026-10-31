@@ -2679,3 +2679,14 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "Waiting for machine capacity" in err
     order.preread(plan, root, config)  # A free slot: no notice.
     assert "own turn" not in capsys.readouterr().err
+
+
+def test_shared_lock_hand_approval_after_a_recorded_one_does_not_inherit_its_record(locked_order):
+    case = locked_order
+    _publish_locked(case, approve=True)
+    assert _record_of(case, 2)
+    case.clock[0] += timedelta(minutes=5)
+    case.tracker.remove_labels(2, ["approved", "ready"])
+    case.clock[0] += timedelta(minutes=5)
+    case.tracker.add_labels(2, ["approved"])  # Approved again by hand on GitHub: no record.
+    assert _record_of(case, 2) == {}

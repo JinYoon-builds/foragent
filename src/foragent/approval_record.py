@@ -35,12 +35,20 @@ def _parse(body: str) -> dict[str, str] | None:
     return value
 
 
+def _earlier(events: list[LabelEvent], event: LabelEvent) -> list[datetime]:
+    position = max((i for i, item in enumerate(events) if item == event), default=len(events))
+    return [datetime.fromisoformat(item.created_at) for item in events[:position] if item.label == event.label]
+
+
+def possible(events: list[LabelEvent], event: LabelEvent) -> bool:
+    """Whether ``event`` can have a record: publication records only re-approvals."""
+    return bool(_earlier(events, event))
+
+
 def recorded(events: list[LabelEvent], comments: list[Comment], event: LabelEvent) -> dict[str, str]:
     """The blob hashes recorded for the approval ``event``, or ``{}`` when there are none."""
     at = datetime.fromisoformat(event.created_at)
-    position = max((i for i, item in enumerate(events) if item == event), default=len(events))
-    earlier = [datetime.fromisoformat(item.created_at) for item in events[:position] if item.label == event.label]
-    floor = max(earlier, default=None)
+    floor = max(_earlier(events, event), default=None)
     found: tuple[datetime, int, dict[str, str]] | None = None
     for comment in comments:
         blobs = _parse(comment.body)

@@ -130,9 +130,11 @@ def _recorded_on_base(
     read again, and if they still disagree the approval waits for a later tick
     (``None``). An approval without a record returns ``{}``: today's lookup applies.
     """
+    events = scheduler._label_events(ctx, issue.number, confirmed=False)
+    if not approval_record.possible(events, event):
+        return {}  # A first approval: no record exists, and no comment needs reading.
     record = {path: sha for path, sha in approval_record.recorded(
-        scheduler._label_events(ctx, issue.number, confirmed=False),
-        ctx.tracker.list_comments(issue.number), event).items() if path in paths}
+        events, ctx.tracker.list_comments(issue.number), event).items() if path in paths}
     if not record or ctx.git.blob_shas(base_ref, record) == record:
         return record
     ctx.git.fetch("origin", ctx.config.base_branch)

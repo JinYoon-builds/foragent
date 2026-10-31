@@ -79,14 +79,16 @@ def inbox_payload(inbox: "Inbox") -> dict:
     return payload
 
 
-def _try_card(ctx: InspectContext, number: int, body: str) -> TryCard | None:
-    path = ctx.store.root / "try" / f"{number}.md"
-    text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else pr_try_text(body)
+def _try_card(body: str) -> TryCard | None:
+    """A merged PR is published, so its current body alone owns the card.
+
+    The saved `<state>/try/<n>.md` copy stays machine evidence and the draft for unpublished
+    work; it never stands in for a published PR, even after an edit removes the section.
+    """
+    text = pr_try_text(body)
     if text is None or text.strip() == "_not provided by the implementer_":
         return None
-    if not path.is_file():
-        text = "## Try it\n" + text
-    return parse_try(text)
+    return parse_try("## Try it\n" + text)
 
 
 @dataclass
@@ -235,7 +237,7 @@ def collect(ctx: InspectContext) -> Inbox:
             items.append(Item(
                 "try", number, pr.title, url, None, f"Merged in PR #{pr.number}; try it",
                 "", pr.number, False,
-                _try_card(ctx, number, pr.body), load_prepared(ctx.store, number),
+                _try_card(pr.body), load_prepared(ctx.store, number),
             ))
             tried_issues.add(number)
         if number in issues and (checks := _human_checks(pr.body)):

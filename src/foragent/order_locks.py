@@ -50,8 +50,10 @@ def _gate_lock(issue: Issue, approval, paths: list[str], config: Config, tracker
     if not paths:
         return {}
     # A recorded hash wins over the approval-time lookup, as in ``scheduler_approval``.
+    events = tracker.label_events(issue.number)
     record = {path: sha for path, sha in approval_record.recorded(
-        tracker.label_events(issue.number), tracker.list_comments(issue.number), event).items() if path in paths}
+        events, tracker.list_comments(issue.number), event).items() if path in paths} \
+        if approval_record.possible(events, event) else {}
     looked_up = [path for path in paths if path not in record]
     if not looked_up:
         return record
