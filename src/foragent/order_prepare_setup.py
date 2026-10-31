@@ -180,7 +180,8 @@ def context_digest(plan: dict, item: dict, config: Config, root: Path) -> str:
     return digest.hexdigest()
 
 
-def published_files(plan: dict, root: Path, config: Config) -> dict[str, bytes]:
+def published_files(plan: dict, root: Path, config: Config,
+                    files: dict[str, str | bytes] | None = None) -> dict[str, bytes]:
     """Every file publication writes except statement issues' own tests, as publication writes them.
 
     The spec, every reference file, and the legacy issues' acceptance files and checkout-read tests
@@ -188,14 +189,17 @@ def published_files(plan: dict, root: Path, config: Config) -> dict[str, bytes]:
     reviewed tree is the published tree. A statement issue's tests are its own cycle's output, and
     the other files its Done when names stay as main has them (``order_reviewed.require_reviewed_bytes``
     holds publication to that). Callers validate the plan first; an invalid one publishes nothing.
+    ``files`` is the manifest publication already read and will write; it is judged as is, never
+    read from the checkout again, so the bytes checked are the bytes published.
     """
     from foragent.issue import acceptance_paths
     from foragent.order import validate_plan
 
-    try:
-        files = validate_plan(plan, root, config)
-    except ValueError:
-        return {}
+    if files is None:
+        try:
+            files = validate_plan(plan, root, config)
+        except ValueError:
+            return {}
     own = {name for item in [*plan["issues"], *plan.get("edits", [])] if "statements" in item
            for name in [*(item.get("acceptance_files") or {}),
                         *acceptance_paths(item.get("done_when") or [], config.acceptance_dir)]}
@@ -203,9 +207,11 @@ def published_files(plan: dict, root: Path, config: Config) -> dict[str, bytes]:
             for name, data in files.items() if name not in own}
 
 
-def published_digest(plan: dict, root: Path, config: Config) -> dict[str, str]:
+def published_digest(plan: dict, root: Path, config: Config,
+                     files: dict[str, str | bytes] | None = None) -> dict[str, str]:
     """The sha256 of each of ``published_files``; part of every statement issue's cycle identity."""
-    return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(published_files(plan, root, config).items())}
+    return {name: hashlib.sha256(data).hexdigest()
+            for name, data in sorted(published_files(plan, root, config, files).items())}
 
 
 def other_candidates(plan: dict, record: dict | None, item: dict) -> dict[str, bytes]:

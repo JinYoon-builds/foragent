@@ -81,8 +81,11 @@ def _language(config: Config) -> str:
 
 
 def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
-                           items: list[dict]) -> dict[str, dict]:
+                           items: list[dict], files: dict[str, str | bytes] | None = None) -> dict[str, dict]:
     """The reviewed record entry of each statement issue; refuses unless every one has current evidence.
+
+    ``files`` is the manifest publication read once and will write. The evidence is checked against
+    those bytes, never against a second read of the checkout that could differ from what is written.
 
     The base itself is checked by ``require_tested_base`` against the base actually published onto.
     """
@@ -101,9 +104,9 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
         if not isinstance(entry, dict) or entry.get("status") != "reviewed":
             status = entry.get("status") if isinstance(entry, dict) else None
             missing.append(f"{key} ({status})" if status else key)
-        elif entry.get("cycle") != identity(plan, item, config, root):
+        elif entry.get("cycle") != identity(plan, item, config, root, files):
             # A published file (a legacy test or helper, the spec, a reference) changed since review.
-            now, then = published_digest(plan, root, config), entry.get("published") or {}
+            now, then = published_digest(plan, root, config, files), entry.get("published") or {}
             paths = sorted(name for name in now.keys() | then.keys() if now.get(name) != then.get(name))
             if paths:
                 changed += paths

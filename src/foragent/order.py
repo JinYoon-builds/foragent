@@ -669,8 +669,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         **{key: by_number[number].body for key, number in mapping.items() if number in by_number},
         **{f"#{item['number']}": by_number[item["number"]].body for item in plan.get("edits", [])},
     }, "publish")
+    # The evidence is checked against ``files``, the bytes read once above and written below.
     reviewed_bases = require_reviewed_tests(
-        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config)) or {}
+        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config), files=files) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
     # Statement issues take the reviewed-tests route instead of preread.

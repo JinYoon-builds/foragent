@@ -53,17 +53,18 @@ def contracts(plan: dict, item: dict) -> dict:
         "done_when": None if "statements" in other else other.get("done_when")} for other in others}
 
 
-def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
+def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | None = None) -> str:
     """What the tests are written and reviewed for: the issue's requirements, every other issue's
     requirements and legacy contracts, the shared spec and references, the risk guidance both agents
-    read, and the executor setup. A change starts a new cycle with the history retained."""
+    read, and the executor setup. A change starts a new cycle with the history retained. Publication
+    passes the ``files`` it will write, so the identity it checks is of exactly those bytes."""
     from foragent.order_prepare_prompt import _risk_notes
     from foragent.order_prepare_setup import context_digest, published_digest
 
     shared = {"item": {name: item.get(name) for name in _CYCLE_FIELDS}, "title": plan.get("title"),
               "risks": _risk_notes(root, config, item),
               "setup": _setup(config, item["lane"]), "context": context_digest(plan, item, config, root),
-              "published": published_digest(plan, root, config),
+              "published": published_digest(plan, root, config, files),
               "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
               "new_lanes": plan.get("new_lanes"),
               "references": {name: hashlib.sha256(data).hexdigest()

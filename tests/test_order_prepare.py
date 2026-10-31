@@ -1505,3 +1505,35 @@ def test_a_review_that_did_not_see_another_issues_reviewed_tests_is_refused(requ
     code, out, err = cases.publish(case, capsys, "--approve")
     assert code != 0 and "notice" in out + err and "not reviewed beside" in out + err, out + err
     cases.assert_no_publication(case)
+
+
+def test_bytes_read_for_publication_are_the_bytes_checked_even_if_the_checkout_changes_back(
+        request, git_history, capsys, monkeypatch):
+    """Publication writes the manifest it read once; restoring the checkout afterwards cannot vouch for it."""
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    strong = "import sys\nsys.exit(1)\n"
+    git_history.update({EXISTING: strong})
+    git_command(case.root, "fetch", "origin", "main")
+    git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
+    git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
+    case.plan["issues"].append({
+        "key": "legacy", "title": "Legacy receipt", "goal": "Keep receipts.", "out_of_scope": "Delivery.",
+        "done_when": [f"python {EXISTING}"], "lane": "api", "size": "s"})
+    case.save()
+    assert cases.prepare(case, capsys)["status"] == "reviewed"
+    (case.root / EXISTING).write_text("pass\n")  # weakened; publication reads these bytes
+    read = order.validate_plan
+
+    def read_then_restore(plan, root, config):
+        files = read(plan, root, config)
+        (case.root / EXISTING).write_text(strong)  # the checkout looks reviewed again afterwards
+        return files
+
+    monkeypatch.setattr(order, "validate_plan", read_then_restore)
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and EXISTING in out + err, out + err
+    cases.assert_no_publication(case)
+    assert git_command(case.root, "show", f"HEAD:{EXISTING}") + "\n" == strong
