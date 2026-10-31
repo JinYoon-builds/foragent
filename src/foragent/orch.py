@@ -149,14 +149,15 @@ def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: I
            say: str | None = None, advice: str | None = None) -> dict:
     """Journal the verb and comment it on the issue.
 
-    ``advice`` is a comment body the issue owns (a retry hint the worker will receive),
-    published byte for byte rather than as the journal's one-line summary. It is never
+    ``advice`` is text the issue owns (a retry hint the worker will receive). The comment
+    keeps the journal's one-line summary and adds ``advice`` byte for byte below it. It is never
     skipped during a GitHub wait, and a refused write waits in the outbox instead of being lost.
     """
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if advice is not None:
         for number in ([n] if n is not None else issues):
-            if error := orch_advice.publish(ctx.tracker, ctx, number, "<!-- foragent:orch -->\n" + advice):
+            body = f"<!-- foragent:orch -->\n{event['summary']}\n\n{advice}"
+            if error := orch_advice.publish(ctx.tracker, ctx, number, body):
                 event["queued_after"] = error
         return event
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
@@ -215,7 +216,7 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     # The worker receives the hint exactly as given; the issue keeps the same bytes.
-    advice = f"#{n}: queued implementation retry; hint:\n\n{hint}" if hint else None
+    advice = f"Hint, exactly as the next implementer receives it:\n\n{hint}" if hint else None
     event = _event(ctx, n, "retry", summary, say=say, advice=advice)
     kick_tick(ctx.repo_root)
     if "queued_after" in event:
