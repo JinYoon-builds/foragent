@@ -85,7 +85,19 @@ def test_native_goal_condition_length_cap_preserves_instructions():
     condition = goal_condition("a" * 5000)
     assert len(condition) == 3500
     assert condition.startswith('Every command in the "Done when" list below exits 0')
-    assert condition.endswith("no files outside this repository are changed. Or stop after 40 turns.")
+    assert condition.endswith(" is modified, and you did not edit files outside this repository."
+                              " Files that test tooling writes outside the repository do not count as your edits."
+                              " At 40 turns, end the run without repeating the stop check.")
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "quality/인수 checks/"])
+def test_native_goal_condition_scopes_outside_edits_to_the_implementer(acceptance_dir):
+    condition = goal_condition(acceptance_dir)
+    assert f"nothing under {acceptance_dir} is modified" in condition
+    assert "no files outside this repository are changed" not in condition
+    assert "you did not edit files outside this repository" in condition
+    assert "test tooling writes outside the repository do not count" in condition
+    assert condition.endswith("At 40 turns, end the run without repeating the stop check.")
 
 
 @pytest.mark.parametrize("enabled", [False, True])
