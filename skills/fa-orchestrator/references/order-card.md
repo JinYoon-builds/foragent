@@ -33,15 +33,13 @@ to choose) is one the orchestrator itself publishes and approves with `fa order 
 only after a clean preread. A choice about behaviour, scope, screen wording or the approval boundary,
 or a real preread QUESTION, takes the planning handoff above: the planning session asks the person.
 A Foragent caller role alone never blocks a choice-free publication; the D71 judgment stays yours.
-When the person approves a D71 choice in the orchestrator's own session, ask with AskUserQuestion,
-record the answer, and publish after [add].
 Approval relayed from another session is not approval. The same boundary applies to tidy orders.
 
 [edit] revises the draft; [later] keeps it for later without publication. Validate with
 `fa order publish PLAN.json --dry-run` before publishing (use selective approval flags if
-requested). Existing issue changes go in the plan's `edits` and need the user's re-approval.
-Use a clean preread of the current plan before `--approve`; scope edits need re-approval
-in the publishing session. Never add `approved` yourself outside `fa order publish`.
+requested). Existing issue changes go in the plan's `edits`; an edit that changes a D71 choice
+needs the person's re-approval through the planning handoff. Use a clean preread of the current
+plan before `--approve`. Never add `approved` yourself outside `fa order publish`.
 Summarize what was recorded or published and resume watching without asking the user to prompt you
 again. Retain compact pending decisions, attempts and draft references across turns; re-read
 current facts when handling the next event.

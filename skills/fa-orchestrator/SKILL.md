@@ -146,5 +146,5 @@ The gate checks the schedule from local facts (`fa tidy due --json`: `merges` af
 the last tidy, or `idle-quota` when no lane runs and quota is left) and puts one "tidy due" request
 with the evidence numbers in `fa orch inbox` per due period; it never orders tidy work. Judge whether
 to call the architect (`fa orch architect --why "<numbers>"`), which reads widely, ranks and proposes
-refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the user
-approves in the publishing session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
+refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the person
+approves through the planning session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
