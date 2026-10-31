@@ -86,6 +86,11 @@ existing verb, always with `--say "<one line for a person>"` in the docs/voice.m
 - `fa orch resolve N --verdict pass|fail --note "<evidence and reasoning>"`: record a verdict on the current PR head. Done when and CI still apply.
 - `fa orch escalate N --summary "<why a human is needed>" --tried "<attempts>" --option "<recommendation>" --option "<alternative>" --recommend 1`: raise a human decision.
 
+GitHub writes (issues, pull requests, comments, labels, board items and fields, API mutations) go through FA
+commands: the verbs above, the other `fa orch` verbs, `fa order` and `fa inspect`. Read-only `gh` inspection stays
+available. When no FA command fits a write you need, do not hand the shell work to the person: propose an issue
+that asks for the missing FA command, as a new order through `fa-order`.
+
 Count attempts by defect class, not by reason code, across `fa orch log` and issue comments. When an issue is held a
 second time for the same defect class, do not retry with another hint; fix the issue itself: redesign its Goal (for
 example one writer per state, D95) through an order edit and re-approval, or split it. Use `fa orch escalate` only
