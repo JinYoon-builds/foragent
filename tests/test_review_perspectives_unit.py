@@ -16,8 +16,8 @@ def test_checklist_lists_every_effective_perspective_in_order():
     names = [item["name"] for item in perspectives(config)]
     positions = [text.index(f"- [ ] {name}:") for name in names]
     assert positions == sorted(positions) and names[-1] == "ops"
-    assert checklist(Config()).count("- [ ]") == len(DEFAULT_PERSPECTIVES) == 7
-    assert DEFAULT_PERSPECTIVES[-1]["name"] == "performance"
+    assert checklist(Config()).count("- [ ]") == len(DEFAULT_PERSPECTIVES) == 4
+    assert DEFAULT_PERSPECTIVES[-1]["name"] == "test-quality"
 
 
 def test_repeated_project_name_is_rejected(tmp_path):

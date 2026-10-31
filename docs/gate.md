@@ -129,8 +129,8 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
-review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 7개(security·concurrency·failure·compatibility·realism·docs·performance)와 이름이 같으면 그 focus를 바꿈
-review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
+review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 4개(goal-fidelity·concurrency·interruption-rollback·test-quality)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
+review_reviewers: 1      # 1 이상 정수; 동시에 도는 관점 리뷰어 수의 상한. 1이면 하나씩 차례로 돌고, 관점은 줄지 않음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [YOUR_GITHUB_LOGIN]   # v1 승인 라벨을 붙일 수 있는 사람 (D14); 자기 GitHub 로그인으로 바꿈. init은 `gh api user`의 로그인을 씀
