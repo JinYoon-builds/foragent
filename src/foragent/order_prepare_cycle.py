@@ -142,7 +142,7 @@ def revision_notes(entry: dict | None) -> str:
 
 
 def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRepo, path: Path,
-                   record: dict, base: str, plan_path: Path | None) -> None:
+                   record: dict, base: str, plan_path: Path | None, store=None) -> None:
     """Write, review and promote one statement issue, reusing what this cycle already settled.
 
     An open question starts no agent until planning changes this issue's requirement.
@@ -164,10 +164,20 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
         pending = fresh and bool(entry.get("written")) and (entry["status"] == "written" or (
             entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
         if not pending:
-            _write_tests(plan, item, root, config, git, path, record, base, cycle, asked)
+            _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
         if pending or record["issues"][item["key"]]["status"] == "written":
-            reviewing.review(plan, item, root, config, git, path, record)
+            reviewing.review(plan, item, root, config, git, path, record, store)
     entry = record["issues"][item["key"]]
+    if entry["status"] == "reviewed" and plan_path is not None and not settled:
+        # The agents may have run for long: main is read again right before the result is promoted.
+        from foragent.order_scratch import base_revision
+
+        base = base_revision(git, config.base_branch)
+        if entry.get("base_revision") != base:
+            entry.update(status="interrupted", phase="reviewing_tests",
+                         reason=text("prepare_main_moved", config.language))
+            _write(path, record)
+            return
     if entry["status"] == "reviewed" and plan_path is not None and not promote(plan_path, item, entry, root, config, base):
         # Planning changed the issue during preparation: these tests answer the old requirements.
         entry.update(status="interrupted", phase="reviewing_tests", reason=text("prepare_plan_changed", config.language))

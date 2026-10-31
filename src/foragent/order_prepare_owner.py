@@ -21,7 +21,12 @@ ACTIVE = ("writing_tests", "reviewing_tests")
 
 
 def current() -> dict:
-    """This process's lifetime as the record names its owner."""
+    """This process's lifetime as the record names its owner.
+
+    When the kernel start time cannot be read, only the pid is recorded; readers then fall back
+    to the existing pid probe, which can keep a reused pid "alive" but never declares a live
+    owner dead.
+    """
     try:
         row = processes.read_process_identity(os.getpid())
     except PermissionError:
@@ -31,31 +36,40 @@ def current() -> dict:
 
 
 def alive(owner: dict | None) -> bool | None:
-    """True or False from the recorded lifetime; None when no lifetime is recorded or readable."""
+    """Whether the recorded owner still runs: True, False, or None when that cannot be known.
+
+    A recorded lifetime is checked by a fresh identity read (None when unreadable). A pid without
+    a start time uses the existing liveness rule (signal 0 only; a denied probe means alive). An
+    owner entry that names no pid is unknown. Only False is evidence that the owner stopped.
+    """
+    from foragent import capacity
+
     if not isinstance(owner, dict) or type(owner.get("pid")) is not int or owner["pid"] <= 0:
         return None
     if not isinstance(owner.get("start_time"), (int, float)):
-        return None
+        return capacity._alive(owner["pid"])
     return processes.recorded_identity_evidence(owner["pid"], owner["start_time"], fresh=True).alive
 
 
 def _same(owner: dict | None, me: dict) -> bool:
-    return isinstance(owner, dict) and owner.get("pid") == me["pid"] and owner.get("start_time") == me["start_time"]
+    """A recorded owner with this process's pid is this process or one that already ended."""
+    return isinstance(owner, dict) and owner.get("pid") == me["pid"]
 
 
 def take(record: dict, config: Config) -> bool:
     """Become the record's owner while holding the order's lock; False while another owner may run.
 
-    A recorded owner whose lifetime is still running and is not this process keeps its preparation.
+    A recorded owner that is not this process keeps its preparation unless it is known to have
+    stopped: a running or unknown liveness is never treated as death.
     Otherwise the steps it left running are closed as interrupted, with their facts kept, so the
     next run resumes them: an unfinished review is reviewed again from the recorded candidate
     bytes, an unfinished writer is written again and its partial files are never candidates.
     """
     me = current()
     previous = record.get("owner")
-    # The lock already proves the previous holder ended; a recorded lifetime still running means
-    # the lock was lost (its file replaced), so that owner keeps the preparation.
-    if previous is not None and not _same(previous, me) and alive(previous) is True:
+    # The lock proves no other holder of this lock file runs, but the file can be replaced under a
+    # live owner; only evidence that the recorded owner stopped lets this process take over.
+    if previous is not None and not _same(previous, me) and alive(previous) is not False:
         return False
     now = datetime.now(UTC).isoformat(timespec="seconds")
     for entry in record.get("issues", {}).values():

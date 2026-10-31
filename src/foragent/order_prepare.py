@@ -30,7 +30,7 @@ import os
 from pathlib import Path
 import re
 
-from foragent import order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
+from foragent import capacity, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -166,7 +166,8 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
 
 
 def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRepo,
-                 path: Path, record: dict, base: str, cycle: str, asked: str | None = None) -> None:
+                 path: Path, record: dict, base: str, cycle: str, asked: str | None = None,
+                 store: StateStore | None = None) -> None:
     """One writer attempt in a new scratch tree; the record is saved before and after the agent."""
     from foragent.order_prepare_cycle import revision_notes, same_requirement
 
@@ -214,8 +215,18 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
         _write(path, record)
         prompt = start.notes + writer_prompt(plan, item, lane_config, root, tree, base) + revision + start.memory_notice
         before = order_scratch.stamps(tree, manifest)  # taken last, right before the writer starts
-        result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
-                                                  timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
+        admitted = False
+        try:
+            # The writer is one agent workload: it waits for the shared machine slot like preread.
+            with capacity.hold_workload(store, config, kind="prepare", role=f"{item['key']} writer"):
+                admitted = True
+                result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
+                                                          timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
+        except TimeoutError as exc:
+            if admitted:
+                raise
+            failure = {"status": "waiting", "reason": say("prepare_admission", error=" ".join(str(exc).split()))}
+            return
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
         failure = _failure(result, config)
     except (GitError, OSError, ValueError) as exc:
@@ -272,10 +283,10 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         _write(path, record)
-        base = order_scratch.base_revision(git, config.base_branch) if any(
-            "statements" in item for item in items) else None
         for item in items:
             if "statements" in item:
-                prepare_issue(plan, item, root, config, git, path, record, base, plan_path)
+                # Main is read again for each issue: an earlier issue's agents may have run for long.
+                base = order_scratch.base_revision(git, config.base_branch)
+                prepare_issue(plan, item, root, config, git, path, record, base, plan_path, store)
         return [owners.row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy,
                            config) for item in items]
