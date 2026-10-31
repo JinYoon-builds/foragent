@@ -313,7 +313,9 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     def admitted(prompt: str, log_path: Path, k: int) -> ExecResult:
         # Each simultaneous reviewer holds one shared machine slot; the run's own slot (its pid)
         # covers the first, so N reviewers use N slots and a budget of 1 runs them one by one.
-        with capacity.hold_workload(ctx.store, ctx.config, kind="review", issue=n, role=f"reviewer {k}"):
+        # It may wait behind its siblings for as long as the run itself may still run.
+        with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
+                                    kind="review", issue=n, role=f"reviewer {k}"):
             return call(prompt, log_path)
 
     def failure(label: str, error: BaseException) -> str:

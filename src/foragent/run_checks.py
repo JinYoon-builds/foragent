@@ -371,10 +371,10 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
         parsed = parse_body(approval.body)
         if not has_machine_check(parsed):
             raise ValueError("Done when has no machine check")
-        slot = run_check_slot.stop_hook_slot(worktree, len(parsed.done_when_commands))
+        budget = run_check_slot.StopHookBudget(directory, worktree)  # One deadline inside the hook timeout.
         for command in parsed.done_when_commands:  # Each holds the machine test slot; every failure is reported.
-            with slot():
-                result = runner._check(command, worktree, directory / "check-done.log", 900)
+            with budget.slot():  # The command runs only for what the hook has left after the wait.
+                result = runner._check(command, worktree, directory / "check-done.log", budget.timeout())
             if result.exit_code != 0 or result.timed_out:
                 failures.append(result)
         if failures:

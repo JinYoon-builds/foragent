@@ -60,3 +60,41 @@ def test_direct_rerun_panel_uses_n_slots_and_merges_once(git_history, tmp_path, 
     assert panel >= 3 and len(reviews) == panel and len(merges) == 1
     assert maximum[0] <= budget and max(used) <= budget, "the runner and its reviewers took N+1 slots"
     assert capacity.machine_runs(case.store, case.clock[0]) == 0
+
+
+@pytest.mark.parametrize("entry", ["issue", "review"])
+def test_admission_waits_as_long_as_the_run_may_take(git_history, tmp_path, monkeypatch, entry):
+    """A reviewer queued behind its siblings, or a direct start behind valid work, never gives up
+    at the 600 s default while the run still has time (review finding, #993)."""
+    case = perspective_case(git_history, tmp_path, monkeypatch, count=1, review_max=0, max_retries=1)
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", .5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    case.store.finish_run(1, "error")
+    if entry == "review":
+        case.tracker.remove_labels(1, ["running"])
+    hold, waits = capacity.hold_workload, []
+
+    def recorded(*args, **kw):
+        waits.append((kw.get("kind"), kw.get("wait_s")))
+        return hold(*args, **kw)
+
+    monkeypatch.setattr(capacity, "hold_workload", recorded)
+    runtime = case.config.max_runtime_minutes * 60
+    assert runtime > 600
+    if entry == "review":
+        monkeypatch.setattr(runner, "_review_only", lambda *args: "merged")
+        assert runner.review_only(1, case.ctx) == "merged"
+        assert waits == [("review", runtime)]
+        return
+
+    def execute(**kw):
+        if not case.implementer.calls:
+            return case.implementer.run(**kw)
+        return ExecResult(0, False, "VERDICT: PASS", kw["log_path"])
+
+    case.ctx.executor_factory = lambda _: SimpleNamespace(run=execute)
+    assert runner.run_issue(1, case.ctx) == "merged"
+    assert waits[0] == (capacity.RUN_KIND, runtime)
+    reviewers = [wait for kind, wait in waits[1:] if kind == "review"]
+    assert reviewers and all(600 < wait <= runtime for wait in reviewers), waits
