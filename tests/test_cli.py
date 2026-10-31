@@ -723,7 +723,7 @@ def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypat
     tracker.add_issue(1, "Issue 1", labels=["needs-human"])
     tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nChoose a format")
     monkeypatch.setattr(cli, "load_config", lambda root: Config(
-        notify="command:/offline/notifier", notify_summary_hour=(datetime.now().astimezone().hour + 1) % 24,
+        notify="command:/offline/notifier", notify_summary_hour=(NOW.astimezone().hour + 1) % 24,  # ctx.now() is NOW, not the wall clock.
     ))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
