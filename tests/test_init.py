@@ -1365,3 +1365,130 @@ def test_role_commands_derive_the_default_roles_they_add_to_a_legacy_config(tmp_
     for name in roles.DEFAULT_ROLES:
         assert f".claude/agents/fa-{name}.md" in head and f".claude/agent-memory/fa-{name}/MEMORY.md" in head
     assert git_command(root, "status", "--porcelain", "--", ".claude", ".foragent.yml") == ""
+
+
+def _fa_allow_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    (root / ".claude").mkdir(parents=True)
+    return root
+
+
+def test_fa_allow_existing_rule_counts_as_accepted_without_asking(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    settings = root / ".claude/settings.json"
+    settings.write_text('{"permissions": {"allow": ["Bash(fa:*)"]}}\n', encoding="utf-8")
+    before = settings.read_bytes()
+
+    def never(prompt):
+        raise AssertionError("must not ask")
+
+    assert offer_fa_allow(root, never) == "present"
+    assert not (root / ".claude/settings.local.json").exists()
+    assert settings.read_bytes() == before
+    assert json.loads(fa_allow_record_path().read_text()) == {str(root.resolve()): "accepted"}
+    assert offer_fa_allow(root, never) == "kept"
+
+
+def test_fa_allow_without_terminal_remembers_nothing(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+
+    def no_terminal(prompt):
+        raise EOFError
+
+    assert offer_fa_allow(root, no_terminal) == "unanswered"
+    assert not fa_allow_record_path().exists()
+    assert offer_fa_allow(root, lambda prompt: "y") == "added"
+    local = json.loads((root / ".claude/settings.local.json").read_text())
+    assert local == {"permissions": {"allow": ["Bash(fa:*)"]}}
+
+
+def test_fa_allow_unreadable_local_settings_is_left_alone(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    local = root / ".claude/settings.local.json"
+    local.write_text("[not an object", encoding="utf-8")
+    assert offer_fa_allow(root, lambda prompt: "yes") == "unreadable"
+    assert local.read_text() == "[not an object"
+    assert not fa_allow_record_path().exists()
+
+
+def test_fa_allow_keeps_settings_edited_while_the_prompt_waits(tmp_path, monkeypatch):
+    from foragent.init import offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    local = root / ".claude/settings.local.json"
+    local.write_text('{"permissions": {"allow": ["Read(a/**)"]}}\n', encoding="utf-8")
+
+    def edit_then_accept(prompt):
+        local.write_text('{"permissions": {"allow": ["Read(a/**)"], "deny": ["Read(.env)"]}}\n',
+                         encoding="utf-8")
+        return "yes"
+
+    assert offer_fa_allow(root, edit_then_accept) == "added"
+    assert json.loads(local.read_text()) == {
+        "permissions": {"allow": ["Read(a/**)", "Bash(fa:*)"], "deny": ["Read(.env)"]}}
+
+
+def test_fa_allow_keeps_other_projects_answers_recorded_while_the_prompt_waits(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    other = tmp_path / "other"
+    (other / ".claude").mkdir(parents=True)
+
+    def other_declines_first(prompt):
+        assert offer_fa_allow(other, lambda _prompt: "no") == "declined"
+        return "no"
+
+    assert offer_fa_allow(root, other_declines_first) == "declined"
+    assert json.loads(fa_allow_record_path().read_text()) == {
+        str(other.resolve()): "declined", str(root.resolve()): "declined"}
+    assert offer_fa_allow(other, lambda prompt: pytest.fail("asked again")) == "kept"
+
+
+def test_fa_allow_never_overwrites_an_unreadable_record(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    record = fa_allow_record_path()
+    record.parent.mkdir(parents=True)
+    record.write_text("{broken", encoding="utf-8")
+    with pytest.raises(OSError):
+        offer_fa_allow(root, lambda prompt: "no")
+    assert record.read_text() == "{broken"
+
+
+def test_fa_allow_concurrent_init_of_the_same_project_does_not_ask_twice(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    nested = []
+
+    def second_init_runs_while_first_waits(prompt):
+        nested.append(offer_fa_allow(root, lambda _prompt: pytest.fail("asked twice")))
+        return "no"
+
+    assert offer_fa_allow(root, second_init_runs_while_first_waits) == "declined"
+    assert nested == ["busy"]
+    assert json.loads(fa_allow_record_path().read_text()) == {str(root.resolve()): "declined"}
+    assert offer_fa_allow(root, lambda prompt: pytest.fail("asked again")) == "kept"
+
+
+def test_fa_allow_rule_added_by_hand_during_the_prompt_is_not_added_twice(tmp_path, monkeypatch):
+    from foragent.init import offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    local = root / ".claude/settings.local.json"
+
+    def add_by_hand_then_accept(prompt):
+        local.write_text('{"permissions": {"allow": ["Bash(fa:*)"]}}\n', encoding="utf-8")
+        return "yes"
+
+    assert offer_fa_allow(root, add_by_hand_then_accept) == "present"
+    assert json.loads(local.read_text()) == {"permissions": {"allow": ["Bash(fa:*)"]}}
