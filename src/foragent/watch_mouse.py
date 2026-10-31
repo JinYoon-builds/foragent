@@ -33,7 +33,10 @@ MIN_SCREEN = 3
 
 def scroll_limit(state: dict[str, Any]) -> int:
     """The last scroll offset: len(F) - (height - 1); 0 under MIN_SCREEN rows; before any
-    screen was drawn, the last row of the last frame."""
+    screen was drawn, the last row of the last frame. With pinned rows the scroll counts
+    body rows only: body_length - body_height."""
+    if "body_length" in state and "body_height" in state:
+        return max(0, state["body_length"] - state["body_height"])
     length, height = state.get("length", 0), state.get("height")
     if height is None:
         return max(0, length - 1)
@@ -52,6 +55,12 @@ def highlighted_row(state: dict[str, Any]) -> int | None:
     down (or a wrapped second line) is not highlighted too.
     """
     issues = dict(state.get("rows", ()))
+    row_map = state.get("row_map")
+    if row_map is not None and "body_length" in state:
+        # Pinned rows: the first issue row among the body rows on screen.
+        pinned = {row for rows in (state.get("pinned_rows") or {}).values() for row in rows}
+        shown = sorted(row for row in row_map.values() if row not in pinned)
+        return next((y for y in shown if y in issues), None)
     top, height = state.get("scroll", 0), state.get("height")
     windowed = height is not None and height >= MIN_SCREEN and state.get("length", 0) > height
     bottom = top + height - 1 if windowed else None
@@ -105,11 +114,18 @@ def handle_mouse(
             state["explanation_target"] = target
         return
     state.pop("explanation_target", None)  # Any other click clears the selection, then acts.
-    if target == ("orchestrator", None):
+    if target == ("settings", None):
+        # The header's text button opens the same window as the s key.
+        if state.get("issue") is None:
+            from foragent.watch_sections import settings as settings_window
+
+            settings_window.open_window(state)
+    elif target == ("orchestrator", None):
         watch.switch_to_orchestrator(store)
     elif isinstance(target, tuple) and target[0] == "acorn":
         # The same issue closes its box; another issue switches the box to it.
-        row = y + layout.get("offset", 0)
+        row_map = layout.get("row_map")
+        row = row_map.get(y) if row_map is not None else y + layout.get("offset", 0)
         _open(state, None if state.get("issue") == target[1] else target[1], store, row)
     elif isinstance(target, tuple) and target[0] == "more":
         toggle_lane(state, target[1])

@@ -75,7 +75,9 @@ def test_a_lane_with_workers_shows_only_their_rows(tmp_path):
     assert len(waiting) == 1 and waiting[0].startswith("⏳"), text
     first, second = rows_with(text, "orch 1"), rows_with(text, "orch 2")
     assert len(first) == len(second) == 1 and "#1" in first[0] and "#2" in second[0], text
-    assert not any(row.startswith("│") for row in text.splitlines()), "no work table"
+    # The unbounded frame (shell) also shows the orchestrator box, whose rows start with │;
+    # a work table would list issue numbers there.
+    assert not any(row.startswith("│") and "#" in row for row in text.splitlines()), "no work table"
 
 
 def test_orchestrator_claim_needs_a_fresh_heartbeat(tmp_path):
