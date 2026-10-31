@@ -90,8 +90,28 @@ def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def requirement(plan: dict, item: dict) -> str:
+    """What planning asked of this issue: its own fields, the order's summary and spec, its references.
+
+    Holds and an open question belong to it. Another issue's edit, a setup change or a new main
+    starts a new cycle (new evidence) but keeps them; planning's clarified statement starts afresh.
+    """
+    asked = {"key": item.get("key"), "item": {name: item.get(name) for name in _CYCLE_FIELDS},
+             "title": plan.get("title"), "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
+             "references": {name: hashlib.sha256(data).hexdigest()
+                            for name, data in sorted(_references(plan, item).items())}}
+    return hashlib.sha256(json.dumps(asked, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _scoped(entry: dict, attempt: dict) -> bool:
+    """Whether an attempt answers the entry's current requirement (records before it: the same cycle)."""
+    if entry.get("requirement") is not None and attempt.get("requirement") is not None:
+        return attempt["requirement"] == entry["requirement"]
+    return attempt.get("cycle") == entry.get("cycle")
+
+
 def holds(entry: dict | None) -> list[str]:
-    """The reasons of this cycle's quality holds, oldest first.
+    """The reasons of the quality holds of this issue's current requirement, oldest first.
 
     Counted from each review attempt's recorded outcome, never its raw verdict: a malformed reply,
     an execution failure or a changed scratch tree is no quality decision and no hold.
@@ -99,8 +119,16 @@ def holds(entry: dict | None) -> list[str]:
     if not entry:
         return []
     return [attempt["reason"] for attempt in entry.get("attempts", [])
-            if attempt.get("role") == "reviewer" and attempt.get("status") == "hold"
-            and attempt.get("cycle") == entry.get("cycle")]
+            if attempt.get("role") == "reviewer" and attempt.get("status") == "hold" and _scoped(entry, attempt)]
+
+
+def same_requirement(entry: dict | None, cycle: str, asked: str) -> bool:
+    """Whether ``entry`` was prepared for ``asked`` (records before requirements: for ``cycle``)."""
+    if entry is None:
+        return False
+    if entry.get("requirement") is not None:
+        return entry["requirement"] == asked
+    return entry.get("cycle") == cycle
 
 
 def revision_notes(entry: dict | None) -> str:
@@ -114,30 +142,42 @@ def revision_notes(entry: dict | None) -> str:
 
 
 def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRepo, path: Path,
-                   record: dict, base: str, plan_path: Path | None) -> None:
+                   record: dict, base: str, plan_path: Path | None, store=None) -> None:
     """Write, review and promote one statement issue, reusing what this cycle already settled.
 
-    An open question of the same cycle starts no agent: only planning's answer (a new cycle) does.
+    An open question starts no agent until planning changes this issue's requirement.
     A reviewed result is reused, and written candidates waiting for review are reviewed without a new
-    writer, only while they were made on the current ``base``; after main moves the lane writes again
-    on a new scratch copy, keeping the cycle's holds.
+    writer, only while they were made for the current cycle on the current ``base``; otherwise the lane
+    writes again on a new scratch copy, keeping the holds of the unchanged requirement.
     """
     from foragent import order_prepare_review as reviewing
     from foragent.order_prepare import _write, _write_tests
 
-    cycle = identity(plan, item, config, root)
+    cycle, asked = identity(plan, item, config, root), requirement(plan, item)
     entry = record["issues"].get(item["key"])
     current = entry is not None and entry.get("cycle") == cycle
     fresh = current and entry.get("base_revision") == base
-    settled = current and (entry["status"] == "question" or (fresh and entry["status"] == "reviewed"))
+    # A question waits for planning to change this issue's requirement, whatever else changed.
+    question = entry is not None and entry["status"] == "question" and same_requirement(entry, cycle, asked)
+    settled = question or (fresh and entry["status"] == "reviewed")
     if not settled:
         pending = fresh and bool(entry.get("written")) and (entry["status"] == "written" or (
             entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
         if not pending:
-            _write_tests(plan, item, root, config, git, path, record, base, cycle)
+            _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
         if pending or record["issues"][item["key"]]["status"] == "written":
-            reviewing.review(plan, item, root, config, git, path, record)
+            reviewing.review(plan, item, root, config, git, path, record, store)
     entry = record["issues"][item["key"]]
+    if entry["status"] == "reviewed" and plan_path is not None and not settled:
+        # The agents may have run for long: main is read again right before the result is promoted.
+        from foragent.order_scratch import base_revision
+
+        base = base_revision(git, config.base_branch)
+        if entry.get("base_revision") != base:
+            entry.update(status="interrupted", phase="reviewing_tests",
+                         reason=text("prepare_main_moved", config.language))
+            _write(path, record)
+            return
     if entry["status"] == "reviewed" and plan_path is not None and not promote(plan_path, item, entry, root, config, base):
         # Planning changed the issue during preparation: these tests answer the old requirements.
         entry.update(status="interrupted", phase="reviewing_tests", reason=text("prepare_plan_changed", config.language))
