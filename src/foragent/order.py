@@ -424,8 +424,12 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
+    waiting_for: str | None = None
+    language: str = "en"
 
     def summary(self) -> str:
+        if self.waiting_for is not None:
+            return text("order_submission_waiting", self.language, id=self.title, boundary=self.waiting_for)
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
@@ -603,7 +607,8 @@ def _reconcile_dependencies(tracker: Tracker, number: int, desired: set[int]) ->
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            defer: str | None = None, urgent: bool = False) -> PublishReport:
     try:
         files = validate_plan(plan, root, config)
     except ValueError as exc:
@@ -703,6 +708,11 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    if defer is not None and not urgent:
+        from foragent import order_submissions
+        order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
+                                 approve_numbers=approve_numbers, language=config.language)
+        return PublishReport(plan["title"], parent, rows, sorted(files), False, defer, config.language)
     owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                          [by_number[n] for n in mapping.values()])
     git = git or GitRepo(root)

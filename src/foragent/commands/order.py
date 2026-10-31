@@ -134,6 +134,8 @@ def add(commands) -> None:
     publish.add_argument("--approve-keys", type=cli._comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=cli._comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
+    publish.add_argument("--defer", help=say("order_submission_defer_help"))
+    publish.add_argument("--urgent", action="store_true", help=say("order_submission_urgent_help"))
 
 
 def _preread(args, root) -> int:
@@ -247,11 +249,12 @@ def run(args) -> int:
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
-    print(cli.order.publish(
+    report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
-        approve_numbers=args.approve_numbers, dry_run=args.dry_run,
-    ).summary())
-    if not args.dry_run:
+        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
+    )
+    print(report.summary())
+    if not args.dry_run and report.waiting_for is None:
         cli._open_lane_view(root)
     return 0
