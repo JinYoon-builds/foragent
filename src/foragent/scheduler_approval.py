@@ -40,6 +40,19 @@ def _invalidate_approval(
     report.actions.append(f"#{issue.number} flagged hash-mismatch: {summary}")
 
 
+def _approval_moved(ctx: TickContext, issue: Issue, approved_at: str, report: TickReport) -> bool:
+    """Re-read the approval before invalidating it (#1107).
+
+    What this tick read may predate a publication that withdrew the approval and
+    approved again; such an approval is rechecked next tick, not invalidated.
+    """
+    latest, _ = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
+    if latest is not None and latest.created_at == approved_at:
+        return False
+    report.actions.append(f"#{issue.number} approval changed since it was read; rechecked next tick")
+    return True
+
+
 def _check_integrity(
     ctx: TickContext, issue: Issue, approval: Approval, base_ref: str, report: TickReport,
 ) -> bool:
@@ -51,13 +64,8 @@ def _check_integrity(
     )
     if not changed_body and not changed_paths:
         return True
-    if changed_paths and not changed_body:
-        # Changed bytes count against this approval only while it is still the current one
-        # (#1107): a publication withdraws an approval before it pushes new locked bytes.
-        latest, _ = _latest_approval(ctx.tracker.label_events(issue.number), ctx.config.approvers)
-        if latest is None or latest.created_at != approval.approved_at:
-            report.actions.append(f"#{issue.number} approval changed since it was listed; rechecked next tick")
-            return False
+    if _approval_moved(ctx, issue, approval.approved_at, report):
+        return False
 
     changed = []
     details = []
@@ -81,6 +89,8 @@ def _snapshot(
 ) -> Approval | None:
     edited_at = ctx.tracker.body_last_edited_at(issue.number)
     if edited_at is not None and scheduler.datetime.fromisoformat(edited_at) >= scheduler.datetime.fromisoformat(event.created_at):
+        if _approval_moved(ctx, issue, event.created_at, report):
+            return None
         scheduler._invalidate_approval(
             ctx, issue,
             "Approval invalidated: approval predates an edit to the issue body. Re-approve to run it.",
@@ -90,6 +100,10 @@ def _snapshot(
 
     parsed = scheduler.parse_body(issue.body)
     paths = scheduler.acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
+    if paths and ctx.git.remote_branch_sha(ctx.config.base_branch) not in (None, ctx.git.ref_sha(base_ref)):
+        # The approval was read before this look at the remote: a base that moved since this
+        # tick fetched (a publication pushed, then approved) is fetched again (#1107).
+        ctx.git.fetch("origin", ctx.config.base_branch)
     record = _recorded_on_base(ctx, issue, event, paths, base_ref, report) if paths else {}
     if record is None:
         return None
@@ -97,6 +111,8 @@ def _snapshot(
     # 알려진 한계: 커밋 시각 기준이라 승인 전에 만들어 승인 후 push한 커밋은 구분 못 함
     approved_ref = ctx.git.commit_before(base_ref, event.created_at) if looked_up else None
     if looked_up and approved_ref is None:
+        if _approval_moved(ctx, issue, event.created_at, report):
+            return None
         scheduler._invalidate_approval(
             ctx, issue,
             "Approval invalidated: no base commit exists at the approval time. Re-approve to run it.",

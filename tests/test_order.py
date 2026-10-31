@@ -2690,3 +2690,144 @@ def test_shared_lock_hand_approval_after_a_recorded_one_does_not_inherit_its_rec
     case.clock[0] += timedelta(minutes=5)
     case.tracker.add_labels(2, ["approved"])  # Approved again by hand on GitHub: no record.
     assert _record_of(case, 2) == {}
+
+
+def test_shared_lock_identical_bytes_already_published_elsewhere_need_no_reapproval(locked_order):
+    """Another clone published B and the owners approved B by hand; this clone is still on A."""
+    case = locked_order
+    new = case.plan["issues"][0]["acceptance_files"][FILE]
+    _push_elsewhere(case, new)
+    case.clock[0] += timedelta(minutes=1)
+    for number in (2, 3):
+        case.tracker.remove_labels(number, ["approved", "ready"])
+        case.tracker.add_labels(number, ["approved"])
+    events = {n: case.tracker.label_events(n) for n in (2, 3)}
+    assert case.git.blob_sha("origin/main", FILE) != order._blob(new.encode())  # Stale local base.
+    report = _publish_locked(case)  # The same bytes B, without --approve.
+    assert report.affected == {}
+    assert {n: case.tracker.label_events(n) for n in (2, 3)} == events
+
+
+def test_shared_lock_stale_tick_does_not_invalidate_after_body_and_bytes_change(
+        locked_order, tmp_path, monkeypatch):
+    """A second clone read the old approval, then the publication changed the body and the bytes."""
+    from foragent import scheduler_approval
+    from foragent.scheduler import TickReport
+
+    case = locked_order
+    other = _second_clone(case, tmp_path, monkeypatch, pause=False)
+    stale = {n: scheduler_approval._latest_approval(case.tracker.label_events(n), case.config.approvers)[0]
+             for n in (2, 3)}
+    case.plan["issues"][0]["goal"] = "Implement login with the amended test."
+    case.plan["issues"][1]["goal"] = "Call login with the amended test."
+    monkeypatch.setattr(order_locks.time, "sleep", lambda seconds: case.clock.__setitem__(
+        0, case.clock[0] + timedelta(seconds=seconds)))
+    _publish_locked(case, approve=True)
+    other.git.fetch("origin", "main")
+    report = TickReport()
+    for number, event in stale.items():
+        issue = case.tracker.get_issue(number)  # Re-read: the new body, edited after the stale approval.
+        assert scheduler_approval._snapshot(other.ctx, issue, event, "origin/main", report) is None
+        assert other.store.load_flag(number) is None
+    assert not any("invalidated" in action or "hash-mismatch" in action for action in report.actions)
+    tick(other.ctx)
+    for number in (2, 3):
+        assert other.store.load_flag(number) is None
+        assert other.store.load_approval(number).acceptance_blobs[FILE] == other.git.blob_sha("origin/main", FILE)
+
+
+def test_shared_lock_same_second_hand_approval_does_not_inherit_the_record(locked_order):
+    case = locked_order
+    _publish_locked(case, approve=True)
+    assert _record_of(case, 2)
+    case.tracker.remove_labels(2, ["approved", "ready"])  # In the recorded approval's second.
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.add_labels(2, ["approved"])
+    assert _record_of(case, 2) == {}
+
+
+def test_shared_lock_marker_from_someone_else_is_ignored(locked_order):
+    from foragent import approval_record
+
+    case = locked_order
+    _publish_locked(case, approve=True)
+    mine = _record_of(case, 2)
+    position = approval_record.next_approval(case.tracker.label_events(2)) - 1
+    actor, case.tracker.actor = case.tracker.actor, "mallory"
+    case.tracker.comment(2, approval_record.comment_body({FILE: "0" * 40}, position))  # Same second, higher id.
+    case.tracker.actor = actor
+    assert _record_of(case, 2) == mine
+
+
+def test_shared_lock_running_tick_does_not_flag_when_body_and_bytes_both_changed(locked_order, monkeypatch):
+    from foragent import scheduler_approval
+    from foragent.scheduler import TickReport
+
+    case = locked_order
+    stale = {n: case.store.load_approval(n) for n in (2, 3)}
+    case.plan["issues"][0]["goal"] = "Implement login with the amended test."
+    case.plan["issues"][1]["goal"] = "Call login with the amended test."
+    monkeypatch.setattr(order_locks.time, "sleep", lambda seconds: case.clock.__setitem__(
+        0, case.clock[0] + timedelta(seconds=seconds)))
+    _publish_locked(case, approve=True)
+    case.git.update_base("main")
+    report = TickReport()
+    for number, approval in stale.items():
+        issue = case.tracker.get_issue(number)  # The new body and the new bytes, against the old approval.
+        assert not scheduler_approval._check_integrity(case.ctx, issue, approval, "origin/main", report)
+        assert case.store.load_flag(number) is None
+    assert not any("hash-mismatch" in action for action in report.actions), report.actions
+
+
+def test_shared_lock_tick_paused_between_reading_and_snapshotting_never_locks_old_bytes(
+        locked_order, tmp_path, monkeypatch):
+    """A second clone fetched A and read the old approval; the publication of B ran before its snapshot."""
+    from foragent import scheduler
+
+    case = locked_order
+    other = _second_clone(case, tmp_path, monkeypatch, pause=False)
+    old = other.git.blob_sha("origin/main", FILE)
+    snapshot, published = scheduler._snapshot, []
+
+    def publish_then_snapshot(ctx, issue, event, base_ref, report):
+        if not published:
+            published.append(_publish_locked(case, approve=True))
+        return snapshot(ctx, issue, event, base_ref, report)
+
+    monkeypatch.setattr(scheduler, "_snapshot", publish_then_snapshot)
+    tick(other.ctx)
+    assert published
+    for number in (2, 3):
+        approval = other.store.load_approval(number)
+        assert approval is None or approval.acceptance_blobs[FILE] != old, "Old bytes locked after the publication"
+        assert other.store.load_flag(number) is None
+    monkeypatch.setattr(scheduler, "_snapshot", snapshot)
+    case.clock[0] += timedelta(minutes=10)
+    tick(other.ctx)
+    case.clock[0] += timedelta(minutes=10)
+    tick(other.ctx)
+    for number in (2, 3):
+        assert other.store.load_flag(number) is None
+        assert other.store.load_approval(number).acceptance_blobs[FILE] == other.git.blob_sha("origin/main", FILE)
+
+
+def test_shared_lock_reapproval_of_a_withdrawn_approval_is_recorded(locked_order, tmp_path, monkeypatch):
+    """The owners' approval was removed before publication, so they are not affected; the
+    publication still re-approves them, and that re-approval records the published bytes."""
+    case = locked_order
+    for number in (2, 3):
+        case.tracker.remove_labels(number, ["approved", "ready"])
+    case.clock[0] += timedelta(minutes=1)
+    other = _second_clone(case, tmp_path, monkeypatch, pause=True)
+    report = _publish_locked(case, approve=True)
+    assert report.affected == {}
+    case.git.update_base("main")
+    published = case.git.blob_sha("origin/main", FILE)
+    assert all(_record_of(case, number) == {FILE: published} for number in (2, 3))
+    tick(other.ctx)  # Started on the old bytes.
+    case.clock[0] += timedelta(minutes=10)
+    tick(other.ctx)
+    for number in (2, 3):
+        assert other.store.load_flag(number) is None
+        assert other.store.load_approval(number).acceptance_blobs[FILE] == published
+

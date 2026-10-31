@@ -678,9 +678,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     def base_git() -> GitRepo:
         if not repos:
             repos.append(git or GitRepo(root))
-            if dry_run:
-                # A preview reads the remote base: another clone may already have published.
-                repos[0].fetch("origin", config.base_branch)
+            # Locks are read from the remote base: another clone may already have published.
+            # A fetch only; the checkout itself is fast-forwarded under the publish lock.
+            repos[0].fetch("origin", config.base_branch)
         return repos[0]
 
     def affected(issues) -> dict[int, list[str]]:
@@ -737,6 +737,14 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                       | set(order_references.selected(plan, item)))
         return {name: published_blobs[name] for name in sorted(referenced)}
 
+    def blobs_moved(existing, blobs: dict[str, str]) -> bool:
+        # Bytes the gate already holds this approval to, even published by another
+        # clone, need no reapproval (#1107); otherwise this order's last record decides.
+        if saved_blobs.get(str(existing.number), {}) == blobs:
+            return False
+        return not ("approved" in existing.labels and existing.number not in shared
+                    and order_locks.holds(config, repo, tracker, existing, blobs, base_git))
+
     def parent_body() -> str:
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
@@ -773,7 +781,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
-            if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
+            if (existing.body != body or blobs_moved(existing, blobs)
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
@@ -806,7 +814,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
         prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
+        if existing.body != body or not prior or "needs-human" in existing.labels or blobs_moved(existing, blobs):
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
             tracker.update_issue(number, title=existing.title, body=body)
             if not prior:
@@ -817,8 +825,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
-        if number in shared:
-            # The re-approval records the published blobs it approves; any gate snapshots
+        if number in shared or order_locks.reapproval(tracker, number):
+            # Every re-approval records the published blobs it approves; any gate snapshots
             # it only once its base holds exactly those bytes (``approval_record``).
             order_locks.approve_after_edits(tracker, number, config.approvers, config.language,
                                             order_locks.record_for(tracker, number, config, published_blobs))

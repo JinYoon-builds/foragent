@@ -86,12 +86,25 @@ def affected_owners(config: Config, repo: str, tracker: Tracker, issues: Iterabl
     return dict(sorted(affected.items()))
 
 
+def holds(config: Config, repo: str, tracker: Tracker, issue: Issue, blobs: dict[str, str],
+          git: Callable[[], GitRepo]) -> bool:
+    """Whether the gate already holds ``issue``'s approval to exactly ``blobs``."""
+    approval = StateStore.for_repo(repo).load_approval(issue.number)
+    locked = _gate_lock(issue, approval, list(blobs), config, tracker, git)
+    return bool(blobs) and all(locked.get(path) == sha for path, sha in blobs.items())
+
+
 APPROVAL_ATTEMPTS = 5
 
 
 def _approval_times(tracker: Tracker, number: int) -> list[datetime]:
     return [datetime.fromisoformat(event.created_at) for event in tracker.label_events(number)
             if event.label == "approved" and event.action == "labeled"]
+
+
+def reapproval(tracker: Tracker, number: int) -> bool:
+    """Whether the next ``approved`` label on ``number`` re-approves it (one was added before)."""
+    return approval_record.next_approval(tracker.label_events(number)) > 1
 
 
 def record_for(tracker: Tracker, number: int, config: Config, published: dict[str, str]) -> dict[str, str]:
@@ -117,7 +130,8 @@ def approve_after_edits(tracker: Tracker, number: int, approvers: list[str], lan
     for _ in range(APPROVAL_ATTEMPTS):
         # Written before each attempt, so the record precedes exactly that approval.
         if record:
-            tracker.comment(number, approval_record.comment_body(record))
+            tracker.comment(number, approval_record.comment_body(
+                record, approval_record.next_approval(tracker.label_events(number))))
         tracker.add_labels(number, ["approved"])
         event, _ = scheduler_approval._latest_approval(tracker.label_events(number), approvers)
         if event is None:
