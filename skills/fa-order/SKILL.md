@@ -90,6 +90,22 @@ Use `fa order publish` below to perform the approved publication itself.
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
+- Present issue questions only from `decisions`: these belong to this factory's effective
+  orderer and are answered in that person's planning session. Reuse the existing @orderer
+  GitHub issue comment and decision flow. Keep foreign questions as read-only facts in
+  `other_orders`; their orderer's planning session handles the answers. If `identity`
+  reports an error, explain it and keep processing the legacy and singleton questions
+  retained in `decisions`. Labelled owners remain visible in `other_orders` until the
+  factory account is known; do not guess that account. Show any `owner_error` from
+  `open_issues` as an unresolved ownership fact.
+- Compare `other_orders` Files with every proposed chunk's Files. Show overlap facts
+  with links to the existing issues, their orderers and current status; let the person
+  choose **wait / split files / go ahead**, with a recommendation and its tradeoff.
+  Empty or missing Files means unknown scope, so explain that uncertainty. Preserve
+  globs as declared; inspect the repository to explain potential overlaps. The script
+  supplies facts and the planning session and person make the decision.
+  Before approval, read open night-order and lane-memory issues whose Files overlap
+  the `MEMORY.new.md` split and add the real dependency to the plan.
 - Build a **decision ledger** from the docs before asking questions: design docs,
   decision logs, README, CLAUDE.md/AGENTS.md and specs contain earlier answers.
   Give each entry its decision, reason, constraints, out of scope, source reference and

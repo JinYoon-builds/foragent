@@ -6,7 +6,9 @@ The `/fa-order` skill (written separately, `skills/fa-order/SKILL.md`) does the 
 One JSON document the skill reads before interviewing:
 - `language`, `lanes` (name → paths, agent, skills), `tiers`, `acceptance_dir`, `base_branch`.
 - `feedback`: open issues labelled `feedback` (number, title, body, about).
-- `decisions`: open `needs-human` issues with reason `spec-question` or `no-machine-check`: number, title, current body, the gate question (comment details), the latest `<!-- foragent:decision -->` answer if any.
+- `decisions`: this factory's effective orderer's open `needs-human` issues with reason `spec-question` or `no-machine-check`: number, title, current body, the gate question (comment details), the latest `<!-- foragent:decision -->` answer if any. The owning factory's planning session answers the existing @orderer comment through the decision flow.
+- `other_orders`: foreign open non-PR issues sorted by number: number, title, orderer, files (the existing Files parser preserves globs; an empty list means unknown scope). Planning shows overlap facts and lets the person choose wait, split files or go ahead.
+- `identity`: present on login failure, with login null and a localized error. Legacy and singleton questions stay in `decisions` without guessing an owner; labelled owners remain visible in `other_orders` until the factory account is known. Ambiguous or unconfirmed owners stay visible as localized `open_issues[].owner_error` facts and enter neither list.
 - `open_issues`: number, title, labels, lane, size, state group (from `fa gate status` logic).
 - `pull_requests`: open PRs, then the 30 latest merged PRs newest first: number, title, head, state, merged_at, `foragent` (head is `foragent/issue-N` or `foragent/batch-N`).
 - `specs`: paths and first heading of `docs/specs/*.md`.
