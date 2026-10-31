@@ -43,7 +43,7 @@ def _publish_reviewed_in_turn(
     pushed (as the implementation path does after its review); without
     ``reverify`` or on a conflict it stops as base-changed.
     """
-    from foragent import runner
+    from foragent import run_group_check, runner
 
     worktree = git.root
     log = ctx.store.log_path(n)
@@ -116,6 +116,7 @@ def _publish_reviewed_in_turn(
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)
     queued_status = None
+    group_checked: set = set()
     while True:
         if stopped := run_publish._wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
@@ -135,6 +136,8 @@ def _publish_reviewed_in_turn(
             if stopped := refresh(target_sha):
                 return stopped
             continue
+        # Consecutive ready FIFO runs share one complete check on this main, outside the merge lock.
+        run_group_check.check(n, ctx, place, head, base_sha, group_checked)
         comparison = None
         if comparison_attempt is not None:
             comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,

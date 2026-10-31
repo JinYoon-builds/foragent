@@ -86,6 +86,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
     if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
+    if type(values["merge_group_max"]) is not int or values["merge_group_max"] < 1:
+        raise ConfigError("merge_group_max must be a positive integer (1 turns merge groups off)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]
