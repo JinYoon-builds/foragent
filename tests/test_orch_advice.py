@@ -71,3 +71,13 @@ def test_retry_hint_comment_refused_by_github_is_queued_not_lost(run_case, monke
     assert "queued for the gate" in summary
     assert [body for _, body in _queued(c.store) if "Use the selected locale" in body]
     assert (c.store.root / "hints/1.txt").read_text() == "Use the selected locale"
+
+
+def test_retry_hint_reaches_the_issue_byte_for_byte(run_case):
+    c = run_case
+    _blocked(c)
+    hint = "Keep  two spaces\n\n  indented line\nlast\tline"
+    orch.retry(c.ctx, 1, hint)
+    bodies = [comment.body for comment in c.tracker.list_comments(1)]
+    assert any(hint in body for body in bodies), bodies
+    assert (c.store.root / "hints/1.txt").read_text() == hint  # The worker receives the same bytes.

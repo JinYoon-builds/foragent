@@ -146,16 +146,17 @@ def _text(value: str, name: str) -> str:
 
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
-           say: str | None = None, durable: bool = False) -> dict:
+           say: str | None = None, advice: str | None = None) -> dict:
     """Journal the verb and comment it on the issue.
 
-    A ``durable`` comment carries advice the issue owns (a retry hint): it is never skipped
-    during a GitHub wait, and a refused write waits in the outbox instead of being lost.
+    ``advice`` is a comment body the issue owns (a retry hint the worker will receive),
+    published byte for byte rather than as the journal's one-line summary. It is never
+    skipped during a GitHub wait, and a refused write waits in the outbox instead of being lost.
     """
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
-    if durable:
+    if advice is not None:
         for number in ([n] if n is not None else issues):
-            if error := orch_advice.publish(ctx.tracker, ctx, number, "<!-- foragent:orch -->\n" + event["summary"]):
+            if error := orch_advice.publish(ctx.tracker, ctx, number, "<!-- foragent:orch -->\n" + advice):
                 event["queued_after"] = error
         return event
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
@@ -213,7 +214,9 @@ def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = No
     _issue(ctx, n)
     _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    event = _event(ctx, n, "retry", summary, say=say, durable=bool(hint))
+    # The worker receives the hint exactly as given; the issue keeps the same bytes.
+    advice = f"#{n}: queued implementation retry; hint:\n\n{hint}" if hint else None
+    event = _event(ctx, n, "retry", summary, say=say, advice=advice)
     kick_tick(ctx.repo_root)
     if "queued_after" in event:
         return f"{summary} (issue comment queued for the gate after: {event['queued_after']})"
