@@ -44,11 +44,16 @@ def test_only_questions_and_legacy_plain_lines_block_then_a_new_proposal_clears_
     preread_case, capsys, question,
 ):
     case = preread_case
-    row = preread(case, capsys, REPLY + "\n" + question, "NONE")["issues"][0]
+    # #1108 (2026-10-31): inside a structured reply (any APPROACH/DECIDE/QUESTION line) unprefixed
+    # lines are notes; a reply made only of plain lines keeps the legacy blocking meaning.
+    legacy = not question.startswith("QUESTION: ")
+    reply = question if legacy else REPLY + "\n" + question
+    row = preread(case, capsys, reply, "NONE")["issues"][0]
     assert len(row["unknowns"]) == 1
     assert question.removeprefix("QUESTION: ") in row["unknowns"][0]
-    assert CHOICE in json.dumps(row["decisions"])
-    assert APPROACH in json.dumps(row["approach"])
+    if not legacy:
+        assert CHOICE in json.dumps(row["decisions"])
+        assert APPROACH in json.dumps(row["approach"])
     publish(case, capsys, blocked_key="api", unknowns=True)
     row = preread(case, capsys, REPLY, "NONE")["issues"][0]
     assert row["unknowns"] == []
