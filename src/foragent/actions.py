@@ -6,7 +6,7 @@ from typing import Protocol
 
 from foragent import board
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
-from foragent.reasons import Reason, flag_marker, format_comment
+from foragent.reasons import Reason, comment_order, flag_marker, format_comment
 from foragent.state import StateStore
 from foragent.tracker import Tracker
 
@@ -46,7 +46,7 @@ def _repeats(store: StateStore, n: int, body: str, labels: set[str]) -> bool:
     if row is None or not labels <= set(row["labels"]):
         return False
     flags = [c for c in row.get("comments", []) if flag_marker(c.get("body", "")) is not None]
-    latest = max(flags, key=lambda c: (datetime.fromisoformat(c["created_at"]), c["id"]), default=None)
+    latest = max(flags, key=comment_order, default=None)
     return latest is not None and latest["body"] == body
 
 

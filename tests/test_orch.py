@@ -12,7 +12,7 @@ from test_runner import enable_reviewer, run_case
 from foragent import cli, orch, runner
 from foragent.executors import ExecResult
 from foragent.issue import body_hash
-from foragent.reasons import Reason
+from foragent.reasons import Reason, one_line
 
 
 @pytest.fixture
@@ -319,7 +319,7 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
     assert c.tracker.merged_prs == []
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert events[-1]["kind"] == entry
-    assert any(comment.body == "<!-- foragent:orch -->\n" + events[-1]["summary"]
+    assert any(comment.body == one_line("<!-- foragent:orch -->", events[-1]["summary"])
                for comment in c.tracker.list_comments(1))
 
 

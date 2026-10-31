@@ -1,5 +1,6 @@
 """Machine-readable comments for decisions and approval snapshots."""
 
+from datetime import datetime
 from enum import StrEnum
 import re
 from typing import Literal
@@ -47,13 +48,21 @@ APPROVAL_MARKER = "<!-- foragent:approved"
 FLAG_MARKER = re.compile(r"<!-- foragent:(blocked|needs-human) reason=([a-z-]+) -->(?=[ \r\n]|$)")
 
 
+SEPARATOR = " ↵ "
+
+
 def one_line(marker: str, text: str = "") -> str:
     """A state-change comment: its marker and its whole text on one line.
 
-    Line breaks in the text become " ↵ " so evidence stays complete and readable.
+    Only line breaks change: each becomes " ↵ ", so `flag_text` gives the exact lines
+    back (spacing inside lines is kept). Blank lines at either end are dropped.
     """
-    flat = " ↵ ".join(" ".join(line.split()) for line in text.splitlines() if line.strip())
-    return f"{marker} {flat}" if flat else marker
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return f"{marker} {SEPARATOR.join(lines)}" if lines else marker
 
 
 def flag_marker(body: str) -> tuple[str, str, str] | None:
@@ -67,11 +76,27 @@ def flag_marker(body: str) -> tuple[str, str, str] | None:
 
 def flag_text(body: str) -> tuple[str, str]:
     """(bold summary, evidence) of a flag comment in either form; the evidence keeps its lines."""
-    found = flag_marker(body)
-    content = found[2] if found else body.partition("\n")[2].strip()
-    first, _, rest = content.partition("\n") if "\n" in content else content.partition(" ↵ ")
+    match = FLAG_MARKER.match(body or "")
+    rest = body[match.end():] if match else "\n" + body.partition("\n")[2]
+    if rest.startswith(" "):  # One-line form: give the evidence its exact lines back.
+        first, _, evidence = rest[1:].partition(SEPARATOR)
+        evidence = evidence.replace(SEPARATOR, "\n")
+    else:
+        first, _, evidence = rest.strip().partition("\n")
+        evidence = evidence.strip()
     first = first.strip()
-    return first[2:-2] if first.startswith("**") and first.endswith("**") else first, rest.strip()
+    return first[2:-2] if first.startswith("**") and first.endswith("**") else first, evidence
+
+
+def comment_order(comment: dict | object) -> tuple[datetime, int, int]:
+    """Sort key for issue comments, oldest first, including queued ones.
+
+    A comment queued in the GitHub outbox has id -<queue id>: it is newer than a
+    delivered comment with the same time, and a larger queue id is newer.
+    """
+    created_at = comment["created_at"] if isinstance(comment, dict) else comment.created_at
+    identity = comment["id"] if isinstance(comment, dict) else comment.id
+    return datetime.fromisoformat(created_at), identity < 0, abs(identity)
 
 
 def format_comment(

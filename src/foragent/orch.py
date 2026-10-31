@@ -24,7 +24,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
-from foragent.reasons import flag_marker, one_line
+from foragent.reasons import comment_order, flag_marker, one_line
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
@@ -129,7 +129,8 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
+    # Local intent still waiting for GitHub delivery wins over GitHub's older labels.
+    issue = RecordingTracker(ctx.tracker, ctx).current_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
@@ -167,7 +168,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         comments = [load_record(Comment, item) for item in row["comments"]]
         flags = [(comment, found[1]) for comment in comments
                  if (found := flag_marker(comment.body)) is not None and found[0] == BLOCKED]
-        latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
+        latest = max(flags, key=lambda item: comment_order(item[0]), default=None)
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
             reviews.append({"path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})

@@ -12,7 +12,7 @@ import re
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.labels import BLOCKED, NEEDS_HUMAN, issue_lane, lane_display
-from foragent.reasons import GROUP, flag_marker, flag_text
+from foragent.reasons import GROUP, comment_order, flag_marker, flag_text
 from foragent.records import load_record
 from foragent.state import StateStore
 from foragent.tracker import Comment, Tracker
@@ -125,8 +125,8 @@ class Inbox:
         }
 
 
-def comment_key(comment: Comment) -> tuple[datetime, int]:
-    return datetime.fromisoformat(comment.created_at), comment.id
+def comment_key(comment: Comment) -> tuple[datetime, bool, int]:
+    return comment_order(comment)
 
 
 def latest_flag(comments: list[Comment]) -> tuple[Comment, str] | None:
