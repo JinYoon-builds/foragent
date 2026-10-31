@@ -598,3 +598,52 @@ def test_with_python_path_joins_inline_and_env_assignments():
         "A='' env PYTHONPATH='/p d:my src' python -m pytest -o addopts=")
     assert _with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
     assert shlex.split(_with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
+
+
+@pytest.mark.parametrize("runtime_minutes, check_seconds, expected_limit, succeeds", [
+    (90, 1100, 3000, True),
+    (40, 1100, 900, False),
+    (90, 3200, 3000, False),
+])
+def test_protected_verification_uses_capture_history_without_ignoring_timeouts(
+    run_case, monkeypatch, runtime_minutes, check_seconds, expected_limit, succeeds,
+):
+    from foragent import run_baseline, runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, test_command="pytest", max_runtime_minutes=runtime_minutes, max_retries=0)
+    keep = "tests/acceptance/test_keep.py"
+    c.history.update({keep: "def test_keep():\n    assert True\n"})
+    # A real capture history owns the budget. The fake transport advances a clock,
+    # so no check sleeps for 25 minutes to prove that 900 seconds is insufficient.
+    cache = c.store.root.parent / "baselines"
+    cache.mkdir(exist_ok=True)
+    (cache / "prior-measurement.json").write_text(json.dumps({
+        "repository": str(c.ctx.repo_root.resolve()), "created_at": c.now[0].isoformat(),
+        "duration_seconds": 1500, "timed_out": False,
+    }))
+    monkeypatch.setattr(run_baseline, "monotonic", c.ctx.monotonic)
+    limits = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        words = shlex.split(command)
+        report = next((word.split("=", 1)[1] for word in words if word.startswith("--junitxml=")), None)
+        if report is not None:
+            assert timeout_s >= 1500
+            c.now[0] += timedelta(seconds=1500)
+            suite = ET.Element("testsuite")
+            ET.SubElement(suite, "testcase", file=keep, name="test_keep", classname="tests.acceptance.test_keep")
+            ET.ElementTree(suite).write(report, encoding="unicode")
+        elif f"{keep}::test_keep" in words:
+            limits.append(timeout_s)
+            c.now[0] += timedelta(seconds=min(check_seconds, timeout_s))
+            if check_seconds > timeout_s:
+                return CheckResult(command, -9, True, "protected verification exceeded its budget")
+        return CheckResult(command, 0, False, "")
+
+    monkeypatch.setattr(runner, "_check", check)
+    assert run_issue(1, c.ctx) == ("merged" if succeeds else "retries-exceeded")
+    assert limits[0] == expected_limit
+    assert bool(c.tracker.merged_prs) is succeeds
+    assert len(c.executor.calls) == 1
+    assert ("Check timed out." in c.store.log_path(1).read_text()) is (not succeeds)

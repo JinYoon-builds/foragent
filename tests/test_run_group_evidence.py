@@ -257,3 +257,29 @@ def test_a_commit_built_on_an_older_tip_is_not_this_merge(history):
     git(history.root, "update-ref", "refs/remotes/origin/main", stale)
     evidence.record_merge(1, history.ctx, "main", read_tip, history.head_1)
     assert merge_events(history.ctx)[-1]["commit"] is None
+
+
+@pytest.mark.parametrize("check_seconds, verdict", [(1100, "passed"), (3200, "void")])
+def test_joint_protected_check_uses_history_and_still_rejects_a_timeout(
+    tmp_path, monkeypatch, check_seconds, verdict,
+):
+    calls = []
+
+    def check(command, worktree, log, timeout_s, **kwargs):
+        calls.append((command, timeout_s))
+        timed_out = "tests/acceptance/test_a.py::t" in command and check_seconds > timeout_s
+        return CheckResult(command, -9 if timed_out else 0, timed_out, "")
+
+    ctx = joint_ctx(tmp_path, monkeypatch, check)
+    cache = ctx.store.root.parent / "baselines"
+    cache.mkdir(exist_ok=True)
+    (cache / "prior-measurement.json").write_text(json.dumps({
+        "repository": str(ctx.repo_root.resolve()), "created_at": NOW.isoformat(),
+        "duration_seconds": 1500, "timed_out": False,
+    }))
+    group.check(5, ctx, turn.seat(ctx, 5, "main"), "h5", "main-sha", set())
+    assert calls == [("echo member-5", 900), ("echo member-1", 900),
+                     ("pytest -q tests/acceptance/test_a.py::t", 3000)]
+    [event] = group_events(ctx)
+    assert event["verdict"] == verdict
+    assert event["passed"] is (verdict == "passed")

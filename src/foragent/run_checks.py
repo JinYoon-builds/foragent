@@ -458,6 +458,15 @@ def _verify_implementation(attempt: Implementation) -> str:
         raise
 
 
+def _baseline_verification_limit(n: int, ctx: RunContext) -> int:
+    """Reuse the capture's measured budget, within the remaining run and existing 900s floor."""
+    from foragent import runner
+    from foragent.run_baseline_limits import repository_limit
+
+    limit, _ = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
+    return min(limit, max(900, runner._remaining(n, ctx)))
+
+
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
@@ -491,11 +500,12 @@ def _verify_contents(attempt: Implementation) -> str:
             harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
             command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
-            result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
+            limit = _baseline_verification_limit(n, ctx)
+            result = runner._check(command, worktree, log, limit, progress=lambda: _progress(n, ctx),
                             slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
-                    f"exit_code={result.exit_code}, timed_out={result.timed_out}")
+                    f"exit_code={result.exit_code}, timed_out={result.timed_out}, limit={limit}s")
             _progress(n, ctx)
             if not enabled(ctx, attempt.target_branch):
                 previous = ctx.store.get_run(n).comparison or {}
