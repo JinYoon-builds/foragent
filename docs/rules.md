@@ -49,7 +49,7 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - Review judges by tests, goal, principles and real defects. Other approaches, names and structure are taste: a NOTE, never a failure. (D98)
 - The first review round is multi-perspective. Later rounds only confirm. (D105)
 - An unclear review goes verbatim to the implementer, who fixes or answers each point. A new reviewer judges. (D44)
-- An issue that comes back twice is redesigned, not given another hint. (D106)
+- When the same issue comes back twice for the same defect class, redesign it. (D106)
 - A PR that touches a risk-map path gets that note and a stricter review. (D84)
 - The nearest layer solves first: issue problems go to the lane, system problems to the orchestrator, person-only decisions to Jin. (D43, D44)
 
