@@ -5,6 +5,8 @@ MESSAGES = {
         "prepare_legacy": "No behaviour statements: this issue keeps its plan tests and the fa order preread route.",
         "prepare_written": "The lane wrote {count} test file(s); they wait for review and are not locked yet.",
         "prepare_question": "The lane needs an answer before its tests can be reviewed.",
+        "prepare_question_open": ("The lane's question is still open: planning answers it by clarifying this "
+                                  "issue's behaviour; summary, spec or setup changes do not start a new review."),
         "prepare_refused_path": ("The test writer changed {path}, which it may not change: only new test files "
                                  "and helpers under {directory} can be kept. Which observable behaviour should "
                                  "the test check instead, without changing {path}?"),
@@ -50,6 +52,7 @@ MESSAGES = {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
         "prepare_written": "레인이 시험 파일 {count}개를 썼어요. 검토를 기다리며 아직 잠기지 않았어요.",
         "prepare_question": "레인이 답을 받아야 시험을 검토에 넘길 수 있어요.",
+        "prepare_question_open": "레인의 질문이 아직 열려 있어요. 계획이 이 이슈의 동작을 다듬어 답해야 해요. 요약·스펙·설정 변경으로는 새 검토가 시작되지 않아요.",
         "prepare_refused_path": ("시험 작성자가 바꿀 수 없는 {path}를 바꿨어요. {directory} 아래 새 시험 파일과 "
                                  "도우미만 남길 수 있어요. {path}를 바꾸지 않고 시험이 어떤 관찰 동작을 확인해야 할까요?"),
         "prepare_not_text": "시험 작성자가 {path}를 UTF-8이 아닌 바이트로 썼어요. 시험은 글이어야 해요. 어떻게 써야 할까요?",

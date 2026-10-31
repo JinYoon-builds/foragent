@@ -27,8 +27,8 @@ from foragent.executors import executor_for
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_prepare import _envelope_text, _now, _write
-from foragent.order_prepare_cycle import HOLD_LIMIT, holds, other_issues
-from foragent.order_prepare_prompt import _references, _risk_notes
+from foragent.order_prepare_cycle import HOLD_LIMIT, holds
+from foragent.order_prepare_prompt import _risk_notes, other_issues
 
 REVIEW_TIMEOUT_S = 30 * 60
 REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], '
@@ -225,7 +225,8 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     outcome = {"status": "interrupted", "reason": say("prepare_review_stopped")}
     try:
         lane_config, context = setup.lane_context(plan, item, config, root)
-        context.files.update(_references(plan, item))
+        context.files.update(setup.scratch_files(plan, item, root, config, record))
+        entry["others"] = setup.others_digest(plan, record, item)  # what this review runs beside
         from foragent.run_implementation import lane_config as resolve
 
         lane_config = resolve(lane_config, item["lane"])
