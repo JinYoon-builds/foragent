@@ -158,13 +158,14 @@ class IssueSnapshotMixin:
         with self._state_lock():
             snapshot = self._issue_snapshot()
             if started_at is not None and (
-                    _observe.newer(snapshot.get("absent", {}).get(str(number)), started_at)
+                    _observe.missing_after(snapshot, str(number), started_at)
                     or action != "comment" and _observe.judged_since(snapshot, number, started_at)):
                 return None
             row = self._local_issue(snapshot, number)
             snapshot.setdefault("outbox_base", {}).setdefault(str(number), _state.deepcopy(row))
             identity = snapshot.get("outbox_sequence", 0) + 1
-            entry = {"id": identity, "issue": number, "action": action,
+            # Its revision is the one the save below gives; it breaks equal clock times (state_observe.after).
+            entry = {"id": identity, "issue": number, "action": action, "revision": snapshot.get("revision", 0) + 1,
                      "queued_at": self._timestamp() if started_at is None
                      else started_at.astimezone(_state.UTC).isoformat(), **payload}
             snapshot.setdefault("outbox", []).append(entry)

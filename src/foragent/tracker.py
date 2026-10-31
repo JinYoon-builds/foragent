@@ -473,18 +473,27 @@ class RecordingTracker:
 
         store = self._context.store
         dropped = set()
-        for entry in store.github_outbox():
-            number, action = entry["issue"], entry["action"]
+
+        def current(identity):
+            """The entry as stored now: a read during an earlier delivery may have retired or dropped it."""
+            return next((item for item in store.github_outbox() if item["id"] == identity), None)
+
+        for queued in store.github_outbox():
+            number, action = queued["issue"], queued["action"]
             if number in dropped:
                 continue
             try:
-                # Each delivery counts from its own start (an overlay until a later read).
+                # Each send re-reads its entry first and counts from its own start (an overlay until a later read).
                 if action == "remove_labels":
-                    labels = entry["labels"]
-                    for index, label in enumerate(labels):
+                    while (entry := current(queued["id"])) is not None and entry["labels"]:
+                        label, rest = entry["labels"][0], entry["labels"][1:]
                         started = self._started()
                         self._tracker.remove_labels(number, [label])
-                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:], started_at=started)
+                        store.deliver_github_write(entry, remaining_labels=rest, started_at=started)
+                        if not rest:
+                            break
+                elif (entry := current(queued["id"])) is None:
+                    continue
                 elif action == "update_issue":
                     started = self._started()
                     self._tracker.update_issue(number, title=entry["title"], body=entry["body"])

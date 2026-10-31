@@ -222,3 +222,129 @@ def test_delayed_create_acknowledgment_cannot_replace_newer_facts(tmp_path):
     created = {item["number"]: item for item in case.store.local_issues()}[number]
     assert (created["title"], created["labels"], created["state"], created["state_reason"]) == (
         "Edited", ["human"], "closed", "not_planned")
+
+
+OTHER = Issue(8, "Other", "", frozenset(), "open")
+
+
+def test_older_read_finishing_during_a_newer_refresh_does_not_win(store):
+    revision = store.issues_revision()
+    store.observe_issues([issue("T1 read")], at(1), {})  # Started before the refresh, saved during it.
+    store.refresh_local_issues([issue("T2 listing"), OTHER], [], {}, at(2), since_revision=revision)
+    assert (row(store)["title"], row(store)["observed_at"]) == ("T2 listing", at(2).isoformat())
+
+
+@pytest.mark.parametrize("action,payload", [
+    ("add_labels", {"labels": ["mine"]}), ("update_issue", {"title": "Mine", "body": "Mine"}), ("close_issue", {})])
+def test_older_write_acknowledged_during_a_newer_refresh_is_judged_by_it(store, action, payload):
+    revision = store.issues_revision()
+    store.acknowledge_github_write(7, action, at(1), lanes={}, **payload)
+    human = Issue(7, "Human", "Human body", frozenset({"human"}), "open")
+    store.refresh_local_issues([human, OTHER], [], {}, at(2), since_revision=revision)
+    assert (row(store)["title"], row(store)["labels"], row(store)["state"]) == ("Human", ["human"], "open")
+
+
+def test_older_queued_write_saved_during_a_newer_refresh_is_judged_by_it(store):
+    revision = store.issues_revision()
+    store.queue_github_write(7, "add_labels", labels=["mine"], started_at=at(1))
+    human = Issue(7, "Title", "Body", frozenset({"human"}), "open")
+    assert store.refresh_local_issues([human, OTHER], [], {}, at(2), since_revision=revision) == [7]
+    assert store.github_outbox() == [] and row(store)["labels"] == ["human"]
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_complete_listing_shows_issues_without_a_row_missing(store, bulk):
+    if bulk:
+        store.refresh_local_issues([issue(), OTHER], [], {}, at(2))
+    else:
+        store.observe_issues([issue(), OTHER], at(2), {}, complete=True)
+    late = Issue(9, "Late", "", frozenset(), "open")
+    store.observe_issues([late], at(1), {})
+    store.refresh_local_issues([issue(), OTHER, late], [], {}, at(1))
+    store.acknowledge_github_write(9, "add_labels", at(1), lanes={}, labels=["x"])
+    assert store.queue_github_write(9, "add_labels", labels=["x"], started_at=at(1)) is None
+    assert 9 not in {item["number"] for item in store.local_issues()}
+    store.observe_issues([late], at(3), {})
+    assert 9 in {item["number"] for item in store.local_issues()}
+
+
+def test_partial_delivery_during_a_refresh_is_not_a_contradiction(store):
+    store.observe_issues([issue(labels=["a", "b"]), OTHER], T0, {}, complete=True)
+    store.clock[0] = at(1)
+    entry = store.queue_github_write(7, "remove_labels", labels=["a", "b"])
+    revision = store.issues_revision()
+    store.deliver_github_write(entry, remaining_labels=["b"], started_at=at(3))
+    assert store.refresh_local_issues([issue(labels=["a", "b"]), OTHER], [], {}, at(2),
+                                      since_revision=revision) == []
+    assert [item["labels"] for item in store.github_outbox()] == [["b"]] and row(store)["labels"] == []
+
+
+@pytest.mark.parametrize("action", ["update_issue", "remove_labels", "add_labels"])
+def test_flush_sends_nothing_a_newer_read_dropped_while_a_delivery_waited(tmp_path, action):
+    case = recording(tmp_path)
+    case.remote.issues[7] = Issue(7, "Title", "Body", frozenset({"a", "b"}), "open")
+    case.reader.list_issues()
+    case.clock[0] = at(1)
+    writes = {"update_issue": [{"title": "Mine 1", "body": "x"}, {"title": "Mine 2", "body": "y"}],
+              "remove_labels": [{"labels": ["a", "b"]}],
+              "add_labels": [{"labels": ["c"]}, {"labels": ["d"]}]}[action]
+    for payload in writes:
+        case.store.queue_github_write(7, action, **payload)
+    human = Issue(7, "Human", "Human body", frozenset({"human"}), "open")
+    sent = []
+    original = getattr(case.remote, action)
+
+    def slow(number, *args, **kwargs):
+        sent.append((args, kwargs))
+        original(number, *args, **kwargs)
+        if len(sent) == 1:
+            # A newer read lands while the first send waits; it contradicts every queued write.
+            case.clock[0] = at(2)
+            case.remote.issues[7] = human
+            case.reader.get_issue(7)
+            case.clock[0] = at(3)
+
+    setattr(case.remote, action, slow)
+    case.reader.flush_outbox()
+    assert len(sent) == 1, "A write dropped by a newer read must not be sent"
+    assert case.store.github_outbox() == []
+    assert (row(case.store)["title"], row(case.store)["labels"]) == ("Human", ["human"])
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_pending_write_is_judged_against_the_latest_read_not_the_first_queue(store, bulk):
+    def read(seen, when):
+        if bulk:
+            return store.refresh_local_issues([seen, OTHER], [], {}, when)
+        return store.observe_issues([seen], when, {})
+
+    store.clock[0] = at(1)
+    store.queue_github_write(7, "add_labels", labels=["x"])
+    human = issue("Human")
+    read(human, at(2))  # Not the label write's field: it stays pending.
+    store.clock[0] = at(3)
+    store.queue_github_write(7, "update_issue", title="Mine", body="Mine body")
+    assert read(human, at(4)) == []  # Same human title as the edit was based on.
+    assert [entry["action"] for entry in store.github_outbox()] == ["add_labels", "update_issue"]
+    assert (row(store)["title"], row(store)["labels"]) == ("Mine", ["x"])
+
+
+@pytest.mark.parametrize("local", ["queue", "acknowledge", "update_local_issue"])
+@pytest.mark.parametrize("bulk", [False, True])
+def test_local_row_for_an_omitted_issue_does_not_hide_the_omission(store, local, bulk):
+    store.observe_issues([issue(), OTHER], at(2), {}, complete=True)
+    store.clock[0] = at(3)
+    if local == "queue":
+        store.queue_github_write(9, "comment", body="Note")
+    elif local == "acknowledge":
+        store.acknowledge_github_write(9, "add_labels", at(3), lanes={}, labels=["x"])
+    else:
+        store.update_local_issue(9, pr_number=4)
+    stale = Issue(9, "Stale", "Stale body", frozenset({"old"}), "closed")
+    if bulk:
+        store.refresh_local_issues([issue(), OTHER, stale], [], {}, at(1))
+    else:
+        store.observe_issues([stale], at(1), {})
+    assert {item["number"]: item for item in store.local_issues()}[9]["title"] != "Stale"
+    store.acknowledge_github_write(9, "update_issue", at(1), lanes={}, title="Late", body="Late")
+    assert {item["number"]: item for item in store.local_issues()}[9]["title"] != "Late"

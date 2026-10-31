@@ -26,7 +26,6 @@ class IssueRefreshMixin:
         with self._state_lock():
             snapshot = self._issue_snapshot()
             previous = dict(snapshot["issues"])
-            bases = snapshot.setdefault("outbox_base", {})
             absent = snapshot.setdefault("absent", {})
             rows, facts, stale, local = {}, {}, set(), set()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
@@ -37,14 +36,7 @@ class IssueRefreshMixin:
                     rows[number] = old
                     stale.add(number)
                     continue
-                if old is not None and since_revision is not None and (
-                        old.get("revision", 0) > since_revision or bases.get(number, {}).get(
-                            "revision", 0) > since_revision):
-                    # Written during this refresh: the next listing judges the omission.
-                    rows[number] = old
-                    stale.add(number)
-                    continue
-                if self._forget_missing(snapshot, int(number), at):
+                if self._forget_missing(snapshot, int(number), at, since_revision):
                     dropped.add(int(number))
                 if number in snapshot["issues"]:
                     # A local write started after this listing still sits on the row.
@@ -55,7 +47,7 @@ class IssueRefreshMixin:
                     continue
                 key = str(issue.number)
                 old = previous.get(key)
-                if _observe.seen_after(old, at, since_revision) or _observe.newer(absent.get(key), at):
+                if _observe.seen_after(old, at, since_revision) or _observe.missing_after(snapshot, key, at):
                     if old is not None:
                         rows[key] = old
                         stale.add(key)
@@ -63,22 +55,20 @@ class IssueRefreshMixin:
                 absent.pop(key, None)
                 old = old or {}
                 facts[key] = _state.observed_issue_facts(issue)
-                # A partial delivery during this refresh advanced the baseline
-                # past what the listing saw, so the listing cannot judge pending writes.
-                partial = since_revision is not None and bases.get(key, {}).get("revision", 0) > since_revision
                 # A local write during this refresh keeps its PR and comment
                 # records; the observed issue facts still advance underneath.
                 if since_revision is not None and old.get("revision", 0) > since_revision:
                     local.add(key)
                 fresh = complete_prs and key not in local
                 rows[key], contradicted = self._ingest_observation(
-                    snapshot, old, issue, at, lanes, judge=not partial, since_revision=since_revision,
+                    snapshot, old, issue, at, lanes, since_revision=since_revision,
                     comments=None if key in local else comments.get(issue.number),
                     pr_number=None if fresh else old.get("pr_number"),
                     merged=False if fresh else old.get("merged", False),
                     merged_at=None if fresh else old.get("merged_at"))
                 if contradicted:
                     dropped.add(issue.number)
+            _observe.advance_complete_listing(snapshot, at)
             for number, row in rows.items():
                 if number in stale:
                     continue
