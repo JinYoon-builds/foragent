@@ -89,12 +89,12 @@ lanes:
   review-engine:
     paths: [src/foragent/run_review.py, src/foragent/run_prompts.py, src/foragent/review_*.py, src/foragent/orch_reviewers.py]
     agent: fa-review-engine
-    skills: []
+    skills: [testing-strategy, principle-prove-it-works, principle-fix-root-causes]
     title: 리뷰 장치
   roles:
     paths: [src/foragent/orch_architect*.py, src/foragent/orch_role*.py, src/foragent/orch_dream*.py, src/foragent/orch_inbox.py, src/foragent/orch_facts*.py, skills/fa-orchestrator/**, skills/fa-architect/**, skills/fa-docs/**]
     agent: fa-roles
-    skills: []
+    skills: [skill-creator, principle-prove-it-works, principle-fix-root-causes, fa-state-design]
     title: 역할
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
 test_slots: 5  # 2026-10-26: CPU 47% idle and memory 76% free while 3 slots were held and more than four runs waited to check; the gate's CPU-busy AIMD climbs within this ceiling
