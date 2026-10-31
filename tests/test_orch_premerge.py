@@ -457,3 +457,24 @@ def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_cas
     assert c.tracker.merged_prs == []
     assert c.tracker.list_comments(c.pr) == [], "Approval is recorded only for a fresh base"
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
+
+
+def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
+    """#1231: after `fa orch dream --redo`, a dream PR from an older prompt is never merged."""
+    from datetime import timedelta
+
+    from foragent import orch_dream
+
+    c = merge_case
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/dream-alpha", c.head)
+    pr = c.tracker.create_pr(head="foragent/dream-alpha", base="main", title="Dream", body="Old")
+    c.tracker.set_pr_head_sha(pr, c.head)
+    c.tracker.set_pr_checks(pr, "pass")
+    c.ctx.config = replace(c.ctx.config, lanes={"alpha": {"paths": ["a/**"]}})
+    earlier = BASE_TIME - timedelta(hours=1)
+    orch_dream.record_published(c.ctx.store, "alpha", 1, earlier, covered_until=earlier, pr=pr,
+                                inputs={}, outputs={})
+    assert orch_dream.redo(c.ctx, "alpha") == 0
+    with pytest.raises(orch.OrchError, match=f"dream PR #{pr} predates a redo of lane alpha"):
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert c.tracker.merged_prs == []

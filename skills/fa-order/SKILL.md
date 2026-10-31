@@ -42,7 +42,21 @@ while the scope still fits; ask again only when the scope changes.
 Approval must come first-hand from the person in the session that publishes. The planning
 session publishes only after the person approves there. When the orchestrator drafts the
 plan, it sends the plan path to the planning session. Approval relayed from another session
-is not approval.
+is not approval. This first-hand rule covers D71 choices: a choice about behaviour, scope,
+screen wording or the approval boundary, or a real preread QUESTION, comes through the planning
+session to the person. A choice-free fix (required behaviour settled, nothing left to choose)
+the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`
+after a clean preread; a Foragent caller role alone does not block that.
+
+Every GitHub write goes through fa commands: creating or changing issues, PRs, comments,
+labels (creation, edits and deletion), board items and board fields. `fa order publish` is
+the main write path, and the publish and approval steps above stay as they are. Closing an
+issue that an order replaces stays with the approved replacement order. Reading GitHub
+with gh (view, list, search) is still fine.
+
+When no fa command does the GitHub change the work needs, do not give the person a shell
+command to run and do not work around the gap. Propose an issue that requests the missing
+fa command, as an `issues[]` entry in the order, and let it go through the same approval.
 
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
@@ -60,7 +74,9 @@ Use these commands as the corresponding facts become known (replace angle bracke
   Mark each cell only when its content is settled, including an explicitly empty skills
   list. An unanswered question leaves the cell empty; a filled cell clears its question.
 - Acceptance checks written: `fa order progress tests --done <n> --total <N>`;
-  count chunks with finished checks out of all chunks that need them.
+  count chunks with finished checks out of all chunks that need them. For an issue with
+  behaviour statements, its checks are finished only when `fa order prepare PLAN.json --status --json`
+  reports it `reviewed`; written but unreviewed tests do not count.
 - Successful plan dry-run: `fa order progress check`.
 - User approval received: `fa order progress approval`.
 - Each issue actually published or updated: `fa order progress publish --issue <number>`.
@@ -187,8 +203,11 @@ no-match or deferred choice with the person; do not invent candidates or hand th
 ### Roles: lightest fix first
 When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
-1. A line in the lane memory: edit `.claude/agent-memory/fa-<lane>/MEMORY.md` of the lane
-   that owns the area directly. The orchestrator commits it in its next batched commit.
+1. A line in the lane memory: append one `- [id:<unique id>] <lesson>` line to the end of
+   `.claude/agent-memory/fa-<lane>/MEMORY.new.md` of the lane that owns the area. The lane
+   dream alone folds pending lessons into `MEMORY.md` and records their ids in
+   `MEMORY.consumed.ids`; never edit those two files. The orchestrator commits the
+   appended line in its next batched commit.
 2. A skill attached to the lane that owns the area: `fa lanes skills <lane> <skill-id>`
    (the lanes code is the one writer of lane skills).
 3. A reviewer perspective scoped to paths: add a `review_perspectives` entry
@@ -353,7 +372,8 @@ Record `fa order progress approval` once the user approves. If the plan changes,
 the dry-run and present the revised scope for approval.
 
 ## 7. Publish
-After receiving the person's first-hand approval here, this planning session runs the
+For a choice-free fix the orchestrator runs this step itself after a clean preread (the D71
+boundary above). After receiving the person's first-hand approval here, this planning session runs the
 validated `fa order publish PLAN.json` for real with
 `--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
