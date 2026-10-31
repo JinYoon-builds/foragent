@@ -28,7 +28,9 @@ Never guess where the pain is.
 3. Mark each proposal `Decision: orchestrator` or `Decision: person` and send it with
    `fa orch request --from architect --text "<proposal>"`, one request per proposal. Person
    decisions are lane boundary changes, anything irreversible, scope and taste; the orchestrator
-   forwards them as multiple choice and decides the rest.
+   forwards them as multiple choice and decides the rest. Reviewers' recorded structural notes
+   (the prompt's "Recorded structural proposals from reviews") are evidence to weigh; send any you
+   adopt this way. A note alone never starts lane rework.
 4. Each proposal answers three checks before you send it:
    (a) Reuse: does existing code already do this or most of it? If so, why is reusing it
    not enough? Name the measured gap.
