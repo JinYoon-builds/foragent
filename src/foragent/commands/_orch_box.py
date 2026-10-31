@@ -74,7 +74,7 @@ def _add_inbox(orch_actions) -> None:
     orch_refresh.add_parsers(orch_actions)
     reviewers = orch_actions.add_parser("reviewers", help="Set or clear how many reviewers check one issue's risk-map PRs")
     reviewers.add_argument("issue", type=int)
-    reviewers.add_argument("count", type=int, nargs="?", help="Reviewer count (1 or more); wins over review_reviewers")
+    reviewers.add_argument("count", type=int, nargs="?", help="Reviewers running at once (1 or more); wins over review_reviewers")
     reviewers.add_argument("--clear", action="store_true")
     reviewers.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 

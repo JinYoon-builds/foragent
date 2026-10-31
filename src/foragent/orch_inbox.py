@@ -217,6 +217,11 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
     return _public(record)
 
 
+def annotate_request(store: StateStore, request_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Set ``fields`` on one request under the state lock; its status and notes stay as they are."""
+    return _public(_update(store, "requests", request_id, lambda record: record.update(fields)))
+
+
 def ask(store: StateStore, question: str, options: list[str], recommend: int | None,
         issues: list[int] = (), kind: str = "question") -> dict[str, Any]:
     """Record an open question; ``issues`` are the issues that wait on its answer."""
