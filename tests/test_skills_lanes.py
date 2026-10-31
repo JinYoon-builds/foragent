@@ -1026,3 +1026,14 @@ def test_install_into_another_project_keeps_the_advertised_vendored_source(tmp_p
     assert "Installed: principle-local" in capsys.readouterr().out
     entry = skills.vendored_library(tmp_path / "nothing", empty)
     assert entry["path"] == str(source)
+
+
+def test_shipped_lane_agents_carry_the_generated_github_writes_paragraph():
+    from foragent.lanes import GITHUB_WRITES, agent_text
+
+    root = Path(__file__).resolve().parents[1]
+    assert agent_text("api", ["src/api/**"], []).endswith("\n\n" + GITHUB_WRITES + "\n")
+    roles = {"fa-orchestrator", "fa-architect", "fa-docs"}
+    for path in sorted((root / ".claude/agents").glob("fa-*.md")):
+        if path.stem not in roles:
+            assert path.read_text(encoding="utf-8").count("\n\n" + GITHUB_WRITES + "\n") == 1, path
