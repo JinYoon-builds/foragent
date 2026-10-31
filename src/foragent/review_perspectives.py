@@ -1,9 +1,9 @@
-"""Review perspectives: a checklist the reviewer works through on risk-map PRs.
+"""Review perspectives on risk-map PRs: each one gets its own whole-change reviewer.
 
-Seven product-generic defaults come first, in a fixed order; a project adds its
-own from `.foragent.yml` `review_perspectives` ({name, focus} items). A project
-item named like a default replaces that default's focus in place; other items
-follow the defaults in the order written. The defaults are never mutated.
+Four core defaults come first, in a fixed order; a project adds its own from
+`.foragent.yml` `review_perspectives` ({name, focus} items). A project item
+named like a default replaces that default's focus in place; other items follow
+the defaults in the order written. The defaults are never mutated.
 """
 
 from __future__ import annotations
@@ -14,22 +14,18 @@ if TYPE_CHECKING:
     from foragent.config import Config
 
 DEFAULT_PERSPECTIVES: tuple[dict[str, str], ...] = (
-    {"name": "security",
-     "focus": "Spoofing, tampering and the provenance of inputs: who can forge or alter what this code trusts."},
+    {"name": "goal-fidelity",
+     "focus": "Does the change deliver the issue's goal and make its acceptance checks pass for the right "
+              "reason, without dropping a stated requirement or doing work the issue puts out of scope?"},
     {"name": "concurrency",
-     "focus": "Races, TOCTOU gaps between a check and its use, and stale reads of shared state."},
-    {"name": "failure",
-     "focus": "Dependencies that are down, slow, or return partial or odd responses."},
-    {"name": "compatibility",
-     "focus": "Old data, existing installs and old config written before this change."},
-    {"name": "realism",
-     "focus": "Real environments and real API shapes, not only the fakes the tests use."},
-    {"name": "docs",
-     "focus": "Behaviour changed, docs unchanged? The lane that changes behaviour updates the related docs "
-              "(README, docs/**, skills) in the same PR."},
-    {"name": "performance",
-     "focus": "Hot paths, repeated work and unbounded growth: extra subprocesses, GitHub calls, file scans "
-              "or memory per tick or run."},
+     "focus": "Races and ordering between processes, threads and ticks: a gap between a check and its use, "
+              "and stale reads or writes of shared state."},
+    {"name": "interruption-rollback",
+     "focus": "An interrupt, crash, timeout or kill at any step: does a rollback restore a clean state, "
+              "or can a partial write, half-applied change or leftover lock remain?"},
+    {"name": "test-quality",
+     "focus": "Would each new or changed test fail if the code returned a wrong value, skipped an effect "
+              "or did the effect twice? Tests that pass on a broken change prove nothing."},
 )
 
 
@@ -48,7 +44,7 @@ def perspectives(config: Config) -> list[dict[str, str]]:
 
 
 def checklist(config: Config, items: list[dict[str, str]] | None = None) -> str:
-    """Reviewer checklist text; covers every perspective unless `items` gives this reviewer's share."""
+    """Reviewer checklist text; covers every perspective unless `items` gives this reviewer's own."""
     lines = ["Review perspectives checklist: check the change from each perspective below "
              "and report findings under any of them."]
     lines += [f"- [ ] {item['name']}: {item['focus']}" for item in (perspectives(config) if items is None else items)]
@@ -60,14 +56,13 @@ def with_checklist(notes: str, config: Config, items: list[dict[str, str]] | Non
     return f"{notes}\n\n{checklist(config, items)}" if notes else ""
 
 
-def shares(config: Config, count: int) -> list[list[dict[str, str]]]:
-    """Split the effective perspectives round-robin in list order: reviewer k gets k, k+N, ...
+def shares(config: Config) -> list[list[dict[str, str]]]:
+    """One whole-change reviewer per effective perspective, in list order.
 
-    N above the number of perspectives is capped at that number.
+    The reviewer count never merges perspectives into one reviewer; it only limits how
+    many reviewers run at once.
     """
-    items = perspectives(config)
-    count = max(1, min(count, len(items)))
-    return [items[k::count] for k in range(count)]
+    return [[item] for item in perspectives(config)]
 
 
 def validate(values: dict[str, Any], error: type[Exception]) -> None:
