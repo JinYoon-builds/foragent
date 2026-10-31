@@ -9,14 +9,18 @@ the interviewer merges duplicates and marks whether a question changed the spec.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
 import re
 import shutil
+import sys
+import threading
 from typing import Any
 
-from foragent import executors
+from foragent import capacity, executors
 from foragent.i18n import text
 
 SEATS = ("skeptic", "first_time_user", "attacker", "operator", "maintainer", "incidents", "other_users")
@@ -58,6 +62,8 @@ RISK_FILE = ".foragent-risks.yml"
 LATEST_DECISIONS = 20
 LEDGER_DIR = "perspectives"
 LANGUAGE_NAMES = {"en": "English", "ko": "Korean"}
+# This process's seats enter the shared machine budget one at a time (see _ask).
+_ADMISSION = threading.Lock()
 
 
 def language_code(language: Any) -> str:
@@ -163,20 +169,28 @@ def _write(store, path: Path, value: dict) -> None:
 
 
 def _ask(seat: str, executor: str | None, plan: dict, root: Path, logs: Path, digest: str,
-         language: str = "en"):
+         language: str = "en", store=None, config: Any = None):
     from foragent.order import PREREAD_TIMEOUT_S, _unknowns
 
     if executor is None:
         return seat, executor, None, text("perspectives_error_missing", language)
     log = logs / f"{digest[:12]}-{seat}.log"
     try:
-        # The executor's own default model and effort; only the timeout follows preread.
-        result = executors.executor_for(executor).run(
-            worktree=root, prompt=prompt(seat, plan, root, language), model=None,
-            timeout_s=PREREAD_TIMEOUT_S, log_path=log, read_only=True)
-    except Exception as exc:  # One seat's failure must not lose the others.
-        return seat, executor, None, text("perspectives_error_raised", language,
-                                          kind=type(exc).__name__, message=exc)
+        with ExitStack() as held:
+            # Each seat is one agent: it holds one shared machine slot only while it runs. Seats are
+            # admitted one at a time, so sibling seats never take each other for a busy machine lock.
+            with _ADMISSION:
+                held.enter_context(capacity.hold_workload(store, config, kind="perspective", role=seat))
+            try:
+                # The executor's own default model and effort; only the timeout follows preread.
+                result = executors.executor_for(executor).run(
+                    worktree=root, prompt=prompt(seat, plan, root, language), model=None,
+                    timeout_s=PREREAD_TIMEOUT_S, log_path=log, read_only=True)
+            except Exception as exc:  # One seat's failure must not lose the others.
+                return seat, executor, None, text("perspectives_error_raised", language,
+                                                  kind=type(exc).__name__, message=exc)
+    except TimeoutError as exc:  # No slot in time: the seat never started.
+        return seat, executor, None, text("perspectives_error_capacity", language, message=exc)
     message = result.last_message or ""
     if result.timed_out:
         return seat, executor, None, text("perspectives_error_timeout", language, seconds=PREREAD_TIMEOUT_S,
@@ -194,8 +208,17 @@ def run(plan: dict, root: Path, config: Any, store) -> dict:
     logs.mkdir(parents=True, exist_ok=True)
     chosen = seat_executors(config)
     language = language_code(getattr(config, "language", "en"))
-    with ThreadPoolExecutor(max_workers=len(SEATS)) as pool:
-        answers = list(pool.map(lambda seat: _ask(seat, chosen[seat], plan, root, logs, digest, language), SEATS))
+    ready = sum(executor is not None for executor in chosen.values())
+    # Counted as admission counts them: live holders only.
+    free = capacity.workload_budget(store) - len(capacity.machine_holders(store, datetime.now(UTC), live=True))
+    if ready > free:
+        # Every seat still runs; the shared machine budget lets only some run at once.
+        print(text("perspectives_waves", language, seats=ready, free=max(0, free),
+                   waves=-(-ready // max(1, free))), file=sys.stderr, flush=True)
+    # Waves of the free slots: a seat that would only wait behind its siblings is not started yet.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(SEATS), free))) as pool:
+        answers = list(pool.map(lambda seat: _ask(seat, chosen[seat], plan, root, logs, digest, language,
+                                                  store, config), SEATS))
     questions, failures = [], []
     for seat, executor, texts, error in answers:
         if error is not None:
