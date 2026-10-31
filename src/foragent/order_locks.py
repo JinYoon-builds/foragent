@@ -9,14 +9,17 @@ each of them is re-approved in the same publication; otherwise it refuses.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Iterable
+import time
+from datetime import datetime
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, parse_body
 from foragent.state import StateStore
-from foragent.tracker import Issue, Tracker
+from foragent.tracker import Issue, Tracker, TrackerError
 
 
 def blob(data: bytes, like: str) -> str:
@@ -72,6 +75,92 @@ def affected_owners(config: Config, repo: str, tracker: Tracker, issues: Iterabl
         if changed:
             affected[issue.number] = changed
     return dict(sorted(affected.items()))
+
+
+GATE_WAIT_S = 15 * 60
+APPROVAL_ATTEMPTS = 5
+
+
+@contextmanager
+def gate_paused(repo: str, busy: Callable[[], Exception]) -> Iterator[None]:
+    """Hold this machine's tick lock, waiting up to ``GATE_WAIT_S`` for a running tick.
+
+    A tick lists issues and checks their approvals against the base it fetched; on
+    this machine the publication moves that same base. Holding the lock, no tick
+    runs between the approval withdrawal, the push and the re-approval. Ticks of
+    other machines fetch the base before they list issues, so they see either the
+    old bytes or the withdrawn approval. The lock is taken on its own descriptor,
+    so even a tick on this thread finds it busy.
+    """
+    store = StateStore.for_repo(repo)
+    path = store._tick_lock_path()
+    deadline = time.monotonic() + GATE_WAIT_S
+    while True:
+        with store._try_tick_lock(path) as acquired:
+            if acquired:
+                yield
+                return
+        if time.monotonic() >= deadline:
+            raise busy()
+        time.sleep(1)
+
+
+def _approval_times(tracker: Tracker, number: int) -> list[datetime]:
+    return [datetime.fromisoformat(event.created_at) for event in tracker.label_events(number)
+            if event.label == "approved" and event.action == "labeled"]
+
+
+def approve_after_edits(tracker: Tracker, number: int, approvers: list[str], language: str) -> None:
+    """Add ``approved`` so the gate reads it as a new approval, later than the last body edit.
+
+    GitHub times have whole seconds. The gate refuses an approval whose time is not
+    after the last body edit, and it keeps a snapshot whose time equals the latest
+    approval's, so the new approval must also be later than every earlier one. The
+    label is read back; an approval in such a second is withdrawn and added again a
+    second later.
+    """
+    from foragent import scheduler_approval
+
+    earlier = max(_approval_times(tracker, number), default=None)
+    for _ in range(APPROVAL_ATTEMPTS):
+        tracker.add_labels(number, ["approved"])
+        event, _ = scheduler_approval._latest_approval(tracker.label_events(number), approvers)
+        if event is None:
+            return  # The gate does not accept this publisher's approval; nothing it could misread.
+        at, edited = datetime.fromisoformat(event.created_at), tracker.body_last_edited_at(number)
+        if (edited is None or at > datetime.fromisoformat(edited)) and (earlier is None or at > earlier):
+            return
+        tracker.remove_labels(number, ["approved"])
+        time.sleep(1)
+    raise TrackerError(text("order_locks_approval_unordered", language, number=number))
+
+
+def confirm_locked(tracker: Tracker, git: GitRepo, config: Config, shared: dict[int, list[str]],
+                   published: dict[str, str]) -> None:
+    """Check, on a fresh base, that each re-approved owner is held to the published bytes.
+
+    The gate locks an approval to the base at the approval time. A publication of
+    another machine may have replaced the tests between this push and the
+    re-approval; those owners would then be approved for bytes nobody reviewed, so
+    their approval is withdrawn and the publication reports them.
+    """
+    from foragent import scheduler_approval
+
+    git.fetch("origin", config.base_branch)
+    replaced: dict[int, list[str]] = {}
+    for number, paths in shared.items():
+        event, _ = scheduler_approval._latest_approval(tracker.label_events(number), config.approvers)
+        if event is None or "approved" not in tracker.get_issue(number).labels:
+            continue
+        ref = git.commit_before(f"origin/{config.base_branch}", event.created_at)
+        locked = git.blob_shas(ref, paths) if ref is not None else {}
+        wrong = sorted(path for path in paths if locked.get(path) != published[path])
+        if wrong:
+            replaced[number] = wrong
+    for number in replaced:
+        tracker.remove_labels(number, ["approved", "ready"])
+    if replaced:
+        raise TrackerError(text("order_locks_replaced", config.language, owners="\n".join(lines(replaced))))
 
 
 def lines(affected: dict[int, list[str]]) -> list[str]:

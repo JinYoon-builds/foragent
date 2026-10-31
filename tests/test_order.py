@@ -1,3 +1,4 @@
+import contextlib
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -11,12 +12,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, order
+from foragent import cli, order, order_locks
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
 from foragent.reasons import Reason, format_comment
-from foragent.scheduler import TickContext, tick
+from foragent.scheduler import BUSY_TICK, TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
@@ -2220,7 +2221,7 @@ def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(pub
 @pytest.fixture
 def locked_order(offline_publication, plan, monkeypatch):
     """Both children of an order approved and snapshotted, locking FILE; then FILE changes."""
-    root, config, tracker, git, _, _ = offline_publication
+    root, config, tracker, git, _, origin = offline_publication
     config = replace(config, approvers=["human"])
     clock = [BASE_TIME + timedelta(hours=1)]
     tracker._now = lambda: clock[0]
@@ -2238,7 +2239,7 @@ def locked_order(offline_publication, plan, monkeypatch):
     original = plan["issues"][0]["acceptance_files"][FILE]
     plan["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
     return SimpleNamespace(root=root, config=config, tracker=tracker, git=git, store=store, ctx=ctx,
-                           plan=plan, clock=clock, original=original)
+                           plan=plan, clock=clock, original=original, origin=origin)
 
 
 def _publish_locked(case, **kwargs):
@@ -2381,4 +2382,190 @@ def test_shared_lock_pending_reapproval_outranks_its_older_snapshot(locked_order
     tick(case.ctx)
     for number in (2, 3):
         assert case.store.load_approval(number).acceptance_blobs[FILE] == blob_b
+        assert case.store.load_flag(number) is None
+
+
+def _assert_owners_renewed(case, *owners):
+    current = case.git.blob_sha("origin/main", FILE)
+    for number in owners:
+        assert case.store.load_flag(number) is None, case.store.load_flag(number)
+        assert case.store.load_approval(number).acceptance_blobs[FILE] == current
+        assert {"approved", "ready"} <= case.tracker.get_issue(number).labels
+
+
+@pytest.mark.parametrize("lock", ["held", "not-held"])
+def test_shared_lock_ticks_between_push_and_reapproval_never_see_stale_approvals(locked_order, monkeypatch, lock):
+    """Ticks after the push and after the body edits: this machine's are held off by the tick
+    lock; one the lock cannot stop (``not-held``) sees withdrawn approvals, not old snapshots."""
+    case, ticks = locked_order, []
+    if lock == "not-held":
+        monkeypatch.setattr(order_locks, "gate_paused", lambda repo, busy: contextlib.nullcontext())
+    push_base, add_labels = case.git.push_base, case.tracker.add_labels
+
+    def push_then_tick(branch):
+        push_base(branch)
+        ticks.append(tick(case.ctx))
+
+    def tick_then_approve(number, labels):
+        if "approved" in labels:
+            ticks.append(tick(case.ctx))
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(case.git, "push_base", push_then_tick)
+    monkeypatch.setattr(case.tracker, "add_labels", tick_then_approve)
+    _publish_locked(case, approve=True)
+    assert len(ticks) >= 3
+    assert not any("hash-mismatch" in action for report in ticks for action in report.actions), ticks
+    assert all((report.skipped == BUSY_TICK) == (lock == "held") for report in ticks), ticks
+    # The injected ticks just refreshed the listing; the next one is due a tick period later.
+    case.clock[0] += timedelta(minutes=10)
+    tick(case.ctx)
+    _assert_owners_renewed(case, 2, 3)
+
+
+def test_shared_lock_reapproval_postdates_a_same_second_body_edit(locked_order, monkeypatch):
+    case = locked_order
+    case.plan["issues"][0]["goal"] = "Implement login with the amended test."
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        case.clock[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(order_locks.time, "sleep", sleep)
+    _publish_locked(case, approve=True)
+    edited = case.tracker.body_last_edited_at(2)
+    approved = [e.created_at for e in case.tracker.label_events(2) if e.label == "approved" and e.action == "labeled"][-1]
+    assert approved > edited and slept == [1]
+    tick(case.ctx)
+    _assert_owners_renewed(case, 2, 3)
+
+
+def test_shared_lock_unordered_reapproval_stops_visibly_unapproved(locked_order, monkeypatch):
+    case = locked_order
+    case.plan["issues"][0]["goal"] = "Implement login with the amended test."
+    monkeypatch.setattr(order_locks.time, "sleep", lambda seconds: None)
+    with pytest.raises(TrackerError, match="#2"):
+        _publish_locked(case, approve=True)
+    assert "approved" not in case.tracker.get_issue(2).labels
+    tick(case.ctx)
+    assert case.store.load_flag(2) is None
+
+
+def _hold_tick_lock(case):
+    import fcntl
+    stream = case.store._tick_lock_path().open("a")
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return stream
+
+
+def test_shared_lock_publication_waits_for_a_running_tick_before_withdrawing(locked_order, monkeypatch):
+    """A running tick may have read the old approvals; nothing changes until it has finished."""
+    case = locked_order
+    running, waited = _hold_tick_lock(case), []
+    old_blob = case.git.blob_sha("origin/main", FILE)
+
+    def sleep(seconds):
+        # Still waiting: owners keep their approval and the base keeps the old bytes.
+        assert all("approved" in case.tracker.get_issue(n).labels for n in (2, 3))
+        assert case.git.blob_sha("origin/main", FILE) == old_blob
+        waited.append(seconds)
+        running.close()  # The tick finishes.
+
+    monkeypatch.setattr(order_locks.time, "sleep", sleep)
+    _publish_locked(case, approve=True)
+    assert waited == [1]
+    case.clock[0] += timedelta(minutes=10)
+    tick(case.ctx)
+    _assert_owners_renewed(case, 2, 3)
+
+
+def test_shared_lock_publication_refuses_when_the_gate_stays_busy(locked_order, monkeypatch):
+    case = locked_order
+    running = _hold_tick_lock(case)
+    monkeypatch.setattr(order_locks, "GATE_WAIT_S", 0)
+    old, old_blob = (case.root / FILE).read_bytes(), case.git.blob_sha("origin/main", FILE)
+    issues = dict(case.tracker.issues)
+    try:
+        with pytest.raises(order.PlanError, match="gate"):
+            _publish_locked(case, approve=True)
+    finally:
+        running.close()
+    assert (case.root / FILE).read_bytes() == old and case.git.blob_sha("origin/main", FILE) == old_blob
+    assert case.tracker.issues == issues
+
+
+def test_shared_lock_reapproval_postdates_an_approval_in_the_same_second(locked_order, monkeypatch):
+    """Only the bytes change and the clock still shows the old approval's second."""
+    case = locked_order
+    case.clock[0] -= timedelta(hours=1)
+    earlier = case.store.load_approval(2).approved_at
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        case.clock[0] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(order_locks.time, "sleep", sleep)
+    _publish_locked(case, approve=True)
+    approved = [e.created_at for e in case.tracker.label_events(2) if e.label == "approved" and e.action == "labeled"][-1]
+    assert approved > earlier and slept
+    case.clock[0] += timedelta(minutes=10)
+    tick(case.ctx)
+    _assert_owners_renewed(case, 2, 3)
+
+
+def _push_elsewhere(case, content: str) -> None:
+    """Another machine's publication: a commit on origin's main replacing FILE."""
+    parent = git_command(case.origin, "rev-parse", "refs/heads/main")
+    data = content.encode()
+    stream = ("commit refs/heads/main\ncommitter Other Machine <other@example.com> 1792483200 +0000\n"
+              f"data 5\nOther\nfrom {parent}\nM 100644 inline {FILE}\ndata {len(data)}\n{content}\ndone\n")
+    git_command(case.origin, "fast-import", "--quiet", input=stream)
+
+
+def test_shared_lock_publication_lock_is_held_until_owners_are_reapproved(locked_order, monkeypatch):
+    """A second publication on this machine cannot push between this push and the re-approval."""
+    import fcntl
+    case, observed = locked_order, []
+    add_labels = case.tracker.add_labels
+    lock = case.root / ".git" / "foragent-publish.lock"
+
+    def probe(number, labels):
+        if "approved" in labels:
+            with lock.open("a") as stream:
+                try:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    observed.append(("held", number))
+                else:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    observed.append(("free", number))
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(case.tracker, "add_labels", probe)
+    _publish_locked(case, approve=True)
+    assert observed and all(state == "held" for state, number in observed if number in (2, 3)), observed
+
+
+def test_shared_lock_bytes_replaced_before_reapproval_leave_owners_unapproved(locked_order, monkeypatch):
+    """Another machine replaces the tests after this push: nobody is approved for those bytes."""
+    case, replaced = locked_order, []
+    add_labels = case.tracker.add_labels
+
+    def replace_then_approve(number, labels):
+        if "approved" in labels and not replaced:
+            _push_elsewhere(case, "assert 2 == 2\n")
+            replaced.append(number)
+        return add_labels(number, labels)
+
+    monkeypatch.setattr(case.tracker, "add_labels", replace_then_approve)
+    with pytest.raises(TrackerError) as refused:
+        _publish_locked(case, approve=True)
+    assert f"#2: {FILE}" in str(refused.value) and f"#3: {FILE}" in str(refused.value)
+    for number in (2, 3):
+        assert "approved" not in case.tracker.get_issue(number).labels
+    case.clock[0] += timedelta(minutes=10)
+    tick(case.ctx)
+    for number in (2, 3):
         assert case.store.load_flag(number) is None

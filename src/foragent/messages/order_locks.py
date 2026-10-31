@@ -9,6 +9,15 @@ MESSAGES = {
             "{owners}\n"
             "Approve every listed issue in this publication (add issues from other orders as edits), "
             "or keep the test bytes unchanged."),
+        "order_locks_approval_unordered": (
+            "Published, but #{number} could not be approved after its last edit, so it is not approved now. "
+            "Approve it again in a moment."),
+        "order_locks_gate_busy": (
+            "Nothing was published: the gate on this machine stayed busy, and approved issues must be "
+            "re-approved while no gate check runs. Try again when the current gate tick has finished."),
+        "order_locks_replaced": (
+            "Published, but another publication replaced these tests before they were approved again, "
+            "so these issues are not approved now:\n{owners}\nReview the current tests, then approve them."),
     },
     "ko": {
         "order_locks_heading": "이 주문이 잠긴 시험을 바꾸는 승인된 이슈:",
@@ -17,5 +26,14 @@ MESSAGES = {
             "이번 발행에서 그 이슈를 모두 다시 승인하지 않아서 승인이 풀려요.\n{owners}\n"
             "목록의 이슈를 이번 발행에서 모두 승인하거나(다른 주문의 이슈는 edits로 넣어요), "
             "시험 내용을 그대로 두세요."),
+        "order_locks_approval_unordered": (
+            "발행은 됐지만 #{number}을 마지막 수정보다 뒤에 승인하지 못해서 지금은 승인되지 않았어요. "
+            "잠시 뒤 다시 승인해 주세요."),
+        "order_locks_gate_busy": (
+            "아무것도 발행하지 않았어요. 이 기계의 게이트가 계속 바빠요. 승인된 이슈는 게이트 검사가 "
+            "돌지 않을 때 다시 승인해야 해요. 지금 도는 게이트 틱이 끝난 뒤 다시 해 주세요."),
+        "order_locks_replaced": (
+            "발행은 됐지만 다시 승인하기 전에 다른 발행이 이 시험을 바꿔서, 이 이슈들은 지금 승인되지 않았어요:\n"
+            "{owners}\n지금 시험을 검토한 뒤 승인해 주세요."),
     },
 }

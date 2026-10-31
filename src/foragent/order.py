@@ -1,6 +1,7 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
@@ -709,121 +710,144 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     # The owner label exists before any file or issue does: without it, nothing is published.
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
-    with git.publish_lock():
+    # Held from the approval withdrawal to the re-approval when owners are affected.
+    with ExitStack() as gate_paused:
+        # Same-machine publications wait here; with affected owners, until they are re-approved.
+        publishing = gate_paused.enter_context(ExitStack())
+        publishing.enter_context(git.publish_lock())
         git.update_base(config.base_branch)
         # Issues, approvals and the base may have moved while waiting for the lock.
         shared = affected(tracker.list_issues())
-        published_blobs = _publish_files(plan, root, config, git, files, manager)
-    for issue in unconfirmed:
-        _retire(tracker, config, issue, owner_label(owner))
-    lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
-    tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
-    if any(item.get("interactive", False) for item in plan["issues"]):
-        tracker.ensure_labels([LabelSpec("interactive", "d4c5f9", "Work that needs substantial back-and-forth with the user.")])
-
-    recorded_blobs = saved_blobs.copy()
-
-    def acceptance_blobs(item: dict) -> dict[str, str]:
-        # Reference files an issue relies on revoke its approval when they change, like its tests.
-        referenced = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
-                      | set(order_references.selected(plan, item)))
-        return {name: published_blobs[name] for name in sorted(referenced)}
-
-    def parent_body() -> str:
-        children = [tracker.get_issue(n) for n in mapping.values()]
-        checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
-        owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
-
-    # An order with no sub-issues (edits or approvals only) is finished once it
-    # applies: publish closes its record below, so it never gets a Backlog card.
-    childless = not plan["issues"] and not mapping
-    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
-    if parent is None:
-        parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
-        linked: set[int] = set()
-    else:
-        tracker.update_issue(parent, title=plan["title"], body=parent_body())
-        # GitHub rejects re-adding an existing sub-issue, so read the links once.
-        linked = {issue.number for issue in tracker.sub_issues(parent)}
-    if not childless:
-        board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
-    for item in plan["issues"]:
-        number = mapping.get(item["key"])
-        existing = tracker.get_issue(number) if number is not None else None
-        owned = existing is None or OWNED_MARKER in existing.body
-        body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
-                + (f"{OWNED_MARKER}\n" if owned else ""))
-        labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
-        if item.get("interactive", False):
-            labels.append("interactive")
-        blobs = acceptance_blobs(item)
-        if number is None:
-            number = _create_owned(tracker, config, owner, item["title"], body, labels)
-            mapping[item["key"]] = number
-            recorded_blobs[str(number)] = blobs
-            # Persist progress before native edge calls so retries reuse the child.
-            tracker.update_issue(parent, title=plan["title"], body=parent_body())
-        else:
-            if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
-                    or ("interactive" in existing.labels) != item.get("interactive", False)):
-                tracker.remove_labels(number, ["approved", "ready"])
-            tracker.update_issue(number, title=item["title"], body=body)
-            tracker.remove_labels(number, [label for label in existing.labels
-                                           if (label.startswith(("lane:", "size:")) or label == "interactive")
-                                           and label not in labels])
-            tracker.add_labels(number, labels)
-            recorded_blobs[str(number)] = blobs
-        if number not in linked:
-            tracker.add_sub_issue(parent, number)
-            linked.add(number)
-        board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
-    for item in plan["issues"]:
-        number = mapping[item["key"]]
-        desired = {mapping[key] for key in item.get("blocked_by", [])}
-        existing = {dep.number for dep in tracker.blocked_by(number)}
-        for blocker in sorted(existing - desired):
-            tracker.remove_blocked_by(number, blocker)
-        for blocker in sorted(desired - existing):
-            tracker.add_blocked_by(number, blocker)
-    for item in plan.get("edits", []):
-        number = item["number"]
-        existing = tracker.get_issue(number)
-        # An edit rewrites the whole body; the issue's owner-label contract survives it.
-        body = _with_contract(_published_body(plan, item, repo, config), existing.body)
-        blobs = acceptance_blobs(item)
-        revision = body_hash(body + json.dumps({
-            name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
-            for name in sorted(blobs)}, sort_keys=True))
-        comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
-                   f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
-        prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
-            tracker.remove_labels(number, ["needs-human", "approved", "ready"])
-            tracker.update_issue(number, title=existing.title, body=body)
-            if not prior:
-                tracker.comment(number, comment)
-        recorded_blobs[str(number)] = blobs
-    tracker.update_issue(parent, title=plan["title"], body=parent_body())
-    if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
-        raise PlanError("approve numbers must refer to this plan's children or edits")
-    approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
-    for number in sorted(approved_numbers):
-        if number in shared:
-            # A fresh approval event makes the gate snapshot the new locked bytes.
+        if shared:
+            # A tick that already read the old approval could check it after the push,
+            # so no tick of this machine runs until the owners are approved again.
+            gate_paused.enter_context(order_locks.gate_paused(
+                repo, lambda: PlanError(text("order_locks_gate_busy", config.language))))
+            shared = affected(tracker.list_issues())
+        # Every affected owner is re-approved below. Its approval is withdrawn before the
+        # new bytes are pushed: a tick fetches the base before it lists issues, so no tick
+        # can see the new bytes together with an approval still held to the old ones.
+        for number in shared:
             tracker.remove_labels(number, ["approved", "ready"])
-        tracker.add_labels(number, ["approved"])
-        board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
-    if approved_numbers:
-        kick_tick(root)
-    if childless and (parent not in by_number or by_number[parent].state == "open"):
-        tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
-    for item, row in zip(plan["issues"], rows):
-        row["number"] = mapping[item["key"]]
-        row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
-    for row in rows:
-        row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
-    return PublishReport(plan["title"], parent, rows, sorted(files), False, shared, config.language)
+        published_blobs = _publish_files(plan, root, config, git, files, manager)
+        if not shared:
+            publishing.close()
+        for issue in unconfirmed:
+            _retire(tracker, config, issue, owner_label(owner))
+        lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
+        tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
+        if any(item.get("interactive", False) for item in plan["issues"]):
+            tracker.ensure_labels([LabelSpec("interactive", "d4c5f9", "Work that needs substantial back-and-forth with the user.")])
+
+        recorded_blobs = saved_blobs.copy()
+
+        def acceptance_blobs(item: dict) -> dict[str, str]:
+            # Reference files an issue relies on revoke its approval when they change, like its tests.
+            referenced = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+                          | set(order_references.selected(plan, item)))
+            return {name: published_blobs[name] for name in sorted(referenced)}
+
+        def parent_body() -> str:
+            children = [tracker.get_issue(n) for n in mapping.values()]
+            checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
+            owned = f"{OWNED_MARKER}\n" if parent_owned else ""
+            return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+
+        # An order with no sub-issues (edits or approvals only) is finished once it
+        # applies: publish closes its record below, so it never gets a Backlog card.
+        childless = not plan["issues"] and not mapping
+        parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
+        if parent is None:
+            parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
+            linked: set[int] = set()
+        else:
+            tracker.update_issue(parent, title=plan["title"], body=parent_body())
+            # GitHub rejects re-adding an existing sub-issue, so read the links once.
+            linked = {issue.number for issue in tracker.sub_issues(parent)}
+        if not childless:
+            board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
+        for item in plan["issues"]:
+            number = mapping.get(item["key"])
+            existing = tracker.get_issue(number) if number is not None else None
+            owned = existing is None or OWNED_MARKER in existing.body
+            body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+                    + (f"{OWNED_MARKER}\n" if owned else ""))
+            labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
+            if item.get("interactive", False):
+                labels.append("interactive")
+            blobs = acceptance_blobs(item)
+            if number is None:
+                number = _create_owned(tracker, config, owner, item["title"], body, labels)
+                mapping[item["key"]] = number
+                recorded_blobs[str(number)] = blobs
+                # Persist progress before native edge calls so retries reuse the child.
+                tracker.update_issue(parent, title=plan["title"], body=parent_body())
+            else:
+                if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
+                        or ("interactive" in existing.labels) != item.get("interactive", False)):
+                    tracker.remove_labels(number, ["approved", "ready"])
+                tracker.update_issue(number, title=item["title"], body=body)
+                tracker.remove_labels(number, [label for label in existing.labels
+                                               if (label.startswith(("lane:", "size:")) or label == "interactive")
+                                               and label not in labels])
+                tracker.add_labels(number, labels)
+                recorded_blobs[str(number)] = blobs
+            if number not in linked:
+                tracker.add_sub_issue(parent, number)
+                linked.add(number)
+            board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
+        for item in plan["issues"]:
+            number = mapping[item["key"]]
+            desired = {mapping[key] for key in item.get("blocked_by", [])}
+            existing = {dep.number for dep in tracker.blocked_by(number)}
+            for blocker in sorted(existing - desired):
+                tracker.remove_blocked_by(number, blocker)
+            for blocker in sorted(desired - existing):
+                tracker.add_blocked_by(number, blocker)
+        for item in plan.get("edits", []):
+            number = item["number"]
+            existing = tracker.get_issue(number)
+            # An edit rewrites the whole body; the issue's owner-label contract survives it.
+            body = _with_contract(_published_body(plan, item, repo, config), existing.body)
+            blobs = acceptance_blobs(item)
+            revision = body_hash(body + json.dumps({
+                name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
+                for name in sorted(blobs)}, sort_keys=True))
+            comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
+                       f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
+            prior = any(c.body == comment for c in tracker.list_comments(number))
+            if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
+                tracker.remove_labels(number, ["needs-human", "approved", "ready"])
+                tracker.update_issue(number, title=existing.title, body=body)
+                if not prior:
+                    tracker.comment(number, comment)
+            recorded_blobs[str(number)] = blobs
+        tracker.update_issue(parent, title=plan["title"], body=parent_body())
+        if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
+            raise PlanError("approve numbers must refer to this plan's children or edits")
+        approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
+        for number in sorted(approved_numbers):
+            if number in shared:
+                # The fresh approval must postdate this publication's body edits, or the gate
+                # rejects it as predating an edit (same-second timestamps included).
+                order_locks.approve_after_edits(tracker, number, config.approvers, config.language)
+            else:
+                tracker.add_labels(number, ["approved"])
+            board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
+        if shared:
+            # Another machine may have pushed other bytes since this push; the owners'
+            # approvals must hold exactly the published ones, or they are withdrawn.
+            order_locks.confirm_locked(tracker, git, config, shared, published_blobs)
+        if approved_numbers:
+            kick_tick(root)
+        if childless and (parent not in by_number or by_number[parent].state == "open"):
+            tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
+        for item, row in zip(plan["issues"], rows):
+            row["number"] = mapping[item["key"]]
+            row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
+        for row in rows:
+            row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
+        return PublishReport(plan["title"], parent, rows, sorted(files), False, shared, config.language)
 
 
 PREREAD_FILE = ".foragent/preread.json"
