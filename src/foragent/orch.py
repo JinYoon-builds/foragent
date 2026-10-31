@@ -22,7 +22,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
-from foragent.orch_premerge_scope import full_selection, selected_on_base
+from foragent.orch_premerge_scope import full_selection, selected_on_base, stepwise_options
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
@@ -447,6 +447,13 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         unverified: list[str] = []
         for i, (command, selection, run, acceptance_only) in enumerate(runs):
             pytest = _pytest_command(command) is not None
+            if pytest and not acceptance_only and (stepwise := stepwise_options(command)):
+                # A stepwise run stops at its first failure, so it measures only part of the selection
+                # (an acceptance-only selection is rebuilt by _pytest_command without it).
+                tests = "fail"
+                broken.extend(sorted(run.failing or ()))
+                unverified.append(f"{command}: {' '.join(stepwise)} stops at the first failure")
+                continue
             if run.failing is None:
                 # Only a non-pytest suite is judged by its exit code; pytest must report each test.
                 if not run.passed or pytest:

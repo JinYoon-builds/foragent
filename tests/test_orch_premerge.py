@@ -689,3 +689,30 @@ def test_base_report_missing_a_test_at_risk_fails_closed(git_history, tmp_path, 
     report = orch.premerge(c.ctx, c.pr)
     assert report["ready"] is False and report["broken"] == [], report
     assert len(report["unverified"]) == 1 and KEPT in report["unverified"][0], report
+
+
+# The configured command reaches the shell as written: globs, variables and quoting expand there.
+@pytest.mark.parametrize("selector", [
+    "tests/test_un*.py", '"$UNIT_DIR"/test_unit.py', "'tests/test_unit.py'",
+    "PYTHONPATH=. {pytest} tests/test_un*.py", "env PYTHONPATH=. {pytest} tests/test_un*.py",
+], ids=["glob", "variable", "quoted", "inline-pythonpath", "env-pythonpath"])
+def test_command_selectors_keep_their_shell_meaning(git_history, tmp_path, monkeypatch, selector):
+    monkeypatch.setenv("UNIT_DIR", "tests")
+    command = selector.format(pytest=PYTEST) if "{pytest}" in selector else f"{PYTEST} {selector}"
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode="all", command=command)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["unverified"] == [], report
+    log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
+    assert "Pre-merge selection on base" not in log, "The base collection must list the selection"
+
+
+@pytest.mark.parametrize("mode,blocked", [("all", True), ("ci", False)])
+def test_stepwise_command_is_unusable_for_the_full_suite_comparison(git_history, tmp_path, mode, blocked):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode,
+                   command=f"{shlex.quote(sys.executable)} -m pytest -q --sw")
+    report = orch.premerge(c.ctx, c.pr)
+    if blocked:
+        assert report["ready"] is False and report["unverified"] == [
+            f"{c.ctx.config.test_command}: --sw stops at the first failure"], report
+    else:  # The acceptance-only selection is rebuilt without --sw.
+        assert report["ready"] is True and report["unverified"] == [], report
