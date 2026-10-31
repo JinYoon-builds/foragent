@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 import zlib
 from typing import Any, Literal, Protocol
@@ -213,12 +214,61 @@ class RecordingTracker:
             return value
 
         def observe(*args, **kwargs):
+            started = self._started()
             result = value(*args, **kwargs)
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
+                self._observe([result], started)
             return result
 
         return observe
+
+    def _started(self):
+        """When a read or write begins; observations and writes are ordered by it."""
+        now = getattr(self._context, "now", None)
+        return now() if now is not None else datetime.now(UTC)
+
+    def _observe(self, issues, started, *, complete=False):
+        """Ingest what one read that began at ``started`` showed; see state_observe."""
+        observed = {issue.number for issue in issues}
+        for number in self._context.store.observe_issues(issues, started, self._context.config.lanes,
+                                                         complete=complete):
+            self._outbox_dropped(number, "remote change" if number in observed else "issue not found")
+
+    def list_issues(self, state="all"):
+        started = self._started()
+        issues = self._tracker.list_issues(state)
+        if self.__dict__.get("_bulk_listing") != threading.get_ident():
+            self._observe(issues, started, complete=state == "all")
+        return issues
+
+    def get_issue(self, n):
+        started = self._started()
+        try:
+            issue = self._tracker.get_issue(n)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                self._absent(n, started)
+            raise
+        self._observe([issue], started)
+        return issue
+
+    def _absent(self, n, started):
+        """A read that began at ``started`` found issue ``n`` missing; see state_observe."""
+        if self._context.store.observe_absence(n, started):
+            self._outbox_dropped(n, "issue not found")
+
+    def _missing(self, number):
+        """Whether the issue itself is gone, not only a write resource; both answers are observed."""
+        started = self._started()
+        try:
+            issue = self._tracker.get_issue(number)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                self._absent(number, started)
+                return True
+            raise
+        self._observe([issue], started)
+        return False
 
     def _pending_issues(self):
         pending = {entry["issue"] for entry in self._context.store.github_outbox()}
@@ -234,7 +284,9 @@ class RecordingTracker:
         return self.get_issue(n)
 
     def sub_issues(self, n):
+        started = self._started()
         children = self._tracker.sub_issues(n)
+        self._observe(children, started)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
 
@@ -267,7 +319,12 @@ class RecordingTracker:
         revision = store.issues_revision()
         pending = {entry["issue"] for entry in store.github_outbox()}
         previous = {row["number"]: row for row in store.local_issues()}
-        issues = self.list_issues()
+        # The bulk refresh ingests this listing itself, with its comments, edges and PRs.
+        self._bulk_listing = threading.get_ident()
+        try:
+            issues = self.list_issues()
+        finally:
+            self._bulk_listing = None
         # The listing is the change signal: an issue whose listed facts match the
         # last listing keeps its last per-issue reads. A changed issue also marks
         # the issues it blocks, because a dependent does not change when its blocker closes.
@@ -294,19 +351,22 @@ class RecordingTracker:
             try:
                 comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
             except TrackerError as exc:
-                if not exc.is_not_found or not self._issue_missing(issue.number):
+                if not exc.is_not_found or not self._missing(issue.number):
                     raise
                 missing.add(issue.number)
         issues = [issue for issue in issues if issue.number not in missing]
         # Order edges and dependencies let views group work without per-frame reads.
         open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
-        children = {}
+        children, child_reads = {}, []
         for issue in open_issues:
             known = (previous.get(issue.number) or {}).get("children")
-            children[issue.number] = (
-                [child.number for child in self._tracker.sub_issues(issue.number)]
-                if issue.number in changed or known is None else known
-            )
+            if issue.number in changed or known is None:
+                # Each child read is its own observation, ingested after the listing.
+                started = self._started()
+                known = self._tracker.sub_issues(issue.number)
+                child_reads.append((known, started))
+                known = [child.number for child in known]
+            children[issue.number] = known
         parents = {child: parent for parent, numbers in children.items() for child in numbers}
         blocked_by = {}
         for issue in open_issues:
@@ -321,6 +381,8 @@ class RecordingTracker:
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
+        for read, started in child_reads:
+            dropped = sorted(set(dropped) | set(store.observe_issues(read, started, self._context.config.lanes)))
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
             store.record_merged_pr_listing(listing)
@@ -377,37 +439,33 @@ class RecordingTracker:
                     raise
                 log.warning("Could not read recently closed issues: %s", exc)
                 return  # Keep the watermark; the next tick reads this span again.
-            closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
-            for issue in issues:
-                if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
-                    store.record_issue(issue, self._context.config.lanes)
+            # Every closed issue is an observation, so a changed close reason is seen too.
+            self._observe([issue for issue in issues if issue.state == "closed"], observed_at)
         store.record_closed_issue_watermark(observed_at)
 
-    def _issue_missing(self, number):
-        """A missing write resource alone does not prove that its issue is gone."""
-        try:
-            self._tracker.get_issue(number)
-        except TrackerError as exc:
-            if exc.is_not_found:
-                return True
-            raise
-        return False
+    def _write(self, n, action, operation, started, **payload):
+        """Deliver now or queue; either way the write counts from ``started``.
 
-    def _write(self, n, action, operation, **payload):
+        Returns (result, queued entry). A queued write that a newer
+        observation already judged is not queued: (None, False).
+        """
         store = self._context.store
         pending = store.github_outbox()
-        if (any(entry["issue"] == n for entry in pending)
+        if not (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
-        try:
-            return operation(), None
-        except TrackerError as exc:
-            if not self.queue_writes or not exc.is_rate_limit:
-                raise
-            from foragent.orch_github import pause
+            try:
+                return operation(), None
+            except TrackerError as exc:
+                if not self.queue_writes or not exc.is_rate_limit:
+                    raise
+                from foragent.orch_github import pause
 
-            pause(self._context, exc)
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+                pause(self._context, exc)
+        entry = store.queue_github_write(n, action, lanes=self._context.config.lanes, started_at=started, **payload)
+        if entry is None:
+            self._outbox_dropped(n, "remote change")
+            return None, False
+        return None, entry
 
     def flush_outbox(self):
         """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
@@ -420,23 +478,26 @@ class RecordingTracker:
             if number in dropped:
                 continue
             try:
+                # Each delivery counts from its own start (an overlay until a later read).
                 if action == "remove_labels":
                     labels = entry["labels"]
                     for index, label in enumerate(labels):
+                        started = self._started()
                         self._tracker.remove_labels(number, [label])
-                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
+                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:], started_at=started)
                 elif action == "update_issue":
+                    started = self._started()
                     self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
-                    store.deliver_github_write(entry)
+                    store.deliver_github_write(entry, started_at=started)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
+                    started = self._started()
                     result = getattr(self._tracker, action)(number, payload)
-                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None,
+                                               started_at=started)
             except TrackerError as exc:
                 try:
-                    if exc.is_not_found and self._issue_missing(number):
-                        store.drop_missing_github_issue(number)
-                        self._outbox_dropped(number, "issue not found")
+                    if exc.is_not_found and self._missing(number):
                         dropped.add(number)
                         continue
                 except TrackerError as lookup_error:
@@ -450,23 +511,29 @@ class RecordingTracker:
         labels = list(labels)
         if not labels:
             return
-        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
-        if queued:
+        started = self._started()
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), started,
+                                     labels=labels)
+        if queued is not None:
             return
+        self._acknowledge(n, "add_labels", started, result, labels=labels)
+
+    def _acknowledge(self, n, action, started, result=None, **payload):
+        """A delivered direct write counts from its start, under any observation since."""
         if isinstance(result, Issue):
-            self._context.store.record_issue(result, self._context.config.lanes)
-        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+            self._observe([result], started)
+        self._context.store.acknowledge_github_write(n, action, started, lanes=self._context.config.lanes,
+                                                     **payload)
 
     def remove_labels(self, n, labels):
         labels = list(labels)
         for index, label in enumerate(labels):
+            started = self._started()
             result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
-                                         labels=labels[index:])
-            if queued:
+                                         started, labels=labels[index:])
+            if queued is not None:
                 break
-            if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
-            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+            self._acknowledge(n, "remove_labels", started, result, labels=[label])
 
     def list_comments(self, n):
         comments = self._tracker.list_comments(n)
@@ -474,31 +541,35 @@ class RecordingTracker:
         return comments
 
     def comment(self, n, body):
-        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
-        if queued:
-            return -queued["id"]
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
+                                       body=body)
+        if queued is not None:
+            return -queued["id"] if queued else None
         self._context.store.record_comments(n, [{"id": identity, "body": body,
             "author": "foragent", "created_at": self._context.now().astimezone(UTC).isoformat()}], append=True)
         return identity
 
     def create_issue(self, title, body, labels):
         labels = list(labels)
+        started = self._started()
         n = self._tracker.create_issue(title, body, labels)
-        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
-                                         self._context.config.lanes)
+        # What was created is observed as of the creation's start, under any later read.
+        self._observe([Issue(n, title, body, frozenset(labels), "open")], started)
         return n
 
     def update_issue(self, n, *, title, body):
+        started = self._started()
         _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
-                                title=title, body=body)
-        if not queued:
-            self._context.store.update_local_issue(n, title=title, body=body)
+                                started, title=title, body=body)
+        if queued is None:
+            self._acknowledge(n, "update_issue", started, title=title, body=body)
 
     def close_issue(self, n, comment=None):
+        started = self._started()
         _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), body=comment)
-        if not queued:
-            self._context.store.update_local_issue(n, state="closed")
+                               else self._tracker.close_issue(n, comment), started, body=comment)
+        if queued is None:
+            self._acknowledge(n, "close_issue", started)
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)

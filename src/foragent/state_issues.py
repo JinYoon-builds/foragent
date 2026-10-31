@@ -13,7 +13,8 @@ def observed_issue_facts(issue: Any) -> dict[str, Any]:
         return dict(summary) if summary is not None else None
 
     return {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
-            "state": issue.state, "updated_at": issue.updated_at,
+            "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
+            "updated_at": issue.updated_at,
             # Link counts change with a sub-issue or dependency change even if updated_at does not.
             "sub_issues": counts(getattr(issue, "sub_issues_summary", None)),
             "dependencies": counts(getattr(issue, "dependencies_summary", None))}
@@ -145,15 +146,27 @@ class IssueSnapshotMixin:
             }]
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
-                           **payload: Any) -> dict[str, Any]:
-        """Persist the FIFO entry and its local effect in one transaction."""
+                           started_at: datetime | None = None, **payload: Any) -> dict[str, Any] | None:
+        """Persist the FIFO entry and its local effect in one transaction.
+
+        ``queued_at`` is when the write began (``started_at``, default now):
+        a direct attempt that is queued after a rate limit counts from its start.
+        An observation newer than that start already judged the write, and
+        an absence newer than it removed the issue, so nothing is queued
+        (None); a comment is judged by absence only.
+        """
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            if started_at is not None and (
+                    _observe.newer(snapshot.get("absent", {}).get(str(number)), started_at)
+                    or action != "comment" and _observe.judged_since(snapshot, number, started_at)):
+                return None
             row = self._local_issue(snapshot, number)
             snapshot.setdefault("outbox_base", {}).setdefault(str(number), _state.deepcopy(row))
             identity = snapshot.get("outbox_sequence", 0) + 1
             entry = {"id": identity, "issue": number, "action": action,
-                     "queued_at": self._timestamp(), **payload}
+                     "queued_at": self._timestamp() if started_at is None
+                     else started_at.astimezone(_state.UTC).isoformat(), **payload}
             snapshot.setdefault("outbox", []).append(entry)
             snapshot["outbox_sequence"] = identity
             self._apply_github_write(row, entry, lanes or {})
@@ -161,8 +174,13 @@ class IssueSnapshotMixin:
             return entry
 
     def deliver_github_write(self, entry: dict[str, Any], *, comment_id: int | None = None,
-                             remaining_labels: list[str] | None = None) -> None:
-        """Acknowledge delivery without losing concurrent appends or later local intent."""
+                             remaining_labels: list[str] | None = None,
+                             started_at: datetime | None = None) -> None:
+        """Acknowledge delivery without losing concurrent appends or later local intent.
+
+        With ``started_at`` (when the delivery began) the delivered effect
+        stays an overlay until an observation at or after that start.
+        """
         with self._state_lock():
             snapshot = self._issue_snapshot()
             pending = snapshot.get("outbox", [])
@@ -178,6 +196,11 @@ class IssueSnapshotMixin:
                 self._apply_github_write(baseline, delivered, {})
             if not remaining_labels:
                 snapshot["outbox"] = [item for item in pending if item["id"] != entry["id"]]
+            if started_at is not None and delivered["action"] != "comment" and not _observe.judged_since(
+                    snapshot, delivered["issue"], started_at):
+                self._add_overlay(snapshot, delivered["issue"], delivered["action"], started_at.isoformat(),
+                                  **{key: delivered[key] for key in ("labels", "title", "body") if key in delivered
+                                     and not (delivered["action"] == "close_issue" and key == "body")})
             row = self._local_issue(snapshot, entry["issue"])
             if comment_id is not None:
                 for facts in (row, baseline or {}):
@@ -217,9 +240,13 @@ class IssueSnapshotMixin:
         return refreshed is None or now - _state.datetime.fromisoformat(refreshed) >= _state.REFRESH_INTERVAL
 
     def update_local_issue(self, number: int, **fields: Any) -> None:
+        """Record local fields; a change to observed issue facts is an overlay from now."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
             row = self._local_issue(snapshot, number)
+            facts = {key: value for key, value in fields.items() if key in _observe.OBSERVED_FIELDS}
+            if facts:
+                self._add_overlay(snapshot, number, "set_fields", self._timestamp(), fields=facts)
             if any(row.get(key) != value for key, value in fields.items()):
                 _state._forget_reads(row)
             row.update(fields)
@@ -242,9 +269,12 @@ class IssueSnapshotMixin:
             self._save_local_issue(snapshot, row)
 
     def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
+        """A local label change, an overlay from now until a later observation."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
             row = self._local_issue(snapshot, number)
+            self._add_overlay(snapshot, number, "remove_labels" if remove else "add_labels", self._timestamp(),
+                              labels=list(labels))
             self._record_labels(row, labels, remove=remove, lanes=lanes)
             self._save_local_issue(snapshot, row)
 
@@ -282,3 +312,4 @@ class IssueSnapshotMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+import foragent.state_observe as _observe
