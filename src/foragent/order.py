@@ -1,7 +1,7 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote
 
-from foragent import board, design, order_references, ownership
+from foragent import board, design, order_locks, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -410,12 +410,17 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
+    # Approved issues outside the order whose locked acceptance bytes it changes (#1107).
+    affected: dict[int, list[str]] = field(default_factory=dict)
+    language: str = "en"
 
     def summary(self) -> str:
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
         lines.append("Files: " + ", ".join(self.paths))
+        if self.affected:
+            lines += ["", text("order_locks_heading", self.language), *order_locks.lines(self.affected)]
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
             lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
@@ -660,8 +665,30 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "interactive": "interactive" in issue.labels,
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
                      "approved": approve or issue.number in selected_numbers})
+    # An approved issue whose locked bytes change stays approved only when this same
+    # publication re-approves it: its own children and edits selected for approval.
+    # Any other affected owner (another order's issue, a child dropped from the plan,
+    # one not selected) would get hash-mismatch on the next tick, so publication refuses.
+    covered = ({mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping
+                and (approve or item["key"] in selected_keys or mapping[item["key"]] in selected_numbers)}
+               | {n for n in edit_numbers if approve or n in selected_numbers})
+    repos: list[GitRepo] = []
+
+    def base_git() -> GitRepo:
+        if not repos:
+            repos.append(git or GitRepo(root))
+        return repos[0]
+
+    def affected(issues) -> dict[int, list[str]]:
+        found = order_locks.affected_owners(config, repo, tracker, issues, files, base_git)
+        if set(found) - covered:
+            raise PlanError(order_locks.refusal(found, config.language))
+        return found
+
     if dry_run:
-        return PublishReport(plan["title"], parent, rows, sorted(files), True)
+        shared = order_locks.affected_owners(config, repo, tracker, all_issues, files, base_git)
+        return PublishReport(plan["title"], parent, rows, sorted(files), True, shared, config.language)
+    affected(all_issues)
     require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -684,6 +711,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
+        # Issues, approvals and the base may have moved while waiting for the lock.
+        shared = affected(tracker.list_issues())
         published_blobs = _publish_files(plan, root, config, git, files, manager)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
@@ -780,6 +809,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
+        if number in shared:
+            # A fresh approval event makes the gate snapshot the new locked bytes.
+            tracker.remove_labels(number, ["approved", "ready"])
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     if approved_numbers:
@@ -791,7 +823,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
-    return PublishReport(plan["title"], parent, rows, sorted(files), False)
+    return PublishReport(plan["title"], parent, rows, sorted(files), False, shared, config.language)
 
 
 PREREAD_FILE = ".foragent/preread.json"

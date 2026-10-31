@@ -2214,3 +2214,171 @@ def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(pub
     tracker.add_labels(1, ["by:human"])  # A person restores the owner; publication continues.
     assert order.publish(plan, root, config, tracker, repo="owner/repo", git=git).parent == 1
     assert len(tracker.issues) == 3
+
+
+
+@pytest.fixture
+def locked_order(offline_publication, plan, monkeypatch):
+    """Both children of an order approved and snapshotted, locking FILE; then FILE changes."""
+    root, config, tracker, git, _, _ = offline_publication
+    config = replace(config, approvers=["human"])
+    clock = [BASE_TIME + timedelta(hours=1)]
+    tracker._now = lambda: clock[0]
+    store = StateStore(root / ".foragent/state", now=lambda: clock[0])
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kwargs: store))
+    plan["issues"][1]["done_when"] = [f"uv run pytest -q {FILE}"]
+    plan["issues"][1]["blocked_by"] = []
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
+    ctx = TickContext(repo="owner/repo", repo_root=root, tracker=tracker, store=store, config=config, git=git,
+                      now=lambda: clock[0], launcher=lambda number: None, start_runs=False,
+                      runner_process_exists=lambda number: False)
+    tick(ctx)
+    assert store.load_approval(2) is not None and store.load_approval(3) is not None
+    clock[0] += timedelta(hours=1)
+    original = plan["issues"][0]["acceptance_files"][FILE]
+    plan["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
+    return SimpleNamespace(root=root, config=config, tracker=tracker, git=git, store=store, ctx=ctx,
+                           plan=plan, clock=clock, original=original)
+
+
+def _publish_locked(case, **kwargs):
+    return order.publish(case.plan, case.root, case.config, case.tracker, repo="owner/repo", git=case.git, **kwargs)
+
+
+def _assert_nothing_changed_and_tick_is_clean(case, publish_kwargs, *owners):
+    old, old_blob = (case.root / FILE).read_bytes(), case.git.blob_sha("origin/main", FILE)
+    snapshots = {n: case.store.load_approval(n) for n in (2, 3)}
+    issues = dict(case.tracker.issues)
+    with pytest.raises(order.PlanError) as refused:
+        _publish_locked(case, **publish_kwargs)
+    assert all(f"#{n}: {FILE}" in str(refused.value) for n in owners), refused.value
+    assert (case.root / FILE).read_bytes() == old and case.git.blob_sha("origin/main", FILE) == old_blob
+    assert case.tracker.issues == issues
+    assert {n: case.store.load_approval(n) for n in (2, 3)} == snapshots
+    tick(case.ctx)
+    for number in (2, 3):
+        assert case.store.load_flag(number) is None
+        assert {"approved", "ready"} <= case.tracker.get_issue(number).labels
+
+
+@pytest.mark.parametrize("how", ["not-reapproved", "one-reapproved", "child-dropped"])
+def test_shared_lock_membership_is_not_coverage(locked_order, how):
+    """An own child is covered only when this publication re-approves it."""
+    case, kwargs = locked_order, {}
+    if how == "one-reapproved":
+        kwargs = {"approve_keys": ["api"]}
+    elif how == "child-dropped":
+        # The parent's map keeps the dropped child; it stays approved, locking FILE.
+        case.plan["issues"].pop(1)
+        kwargs = {"approve": True}
+    preview = _publish_locked(case, dry_run=True, **kwargs)
+    assert preview.affected == {2: [FILE], 3: [FILE]}
+    assert f"#3: {FILE}" in preview.summary()
+    _assert_nothing_changed_and_tick_is_clean(case, kwargs, 2, 3)
+
+
+def test_shared_lock_reapproving_every_owner_refreshes_their_snapshots(locked_order):
+    case = locked_order
+    before = {n: case.store.load_approval(n) for n in (2, 3)}
+    report = _publish_locked(case, approve=True)
+    assert report.affected == {2: [FILE], 3: [FILE]}
+    assert f"#2: {FILE}" in report.summary() and f"#3: {FILE}" in report.summary()
+    tick(case.ctx)
+    current = case.git.blob_sha("origin/main", FILE)
+    for number in (2, 3):
+        renewed = case.store.load_approval(number)
+        assert renewed.approved_at != before[number].approved_at
+        assert renewed.acceptance_blobs[FILE] == current != before[number].acceptance_blobs[FILE]
+        assert case.store.load_flag(number) is None
+
+
+def test_shared_lock_covered_owner_gets_a_fresh_approval_even_when_its_plan_entry_is_unchanged(locked_order):
+    """A snapshot can lock other bytes than the order last recorded; re-approval must still renew it."""
+    case = locked_order
+    case.plan["issues"][0]["acceptance_files"][FILE] = case.original
+    stale = case.store.load_approval(2)
+    case.store.save_approval(2, body=stale.body, body_sha=stale.body_sha, acceptance_blobs={FILE: "f" * 40},
+                             approved_by=stale.approved_by, approved_at=stale.approved_at)
+    assert _publish_locked(case, dry_run=True, approve=True).affected == {2: [FILE]}
+    _publish_locked(case, approve=True)
+    tick(case.ctx)
+    assert case.store.load_approval(2).acceptance_blobs[FILE] == case.git.blob_sha("origin/main", FILE)
+    assert case.store.load_flag(2) is None
+    assert {"approved", "ready"} <= case.tracker.get_issue(2).labels
+
+
+def _approved_outsider(case) -> int:
+    body = f"## Goal\nOther work.\n\n## Done when\n```sh\nuv run pytest -q {FILE}\n```\n"
+    number = case.tracker.create_issue("Other order", body, [])
+    case.tracker.add_labels(number, ["approved"])
+    return number
+
+
+def test_shared_lock_unsnapshotted_approval_uses_the_base_at_approval_time(locked_order):
+    """The gate snapshots the base before the approval time, not the working tree."""
+    case = locked_order
+    outsider = _approved_outsider(case)
+    assert case.store.load_approval(outsider) is None
+    # The proposed bytes are already in the working tree, but not on the base.
+    (case.root / FILE).write_text(case.plan["issues"][0]["acceptance_files"][FILE])
+    assert _publish_locked(case, dry_run=True, approve=True).affected == {2: [FILE], 3: [FILE], outsider: [FILE]}
+    with pytest.raises(order.PlanError, match=f"#{outsider}: "):
+        _publish_locked(case, approve=True)
+
+
+def test_shared_lock_recheck_lists_issues_approved_while_waiting_for_the_lock(locked_order, monkeypatch):
+    case = locked_order
+    update_base, late = case.git.update_base, []
+
+    def approve_meanwhile(branch):
+        late.append(_approved_outsider(case))
+        return update_base(branch)
+
+    monkeypatch.setattr(case.git, "update_base", approve_meanwhile)
+    old_blob = case.git.blob_sha("origin/main", FILE)
+    with pytest.raises(order.PlanError) as refused:
+        _publish_locked(case, approve=True)
+    assert f"#{late[0]}: {FILE}" in str(refused.value)
+    assert case.git.blob_sha("origin/main", FILE) == old_blob
+    assert (case.root / FILE).read_text() == case.original
+
+
+@pytest.mark.parametrize("width", [40, 64])
+def test_shared_lock_identical_bytes_match_in_the_snapshot_object_format(locked_order, width):
+    case = locked_order
+    digest = hashlib.sha256 if width == 64 else hashlib.sha1
+    data = case.original.encode()
+    sha = digest(b"blob %d\0" % len(data) + data).hexdigest()
+    for number in (2, 3):
+        stale = case.store.load_approval(number)
+        case.store.save_approval(number, body=stale.body, body_sha=stale.body_sha, acceptance_blobs={FILE: sha},
+                                 approved_by=stale.approved_by, approved_at=stale.approved_at)
+    assert _publish_locked(case, dry_run=True).affected == {2: [FILE], 3: [FILE]}
+    case.plan["issues"][0]["acceptance_files"][FILE] = case.original
+    assert _publish_locked(case, dry_run=True).affected == {}
+
+
+def test_shared_lock_pending_reapproval_outranks_its_older_snapshot(locked_order):
+    """Re-approved bytes B, no tick yet: restoring the snapshot's bytes A still changes the lock."""
+    case = locked_order
+    _publish_locked(case, approve=True)
+    assert case.store.load_approval(2).acceptance_blobs[FILE] == order._blob(case.original.encode())
+    # A real push also moves origin/main here; the offline push only updates the origin repository.
+    case.git.update_base("main")
+    case.clock[0] += timedelta(hours=1)
+    restore = deepcopy(case.plan)
+    item = deepcopy(restore["issues"][0])
+    item.update(key="restore", title="Restore the old test", blocked_by=[])
+    item["acceptance_files"][FILE] = case.original
+    restore.update(id="2026-10-21-restore", title="Restore", issues=[item], edits=[])
+    preview = order.publish(restore, case.root, case.config, case.tracker, repo="owner/repo", git=case.git,
+                            approve=True, dry_run=True)
+    assert preview.affected == {2: [FILE], 3: [FILE]}
+    blob_b = case.git.blob_sha("origin/main", FILE)
+    with pytest.raises(order.PlanError, match=f"#2: {FILE}"):
+        order.publish(restore, case.root, case.config, case.tracker, repo="owner/repo", git=case.git, approve=True)
+    assert case.git.blob_sha("origin/main", FILE) == blob_b
+    tick(case.ctx)
+    for number in (2, 3):
+        assert case.store.load_approval(number).acceptance_blobs[FILE] == blob_b
+        assert case.store.load_flag(number) is None
