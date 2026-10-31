@@ -365,3 +365,63 @@ def test_tracker_exception_after_push_still_cleans_up_and_finishes(run_case, mon
     assert run_issue(1, c.ctx) == "error"
     assert "PR creation unavailable" in c.store.log_path(1).read_text()
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+
+
+def _junit(path, cases):
+    body = "".join(f'<testcase file="tests/test_a.py" classname="tests.test_a" name="{name}">{inner}</testcase>'
+                   for name, inner in cases)
+    path.write_text(f"<testsuites><testsuite>{body}</testsuite></testsuites>", encoding="utf-8")
+    return path
+
+
+def test_related_base_comparison_exempts_only_nodes_that_fail_on_base(tmp_path):
+    from foragent.run_checks import junit_failing_ids, split_base_failures
+
+    head = junit_failing_ids(_junit(tmp_path / "head.xml", [
+        ("test_old", "<failure/>"), ("test_regressed", "<error/>"), ("test_new", "<failure/>"), ("test_ok", "")]), 1)
+    assert head == {"tests/test_a.py::test_old", "tests/test_a.py::test_regressed", "tests/test_a.py::test_new"}
+    base = junit_failing_ids(_junit(tmp_path / "base.xml", [("test_old", "<failure/>"), ("test_regressed", "")]), 1)
+    exempt, blocking = split_base_failures(head, base)
+    assert exempt == {"tests/test_a.py::test_old"}
+    assert blocking == {"tests/test_a.py::test_regressed", "tests/test_a.py::test_new"}
+    # An unmeasured base proves nothing.
+    assert split_base_failures(head, None) == (frozenset(), head)
+
+
+@pytest.mark.parametrize("exit_code, cases", [
+    (2, [("test_old", "<failure/>")]),  # interrupted or collection error
+    (1, [("test_ok", "")]),  # exit 1 that no test case explains
+    (None, [("test_old", "<failure/>")]),  # timed out
+])
+def test_related_failures_are_unmeasured_unless_the_report_explains_the_exit(tmp_path, exit_code, cases):
+    from foragent.run_checks import junit_failing_ids
+
+    assert junit_failing_ids(_junit(tmp_path / "r.xml", cases), exit_code) is None
+    assert junit_failing_ids(tmp_path / "missing.xml", 1) is None
+
+
+def test_related_base_run_imports_base_sources_not_the_head_installation(git_history, tmp_path, monkeypatch):
+    """A head regression in a source module must not fail on base too through the head's import path."""
+    from acceptance.test_acceptance_baseline import make_case
+
+    git_history.update({
+        "src/relmod.py": "VALUE = 1\n",
+        "tests/test_relmod.py": "import relmod\n\ndef test_old():\n    assert False\n\n"
+                                "def test_value():\n    assert relmod.VALUE == 1\n",
+    })
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
+    case = make_case(git_history, tmp_path, monkeypatch, test_command=f"{sys.executable} -m pytest -q",
+                     max_retries=0, runner_unit_tests="all")
+
+    def regress(kwargs):
+        case.implement(kwargs)
+        # Stands in for the head's editable installation: the head sources are on every import path.
+        monkeypatch.setenv("PYTHONPATH", str(kwargs["worktree"] / "src"))
+        (kwargs["worktree"] / "src/relmod.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    case.implementer.steps = [regress]
+    assert run_issue(1, case.ctx) != "merged"
+    log = case.store.log_path(1).read_text(encoding="utf-8")
+    assert "Related base comparison: base_failing=['tests/test_relmod.py::test_old'] " \
+           "blocking=['tests/test_relmod.py::test_value']" in log

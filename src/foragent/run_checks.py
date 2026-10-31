@@ -21,7 +21,7 @@ import yaml
 from foragent import capacity, cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
 from foragent.records import load_record
@@ -225,25 +225,93 @@ def _junit_file_seconds(report: Path) -> dict[str, float]:
 
 def _record_related_check(
     n: int, ctx: RunContext, changed: int, selected: list[str], report: Path, result: CheckResult,
+    base: dict | None = None,
 ) -> None:
     """Append this related-unit-test check to the run, before a timeout ends it."""
     check = {"changed_file_count": changed, "selected_files": sorted(selected),
              "file_seconds": _junit_file_seconds(report),
              "total_seconds": result.seconds if result.seconds is not None else 0,
-             "timed_out": bool(result.timed_out)}
+             "timed_out": bool(result.timed_out), **(base or {})}
     report.unlink(missing_ok=True)
     run = ctx.store.get_run(n)
     if run is not None:
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
 
 
+def junit_failing_ids(report: Path, exit_code: int | None) -> frozenset[str] | None:
+    """Failing node ids of a pytest run that the report fully explains, else None.
+
+    Only an exit of 0 or 1 whose report names every failing node counts: a
+    collection or session failure, a timeout or an unreadable report is unmeasured.
+    """
+    if exit_code not in (0, 1):
+        return None
+    try:
+        tree = ET.parse(report)
+    except (OSError, ET.ParseError):
+        return None
+    if tree.find(".//error[@message='collection failure']") is not None:
+        return None
+    failing = set()
+    for case in tree.iter("testcase"):
+        node_id = junit_node_id(case)
+        if node_id is None:
+            return None
+        if any(case.find(tag) is not None for tag in ("failure", "error")):
+            failing.add(node_id)
+    # Exit 1 without a reported failure is a session failure.
+    return frozenset(failing) if bool(failing) == (exit_code == 1) else None
+
+
+def split_base_failures(head: frozenset[str], base: frozenset[str] | None) -> tuple[frozenset[str], frozenset[str]]:
+    """(exempt, blocking): a head failure is exempt only when the same node failed on base."""
+    exempt = head & base if base is not None else frozenset()
+    return exempt, head - exempt
+
+
+def _related_base_failures(
+    n: int, ctx: RunContext, worktree: Path, unit_command: str, failing: frozenset[str], base_sha: str, limit: int,
+) -> frozenset[str] | None:
+    """Run the files holding head failures on a fresh base checkout; None when unmeasured."""
+    import tempfile
+    from foragent import runner
+    from foragent.run_baseline import _with_python_path
+
+    report = ctx.store.root / "runs" / f"issue-{n}-related-base.xml"
+    report.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="foragent-related-base-") as directory:
+        checkout = Path(directory) / "worktree"
+        ctx.git.add_detached_worktree(checkout, base_sha)
+        try:
+            # Whole files: a node id that exists only on head would stop pytest before it runs anything.
+            files = sorted(name for name in {node.split("::", 1)[0] for node in failing}
+                           if (checkout / name).is_file())
+            if not files:
+                return frozenset()
+            junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+            # The base sources must win over the head's editable installation (or an inherited
+            # PYTHONPATH): otherwise a head regression would fail on "base" too and be exempted.
+            roots = os.pathsep.join(str(root) for root in (checkout / "src", checkout) if root.is_dir())
+            command = _with_python_path(f"{unit_command} {junit} {shlex.join(files)}", roots)
+            result = runner._check(command, checkout, ctx.store.log_path(n),
+                                   limit, progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                                   clock=ctx.monotonic, full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            return None if result.timed_out else junit_failing_ids(report, result.exit_code)
+        finally:
+            report.unlink(missing_ok=True)
+            ctx.git.remove_worktree(checkout)
+
+
 def run_related_check(
     n: int, ctx: RunContext, worktree: Path, unit_command: str, unit_tests: list[str], changed: int, limit: int,
+    base_ref: str | None = None,
 ) -> CheckResult:
     """Run the selected related unit tests with their own JUnit report and record the check.
 
     Every verification path that runs related tests (implementation, review-only CI
-    checks) goes through here, so each check lands in Run.related_tests.
+    checks) goes through here, so each check lands in Run.related_tests. A failing
+    node that also fails on the compared base (the merge base with `base_ref`) is
+    reported without failing the check; any other failure keeps the check failing.
     """
     from foragent import runner
 
@@ -255,7 +323,25 @@ def run_related_check(
     result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                            full_text_dir=cuts.issue_dir(ctx.store.root, n))
-    _record_related_check(n, ctx, changed, unit_tests, report, result)
+    base: dict | None = None
+    failing = None if result.timed_out else junit_failing_ids(report, result.exit_code)
+    base_sha = None
+    if failing and base_ref:
+        try:
+            base_sha = ctx.git.at(worktree)._own_base(base_ref)
+        except GitError:
+            base_sha = None  # an unknown base proves no failure on it
+    if failing and base_sha:
+        exempt, blocking = split_base_failures(
+            failing, _related_base_failures(n, ctx, worktree, unit_command, failing, base_sha, limit))
+        base = {"base_sha": base_sha, "base_failing": sorted(exempt)}
+        _append(ctx.store.log_path(n),
+                f"Related base comparison: base_failing={sorted(exempt)} blocking={sorted(blocking)}")
+        if not blocking:
+            result = CheckResult(result.command, 0, False,
+                                 f"{result.output}\nFailing on base {base_sha} too, not blocking: "
+                                 + ", ".join(sorted(exempt)), result.seconds)
+    _record_related_check(n, ctx, changed, unit_tests, report, result, base)
     _progress(n, ctx)
     return result
 
@@ -514,7 +600,8 @@ def _verify_contents(attempt: Implementation) -> str:
                 attempt.checks.append(local_units)
         if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
-            result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
+            result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit,
+                                       f"origin/{attempt.target_branch}")
             attempt.checks.append(result)
             if result.timed_out:
                 # Keep every failure gathered so far, not only the timeout, for the next attempt.
