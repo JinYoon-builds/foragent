@@ -193,7 +193,8 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     else:
         path.unlink(missing_ok=True)
     # The next implementer receives the keep-work/defect-class default before any hint.
-    ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
+    # The time, written before `ready`, authorizes one restart after auth-failed (#1208).
+    ctx.store._atomic_write(retry_marker(ctx.store.root, n), f"retry {ctx.now().isoformat()}\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.

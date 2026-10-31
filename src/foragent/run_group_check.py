@@ -171,6 +171,8 @@ def check(
                 finally:
                     ctx.git.remove_worktree(worktree)
     except (GitError, AttemptFailure, OSError) as exc:
+        if getattr(exc, "is_auth_failure", False):
+            raise  # A refused credential is no check result; the run ends auth-failed (#1208).
         # An unreadable result is an infrastructure fault, never a pass.
         error = str(exc).strip() or type(exc).__name__
     verdict, reason = judge(error, baseline, results)

@@ -96,7 +96,7 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
     try:
         ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=body)
     except run_publish.TrackerError as exc:
-        if exc.is_rate_limit:
+        if exc.is_unavailable:
             raise
         attempt.pr_title = None  # unknown: the merge retitles before squashing
         run_publish._append(attempt.log, f"PR #{pr} retitle failed; retitling again at merge: {exc}")
@@ -108,7 +108,7 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
                 ctx.tracker.update_pr(pr, base=attempt.target_branch, title=current.title, body=body)
                 attempt.pr_title = current.title
         except run_publish.TrackerError as retry:
-            if retry.is_rate_limit:
+            if retry.is_unavailable:
                 raise
             run_publish._append(attempt.log, f"PR #{pr} refresh under its current title failed: {retry}")
     else:

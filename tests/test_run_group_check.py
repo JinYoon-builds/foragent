@@ -92,3 +92,36 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(tmp_pat
     group.check(5, ctx, place, "h5", "main-sha", done)  # once per (main, heads)
     assert captured == [(5, "pytest -q", "main-sha")]
     assert ran == ["echo member-5", "echo member-1", "pytest -q tests/acceptance/test_a.py::t"]
+
+
+def test_refused_credential_while_combining_ends_the_run_but_other_git_errors_are_a_failed_check(tmp_path, monkeypatch):
+    """#1208: a group fetch refused by the credential is no check result."""
+    from contextlib import nullcontext
+
+    import pytest
+
+    from foragent import ci_mode, run_baseline, run_implementation
+    from foragent.git import GitError
+    from foragent.run_baseline import AcceptanceBaseline
+
+    ctx = make_ctx(tmp_path, (5, 1))
+    ctx.config = replace(ctx.config, test_command="pytest -q")
+    ctx.repo_root = tmp_path
+    monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
+    monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
+    monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda *a: AcceptanceBaseline("pytest -q", ()))
+    monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
+    ctx.git = SimpleNamespace(add_detached_worktree=lambda path, ref: None, remove_worktree=lambda path: None,
+                              _call=lambda args: "")
+    place = turn.seat(ctx, 5, "main")
+    message = ["git@github.com: Permission denied (publickey)."]
+
+    def combine(git, base, members):
+        raise GitError(message[0])
+    monkeypatch.setattr(group, "_combine", combine)
+    with pytest.raises(GitError):
+        group.check(5, ctx, place, "h5", "main-sha", set())
+    message[0] = "fatal: merge-tree conflict"
+    group.check(5, ctx, place, "h5", "other-sha", set())
+    log = ctx.store.log_path(5).read_text()
+    assert "group check void" in log and "merge-tree conflict" in log and "publickey" not in log

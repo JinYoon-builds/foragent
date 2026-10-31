@@ -170,24 +170,24 @@ def _publish_reviewed_in_turn(
                     ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
-                    if exc.is_rate_limit:
+                    if exc.is_unavailable:
                         raise
                     if ctx.tracker.pr_head_sha(pr.number) != head:
                         inputs.stop = lambda: run_publish._hold_changed_head(n, ctx, link)
                     else:
                         failed_merge = exc
                 else:
-                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
-                        runner.after_merge(ctx, pr.number, pr.base)
+                        run_publish.run_auth_failed.record_after(n, ctx, runner.after_merge(ctx, pr.number, pr.base))
                     try:
                         if pr.base == batch_branch:
                             ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
                         else:
                             ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
-                        if exc.is_rate_limit:
+                        if exc.is_unavailable:
                             raise
                         if ctx.tracker.current_issue(n).state != "closed":
                             raise
@@ -196,7 +196,7 @@ def _publish_reviewed_in_turn(
                         try:
                             run_publish._batch_pr(parent, ctx)
                         except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+                            if getattr(exc, "is_auth_failure", False) or isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
                                 raise
                             run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"

@@ -1430,3 +1430,32 @@ def test_github_binary_download_preserves_bytes_and_text_errors(monkeypatch):
         tracker._call(['api', 'missing'])
     assert exc.value.stdout == 'body'
     assert all(not kwargs.get('text') for _, kwargs in calls)
+
+
+@pytest.mark.parametrize('read', ['reports', 'default-branch'])
+def test_ci_evidence_authentication_failure_ends_the_run_instead_of_holding(tmp_path, monkeypatch, read):
+    """#1208: a refused credential is not missing evidence; it propagates to the auth-failed outcome."""
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.tracker import TrackerError
+
+    def refuse(*args):
+        raise TrackerError('gh: Bad credentials (HTTP 401)')
+    flags = []
+    ctx = SimpleNamespace(
+        repo='owner/repo', repo_root=tmp_path, config=Config(checks='ci', test_command='pytest'),
+        now=lambda: BASE_TIME, sleep=lambda seconds: None,
+        tracker=SimpleNamespace(pr_default_branch=refuse if read == 'default-branch' else lambda: 'main',
+                                pr_acceptance_reports=refuse if read == 'reports' else lambda pr: []),
+        store=SimpleNamespace(update_run=lambda n, **kwargs: None),
+    )
+    attempt = SimpleNamespace(
+        n=1, ctx=ctx, worktree=tmp_path, target_branch='main', log=tmp_path / 'log',
+        git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''),
+    )
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
+    monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
+    with pytest.raises(TrackerError) as raised:
+        ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+    assert raised.value.is_auth_failure and flags == []

@@ -265,3 +265,30 @@ def test_local_fallback_guards_the_commit_it_measures(case, monkeypatch):
         ci_local.fallback_comparison(attempt, case.base)
     assert held == [["tests/conftest.py"]]
     assert measured == [], "nothing is measured on a held commit"
+
+
+def test_held_publication_with_a_refused_credential_ends_the_run_instead_of_holding(tmp_path, monkeypatch):
+    """#1208: a push refused by the credential propagates; other push failures still hold for a person."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from foragent import harness_guard, run_publish
+    from foragent.git import GitError
+
+    flags, message = [], ["git@github.com: Permission denied (publickey)."]
+
+    def push(attempt):
+        raise GitError(message[0])
+    monkeypatch.setattr(run_publish, "commit_exclusions", lambda attempt, title: None)
+    monkeypatch.setattr(run_publish, "_push_branch", push)
+    monkeypatch.setattr(run_publish, "flag", lambda *args, **kwargs: flags.append(args))
+    ctx = SimpleNamespace(tracker=SimpleNamespace(get_issue=lambda n: SimpleNamespace(title="T")),
+                          config=SimpleNamespace(language="en"), repo="o/r")
+    attempt = SimpleNamespace(n=1, ctx=ctx, failure="held paths")
+    with pytest.raises(GitError):
+        harness_guard.publish_hold(attempt)
+    assert flags == []
+    message[0] = "fatal: the remote end hung up unexpectedly"
+    assert harness_guard.publish_hold(attempt) == "held"
+    assert len(flags) == 1

@@ -174,7 +174,7 @@ def retitle_for_merge(
         try:
             ctx.tracker.update_pr(pr, base=base, title=title, body=body())
         except run_publish.TrackerError as exc:
-            if exc.is_rate_limit:
+            if exc.is_unavailable:
                 raise
             note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
             return {"subject": title}

@@ -72,6 +72,10 @@ def _check_prerequisites(
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
         scheduler.board.sync_status(ctx, issue, "Done")
         return False
+    from foragent import run_auth_failed
+
+    if run_auth_failed.held(ctx.store, issue.number, approval.approved_at):  # #1208: `fa orch retry` decides
+        return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None
         and (latest_run is None or latest_run.outcome != "limit-wait")

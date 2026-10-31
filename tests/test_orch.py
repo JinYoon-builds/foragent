@@ -667,3 +667,18 @@ def test_review_done_when_that_commits_a_harness_change_holds(review_case, last)
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == []
+
+
+def test_orch_retry_authorizes_one_restart_after_auth_failed(run_case):
+    """#1208: `fa orch retry` records its time before `ready`; only a request after the run's start releases it."""
+    from foragent import run_auth_failed
+
+    c = run_case
+    c.store.update_run(1, outcome="auth-failed")
+    c.store.finish_run(1, outcome="auth-failed", detail="authentication failed after 3 attempts: x")
+    approved_at = c.store.load_approval(1).approved_at
+    assert run_auth_failed.held(c.store, 1, approved_at)
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    orch.retry(c.ctx, 1)
+    assert not run_auth_failed.held(c.store, 1, approved_at)

@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, run_auth_failed
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -265,9 +265,13 @@ def _implement_and_publish(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         raise
-    except TrackerError as exc:
-        attempt.tracker_available = False
-        outcome = "limit-wait" if exc.is_rate_limit else "error"
+    except (TrackerError, GitError) as exc:
+        if run_auth_failed.is_auth_failure(exc):
+            # The same credential would refuse a WIP push too; keep the WIP on the local branch.
+            attempt.tracker_available, outcome = False, run_auth_failed.outcome(ctx, n)
+        elif isinstance(exc, TrackerError):
+            attempt.tracker_available = False
+            outcome = "limit-wait" if exc.is_rate_limit else "error"
         raise
     except (SystemExit, KeyboardInterrupt):
         outcome = "killed"
@@ -304,7 +308,7 @@ def review_only(
     outcome = "error"
     detail = ""
     previous = ctx.store.get_run(n)
-    started = False
+    started = auth_ended = False
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -341,14 +345,18 @@ def review_only(
         detail = str(exc)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
+        labeled = started  # `running` is added right after the record starts
         if not started:
-            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+            # A refused credential before the start still leaves a record, a reason and an event.
+            if not (isinstance(exc, TrackerError) and exc.is_rate_limit or run_auth_failed.is_auth_failure(exc)):
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+        if run_auth_failed.is_auth_failure(exc):
+            (outcome, detail), auth_ended = run_auth_failed.finish(n, ctx, exc, RUNNING if labeled else None), True
+        elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
@@ -363,19 +371,23 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    # An exhausted credential already dropped its label; `fa orch retry` decides.
+                    if outcome != "limit-wait" and not auth_ended:
                         current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
                 except TrackerError as exc:
-                    if not wait_for_rate_limit(n, ctx, exc):
+                    if run_auth_failed.is_auth_failure(exc):  # its reason is kept, not raised past the record
+                        outcome, detail = run_auth_failed.finish(n, ctx, exc, None)
+                    elif not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    detail = str(exc) or type(exc).__name__
-                    outcome = "limit-wait"
+                    else:
+                        detail = str(exc) or type(exc).__name__
+                        outcome = "limit-wait"
                 finally:
                     try:
-                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                        ctx.store.finish_run(n, outcome=outcome, detail=detail or run_auth_failed.recorded_detail(ctx, n))
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
@@ -416,7 +428,9 @@ def run_issue(n: int, ctx: RunContext) -> str:
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+        if run_auth_failed.is_auth_failure(exc):
+            outcome, detail = run_auth_failed.finish(n, ctx, exc, RUNNING)
+        elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
@@ -437,7 +451,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
+                ctx.store.finish_run(n, outcome=run.outcome or outcome,
+                                     detail=detail or run_auth_failed.recorded_detail(ctx, n))
         finally:
             kick_tick(ctx.repo_root)
     return outcome
