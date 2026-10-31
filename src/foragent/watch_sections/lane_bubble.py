@@ -178,29 +178,39 @@ def _summary_rows(sentences: list[tuple[str, str, str]], width: int, mark: str) 
     return _clip(rows, width, mark)
 
 
-def _clip(rows: list[Line], width: int, mark: str) -> list[Line]:
-    if len(rows) <= BODY_ROWS:
+def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> list[Line]:
+    """At most ``limit`` rows; when any were left out the last kept row ends in the mark."""
+    if len(rows) <= limit:
         return rows
+    if limit <= 0:
+        return []
     from foragent import watch
 
-    last = rows[BODY_ROWS - 1]
+    last = rows[limit - 1]
     text = watch._clean("".join(value for value, _ in last))
     style = last[0][1] if last else ""
-    # The sixth row always ends in the mark: something was left out, even when it was full.
+    # The last row always ends in the mark: something was left out, even when it was full.
     room = max(0, width - watch._cells(mark))
     kept = "".join(part for part, _ in watch._fit([(text, "")], room)).rstrip()
-    return rows[:BODY_ROWS - 1] + [[(kept + mark, style)]]
+    return rows[:limit - 1] + [[(kept + mark, style)]]
 
 
 def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
-    """Each logical row of an explanation wrapped by cells, within six rows."""
+    """Each logical row of an explanation wrapped by cells, within six rows.
+
+    A row may wrap only into rows no later logical row needs: every one of up to six
+    logical rows keeps at least one row, so long metadata (a lane with many paths, a long
+    lane name) is cut with the mark instead of pushing out the step, its time or a warning.
+    """
     from foragent import watch
 
     rows: list[Line] = []
-    for line in found:
+    for index, line in enumerate(found):
         text = "".join(value for value, _ in line)
         style = next((style for value, style in line if value.strip()), "")
-        rows += watch._wrap(text, width, style) if text.strip() else [[]]
+        wrapped = watch._wrap(text, width, style) if text.strip() else [[]]
+        later = len(found) - index - 1
+        rows += _clip(wrapped, width, mark, max(1, BODY_ROWS - len(rows) - later))
     return _clip(rows, width, mark)
 
 

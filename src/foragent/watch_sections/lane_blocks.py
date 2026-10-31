@@ -67,16 +67,20 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool) -
     return sideways_acorn(item["number"], word, style, tick=tick, ascii=ascii_glyphs)
 
 
-def _flow(units: list[tuple[Line, int, int, int]], width: int, rows: int, prefix: Line, mark: str,
+def _flow(units: list[tuple[Line, str, int]], width: int, rows: int, prefix: Line, mark: str,
           per_row: int | None = None) -> tuple[list[Line], list[tuple[int, int, int, int]]]:
     """Acorns two spaces apart over at most ``rows`` rows, then …N for every one left out.
 
-    ``units`` are (spans, acorn cells, all cells, number); a continuation row is indented
-    by the prefix. Returns the rows and each placed acorn as (row, x0, x1, number).
+    ``units`` are (acorn spans, warning text or '', number); a continuation row is indented
+    by the prefix. Every acorn, the first on a row too, keeps to the row's room, and the
+    last row always keeps room for the omitted count: a warning that does not fit is cut,
+    then dropped, and an acorn that cannot stand beside the count is counted instead.
+    Returns the rows and each placed acorn as (row, x0, x1, number).
     """
     from foragent import watch
 
-    indent = sum(watch._cells(value) for value, _ in prefix)
+    cells = lambda line: sum(watch._cells(value) for value, _ in line)
+    indent = cells(prefix)
     room = max(1, width - indent)
     lines: list[Line] = []
     placed: list[tuple[int, int, int, int]] = []
@@ -85,24 +89,36 @@ def _flow(units: list[tuple[Line, int, int, int]], width: int, rows: int, prefix
         last = len(lines) == rows - 1
         line: Line = list(prefix) if not lines else ([(" " * indent, "")] if indent else [])
         used = count = 0
-        while index < total:
-            spans, acorn_cells, cells, number = units[index]
+        while index < total and not (per_row and count >= per_row):
+            acorn, warning, number = units[index]
             gap = 2 if count else 0
             rest = total - index - 1
             # The last row keeps room for the count of what follows.
             reserve = 2 + watch._cells(f"{mark}{rest}") if last and rest else 0
-            if count and (used + gap + cells + reserve > room or (per_row and count >= per_row)):
-                break
+            free = room - used - gap - reserve
+            size = cells(acorn)
+            if size > free and (count or (last and rest)):
+                break  # Next row, or (on the last row) counted in …N.
+            extra: Line = []
+            if warning:
+                text = " " + warning
+                spare = free - size
+                if watch._cells(text) <= spare:
+                    extra = [(text, "yellow")]
+                elif count:
+                    break  # The whole unit moves to the next row, where it is first.
+                elif spare > watch._cells(mark) + 1:
+                    extra = [(_cut(text, spare, mark), "yellow")]
             if gap:
                 line.append(("  ", ""))
-            placed.append((len(lines), indent + used + gap, indent + used + gap + acorn_cells, number))
-            line += spans
-            used += gap + cells
+            placed.append((len(lines), indent + used + gap, indent + used + gap + size, number))
+            line += acorn + extra
+            used += gap + size + cells(extra)
             count += 1
             index += 1
         lines.append(line)
     if index < total:
-        lines[-1] += [("  ", ""), (f"{mark}{total - index}", "dim")]
+        lines[-1] += ([("  ", "")] if count else []) + [(f"{mark}{total - index}", "dim")]
     return lines, placed
 
 
@@ -152,17 +168,11 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     hits: list[Hit] = []
     marks: list[tuple[int, int]] = []
 
-    def units(items: list[dict[str, Any]], warnings: bool) -> list[tuple[Line, int, int, int]]:
-        found = []
-        for item in items:
-            spans = _acorn(item, language, acorn_tick, ascii_glyphs)
-            acorn_cells = sum(watch._cells(value) for value, _ in spans)
-            # A worker warning stands right beside its acorn (blocks.08).
-            warning = watch_scene.activity_warning(snapshot, config, row, item, now) if warnings else ""
-            if warning:
-                spans = [*spans, (" " + warning, "yellow")]
-            found.append((spans, acorn_cells, sum(watch._cells(value) for value, _ in spans), item["number"]))
-        return found
+    def units(items: list[dict[str, Any]], warnings: bool) -> list[tuple[Line, str, int]]:
+        # A worker warning stands right beside its acorn (blocks.08).
+        return [(_acorn(item, language, acorn_tick, ascii_glyphs),
+                 watch_scene.activity_warning(snapshot, config, row, item, now) if warnings else "",
+                 item["number"]) for item in items]
 
     def place(flowed: tuple[list[Line], list[tuple[int, int, int, int]]]) -> None:
         rows, placed = flowed

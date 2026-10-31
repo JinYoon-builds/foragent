@@ -65,29 +65,39 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     titles = {item["number"]: item.get("title") for key in ("running", "queued", "held")
               for item in row.get(key) or () if isinstance(item, dict) and "number" in item}
     current: list[dict[str, Any]] = []
-    seen: set[int] = set()
+    seen: dict[int, dict[str, Any]] = {}
 
     def add(target: list[dict[str, Any]], number: int, state: str, phase: str | None,
             run: dict[str, Any] | None) -> None:
         if number in seen:
+            # One acorn per issue, but question evidence from any listing still counts.
+            entry = seen[number]
+            if state == "waiting-human" and entry["state"] != "waiting-human":
+                entry["state"] = state
+                entry["class"] = acorn_class(snapshot, row, number, state, entry["phase"], needs)
             return
-        seen.add(number)
         title = titles.get(number) or snapshot.titles.get(number) or (
             row.get("title") if number == row.get("issue") else "") or ""
-        target.append({"number": number, "title": title, "state": state, "phase": phase, "run": run,
-                       "class": acorn_class(snapshot, row, number, state, phase, needs)})
+        entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
+                 "class": acorn_class(snapshot, row, number, state, phase, needs)}
+        seen[number] = entry
+        target.append(entry)
 
-    def worker(number: int, run: dict[str, Any] | None) -> None:
+    def worker(number: int, run: dict[str, Any] | None, listed: str | None = None) -> None:
         own = number == row.get("issue")
         state = snapshot.worker_states.get(number) or (row.get("state") if own else "working") or "working"
+        if listed == "waiting-human":
+            state = listed  # The listing's own question wins over any other state.
         phase = (run or {}).get("phase") or (row.get("phase") if own else None)
         add(current, number, state, phase, run)
 
     # Running runs first, in start order (ties by issue number), then any other running issue.
+    listed = {item["number"]: item.get("state") for item in row.get("running") or ()
+              if isinstance(item, dict) and isinstance(item.get("state"), str)}
     for number, run in runs.items():
-        worker(number, run)
+        worker(number, run, listed.get(number))
     for item in row.get("running") or ():
-        worker(item["number"], runs.get(item["number"]))
+        worker(item["number"], runs.get(item["number"]), listed.get(item["number"]))
     for item in row.get("held") or ():
         number, state = item["number"], item.get("state") or "blocked"
         phase = item.get("phase") or (snapshot.run_phases.get(number) if state == "working" else None)
@@ -100,7 +110,9 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         add(current, number, state, phase, None)
     upcoming: list[dict[str, Any]] = []
     for item in row.get("queued") or ():
-        add(upcoming, item["number"], "queued", None, None)
+        # A queued item keeps a recorded question; any other state of the queue is next.
+        add(upcoming, item["number"], "waiting-human" if item.get("state") == "waiting-human" else "queued",
+            None, None)
     return current, upcoming
 
 
@@ -109,7 +121,8 @@ def category(current: list[dict[str, Any]], upcoming: list[dict[str, Any]]) -> s
     classes = {item["class"] for item in current}
     if "working" in classes:
         return "working"
-    if "question" in classes:
+    # A queued issue with a recorded question asks too: its class, not its listing, decides.
+    if "question" in classes or any(item["class"] == "question" for item in upcoming):
         return "question"
     return "waiting" if current or upcoming else "idle"
 
@@ -119,21 +132,23 @@ def representative_wait(row: dict[str, Any], current: list[dict[str, Any]],
     """The issue whose waiting reason the lane shows, or None.
 
     The lane's representative (the row's own issue) in a recorded wait phase or an
-    orchestrator block always has one. A lane with nothing working or asked shows the
-    reason of its first waiting acorn, else of its waiting queue (its own issue first),
-    unless that issue is parked.
+    orchestrator block always has one. A lane with nothing working or asked (in its current
+    or queued acorns) shows the reason of its first waiting acorn, else of its first queued
+    acorn classed next (its own issue first); parked and question acorns wait for no turn.
     """
     waiting = [item["number"] for item in current if item["class"] == "wait"]
     if row.get("issue") in waiting:
         return row["issue"]
-    if any(item["class"] in {"working", "question"} for item in current):
+    if any(item["class"] in {"working", "question"} for item in current + upcoming):
         return None
     if waiting:
         return waiting[0]
-    if not upcoming:
+    # Only acorns classed as next wait their turn; parked and question ones never do.
+    turn = [item for item in upcoming if item["class"] == "next"]
+    if not turn:
         return None
-    chosen = next((item for item in upcoming if item["number"] == row.get("issue")), upcoming[0])
-    return None if chosen["class"] == "parked" else chosen["number"]
+    chosen = next((item for item in turn if item["number"] == row.get("issue")), turn[0])
+    return chosen["number"]
 
 
 def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, language: str) -> str:
