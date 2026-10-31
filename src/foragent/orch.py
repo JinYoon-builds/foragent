@@ -373,7 +373,7 @@ def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: boo
         )
     if baseline is None:
         return []
-    owned = set(baseline.excluded)  # A shared cache may come from a capture with fewer exclusions.
+    owned = set(_baseline_exclusions(ctx, base, log_path))  # Approvals may have changed since capture.
     protected = sorted({node for node in baseline.node_ids if node.split("::", 1)[0] not in owned})
     if not protected:
         return []

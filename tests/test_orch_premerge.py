@@ -608,3 +608,29 @@ def test_same_base_cache_with_wider_exclusions_is_reused(git_history, tmp_path):
     second = orch.premerge(c.ctx, c.pr)
     assert second["ready"] is True and second["failing_on_base"] == [NEIGHBOUR], second
     assert c.log().count("protected baseline base=") == 1, "The same-base cache was reused"
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_current_exclusions_override_the_reused_baseline(git_history, tmp_path, monkeypatch, mode):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES["skipped"]}, mode=mode)
+    first = orch.premerge(c.ctx, c.pr)
+    assert first["broken"] == [KEPT], first  # Warm a baseline with no exclusions.
+    capture = orch._capture_baseline
+
+    def capture_then_approve(*args, **kwargs):
+        baseline = capture(*args, **kwargs)
+        assert baseline is not None and SUITE_FILE not in baseline.excluded
+        assert "cache=hit" in c.log(), "Reuse the existing same-base measurement"
+        # Another issue claims the locked file after capture but before protection is checked.
+        # In CI mode the baseline is passed in; in full-suite mode the helper captures it.
+        c.ctx.store.save_approval(5, body="pending", body_sha="body",
+                                  acceptance_blobs={SUITE_FILE: "blob"}, approved_by="human",
+                                  approved_at=BASE_TIME.isoformat())
+        return baseline
+
+    monkeypatch.setattr(orch, "_capture_baseline", capture_then_approve)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True and report["broken"] == [], report
+    monkeypatch.setattr(orch, "_capture_baseline", capture)
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
