@@ -5,8 +5,8 @@ The queue is local control state in the repository's ignored ``.foragent/order-b
 A boundary is a name the person or agent chooses (for example ``next-code-merge``);
 ``flush`` publishes everything waiting for it in one commit and push, then runs each
 order's normal tracker publication. Every order keeps its own approval and preread
-requirements. An interrupted flush is finished or undone from its journal's recorded
-commit (``order_batch_journal``); issues are found again by their existing markers.
+requirements. A batch commit is never undone: an interrupted flush finishes the one pending
+batch before anything new (``order_batch_flush``); issues are found again by their markers.
 """
 
 import hashlib
@@ -15,22 +15,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from foragent import order
-from foragent import order_batch_journal as journal
 from foragent.config import Config
-from foragent.git import GitError
 from foragent.i18n import text
-from foragent.order_batch_journal import _directory, _lock
-from foragent.order_batch_notes import COMMITTED, NOTE_FILES, _note_files, _write_notes
-from foragent.order_batch_queue import (
-    PUBLISHED,
-    WAITING,
-    _committed,
-    _load,
-    _mark,
-    _revalidate,
-    _update,
-)
-from foragent.order_files import check_destinations
+from foragent.order_batch_notes import NOTE_FILES
+from foragent.order_batch_queue import PUBLISHED, WAITING, _load, _update
 
 
 def _now() -> str:
@@ -122,124 +110,20 @@ def pending(root: Path) -> dict:
     state = _load(root)
     keys = ("id", "revision", "title", "boundary", "status", "approve", "approve_keys", "approve_numbers",
             "queued_at", "published_at", "parent")
+    batch = state["batch"]
     return {"orders": [{key: row[key] for key in keys if key in row} for row in state["orders"]],
-            "notes": [dict(row) for row in state["notes"]]}
-
-
-def _settle(root: Path, git, language: str) -> bool:
-    """Undo or finish a flush that stopped mid-write; True when there was one."""
-    directory = _directory(root)
-    if not (directory / journal.JOURNAL_FILE).exists():
-        return False
-    # A flush of any boundary that stopped mid-write is settled before anything reads files.
-    with git.publish_lock():
-        journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), language)
-    return True
-
-
-def recover(root: Path, git, language: str = "en") -> bool:
-    """Settle an interrupted flush using only the repository, Git and the journal.
-
-    It reads no configuration, because the interrupted write may have damaged
-    .foragent.yml; callers run it before loading configuration for a flush.
-    """
-    with _lock(root, "order-batch-flush.lock"):
-        settled = _settle(root, git, language)
-        _revalidate(root, git)
-        return settled
-
-
-def _require_base(git, config: Config) -> None:
-    if git.current_branch() != config.base_branch:
-        raise GitError(f"order flush must run on the base branch {config.base_branch!r}")
+            "notes": [dict(row) for row in state["notes"]],
+            # The one pending batch: committed (with its sha) or still to commit, not yet published.
+            "batch": None if batch is None else {
+                "id": batch["id"], "boundary": batch["boundary"], "commit": batch.get("commit"),
+                "pushed": batch.get("pushed", False), "status": "committed" if batch.get("commit") else "writing",
+                "paths": sorted(batch["contents"]), "orders": sorted(batch["orders"]), "notes": batch["notes"]}}
 
 
 def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git) -> dict:
-    """Publish what waits for ``boundary``: one commit and push, then each order's issues.
+    """Publish what waits for ``boundary`` in one commit and push (``order_batch_flush``)."""
+    from foragent import order_batch_flush
 
-    Status moves waiting -> committed (the local commit exists) -> published. Before
-    writing, the flush journals every path it will write; recovery finishes or undoes an
-    interrupted flush from the commit shas it recorded (``order_batch_journal``).
-    """
     boundary = _boundary(boundary, config.language)
-    with _lock(root, "order-batch-flush.lock"):
-        directory = _directory(root)
-        _settle(root, git, config.language)
-        _revalidate(root, git)
-        state = _load(root)
-        orders = [row for row in state["orders"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
-        notes = [row for row in state["notes"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
-        if not orders and not notes:
-            return {"boundary": boundary, "orders": [], "notes": [], "parents": {}}
-        prepared = []
-        for entry in orders:
-            if entry["status"] == COMMITTED:
-                continue  # its files are in a local commit; later edits to them must stay
-            # Every order's own checks pass before anything is written for any of them.
-            order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, **_approval(entry))
-            files = order.validate_plan(entry["plan"], root, config)
-            _unchanged_inputs(entry, files, config.language)
-            prepared.append((entry, files))
-        combined: dict[str, str | bytes] = {}
-        for entry, files in prepared:
-            for name, content in files.items():
-                if name in combined and combined[name] != content:
-                    raise order.PlanError(text("batch_path_conflict", config.language, path=name))
-                combined[name] = content
-        _require_base(git, config)
-        with git.publish_lock():
-            git.update_base(config.base_branch)
-            check_destinations(root, combined)
-            applying = [row for row in notes if row["status"] != COMMITTED]
-            if not prepared and not applying:
-                # Only committed work is left: push the recorded commit. Nothing is written,
-                # staged or committed, so unrelated checkout changes stay out.
-                git.push_base(config.base_branch)
-            else:
-                note_contents = _note_files(root, applying, config.language)  # may refuse; nothing written yet
-                planned = {**combined, **note_contents}
-                written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
-                           "notes": [row["id"] for row in applying]}
-                journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha())
-
-                def committed(blobs: dict[str, str]) -> None:
-                    # The commit exists; only now do its order files and notes reach the checkout.
-                    for entry, files in prepared:
-                        order.write_files_now(entry["plan"], root, config, files)
-                    _write_notes(root, note_contents)
-                    # With nothing to commit, HEAD already holds the batch; record it the same way.
-                    journal.batch_done(directory, git.head_sha())
-                    _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
-                    journal.retire(directory, git.head_sha())  # undoable until published
-
-                try:
-                    for entry, files in prepared:
-                        # Destination checks only: no order file is in the checkout before the commit.
-                        order.write_order_files(entry["plan"], root, config, git, files, None, write_files=False)
-                    title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
-                    # Exactly the listed paths, committed from memory: the journal can undo every one.
-                    contents = {name: data.encode("utf-8") if isinstance(data, str) else data
-                                for name, data in planned.items()}
-                    order.commit_and_push(config, git, planned, title, after_commit=committed, contents=contents,
-                                          record=lambda sha: journal.batch_done(directory, sha))
-                except BaseException:
-                    # Undo an uncommitted write now, so waiting work never stays in the checkout.
-                    journal.recover(directory, root, git, lambda *facts: _committed(root, *facts), config.language)
-                    _revalidate(root, git)
-                    raise
-        published = {row["id"] for row in notes}
-        _mark(root, "notes", published, status=PUBLISHED, published_at=_now())
-        parents: dict[str, int | None] = {}
-        for entry in orders:
-            current = next((row for row in _load(root)["orders"] if row.get("revision") == entry["revision"]), None)
-            if current is None or current["status"] != COMMITTED:
-                continue  # replaced while flushing; the newer version waits for its own flush
-            report = order.publish(current["plan"], root, config, tracker, repo=repo, git=git,
-                                   published_blobs=current["blobs"], **_approval(current))
-            parents[entry["id"]] = report.parent
-            _mark(root, "orders", {entry["revision"]}, status=PUBLISHED, published_at=_now(), parent=report.parent)
-        # Published batches need no undo record any more.
-        state = _load(root)
-        journal.forget(directory, {row.get("commit") for kind in ("orders", "notes") for row in state[kind]
-                                   if row["status"] == COMMITTED})
-        return {"boundary": boundary, "orders": list(parents), "notes": sorted(published), "parents": parents}
+    return order_batch_flush.flush(boundary, root, config, tracker, repo=repo, git=git,
+                                   unchanged=_unchanged_inputs)

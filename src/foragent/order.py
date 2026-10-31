@@ -9,9 +9,10 @@ import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
+import sys
 from urllib.parse import quote
 
-from foragent import board, design, order_references, ownership
+from foragent import board, capacity, design, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -21,7 +22,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
-from foragent.order_files import blob_id, check_destinations, check_write, issue_body, validate_paths, write_atomic
+from foragent.order_files import check_destinations, check_write, issue_body, validate_paths, write_atomic
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
@@ -427,11 +428,8 @@ class PublishReport:
 
 
 def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                      manager: SkillManager | None, write_files: bool = True) -> None:
-    """Write this order's own paths (and new lanes) on the refreshed base, without committing them.
-
-    New lanes commit through ``git`` (a batch never has any). With ``write_files`` false only
-    the checks run, and ``write_files_now`` writes once the batch commit exists."""
+                      manager: SkillManager | None) -> None:
+    """Write this order's own paths (and new lanes) on the refreshed base, without committing them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     roots = _own_roots(plan, config, files)
     check_destinations(root, files)
@@ -449,8 +447,7 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
             pending = git.uncommitted_paths(paths)
             if pending:
                 git.commit_paths(pending, f"Foragent lane {lane['name']}")
-    if write_files:
-        write_files_now(plan, root, config, files)
+    write_files_now(plan, root, config, files)
 
 
 def _own_roots(plan: dict, config: Config, files: dict) -> dict[str, str]:
@@ -474,32 +471,16 @@ def write_files_now(plan: dict, root: Path, config: Config, files: dict[str, str
             write_atomic(root, name, data)
 
 
-def commit_and_push(config: Config, git: GitRepo, files: dict, title: str,
-                    after_commit=None, record=None, contents: dict[str, bytes] | None = None) -> dict[str, str]:
-    """Commit the given paths once, confirm HEAD has them all, and push the base.
-
-    Paths in ``contents`` are committed from those bytes (``commit_recorded``), not from
-    the working tree; the others must already be written. ``after_commit`` receives the
-    committed blobs before the push, so a caller can write and record what landed even
-    when the push is interrupted."""
-    contents = contents or {}
-    on_disk = [name for name in files if name not in contents]
-    git.ensure_tracked(on_disk)
-    changed = git.uncommitted_paths(on_disk)
-    if contents:
-        heads = git.blob_shas(git.head_sha(), list(contents))
-        changed += [name for name in contents if heads[name] != blob_id(contents[name])]
-    if changed and record is not None:
-        # ``record`` gets the sha before HEAD moves.
-        git.commit_recorded(changed, title, record, {name: contents[name] for name in changed if name in contents})
-    elif changed:
+def commit_and_push(config: Config, git: GitRepo, files: dict, title: str) -> dict[str, str]:
+    """Commit the given written paths once, confirm HEAD has them all, and push the base."""
+    git.ensure_tracked(list(files))
+    changed = git.uncommitted_paths(list(files))
+    if changed:
         git.commit_paths(changed, title)
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
         raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
-    if after_commit is not None:
-        after_commit(published_blobs)
     # Also retry a previously failed push when the files already match HEAD.
     git.push_base(config.base_branch)
     return published_blobs
@@ -929,19 +910,25 @@ def _preread_lines(message: str) -> list[str]:
     return [line for line in lines if line and line != "NONE"]
 
 
+_TAG = re.compile(r"(?i)^(APPROACH|DECIDE|QUESTION):\s*")
+
+
 def _unknowns(message: str) -> list[str]:
-    """QUESTION lines, and unprefixed lines as before; the lane's APPROACH and DECIDE lines do not block."""
-    unknowns = []
-    for line in _preread_lines(message):
-        if re.match(r"(?i)^(?:APPROACH|DECIDE):", line):
-            continue
-        unknowns.append(re.sub(r"(?i)^QUESTION:\s*", "", line))
-    return unknowns
+    """What blocks approval. Once any line carries a tag, only QUESTION lines do and the
+    unprefixed lines are notes; an all-plain reply keeps every line as an unknown."""
+    lines = _preread_lines(message)
+    if not any(_TAG.match(line) for line in lines):
+        return lines
+    return _tagged(message, "QUESTION")
 
 
 def _tagged(message: str, tag: str) -> list[str]:
-    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
-            if re.match(rf"(?i)^{tag}:", line)]
+    tagged = []
+    for line in _preread_lines(message):
+        match = _TAG.match(line)
+        if match and match.group(1).upper() == tag:
+            tagged.append(line[match.end():])
+    return tagged
 
 
 def _decisions(message: str) -> list[str]:
@@ -1071,6 +1058,10 @@ def preread(plan: dict, root: Path, config: Config,
         raise PlanError(f"{ignore} must be a regular file, not a symlink")
     if not ignore.exists():
         ignore.write_text("*\n", encoding="utf-8")
+    store = _workload_store(root, repo or config.repo)
+    language = (getattr(config, "language", None) or "en").lower().split("-")[0]
+    if len(items) > 1 and _free_slots(store) < 1:
+        print(text("preread_turns_wait", language, count=len(items)), file=sys.stderr, flush=True)
     results = []
     for item in items:
         # Each reader gets its own snapshot directory, never the references' destination.
@@ -1080,9 +1071,18 @@ def preread(plan: dict, root: Path, config: Config,
             log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
             if log.is_symlink():
                 log.unlink()
-            result = executor_for(setup.executor).run(
-                worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
-                log_path=log, read_only=True, **setup.options)
+            admitted = False
+            try:
+                # Each turn is one agent: it holds one shared machine slot only while it runs.
+                with capacity.hold_workload(store, config, kind="preread", role=item["key"]):
+                    admitted = True
+                    result = executor_for(setup.executor).run(
+                        worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+                        log_path=log, read_only=True, **setup.options)
+            except TimeoutError as exc:
+                if admitted:
+                    raise
+                raise PlanError(str(exc)) from exc
         finally:
             order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
@@ -1104,6 +1104,20 @@ def preread(plan: dict, root: Path, config: Config,
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
     return results
+
+
+def _workload_store(root: Path, repo: str | None) -> StateStore:
+    """The state store whose machine slots this planning agent counts in; a repository-less root gets its own."""
+    if not repo:
+        repo = f"local/{root.name}-{hashlib.sha256(str(root.resolve()).encode('utf-8')).hexdigest()[:12]}"
+    store = StateStore.for_repo(repo)
+    store.root.mkdir(parents=True, exist_ok=True)  # The machine scan reads its parent; a first run has none.
+    return store
+
+
+def _free_slots(store: StateStore) -> int:
+    """Machine slots free right now; only for telling the person why a turn may wait."""
+    return capacity.workload_budget(store) - len(capacity.machine_holders(store, datetime.now(UTC), live=True))
 
 
 def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[list[str], list[str]]:

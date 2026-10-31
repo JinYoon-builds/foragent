@@ -31,7 +31,7 @@ def test_escalation_is_only_for_a_product_decision_and_counting_is_by_defect_cla
 
 def test_a_daily_retrospective_finds_lost_run_time_and_repeated_failures():
     text = normalized()
-    assert "once a day" in text and "24 h" in text
+    assert "when an order finishes" in text
     for phrase in ("fa orch facts", "fa orch log", "where run time was lost", "architect"):
         assert phrase in text, phrase
     # Fix what is within the orchestrator's authority, tell the person one line,

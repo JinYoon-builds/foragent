@@ -1,17 +1,41 @@
-"""The local order-batch queue file and its committed checkpoints (D85, #1043)."""
+"""The local order-batch queue file: waiting rows and the one pending batch (D85, #1043).
+
+Everything lives in the repository's ignored ``.foragent/order-batch.json``. ``batch`` is a
+single field, never a list: at most one batch is committed and not yet published.
+"""
 
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
-from foragent import order
-from foragent import order_batch_journal as journal
-from foragent.order_batch_journal import _directory, _lock
-from foragent.order_batch_notes import COMMITTED
+from foragent import order, order_references
+from foragent.order_files import write_atomic
+from foragent.state_locks import _file_lock
 
 QUEUE_FILE = "order-batch.json"
-WAITING, PUBLISHED = "waiting", "published"
+WAITING, COMMITTED, PUBLISHED = "waiting", "committed", "published"
+
+
+def _directory(root: Path) -> Path:
+    """The ignored local control directory; a planted symlink must not redirect it."""
+    directory = order_references.real_directory(root, ".foragent")
+    ignore = directory / ".gitignore"
+    if ignore.is_symlink():
+        raise order.PlanError(f"{ignore} must be a regular file, not a symlink")
+    if not ignore.exists() or ignore.read_bytes() == b"":
+        write_atomic(root, ".foragent/.gitignore", b"*\n")  # never a half-written ignore rule
+    return directory
+
+
+@contextmanager
+def _lock(root: Path, name: str):
+    path = _directory(root) / name
+    if path.is_symlink():
+        raise order.PlanError(f"{path} must be a regular file, not a symlink")
+    with _file_lock(path):
+        yield
 
 
 def _load(root: Path) -> dict:
@@ -23,7 +47,9 @@ def _load(root: Path) -> dict:
     except ValueError as exc:
         raise order.PlanError(f"{path} is not valid JSON") from exc
     value = value if isinstance(value, dict) else {}
-    return {"orders": list(value.get("orders", [])), "notes": list(value.get("notes", []))}
+    batch = value.get("batch")
+    return {"orders": list(value.get("orders", [])), "notes": list(value.get("notes", [])),
+            "batch": batch if isinstance(batch, dict) else None}
 
 
 def _update(root: Path, change) -> dict:
@@ -50,36 +76,12 @@ def _mark(root: Path, kind: str, revisions: set[str], **fields) -> None:
     _update(root, change)
 
 
-def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads: dict[str, str],
-               commit: str) -> None:
-    """Record that the batch commit exists: later runs push and finish, never rewrite."""
-    for revision, names in orders.items():
-        _mark(root, "orders", {revision}, status=COMMITTED, commit=commit,
-              blobs={name: heads[name] for name in names})
-    _mark(root, "notes", set(notes), status=COMMITTED, commit=commit)
-
-
-def _revalidate(root: Path, git) -> None:
-    """A committed checkpoint whose commit left HEAD's history is undone, then waits again.
-
-    Its files go back first (worktree and index, from the commit's undo record), so the
-    retry starts from the checkout the batch began with; the record goes last.
-    """
-    rows = [row for kind in ("orders", "notes") for row in _load(root)[kind] if row["status"] == COMMITTED]
-    commits = {row.get("commit") for row in rows}
-    gone = {commit for commit in commits if not journal.landed(git, commit)}  # the recovery predicate
-    directory = _directory(root)
-    for commit in sorted(gone, key=str):
-        if commit is not None:
-            journal.undo_commit(directory, root, git, commit)
-
+def _set_batch(root: Path, **fields) -> None:
+    """Update (or with ``batch=None`` drop) the one pending batch record."""
     def change(current: dict) -> None:
-        for row in [*current["orders"], *current["notes"]]:
-            if row["status"] == COMMITTED and row.get("commit") in gone:
-                row["status"] = WAITING
-                for field in ("commit", "blobs"):
-                    row.pop(field, None)
+        if "batch" in fields:
+            current["batch"] = fields["batch"]
+        elif current["batch"] is not None:
+            current["batch"].update(fields)
 
-    if gone:
-        _update(root, change)
-    journal.forget(directory, {commit for commit in commits - gone if commit is not None})
+    _update(root, change)

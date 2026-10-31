@@ -366,60 +366,35 @@ class GitRepo:
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 
-    def commit_recorded(self, paths: list[str], title: str, record: Callable[[str], None],
-                        contents: dict[str, bytes] | None = None) -> str | None:
-        """Commit only ``paths`` (like commit_paths), handing the new sha to ``record`` before HEAD moves.
-
-        The commit is built from HEAD plus these paths in a private index, so other staged
-        changes stay out. A path in ``contents`` is committed with those bytes straight from
-        memory, never from the working tree, so nothing of it is in the checkout before the
-        commit exists; the caller writes it afterwards. After ``record`` returns, HEAD moves
-        to the commit only if HEAD has not moved meanwhile, and these paths' index entries
-        are set to the new commit.
-        """
-        contents = contents or {}
-        if not paths:
-            return None  # an empty scope commits nothing and records nothing
-        parent = self.head_sha()
-        git_dir = Path(self._call(["rev-parse", "--git-dir"]).strip())
-        index = (git_dir if git_dir.is_absolute() else self.root / git_dir) / "foragent-batch-index"
-        environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
-
-        def git(*args: str, data: bytes | None = None) -> str:
-            try:
-                return subprocess.run(["git", *args], cwd=self.root, env=environment, check=True,
-                                      capture_output=True, input=data, timeout=120).stdout.decode("utf-8", "replace")
-            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                raise GitError((getattr(exc, "stderr", b"") or b"").decode("utf-8", "replace") or str(exc)) from exc
-
+    def batch_commit(self, message: str, branch: str) -> str | None:
+        """The newest commit since ``origin/<branch>`` whose message contains ``message`` verbatim."""
+        remote = f"refs/remotes/origin/{branch}"
         try:
-            git("read-tree", parent)
-            for path in (path for path in paths if path in contents):
-                blob = git("hash-object", "-w", "--stdin", data=contents[path]).strip()
-                staged = git("--literal-pathspecs", "ls-files", "-s", "--", path).split()
-                mode = staged[0] if staged else "100644"
-                git("update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
-            on_disk = [path for path in paths if path not in contents]
-            present = [path for path in on_disk if (self.root / path).exists()]
-            if present:
-                git("--literal-pathspecs", "add", "-f", "--", *present)
-            if missing := [path for path in on_disk if path not in present]:
-                git("--literal-pathspecs", "rm", "--cached", "-q", "--ignore-unmatch", "--", *missing)
-            tree = git("write-tree").strip()
-        finally:
-            index.unlink(missing_ok=True)
-        identity = []
-        for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
+            self._call(["rev-parse", "--verify", "--quiet", remote])
+            since = [f"{remote}..HEAD"]
+        except GitError:
+            since = ["HEAD"]  # no remote base known yet: look through all of HEAD's history
+        return self._call(["log", "-n", "1", "--format=%H", "--fixed-strings", f"--grep={message}",
+                           *since]).strip() or None
+
+    def rebase_onto_base(self, branch: str) -> bool:
+        """Replay local commits onto a moved ``origin/<branch>``; True when they moved.
+
+        On a conflict the rebase is aborted, so the local commits stay exactly as they were.
+        """
+        self.fetch("origin", branch)
+        remote = f"refs/remotes/origin/{branch}"
+        if self.is_ancestor(remote, "HEAD"):
+            return False
+        try:
+            self._call(["rebase", "--autostash", remote])
+        except GitError as exc:
             try:
-                value = self._call(["config", "--get", key]).strip()
+                self._call(["rebase", "--abort"])
             except GitError:
-                value = ""
-            identity.extend(["-c", f"{key}={value or fallback}"])
-        sha = self._call([*identity, "commit-tree", tree, "-p", parent, "-m", title]).strip()
-        record(sha)
-        self._call(["update-ref", "-m", title.splitlines()[0], "HEAD", sha, parent])
-        self.restore_staged_paths("HEAD", paths)
-        return sha
+                pass
+            raise GitError(f"cannot rebase the unpushed batch onto origin/{branch}: {exc}") from exc
+        return True
 
     def is_ancestor(self, ancestor: str, head: str) -> bool:
         try:

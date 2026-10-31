@@ -12,9 +12,7 @@ MESSAGES = {
         "batch_rule_one_line": "a rule note and its --replace line must each be one non-empty line",
         "batch_rule_line_missing": "{path} has no line {line!r} to replace; check the current rule and queue the rule note again",
         "batch_rules_missing": "{path} does not exist; record the decision only and drop the rule note",
-        "batch_recover_format": "{path} was written by an older Foragent; check the files it lists against the last "
-                                "commit, then delete it and run fa order flush again",
-        "batch_recover_branch": "an interrupted batch was written on {branch}; switch to {branch} and run fa order flush again",
+        "batch_wrong_branch": "fa order flush runs only on the base branch {branch}; nothing was changed",
         "batch_lanes_publish_now": "an order that adds lanes is not batched; publish it now, without --defer",
         "batch_lanes_published_now": "Published now instead of waiting for {boundary}: this order adds lanes, "
                                      "and orders that add lanes are never batched.",
@@ -49,9 +47,7 @@ MESSAGES = {
         "batch_rule_one_line": "규칙 기록과 --replace 줄은 각각 비어 있지 않은 한 줄이어야 해요",
         "batch_rule_line_missing": "{path}에 바꿀 줄 {line!r}이(가) 없어요. 현재 규칙을 확인하고 규칙 기록을 다시 맡겨 주세요",
         "batch_rules_missing": "{path}이(가) 없어요. 결정만 기록하고 규칙 기록은 빼 주세요",
-        "batch_recover_format": "{path}은(는) 예전 Foragent가 썼어요. 적힌 파일을 마지막 커밋과 비교한 다음 지우고 "
-                                "fa order flush를 다시 실행해 주세요",
-        "batch_recover_branch": "중단된 일괄 올리기는 {branch} 브랜치에서 쓰였어요. {branch}로 바꾼 다음 fa order flush를 다시 실행해 주세요",
+        "batch_wrong_branch": "fa order flush는 base 브랜치 {branch}에서만 돌아요. 아무것도 바꾸지 않았어요",
         "batch_lanes_publish_now": "레인을 더하는 주문은 모아 올리지 않아요. --defer 없이 지금 발행해 주세요",
         "batch_lanes_published_now": "{boundary}을(를) 기다리지 않고 지금 발행했어요. 이 주문은 레인을 더하고, "
                                      "레인을 더하는 주문은 모아 올리지 않아요.",

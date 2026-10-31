@@ -9,7 +9,6 @@ from foragent.paths import repo_path
 
 # decision and idea notes append to their history; a rule note edits one current-rules line.
 NOTE_FILES = {"decision": "docs/decisions.md", "idea": "docs/ideas.md", "rule": "docs/rules.md"}
-COMMITTED = "committed"
 
 
 def _rule_lines(name: str, current: str, entry: dict, language: str) -> str:

@@ -374,8 +374,10 @@ notes under a boundary of its own (for example `urgent-<order id>`) and run
 `fa order flush --boundary urgent-<order id>` right after it, so they land with it and
 ordinary waiting work keeps waiting. `fa order pending --json` shows what waits.
 When the boundary arrives (the next code merge lands, or the chosen time comes), run
-`fa order flush --boundary <boundary>`; rerunning it after an interruption finishes the rest
-without duplicate issues or notes. `fa order publish` places the
+`fa order flush --boundary <boundary>` on the base branch (anywhere else it refuses and
+changes nothing); rerunning it after an interruption finishes the rest without duplicate
+issues or notes. A batch whose push failed stays committed and is pushed first by the next
+flush (rebased onto a moved base); new notes and orders wait until it is pushed. `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
