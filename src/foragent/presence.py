@@ -69,8 +69,10 @@ def counts(store, now: datetime) -> tuple[int, int, int]:
     lanes = {run.lane for run in store.active_runs()}
     # Issues an open question waits on (the tolerant scan skips a corrupt question file
     # alone) and person-labelled issues, less those whose question was answered.
-    found = watch_questions.recipients(store)
-    turns = {number for number, who in found.items() if who == watch_questions.PERSON}
+    questions = watch_questions.collect(store)
+    found = questions.issues
+    # Open questions name issues with no local record too; each still counts once.
+    turns = {number for number, who in found.items() if who == watch_questions.PERSON} | questions.strays
     turns.update(row["number"] for row in store.local_issues()
                  if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())
                  and found.get(row["number"]) != watch_questions.ANSWERED)
@@ -193,7 +195,8 @@ def _question_groups(store, language: str) -> str:
     from foragent import watch_questions
     from foragent.i18n import text
 
-    counts_by = watch_questions.waiting(*watch_questions.collect(store))
+    questions = watch_questions.collect(store)
+    counts_by = watch_questions.waiting(questions.issues, questions.unlinked)
     groups = [text("presence_question_group", language, who=text(f"question_{who}", language), count=count)
               for who, count in counts_by.items() if count]
     return " · " + text("presence_questions", language, groups=" · ".join(groups)) if groups else ""
@@ -221,9 +224,11 @@ def statusline_segment(cwd: Path, now: datetime) -> str | None:
         # Only the planning session, where the person answers, is told about open questions.
         if not (_planning_session(cwd, store) and store.root.is_dir()):
             return segment
-        from foragent.orch_inbox import scan
+        from foragent import watch_questions
 
-        waiting = sum(row["status"] == "open" for row in scan(store, "questions")[0])
+        # The same projection as the groups: an earlier run's or a closed issue's open
+        # question no longer asks anything.
+        waiting = len(watch_questions.collect(store).open_ids)
         if not waiting:
             return segment
         key = "presence_open_question" if waiting == 1 else "presence_open_questions"
@@ -390,8 +395,13 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     if unreadable:
         lines.append("Processing requests with an unreadable time (left out): "
                      + ", ".join(map(_quote, unreadable)))
+    # Only questions that still await the person: the projection drops an earlier run's or a
+    # closed issue's open question, as the statusline and lane view do.
+    from foragent import watch_questions
+
+    awaited = watch_questions.collect(store).open_ids
     rows("Open questions waiting for the person:", "question",
-         [row for row in questions if row["status"] == "open"], question)
+         [row for row in questions if row["status"] == "open" and row["id"] in awaited], question)
     rows(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):", "notice",
          notices[-NOTICE_LIMIT:], notice)
     if len(notices) > NOTICE_LIMIT:

@@ -96,6 +96,21 @@ def person_turn(language: str) -> str:
     return row_words("waiting-human", None, "person", language)[1]
 
 
+def recipient(question: str | None, language: str) -> str | None:
+    """The name a waiting question carries ("you", "the orchestrator"); None for no recipient."""
+    from foragent import watch
+
+    return watch.text(f"question_{question}", language) if question in ASKING else None
+
+
+def turn_within(language: str, width: int) -> str:
+    """The person's turn words, or only their name when the words would not fit ``width`` cells."""
+    from foragent import watch
+
+    words = person_turn(language)
+    return words if watch._cells(words) <= width else recipient("person", language)
+
+
 def _time(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(value)
@@ -204,6 +219,8 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
             "words": words, "activity": activity,
+            # The recipient's name, kept whole when a narrow row must shorten the words.
+            "who": recipient(question, language),
             # Without a recorded time (a queued issue, a row with no run) the cell says so.
             "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}
@@ -354,11 +371,19 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         others = sum(value + 1 for key, value in widths.items() if key != "title" and value)
         widths["title"] = min(widths["title"], max(0, width - others - 1))
     # The row must fit: warnings, then the lane name, then the phase word give way, so the
-    # glyph, number, elapsed time and acorns at the end are never pushed off the line.
-    for key, least in (("activity", 0), ("lane", 4), ("words", 4), ("lane", 1), ("words", 1)):
+    # glyph, number, elapsed time and acorns at the end are never pushed off the line. A
+    # question's word keeps at least its recipient's name; only a line too narrow even for
+    # that cuts the name.
+    named = max((watch._cells(row["who"]) for row in cells if row.get("who")), default=0)
+    for key, least in (("activity", 0), ("lane", 4), ("words", max(4, named)), ("lane", 1),
+                       ("words", max(1, named)), ("words", 1)):
         over = sum(value + 1 for value in widths.values() if value) - 1 - width
         if over > 0:
             widths[key] = max(min(widths[key], least), widths[key] - over)
+    for row in cells:
+        # A question word too long for its column becomes the recipient's name alone.
+        if row.get("who") and watch._cells(row["words"]) > widths["words"]:
+            row["words"] = row["who"]
     shown = [key for key in columns if widths[key]]
     hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []

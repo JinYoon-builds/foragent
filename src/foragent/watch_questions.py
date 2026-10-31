@@ -16,9 +16,17 @@ flags and run records; it never reads question wording and stores nothing.
 - ``answered``: that spec or needs-human question was answered; the issue waits
   to restart. The needs-human label may stay until someone acts on the answer.
 
-An answer ends only a question raised before it: an answer older than the issue's
-current question (its routing marker comment, its current spec flag or the start of
-its latest run, whichever is newest) belongs to an earlier question and is ignored.
+Every question belongs to the issue's current episode: the time since its latest run
+began, or since its current spec flag when that run ended with a spec question. An
+inbox question asked (``created_at``) before that boundary belongs to an earlier
+run and is ignored, open or answered: a retry starts a new episode, so the earlier
+run's open question stops counting. A closed issue waits for nobody.
+
+The routing marker is not a boundary: the orchestrator may ask first and route the
+issue afterwards. It decides only whether an answer is still current: an answer
+given (``answered_at``) before the newest marker was followed by a new routing, so
+the person's turn comes back.
+
 An answer also ends only a question of its own kind (``orch_inbox.QUESTION_KINDS``):
 a merge or order decision about the issue never ends its plain question, and a plain
 answer never ends a pending merge or order decision. A spec question is plain. A
@@ -26,9 +34,9 @@ needs-human question takes its kind from the reason recorded in its newest routi
 marker (``reasons.GROUP``: a review is a merge decision, a re-approval an order
 decision, anything else plain); without a marker it is plain.
 
-"At or after the flag" compares the answer with the earlier of the flag's own time
-and when its file was written, so two writers' disagreeing clocks let the answer win;
-a flag saved again after the answer (a new spec question) still names the orchestrator.
+The spec flag's time is the earlier of its recorded time and when its file was
+written, so two writers' disagreeing clocks keep a question asked after the flag in
+the episode; a flag saved again later (a new spec question) still starts a new one.
 """
 
 from datetime import UTC, datetime
@@ -50,7 +58,12 @@ KIND_BY_GROUP = {"review": "merge", "reapprove": "order"}
 
 class Questions(NamedTuple):
     issues: dict[int, str]  # Issue number -> PERSON, ORCHESTRATOR or ANSWERED.
-    unlinked: int  # Open inbox questions that list no issue: the person's.
+    unlinked: int  # Open inbox questions that list no issue we have a record of: the person's.
+    # Issue numbers those questions name although no local record exists (✋ counts them).
+    strays: frozenset[int] = frozenset()
+    # Ids of the open inbox questions still awaiting the person: about no recorded issue, or
+    # about an open issue in the episode they were asked in. Earlier runs' and closed issues' are not.
+    open_ids: frozenset[str] = frozenset()
 
 
 def _time(value: Any) -> datetime | None:
@@ -77,24 +90,33 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
     """Every open question's recipient. One malformed question file, flag or run record is skipped alone."""
     from foragent.orch_inbox import scan
 
-    rows = store.local_issues()
+    rows = [row for row in store.local_issues() if isinstance(row.get("number"), int)]
+    known = {row["number"] for row in rows}
     found: dict[int, str] = {}
-    unlinked = 0
-    answers: dict[int, list[tuple[datetime, str]]] = {}  # Issue -> (answered_at, question kind).
+    unlinked, strays = 0, set()
+    live: set[str] = set()  # Ids of open questions that still await the person.
+    asked: dict[int, list[tuple[datetime | None, str]]] = {}  # Open questions: (asked_at, id).
+    answers: dict[int, list[tuple[datetime, datetime, str]]] = {}  # (asked_at, answered_at, kind).
     for row in scan(store, "questions")[0]:
         linked = row.get("issues")
         numbers = [number for number in linked if type(number) is int] if isinstance(linked, list) else []
+        created, kind = _time(row.get("created_at")), row.get("kind") or PLAIN
         if row["status"] == "open":
-            found.update((number, PERSON) for number in numbers)
-            unlinked += not numbers
-        elif (at := _time(row.get("answered_at"))) is not None:
+            # A question about no issue we know of has no row: it is counted apart.
+            if not any(number in known for number in numbers):
+                unlinked += 1
+                strays |= set(numbers)
+                live.add(row["id"])
             for number in numbers:
-                answers.setdefault(number, []).append((at, row.get("kind") or PLAIN))
+                asked.setdefault(number, []).append((created, row["id"]))
+        elif (given := _time(row.get("answered_at"))) is not None and created is not None:
+            for number in numbers:
+                answers.setdefault(number, []).append((created, given, kind))
     history = list(history) if history is not None else None
     for row in rows:
         number = row["number"]
-        if row.get("state") != "open" or number in found:
-            continue
+        if row.get("state") != "open":
+            continue  # A closed issue waits for nobody, whatever its old records say.
         try:
             flag = store.load_flag(number)
             run = _latest_run(store, number, history)
@@ -102,23 +124,24 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
             flag = run = None
         # The current spec question: the flag says so and the latest run ended with it.
         spec = flag is not None and flag.reason == SPEC and run is not None and run.outcome == SPEC
-        flagged = _flagged(store, number, flag.flagged_at) if spec else None
-        if NEEDS_HUMAN in (row.get("labels") or ()):
-            # Routed to the person: a decision of the question's own kind, made after it was raised.
+        # The episode's start: the spec flag (saved after its run began), else the latest run's start.
+        start = _flagged(store, number, flag.flagged_at) if spec else _time(run.started_at) if run else None
+        current = lambda moment: moment is not None and (start is None or moment >= start)
+        # An open question with no recorded asking time cannot be dated, so it is not hidden.
+        waiting = {question for moment, question in asked.get(number, ()) if moment is None or current(moment)}
+        if waiting:
+            found[number] = PERSON  # An open question of this episode awaits the person.
+            live |= waiting
+        elif NEEDS_HUMAN in (row.get("labels") or ()):
             routed, kind = _routed(row)
-            raised = [moment for moment in (routed, flagged, _time(run.started_at) if run else None) if moment]
-            found[number] = ANSWERED if _answered(answers.get(number, ()), kind, max(raised, default=None)) else PERSON
+            # Answered: a question of its kind from this episode, answered after the newest routing.
+            done = any(given_kind == kind and current(moment) and (routed is None or given >= routed)
+                       for moment, given, given_kind in answers.get(number, ()))
+            found[number] = ANSWERED if done else PERSON
         elif spec:
-            # Not routed yet: a plain answer after the flag ends it. The flag is saved when the
-            # run ends, after its start, so it is the question's newest fact.
-            answered = flagged is not None and _answered(answers.get(number, ()), PLAIN, flagged)
-            found[number] = ANSWERED if answered else ORCHESTRATOR
-    return Questions(found, unlinked)
-
-
-def _answered(answers: Iterable[tuple[datetime, str]], kind: str, raised: datetime | None) -> bool:
-    """Whether a decision of ``kind`` came at or after the question was raised (unknown raise time: any)."""
-    return any(given == kind and (raised is None or at >= raised) for at, given in answers)
+            done = any(given_kind == PLAIN and current(moment) for moment, _, given_kind in answers.get(number, ()))
+            found[number] = ANSWERED if done else ORCHESTRATOR
+    return Questions(found, unlinked, frozenset(strays), frozenset(live))
 
 
 def recipients(store, history: Iterable[Any] | None = None) -> dict[int, str]:

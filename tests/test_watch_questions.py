@@ -105,7 +105,7 @@ def test_an_open_question_without_an_issue_is_the_persons(tmp_path):
     tracker.add_issue(9, "Busy", labels=["approved", "lane:api"])
     _refresh(store, tracker, clock)
     asked = orch_inbox.ask(store, "Keep the weekly report?", ["yes", "no"], 1)
-    assert watch_questions.collect(store) == watch_questions.Questions({}, 1)
+    assert watch_questions.collect(store) == watch_questions.Questions({}, 1, frozenset(), frozenset({asked["id"]}))
     assert presence._question_groups(store, "ko") == " · 질문: 진님 1"
     assert "답할 질문 1개" in _frame(store, tracker, clock, "ko")[0]
     orch_inbox.answer(store, asked["id"], "yes")
@@ -202,3 +202,93 @@ def test_only_a_decision_of_the_questions_own_kind_ends_a_routed_question(tmp_pa
         asked = orch_inbox.ask(store, f"{kind} about #{number}?", ["yes", "no"], 1, issues=[number], kind=kind)
         orch_inbox.answer(store, asked["id"], "yes")
     assert watch_questions.recipients(store) == {17: watch_questions.ANSWERED, 18: watch_questions.ANSWERED}
+
+
+def test_an_answer_to_an_earlier_runs_question_leaves_the_new_question_open(tmp_path):
+    """Defect class: answers matched by issue alone instead of the question they answer."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 19, clock)  # Run 1 asks.
+    earlier = orch_inbox.ask(store, "Run 1: which region?", ["a", "b"], 1, issues=[19])
+    clock[0] += timedelta(minutes=5)
+    _spec_question(store, tracker, 19, clock)  # The retried run 2 asks something else.
+    os.utime(store.root / "flags" / "19.json", (clock[0].timestamp(),) * 2)
+    clock[0] += timedelta(minutes=1)
+    orch_inbox.answer(store, earlier["id"], "a")  # Run 1's question is answered only now.
+    _refresh(store, tracker, clock)
+    assert watch_questions.recipients(store) == {19: watch_questions.ORCHESTRATOR}
+    tracker.add_labels(19, ["needs-human"])  # Routed through needs-human: still unanswered.
+    _refresh(store, tracker, clock)
+    assert watch_questions.recipients(store) == {19: watch_questions.PERSON}
+    current = orch_inbox.ask(store, "Run 2: which zone?", ["a", "b"], 1, issues=[19])
+    orch_inbox.answer(store, current["id"], "a")
+    assert watch_questions.recipients(store) == {19: watch_questions.ANSWERED}
+
+
+def test_a_narrow_row_keeps_the_recipients_name_whole(tmp_path):
+    """Defect class: recipient names lost when a narrow row or prep line is cut."""
+    from foragent import status, watch
+    from foragent.config import Config
+    from foragent.watch_sections import prep
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 20, clock)
+    tracker.add_issue(21, "Asked", labels=["approved", "blocked", "lane:api"])
+    _refresh(store, tracker, clock)
+    orch_inbox.ask(store, "About #21?", ["a", "b"], 1, issues=[21])
+    for language, names in (("en", ("the orchestrator", "you")), ("ko", ("오케스트레이터", "진님"))):
+        # A long lane name: the lane column must give way before the recipient's name.
+        config = Config(language=language, view_glyphs="ascii", lanes={"api": {"title": "Server side work"}})
+        snap = watch.collect(status.collect(store, config, clock[0]), tracker, store, config, clock[0])
+        for width in (34, 36, 40, 50, 60):
+            frame = watch.render_frame(snap, config, store.root, width=width, now=clock[0]).splitlines()
+            for number, name in zip((20, 21), names):
+                row = next(line for line in frame if f"#{number} " in line)
+                assert name in row and watch._cells(row.rstrip()) <= width, (width, row)
+        line = prep._ledger({"ledger": ["D1 a decision"]}, language, 12)[-1]
+        assert names[1] in "".join(part for part, _ in line), line
+
+
+def test_an_open_question_of_an_earlier_run_stops_counting_when_the_issue_moves_on(tmp_path):
+    """Defect class: stale inbox facts (an earlier run's open question) overriding current run facts."""
+    from foragent import presence
+
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 22, clock)
+    orch_inbox.ask(store, "Run 1: which region?", ["a", "b"], 1, issues=[22])  # Left open.
+    _refresh(store, tracker, clock)
+    assert watch_questions.recipients(store) == {22: watch_questions.PERSON}
+    clock[0] += timedelta(minutes=5)
+    store.start_run(22, branch="issue-22", worktree="unused", lane="api")  # The retry is working.
+    assert watch_questions.recipients(store) == {}
+    assert presence._question_groups(store, "en") == ""
+    store.save_flag(22, "spec-question", flagged_at=clock[0].isoformat())  # It asks something new.
+    store.finish_run(22, outcome="spec-question", detail="Which zone?")
+    os.utime(store.root / "flags" / "22.json", (clock[0].timestamp(),) * 2)
+    assert watch_questions.recipients(store) == {22: watch_questions.ORCHESTRATOR}
+    tracker.close_issue(22)  # Merged: nobody waits, whatever the open question says.
+    _refresh(store, tracker, clock)
+    assert watch_questions.collect(store) == watch_questions.Questions({}, 0)
+    assert presence._question_groups(store, "en") == "" and presence.counts(store, clock[0])[1] == 0
+
+
+def test_routing_after_asking_does_not_hide_the_answer(tmp_path):
+    """Defect class: registration order (ask, then route) taken for question identity."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 23, clock)
+    clock[0] += timedelta(minutes=1)
+    asked = orch_inbox.ask(store, "Which region?", ["a", "b"], 1, issues=[23])
+    tracker.add_labels(23, ["needs-human"])
+    marker = lambda minutes: {"id": minutes, "author": "foragent",
+                              "created_at": (NOW + timedelta(minutes=minutes)).isoformat(),
+                              "body": "<!-- foragent:needs-human reason=spec-question -->\nWhich region?"}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={23: [marker(2)]})
+    clock[0] += timedelta(minutes=2)
+    orch_inbox.answer(store, asked["id"], "a")  # Asked, then routed, then answered.
+    assert watch_questions.recipients(store) == {23: watch_questions.ANSWERED}
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
+                               comments={23: [marker(2), marker(10)]})  # Routed again after the answer.
+    assert watch_questions.recipients(store) == {23: watch_questions.PERSON}

@@ -741,3 +741,36 @@ def test_well_formed_events_of_other_kinds_are_not_diagnosed(stall_store):
     append_event(store, now - timedelta(minutes=2), 201, "retry", "Retry", say="Retried.", verdict="ok")
     notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
     assert notices == [] and problems == []
+
+
+def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_question(stall_store):
+    """Defect class: planning display paths counting open questions the projection no longer awaits."""
+    import os
+    from datetime import timedelta
+
+    from foragent import orch_inbox, presence
+    from foragent.tracker import FakeTracker
+
+    root, store, now = _bound_stall_store(stall_store)  # One open question with no issue: still awaited.
+    tracker = FakeTracker(now=lambda: now)
+    tracker.add_issue(7, "Storage", labels=["approved", "blocked", "lane:api"])
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")
+    store.save_flag(7, "spec-question", flagged_at=now.isoformat())
+    store.finish_run(7, outcome="spec-question")
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, now)
+    asked = orch_inbox.ask(store, "Run 1: which region?", ["a", "b"], 1, issues=[7])
+    later = lambda minutes: now + timedelta(minutes=minutes)
+    os.utime(store.root / "flags" / "7.json", (now.timestamp(),) * 2)
+    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert asked["question"] in presence.prompt_context(root, now)[0]
+    store._now = lambda: later(5)
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")  # The retry starts a new episode.
+    segment = presence.statusline_segment(root, later(5))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(5))[0] or "")
+    store.finish_run(7, outcome="merged")
+    tracker.close_issue(7)  # Merged and closed: still not awaited.
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, later(6))
+    segment = presence.statusline_segment(root, later(6))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(6))[0] or "")

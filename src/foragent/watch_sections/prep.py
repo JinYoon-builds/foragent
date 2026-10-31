@@ -71,16 +71,16 @@ def _ledger(prep: dict[str, Any], language: str, width: int) -> list[Line]:
     from foragent import watch
 
     lines = [_cut(item, width) for item in prep.get("ledger") or []]
-    from foragent.watch_sections.lanes import person_turn
+    from foragent.watch_sections.lanes import turn_within
 
     # The confirmation asks the person; it names them first so a narrow cut keeps the name.
-    confirm = f"{person_turn(language)} · {watch.text('prep_ledger_confirm', language)}"
+    confirm = f"{turn_within(language, width)} · {watch.text('prep_ledger_confirm', language)}"
     return lines + [_cut(confirm, width, "yellow")] if lines else []
 
 
 def _chunks(prep: dict[str, Any], language: str, marks: dict[str, str], width: int) -> list[Line]:
     from foragent import watch
-    from foragent.watch_sections.lanes import person_turn
+    from foragent.watch_sections.lanes import turn_within
 
     chunks = [chunk for chunk in prep.get("chunks") or [] if isinstance(chunk, str)]
     if not chunks:
@@ -105,7 +105,7 @@ def _chunks(prep: dict[str, Any], language: str, marks: dict[str, str], width: i
                 values.append(marks["asked"])
                 name = "".join(part for part, _ in watch._columns([chunk], [first])[0]).rstrip()
                 # An open cell question is the person's (the order interview); the name comes first.
-                questions.append(person_turn(language) + " · " + watch.text(
+                questions.append(turn_within(language, width) + " · " + watch.text(
                     "prep_question", language, chunk=name, slot=label, question=cell["ask"]))
             else:
                 values.append(marks["empty"])
