@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 def _push_branch(attempt: Implementation) -> None:
+    run_publish.orch_scope.require(attempt.ctx, attempt.n)  # Never push a branch for another person's issue (#1004).
     if attempt.rebuilt:
         attempt.git.push(attempt.branch, lease=attempt.rebuild_lease)
         attempt.rebuild_lease = attempt.git.head_sha()

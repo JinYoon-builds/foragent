@@ -76,7 +76,8 @@ def _final_merge_inputs(
         return "base-changed"
 
     status = run_publish._ci_status(ctx, pr, git.root, ready_at)
-    issue = ctx.tracker.get_issue(n)
+    # The merge's own fresh read also rechecks the owner: an edit during the run stops it here (#1004).
+    issue = run_publish.orch_scope.require(ctx, n, ctx.tracker.get_issue(n))
     saved = ctx.store.load_approval(n)
     if (run_publish.APPROVED not in issue.labels
             or (approved_body_sha is not None and run_publish.body_hash(issue.body) != approved_body_sha)
@@ -127,6 +128,10 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     branch = f"foragent/batch-{parent}"
     if any(pr.head == branch for pr in ctx.tracker.list_prs("merged", branch)):
         return
+    from foragent import orch_scope
+
+    if not orch_scope.may_write(ctx, parent):
+        return  # Another person's order (or its owner is unknown): their factory finalizes it (#1004).
     ctx.git.fetch("origin", ctx.config.base_branch)
     ctx.git.fetch("origin", branch)
     base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")

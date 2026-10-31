@@ -19,7 +19,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from foragent import board
+from foragent import board, orch_scope
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
 from foragent.orch_events import append_event
@@ -145,6 +145,10 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
     return closed
 
 
+def _parent_issue(number: int, row: dict) -> Issue:
+    return Issue(number, row.get("title", ""), row.get("body", ""), frozenset(row.get("labels", ())), "open")
+
+
 def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all its work is done."""
     rows = ctx.store.local_issues()
@@ -154,7 +158,10 @@ def follow_children(ctx, report) -> None:
     parents = order_parents(rows)
     records, unparseable = order_records(rows)
     language = ctx.config.language
+    scope = getattr(ctx, "_scope", None) or orch_scope.Scope(ctx)
     for number in sorted(parents | records.keys()):
+        if not scope.owns(_parent_issue(number, by_number[number])):
+            continue  # Another person's order by this listing (#1004); an own parent still reads foreign children.
         children = ctx.tracker.sub_issues(number) if by_number[number].get("children") else []
         # Until a record closes, only an order parent's sub-issues move its card (today's handling).
         state = parent_state(children, open_prs) if number in parents else None
@@ -181,6 +188,8 @@ def follow_children(ctx, report) -> None:
             closes = False  # Its work is unknown: skip the close quietly; the card keeps today's column.
         else:
             closes = state == "Done"
+        if closes and not orch_scope.may_write(ctx, number):
+            continue  # Relabelled since the listing, or its owner is unknown: no close and no card move (#1004). (#1004).
         if closes:
             ctx.tracker.close_issue(number, text("order_record_closed", language, count=len(work)))
             report.actions.append(text("parent_closed_report", language, number=number,

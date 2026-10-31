@@ -58,8 +58,10 @@ def spec_conflicts(*texts: str) -> tuple[str, ...]:
 def _stop_on_spec_conflict(n: int, ctx: RunContext, review: ReviewResult) -> None:
     """A finding against a locked test is a question for the orchestrator, not a defect to retry."""
     if review.conflicts:
-        flag(ctx, n, Reason.SPEC_QUESTION,
-             "The reviewer found a conflict with a locked acceptance test.", "\n".join(review.conflicts))
+        from foragent.orch_scope import ask_orderer
+
+        flag(ctx, n, Reason.SPEC_QUESTION, ask_orderer(
+            ctx, n, "The reviewer found a conflict with a locked acceptance test."), "\n".join(review.conflicts))
         raise ExecutorStopped("spec-question")
 
 
@@ -493,7 +495,9 @@ def _review_implementation(attempt: Implementation) -> None:
     worktree = attempt.worktree
     pr = None
     if ctx.config.review_scope == "pr-body":
-        title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+        from foragent import orch_scope
+
+        title = f"{orch_scope.require(ctx, n, ctx.tracker.get_issue(n)).title} (#{n})"  # Before the push (#1004).
         commit_exclusions(attempt, title)
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))

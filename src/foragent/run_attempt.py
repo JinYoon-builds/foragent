@@ -74,6 +74,16 @@ class ExecutorStopped(Exception):
         self.outcome = outcome
 
 
+class OwnershipLost(ExecutorStopped):
+    """The issue now belongs to another person's factory, or its owner cannot be confirmed (#1004).
+
+    The run stops before its next shared effect; its work stays on the local branch.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__("refused", detail)
+
+
 class ReviewerLimited(ExecutorStopped):
     """A stored reviewer reached a hard limit before its session launched (#186).
 

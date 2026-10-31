@@ -94,8 +94,9 @@ def _check_prerequisites(
     )
     if cancelled is not None:
         scheduler.flag(
-            ctx, issue.number, scheduler.Reason.SPEC_QUESTION,
-            f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency.",
+            ctx, issue.number, scheduler.Reason.SPEC_QUESTION, scheduler.orch_scope.ask_orderer(
+                ctx, issue.number,
+                f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency."),
         )
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
@@ -173,6 +174,8 @@ def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
             parents.add(parent)
         if number not in issues or ctx.tracker.parent_of(number) != parent:
             continue
+        if not scheduler.orch_scope.may_write(ctx, number):
+            continue  # Another person's child: their factory closes it (#1004).
         ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
         ctx.tracker.remove_labels(number, [scheduler.READY, scheduler.RUNNING])
         scheduler.board.sync_status(ctx, number, "Done")

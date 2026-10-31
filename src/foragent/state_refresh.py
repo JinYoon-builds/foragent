@@ -22,7 +22,11 @@ class IssueRefreshMixin:
             previous = snapshot["issues"]
             rows = {}
             facts = {}
+            refused: dict[int, str] = {}
             observed = {issue.number for issue in issues if not issue.is_pull_request}
+            # A queued PR write targets a PR, which an issue listing never shows: not a missing issue (#1004).
+            observed |= ({pr.number for pr in prs} | {issue.number for issue in issues if issue.is_pull_request}
+                         | {row["pr_number"] for row in previous.values() if row.get("pr_number")})
             dropped = {entry["issue"] for entry in snapshot.get("outbox", [])
                        if entry["issue"] not in observed and (
                            since_revision is None or snapshot.get("outbox_base", {}).get(
@@ -60,7 +64,13 @@ class IssueRefreshMixin:
                     if concurrent or matches:
                         rows[str(issue.number)] = dict(old)
                         continue
-                    dropped.add(issue.number)
+                    before, after = _owners(expected.get("labels", ())), _owners(remote["labels"])
+                    if before != after:
+                        # An owner edit is not a person overriding this write: keep it, refused (#1004).
+                        refused[issue.number] = (f"owner label changed from {', '.join(before) or 'none'} "
+                                                 f"to {', '.join(after) or 'none'} while the write was queued")
+                    else:
+                        dropped.add(issue.number)
                 rows[str(issue.number)] = remote
             for number, row in rows.items():
                 # Order edges and dependencies are observations, never local intent.
@@ -101,6 +111,7 @@ class IssueRefreshMixin:
                 rows.update({number: row for number, row in previous.items()
                              if row.get("revision", 0) > since_revision and int(number) not in dropped})
             snapshot.pop("refresh_failure", None)
+            _refuse(snapshot, refused, self._timestamp())
             self._write_json(self.root / "issues.json", {
                 **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
                 "outbox": [entry for entry in snapshot.get("outbox", []) if entry["issue"] not in dropped],
@@ -242,3 +253,10 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+
+
+def _owners(labels) -> list[str]:
+    return sorted({label.lower() for label in labels if label.lower().startswith("by:")})
+
+
+from foragent.state_issues import _refuse  # noqa: E402

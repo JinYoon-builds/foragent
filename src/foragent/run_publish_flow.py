@@ -39,7 +39,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     if attempt.review_hold and attempt.review_hold_reason == run_publish.Reason.TEST_HARNESS_CHANGED:
         return harness_guard.publish_hold(attempt)  # the hold wins over every publication check
     worktree, log = attempt.worktree, attempt.log
-    issue = ctx.tracker.get_issue(n)
+    issue = run_publish.orch_scope.require(ctx, n, ctx.tracker.get_issue(n))  # Before any push or PR (#1004).
     title = f"{issue.title} (#{n})"
     run_publish.commit_exclusions(attempt, title)
     run_publish._progress(n, ctx)
@@ -128,12 +128,14 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             return "pr-open"
 
     if stopped := policy_hold(run_publish._merge_decision(
-            n, ctx, git, ctx.tracker.pr_changed_files(pr), ctx.tracker.get_issue(n).labels)):
+            n, ctx, git, ctx.tracker.pr_changed_files(pr),
+            run_publish.orch_scope.require(ctx, n, ctx.tracker.get_issue(n)).labels)):
         return stopped
 
     def publish_refresh(target_sha: str) -> str | None:
         nonlocal pr_ready_at, ci_wait, verified_base_sha
         run_publish._check_publication(git, attempt.target_branch, target_sha)
+        run_publish.orch_scope.require(ctx, n)  # The owner may have changed while CI ran (#1004).
         run_publish._push_branch(attempt)
         run_publish._progress(n, ctx)
         run_publish._append(log, f"Pushed verified HEAD: {verified_head_sha}")

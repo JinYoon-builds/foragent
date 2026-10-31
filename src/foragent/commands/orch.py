@@ -101,7 +101,11 @@ def run(args) -> int:
                          config=config, git=git, now=lambda: cli.datetime.now(cli.UTC))
     orch = cli.orch
     from foragent.commands import _orch_park
+    from foragent import orch_scope
 
+    if (refusal := orch_scope.refuse_verb(ctx, args.action, getattr(args, "number", None))) is not None:
+        print(refusal, file=cli.sys.stderr)  # #1004: before checks, executors, labels, journals or signals.
+        return 1
     if args.action in _orch_park.ACTIONS:
         return _orch_park.run(ctx, args)
     if args.action == "list":

@@ -160,6 +160,24 @@ class IssueSnapshotMixin:
             self._save_local_issue(snapshot, row)
             return entry
 
+    def refuse_github_writes(self, number: int, reason: str) -> int:
+        """Move every queued write for ``#number`` out of delivery, kept with its reason (#1004).
+
+        Refused writes are never delivered or discarded silently; they leave the FIFO so
+        they hold back no other issue's writes or starts. Returns how many moved.
+        """
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            moved = _refuse(snapshot, {number: reason}, self._timestamp())
+            if moved:
+                snapshot["revision"] = snapshot.get("revision", 0) + 1
+                self._write_json(self.root / "issues.json", snapshot)
+            return moved
+
+    def refused_github_writes(self) -> list[dict[str, Any]]:
+        """Queued writes this factory refused to deliver, each with its reason, oldest first."""
+        return _copy(self._issue_record().get("outbox_refused", []))
+
     def deliver_github_write(self, entry: dict[str, Any], *, comment_id: int | None = None,
                              remaining_labels: list[str] | None = None) -> None:
         """Acknowledge delivery without losing concurrent appends or later local intent."""
@@ -282,3 +300,16 @@ class IssueSnapshotMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+
+
+def _refuse(snapshot: dict[str, Any], reasons: dict[int, str], at: str) -> int:
+    """Move the FIFO entries of each issue in ``reasons`` to ``outbox_refused``."""
+    pending = snapshot.get("outbox", [])
+    moved = [{**entry, "refused": reasons[entry["issue"]], "refused_at": at}
+             for entry in pending if entry["issue"] in reasons]
+    if moved:
+        snapshot["outbox"] = [entry for entry in pending if entry["issue"] not in reasons]
+        snapshot.setdefault("outbox_refused", []).extend(moved)
+        for number in reasons:
+            snapshot.get("outbox_base", {}).pop(str(number), None)
+    return len(moved)

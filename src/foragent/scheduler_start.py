@@ -187,6 +187,8 @@ def _start_checks(
             issue = ctx.tracker.get_issue(number)
     else:
         issue = ctx.tracker.get_issue(number)
+    if (scope := getattr(ctx, "_scope", None)) is not None and not scope.owns(issue):
+        return None  # Its fresh read shows another person's issue: no check below may write to it (#1004).
     if not eligible(issue, lane):
         return None
     if not scheduler._can_start_in_lane(ctx, lane, issue):

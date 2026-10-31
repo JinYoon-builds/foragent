@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, irreversible_paths, review_perspectives, risks
+from foragent import board, cuts, irreversible_paths, orch_scope, review_perspectives, risks
 from foragent import run_merge_turn as merge_turn
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison

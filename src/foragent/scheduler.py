@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_scope, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -120,6 +120,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
 def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
+    ctx._scope = orch_scope.Scope(ctx)  # #1004: one identity read per tick, shared by recovery and admission.
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
@@ -173,6 +174,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
+    scope = ctx._scope
 
     def lane_for(issue: Issue) -> str:
         for label in sorted(issue.labels):
@@ -184,6 +186,8 @@ def _tick_steps(ctx: TickContext) -> TickReport:
 
     def consider(issue: Issue) -> None:
         """Sync one stored issue's card and promote it to ready when it may start."""
+        if not scope.owns(issue):
+            return  # #1004: another person's work stays a read-only local fact.
         if issue.state != "open":
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
@@ -231,7 +235,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 return  # A re-approval is new evidence; it is read and resumed after a successful refresh.
             # A new approval is a new generation even between full refreshes.
             issue = ctx.tracker.get_issue(issue.number)
-            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels or not scope.owns(issue):
                 return
             ctx.tracker.remove_labels(issue.number, waiting_labels)
             issue = replace(issue, labels=issue.labels - waiting_labels)
@@ -243,8 +247,8 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 return  # Missing approval evidence: the snapshot needs a read; only stored approvals start now.
             if not waiting_labels:
                 issue = ctx.tracker.get_issue(issue.number)
-            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
-                return
+            if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels or not scope.owns(issue):
+                return  # A fresh read decides ownership again before any snapshot write (#1004).
             approval = _snapshot(ctx, issue, event, base_ref, report)
             if approval is None:
                 return

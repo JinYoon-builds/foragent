@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler, scheduler_reconcile, sleep_credit
+from foragent import orch_scope, processes, scheduler, scheduler_reconcile, sleep_credit
 from foragent.scheduler_stop import (
     DECISION_FIELDS, LIVENESS_FIELDS, _flag_stop_refused, _stop_unconfirmed, _restore_stopped, _pid_exists, _run_processes_exist,
     _stop_already_refused, _stop_run_processes, registered_since, runner_alive,
@@ -34,7 +34,8 @@ def _remove_run_worktree(
             try:
                 scheduler._preserve_failed_implementation(
                     number, ctx, ctx.git.at(worktree), f"{outcome}: {why}" if why else outcome, approval=ctx.store.load_approval(number),
-                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None, owned_deletions=bool(why),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None and orch_scope.shares(ctx, number),
+                    owned_deletions=bool(why),
                 )
             except Exception as exc:
                 detail = f"WIP preservation failed before worktree cleanup: {exc}"
@@ -134,6 +135,9 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         if run is None or run.status != "running":
             # The label request may have succeeded even when its reply was lost.
             # No run record means this scheduler never reached the launcher.
+            if not orch_scope.may_write(ctx, issue.number):  # Relabelled since the listing (#1004).
+                ctx.store.clear_run_start(issue.number)
+                return issue
             ctx.tracker.remove_labels(issue.number, [scheduler.RUNNING])
             ctx.store.clear_run_start(issue.number)
             report.actions.append(f"#{issue.number} incomplete start recovered before launch")
@@ -145,6 +149,8 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     )
+    if not orch_scope.may_write(ctx, issue.number):
+        return issue  # Local cleanup only: the labels are another person's now (#1004).
     if run is not None and run.outcome == "merged":
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
@@ -234,7 +240,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                        - run.waited_seconds - run.slept_seconds - run.talk_pause_seconds(ctx.now()))
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error", unless_talking=True,
-                                       detail="Runner exceeded its runtime limit.", decided=run) and issue:
+                                       detail="Runner exceeded its runtime limit.", decided=run) and issue \
+                        and orch_scope.shares(ctx, run.number):  # An owner edit keeps cleanup local (#1004).
                     scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
                     report.actions.append(f"#{run.number} flagged timeout")
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
@@ -245,7 +252,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
                 restarts = run.restarts + 1
                 outcome = ("stalled-restart" if restarts <= 1 else "stalled") if issue else "error"
                 if scheduler._kill_run(ctx, run.key, report, outcome=outcome, count_stall=True, decided=run,
-                          detail="Runner stopped making progress past the stall limit.", unless_talking=True) and issue:
+                          detail="Runner stopped making progress past the stall limit.", unless_talking=True) and issue \
+                        and orch_scope.shares(ctx, run.number):
                     scheduler._restore_stalled(ctx, run.number, restarts, report)
             continue
         # Clean up a crashed group or finish an interrupted stall; a recorded completion needs no signal.
@@ -265,7 +273,9 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     scheduler._remove_run_worktree(ctx, run.key, scheduler.Path(run.worktree), report, outcome=outcome)
     detail = scheduler._crash_detail(ctx, run.number) if outcome == "crashed" else run.detail
     finished = ctx.store.finish_run(run.key, outcome=outcome, detail=detail)
-    if finished.outcome in {"stalled-restart", "stalled"}:
+    if run.kind == "issue" and not orch_scope.shares(ctx, run.number):
+        report.actions.append(f"#{run.number} runner cleaned up locally; the issue belongs to another factory")
+    elif finished.outcome in {"stalled-restart", "stalled"}:
         scheduler._restore_stalled(ctx, run.number, finished.restarts, report)
     elif finished.outcome == "crashed":
         report.actions.append(f"#{run.number} runner crashed")

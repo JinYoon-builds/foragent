@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, orch_scope
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -264,6 +264,8 @@ def _implement_and_publish(
             return outcome
     except ExecutorStopped as exc:
         outcome = exc.outcome
+        if outcome == "refused":
+            attempt.tracker_available = False  # Ownership lost: the WIP stays on the local branch (#1004).
         raise
     except TrackerError as exc:
         attempt.tracker_available = False
@@ -317,6 +319,7 @@ def review_only(
         issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
+        orch_scope.require(ctx, n, issue)  # Before the run record, labels or the reviewer (#1004).
         if RUNNING in issue.labels:
             raise TrackerError(f"issue #{n} already has a running execution")
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
@@ -325,7 +328,7 @@ def review_only(
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
-        with extend_deadline(partial(paused_seconds, n, ctx)):  # Talk pauses (D55 addendum).
+        with extend_deadline(partial(paused_seconds, n, ctx)), orch_scope.guarding(ctx, n):  # Talk pauses (D55 addendum).
             try:
                 outcome = _review_only(n, ctx, worktree, verdict_head)
             except AttemptFailure as exc:
@@ -350,7 +353,7 @@ def review_only(
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
-        else:
+        elif orch_scope.may_write(ctx, n):
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
         outcome = "killed"
@@ -363,7 +366,7 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    if outcome != "limit-wait" and outcome != "refused" and orch_scope.may_write(ctx, n):
                         current = ctx.tracker.current_issue(n)
                         if current.state == "open" and not current.labels & {BLOCKED, READY}:
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
@@ -392,6 +395,10 @@ def run_issue(n: int, ctx: RunContext) -> str:
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
+        if (refusal := orch_scope.check(ctx, n)) is not None:  # #1004: before any label, comment or executor.
+            _append(log, refusal)
+            outcome, detail = "refused", refusal
+            return outcome
         board.sync_status(ctx, n, "Running")
         from foragent.run_implementation import lane_config
 
@@ -403,7 +410,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
                       lane_executor=lane_settings.executor)
         try:
             # Every command's timeout grows by time a talk paused the run (D55 addendum).
-            with extend_deadline(partial(paused_seconds, n, ctx)):
+            # Every write of the run rechecks the owner first (#1004).
+            with extend_deadline(partial(paused_seconds, n, ctx)), orch_scope.guarding(ctx, n):
                 outcome = _execute(n, ctx, worktree)
         except ExecutorStopped as exc:
             outcome = exc.outcome
@@ -418,14 +426,16 @@ def run_issue(n: int, ctx: RunContext) -> str:
         _append(log, traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
-        else:
+        elif orch_scope.may_write(ctx, n):  # No flag on another person's (or unconfirmed) issue (#1004).
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
+            outcome = "error"
+        else:
             outcome = "error"
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
         stopped = ctx.store.get_run(n)
-        if stopped is None or stopped.outcome != "stalled-restart":
+        if (stopped is None or stopped.outcome != "stalled-restart") and orch_scope.may_write(ctx, n):
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])

@@ -244,6 +244,17 @@ class RecordingTracker:
         append_event(self._context.store, self._context.now(), number, "outbox-dropped",
                      f"#{number}: dropped queued GitHub writes: {reason}")
 
+    def _replay_refusal(self, number):
+        from foragent import orch_scope
+
+        return orch_scope.replay_refusal(self._context, self._tracker, number)
+
+    def _outbox_refused(self, number, reason):
+        from foragent.orch_events import append_event
+
+        append_event(self._context.store, self._context.now(), number, "outbox-refused",
+                     f"#{number}: queued GitHub writes kept undelivered: {reason}")
+
     def refresh_issues(self, *, observed_at=None):
         """Publish a bulk observation once, preserving writes made during its reads.
 
@@ -318,12 +329,15 @@ class RecordingTracker:
                           **({"repository": dep.repository} if dep.repository else {})}
                          for dep in self._tracker.blocked_by(issue.number)]
             blocked_by[issue.number] = known
+        refused_before = len(store.refused_github_writes())
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
             store.record_merged_pr_listing(listing)
+        for entry in store.refused_github_writes()[refused_before:]:
+            self._outbox_refused(entry["issue"], entry["refused"])
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
@@ -420,6 +434,14 @@ class RecordingTracker:
             if number in dropped:
                 continue
             try:
+                # Current ownership before every entry, also for writes queued before #1004:
+                # an owner edit between two queued writes stops the second.
+                if (refusal := self._replay_refusal(number)) is not None:
+                    # Moved aside with its reason; later entries for other issues still go out.
+                    store.refuse_github_writes(number, refusal)
+                    self._outbox_refused(number, refusal)
+                    dropped.add(number)
+                    continue
                 if action == "remove_labels":
                     labels = entry["labels"]
                     for index, label in enumerate(labels):

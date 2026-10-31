@@ -529,6 +529,12 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+            if (issue := pr_issue_number(current.head)) is not None:
+                from foragent import orch_scope
+
+                # The owner may have changed during the pre-merge checks (#1004).
+                if (refusal := orch_scope.current_refusal(ctx, issue)) is not None:
+                    raise OrchError(refusal)
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event
                 from foragent.orch_dream_publish import memory_moved

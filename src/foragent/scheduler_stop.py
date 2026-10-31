@@ -59,7 +59,12 @@ def _flag_stop_refused(ctx: TickContext, run: Run, report: TickReport, error: Ex
     if run.kind != "issue":  # Never flag issue #0: a dream's refusal touches no issue labels.
         report.actions.append(f"lane {run.lane} dream {summary}")
         return
-    scheduler.flag(ctx, run.number, scheduler.Reason.STOP_REFUSED, summary)
+    from foragent import orch_scope
+
+    if orch_scope.may_write(ctx, run.number):
+        scheduler.flag(ctx, run.number, scheduler.Reason.STOP_REFUSED, summary)
+    else:  # Another person's issue now (#1004): the refusal stays local, recorded once like a flag.
+        ctx.store.save_flag(run.number, scheduler.Reason.STOP_REFUSED, flagged_at=ctx.now().astimezone(scheduler.UTC).isoformat())
     scheduler.append_event(ctx.store, ctx.now(), run.number, "stop-refused", summary)
     report.actions.append(f"#{run.number} {summary}")
 
@@ -223,7 +228,10 @@ def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport
     streak nor the stall restart budget.
     """
     from foragent.i18n import text
+    from foragent import orch_scope
 
+    if not orch_scope.may_write(ctx, number):
+        return  # The issue changed hands during the stop: the work stays local, no label or comment (#1004).
     run = ctx.store.get_run(number)
     journal = ctx.store.root / "orch-events.jsonl"
     started = scheduler.datetime.fromisoformat(run.started_at) if run is not None else None
