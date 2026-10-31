@@ -2,8 +2,8 @@
 
 render_frame fills a caller-owned layout with hit boxes; coordinates are
 zero-based screen cells. Handlers change a caller-owned state: ``issue`` is the
-open box's number (or None), ``explanation_target`` the selected ('role', name) or
-('squirrel', slug) to explain (or None), ``scroll`` the zero-based first visible frame row,
+legacy box's number (or None; no input opens it since the lane scene), ``explanation_target``
+the selected ('acorn', number), ('role', name) or ('squirrel', slug) to explain (or None), ``scroll`` the zero-based first visible frame row,
 ``unfolded`` the lanes showing all their rows. Each frame records ``length``,
 ``rows`` (issue rows as (y, number)) and, on a screen, ``height``. Runtime
 dependencies resolve through foragent.watch to preserve its patch points.
@@ -110,8 +110,7 @@ def handle_mouse(
     target = watch.hit_test(layout, x, y)
     if isinstance(target, tuple) and target[0] in EXPLAINED:
         # The same target closes its explanation; another one switches to it.
-        if state.pop("explanation_target", None) != target:
-            state["explanation_target"] = target
+        _select(state, target)
         return
     state.pop("explanation_target", None)  # Any other click clears the selection, then acts.
     if target == ("settings", None):
@@ -122,17 +121,19 @@ def handle_mouse(
             settings_window.open_window(state)
     elif target == ("orchestrator", None):
         watch.switch_to_orchestrator(store)
-    elif isinstance(target, tuple) and target[0] == "acorn":
-        # The same issue closes its box; another issue switches the box to it.
-        row_map = layout.get("row_map")
-        row = row_map.get(y) if row_map is not None else y + layout.get("offset", 0)
-        _open(state, None if state.get("issue") == target[1] else target[1], store, row)
     elif isinstance(target, tuple) and target[0] == "more":
         toggle_lane(state, target[1])
 
 
-# Click targets that select an explanation instead of acting.
-EXPLAINED = frozenset({"role", "squirrel"})
+# Click targets that select an explanation instead of acting. An acorn explains its issue
+# in the orchestrator's bubble while every lane stays visible (no box, no scroll change).
+EXPLAINED = frozenset({"acorn", "role", "squirrel"})
+
+
+def _select(state: dict[str, Any], target: tuple[str, Any]) -> None:
+    """Select ``target``; the selected one again clears the selection."""
+    if state.pop("explanation_target", None) != target:
+        state["explanation_target"] = target
 
 
 def toggle_lane(state: dict[str, Any], slug: str) -> None:
@@ -145,7 +146,8 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
                repo_root: Path | None = None, confirm: Callable[[str], bool] | None = None) -> bool:
     """Act on one key name; True asks the view to quit.
 
-    j/k (and the arrows) move one row, Enter opens the highlighted row's box, f folds
+    j/k (and the arrows) move one row, Enter explains (or, again, stops explaining) the
+    highlighted row's acorn, f folds
     its lane, a unfolds every lane when any is folded (else folds all), o switches to
     the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the selected
     explanation, else the box (Esc quits when neither is open). While a
@@ -206,7 +208,8 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         if row is None:
             return False
         if key == "enter":
-            _open(state, dict(state.get("rows", ()))[row], store, row)
+            # The highlighted acorn is explained, as a click on it would be.
+            _select(state, ("acorn", dict(state.get("rows", ()))[row]))
         elif (slug := state.get("row_lanes", {}).get(row)) is not None:
             watch.toggle_lane(state, slug)
     return False
