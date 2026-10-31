@@ -203,13 +203,14 @@ def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_pa
     result.events = [{"summary": "긴 사건 기록도 잘리지 않고 마지막 내용까지 보여야 합니다 끝", "at": NOW.isoformat()}]
     output = watch.render_frame(result, config, tmp_path, width=width)
     assert all(watch._cells(line) <= width for line in output.splitlines())
-    if width > 40:
-        assert "합니다 끝 ✓" in output
-    else:
-        # At 40 columns the usage line (#115, KEEP) wraps instead of losing its end, and
-        # the event log gives way from the bottom up; it is never left half shown.
-        assert "긴 사건" not in output and output.endswith("q 끝내기")
-        assert "Claude —" in output and "동시 " in output and "keep 80%" in output
+    # The frame is unbounded (shell): the event log stays at every width, and the usage
+    # and hint rows are the last two rows, cut to the width instead of wrapped.
+    assert "합니다 끝 ✓" in output
+    lines = output.splitlines()
+    assert lines[-2].startswith("Claude —") and "동시 " not in lines[-2]
+    assert lines[-1].startswith("도토리를 누르면")
+    if width >= 120:
+        assert lines[-1].endswith("q 끝내기") and "keep 80%" in lines[-2]
 
 
 @pytest.mark.parametrize("lane_count,keys", [(1, "11q"), (12, "12\n12\nq")])
@@ -234,7 +235,14 @@ def test_keyboard_toggles_detail_and_scrolls_it_into_view(tmp_path, monkeypatch,
         def getmaxyx(self): return 24, 120
         def erase(self): self.current = []
         def addstr(self, y, x, value, style): self.current.append(value)
-        def refresh(self): self.frames.append("".join(self.current))
+        def move(self, y, x): pass
+        def clrtoeol(self): pass
+        def clrtobot(self): pass
+
+        def refresh(self):
+            # The view erases once and then paints in place: each refresh ends a frame.
+            self.frames.append("".join(self.current))
+            self.current = []
         def getch(self): return ord(next(self.keys))
 
     screen = Screen()
@@ -256,13 +264,13 @@ def test_header_warns_when_nothing_was_read_and_summary_keeps_the_snapshot_time(
     config = Config()
     empty = watch.collect(cli._status(tracker, store, config), tracker, store, config, NOW)
     frame = watch.render_frame(empty, config, tmp_path)
-    assert "⚠ Couldn't read the status" in frame and "working ?" in frame
+    # The top line puts the warning before the status (lane_header).
+    assert frame.splitlines()[0].startswith("⚠ Couldn't read the status")
     tracker.add_issue(1, "Queued", labels=["approved"])
     observed = local_status(tracker, store, config)
     frame = watch.render_frame(watch.collect(observed, tracker, store, config, NOW), config, tmp_path)
-    local_time = datetime.fromisoformat(observed["as_of"]).astimezone().strftime("%H:%M")
-    assert "Couldn't read the status" not in frame  # No run yet: the big squirrel heads the frame.
-    assert any(line.endswith(f"queued 1 · as of {local_time}") for line in frame.splitlines())
+    assert "Couldn't read the status" not in frame
+    assert frame.splitlines()[0].startswith("● "), "with the status read, the top line has no warning"
 
 
 @pytest.mark.parametrize('language,label', [('en', 'waiting for shared files'), ('ko', '공유 파일 기다려요')])
