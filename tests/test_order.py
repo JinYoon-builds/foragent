@@ -2230,3 +2230,81 @@ def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(pub
     tracker.add_labels(1, ["by:human"])  # A person restores the owner; publication continues.
     assert order.publish(plan, root, config, tracker, repo="owner/repo", git=git).parent == 1
     assert len(tracker.issues) == 3
+
+
+def _budget_case(tmp_path, monkeypatch, budget):
+    """One store in a private machine root with ``budget`` slots and a calm machine."""
+    from datetime import UTC, datetime
+    from foragent import capacity
+
+    store = StateStore(tmp_path / "machine" / "owner__project")
+    store.root.mkdir(parents=True)
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    capacity.write_state(store, budget, datetime.now(UTC))
+    return store
+
+
+def test_perspectives_seat_without_a_slot_in_time_fails_in_the_configured_language(
+        tmp_path, monkeypatch, capsys, fake_process_table):
+    import shutil
+    from foragent import capacity, executors, order_perspectives
+
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree=sibling.worktree_path(99), pid=capacity.os.getpid())
+    clock = [0.0]
+    monkeypatch.setattr(capacity.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: pytest.fail("no seat may start without a slot"))
+    result = order_perspectives.run({"id": "p"}, tmp_path, Config(language="ko"), store)
+    assert result["questions"] == []
+    assert len(result["failures"]) == len(order_perspectives.SEATS)
+    assert all("시작하지 못했어요" in failure["error"] and "기계 여유" in failure["error"]
+               for failure in result["failures"])
+    err = capsys.readouterr().err
+    assert f"관점 자리 {len(order_perspectives.SEATS)}개" in err and "남은 칸은 0개" in err
+    assert capacity.machine_runs(store, capacity.datetime.now(capacity.UTC)) == 1  # Only the sibling's run.
+
+
+def test_perspectives_wave_notice_only_when_seats_outnumber_free_slots(tmp_path, monkeypatch, capsys):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.executors import ExecResult
+
+    class Worker:
+        def run(self, **kwargs):
+            return ExecResult(0, False, "NONE", kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    seats = len(order_perspectives.SEATS)
+    store = _budget_case(tmp_path / "wide", monkeypatch, seats)
+    (store.root.parent / "machine.yml").write_text(f"max_parallel: {seats}\n")
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    assert capsys.readouterr().err == ""
+    store = _budget_case(tmp_path / "narrow", monkeypatch, 2)
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    err = capsys.readouterr().err
+    assert f"{seats} perspective seats" in err and "2 free slot(s)" in err and f"{-(-seats // 2)} wave(s)" in err
+
+
+def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, monkeypatch, capsys,
+                                                   fake_process_table):
+    from foragent import capacity
+
+    root, config = publishing[0], publishing[1]
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree="other", pid=capacity.os.getpid())
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: sibling.active_runs() and sibling.finish_run(99, "merged"))
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    assert len(order.preread(plan, root, config)) == len(plan["issues"]) > 1
+    err = capsys.readouterr().err
+    assert f"Each of the {len(plan['issues'])} issues is read in its own turn" in err
+    assert "Waiting for machine capacity" in err
+    order.preread(plan, root, config)  # A free slot: no notice.
+    assert "own turn" not in capsys.readouterr().err
