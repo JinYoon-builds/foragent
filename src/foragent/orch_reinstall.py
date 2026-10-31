@@ -57,14 +57,18 @@ def _reinstall(ctx: "RunContext", base: str) -> str | None:
     return f"reinstalled Foragent {sha}; installed package matches merged source"
 
 
-def after_merge(ctx: "RunContext", pr: int, base: str) -> None:
-    """Keep the successful merge even if installing or verifying fails."""
+def after_merge(ctx: "RunContext", pr: int, base: str) -> Exception | None:
+    """Keep the successful merge even if installing or verifying fails; return that failure.
+
+    A run uses the returned error to record a refused credential against its issue (#1208).
+    """
     try:
         message = _reinstall(ctx, base)
     except Exception as exc:
         reason = " ".join(str(exc).split()) or type(exc).__name__
         print(f"reinstall failed: {reason}")
         append_event(ctx.store, ctx.now(), None, "reinstall-failed", f"PR #{pr}: {reason}")
+        return exc
     else:
         if message is not None:
             print(message)

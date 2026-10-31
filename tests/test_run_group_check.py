@@ -124,4 +124,4 @@ def test_refused_credential_while_combining_ends_the_run_but_other_git_errors_ar
     message[0] = "fatal: merge-tree conflict"
     group.check(5, ctx, place, "h5", "other-sha", set())
     log = ctx.store.log_path(5).read_text()
-    assert "group check failed" in log and "merge-tree conflict" in log and "publickey" not in log
+    assert "group check void" in log and "merge-tree conflict" in log and "publickey" not in log

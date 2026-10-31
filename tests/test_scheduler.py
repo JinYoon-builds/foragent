@@ -3187,7 +3187,12 @@ def test_auth_failed_issue_waits_for_orch_retry_instead_of_restarting(ctx, label
     assert launches == []
     assert ctx.tracker.get_issue(1).labels == {"approved"}
     assert [run.outcome for run in ctx.store.read_history() if run.number == 1] == ["auth-failed"]
-    ctx.tracker.add_labels(1, ["ready"])  # what `fa orch retry` does
+    ctx.tracker.add_labels(1, ["ready"])  # a ready label alone (the runner's limit wait adds one too)
+    tick(ctx)
+    assert launches == [], "a ready label without `fa orch retry` restarted the auth-failed issue"
+    from foragent.orch_events import append_event
+
+    append_event(ctx.store, ctx.now(), 1, "retry", "#1: queued implementation retry")  # what `fa orch retry` journals
     tick(ctx)
     assert launches == [1]
 
@@ -3216,7 +3221,10 @@ def test_orch_retry_over_a_stale_running_label_starts_the_auth_failed_issue(ctx)
     ctx.now = lambda: NOW + timedelta(minutes=1)
     ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
     ctx.store.finish_run(1, "auth-failed", detail="authentication failed after 3 attempts: x")
+    from foragent.orch_events import append_event
+
     ctx.tracker.add_labels(1, ["ready"])  # `fa orch retry` before any tick
+    append_event(ctx.store, NOW + timedelta(minutes=1, seconds=30), 1, "retry", "#1: queued implementation retry")
     ctx.now = lambda: NOW + timedelta(minutes=2)
     launches = []
     ctx.launcher = lambda number: launches.append(number) or 7001

@@ -57,3 +57,53 @@ def finish(n: int, ctx: RunContext, exc: BaseException, label: str | None) -> tu
             append_event(ctx.store, ctx.now(), n, "cleanup-failed",
                          f"running label removal failed: {auth_retry.first_line(str(error))}")
     return result, detail
+
+
+def _events_since(store, n: int, since: str) -> list[dict]:
+    """This issue's journal events at or after ``since`` (the run's start)."""
+    path = store.root / "orch-events.jsonl"
+    try:
+        start = datetime.fromisoformat(since)
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, ValueError, TypeError):
+        return []
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+            if event.get("issue") == n and datetime.fromisoformat(event["at"]) >= start:
+                events.append(event)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return events
+
+
+def recorded_detail(ctx: RunContext, n: int) -> str:
+    """The reason ``finish`` recorded for this execution, derived from the journal, or ""."""
+    run = ctx.store.get_run(n)
+    if run is None:
+        return ""
+    reasons = [event["summary"] for event in _events_since(ctx.store, n, run.started_at) if event["kind"] == OUTCOME]
+    return reasons[-1] if reasons else ""
+
+
+def held(store, n: int, approved_at: str) -> bool:
+    """An auth-failed execution waits for `fa orch retry` (its journal event) or a newer approval.
+
+    A ``ready`` label proves nothing: the runner's own limit wait adds one too.
+    """
+    run = store.get_run(n)
+    if run is None or run.outcome != OUTCOME:
+        return False
+    try:
+        if datetime.fromisoformat(approved_at) > datetime.fromisoformat(run.started_at):
+            return False
+    except (TypeError, ValueError):
+        return True
+    return not any(event["kind"] == "retry" for event in _events_since(store, n, run.started_at))
+
+
+def record_after(n: int, ctx: RunContext, failure: object) -> None:
+    """Record a refused credential in a step after the merge (the reinstall's fetch); the run stays merged."""
+    if is_auth_failure(failure):
+        finish(n, ctx, failure, None)

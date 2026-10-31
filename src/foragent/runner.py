@@ -345,15 +345,17 @@ def review_only(
         detail = str(exc)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
+        labeled = started  # `running` is added right after the record starts
         if not started:
-            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+            # A refused credential before the start still leaves a record, a reason and an event.
+            if not (isinstance(exc, TrackerError) and exc.is_rate_limit or run_auth_failed.is_auth_failure(exc)):
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
         if run_auth_failed.is_auth_failure(exc):
-            (outcome, detail), auth_ended = run_auth_failed.finish(n, ctx, exc, RUNNING), True
+            (outcome, detail), auth_ended = run_auth_failed.finish(n, ctx, exc, RUNNING if labeled else None), True
         elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome = "limit-wait"
         else:
@@ -385,7 +387,7 @@ def review_only(
                         outcome = "limit-wait"
                 finally:
                     try:
-                        ctx.store.finish_run(n, outcome=outcome, detail=detail)
+                        ctx.store.finish_run(n, outcome=outcome, detail=detail or run_auth_failed.recorded_detail(ctx, n))
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
@@ -449,7 +451,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
         try:
             run = ctx.store.get_run(n)
             if run is not None and run.status != "finished":
-                ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
+                ctx.store.finish_run(n, outcome=run.outcome or outcome,
+                                     detail=detail or run_auth_failed.recorded_detail(ctx, n))
         finally:
             kick_tick(ctx.repo_root)
     return outcome

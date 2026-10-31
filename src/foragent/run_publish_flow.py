@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import harness_guard, run_group_check, runner
+    from foragent import harness_guard, run_group_check, run_group_evidence, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -178,6 +178,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         ctx.git.fetch("origin", attempt.target_branch)
         target_sha = git.ref_sha(f"origin/{attempt.target_branch}")
         if target_sha != verified_base_sha:
+            run_group_evidence.note(n, ctx, verified_head_sha, target_sha)  # recorded only; no reuse yet
             target_sha = refresh_base(run_publish.capture_move(git, target_sha))
             if stopped := publish_refresh(target_sha):
                 return stopped
@@ -230,9 +231,10 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     else:
                         failed_merge = exc
                 else:
+                    run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
                     if inputs.decision.kind == "merge":
-                        runner.after_merge(ctx, pr, attempt.target_branch)
+                        run_publish.run_auth_failed.record_after(n, ctx, runner.after_merge(ctx, pr, attempt.target_branch))
                     run_publish._progress(n, ctx)
                     try:
                         if attempt.target_branch == attempt.batch_branch:

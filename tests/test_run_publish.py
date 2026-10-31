@@ -1217,7 +1217,7 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert "retitle failed" in log and "HTTP 500" in log
 
 
-def _merge_batch_then_tick(c):
+def _merge_batch_then_tick(c, before_tick=lambda: None):
     """Merge the batch PR right after runner finalization, before any gate tick."""
     from foragent.scheduler import TickContext, tick
 
@@ -1227,6 +1227,7 @@ def _merge_batch_then_tick(c):
     assert not CLOSING_KEYWORD.search(batch.body), "A batch PR merge must not close the order parent"
     c.tracker.merge_pr(batch.number, expected_head_sha=c.tracker.pr_head_sha(batch.number))
     assert c.tracker.get_issue(99).state == "open"
+    before_tick()
     context = TickContext(
         repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
         config=c.ctx.config, git=c.ctx.git, now=c.ctx.now,
@@ -1237,7 +1238,7 @@ def _merge_batch_then_tick(c):
 
 
 def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(run_case):
-    from foragent.i18n import text
+    from foragent.board_parents import closing_comment
     from foragent.scheduler import tick
 
     c = run_case
@@ -1246,7 +1247,7 @@ def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(ru
     context = _merge_batch_then_tick(c)
     parent = c.tracker.get_issue(99)
     assert parent.state == "closed", "The gate closes the order once every child is done"
-    completion = text("order_record_closed", c.ctx.config.language, count=1)
+    completion = closing_comment(c.ctx.config.language, [1], [])
     added = c.tracker.list_comments(99)[len(before):]
     assert [comment.body for comment in added].count(completion) == 1
     tick(context)
@@ -1256,16 +1257,33 @@ def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(ru
 
 
 def test_batch_pr_merge_keeps_a_parent_with_a_not_planned_child_open_and_flagged(run_case):
+    """While another child is open, a not-planned child flags the order; the last child's end closes it."""
     from dataclasses import replace as replace_issue
+    from datetime import timedelta
 
-    from foragent.board_parents import NOT_PLANNED_FLAG
+    from foragent.board_parents import NOT_PLANNED_FLAG, closing_comment
+    from foragent.scheduler import tick
 
     c = run_case
     batch_setup(c)
     dropped = c.tracker.add_issue(3, "Dropped part", state="closed")
     c.tracker.issues[3] = replace_issue(dropped, state_reason="not_planned")
     c.tracker.set_parent(3, 99)
-    _merge_batch_then_tick(c)
-    assert c.tracker.get_issue(99).state == "open", "A not-planned child keeps the order open"
+
+    def open_sibling():  # Added after the batch so the batch PR still opens for its finished child.
+        c.tracker.add_issue(4, "Later part")
+        c.tracker.set_parent(4, 99)
+
+    context = _merge_batch_then_tick(c, open_sibling)
+    assert c.tracker.get_issue(99).state == "open", "A not-planned child with an open sibling keeps the order open"
     flag = c.store.load_flag(99)
     assert flag is not None and flag.reason == NOT_PLANNED_FLAG
+
+    before = c.tracker.list_comments(99)
+    c.tracker.close_issue(4)
+    clock = context.now()
+    context.now = lambda: clock + timedelta(minutes=6)  # Past the listing refresh interval.
+    tick(context)
+    assert c.tracker.get_issue(99).state == "closed", "A cancelled child counts as ended once nothing is open"
+    added = [comment.body for comment in c.tracker.list_comments(99)[len(before):]]
+    assert added == [closing_comment(c.ctx.config.language, [1, 4], [3])]

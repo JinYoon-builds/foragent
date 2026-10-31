@@ -134,7 +134,7 @@ def _issue(ctx: RunContext, n: int) -> Issue:
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
 
-    if run_is_live(ctx.store.get_run(n)):  # The same rule as fa orch stop (#435).
+    if run_is_live(ctx.store.get_run(n)):  # Live workers, as the status lane row (#435).
         raise OrchError(f"issue #{n} is running; wait for its runner to finish")
     return issue
 
