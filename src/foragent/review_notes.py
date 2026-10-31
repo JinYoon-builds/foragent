@@ -112,7 +112,7 @@ def for_architect(store: StateStore, role: str = "architect") -> list[dict]:
     events = _events(store)
     since = None
     for event in events:
-        if event.get("kind") == f"{role}-done":
+        if event.get("kind") == f"{role}-done" and event.get("exit_code") == 0:
             started = _when(event.get("started_at"))
             if started is not None and (since is None or started > since):
                 since = started
