@@ -3,8 +3,10 @@
 Sprites follow docs/design/lane-view-sketch/cast.py. Pixels are palette keys or
 None (transparent); half-block cells carry glyph, foreground and background.
 A None colour means an unpainted pixel (the terminal background), including
-when only the bottom pixel is painted. Only the upper half-block and ASCII are
-used. Consumers must map transparent foregrounds to the terminal background.
+when only the bottom pixel is painted. half_blocks keeps that data shape (an
+upper half-block with a None foreground); the serializers pixel_rows and
+ansi_rows draw such a cell as a lower half-block in the bottom colour, so its
+upper half stays the terminal background.
 """
 
 from collections.abc import Mapping, Sequence
