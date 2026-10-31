@@ -187,6 +187,14 @@ def local_issue_models(store) -> list[Issue]:
             for row in store.local_issues()]
 
 
+class WriteRefused(TrackerError):
+    """A PR write refused at the write boundary: its issue belongs to another factory (#1004)."""
+
+
+# What `_write` returns for a refused write: no result, nothing queued, no local effect.
+_REFUSED = {"id": 0, "refused": True}
+
+
 class RecordingTracker:
     """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
 
@@ -407,6 +415,22 @@ class RecordingTracker:
             raise
         return False
 
+    def _refused(self, n):
+        """The write boundary (#1004): the refusal for a write on ``#n`` now, recorded locally.
+
+        A run's own guard (orch_scope.RunTracker) raises instead, so a run stops.
+        """
+        from foragent import orch_scope
+
+        if isinstance(self._tracker, orch_scope.RunTracker):
+            return None
+        if (refusal := orch_scope.write_refusal(self._context, self._tracker, n)) is not None:
+            from foragent.orch_events import append_event
+
+            append_event(self._context.store, self._context.now(), n, "write-refused",
+                         f"#{n}: GitHub write not sent: {refusal}")
+        return refusal
+
     def _write(self, n, action, operation, **payload):
         store = self._context.store
         pending = store.github_outbox()
@@ -414,6 +438,8 @@ class RecordingTracker:
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
             return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
         try:
+            if self._refused(n) is not None:
+                return None, _REFUSED  # Nothing sent, so no local effect either.
             return operation(), None
         except TrackerError as exc:
             if not self.queue_writes or not exc.is_rate_limit:
@@ -548,12 +574,18 @@ class RecordingTracker:
             self._record_pr(pr.number, pr.head, pr.base, merged=pr.merged_at is not None)
         return prs
 
+    def _require(self, n):
+        if n is not None and (refusal := self._refused(n)) is not None:
+            raise WriteRefused(refusal)
+
     def create_pr(self, *, head, base, title, body):
+        self._require(pr_issue_number(head))
         pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
         self._record_pr(pr, head, base)
         return pr
 
     def update_pr(self, pr, *, base, title, body):
+        self._require(pr)
         self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
 
@@ -563,10 +595,12 @@ class RecordingTracker:
                 self._context.store.update_local_issue(row["number"], **fields)
 
     def close_pr(self, pr, comment=None):
+        self._require(pr)
         self._tracker.close_pr(pr, comment)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
     def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
+        self._require(pr)
         if subject is None:
             self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
         else:

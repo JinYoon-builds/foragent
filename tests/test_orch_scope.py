@@ -273,3 +273,48 @@ def test_a_malformed_owner_answer_is_no_permission_and_never_raises():
                           store=SimpleNamespace(local_issues=lambda: []))
     assert orch_scope.may_write(ctx, 1) is False
     assert "#1" in orch_scope.current_refusal(ctx, 1)
+
+
+def test_the_write_boundary_rereads_a_stale_cached_owner_before_any_label_or_comment(tmp_path):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice", "blocked"]), legacy="alice")
+    tracker.remove_labels(1, ["by:alice"])  # Relabelled to Bob after the last listing.
+    tracker.add_labels(1, ["by:bob"])
+    recorder.add_labels(1, ["needs-human"])
+    recorder.comment(1, "<!-- foragent:needs-human reason=orchestrator-timeout -->")
+    recorder.close_issue(1, "closing")
+    issue = tracker.get_issue(1)
+    assert "needs-human" not in issue.labels and issue.state == "open" and tracker.list_comments(1) == []
+    row = next(row for row in store.local_issues() if row["number"] == 1)
+    assert "needs-human" not in row["labels"] and row["state"] == "open" and row["comments"] == []
+    events = (store.root / "orch-events.jsonl").read_text()
+    assert events.count('"write-refused"') == 3
+
+
+def test_the_write_boundary_lets_own_writes_through(tmp_path):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
+    recorder.add_labels(1, ["needs-human"])
+    recorder.comment(1, "Mine")
+    assert "needs-human" in tracker.get_issue(1).labels and [c.body for c in tracker.list_comments(1)] == ["Mine"]
+
+
+def test_a_queued_pr_comment_is_judged_by_its_linked_issue_without_a_team_setting(tmp_path):
+    store, tracker, recorder, now = flush_case(tmp_path, (1, ["by:alice"]))
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="t", body="b")
+    store.update_local_issue(1, pr_number=pr)
+    tracker.login = ""  # The signed-in account was lost: this factory cannot prove it is Alice's.
+    store.queue_github_write(pr, "comment", body="On the PR")
+    recorder.flush_outbox()
+    assert tracker.list_comments(pr) == []
+    assert [entry["issue"] for entry in store.refused_github_writes()] == [pr]
+
+
+def test_a_refused_queued_close_leaves_the_local_issue_open(tmp_path):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
+    store.queue_github_write(1, "close_issue", body="Done")
+    assert next(row for row in store.local_issues() if row["number"] == 1)["state"] == "closed"
+    tracker.remove_labels(1, ["by:alice"])
+    tracker.add_labels(1, ["by:bob"])
+    recorder.flush_outbox()
+    assert tracker.get_issue(1).state == "open"
+    row = next(row for row in store.local_issues() if row["number"] == 1)
+    assert row["state"] == "open", "Nothing was sent, so the local row returns to GitHub's facts"

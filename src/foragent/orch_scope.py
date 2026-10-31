@@ -136,21 +136,56 @@ def _unreadable(ctx, number: int, exc: Exception) -> str:
                 number=number, error=" ".join(str(exc).split())[:200])
 
 
+def _evidence_row(store, number: int) -> dict | None:
+    """The stored facts that decide ``#number``: a PR is judged by the issue it works.
+
+    A row that only a queued write created (no title, never listed) holds no facts.
+    """
+    rows = _rows(store)
+    row = next((row for row in rows if row.get("pr_number") == number and row["number"] != number), None)
+    if row is None:
+        row = next((row for row in rows if row["number"] == number), None)
+    if row is None or ("observed" not in row and not row.get("title") and not row.get("labels")):
+        return None
+    return row
+
+
 def stored_singleton(store, config, number: int) -> bool:
     """The unchanged single-factory path, decided without a new read.
 
     Team mode requires ``legacy_owner`` before a second factory joins (D78 revision,
     decision 2), so with no setting this factory is the only one and the facts already
-    held decide: a stored row with an owner (in local intent or in what the last
-    listing observed) still goes through the full check, anything else keeps today's
-    path. With ``legacy_owner`` set, every effect reads the issue now.
+    held decide: stored facts with an owner (in local intent or in what the last
+    listing observed, a PR's through its linked issue) still go through the full
+    check; a target with no stored facts keeps today's path. With ``legacy_owner``
+    set, every effect reads the issue now.
     """
     if getattr(config, "legacy_owner", None) is not None:
         return False
-    row = next((row for row in _rows(store) if row["number"] == number), None)
+    row = _evidence_row(store, number)
     if row is None:
         return True
-    return all(singleton(_model(number, facts), config) for facts in (row, row.get("observed") or row))
+    return all(singleton(_model(row["number"], facts), config) for facts in (row, row.get("observed") or row))
+
+
+def write_refusal(context, tracker, number: int) -> str | None:
+    """The refusal for one GitHub write on ``#number`` (issue or PR) right before it is sent.
+
+    The write boundary every comment, label, close and audit write passes: fresh facts,
+    a PR resolved to its linked issue, any failed or malformed read refuses; a rate
+    limit propagates to the caller's own wait. The unchanged single-factory path with
+    stored facts reads nothing.
+    """
+    if stored_singleton(context.store, context.config, number):
+        return None
+    ctx = SimpleNamespace(store=context.store, config=context.config, tracker=tracker)
+    try:
+        issue = current_issue(ctx, number, tracker)
+    except Exception as exc:
+        if _rate_limited(exc):
+            raise
+        return _unreadable(ctx, number, exc)
+    return None if issue is None else foreign_reason(issue, context.config, tracker)
 
 
 def current_refusal(ctx, number: int) -> str | None:

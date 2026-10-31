@@ -311,5 +311,9 @@ def _refuse(snapshot: dict[str, Any], reasons: dict[int, str], at: str) -> int:
         snapshot["outbox"] = [entry for entry in pending if entry["issue"] not in reasons]
         snapshot.setdefault("outbox_refused", []).extend(moved)
         for number in reasons:
-            snapshot.get("outbox_base", {}).pop(str(number), None)
+            # The row showed the queued writes' optimistic effect; none was sent, so it
+            # returns to the facts before them (advanced only by delivered writes).
+            base = snapshot.get("outbox_base", {}).pop(str(number), None)
+            if base is not None and str(number) in snapshot.get("issues", {}):
+                snapshot["issues"][str(number)] = {**base, "revision": snapshot.get("revision", 0) + 1}
     return len(moved)

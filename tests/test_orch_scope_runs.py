@@ -252,3 +252,20 @@ def test_a_start_check_never_writes_to_an_issue_that_changed_hands(monkeypatch):
     assert scheduler_start._start_checks(ctx, 1, "main", lambda issue, lane: True, "origin/main",
                                          SimpleNamespace(actions=[])) is None
     assert checked == [] and tracker.list_comments(1) == []
+
+
+def test_rerun_review_posts_no_audit_comment_after_the_owner_changed(git_history, tmp_path, monkeypatch):
+    from foragent import orch
+
+    case = owned_case(git_history, tmp_path, monkeypatch)
+    case.store.finish_run(1, outcome="blocked")
+    case.tracker.remove_labels(1, ["running"])
+
+    def handover(n, ctx, **kwargs):
+        relabel(case.tracker, "bob")
+        return "refused"
+
+    monkeypatch.setattr(orch, "review_only", handover)
+    comments = list(case.tracker.list_comments(1))
+    orch.rerun_review(case.ctx, 1)
+    assert case.tracker.list_comments(1) == comments
