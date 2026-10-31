@@ -55,7 +55,8 @@ instead, the lane dreams again from the current base, over the same runs.
   as written on its branch. `fa orch merge` compares the current base and PR head with them. A
   change (a hand edit of `MEMORY.md` on the base, or a PR head that is no longer the dream's work)
   makes the PR stale: `fa orch merge` refuses it, or one with no recorded digests, and names the
-  changed files. Close it with that reason; the lane dreams again from the current base.
+  changed files. Run `fa orch dream --redo <lane>` and record that reason with
+  `fa orch note --why "<reason>"`; the lane dreams again from the current base.
 
 ## Moving a project to the split
 
