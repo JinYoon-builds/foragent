@@ -9,9 +9,10 @@ import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
+import sys
 from urllib.parse import quote
 
-from foragent import board, design, order_references, ownership
+from foragent import board, capacity, design, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -881,19 +882,25 @@ def _preread_lines(message: str) -> list[str]:
     return [line for line in lines if line and line != "NONE"]
 
 
+_TAG = re.compile(r"(?i)^(APPROACH|DECIDE|QUESTION):\s*")
+
+
 def _unknowns(message: str) -> list[str]:
-    """QUESTION lines, and unprefixed lines as before; the lane's APPROACH and DECIDE lines do not block."""
-    unknowns = []
-    for line in _preread_lines(message):
-        if re.match(r"(?i)^(?:APPROACH|DECIDE):", line):
-            continue
-        unknowns.append(re.sub(r"(?i)^QUESTION:\s*", "", line))
-    return unknowns
+    """What blocks approval. Once any line carries a tag, only QUESTION lines do and the
+    unprefixed lines are notes; an all-plain reply keeps every line as an unknown."""
+    lines = _preread_lines(message)
+    if not any(_TAG.match(line) for line in lines):
+        return lines
+    return _tagged(message, "QUESTION")
 
 
 def _tagged(message: str, tag: str) -> list[str]:
-    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
-            if re.match(rf"(?i)^{tag}:", line)]
+    tagged = []
+    for line in _preread_lines(message):
+        match = _TAG.match(line)
+        if match and match.group(1).upper() == tag:
+            tagged.append(line[match.end():])
+    return tagged
 
 
 def _decisions(message: str) -> list[str]:
@@ -1023,6 +1030,10 @@ def preread(plan: dict, root: Path, config: Config,
         raise PlanError(f"{ignore} must be a regular file, not a symlink")
     if not ignore.exists():
         ignore.write_text("*\n", encoding="utf-8")
+    store = _workload_store(root, repo or config.repo)
+    language = (getattr(config, "language", None) or "en").lower().split("-")[0]
+    if len(items) > 1 and _free_slots(store) < 1:
+        print(text("preread_turns_wait", language, count=len(items)), file=sys.stderr, flush=True)
     results = []
     for item in items:
         # Each reader gets its own snapshot directory, never the references' destination.
@@ -1032,9 +1043,18 @@ def preread(plan: dict, root: Path, config: Config,
             log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
             if log.is_symlink():
                 log.unlink()
-            result = executor_for(setup.executor).run(
-                worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
-                log_path=log, read_only=True, **setup.options)
+            admitted = False
+            try:
+                # Each turn is one agent: it holds one shared machine slot only while it runs.
+                with capacity.hold_workload(store, config, kind="preread", role=item["key"]):
+                    admitted = True
+                    result = executor_for(setup.executor).run(
+                        worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+                        log_path=log, read_only=True, **setup.options)
+            except TimeoutError as exc:
+                if admitted:
+                    raise
+                raise PlanError(str(exc)) from exc
         finally:
             order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
@@ -1056,6 +1076,20 @@ def preread(plan: dict, root: Path, config: Config,
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
     return results
+
+
+def _workload_store(root: Path, repo: str | None) -> StateStore:
+    """The state store whose machine slots this planning agent counts in; a repository-less root gets its own."""
+    if not repo:
+        repo = f"local/{root.name}-{hashlib.sha256(str(root.resolve()).encode('utf-8')).hexdigest()[:12]}"
+    store = StateStore.for_repo(repo)
+    store.root.mkdir(parents=True, exist_ok=True)  # The machine scan reads its parent; a first run has none.
+    return store
+
+
+def _free_slots(store: StateStore) -> int:
+    """Machine slots free right now; only for telling the person why a turn may wait."""
+    return capacity.workload_budget(store) - len(capacity.machine_holders(store, datetime.now(UTC), live=True))
 
 
 def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[list[str], list[str]]:
