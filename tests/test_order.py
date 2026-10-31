@@ -2339,9 +2339,9 @@ def test_waiting_section_is_read_raw_and_ends_at_the_next_heading():
     assert order_waiting.section(body) == "Reason: A\n### Detail\nNext: B"
     assert order_waiting.section("## Waiting\nNone.\n<!-- foragent:child plan=p key=k -->") == "None."
     assert order_waiting.section("## Goal\nNo wait.") is None
-    line = order_waiting.comment_line("0" * 64, "Reason: A\nNext: B")
+    line = order_waiting.comment_line("0" * 64, "1" * 32, "Reason: A\nNext: B")
     assert len(line.splitlines()) == 1 and line.startswith("Waiting: Reason: A · Next: B <!--")
-    assert "cleared" in order_waiting.comment_line("0" * 64, None)
+    assert "cleared" in order_waiting.comment_line("0" * 64, "1" * 32, None)
 
 
 def test_bodies_without_a_wait_change_are_written_unchanged():
@@ -2646,3 +2646,72 @@ def test_cleared_hand_written_wait_is_announced_after_a_failed_comment(publishin
 def order_waiting_section(body):
     from foragent import order_waiting
     return order_waiting.section(body)
+
+
+def test_repeating_a_change_after_a_hand_restore_comments_again():
+    """A→B is announced, a person restores A by hand, publication writes B again: a new change."""
+    issue = _WaitIssue()
+    issue.write("## Waiting\nA\n")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 2
+    issue.body = issue.body.replace("## Waiting\nB", "## Waiting\nA")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 3 and issue.lines()[-1].startswith("Waiting: B ")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 3
+
+
+def test_repeated_clearing_after_a_hand_restore_comments_each_time():
+    issue = _WaitIssue("## Waiting\nHold\n")
+    issue.write("## Goal\nDone.\n")
+    issue.body = issue.body.replace("## Goal\nDone.\n", "## Goal\nDone.\n\n## Waiting\nHold\n")
+    issue.write("## Goal\nDone.\n")
+    assert [line.split(" <!--")[0] for line in issue.lines()] == ["Waiting cleared.", "Waiting cleared."]
+
+
+@pytest.mark.parametrize("path", ["child", "edit"])
+def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan, path):
+    root, config, tracker, git, _ = publishing
+    a, b = "\n\n## Waiting\nReason: A\n", "\n\n## Waiting\nReason: B\n"
+    if path == "child":
+        plan["issues"] = plan["issues"][:1]
+        base = plan["issues"][0]["goal"]
+        item, changed = plan["issues"][0], plan
+    else:
+        body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+        tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"])
+        base, item = "Ship.", {"number": 70, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [item]}
+    item["goal"] = base + a
+    publish(publishing, changed)
+    number = 70 if path == "edit" else next(i.number for i in tracker.list_issues() if i.title == "Login API")
+    item["goal"] = base + b
+    publish(publishing, changed)
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title, body=issue.body.replace("Reason: B", "Reason: A"))
+    publish(publishing, changed)
+    lines = [c.body.split(" <!--")[0] for c in tracker.list_comments(number) if "foragent:waiting" in c.body]
+    assert lines == ["Waiting: Reason: A", "Waiting: Reason: B", "Waiting: Reason: B"]
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(number) if "foragent:waiting" in c.body]) == 3
+
+
+def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(publishing, plan):
+    """The edit comment names this write; rewriting over a hand edit is not the old revision."""
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"])
+    edit = {"number": 70, "goal": "Ship it.", "out_of_scope": "Other.", "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    publish(publishing, changed)
+    publish(publishing, changed)
+    revisions = lambda: [c for c in tracker.list_comments(70) if "foragent:edit " in c.body]
+    assert len(revisions()) == 1
+    issue = tracker.get_issue(70)
+    tracker.update_issue(70, title=issue.title, body=issue.body.replace("Ship it.", "Ship it by hand."))
+    tracker.add_labels(70, ["approved"])
+    publish(publishing, changed)
+    assert "Ship it.\n" in tracker.get_issue(70).body and "approved" not in tracker.get_issue(70).labels
+    assert len(revisions()) == 2
+    publish(publishing, changed)
+    assert len(revisions()) == 2

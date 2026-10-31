@@ -780,6 +780,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         existing = tracker.get_issue(number)
         # An edit rewrites the whole body; the issue's owner-label contract survives it.
         body = order_waiting.stamp(existing.body, _with_contract(_published_body(plan, item, repo, config), existing.body))
+        # A rewrite gets its own id, so the revision comment below names this write: a body
+        # written back over a hand edit is a new change that comments, not an old one repeated.
+        body = order_waiting.mark_write(existing.body, body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
