@@ -133,8 +133,8 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
     the event) then runs under ``worktree_lock(n)``, the lock the tick's stall and runtime
     stop also take, with the opener lock inside it.
 
-    ``accepted(message)`` runs once the message is accepted (delivered to the running
-    worker, or given to a launched resume terminal), after the locks are released.
+    ``accepted(message)`` persists the issue-owned copy or publication intent before any
+    delivery effect. If persistence fails, the message is neither saved nor sent.
     """
     language = config.language
     root = (repo_root or Path.cwd()).resolve()
@@ -145,20 +145,27 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
     running = run.status == "running"
     if session is None and not (running and executor == "claude"):
         raise TalkError(text("talk_no_session", language, n=number))
-    sent = _deliver(store, run, number, executor, message, root, language) if running and message else ""
-    taken: list[bool] = []  # The message was accepted under the lock.
+    published = False
+
+    def accept():
+        nonlocal published
+        if message and accepted is not None and not published:
+            accepted(message)
+            published = True
+
+    sent = ""
+    if running and message:
+        accept()
+        sent = _deliver(store, run, number, executor, message, root, language)
     try:
         with store.worktree_lock(number, timeout=TALK_LOCK_WAIT), orch_spawn.watch_open._opening(store):
-            return _decide(number, message, store, config, root, now, sent, taken) or sent
+            return _decide(number, message, store, config, root, now, sent, accept) or sent
     except LockBusy as exc:
         raise TalkError(text("talk_busy", language, n=number), stdout=sent) from exc
-    finally:
-        if message and accepted is not None and (sent or taken):
-            accepted(message)
 
 
 def _decide(number: int, message: str | None, store: StateStore, config: Config, root: Path,
-            now: datetime | None, sent: str, taken: list[bool]) -> str:
+            now: datetime | None, sent: str, accept: Callable[[], None]) -> str:
     """Under the worktree and opener locks: re-show, report unknown, or launch and append the event."""
     language = config.language
     run = store.get_run(number)  # Read again under the lock: the run may have finished meanwhile.
@@ -169,8 +176,8 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         raise TalkError(text("talk_no_session", language, n=number), stdout=sent)
     if running and message and not sent:
         # The run started after talk's first read: deliver to the worker now, exactly once.
+        accept()
         sent = _deliver(store, run, number, executor, message, root, language)
-        taken.append(True)
     # A message already given to the worker (Codex queue or Claude hint) is never sent again as a
     # resume terminal's first prompt, even when the run finished between delivery and this read.
     prompt = None if sent else message
@@ -213,6 +220,8 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         return " ".join(filter(None, [sent, text("talk_manual", language, command=f"cd {shlex.quote(str(cwd))} && "
                                                   + shlex.join(command))]))
     trackable = opener["kind"] in {"orca", "tmux"}
+    if prompt and not running:
+        accept()
     try:
         handle = _launch(opener, cwd, title, command)
     except subprocess.SubprocessError as exc:
@@ -220,8 +229,6 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         if trackable:
             _opened(store, run, number, executor, mode, opener, title, None, now)
         raise TalkError(text("talk_open_unknown", language, n=number), stdout=sent) from exc
-    if prompt and not running:
-        taken.append(True)  # The resume terminal received the message as its first prompt.
     if trackable:
         _opened(store, run, number, executor, mode, opener, title, handle, now)
     opened = text("talk_log_opened" if running else "talk_resume_opened", language, n=number, screen=opener["kind"])

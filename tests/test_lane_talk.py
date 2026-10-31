@@ -1412,3 +1412,66 @@ def test_fa_takes_an_option_like_message_in_its_attached_form(store, tmp_path, m
     Terminals(monkeypatch)
     assert _cli(store, monkeypatch, tmp_path, "--message=--help", executor="claude") == 0
     assert (store.root / "hints/1.txt").read_text() == "--help" and "next attempt" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("mode", ["live", "resume", "started-between-reads"])
+def test_talk_records_publication_before_every_delivery_effect(
+    store, tmp_path, monkeypatch, executor, mode,
+):
+    session(store, executor, status="running" if mode == "live" else "blocked")
+    terminals = Terminals(monkeypatch)
+    message = "Keep  labels\n\n  exactly"
+    publication = []
+    if mode == "started-between-reads":
+        lock, started = store.worktree_lock, []
+
+        def start_then_lock(*args, **kwargs):
+            if not started:
+                started.append(True)
+                store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+                store.update_run(1, session_id="thread-2", session_executor=executor, session_stale=False)
+            return lock(*args, **kwargs)
+
+        monkeypatch.setattr(store, "worktree_lock", start_then_lock)
+    deliver, launch = lane_talk_open._deliver, lane_talk_open._launch
+    effects = []
+
+    def checked(effect):
+        def call(*args, **kwargs):
+            assert publication == [message]  # Actual boundary before append, queue or resume launch.
+            assert [entry["body"] for entry in store.github_outbox()] == [message]
+            effects.append(effect.__name__)
+            return effect(*args, **kwargs)
+        return call
+
+    monkeypatch.setattr(lane_talk_open, "_deliver", checked(deliver))
+    monkeypatch.setattr(lane_talk_open, "_launch", checked(launch))
+
+    def accept(body):
+        store.queue_github_write(1, "comment", body=body)
+        publication.append(body)
+
+    lanes.talk(1, message=message, store=store, config=config(executor=executor), repo_root=tmp_path,
+               accepted=accept)
+    assert publication == [message] and effects
+    assert len(terminals.opened()) == 1
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("status", ["running", "blocked"])
+def test_talk_publication_failure_prevents_local_acceptance_or_delivery(
+    store, tmp_path, monkeypatch, executor, status,
+):
+    session(store, executor, status=status)
+    terminals = Terminals(monkeypatch)
+
+    def refuse(message):
+        raise OSError("cannot persist publication")
+
+    with pytest.raises(OSError, match="cannot persist publication"):
+        lanes.talk(1, message="No private facts", store=store, config=config(executor=executor),
+                   repo_root=tmp_path, accepted=refuse)
+    assert not (store.root / "hints/1.txt").exists()
+    assert not terminals.opened()
+    assert not any(Path(argv[0]).name == "codex" for argv in terminals.calls)

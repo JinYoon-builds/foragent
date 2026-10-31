@@ -81,3 +81,73 @@ def test_retry_hint_reaches_the_issue_byte_for_byte(run_case):
     bodies = [comment.body for comment in c.tracker.list_comments(1)]
     assert any(hint in body for body in bodies), bodies
     assert (c.store.root / "hints/1.txt").read_text() == hint  # The worker receives the same bytes.
+
+
+@pytest.mark.parametrize("operation", ["find_pr", "close_pr", "add_labels", "remove_labels"])
+def test_retry_publishes_advice_before_any_fallible_transition(run_case, monkeypatch, operation):
+    c = run_case
+    _blocked(c)
+    c.tracker.create_pr(head="foragent/issue-1", base="main", title="Old", body="Old")
+    hint = "Keep  spacing\n\n  and indentation"
+
+    def refuse(*args, **kwargs):
+        # These operations must never see local deliverable advice without its public fact.
+        assert any(hint in comment.body for comment in c.tracker.list_comments(1))
+        raise TrackerError("HTTP 502: Bad Gateway")
+
+    monkeypatch.setattr(c.tracker, operation, refuse)
+    with pytest.raises(TrackerError, match="502"):
+        orch.retry(c.ctx, 1, hint)
+    assert (c.store.root / "hints/1.txt").read_text() == hint
+
+
+@pytest.mark.parametrize("entry", ["retry", "resolve-checks", "resolve-ci"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_every_retry_path_records_publication_before_hint_write(run_case, monkeypatch, entry, queued):
+    from foragent import run_previous
+
+    c = run_case
+    _blocked(c)
+    c.tracker.create_pr(head="foragent/issue-1", base="main", title="Old", body="Old")
+    hint = "Keep  spacing\n\n  and indentation"
+    append = run_previous.add_hint
+    seen = []
+
+    def check_before_save(store, number, message):
+        public = [comment.body for comment in c.tracker.list_comments(number)]
+        public += [body for _, body in _queued(store)]
+        assert any(message in body for body in public), public
+        seen.append(message)
+        append(store, number, message)
+
+    monkeypatch.setattr(orch, "add_hint", check_before_save)
+    if queued:
+        comment = c.tracker.comment
+
+        def refuse_advice(number, body):
+            if number != 1 or body.startswith("<!-- foragent:orch-verdict "):
+                return comment(number, body)
+            raise TrackerError("HTTP 502: Bad Gateway")
+
+        monkeypatch.setattr(c.tracker, "comment", refuse_advice)
+    if entry == "retry":
+        orch.retry(c.ctx, 1, hint)
+    else:
+        outcome = "checks-failed" if entry == "resolve-checks" else "ci-failed"
+        monkeypatch.setattr(orch, "review_only", lambda *a, **kw: outcome)
+        orch.resolve(c.ctx, 1, "pass", hint)
+    assert len(seen) == 1 and seen[0].startswith(hint)
+
+
+def test_retry_does_not_accept_hint_when_publication_cannot_be_persisted(run_case, monkeypatch):
+    c = run_case
+    _blocked(c)
+
+    def refuse(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(c.tracker, "comment", refuse)
+    monkeypatch.setattr(c.store, "queue_github_write", refuse)
+    with pytest.raises(OSError, match="disk full"):
+        orch.retry(c.ctx, 1, "Must not become deliverable")
+    assert not (c.store.root / "hints/1.txt").exists()
