@@ -82,7 +82,7 @@ def test_reviewer_fanout_counts_each_simultaneous_session_and_merges_once(git_hi
     def review(**kw):
         with lock:
             index = len(reviews)
-            if index >= 3:
+            if index >= 4:  # #993 (2026-10-31, test owner): one reviewer per perspective (four defaults, #1167)
                 merges.append(kw)
                 assert active[0] == 0
                 return ExecResult(0, False, "VERDICT: PASS", kw["log_path"])
@@ -103,5 +103,5 @@ def test_reviewer_fanout_counts_each_simultaneous_session_and_merges_once(git_hi
 
     case.ctx.executor_factory = lambda _: SimpleNamespace(run=execute)
     assert runner.run_issue(1, case.ctx) == "merged"
-    assert maximum[0] == 2 and len(reviews) == 3 and len(merges) == 1
+    assert maximum[0] == 2 and len(reviews) == 4 and len(merges) == 1
     assert capacity.machine_runs(case.store, case.clock[0]) == 0
