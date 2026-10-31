@@ -10,9 +10,8 @@ from __future__ import annotations
 from datetime import datetime
 import json
 
-from foragent.actions import repeats
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, WAITING_PERSON
-from foragent.reasons import ORCH_MARKER
+from foragent.orch_transition import transition_state
 from foragent.state import StateStore
 
 
@@ -47,7 +46,7 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     from foragent import orch
     from foragent.tracker import RecordingTracker
 
-    orch._issue(ctx, n)
+    before = transition_state(ctx, n, orch._issue(ctx, n))
     why = orch._text(why, "why")
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     if for_person:
@@ -55,8 +54,8 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     # Park revokes admission; only a new approval (fa order publish) lets the gate start it again.
     tracker.remove_labels(n, [APPROVED, BLOCKED, NEEDS_HUMAN])
     summary = f"#{n}: parked" + (" for a person's decision" if for_person else "") + f"; why: {why}"
-    # Parking again for the same reason, with no newer orchestrator record, changes nothing public.
-    changed = not (is_parked(ctx.store, n) and repeats(ctx.store, n, orch.orch_record(summary), marker=ORCH_MARKER))
+    after = before.after(add=[WAITING_PERSON] if for_person else [], remove=[APPROVED, BLOCKED, NEEDS_HUMAN])
+    changed = before != after
     orch._event(ctx, n, "parked", summary, changed=changed)
     return summary
 
@@ -65,10 +64,10 @@ def unpark(ctx, n: int) -> str:
     from foragent import orch
     from foragent.tracker import RecordingTracker
 
-    orch._issue(ctx, n)
+    before = transition_state(ctx, n, orch._issue(ctx, n))
     if not is_parked(ctx.store, n):
         raise orch.OrchError(f"issue #{n} is not parked")
     RecordingTracker(ctx.tracker, ctx, queue_writes=True).remove_labels(n, [WAITING_PERSON])
     summary = f"#{n}: unparked"
-    orch._event(ctx, n, "unparked", summary)
+    orch._event(ctx, n, "unparked", summary, changed=before != before.after(remove=[WAITING_PERSON]))
     return summary

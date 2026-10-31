@@ -82,9 +82,10 @@ class LocalRecordsMixin:
         with self._state_lock():
             (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
-    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
+    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None,
+                  summary: str | None = None) -> None:
         self._write_mapping(self.root / "flags" / f"{number}.json", _state.Flag, {
-            "number": number, "reason": reason,
+            "number": number, "reason": reason, **({"summary": summary} if summary is not None else {}),
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
         })
 

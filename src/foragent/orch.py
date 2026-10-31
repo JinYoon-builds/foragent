@@ -17,12 +17,12 @@ import xml.etree.ElementTree as ET
 from foragent import capacity, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
-from foragent.actions import repeats
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
+from foragent.orch_transition import transition_state
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
 from foragent.reasons import ORCH_MARKER, comment_order, flag_marker, one_line
@@ -195,11 +195,10 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> bool:
-    """Queue a retry; True when it changes the pending hint."""
+def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+    """Queue a retry, preserving the branch and delivering its pending hint."""
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
-    changed = (path.read_text(encoding="utf-8") if path.is_file() else None) != hint
     if hint is not None:
         ctx.store._atomic_write(path, hint)
     else:
@@ -211,12 +210,13 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> bool:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
-    return changed
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
-    labels = _issue(ctx, n).labels
-    changed = _retry(ctx, n, hint) or READY not in labels or bool(labels & {BLOCKED, NEEDS_HUMAN})
+    before = transition_state(ctx, n, _issue(ctx, n))
+    after = before.after(add=[READY], remove=[BLOCKED, NEEDS_HUMAN], hint=hint)
+    _retry(ctx, n, hint)
+    changed = before != after
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say, changed=changed)
     kick_tick(ctx.repo_root)
@@ -267,7 +267,7 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
 
 def escalate(ctx: RunContext, n: int, summary: str, tried: str,
              options: list[str] | None = None, recommend: int | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
+    before = transition_state(ctx, n, _issue(ctx, n))
     summary, tried = _text(summary, "summary"), _text(tried, "tried")
     options = [_text(option, "option") for option in (options or [])]
     if recommend is not None and not 1 <= recommend <= len(options):
@@ -276,9 +276,12 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
-    body = one_line("<!-- foragent:needs-human reason=escalated -->", "\n".join(lines))
-    # The same escalation again (already needs-human with this newest flag) adds no comment.
-    changed = not repeats(ctx.store, n, body, {NEEDS_HUMAN})
+    question = "\n".join(lines)
+    body = one_line("<!-- foragent:needs-human reason=escalated -->", question)
+    after = before.after(add=[NEEDS_HUMAN], remove=[READY], blocked_reason=("escalated", question))
+    changed = before != after
+    if changed:
+        ctx.store.save_flag(n, "escalated", summary=question, flagged_at=ctx.now().astimezone(UTC).isoformat())
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     if changed:
         tracker.comment(n, body)

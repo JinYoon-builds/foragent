@@ -284,8 +284,12 @@ def test_a_board_rate_limit_after_ready_keeps_running_for_the_retry_and_records_
     assert "running" in case.ctx.tracker.issue.labels, "Orphan recovery still finds the issue"
     _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())  # The next tick's retry.
     assert len(_stops(case)) == 1
-    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 2, (
+        "The retry removes running: a second actual label transition, without duplicating the run event")
     assert case.ctx.tracker.issue.labels == {"approved", "ready"}
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 2, "Ready already: no transition"
+    assert len(_stops(case)) == 1
 
 
 def test_a_failing_open_pr_flag_still_leaves_the_stop_event_and_comment(case):
@@ -312,3 +316,34 @@ def test_the_command_posts_one_audit_comment(case, monkeypatch):
     monkeypatch.setattr(scheduler, "_kill_run", kill)
     orch.stop(case.ctx, 1, "reprioritize")
     assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+
+
+@pytest.mark.parametrize("state,labels", [
+    ("closed", ("approved",)), ("open", ("blocked",)),
+    ("open", ("needs-human",)), ("open", ("approved", "ready")),
+])
+def test_stop_restoration_comments_only_when_the_observed_issue_state_changes(case, state, labels):
+    case.ctx.tracker = _Tracker(state=state, labels=labels)
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert not [call for call in case.ctx.tracker.calls if call[0] == "comment"]
+    assert len(_stops(case)) == 1, "Every completed stop still has its run journal event"
+    case.ctx.tracker.issue.labels |= {"running"}
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert "running" not in case.ctx.tracker.issue.labels
+
+
+
+def test_stop_keeps_the_opening_snapshot_when_the_kill_changes_labels(case, monkeypatch):
+    # An exited runner can have removed running by the time restoration begins.
+    case.tracker.issue.labels = frozenset({"running", "approved"})
+
+    def kill(ctx, number, report, **kwargs):
+        case.tracker.issue.labels = frozenset({"blocked", "approved"})
+        ctx.store.finish_run(number, outcome="stopped", detail=kwargs["detail"])
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert case.tracker.issue.labels == {"blocked", "approved"}

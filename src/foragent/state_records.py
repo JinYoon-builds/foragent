@@ -22,6 +22,7 @@ class Flag:
     number: int
     reason: str
     flagged_at: str
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
