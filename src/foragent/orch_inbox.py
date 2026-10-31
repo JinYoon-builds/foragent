@@ -199,14 +199,34 @@ def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
-                       check=None) -> dict[str, Any]:
-    """Set one request's status; ``check(record)`` runs inside the same state lock and may raise InboxError."""
+                       check=None, *, answer: str | None = None, require_answer: bool = False,
+                       empty_answer_reason: str | None = None) -> dict[str, Any]:
+    """Set status and optional answer atomically; ``check(record)`` runs under the same lock.
+
+    CLI completion requires an answer or explicit empty reason; signals use their own check hook.
+    """
     if status not in REQUEST_STATUSES:
         raise InboxError(f"status must be one of: {', '.join(REQUEST_STATUSES)}")
 
+    has_answer = bool(answer and answer.strip())
+    has_reason = bool(empty_answer_reason and empty_answer_reason.strip())
+    if status == "done" and require_answer and not (has_answer or has_reason):
+        raise InboxError("closing a request needs a non-empty --answer")
+
     def change(record: dict[str, Any]) -> None:
+        if require_answer and (status == "done" or answer is not None):
+            from foragent.orch_role_raise import is_signal_request
+
+            if is_signal_request(record):
+                raise InboxError("close role signals with fa orch signal-answer")
         if check is not None:
             check(record)
+        if answer is not None:
+            record["answer"] = answer
+            record.pop("empty_answer_reason", None)
+        elif status == "done" and has_reason:
+            record.pop("answer", None)
+            record["empty_answer_reason"] = empty_answer_reason
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})

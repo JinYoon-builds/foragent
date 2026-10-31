@@ -15,7 +15,8 @@ def store(tmp_path):
 def test_requests_keep_order_and_pending_hides_done(store):
     first = orch_inbox.add_request(store, "planning", "one")
     second = orch_inbox.add_request(store, "planning", "two")
-    orch_inbox.set_request_status(store, first["id"], "done", "finished")
+    orch_inbox.set_request_status(store, first["id"], "done", "finished", answer="Completed one", require_answer=True)
+    assert orch_inbox.requests(StateStore(store.root))[0]["answer"] == "Completed one"
     assert [row["id"] for row in orch_inbox.requests(store)] == [first["id"], second["id"]]
     assert [row["id"] for row in orch_inbox.requests(store, pending=True)] == [second["id"]]
     events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
@@ -176,3 +177,41 @@ def test_follow_events_fall_back_to_timestamps_when_the_start_read_fails(tmp_pat
     at_start = orch_inbox.add_request(store, "planning", "at start")
     assert [event["id"] for event in events.poll(store)] == [at_start["id"]]
     assert before["id"] != at_start["id"] and events.poll(store) == []
+
+
+@pytest.mark.parametrize("answer", [None, "", " \n\t"])
+def test_completion_requires_answer_without_writing_request_or_journal(store, answer):
+    request = orch_inbox.add_request(store, "planning", "one")
+    journal = store.root / "orch-events.jsonl"
+    before = journal.read_bytes()
+    request_path = store.root / "inbox" / "requests" / f"{request['id']}.json"
+    request_before = request_path.read_bytes()
+    with pytest.raises(InboxError, match="--answer"):
+        orch_inbox.set_request_status(store, request["id"], "done", answer=answer, require_answer=True)
+    assert request_path.read_bytes() == request_before
+    assert journal.read_bytes() == before
+
+
+def test_generic_completion_cannot_overwrite_a_signal_answer(store):
+    request = orch_inbox.add_request(store, "gate", "signal", {"role": "docs", "signal": {"id": "docs"}})
+    journal = store.root / "orch-events.jsonl"
+    before = journal.read_bytes()
+    request_path = store.root / "inbox" / "requests" / f"{request['id']}.json"
+    request_before = request_path.read_bytes()
+    with pytest.raises(InboxError, match="signal-answer"):
+        orch_inbox.set_request_status(store, request["id"], "done", answer="finished", require_answer=True)
+    assert request_path.read_bytes() == request_before
+    assert journal.read_bytes() == before
+
+
+def test_legacy_completion_keeps_an_explicit_empty_answer_reason(store):
+    request = orch_inbox.add_request(store, "planning", "one")
+    reason = "Legacy request-status completion: --answer was omitted."
+    orch_inbox.set_request_status(store, request["id"], "done", require_answer=True, empty_answer_reason=reason)
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["status"] == "done"
+    assert closed["empty_answer_reason"] == reason
+    orch_inbox.set_request_status(store, request["id"], "done", require_answer=True, answer="Completed")
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["answer"] == "Completed"
+    assert "empty_answer_reason" not in closed

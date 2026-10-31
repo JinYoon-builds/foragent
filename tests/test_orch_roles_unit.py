@@ -80,11 +80,14 @@ def test_idle_lanes_with_backlog_needs_an_idle_other_lane_and_three_ready_issues
 def test_role_decision_appends_one_event_and_closes_the_request(store):
     named = orch_inbox.add_request(store, "gate", "security signal met", {"role": "security"})
     bare = orch_inbox.add_request(store, "planning", "proposal")
-    event = orch_roles.decide(store, named["id"], "accepted", "docs")
+    event = orch_roles.decide(store, named["id"], "accepted", "docs", answer="Recorded outcome")
     assert event["role"] == "security", "The request's own role wins over --role"
     with pytest.raises(orch_inbox.InboxError):
-        orch_roles.decide(store, bare["id"], "rejected", None)
-    orch_roles.decide(store, bare["id"], "rejected", "docs")
+        orch_roles.decide(store, bare["id"], "rejected", None, answer="Recorded outcome")
+    orch_roles.decide(store, bare["id"], "rejected", "docs", answer="Recorded outcome")
+    reopened = {row["id"]: row for row in orch_inbox.requests(StateStore(store.root))}
+    assert [(reopened[r["id"]]["answer"], reopened[r["id"]]["role"], reopened[r["id"]]["accepted"])
+            for r in (named, bare)] == [("Recorded outcome", "security", True), ("Recorded outcome", "docs", False)]
     decisions = [row for row in _jsonl(store.root / "orch-events.jsonl") if row["kind"] == "role-proposal"]
     assert [(row["role"], row["request_id"], row["accepted"]) for row in decisions] == [
         ("security", named["id"], True), ("docs", bare["id"], False)]
@@ -112,17 +115,45 @@ def test_repeating_a_role_decision_counts_once_and_the_latest_one_wins(store, tm
     requests = [orch_inbox.add_request(store, "gate", f"proposal {n}", {"role": "security"}) for n in range(3)]
     for step in range(3):
         store.clock[0] = NOW - timedelta(minutes=10 - step)
-        orch_roles.decide(store, requests[0]["id"], "rejected", None)
+        orch_roles.decide(store, requests[0]["id"], "rejected", None, answer="Recorded outcome")
     store.clock[0] = NOW
     rows = orch_roles.collect(store, config, tmp_path)["roles"]
     assert rows["security"]["removal_proposed"] is False, "One proposal rejected three times is one rejection"
     for request in requests[1:]:
-        orch_roles.decide(store, request["id"], "rejected", None)
+        orch_roles.decide(store, request["id"], "rejected", None, answer="Recorded outcome")
     assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is True
     store.clock[0] = NOW + timedelta(minutes=1)
-    orch_roles.decide(store, requests[0]["id"], "accepted", None)
-    orch_roles.decide(store, requests[0]["id"], "accepted", None)
+    orch_roles.decide(store, requests[0]["id"], "accepted", None, answer="Recorded outcome")
+    orch_roles.decide(store, requests[0]["id"], "accepted", None, answer="Recorded outcome")
     assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is False, (
         "A corrected decision replaces the earlier one")
     card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=2))
     assert card["window"]["today"]["roles"]["security"]["accepted_proposals"] == 1
+
+
+@pytest.mark.parametrize("decision", ["accepted", "rejected"])
+@pytest.mark.parametrize("answer", [None, "", " \t"])
+def test_role_decision_without_answer_changes_nothing(store, decision, answer):
+    request = orch_inbox.add_request(store, "architect", "proposal")
+    journal = store.root / "orch-events.jsonl"
+    before = journal.read_bytes()
+    request_path = store.root / "inbox" / "requests" / f"{request['id']}.json"
+    request_before = request_path.read_bytes()
+    with pytest.raises(orch_inbox.InboxError, match="--answer"):
+        orch_roles.decide(store, request["id"], decision, "architect", answer=answer)
+    assert request_path.read_bytes() == request_before
+    assert journal.read_bytes() == before
+
+
+def test_role_decision_uses_the_record_inside_the_completion_lock(store, monkeypatch):
+    request = orch_inbox.add_request(store, "planning", "proposal")
+    update = orch_inbox._update
+
+    def concurrent_update(store, kind, record_id, change):
+        update(store, kind, record_id, lambda row: row.update(role="docs"))
+        return update(store, kind, record_id, change)
+
+    monkeypatch.setattr(orch_inbox, "_update", concurrent_update)
+    event = orch_roles.decide(store, request["id"], "accepted", "architect", answer="Applied")
+    assert event["role"] == "docs"
+    assert orch_inbox.requests(store)[0]["role"] == "docs"

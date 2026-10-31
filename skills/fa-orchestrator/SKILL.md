@@ -16,7 +16,7 @@ To assign an issue's executor and model, or to read Jin's goal and deadline, als
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json` (planning
 requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
 `fa orch request --from planning --text "..."`; mark progress with
-`fa orch request-status ID processing|done --note "..."`. Every request or question sent as a cross-session message is
+`fa orch request-status ID processing|done --answer "..."`. Every request or question sent as a cross-session message is
 also written to the box, even when the message itself arrives, so nothing is lost on restart. Record each D71 question
 below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1` (`--kind merge` for a merge
 approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text "..."`, which
@@ -104,7 +104,7 @@ conditions to recover a metric: ask the person first with choices and a recommen
 "does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
 files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>" --short "<one-line reason>"`, or record why not; no fixed threshold
 ([why](references/retrospective.md)). `--why` carries the full evidence to the role; `--short` is the one-line reason people see, which you write in the config `language`.
-Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
+Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer "..."`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
 
 ## Human decisions, notification and merge
 
