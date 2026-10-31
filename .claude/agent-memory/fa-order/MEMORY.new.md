@@ -1,0 +1,1 @@
+- [id:1106-2026-10-31-verify-only] #1106 같은 "이미 고쳐진 동작 확인" 이슈는 제품 코드를 바꾸지 않는다. Done when을 돌린 뒤 `.foragent/order.py.bak`에 복사하고 python 치환으로 변이 3개(order.py 마커 재사용 `mapping[item["key"]] = matches[0]`, `add_sub_issue` 재연결, `add_blocked_by` 복구)를 하나씩 넣어 실패를 확인하고, 복사본으로 되돌린 뒤 `git hash-object`로 같은지 본다. 결과: 3/7/4개 실패.
