@@ -1153,7 +1153,8 @@ if __name__ == "__main__":
 
 
 def _mixed_with_helper(case, git_history, legacy_helper):
-    git_history.update({HELPER: "SKIP = False\n"})
+    # Importing the helper writes __pycache__ in the scratch tree; a real repository ignores it.
+    git_history.update({HELPER: "SKIP = False\n", ".gitignore": "__pycache__/\n"})
     git_command(case.root, "fetch", "origin", "main")
     git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
     git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
@@ -1454,12 +1455,17 @@ SHADOW = "tests/acceptance/json.py"
 SHADOW_TEST = "import sys\nprint('shadow json loaded as', __name__)\nsys.exit(1 if __name__ == '__main__' else 0)\n"
 
 
-def test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test(request, capsys, monkeypatch):
+def test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test(request, git_history, capsys,
+                                                                              monkeypatch):
     """B's new tests/acceptance/json.py shadows the stdlib json A's test imports: A is reviewed beside it."""
     from foragent import executors
 
     cases = _cases
     case = request.getfixturevalue("lane_case")
+    git_history.update({".gitignore": "__pycache__/\n"})  # the shadow import writes bytecode
+    git_command(case.root, "fetch", "origin", "main")
+    git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
+    git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
     other = {**case.plan["issues"][0], "key": "shadow", "title": "Shadow helper"}
     case.plan["issues"].append(other)
     case.save()
