@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 import json
+from contextlib import contextmanager
 import os
 import subprocess
 import sys
@@ -269,7 +270,8 @@ def test_cli_dispatches_to_runner_and_returns_failure_code(app, monkeypatch, out
     def runner(number, ctx):
         calls.append(number)
         assert ctx.repo_root == root and ctx.git is git and ctx.tracker._tracker is tracker
-        assert ctx.store is store and store.get_run(number).pid == os.getpid()
+        # The pid is the runner's to claim after admission (#993), not the dispatcher's.
+        assert ctx.store is store and store.get_run(number).pid is None
         return outcome
 
     monkeypatch.setattr(cli, "run_issue", runner)
@@ -936,3 +938,27 @@ def test_gate_commands_count_gh_calls_outside_a_tick_in_the_repo_store(app, caps
     capsys.readouterr()
     gh.count_call()  # e.g. a live status refresh or update check after the command starts
     assert [row["calls"] for row in store.github_calls()] == [1]
+
+
+def test_run_dream_is_admitted_before_it_claims_the_dream_pid(app, monkeypatch):
+    """A dream record whose pid has died is no reservation: admission comes first (#993)."""
+    root, git, tracker, store, _ = app
+    store.start_dream("main", worktree=store.root / "worktrees/dream-main")
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    store.update_run("dream-main", pid=dead.pid, process_identities=[])
+    order = []
+
+    @contextmanager
+    def hold(*args, **kwargs):
+        order.append(("admitted", kwargs.get("kind"), store.get_dream("main").pid))
+        yield
+
+    def run_dream(lane, ctx):
+        order.append(("work", lane, store.get_dream(lane).pid))
+        return 0
+
+    monkeypatch.setattr(cli.capacity, "hold_workload", hold)
+    monkeypatch.setattr(cli.orch_dream, "run_dream", run_dream)
+    assert cli.main(["gate", "run-dream", "main", "--repo-root", str(root)]) == 0
+    assert order == [("admitted", "dream", dead.pid), ("work", "main", os.getpid())]

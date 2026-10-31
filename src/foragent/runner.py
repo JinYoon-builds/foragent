@@ -394,17 +394,21 @@ def _admission_seconds(ctx: RunContext) -> int:
 
 
 def run_issue(n: int, ctx: RunContext) -> str:
-    """Run issue N. The tick admitted an active run, whose record holds its machine slot; a direct
-    start of a finished run first waits for the shared budget and holds one slot until it ends."""
+    """Run issue N once the shared budget admits it, before it claims the run record's pid.
+
+    Admission reads the live slot holders, never the record's status: a record the tick
+    launched this process for (its pid is this one) or a fresh reservation is reused at once;
+    a finished record, or a running one whose pid has died, must fit the budget. Once the
+    running record carries this pid it holds the slot itself; a finished record cannot, so
+    the admission then holds the slot until the run ends.
+    """
     with ExitStack() as admission:
-        current = ctx.store.get_run(n)
-        if current is not None and current.status == "finished":
-            admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
-                                                           kind=capacity.RUN_KIND, issue=n))
-        return _run_issue(n, ctx)
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n))
+        return _run_issue(n, ctx, admission)
 
 
-def _run_issue(n: int, ctx: RunContext) -> str:
+def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)
@@ -412,6 +416,8 @@ def _run_issue(n: int, ctx: RunContext) -> str:
     try:
         run = ctx.store.update_run(n, pid=os.getpid(),
                                    process_identities=observe_tree(roots=(os.getpid(),)))
+        if run.status == "running":
+            admission.close()  # The record now names this live process: it holds the slot.
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
