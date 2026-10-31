@@ -140,6 +140,16 @@ def stall_store(tmp_path, monkeypatch):
     root.mkdir()
     (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
     now = datetime(2026, 10, 30, 12, tzinfo=UTC)
+
+    class _Frozen(datetime):
+        """The prompt hook reads the wall clock; pin it to the store's clock so the 24-hour window holds."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is None else now.astimezone(tz)
+
+    from foragent import statusline
+    monkeypatch.setattr(statusline, "datetime", _Frozen)
     return root, StateStore.for_repo("offline/stall", now=lambda: now), now
 
 
