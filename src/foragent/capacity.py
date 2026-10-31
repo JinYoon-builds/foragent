@@ -338,9 +338,11 @@ def _within_grace(timestamp: str | None, now: datetime) -> bool:
 
 
 def _alive(pid: int) -> bool:
-    """The existing liveness rule: signal 0 probes only; a denied probe means alive."""
+    """The existing liveness rule: signal 0 probes only; a denied probe means alive.
+
+    This process is alive by definition, so its own runs and workloads are never probed."""
     if pid == os.getpid():
-        return True  # This process: no probe needed (an in-process reviewer's own run and workload).
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -777,6 +779,10 @@ def _say(message: str, wait_s: float) -> None:
         print(message, file=sys.stderr, flush=True)
 
 
+# One admission try at a time per process; the scan and record write inside are short.
+_ADMISSION = threading.Lock()
+
+
 def _acquire_workload(
     store: StateStore, record: Path, language: str, wait_s: float, deadline: float, *,
     kind: str, issue: int | None, role: str | None,
@@ -792,8 +798,10 @@ def _acquire_workload(
     candidate = capacity_sessions.Workload(Path(), pid, kind, issue, role)
     while True:
         sensed = _sensor_block()  # Read outside the lock: waiting holds no lock.
-        # One try: the loop below does every wait, so each one is reported and bounded.
-        with _try_flock(store.root.parent / LOCK_FILE) as locked:
+        # One try: the loop below does every wait, so each one is reported and bounded. Threads of
+        # this process (concurrent reviewers) queue for the try, so they never see each other's
+        # flock as another process's.
+        with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
             # One scan decides admission: reuse is matched by identity, never by comparing counts.
             holders, reused = _machine_scan(store, datetime.now(UTC), live=True, candidate=candidate)
             budget = workload_budget(store)

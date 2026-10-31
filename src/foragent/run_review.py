@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
+from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -288,8 +288,9 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
                   round_number: int, *, lane_decisions: str = "", workers: int = 1) -> ReviewResult:
     """One independent whole-change reviewer per perspective share; one merge call decides.
 
-    At most `workers` reviewers run at once (the issue's reviewer count); the rest wait for a
-    free slot, so every perspective is still reviewed. The merge starts after all have returned.
+    At most `workers` reviewers (the issue's reviewer count) and the shared machine budget run at
+    once, each holding one machine slot; the rest wait for a free slot in later batches, so every
+    perspective is still reviewed. The merge starts after all have returned.
 
     Every call uses the prompt path at the risk-map tier, whatever reviewer or review_scope is
     set. A usage limit in any reviewer stops the whole round (limit-wait) and it runs again in
@@ -309,14 +310,6 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
                                    **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
                                    flag_exhaustion=False, on_result=record)
-
-    def admitted(prompt: str, log_path: Path, k: int) -> ExecResult:
-        # Each simultaneous reviewer holds one shared machine slot; the run's own slot (its pid)
-        # covers the first, so N reviewers use N slots and a budget of 1 runs them one by one.
-        # It may wait behind its siblings for as long as the run itself may still run.
-        with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
-                                    kind="review", issue=n, role=f"reviewer {k}"):
-            return call(prompt, log_path)
 
     def failure(label: str, error: BaseException) -> str:
         return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
@@ -343,12 +336,22 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
                                    risk_notes=review_perspectives.with_checklist(notes, ctx.config, share),
                                    lane_decisions=lane_decisions)
                for share in shares]
+    # Perspectives beyond the shared machine budget wait in the pool queue and run in later batches.
+    at_once = max(1, min(workers, len(prompts), capacity.workload_budget(ctx.store)))
+
+    def held(prompt: str, log_path: Path, k: int) -> ExecResult:
+        # Every reviewer holds one shared machine slot (the first reuses this run's own slot); a slot
+        # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
+        with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
+                                    kind="review", issue=n, role=f"reviewer {k}"):
+            return call(prompt, log_path)
+
     before = git.review_state()
     try:
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(prompts))),
+        with ThreadPoolExecutor(max_workers=at_once,
                                 thread_name_prefix=f"review-{n}") as pool:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
-            futures = [pool.submit(contextvars.copy_context().run, admitted, prompt, path, k)
+            futures = [pool.submit(contextvars.copy_context().run, held, prompt, path, k)
                        for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
         errors = [future.exception() for future in futures]
     finally:
@@ -409,7 +412,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
             )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
     _save_review(n, ctx, f"review-{round_number}.txt", raw)
     review = ReviewResult(review.verdict, review.findings, (
-        f"reviewers: {count}, up to {max(1, min(workers, count))} at once, one findings merge", *review.notes,
+        f"reviewers: {count}, up to {at_once} at once in {-(-count // at_once)} batches, one findings merge",
+        *review.notes,
     ))
     if edited:
         review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
