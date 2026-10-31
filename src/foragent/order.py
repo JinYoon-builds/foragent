@@ -12,7 +12,7 @@ import re
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_locks, order_references, ownership
+from foragent import board, capacity, design, order_references, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -411,7 +411,7 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
-    # Approved issues outside the order whose locked acceptance bytes it changes (#1107).
+    # Approved issues outside this order whose locked acceptance bytes it would change (#1107).
     affected: dict[int, list[str]] = field(default_factory=dict)
     language: str = "en"
 
@@ -421,7 +421,7 @@ class PublishReport:
             lines.append(f"Parent: #{self.parent}")
         lines.append("Files: " + ", ".join(self.paths))
         if self.affected:
-            lines += ["", text("order_locks_heading", self.language), *order_locks.lines(self.affected)]
+            lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
             lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
@@ -666,33 +666,23 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "interactive": "interactive" in issue.labels,
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
                      "approved": approve or issue.number in selected_numbers})
-    # An approved issue whose locked bytes change stays approved only when this same
-    # publication re-approves it: its own children and edits selected for approval.
-    # Any other affected owner (another order's issue, a child dropped from the plan,
-    # one not selected) would get hash-mismatch on the next tick, so publication refuses.
-    covered = ({mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping
-                and (approve or item["key"] in selected_keys or mapping[item["key"]] in selected_numbers)}
-               | {n for n in edit_numbers if approve or n in selected_numbers})
+    # Approvals of other orders (and of issues this order does not own) lock their tests;
+    # changing those bytes would revoke them on the next tick, so publication refuses.
+    # Own means handled by this publication: children still in this plan, and edits. A child
+    # dropped from the plan keeps the parent's map entry, but nothing here updates its labels.
+    own = {mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping} | edit_numbers
     repos: list[GitRepo] = []
 
     def base_git() -> GitRepo:
         if not repos:
             repos.append(git or GitRepo(root))
-            # Locks are read from the remote base: another clone may already have published.
-            # A fetch only; the checkout itself is fast-forwarded under the publish lock.
-            repos[0].fetch("origin", config.base_branch)
         return repos[0]
 
-    def affected(issues) -> dict[int, list[str]]:
-        found = order_locks.affected_owners(config, repo, tracker, issues, files, base_git)
-        if set(found) - covered:
-            raise PlanError(order_locks.refusal(found, config.language))
-        return found
-
+    affected = _affected_owners(all_issues, own, files, repo, config, base_git, fetch=True)
     if dry_run:
-        shared = order_locks.affected_owners(config, repo, tracker, all_issues, files, base_git)
-        return PublishReport(plan["title"], parent, rows, sorted(files), True, shared, config.language)
-    affected(all_issues)
+        return PublishReport(plan["title"], parent, rows, sorted(files), True, affected, config.language)
+    if affected:
+        raise PlanError(text("order_locks_refused", config.language, owners="\n".join(_owner_lines(affected))))
     require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -715,12 +705,11 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
-        # Issues, approvals and the base may have moved while waiting for the lock.
-        shared = affected(tracker.list_issues())
-        # Every affected owner is re-approved below. Its approval is withdrawn before the
-        # new bytes are pushed, so no tick sees them together with the old approval.
-        for number in shared:
-            tracker.remove_labels(number, ["approved", "ready"])
+        # Another clone may have published or someone approved since the first check.
+        affected = _affected_owners(tracker.list_issues(), own, files, repo, config, lambda: git, fetch=False)
+        if affected:
+            raise PlanError(text("order_locks_refused", config.language,
+                                 owners="\n".join(_owner_lines(affected))))
         published_blobs = _publish_files(plan, root, config, git, files, manager)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
@@ -736,14 +725,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         referenced = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
                       | set(order_references.selected(plan, item)))
         return {name: published_blobs[name] for name in sorted(referenced)}
-
-    def blobs_moved(existing, blobs: dict[str, str]) -> bool:
-        # Bytes the gate already holds this approval to, even published by another
-        # clone, need no reapproval (#1107); otherwise this order's last record decides.
-        if saved_blobs.get(str(existing.number), {}) == blobs:
-            return False
-        return not ("approved" in existing.labels and existing.number not in shared
-                    and order_locks.holds(config, repo, tracker, existing, blobs, base_git))
 
     def parent_body() -> str:
         children = [tracker.get_issue(n) for n in mapping.values()]
@@ -781,7 +762,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
         else:
-            if (existing.body != body or blobs_moved(existing, blobs)
+            if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
@@ -814,7 +795,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
         prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or blobs_moved(existing, blobs):
+        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
             tracker.update_issue(number, title=existing.title, body=body)
             if not prior:
@@ -825,13 +806,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
     for number in sorted(approved_numbers):
-        if number in shared or order_locks.reapproval(tracker, number):
-            # Every re-approval records the published blobs it approves; any gate snapshots
-            # it only once its base holds exactly those bytes (``approval_record``).
-            order_locks.approve_after_edits(tracker, number, config.approvers, config.language,
-                                            order_locks.record_for(tracker, number, config, published_blobs))
-        else:
-            tracker.add_labels(number, ["approved"])
+        tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     if approved_numbers:
         kick_tick(root)
@@ -842,7 +817,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
-    return PublishReport(plan["title"], parent, rows, sorted(files), False, shared, config.language)
+    return PublishReport(plan["title"], parent, rows, sorted(files), False)
 
 
 PREREAD_FILE = ".foragent/preread.json"
@@ -982,6 +957,70 @@ def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
         head, _, last = text.rpartition("\n")
     marker = _CHILD_LINE.fullmatch(last)
     return (head if marker else text), marker
+
+
+_ANY_PLAN_ACCEPTANCE = re.compile(r"<!-- foragent:plan id=\S+ map=\{[^\n]*?\} acceptance=(\{[^\n]*\}) -->")
+
+
+def _under_lock(name: str, locks: set[str]) -> bool:
+    """Whether the gate's lock on one of ``locks`` (a file or a directory) covers ``name``."""
+    return any(name == lock or name.startswith(lock + "/") for lock in locks)
+
+
+def _owner_lines(affected: dict[int, list[str]]) -> list[str]:
+    return [f"#{number}: {', '.join(paths)}" for number, paths in affected.items()]
+
+
+def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo: str, config: Config,
+                     base_git: Callable[[], GitRepo], *, fetch: bool) -> dict[int, list[str]]:
+    """``{issue: paths}`` for open approved issues outside ``own`` whose locked bytes ``files`` change.
+
+    An issue's locked paths are the Done-when acceptance paths of its body (what any
+    gate snapshots, also for legacy issues and approvals snapshotted on other clones),
+    the acceptance maps every order's parent records for it, and this machine's
+    approval snapshot. Only paths this order writes count,
+    and only when the new bytes differ from the base: identical bytes change nothing.
+    The base is fetched (``fetch``) only when such an overlap exists.
+    """
+    # Every gate, on any clone, locks the Done-when acceptance paths of the issue body
+    # (``scheduler_approval._snapshot``), whether or not an order recorded them.
+    locked: dict[int, set[str]] = {
+        issue.number: set(acceptance_paths(parse_body(issue.body).done_when_commands, config.acceptance_dir))
+        for issue in issues if issue.state == "open" and "approved" in issue.labels and issue.number not in own}
+    if not locked:
+        return {}
+    for issue in issues:
+        for match in _ANY_PLAN_ACCEPTANCE.finditer(issue.body):
+            try:
+                acceptance = json.loads(match[1])
+            except ValueError:
+                continue
+            for number, blobs in (acceptance.items() if isinstance(acceptance, dict) else ()):
+                if number.isdecimal() and int(number) in locked and isinstance(blobs, dict):
+                    locked[int(number)].update(path for path in blobs if isinstance(path, str))
+    store = StateStore.for_repo(repo)
+    for number, paths in locked.items():
+        if (approval := store.load_approval(number)) is not None:
+            paths.update(approval.acceptance_blobs)
+    # A lock on a directory (``pytest tests/acceptance``) is the Git tree of that directory:
+    # any written file beneath it changes it.
+    overlap = {number: covered for number, paths in sorted(locked.items())
+               if (covered := sorted(name for name in files if _under_lock(name, paths)))}
+    if not overlap:
+        return {}
+    git = base_git()
+    if fetch:
+        git.fetch("origin", config.base_branch)
+    candidates = sorted({path for paths in overlap.values() for path in paths})
+    current = git.blob_shas(f"origin/{config.base_branch}", candidates)
+    changed = set()
+    for path in candidates:
+        data = files[path].encode("utf-8") if isinstance(files[path], str) else files[path]
+        digest = hashlib.sha256 if len(current[path]) == 64 else hashlib.sha1
+        if digest(b"blob %d\0" % len(data) + data).hexdigest() != current[path]:
+            changed.add(path)
+    return {number: [path for path in paths if path in changed]
+            for number, paths in overlap.items() if changed & set(paths)}
 
 
 def _blob(data: bytes) -> str:
