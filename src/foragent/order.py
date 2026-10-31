@@ -37,6 +37,20 @@ class PlanError(ValueError):
     """An order plan is malformed or cannot be applied."""
 
 
+class DoneWhenExecutableError(PlanError):
+    """One diagnostic per unavailable Done when command, in plan order."""
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        super().__init__("\n".join(lines))
+
+
+def check_done_when_executables(plan: dict, root: Path, language: str = "en") -> None:
+    from foragent.order_executables import check
+
+    check(plan, root, language)
+
+
 PROGRESS_SLOTS = ("goal", "out_of_scope", "done_when", "lane", "skills")
 PROGRESS_STEPS = ("start", "ledger", "chunk", "cell", "tests", "check", "approval", "publish", "end")
 
@@ -582,6 +596,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         files = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    check_done_when_executables(plan, root, config.language)
     keys = {item["key"] for item in plan["issues"]}
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
