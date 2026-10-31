@@ -47,6 +47,10 @@ def add(commands) -> None:
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
     stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
+    dream = orch_actions.add_parser("dream", help="Replace a lane's stale dream with a fresh one")
+    dream.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    dream.add_argument("--redo", metavar="LANE", required=True,
+                       help="Record a redo: the next tick closes this lane's stale dream PR and starts a fresh dream")
     from foragent.commands import _orch_park, _orch_seat
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
@@ -104,6 +108,11 @@ def run(args) -> int:
 
     if args.action in _orch_park.ACTIONS:
         return _orch_park.run(ctx, args)
+    if args.action == "dream":
+        result = cli.orch_dream.redo(ctx, args.redo)
+        if result == 0:
+            cli.kick_tick(root)
+        return result
     if args.action == "list":
         _list(ctx, args)
     elif args.action == "log":
