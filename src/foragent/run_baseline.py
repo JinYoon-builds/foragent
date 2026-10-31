@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from foragent import cuts
 from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
-from foragent.run_baseline_limits import load_reusable, record_timeout, repository_limit
+from foragent.run_baseline_limits import _duration, load_reusable, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
@@ -46,6 +46,8 @@ class AcceptanceBaseline:
     # The configured or detected test command this baseline came from (#483);
     # a refresh reuses it so later edits to detected files cannot drop protection.
     test_command: str | None = None
+    # Carry the measurement with the selection, including on a cache hit.
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -227,7 +229,8 @@ def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
     return AcceptanceBaseline(command, tuple(saved["node_ids"]),
                               tuple(saved["collected_ids"]) if "collected_ids" in saved else None,
                               tuple(saved["failing_ids"]) if "failing_ids" in saved else None,
-                              tuple(saved.get("excluded", ())))
+                              tuple(saved.get("excluded", ())),
+                              duration_seconds=_duration(saved.get("duration_seconds")))
 
 
 def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
@@ -430,7 +433,8 @@ def _capture_baseline(
                         f"acceptance baseline unavailable: exit_code={result.exit_code}, timed_out={result.timed_out}; "
                         "capture did not produce a complete, usable JUnit report"
                     )
-                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha)
+                return AcceptanceBaseline(command, node_ids, collected_ids, failing_ids, tuple(excluded), base_sha,
+                                          duration_seconds=duration_seconds)
             finally:
                 ctx.git.remove_worktree(worktree)
 
