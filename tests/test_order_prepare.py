@@ -930,3 +930,46 @@ def test_writer_and_reviewer_read_every_other_issues_contract(tmp_path):
     changed = {**plan, "issues": [item, {**other, "goal": "Receipts are CSV."}, legacy]}
     assert order_prepare_cycle.identity(changed, item, config, tmp_path) != order_prepare_cycle.identity(
         plan, item, config, tmp_path)
+
+
+def test_base_moving_under_the_publication_lock_writes_nothing(request, git_history, capsys):
+    """The base is checked again after the lock's refresh, before any file, commit, push or issue."""
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    refresh = case.git.update_base
+
+    def moved_meanwhile(branch):
+        # Another publication lands between the first check and this lock.
+        git_history.update({"unrelated.txt": "Moved while waiting for the lock.\n"})
+        refresh(branch)
+
+    case.git.update_base = moved_meanwhile
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and "prepare" in (out + err).lower(), out + err
+    assert "base branch moved" in out + err
+    cases.assert_no_publication(case)
+    assert not (case.root / cases.TEST_PATH).exists()
+
+
+def test_a_new_base_commit_with_the_same_content_keeps_the_review(request, git_history, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    reviewed = cases.prepare(case, capsys)["base_revision"]
+    git_history.update({}, message="Empty commit: same files")
+    assert git_history.tip != reviewed
+    before = len(case.calls)
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code == 0, out + err
+    assert len(case.calls) == before
+    assert (case.root / cases.TEST_PATH).read_text() == cases.CANDIDATE
+
+
+def test_a_review_still_waiting_or_questioned_is_named_with_its_status(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["question"]
+    assert cases.prepare(case, capsys)["status"] == "question"
+    code, out, err = cases.publish(case, capsys)
+    assert code != 0 and "notice (question)" in out + err and "no reviewed tests" in out + err
+    cases.assert_no_publication(case)

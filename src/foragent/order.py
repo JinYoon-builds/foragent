@@ -12,7 +12,7 @@ import re
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, ownership
+from foragent import board, capacity, design, order_references, order_reviewed, order_scratch, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -663,7 +663,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
-    require_reviewed_tests(plan)
+    # Statement issues need the reviewed evidence preparation recorded, approved or not; the
+    # tested base is checked again under the publication lock, before anything is written.
+    reviewed_bases = require_reviewed_tests(
+        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config)) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
     # Statement issues take the reviewed-tests route instead of preread.
@@ -681,10 +684,17 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
+    if reviewed_bases:
+        order_reviewed.require_tested_base(git, config, reviewed_bases,
+                                           order_scratch.base_revision(git, config.base_branch))
     # The owner label exists before any file or issue does: without it, nothing is published.
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
+        if reviewed_bases:
+            # The refreshed base is what the files land on: evidence for another base writes nothing.
+            order_reviewed.require_tested_base(git, config, reviewed_bases,
+                                               git.ref_sha(f"refs/remotes/origin/{config.base_branch}"))
         published_blobs = _publish_files(plan, root, config, git, files, manager)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
@@ -1005,12 +1015,14 @@ def preread(plan: dict, root: Path, config: Config,
         published = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
-    items = list(plan["issues"])
-    if plan.get("edits"):
+    # Statement issues are prepared and reviewed instead; preread reads only the legacy issues.
+    items = [item for item in plan["issues"] if "statements" not in item]
+    edits = [item for item in plan.get("edits", []) if "statements" not in item]
+    if edits:
         if tracker is None:
             raise PlanError("prereading edits needs the tracker for the existing issues")
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+        items += [edit_view(item, source.get_issue(item["number"]), config) for item in edits]
     waiting, lanes = _uncreated_lanes(plan, config, items)
     if waiting:
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
@@ -1097,20 +1109,7 @@ NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent
                   "then run fa order preread PLAN.json and publish again with --approve")
 
 
-def require_reviewed_tests(plan: dict) -> None:
-    """A statement issue is published only with tests its lane wrote and an independent reviewer passed.
-
-    The ``statements`` field selects this route for good, even once acceptance_files exist.
-    No reviewed-tests record is read or written here yet, so every statement issue is refused.
-    """
-    keys = [item["key"] for item in plan["issues"] if "statements" in item]
-    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" in item]
-    if keys:
-        raise PlanError(
-            f"cannot publish: statement issue(s) {', '.join(keys)} have no reviewed tests; "
-            "prepare them with fa order prepare PLAN.json so the lane writes the tests and the "
-            "configured reviewer reviews them, then publish again (fa order publish PLAN.json "
-            "--dry-run still previews the plan)")
+require_reviewed_tests = order_reviewed.require_reviewed_tests
 
 
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:
