@@ -150,7 +150,7 @@ def _prepare(args, root) -> int:
     cli = facade()
     config, repo, store = repo_store(root)
     rows = order_prepare.prepare(cli.order.read_plan(args.plan), root, config, cli.GitRepo(root), store,
-                                 lambda: cli.GhTracker(repo), status=args.status)
+                                 lambda: cli.GhTracker(repo), status=args.status, plan_path=args.plan)
     if args.json:
         print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
     else:

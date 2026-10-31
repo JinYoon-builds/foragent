@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import json
+from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
@@ -537,3 +538,224 @@ def test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox(git
     assert (tree / ".codex/prompts/keep.md").read_text() == "kept\n"
     # Removed before the baseline is read, so the removal itself is no question.
     assert order_scratch.changes(git, tree, manifest, "tests/acceptance/") == ({}, [], [])
+
+
+def _review_outcome(tmp_path, reply, *, session="reviewer-1", commands=("check",)):
+    from foragent import order_prepare_review
+
+    (tmp_path / "test_x.py").write_text("assert False\n")
+    result = SimpleNamespace(error_kind="normal", timed_out=False, exit_code=0, session_id=session,
+                             log_path=tmp_path / "reviewer.log")
+    item = {"statements": ["One delivery is reported."]}
+    entry = {"written": {"test_x.py": "assert False\n"}, "done_when": list(commands)}
+    return order_prepare_review._outcome(result, reply, item, entry, tmp_path, {"writer-1"}, Config())
+
+
+RUN = {"command": "check", "collected": 1, "failed": 1, "exit_code": 1, "output": "AssertionError: 0 != 1",
+       "failure_kind": "assertion"}
+PASS = {"verdict": "pass", "reason": "ok", "questions": [],
+        "coverage": [{"statement": "One delivery is reported.", "tests": ["test_x.py::test_once"],
+                      "break_it": ["wrong value", "skipped effect", "doubled effect"]}],
+        "red": [RUN]}
+
+
+def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tmp_path):
+    assert _review_outcome(tmp_path, PASS)["status"] == "reviewed"
+    # A command reported passing on current main, or not reported at all, contradicts the pass.
+    # Reported facts that contradict a red run on current main make the pass a quality hold.
+    for wrong in ({"exit_code": 0}, {"collected": 0}, {"failed": 0}):
+        outcome = _review_outcome(tmp_path, {**PASS, "red": [{**RUN, **wrong}]})
+        assert outcome["status"] == outcome["verdict"] == "hold", wrong
+    # Missing evidence or a reused writer session approves nothing, and is no quality hold.
+    unmapped = {**PASS, "coverage": [{"statement": "Something else."}]}
+    assert _review_outcome(tmp_path, unmapped)["status"] == "interrupted"
+    assert _review_outcome(tmp_path, {**PASS, "red": []})["status"] == "interrupted"
+    assert _review_outcome(tmp_path, None)["status"] == "interrupted"
+    assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
+
+
+def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
+    cover = PASS["coverage"][0]
+    incomplete = [
+        # The reported case: a statement without tests or break-it, a red run without counts or output.
+        {**PASS, "coverage": [{"statement": cover["statement"]}], "red": [{"command": "check", "exit_code": 2}]},
+        {**PASS, "coverage": [{**cover, "tests": []}]},
+        {**PASS, "coverage": [{**cover, "tests": ["test_other.py"]}]},
+        {**PASS, "coverage": [{**cover, "break_it": []}]},
+        {**PASS, "coverage": [{**cover, "break_it": [" "]}]},
+        {**PASS, "red": [RUN, RUN]},
+        {**PASS, "red": [{**RUN, "command": "other"}]},
+        {**PASS, "reason": " "},
+        {"verdict": "hold", "reason": "", "questions": []},
+        {"verdict": "question", "reason": "", "questions": []},
+    ] + [{**PASS, "red": [{key: value for key, value in RUN.items() if key != name}]} for name in RUN] + [
+        {**PASS, "red": [{**RUN, "collected": True}]}, {**PASS, "red": [{**RUN, "output": ""}]}]
+    for reply in incomplete:
+        assert _review_outcome(tmp_path, reply)["status"] == "interrupted", reply
+    assert _review_outcome(tmp_path, PASS, commands=("check", "second"))["status"] == "interrupted"
+    assert _review_outcome(tmp_path, PASS, commands=())["status"] == "interrupted"
+
+
+def test_reviewer_runs_checks_in_the_writer_sandbox_without_edit_tools(tmp_path):
+    from foragent import order_prepare_review
+
+    tree, state = tmp_path / "state/attempt/tree", tmp_path / "state"
+    tree.mkdir(parents=True)
+    claude = order_prepare_review._options("claude", tree, (tmp_path / "checkout", state), Config(),
+                                           tmp_path / "review")
+    settings = json.loads(claude["settings_path"].read_text())
+    assert claude["read_only"] is True and claude["permission_mode"] == "dontAsk"
+    assert {"Edit", "Write"} <= set(settings["permissions"]["deny"])
+    assert not any(rule.startswith(("Edit(", "Write(")) for rule in settings["permissions"]["allow"])
+    assert settings["sandbox"]["enabled"] and settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["filesystem"]["allowWrite"] == [str(tree)]
+    assert settings["sandbox"]["network"]["allowedDomains"] == [] and settings["disableAllHooks"] is True
+    assert order_prepare_review._options("codex", tree, (), Config(), tmp_path / "r2") == {"isolated": True}
+
+
+def test_promotion_needs_the_reviewed_requirements_and_base(tmp_path):
+    from foragent import order_prepare_cycle
+
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api",
+            "size": "s", "done_when": ["true"], "blocked_by": []}
+    plan = {"id": "p", "title": "P", "summary": "x", "spec_markdown": "spec", "issues": [item]}
+    config = Config(lanes={"api": {"paths": ["src/**"]}})
+    path = tmp_path / "PLAN.json"
+    entry = {"cycle": order_prepare_cycle.identity(plan, item, config), "base_revision": "b1",
+             "written": {"tests/acceptance/test_a.py": "assert False\n"},
+             "done_when": ["pytest tests/acceptance/test_a.py"]}
+    for changed in ({"goal": "other goal"}, {"out_of_scope": "less"}, {"statements": ["t"]}):
+        path.write_text(json.dumps({**plan, "issues": [{**item, **changed}]}))
+        assert not order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b1"), changed
+    path.write_text(json.dumps({**plan, "spec_markdown": "new spec"}))
+    assert not order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b1")
+    path.write_text(json.dumps(plan))
+    assert not order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b2")
+    other = Config(lanes={"api": {"paths": ["src/**"]}}, reviewer="codex", executor="claude")
+    assert not order_prepare_cycle.promote(path, item, entry, tmp_path, other, "b1")
+    assert "acceptance_files" not in json.loads(path.read_text())["issues"][0]
+    (tmp_path / "tests/acceptance").mkdir(parents=True)
+    assert order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b1")
+    promoted = json.loads(path.read_text())["issues"][0]
+    assert promoted["acceptance_files"] == entry["written"] and promoted["done_when"] == entry["done_when"]
+
+
+def test_holds_are_counted_in_the_current_cycle_only():
+    from foragent.order_prepare_cycle import holds
+
+    attempts = [{"role": "reviewer", "verdict": "hold", "cycle": "old", "reason": "a"},
+                {"role": "writer", "cycle": "new"},
+                {"role": "reviewer", "verdict": "hold", "cycle": "new", "reason": "b"},
+                {"role": "reviewer", "verdict": "question", "cycle": "new", "reason": "c"}]
+    assert holds({"cycle": "new", "attempts": attempts}) == ["b"]
+    assert holds({"cycle": "old", "attempts": attempts}) == ["a"]
+    assert holds(None) == []
+
+
+def _lane_case_module():
+    """The order's shared offline fixtures (local Git, faked executors, no GitHub)."""
+    import importlib
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+    return importlib.import_module("lane_tests_case")
+
+
+def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, git_history, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    first = cases.prepare(case, capsys)
+    assert first["status"] == "reviewed"
+    git_history.update({"later.py": "x = 1\n"})
+    second = cases.prepare(case, capsys)
+    assert second["status"] == "reviewed" and second["base_revision"] == git_history.tip != first["base_revision"]
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer"] * 2
+    # A review left pending on the older main is not resumed on its old scratch copy either.
+    case.reviewer_exit = 1
+    git_history.update({"later.py": "x = 2\n"})
+    assert cases.prepare(case, capsys)["status"] == "waiting"
+    case.reviewer_exit = 0
+    git_history.update({"later.py": "x = 3\n"})
+    third = cases.prepare(case, capsys)
+    assert third["status"] == "reviewed" and third["base_revision"] == git_history.tip
+    assert [call["role"] for call in case.calls][-2:] == ["writer", "reviewer"]
+    assert [call["role"] for call in case.calls].count("writer") == 4
+
+
+_cases = _lane_case_module()
+lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
+
+
+def test_promotion_never_loses_a_planning_edit_made_meanwhile(tmp_path, monkeypatch):
+    from foragent import order, order_prepare_cycle
+
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api",
+            "size": "s", "done_when": ["true"], "blocked_by": []}
+    plan = {"id": "p", "title": "P", "summary": "x", "spec_markdown": "spec", "issues": [item]}
+    config = Config(lanes={"api": {"paths": ["src/**"]}})
+    (tmp_path / "tests/acceptance").mkdir(parents=True)
+    path = tmp_path / "PLAN.json"
+    entry = {"cycle": order_prepare_cycle.identity(plan, item, config), "base_revision": "b1",
+             "written": {"tests/acceptance/test_a.py": "assert False\n"}, "done_when": ["check"]}
+    edited = json.dumps({**plan, "issues": [{**item, "goal": "planning's newer goal"}]})
+    validate = order.validate_plan
+
+    def planning_edits_during_validation(*args, **kwargs):
+        path.write_text(edited)  # in place, as an editor does
+        return validate(*args, **kwargs)
+
+    monkeypatch.setattr(order, "validate_plan", planning_edits_during_validation)
+    path.write_text(json.dumps(plan))
+    assert not order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b1")
+    assert path.read_text() == edited
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["PLAN.json", "tests"]
+    monkeypatch.setattr(order, "validate_plan", validate)
+    path.write_text(json.dumps(plan))
+    assert order_prepare_cycle.promote(path, item, entry, tmp_path, config, "b1")
+    assert json.loads(path.read_text())["issues"][0]["done_when"] == ["check"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["PLAN.json", "tests"]
+
+
+def test_compare_and_swap_keeps_writes_that_race_each_step(tmp_path, monkeypatch):
+    from foragent import order_prepare_cycle
+
+    path = tmp_path / "PLAN.json"
+    path.write_bytes(b"old")
+    assert order_prepare_cycle.replace_unchanged(path, b"old", b"ours") and path.read_bytes() == b"ours"
+    assert not order_prepare_cycle.replace_unchanged(path, b"old", b"again") and path.read_bytes() == b"ours"
+    real_rename, real_link = order_prepare_cycle.os.rename, order_prepare_cycle.os.link
+
+    def recreate_after_move(source, target):  # planning saves a new plan right after the move
+        real_rename(source, target)
+        if Path(source) == path:
+            path.write_bytes(b"planning")
+
+    path.write_bytes(b"old")
+    monkeypatch.setattr(order_prepare_cycle.os, "rename", recreate_after_move)
+    assert not order_prepare_cycle.replace_unchanged(path, b"old", b"ours") and path.read_bytes() == b"planning"
+    monkeypatch.setattr(order_prepare_cycle.os, "rename", real_rename)
+
+    def write_into_moved_file(source, target):  # an editor with the old plan open writes after the move
+        real_link(source, target)
+        if Path(target) == path:
+            next(tmp_path.glob(".PLAN.json.prepare-*.old")).write_bytes(b"late edit")
+
+    path.write_bytes(b"old")
+    monkeypatch.setattr(order_prepare_cycle.os, "link", write_into_moved_file)
+    assert not order_prepare_cycle.replace_unchanged(path, b"old", b"ours") and path.read_bytes() == b"late edit"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["PLAN.json"]
+
+
+def test_a_plan_changed_before_the_move_is_never_replaced_even_briefly(tmp_path, monkeypatch):
+    from foragent import order_prepare_cycle
+
+    path, linked = tmp_path / "PLAN.json", []
+    real_link = order_prepare_cycle.os.link
+    monkeypatch.setattr(order_prepare_cycle.os, "link",
+                        lambda source, target: (linked.append((Path(source).read_bytes(), Path(target))),
+                                                real_link(source, target)))
+    path.write_bytes(b"planning's newer plan")
+    assert not order_prepare_cycle.replace_unchanged(path, b"old", b"ours")
+    assert path.read_bytes() == b"planning's newer plan"
+    assert (b"ours", path) not in linked
