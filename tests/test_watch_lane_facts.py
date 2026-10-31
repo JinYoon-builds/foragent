@@ -227,6 +227,33 @@ def test_a_merge_started_by_an_active_run_counts_for_that_runs_lane():
     assert unknown["work"]["week_finished"] is None, "without the run history no merge has a known run"
 
 
+def test_only_the_ready_label_differing_gives_the_same_admission_facts(tmp_path, monkeypatch):
+    config = Config(lanes={"work": {}}, overlap_per_file=1)
+    store, tracker = setup(tmp_path, [(1001, ["approved", "running", "lane:work"]),
+                                      (1002, ["approved", "ready", "lane:work"]), (1003, ["lane:work"]),
+                                      (1004, ["approved", "ready", "lane:work"]), (1005, ["lane:work"]),
+                                      (1006, ["lane:work"])], config)
+    approve(store, 1001, ["src/a.py"])
+    store.start_run(1001, branch="b", worktree=str(tmp_path / "w"), lane="work")
+    for number in (1002, 1003):
+        approve(store, number, ["src/a.py", "src/z.py"])
+    approve(store, 1006, ["src/z.py"])  # Saved approval, no overlap, no label: nothing waits.
+    rows = store.local_issues()
+    edges = {number: [{"number": 1001, "state": "open"}] for number in (1004, 1005)}
+    store.local_issues = lambda: [dict(row, blocked_by=edges.get(row["number"], [])) for row in rows]
+    monkeypatch.setattr(watch_data, "meter", lambda *a: {"running": 1, "budget": 5})
+    payload = status.collect(store, config, NOW)
+    facts = watch_data.collect(payload, tracker, store, config, NOW, repo_root=tmp_path).waiting_facts
+    overlap = {"kind": "file-overlap", "blocking_issues": [], "overlapping_files": ["src/a.py"]}
+    assert facts[1002] == facts[1003] == overlap
+    dependency = {"kind": "dependency", "blocking_issues": [1001], "overlapping_files": []}
+    assert facts[1004] == facts[1005] == dependency
+    assert 1006 not in facts
+    unrooted = watch_data.collect(payload, tracker, store, config, NOW).waiting_facts
+    assert 1003 not in unrooted, "without a root no overlap evidence can be read"
+    assert unrooted[1002] == {"kind": None, "blocking_issues": [], "overlapping_files": []}
+
+
 def test_role_facts_default_to_never_called_and_ignore_the_full_why(tmp_path):
     store = StateStore(tmp_path / "state", now=lambda: NOW)
     store.root.mkdir(parents=True)

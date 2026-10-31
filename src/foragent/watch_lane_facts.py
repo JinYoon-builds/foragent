@@ -290,9 +290,12 @@ def waiting_facts(
     states = {number: row["state"] for number, row in rows.items()}
     runs = {run["number"]: run for run in status.get("active_runs", [])}
     waiting_for: dict[int, list[int]] = {}
+    visible: set[int] = set()  # The queue the status shows (ready work and approved waiting work).
     for lane in status.get("lanes", {}).values():
         if lane.get("issue") is not None:
             waiting_for[lane["issue"]] = [n for n in lane.get("waiting_for") or [] if type(n) is int]
+        visible.update(item["number"] for item in lane.get("queued") or []
+                       if isinstance(item, dict) and type(item.get("number")) is int)
     machine = None
     ctx = None
     # Unreadable history cannot show a start after a memory hold, so it proves no hold.
@@ -307,21 +310,21 @@ def waiting_facts(
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
         if state in HELD or (run is None and {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & labels):
-            continue
+            continue  # A person's question or a blocked issue is a held fact, not a wait.
         blocking = {dep["number"] for dep in row.get("blocked_by") or []
                     if isinstance(dep, dict) and type(dep.get("number")) is int
                     and states.get(dep["number"], dep.get("state")) != "closed"}
         blocking |= set(waiting_for.get(number, []))
         phase = run.get("phase") if run else None
-        queued = state == "queued"
-        if not (blocking or phase in PHASE_KINDS or queued):
-            continue  # Ordinary active work, or an issue nobody shows as waiting.
-        kind = "dependency" if blocking else PHASE_KINDS.get(phase)
+        waiting_run = run is not None and phase in PHASE_KINDS
         paths: set[str] = set()
-        if phase == "overlap-wait":
+        held = False
+        if waiting_run and phase == "overlap-wait":
             paths |= {record["file"] for record in run.get("overlap_records") or []
                       if isinstance(record, dict) and isinstance(record.get("file"), str)}
-        if root is not None:
+        # The saved approval and the active recorded claims decide file overlap, whatever the
+        # issue's labels; an ordinary running issue already holds its files and waits on none.
+        if root is not None and (run is None or waiting_run):
             try:
                 if ctx is None:
                     from foragent.git import GitRepo
@@ -335,11 +338,16 @@ def waiting_facts(
                     lane = (run or {}).get("lane") or issue_lane(labels, config.lanes)
                     held, shared = _overlap(ctx, number, lane, parse_body(approval.body))
                     paths |= shared
-                    if held and kind is None:
-                        kind = "file-overlap"
             except Exception:  # noqa: BLE001, S110 - optional evidence; the entry and its dependencies stay.
                 pass
-        if kind is None and queued:
+        shown = number in visible and run is None
+        if not (blocking or waiting_run or held or shown):
+            continue  # Ordinary active work, or an issue with no waiting evidence.
+        kind = "dependency" if blocking else PHASE_KINDS.get(phase) if waiting_run else None
+        if held and kind is None:
+            kind = "file-overlap"
+        if kind is None and shown:
+            # Capacity facts cover the queue the status shows, equally in every lane (v3.facts.05).
             if machine is None:
                 machine = [_held_by_machine(store, config, meter, starts)]
             kind = machine[0]
