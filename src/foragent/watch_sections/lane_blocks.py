@@ -56,11 +56,17 @@ def _cut(value: str, width: int, mark: str) -> str:
     return "".join(part for part, _ in watch._fit([(value, "")], room)).rstrip() + mark
 
 
-def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool) -> Line:
+def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True) -> Line:
+    """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the step word
+    does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
     from foragent import watch, watch_scene
     from foragent.watch_art import sideways_acorn
 
     kind = item["class"]
+    if not word:
+        return sideways_acorn(item["number"], "", {"working": "working", "question": "question",
+                                                   "parked": "parked"}.get(kind, "next"),
+                              tick=tick, ascii=ascii_glyphs)
     if kind == "working":
         step = watch_scene.STEPS.get(item["phase"])
         word = watch.text(f"lane_blocks_step_{step}", language) if step else ""
@@ -70,22 +76,27 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool) -
     return sideways_acorn(item["number"], word, style, tick=tick, ascii=ascii_glyphs)
 
 
-def _flow(units: list[tuple[Line, str, int]], width: int, rows: int, prefix: Line, mark: str,
+def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefix: Line, mark: str,
           per_row: int | None = None) -> tuple[list[Line], list[tuple[int, int, int, int]]]:
     """Acorns two spaces apart over at most ``rows`` rows, then …N for every one left out.
 
-    ``units`` are (acorn spans, warning text or '', number); a continuation row is indented
-    by the prefix. Every acorn, the first on a row too, keeps to the row's room, and the
-    last row always keeps room for the omitted count: a warning that does not fit is cut,
-    then dropped, and an acorn that cannot stand beside the count is counted instead.
-    Returns the rows and each placed acorn as (row, x0, x1, number).
+    ``units`` are (acorn spans, ID-only acorn spans, warning text or '', number); a
+    continuation row is indented by the prefix. Every acorn, the first on a row too, keeps to
+    the row's room, and the last row always keeps room for the omitted count. An acorn first
+    on its row that does not fit drops its step word but keeps its complete ID; when even the
+    ID does not fit beside the prefix, the prefix takes a row of its own and the acorns start
+    at the left edge. Only an ID wider than the whole row is cut, with the mark. A warning
+    that does not fit is cut, then dropped. Returns the rows and each placed acorn as
+    (row, x0, x1, number).
     """
-    from foragent import watch
+    from foragent import watch, watch_scene
 
     cells = lambda line: sum(watch._cells(value) for value, _ in line)
     indent = cells(prefix)
-    room = max(1, width - indent)
     lines: list[Line] = []
+    if prefix and any(cells(compact) > width - indent for _, compact, _, _ in units):
+        lines, prefix, indent, rows = [list(prefix)], [], 0, rows + 1
+    room = max(1, width - indent)
     placed: list[tuple[int, int, int, int]] = []
     index, total = 0, len(units)
     while index < total and len(lines) < rows:
@@ -93,15 +104,23 @@ def _flow(units: list[tuple[Line, str, int]], width: int, rows: int, prefix: Lin
         line: Line = list(prefix) if not lines else ([(" " * indent, "")] if indent else [])
         used = count = 0
         while index < total and not (per_row and count >= per_row):
-            acorn, warning, number = units[index]
+            acorn, compact, warning, number = units[index]
             gap = 2 if count else 0
             rest = total - index - 1
             # The last row keeps room for the count of what follows.
             reserve = 2 + watch._cells(f"{mark}{rest}") if last and rest else 0
             free = room - used - gap - reserve
             size = cells(acorn)
-            if size > free and (count or (last and rest)):
-                break  # Next row, or (on the last row) counted in …N.
+            if size > free:
+                if count:
+                    break  # Next row, where it is first.
+                if cells(compact) <= free:
+                    acorn, size = compact, cells(compact)  # The complete ID stays; the step word goes.
+                elif last and rest:
+                    break  # Counted in …N.
+                else:
+                    acorn = watch_scene.fit_marked(compact, max(1, free), mark)  # Only a row narrower than the ID.
+                    size = cells(acorn)
             extra: Line = []
             if warning:
                 text = " " + warning
@@ -164,19 +183,23 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     """One lane's content rows, their acorn hits and issue marks, and the name's cells."""
     from foragent import watch, watch_scene
 
-    pixels, ascii_glyphs, narrow = modes
+    pixels, ascii_glyphs, _narrow = modes
     language = config.language
     mark = "..." if ascii_glyphs else "…"
     acorn_tick = tick if config.animation else 0
-    per_row = 1 if narrow else None
+    # Every text fallback (narrow, ASCII or non-UTF-8 glyphs, animation off) lists one acorn
+    # per row, all of them, so each issue keeps its own selectable row (blocks.11); only the
+    # pixel scene flows acorns side by side within its two rows and counts the rest as …N.
+    per_row = None if pixels else 1
     name, name_cells = _name_row(snapshot, config, row, width, mark)
     lines: list[Line] = [name]
     hits: list[Hit] = []
     marks: list[tuple[int, int]] = []
 
-    def units(items: list[dict[str, Any]], warnings: bool) -> list[tuple[Line, str, int]]:
+    def units(items: list[dict[str, Any]], warnings: bool) -> list[tuple[Line, Line, str, int]]:
         # A worker warning stands right beside its acorn (blocks.08).
         return [(_acorn(item, language, acorn_tick, ascii_glyphs),
+                 _acorn(item, language, acorn_tick, ascii_glyphs, word=False),
                  watch_scene.activity_warning(snapshot, config, row, item, now) if warnings else "",
                  item["number"]) for item in items]
 
@@ -192,14 +215,15 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
                 marks.append((start + offset, number))
 
     if current:
-        place(_flow(units(current, True), width, ACORN_ROWS, [], mark, per_row))
+        place(_flow(units(current, True), width, ACORN_ROWS if pixels else len(current), [], mark, per_row))
     waiting = watch_scene.representative_wait(row, current, upcoming)
     if waiting is not None:
         lines.append([(_cut(watch_scene.waiting_reason(snapshot, row, waiting, language), width, mark), "dim")])
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
-        place(_flow(units(upcoming, False), width, ACORN_ROWS, prefix, mark, per_row))
+        place(_flow(units(upcoming, False), width, ACORN_ROWS if pixels else len(upcoming), prefix, mark,
+                    per_row))
     return lines, hits, marks, name_cells
 
 

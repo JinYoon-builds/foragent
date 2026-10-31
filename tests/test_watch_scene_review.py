@@ -56,6 +56,7 @@ def test_oversized_first_acorns_still_leave_room_for_the_exact_omitted_count(asc
 
     mark = "..." if ascii_glyphs else "…"
     units = [(sideways_acorn(100 + n, "write", "working", ascii=ascii_glyphs),
+              sideways_acorn(100 + n, "", "working", ascii=ascii_glyphs),
               "quiet for 30 minutes, nothing written to the log", 100 + n) for n in range(10)]
     lines, placed = _flow(units, 40, 2, [], mark)
     texts = ["".join(value for value, _ in line) for line in lines]
@@ -127,3 +128,76 @@ def test_a_bar_label_wider_than_the_row_is_cut_with_the_mark():
     snapshot.status["issues"] = {"running": [{"number": 1}, {"number": 2}]}
     text = "".join(value for value, _ in _bar(snapshot, "en", 12, "…")[0])
     assert text.endswith("…") and watch._cells(text) <= 12 and text.startswith("80%")
+
+
+@pytest.mark.parametrize("fallback", ["animation-off", "ascii", "non-utf8", "narrow"])
+def test_every_text_fallback_gives_each_acorn_its_own_selectable_row(monkeypatch, fallback):
+    from types import SimpleNamespace
+
+    from foragent.watch_scene import lane_items
+    from foragent.watch_sections.lane_blocks import _block, _modes
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_CTYPE", raising=False)
+    monkeypatch.setenv("LANG", "C" if fallback == "non-utf8" else "en_US.UTF-8")
+    config = SimpleNamespace(language="en", lanes={"work": {}}, animation=fallback != "animation-off",
+                             view_glyphs="ascii" if fallback == "ascii" else "auto")
+    row = {"slug": "work", "lane_display": "work", "state": "working", "issue": 101, "phase": "implementing",
+           "running": [{"number": n, "title": "T"} for n in (101, 102, 103)],
+           "queued": [{"number": n, "title": "N"} for n in (201, 202, 203)], "held": []}
+    snapshot = _snapshot(row, worker_states={101: "working", 102: "working", 103: "working"})
+    current, upcoming = lane_items(snapshot, row)
+    width = 30 if fallback == "narrow" else 160
+    modes = _modes(config, width)
+    assert not modes[0], "every case is a text fallback"
+    lines, hits, marks, _ = _block(snapshot, config, row, current, upcoming, width, 0, NOW, modes)
+    numbers = (101, 102, 103, 201, 202, 203)
+    assert sorted(number for _, number in marks) == sorted(numbers), "each acorn is reachable by keyboard"
+    for number in numbers:
+        rows = [text for text in ("".join(value for value, _ in line) for line in lines) if f"#{number}" in text]
+        assert len(rows) == 1 and sum(f"#{n}" in rows[0] for n in numbers) == 1, (number, rows)
+    assert {target for *_, target in hits} == {("acorn", n) for n in numbers}
+
+
+@pytest.mark.parametrize("ascii_glyphs", [True, False])
+@pytest.mark.parametrize("width", [8, 10, 12])
+def test_narrow_acorns_keep_their_complete_id_before_the_step_word_or_the_prefix(ascii_glyphs, width):
+    from foragent.watch_art import sideways_acorn
+    from foragent.watch_sections.lane_blocks import _flow
+
+    mark = "..." if ascii_glyphs else "…"
+    units = [(sideways_acorn(n, word, style, ascii=ascii_glyphs), sideways_acorn(n, "", style, ascii=ascii_glyphs),
+              "", n) for n, word, style in ((1062, "write", "working"), (1063, "", "next"))]
+    for prefix in ([], [("next  ", "dim")]):
+        lines, placed = _flow(units, width, 2, prefix, mark, 1)
+        texts = ["".join(value for value, _ in line) for line in lines]
+        assert all(watch._cells(text) <= width for text in texts), texts
+        for number in (1062, 1063):
+            rows = [index for index, text in enumerate(texts) if f"#{number}" in text]
+            assert len(rows) == 1, (number, texts)
+            assert [entry[3] for entry in placed if entry[0] == rows[0]] == [number]
+        assert not any(text.rstrip().endswith(("#10", "#106")) for text in texts), texts
+
+
+def test_an_id_wider_than_the_row_is_cut_with_the_mark_not_silently():
+    from foragent.watch_art import sideways_acorn
+    from foragent.watch_sections.lane_blocks import _flow
+
+    units = [(sideways_acorn(1062, "write", "working", ascii=True), sideways_acorn(1062, "", "working", ascii=True),
+              "", 1062)]
+    lines, placed = _flow(units, 5, 1, [], "...", 1)
+    text = "".join(value for value, _ in lines[0])
+    assert text.endswith("...") and watch._cells(text) <= 5 and placed[0][3] == 1062
+
+
+def test_an_id_that_fits_beside_the_count_is_drawn_not_counted():
+    from foragent.watch_art import sideways_acorn
+    from foragent.watch_sections.lane_blocks import _flow
+
+    units = [(sideways_acorn(n, "write", "working", ascii=True), sideways_acorn(n, "", "working", ascii=True),
+              "", n) for n in (1062, 1063, 1064)]
+    lines, placed = _flow(units, 14, 2, [], "...", 1)
+    texts = ["".join(value for value, _ in line) for line in lines]
+    assert [entry[3] for entry in placed] == [1062, 1063]
+    assert "[#1063]" in texts[1] and texts[1].endswith("...1") and watch._cells(texts[1]) <= 14
