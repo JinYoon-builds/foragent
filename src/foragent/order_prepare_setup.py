@@ -178,3 +178,58 @@ def context_digest(plan: dict, item: dict, config: Config, root: Path) -> str:
         digest.update(f"{name}\0".encode("utf-8") + hashlib.sha256(data).digest())
     digest.update(json.dumps(sorted(context.refused)).encode("utf-8"))
     return digest.hexdigest()
+
+
+def published_files(plan: dict, root: Path, config: Config) -> dict[str, bytes]:
+    """Every file publication writes except statement issues' own tests, as publication writes them.
+
+    The spec, every reference file, and the legacy issues' acceptance files and checkout-read tests
+    named by Done when: the writer's and reviewer's scratch trees hold exactly these bytes, so the
+    reviewed tree is the published tree. A statement issue's tests are its own cycle's output, and
+    the other files its Done when names stay as main has them (``order_reviewed.require_reviewed_bytes``
+    holds publication to that). Callers validate the plan first; an invalid one publishes nothing.
+    """
+    from foragent.issue import acceptance_paths
+    from foragent.order import validate_plan
+
+    try:
+        files = validate_plan(plan, root, config)
+    except ValueError:
+        return {}
+    own = {name for item in [*plan["issues"], *plan.get("edits", [])] if "statements" in item
+           for name in [*(item.get("acceptance_files") or {}),
+                        *acceptance_paths(item.get("done_when") or [], config.acceptance_dir)]}
+    return {name: data.encode("utf-8") if isinstance(data, str) else data
+            for name, data in files.items() if name not in own}
+
+
+def published_digest(plan: dict, root: Path, config: Config) -> dict[str, str]:
+    """The sha256 of each of ``published_files``; part of every statement issue's cycle identity."""
+    return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(published_files(plan, root, config).items())}
+
+
+def other_candidates(plan: dict, record: dict | None, item: dict) -> dict[str, bytes]:
+    """The reviewed tests of the order's other statement issues: they are published beside this
+    issue's, so its trees hold them too (a new helper of one issue can shadow another's import)."""
+    keys = {other["key"] for other in plan["issues"] if "statements" in other}
+    keys |= {f"#{other['number']}" for other in plan.get("edits", []) if "statements" in other}
+    files: dict[str, bytes] = {}
+    for key in sorted(keys - {item["key"]}):
+        entry = ((record or {}).get("issues") or {}).get(key) or {}
+        if entry.get("status") == "reviewed":
+            files.update({name: data.encode("utf-8") for name, data in (entry.get("written") or {}).items()})
+    return files
+
+
+def others_digest(plan: dict, record: dict | None, item: dict) -> dict[str, str]:
+    """What an issue's review saw of the other statement issues' tests; recorded and compared, never
+    part of the cycle identity, so a change re-reviews the same tests instead of rewriting them."""
+    return {name: hashlib.sha256(data).hexdigest() for name, data in sorted(other_candidates(plan, record, item).items())}
+
+
+def scratch_files(plan: dict, item: dict, root: Path, config: Config, record: dict | None = None) -> dict[str, bytes]:
+    """The generated files of an issue's scratch tree: the published files, the other statement
+    issues' reviewed tests and its references."""
+    from foragent.order_prepare_prompt import _references
+
+    return {**published_files(plan, root, config), **other_candidates(plan, record, item), **_references(plan, item)}

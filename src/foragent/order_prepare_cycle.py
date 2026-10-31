@@ -53,42 +53,17 @@ def contracts(plan: dict, item: dict) -> dict:
         "done_when": None if "statements" in other else other.get("done_when")} for other in others}
 
 
-def _lines(values) -> str:
-    return "".join(f"  - {value}\n" for value in values or []) or "  (none)\n"
-
-
-def other_issues(plan: dict, item: dict) -> str:
-    """Every other issue and edit of the order as the writer and reviewer read them: the same
-    ``contracts`` the cycle binds, so a contract declared only in another issue's words reaches both."""
-    blocks = []
-    for key, other in contracts(plan, item).items():
-        tests = "".join(f"\n#### {path} (locked)\n```\n{content}\n```\n"
-                        for path, content in (other["acceptance_files"] or {}).items())
-        commands = "" if other["done_when"] is None else f"Done when:\n{_lines(other['done_when'])}"
-        blocks.append(
-            f"### {'Edit of existing issue ' if other['number'] is not None else 'Issue '}{key}"
-            f"{': ' + other['title'] if other.get('title') else ''}\n"
-            f"Lane: {other.get('lane') or '(from the tracker)'}\n"
-            f"Goal: {other.get('goal') or '(unchanged)'}\n"
-            f"Behaviour statements:\n{_lines(other.get('statements'))}"
-            f"Out of scope: {other.get('out_of_scope') or '(unchanged)'}\n"
-            f"Checklist:\n{_lines(other.get('checklist'))}"
-            f"Blocked by: {', '.join(other.get('blocked_by') or []) or '(none)'}\n"
-            f"Files expected to change: {', '.join(other.get('files') or []) or '(not listed)'}\n"
-            f"{commands}{tests}")
-    return "\n".join(blocks) or "No other issue in this order."
-
-
 def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
     """What the tests are written and reviewed for: the issue's requirements, every other issue's
     requirements and legacy contracts, the shared spec and references, the risk guidance both agents
     read, and the executor setup. A change starts a new cycle with the history retained."""
     from foragent.order_prepare_prompt import _risk_notes
-    from foragent.order_prepare_setup import context_digest
+    from foragent.order_prepare_setup import context_digest, published_digest
 
     shared = {"item": {name: item.get(name) for name in _CYCLE_FIELDS}, "title": plan.get("title"),
               "risks": _risk_notes(root, config, item),
               "setup": _setup(config, item["lane"]), "context": context_digest(plan, item, config, root),
+              "published": published_digest(plan, root, config),
               "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
               "new_lanes": plan.get("new_lanes"),
               "references": {name: hashlib.sha256(data).hexdigest()
@@ -97,8 +72,34 @@ def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
     return hashlib.sha256(json.dumps(shared, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def requirement(plan: dict, item: dict) -> str:
+    """What planning asked of this issue: its own fields, the order's summary and spec, its references.
+
+    Holds and an open question belong to it. Another issue's edit, a setup change or a new main
+    starts a new cycle (new evidence) but keeps them; planning's clarified statement starts afresh.
+    """
+    asked = {"key": item.get("key"), "item": {name: item.get(name) for name in _CYCLE_FIELDS},
+             "title": plan.get("title"), "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
+             "references": {name: hashlib.sha256(data).hexdigest()
+                            for name, data in sorted(_references(plan, item).items())}}
+    return hashlib.sha256(json.dumps(asked, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def behaviour(item: dict) -> str:
+    """The behaviour planning states for this issue: only a change here answers the lane's question."""
+    stated = {name: item.get(name) for name in ("goal", "statements", "out_of_scope", "checklist")}
+    return hashlib.sha256(json.dumps(stated, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _scoped(entry: dict, attempt: dict) -> bool:
+    """Whether an attempt answers the entry's current requirement (records before it: the same cycle)."""
+    if entry.get("requirement") is not None and attempt.get("requirement") is not None:
+        return attempt["requirement"] == entry["requirement"]
+    return attempt.get("cycle") == entry.get("cycle")
+
+
 def holds(entry: dict | None) -> list[str]:
-    """The reasons of this cycle's quality holds, oldest first.
+    """The reasons of the quality holds of this issue's current requirement, oldest first.
 
     Counted from each review attempt's recorded outcome, never its raw verdict: a malformed reply,
     an execution failure or a changed scratch tree is no quality decision and no hold.
@@ -106,8 +107,16 @@ def holds(entry: dict | None) -> list[str]:
     if not entry:
         return []
     return [attempt["reason"] for attempt in entry.get("attempts", [])
-            if attempt.get("role") == "reviewer" and attempt.get("status") == "hold"
-            and attempt.get("cycle") == entry.get("cycle")]
+            if attempt.get("role") == "reviewer" and attempt.get("status") == "hold" and _scoped(entry, attempt)]
+
+
+def same_requirement(entry: dict | None, cycle: str, asked: str) -> bool:
+    """Whether ``entry`` was prepared for ``asked`` (records before requirements: for ``cycle``)."""
+    if entry is None:
+        return False
+    if entry.get("requirement") is not None:
+        return entry["requirement"] == asked
+    return entry.get("cycle") == cycle
 
 
 def revision_notes(entry: dict | None) -> str:
@@ -121,30 +130,51 @@ def revision_notes(entry: dict | None) -> str:
 
 
 def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRepo, path: Path,
-                   record: dict, base: str, plan_path: Path | None) -> None:
+                   record: dict, base: str, plan_path: Path | None, store=None) -> None:
     """Write, review and promote one statement issue, reusing what this cycle already settled.
 
-    An open question of the same cycle starts no agent: only planning's answer (a new cycle) does.
+    An open question starts no agent until planning clarifies this issue's behaviour (its goal,
+    statements, scope or checklist); a change to the order's summary, spec or setup leaves it open.
     A reviewed result is reused, and written candidates waiting for review are reviewed without a new
-    writer, only while they were made on the current ``base``; after main moves the lane writes again
-    on a new scratch copy, keeping the cycle's holds.
+    writer, only while they were made for the current cycle on the current ``base``; otherwise the lane
+    writes again on a new scratch copy, keeping the holds of the unchanged requirement.
     """
     from foragent import order_prepare_review as reviewing
     from foragent.order_prepare import _write, _write_tests
 
-    cycle = identity(plan, item, config, root)
+    cycle, asked = identity(plan, item, config, root), requirement(plan, item)
     entry = record["issues"].get(item["key"])
     current = entry is not None and entry.get("cycle") == cycle
     fresh = current and entry.get("base_revision") == base
-    settled = current and (entry["status"] == "question" or (fresh and entry["status"] == "reviewed"))
+    # A question waits for planning to clarify this issue's behaviour, whatever else changed.
+    question = entry is not None and entry["status"] == "question" and (
+        same_requirement(entry, cycle, asked) or entry.get("behaviour") == behaviour(item))
+    if question and not same_requirement(entry, cycle, asked):
+        entry.update(reason=text("prepare_question_open", config.language))
+        _write(path, record)
+    from foragent.order_prepare_setup import others_digest
+
+    beside = entry is not None and entry.get("others") == others_digest(plan, record, item)
+    settled = question or (fresh and entry["status"] == "reviewed" and beside)
     if not settled:
-        pending = fresh and bool(entry.get("written")) and (entry["status"] == "written" or (
+        # Another issue's tests changed beside reviewed ones: review the same tests again, write nothing.
+        pending = fresh and bool(entry.get("written")) and (entry["status"] in {"written", "reviewed"} or (
             entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
         if not pending:
-            _write_tests(plan, item, root, config, git, path, record, base, cycle)
+            _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
         if pending or record["issues"][item["key"]]["status"] == "written":
-            reviewing.review(plan, item, root, config, git, path, record)
+            reviewing.review(plan, item, root, config, git, path, record, store)
     entry = record["issues"][item["key"]]
+    if entry["status"] == "reviewed" and plan_path is not None and not settled:
+        # The agents may have run for long: main is read again right before the result is promoted.
+        from foragent.order_scratch import base_revision
+
+        base = base_revision(git, config.base_branch)
+        if entry.get("base_revision") != base:
+            entry.update(status="interrupted", phase="reviewing_tests",
+                         reason=text("prepare_main_moved", config.language))
+            _write(path, record)
+            return
     if entry["status"] == "reviewed" and plan_path is not None and not promote(plan_path, item, entry, root, config, base):
         # Planning changed the issue during preparation: these tests answer the old requirements.
         entry.update(status="interrupted", phase="reviewing_tests", reason=text("prepare_plan_changed", config.language))

@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 
 from foragent.config import Config
-from foragent.git import GitError, GitRepo
+from foragent.git import GitRepo
 from foragent.i18n import text
 
 
@@ -88,22 +88,34 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
     """
     from foragent.order import PlanError
     from foragent.order_prepare_cycle import identity
+    from foragent.order_prepare_setup import others_digest, published_digest
 
     if not items:
         return {}
     language = _language(config)
-    record = _record(plan, repo)
-    missing, stale, differ, bases = [], [], [], {}
+    full = {"issues": _record(plan, repo)}
+    record = full["issues"]
+    missing, stale, differ, bases, changed, changed_keys, alone = [], [], [], {}, [], [], []
     for item in items:
         key, entry = item["key"], record.get(item["key"])
         if not isinstance(entry, dict) or entry.get("status") != "reviewed":
             status = entry.get("status") if isinstance(entry, dict) else None
             missing.append(f"{key} ({status})" if status else key)
         elif entry.get("cycle") != identity(plan, item, config, root):
-            stale.append(key)
+            # A published file (a legacy test or helper, the spec, a reference) changed since review.
+            now, then = published_digest(plan, root, config), entry.get("published") or {}
+            paths = sorted(name for name in now.keys() | then.keys() if now.get(name) != then.get(name))
+            if paths:
+                changed += paths
+                changed_keys.append(key)
+            else:
+                stale.append(key)
         elif (entry.get("written") != item.get("acceptance_files")
               or entry.get("done_when") != item.get("done_when")):
             differ.append(key)
+        elif entry.get("others") != others_digest(plan, full, item):
+            # Reviewed without the other statement issues' tests that are published beside it.
+            alone.append(key)
         else:
             bases[key] = entry
     problems = []
@@ -113,6 +125,11 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
         problems.append(text("reviewed_stale", language, keys=", ".join(stale)))
     if differ:
         problems.append(text("reviewed_differ", language, keys=", ".join(differ)))
+    if alone:
+        problems.append(text("reviewed_alone", language, keys=", ".join(alone)))
+    if changed:
+        problems.append(text("reviewed_bytes_changed", language, paths=", ".join(dict.fromkeys(changed)),
+                             keys=", ".join(changed_keys)))
     if problems:
         raise PlanError(" ".join(problems))
     return bases
@@ -124,8 +141,9 @@ def require_reviewed_bytes(git: GitRepo, config: Config, items: list[dict], entr
 
     The manifest is what ``validate_plan`` collected: the plan's acceptance files and the tests its
     Done when commands name, the latter read from the checkout. A written test must equal the
-    reviewed candidate; any other named file must equal its copy on the reviewed base, which is the
-    tree the reviewer's scratch copy held. Files publication does not write land as they are on the
+    reviewed candidate, another statement issue's test the reviewed test it was reviewed beside
+    (every statement issue passed the gate, so ``entries`` holds them), any other named file its copy on the reviewed base, which is
+    the tree the reviewer's scratch copy held. Files publication does not write land as they are on the
     landing commit, which ``require_tested_base`` binds.
     """
     from foragent.issue import acceptance_paths
@@ -143,7 +161,10 @@ def require_reviewed_bytes(git: GitRepo, config: Config, items: list[dict], entr
                 continue
             published = files[name]
             published = published.decode("utf-8", "surrogateescape") if isinstance(published, bytes) else published
-            reviewed = written[name] if name in written else git.file_at(entry.get("base_revision") or "", name)
+            beside = {path: data for key, other in entries.items() if key != item["key"]
+                      for path, data in (other.get("written") or {}).items()}
+            reviewed = (written[name] if name in written else beside[name] if name in beside
+                        else git.file_at(entry.get("base_revision") or "", name))
             if published != reviewed:
                 changed.append(name)
                 keys.append(item["key"])
@@ -153,22 +174,11 @@ def require_reviewed_bytes(git: GitRepo, config: Config, items: list[dict], entr
 
 
 def require_tested_base(git: GitRepo, config: Config, entries: dict[str, dict], current: str) -> None:
-    """Refuse unless the tests were reviewed on ``current``, the commit publication lands on (``landing``).
-
-    Another commit with the very same content keeps the evidence."""
+    """Refuse unless the tests were reviewed on exactly ``current``, the commit publication lands on
+    (``landing``). Any other commit needs new red evidence, even one with the same files."""
     from foragent.order import PlanError
 
-    moved = []
-    for key, entry in entries.items():
-        base = entry.get("base_revision")
-        if base == current:
-            continue
-        try:
-            same = isinstance(base, str) and not git.committed_diff(base, current)
-        except GitError:  # an unknown or unreachable revision is no evidence for this base
-            same = False
-        if not same:
-            moved.append(key)
+    moved = [key for key, entry in entries.items() if entry.get("base_revision") != current]
     if moved:
         raise PlanError(text("reviewed_base_moved", _language(config), keys=", ".join(moved),
                              base=current[:12], branch=config.base_branch))
