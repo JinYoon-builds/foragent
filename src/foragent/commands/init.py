@@ -57,7 +57,8 @@ def _offer_fa_allow(root, answer: str | None) -> None:
     from foragent.init import FA_ALLOW_RULE, offer_fa_allow
 
     try:
-        outcome = offer_fa_allow(root, input if answer is None else lambda _prompt: answer)
+        outcome = offer_fa_allow(root, input if answer is None else lambda _prompt: answer,
+                                 require_settings=answer is None)
     except OSError as exc:
         print(f"FA commands: not allowed ({exc}); fa init will ask again next time.")
         return

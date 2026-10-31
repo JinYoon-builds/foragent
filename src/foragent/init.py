@@ -549,12 +549,14 @@ def _fa_allow_decided(key: str) -> bool:
     return (_read_json_object(fa_allow_record_path()) or {}).get(key) in {"accepted", "declined"}
 
 
-def offer_fa_allow(root: Path, ask: Callable[[str], str] = input) -> str:
+def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_settings: bool = True) -> str:
     """Ask once whether Claude may run fa commands in this project; remember either answer.
 
     Returns "added", "declined", "present" (the rule was already there), "kept" (already
-    decided), "busy" (another init is deciding for this project now), "unanswered" (no
-    terminal) or "unreadable" (settings are not a JSON object). Raises OSError when a file
+    decided), "busy" (another init is deciding for this project now), "skipped" (the project
+    has no Claude settings file yet, so there is nothing to extend and no question is added
+    to setup; pass ``require_settings=False`` when the person already gave an answer),
+    "unanswered" (no terminal) or "unreadable" (settings are not a JSON object). Raises OSError when a file
     cannot be written; then nothing is remembered.
 
     One per-project lock covers the whole check, prompt and write, so two inits of the same
@@ -581,6 +583,8 @@ def offer_fa_allow(root: Path, ask: Callable[[str], str] = input) -> str:
         if rule_present():
             _remember_fa_allow(key, "accepted")
             return "present"
+        if require_settings and not (local_file.exists() or (claude / "settings.json").exists()):
+            return "skipped"
         if _read_json_object(local_file) is None:
             return "unreadable"
         try:

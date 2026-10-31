@@ -49,6 +49,10 @@ description: Set up a project folder for Foragent.
    for them. When the command cannot prompt, ask once with AskUserQuestion:
    Yes or No, then rerun with `--fa-allow yes|no` using their answer. Either
    answer is remembered for this project; a dry run neither asks nor grants.
+   The interactive offer appears only when the project already has
+   `.claude/settings.json` or `.claude/settings.local.json`; otherwise init
+   stays silent, and you may offer it yourself and rerun with `--fa-allow` after
+   the person's explicit answer.
 
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
    public repositories (hosted Actions minutes are free), or `local` for private

@@ -1371,6 +1371,8 @@ def _fa_allow_env(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     root = tmp_path / "project"
     (root / ".claude").mkdir(parents=True)
+    # Claude Code has already written project settings: the offer only extends existing ones.
+    (root / ".claude/settings.local.json").write_text("{}\n", encoding="utf-8")
     return root
 
 
@@ -1386,7 +1388,7 @@ def test_fa_allow_existing_rule_counts_as_accepted_without_asking(tmp_path, monk
         raise AssertionError("must not ask")
 
     assert offer_fa_allow(root, never) == "present"
-    assert not (root / ".claude/settings.local.json").exists()
+    assert (root / ".claude/settings.local.json").read_text() == "{}\n"
     assert settings.read_bytes() == before
     assert json.loads(fa_allow_record_path().read_text()) == {str(root.resolve()): "accepted"}
     assert offer_fa_allow(root, never) == "kept"
@@ -1441,6 +1443,7 @@ def test_fa_allow_keeps_other_projects_answers_recorded_while_the_prompt_waits(t
     root = _fa_allow_env(tmp_path, monkeypatch)
     other = tmp_path / "other"
     (other / ".claude").mkdir(parents=True)
+    (other / ".claude/settings.json").write_text("{}\n", encoding="utf-8")
 
     def other_declines_first(prompt):
         assert offer_fa_allow(other, lambda _prompt: "no") == "declined"
@@ -1492,3 +1495,26 @@ def test_fa_allow_rule_added_by_hand_during_the_prompt_is_not_added_twice(tmp_pa
 
     assert offer_fa_allow(root, add_by_hand_then_accept) == "present"
     assert json.loads(local.read_text()) == {"permissions": {"allow": ["Bash(fa:*)"]}}
+
+
+def test_fa_allow_asks_nothing_in_a_project_without_claude_settings(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    (root / ".claude/agents").mkdir(parents=True)
+    assert offer_fa_allow(root, lambda prompt: pytest.fail("asked")) == "skipped"
+    assert sorted(path.name for path in (root / ".claude").iterdir()) == ["agents"]
+    assert not fa_allow_record_path().exists(), "a skipped offer must not consume the decision"
+
+
+def test_fa_allow_explicit_answer_works_without_existing_claude_settings(tmp_path, monkeypatch):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    root = tmp_path / "project"
+    root.mkdir()
+    assert offer_fa_allow(root, lambda prompt: "yes", require_settings=False) == "added"
+    assert json.loads((root / ".claude/settings.local.json").read_text()) == {
+        "permissions": {"allow": ["Bash(fa:*)"]}}
+    assert json.loads(fa_allow_record_path().read_text()) == {str(root.resolve()): "accepted"}
