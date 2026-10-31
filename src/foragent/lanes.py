@@ -61,6 +61,15 @@ def lane_files(root: Path, name: str, skills: list[str]) -> list[str]:
     return paths
 
 
+# Lane agents finish GitHub writes through FA commands; shipped lane agents copy this paragraph.
+GITHUB_WRITES = (
+    "GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA "
+    "commands such as `fa order`, `fa inspect` and `fa orch`. Read-only `gh` inspection stays available. "
+    "If no FA command fits a write you need, do not hand the write to the person: propose an issue "
+    "that asks for the missing FA command."
+)
+
+
 def agent_text(name: str, paths: list[str], installed: list[str]) -> str:
     """The lane agent definition add_lane writes; order preparation shows a proposed lane the same file."""
     areas = ", ".join(paths)
@@ -71,7 +80,8 @@ def agent_text(name: str, paths: list[str], installed: list[str]) -> str:
     return (f"---\n{header}---\n"
             f"You implement one GitHub issue at a time in this repository's {name} lane ({areas}).\n"
             f"{lane_memory.instruction(f'fa-{name}')}\n"
-            "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n")
+            "Run tests with `fa test <pytest args>`; it waits for a machine-wide test slot.\n"
+            f"\n{GITHUB_WRITES}\n")
 
 
 def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | None = None,
