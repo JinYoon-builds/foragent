@@ -75,3 +75,74 @@ def record(store: StateStore, at: datetime, issue: int, notes: Iterable[str], **
             orch_events.append_event(store, at, issue, KIND, note, locked=True, note=note, **fields)
             added.append(note)
     return added
+
+
+ARCHITECT_LIMIT = 20
+
+
+def _events(store: StateStore) -> list[dict]:
+    path = store.root / "orch-events.jsonl"
+    if not path.is_file():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _when(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def for_architect(store: StateStore, role: str = "architect") -> list[dict]:
+    """Recorded notes the next ``role`` session has not yet seen, oldest first.
+
+    Derived from the journal alone: the notes recorded since the start of the last ``<role>-done``
+    session that exited 0, or every note when no session finished cleanly. Nothing is consumed or
+    deleted; a failed session leaves the same notes for the next one.
+    """
+    events = _events(store)
+    since = None
+    for event in events:
+        if event.get("kind") == f"{role}-done" and event.get("exit_code") == 0:
+            started = _when(event.get("started_at"))
+            if started is not None and (since is None or started > since):
+                since = started
+    notes = []
+    for event in events:
+        if event.get("kind") != KIND:
+            continue
+        at = _when(event.get("at"))
+        if since is not None and (at is None or at < since):
+            continue
+        notes.append({"issue": event.get("issue"), "round": event.get("round"), "at": event.get("at"),
+                      "note": str(event.get("note", event.get("summary", "")))})
+    return notes
+
+
+def architect_section(store: StateStore, role: str = "architect") -> str:
+    """The prompt section listing the recorded review notes, or "" when there are none."""
+    notes = for_architect(store, role)
+    if not notes:
+        return ""
+    shown = notes[::-1][:ARCHITECT_LIMIT]
+    lines = ["## Recorded structural proposals from reviews", "",
+             "Reviewers recorded these NOTE lines (root causes and structure outside each issue's Goal).",
+             "They never blocked a merge and never started lane rework. Weigh them as evidence; deliver",
+             "any you adopt as your own proposal through `fa orch request`.", ""]
+    for note in shown:
+        round_part = f"round {note['round']}, " if note["round"] is not None else ""
+        lines.append(f"- #{note['issue']} ({round_part}{note['at']}): {note['note']}")
+    older = len(notes) - len(shown)
+    journal = store.root / "orch-events.jsonl"
+    lines += ["", (f"{older} older notes are not shown. " if older else "")
+              + f"Full source: the `{KIND}` events in {journal}."]
+    return "\n".join(lines)
