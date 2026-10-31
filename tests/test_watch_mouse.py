@@ -75,7 +75,9 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     assert len(bubble) == 1 and "▀" in bubble[0] and "second line" not in frame
     stacked = watch.render_frame(snapshot(rows), config, tmp_path, width=50, now=NOW).splitlines()
     line = next(index for index, value in enumerate(stacked) if "Planning request" in value)
-    assert "▀" not in stacked[line] and any("▀" in value for value in stacked[:line])
+    # Below 80 columns the bubble takes the whole width, without the sprite beside it.
+    top = next(index for index, value in enumerate(stacked) if value.startswith("╭"))
+    assert top < line < top + 7 and not any("▀" in value or "▄" in value for value in stacked[top:top + 8])
     text = watch.render_frame(snapshot(rows), config, tmp_path, width=40, now=NOW)
     assert "Planning request" in text and "▀" not in text
     idle = watch.render_frame(snapshot([]), config, tmp_path, width=160, now=NOW)

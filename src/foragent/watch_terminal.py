@@ -353,16 +353,18 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                                          + palette.link(style, attribute) + watch.osc8(url, found[0]) + "\x1b[0m")
                     x += watch._cells(value)
                 if x < width:
+                    # A screen that only paints (the minimal screen the locked live-view tests
+                    # drive) has no move/clrtoeol: it keeps no remnants to clear.
                     try:
                         screen.move(y, x)
                         screen.clrtoeol()  # The rest of a shorter row from the last frame.
-                    except curses.error:
+                    except (curses.error, AttributeError):
                         pass
             if len(shown) < height:
                 try:
                     screen.move(len(shown), 0)
                     screen.clrtobot()  # Rows below the frame that the last frame used.
-                except curses.error:
+                except (curses.error, AttributeError):
                     pass
             screen.refresh()
             # Curses cannot write OSC 8, so every visible #n is written again as a link after
