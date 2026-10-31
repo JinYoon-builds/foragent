@@ -105,9 +105,14 @@ def test_blocked_issue_counts_as_running_when_folded(tmp_path):
 def test_a_short_plain_frame_drops_folded_extras_before_other_sections(tmp_path):
     snapshot, config = lane_case(running=False, blocked=True)
     assert numbers(whole(snapshot, config, tmp_path, {})) == [2, 3, 4]
-    short = watch.render_frame(snapshot, config, tmp_path, width=100, state={})
+    # Only an explicit height that the frame overflows compacts it (shell: heightless F is
+    # unbounded and never TIGHT); nothing else is dropped.
+    whole_frame = watch.render_frame(snapshot, config, tmp_path, width=100, state={})
+    assert numbers(whole_frame) == [2, 3, 4]
+    lines = watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None,
+                         now=snapshot.captured_at, height=8, state={})
+    short = "\n".join("".join(value for value, _ in line).rstrip() for line in lines)
     assert numbers(short) == [3, 4] and "▸" not in short
-    assert len(short.splitlines()) <= 24
 
 
 def test_scroll_stays_within_the_last_full_screen(tmp_path):
@@ -129,15 +134,17 @@ def test_scroll_before_any_screen_is_bounded_by_the_last_frame(tmp_path):
 
 
 def test_window_shows_position_line_only_when_taller_than_the_screen(tmp_path):
-    """One slice rule: F[scroll : scroll + h - 1] plus the position line, N = len(F)."""
+    """Pinned header and footer; the body slice, then the position line over the body rows."""
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     state = {"unfolded": {"work"}, "scroll": 999}
     full = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, state=state)).splitlines()
     shown = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state)).splitlines()
-    assert state["scroll"] == len(full) - 11
-    assert shown[:-1] == full[-11:], "F's own footer row is an ordinary row and scrolls with it"
-    assert full[-2].startswith("j/k 이동") and full[-1].endswith("q 끝내기")
-    assert shown[-1].startswith(f"{len(full) - 10}–{len(full)}/{len(full)}줄")
+    body = full[1:-2]
+    assert state["scroll"] == len(body) - 8
+    assert shown[0] == full[0] and shown[-2:] == full[-2:], "header, usage and hints stay put"
+    assert shown[1:-3] == body[-8:], "only the body scrolls"
+    assert full[-2].startswith("Claude") and full[-1].endswith("q 끝내기")
+    assert shown[-3].startswith(f"{len(body) - 7}–{len(body)}/{len(body)}줄")
     small = plain_frame(watch.render_frame(snapshot, config, tmp_path, width=100, height=200, state={}))
     assert "줄 ·" not in small and "Option" not in small
 
@@ -379,9 +386,9 @@ def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
     from foragent.messages import acorns, squirrel, watch as shared
 
     snapshot, config = lane_case()
-    # The help line sits directly above the usage line (#115), the last row.
-    assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-2] == (
-        "1–1: 담당 보기 · j/k 이동 · Enter 열기 · f 접기 · a 모두 · o 오케스트레이터 · m keep/burn · x 닫기")
+    # The hint row (lane_footer) is the last row, directly under the usage row.
+    assert watch.render_frame(snapshot, config, tmp_path, width=200).splitlines()[-1] == (
+        "도토리를 누르면 설명해요 · s 설정 · m 사용량 모드 · q 끝내기")
     assert "acorns_keys" in acorns.MESSAGES["en"]
     assert all("j/k move" not in value for module in (squirrel, shared)
                for table in module.MESSAGES.values() for value in table.values())
@@ -393,10 +400,14 @@ def test_hits_use_screen_rows_after_a_height_render(tmp_path):
     watch.render_frame(snapshot, config, tmp_path, width=100, state=state, layout=whole_layout)
     state["scroll"] = 5
     watch.render_frame(snapshot, config, tmp_path, width=100, height=12, state=state, layout=layout)
-    expected = [(x0, y0 - 5, x1, y1 - 5, target) for x0, y0, x1, y1, target in whole_layout["hits"]
-                if 5 <= y0 and y1 - 5 <= 11]
+    # Screen rows map to F rows through row_map: pinned rows stay, the body scrolls by 5.
+    screen = {row: y for y, row in layout["row_map"].items()}
+    assert screen[0] == 0 and screen[state["pinned_rows"]["footer"][-1]] == 11
+    expected = [(x0, screen[row], x1, screen[row] + 1, target)
+                for x0, y0, x1, y1, target in whole_layout["hits"] for row in range(y0, y1) if row in screen]
     assert layout["hits"] == expected and expected
-    assert all(0 <= y0 < y1 <= 11 for _, y0, _, y1, _ in layout["hits"]), "clipped to the h-1 visible rows"
+    # Header row 0, body rows 1-8, the position row 9, usage 10 and hints 11.
+    assert not any(y0 <= 9 < y1 for _, y0, _, y1, _ in layout["hits"]), "the position row has no hits"
     x, y = next((x0, y0) for x0, y0, _, _, target in layout["hits"] if target == ("acorn", 6))
     watch.handle_mouse("left", x, y, layout, StateStore(tmp_path), config, state=state)
     assert state["issue"] == 6, "a screen-row click opens the issue shown on that row"
@@ -444,10 +455,10 @@ def test_live_view_paints_exactly_render_frames_slice(tmp_path, monkeypatch):
     tall, _ = live_paint(tmp_path, monkeypatch, snapshot, config, height=60, unfolded={"work"})
     frame = watch.render_frame(snapshot, config, tmp_path, width=100, state={"unfolded": {"work"}}).splitlines()
     assert len(frame) < 60
-    assert [tall.get(y, "").rstrip() for y in range(len(frame) - 1)] == frame[:-1], (
-        "a tall screen paints F itself: the same 24-row trimming, no extra sections")
-    assert tall[59].rstrip() == frame[-1], "as today, F's last row (the key help) sits on the bottom row"
-    assert not any(text.strip() for y, text in tall.items() if len(frame) - 1 <= y < 59)
+    assert [tall.get(y, "").rstrip() for y in range(len(frame) - 2)] == frame[:-2], (
+        "a tall screen paints F itself above its pinned footer, no extra sections")
+    assert [tall[58].rstrip(), tall[59].rstrip()] == frame[-2:], "usage and hints sit on the bottom rows"
+    assert not any(text.strip() for y, text in tall.items() if len(frame) - 2 <= y < 58)
 
 
 def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
@@ -580,16 +591,22 @@ def final_rows_match_state(frame, state):
 def test_interaction_data_comes_from_the_final_rows_after_trimming(tmp_path, case):
     """Class: interaction data built once from the final rows, never from a replaced draw."""
     if case == "tight":
-        # The big squirrel pushes this frame past 24 rows, so the lane rows are drawn again tight.
+        # A 10-row screen: the frame overflows, so the lane rows are drawn again tight.
         snapshot, config = lane_case(running=False, blocked=True)
     elif case == "tight-fits":
-        # 26 rows; the tight draw alone (no finished row, no toggle) brings it to 24.
+        # The tight draw drops the finished row and the toggle; nothing else gives way.
         snapshot, config = lane_case(running=False, blocked=True, queued=(), done=(1, 2))
     else:
         snapshot, config = lane_case(running=False, queued=(), done=(1, 2))
         snapshot = replace(snapshot, total=snapshot.completed)
     state = {"unfolded": {"work"}} if case == "unfolded-completed" else {}
-    frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=state)
+    if case.startswith("tight"):
+        # Only an explicit height that F overflows redraws the lane rows tight (shell).
+        frame = "\n".join("".join(value for value, _ in line).rstrip() for line in watch._frame(
+            snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at,
+            height=10, state=state))
+    else:
+        frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=state)
     lines = final_rows_match_state(frame, state)
     lane_rows = {int(re.search(r"#(\d+)", line)[1]) for line in lines
                  if line.startswith(("🐿", "⏳", "💤", "✋", "🔍")) and "#" in line}
@@ -600,8 +617,7 @@ def test_interaction_data_comes_from_the_final_rows_after_trimming(tmp_path, cas
     if case == "tight":
         assert lane_rows == {3, 4} and 2 not in dict(state["rows"]).values(), "the dropped row leaves no trace"
     if case == "tight-fits":
-        # The usage line (#115) adds a row, so the frame also gives way further down.
-        assert len(lines) <= 24 and lane_rows == {3}
+        assert lane_rows == {3}
         assert {number for _, number in state["rows"]} == {3}, "the dropped finished row leaves no trace"
     if case == "completed":
         listed = {number for _, number in state["rows"]}
@@ -627,18 +643,20 @@ def test_completion_rows_open_a_box_but_do_not_fold(tmp_path):
 
 @pytest.mark.parametrize("height", [0, 1, 2])
 def test_a_screen_under_three_rows_counts_as_no_height(tmp_path, height):
-    """Class: no forced positive capacity below 3 rows (window, scroll bound, highlight)."""
+    """Class: no forced positive capacity below 4 rows (window, scroll bound, highlight):
+    the frame is cut from its top, with no position line and no scrolling (shell)."""
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     store, state = StateStore(tmp_path), {"unfolded": {"work"}}
     whole_frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=dict(state))
     short = watch.render_frame(snapshot, config, tmp_path, width=100, height=height, state=state)
-    assert short == whole_frame and "Option" not in short, "F as it is, no position line"
+    assert short == "\n".join(whole_frame.splitlines()[:height]) and "Option" not in short, (
+        "F from its top, no position line")
     for _ in range(3):
         watch.handle_key("j", store, config, state=state)
     assert state["scroll"] == 0 and watch.scroll_limit(state) == 0
     assert watch.highlighted_row(state) == min(y for y, _ in state["rows"])
     three = watch.render_frame(snapshot, config, tmp_path, width=100, height=3, state={"unfolded": {"work"}})
-    assert len(three.splitlines()) == 3 and "Option" in three.splitlines()[-1]
+    assert three.splitlines() == whole_frame.splitlines()[:3] and "Option" not in three
 
 
 def test_live_view_under_three_rows_paints_the_start_of_f(tmp_path, monkeypatch):
@@ -665,8 +683,8 @@ def test_done_summary_and_more_line_are_plain_text(tmp_path):
 
 @pytest.mark.parametrize("unfolded, height", [(set(), 40), ({"work"}, 15)])
 def test_a_refresh_error_takes_the_bottom_row(tmp_path, monkeypatch, unfolded, height):
-    """F fits: the error replaces the key help on the bottom row, as today. F taller: it
-    replaces the position line."""
+    """The error takes the row above the pinned usage and hint rows: the position row
+    while F is taller than the screen, else the last body row (shell, v3.shell.04)."""
     import curses
     from concurrent.futures import Future
     from io import StringIO
@@ -698,11 +716,12 @@ def test_a_refresh_error_takes_the_bottom_row(tmp_path, monkeypatch, unfolded, h
 
     snapshot, config = lane_case(queued=tuple(range(4, 40)))
     clock = iter([0] + [100] * 50)
-    frames: list[dict[int, str]] = []
+    frames: list[dict[int, str]] = [{}]
     screen = Mock()
     screen.getmaxyx.return_value = (height, 100)
     screen.getch.side_effect = [-1, ord("q")]
-    screen.erase.side_effect = lambda: frames.append({})
+    # The screen is erased once; each refresh ends one painted frame.
+    screen.refresh.side_effect = lambda: frames.append({})
     screen.addstr.side_effect = lambda y, x, value, attr: frames[-1].__setitem__(y, frames[-1].get(y, "") + value)
     monkeypatch.setattr(watch.sys, "stdout", StringIO())
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: next(clock)))
@@ -717,15 +736,17 @@ def test_a_refresh_error_takes_the_bottom_row(tmp_path, monkeypatch, unfolded, h
         *a, state=state.setdefault("unfolded", set()).update(unfolded) or state, **k))
     watch_terminal._terminal(screen, refresh, snapshot, config, tmp_path, lambda: snapshot.captured_at,
                              StateStore(tmp_path))
-    first, second = frames
+    first, second = frames[:2]
+    assert screen.erase.call_count == 1
     assert "tracker unreachable" not in "".join(first.values())
-    assert "tracker unreachable" in second[height - 1]
+    assert "tracker unreachable" in second[height - 3]
     assert sum("tracker unreachable" in text for text in second.values()) == 1
+    assert "q " in second[height - 1] and "Claude" in second[height - 2], "usage and hints stay last"
     if unfolded:
-        assert "Option" in first[height - 1] and "Option" not in "".join(second.values())
+        assert "Option" in first[height - 3] and "Option" not in "".join(second.values())
     else:
-        # The usage line (#115) is the bottom row until the error takes it.
-        assert "Claude —" in first[height - 1] and "Claude —" not in "".join(second.values())
+        # F fits: the usage row stays above the hints; the error takes the last body row.
+        assert "Claude —" in first[height - 2] and "Claude —" in second[height - 2]
 
 
 def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_path):
@@ -755,10 +776,116 @@ def test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice(tmp_pa
     assert state["unfolded"] == set(), "f on the lane row folds its lane"
     # Clicks after a scrolled height render: screen rows map back to the right F rows.
     for row, lane in ((lane_row, "work"), (done_row, None)):
-        state, layout = {"unfolded": {"work"}, "scroll": row}, {}
+        # The scroll counts body rows: the one pinned header row is not one of them.
+        state, layout = {"unfolded": {"work"}, "scroll": row - 1}, {}
         watch.render_frame(snapshot, config, tmp_path, width=100, height=8, state=state, layout=layout)
-        top = state["scroll"]
-        assert top > 0 and top <= row < top + 7, (top, row)
-        x0, y0, *_ = next(hit for hit in layout["hits"] if hit[1] == row - top and hit[4] == ("acorn", 1))
+        screen = {frame_row: y for y, frame_row in layout["row_map"].items()}
+        assert state["scroll"] > 0 and row in screen, (state["scroll"], row)
+        x0, y0, *_ = next(hit for hit in layout["hits"] if hit[1] == screen[row] and hit[4] == ("acorn", 1))
         watch.handle_mouse("left", x0, y0, layout, store, config, state=state)
         assert state["issue"] == 1 and state["issue_lane"] == lane, row
+
+
+def test_a_stateless_height_render_keeps_its_pins_and_counts_only_body_rows(tmp_path, monkeypatch):
+    """Class: pinned metadata lost when the caller owns no state (render_frame without state)."""
+    from types import SimpleNamespace
+
+    from foragent import watch_layout
+
+    def section(name, order, lines, pin=None):
+        return SimpleNamespace(__name__="foragent.watch_sections." + name, ORDER=order, PIN=pin, GAP=False,
+                               GAP_AFTER=False, render=lambda *args, **context: [[(line, "")] for line in lines])
+
+    monkeypatch.setattr(watch_layout, "_sections", lambda: [
+        section("head", 1, ["HEADER"], "header"),
+        section("body", 2, [f"BODY {index}" for index in range(20)]),
+        section("foot", 3, ["USAGE", "HINTS"], "footer")])
+    snapshot, config = lane_case()
+    lines = watch.render_frame(snapshot, config, tmp_path, width=80, height=5).splitlines()
+    assert lines[0] == "HEADER" and lines[-2:] == ["USAGE", "HINTS"]
+    assert lines[1] == "BODY 0" and lines[2].startswith("1–1/20줄"), lines
+
+
+def test_a_refresh_error_over_the_only_body_row_leaves_nothing_to_open(tmp_path, monkeypatch):
+    """Class: a screen-row map edited for painting but not in the state the keys read."""
+    import curses
+    from concurrent.futures import Future
+    from io import StringIO
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from foragent import watch_terminal
+
+    class Sync:
+        def __init__(self, max_workers):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def submit(self, fn):
+            future = Future()
+            try:
+                future.set_result(fn())
+            except Exception as exc:  # noqa: BLE001 - the view shows any refresh failure
+                future.set_exception(exc)
+            return future
+
+    def refresh():
+        raise RuntimeError("tracker unreachable")
+
+    snapshot, config = lane_case(queued=tuple(range(4, 40)))
+    clock = iter([0] + [100] * 50)
+    screen = Mock()
+    screen.getmaxyx.return_value = (4, 100)
+    screen.getch.side_effect = [-1, 10, ord("q")]
+    seen = []
+    real_key = watch.handle_key
+
+    def handle_key(key, *args, state=None, **kwargs):
+        if key == "enter":
+            seen.append((watch.highlighted_row(state), dict(state.get("row_map") or {})))
+        return real_key(key, *args, state=state, **kwargs)
+
+    monkeypatch.setattr(watch, "handle_key", handle_key)
+    monkeypatch.setattr(watch.sys, "stdout", StringIO())
+    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(watch, "ThreadPoolExecutor", Sync)
+    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
+    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
+    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
+    watch_terminal._terminal(screen, refresh, snapshot, config, tmp_path, lambda: snapshot.captured_at,
+                             StateStore(tmp_path))
+    painted = "".join(call.args[2] for call in screen.addstr.call_args_list)
+    assert "tracker unreachable" in painted
+    (highlight, row_map), = seen
+    assert 1 not in row_map, "the row under the error is not on screen for the keys"
+    assert highlight is None, "Enter has no visible issue row to open"
+
+
+def test_the_top_line_counts_only_running_work_and_only_real_questions(tmp_path):
+    """Class: pending or held work read as running (or as a question) in the top line."""
+    def top(snapshot):
+        return watch.render_frame(snapshot, config, tmp_path, width=120).splitlines()[0]
+
+    snapshot, config = lane_case()
+    assert "잘 돌고 있어요" in top(snapshot)
+    queued, _ = lane_case(running=False, queued=(4, 5))
+    assert "쉬고 있어요" in top(queued), "queued work is pending, not running"
+    blocked, _ = lane_case(running=False, blocked=True)
+    # A live run on a blocked issue is listed in active_runs, but no worker is running.
+    blocked.status["active_runs"] = [{"number": 3, "lane": "work", "attempts": 1}]
+    assert "쉬고 있어요" in top(blocked), "blocked work is held, not running"
+    parked, _ = lane_case(running=False, queued=())
+    parked.status["lanes"]["work"].update(state="waiting-human", issue=3)
+    parked.status["summary"] = {**parked.status["summary"], "waiting_human": 1}
+    parked.status["issues"] = {"needs-human": []}
+    line = top(parked)
+    assert "쉬고 있어요" in line and "답할 질문" not in line, "parked work asks no question"
+    parked.status["issues"] = {"needs-human": [{"number": 3}, {"number": 3}]}
+    assert "답할 질문 1개" in top(parked), "one distinct needs-human issue is one question"

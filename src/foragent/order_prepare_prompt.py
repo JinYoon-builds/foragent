@@ -31,11 +31,11 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
     blocked = "\n".join(
         f"- {key}: {titles[key]['title']}: {titles[key]['goal']}" if key in titles else f"- {key}"
         for key in item.get("blocked_by", [])) or "(none)"
-    locked = "".join(f"\n### {path} (issue {other['key']})\n```\n{content}\n```\n"
-                     for other in plan["issues"] if other is not item
-                     for path, content in other.get("acceptance_files", {}).items())
+    from foragent.order_prepare_cycle import other_issues
+
     statements = "\n".join(f"- {line}" for line in item["statements"])
     files = "\n".join(f"- {path}" for path in item.get("files", [])) or "(not listed)"
+    checklist = "\n".join(f"- {line}" for line in item.get("checklist", [])) or "(none)"
     references = order_references.preread_section(plan, item, root, tree) if _references(plan, item) else ""
     notes = _risk_notes(root, config, item) or "(no risk map entry matches this issue)"
     heading = (f"# Edit of existing issue {item['key']}: {item['title']}" if item.get("edit")
@@ -68,7 +68,9 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         f"## Behaviour statements\n{statements}\n\n"
         f"## Goal\n{item['goal']}\n\n## Out of scope\n{item['out_of_scope']}\n\n"
         f"## Blocked by\n{blocked}\n\n## Files expected to change later\n{files}\n\n"
-        f"## Existing locked contracts\nTests already under {directory} in this tree are locked; read them,\n"
-        f"do not change them.{locked or ' No other issue in this order brings tests.'}\n\n"
+        f"## Checklist\n{checklist}\n\n"
+        f"## Other issues of this order (contracts you may rely on)\nTests already under {directory} in this tree\n"
+        "and the locked tests below are read-only: read them, do not change them. Another issue's\n"
+        f"statements and goal are its public contract.\n\n{other_issues(plan, item)}\n\n"
         f"## Risk guidance\n{notes}\n"
     ) + (f"\n{references}" if references else "")

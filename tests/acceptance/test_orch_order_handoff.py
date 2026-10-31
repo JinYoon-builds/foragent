@@ -1,6 +1,10 @@
 """Acceptance test for orch-order-handoff. Locked by Foragent; do not edit."""
 
 from pathlib import Path
+
+from test_orchestrator_publishes_choice_free_fixes import assert_choice_free_boundary
+
+ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / ".foragent.yml").is_file())
 import re
 
 import pytest
@@ -8,7 +12,7 @@ import pytest
 
 @pytest.fixture(params=["SKILL.md", "references/order-card.md"])
 def handoff_text(request):
-    root = Path(__file__).resolve().parents[2] / "skills/fa-orchestrator"
+    root = ROOT / "skills/fa-orchestrator"
     text = (root / request.param).read_text(encoding="utf-8")
     if request.param == "SKILL.md":
         pointer = re.search(r"\[order card\]\((references/order-card\.md)\)", text)
@@ -18,7 +22,7 @@ def handoff_text(request):
 
 
 def test_orch_order_handoff_entrypoint_is_a_one_line_pointer_within_the_skill_limit():
-    root = Path(__file__).resolve().parents[2] / "skills/fa-orchestrator"
+    root = ROOT / "skills/fa-orchestrator"
     skill = (root / "SKILL.md").read_text(encoding="utf-8")
     assert len(skill.splitlines()) <= 150
     assert re.search(
@@ -51,11 +55,10 @@ def test_orch_order_handoff_planning_asks_the_person_and_publishes_after_approva
 
 
 def test_orch_order_handoff_orchestrator_publishes_only_after_approval_in_its_own_session(handoff_text):
-    assert re.search(
-        r"orchestrator publishes with.{0,15}--approve.{0,20}only when"
-        r".{0,20}person approved.{0,15}in the orchestrator['’]s own session",
-        handoff_text,
-    ), "Orchestrator publication requires the person's approval in its own session"
+    """Historical name retained: D71 choices need the person's planning-session
+    approval; a choice-free fix instead needs the orchestrator's clean preread.
+    """
+    assert_choice_free_boundary(handoff_text, "orchestrator order-card guidance")
 
 
 def test_orch_order_handoff_relayed_add_is_not_publication_approval(handoff_text):

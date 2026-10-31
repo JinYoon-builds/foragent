@@ -3,7 +3,8 @@
 An approval snapshot locks the Git blob of every acceptance file the issue relies
 on; the gate flags hash-mismatch when the base's blob differs. Publication lists
 every approved issue whose locked bytes it would change. It may go ahead only when
-each of them is re-approved in the same publication; otherwise it refuses.
+each of them is re-approved in the same publication; otherwise it refuses. A
+re-approval records the published blobs (``approval_record``).
 """
 
 from __future__ import annotations
@@ -11,9 +12,9 @@ from __future__ import annotations
 import hashlib
 import time
 from datetime import datetime
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable
 
+from foragent import approval_record
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.i18n import text
@@ -48,8 +49,14 @@ def _gate_lock(issue: Issue, approval, paths: list[str], config: Config, tracker
         return dict(approval.acceptance_blobs)
     if not paths:
         return {}
+    # A recorded hash wins over the approval-time lookup, as in ``scheduler_approval``.
+    record = {path: sha for path, sha in approval_record.recorded(
+        tracker.label_events(issue.number), tracker.list_comments(issue.number), event).items() if path in paths}
+    looked_up = [path for path in paths if path not in record]
+    if not looked_up:
+        return record
     approved_ref = git().commit_before(f"origin/{config.base_branch}", event.created_at)
-    return git().blob_shas(approved_ref, paths) if approved_ref is not None else {}
+    return {**(git().blob_shas(approved_ref, looked_up) if approved_ref is not None else {}), **record}
 
 
 def affected_owners(config: Config, repo: str, tracker: Tracker, issues: Iterable[Issue],
@@ -77,32 +84,7 @@ def affected_owners(config: Config, repo: str, tracker: Tracker, issues: Iterabl
     return dict(sorted(affected.items()))
 
 
-GATE_WAIT_S = 15 * 60
 APPROVAL_ATTEMPTS = 5
-
-
-@contextmanager
-def gate_paused(repo: str, busy: Callable[[], Exception]) -> Iterator[None]:
-    """Hold this machine's tick lock, waiting up to ``GATE_WAIT_S`` for a running tick.
-
-    A tick lists issues and checks their approvals against the base it fetched; on
-    this machine the publication moves that same base. Holding the lock, no tick
-    runs between the approval withdrawal, the push and the re-approval. Ticks of
-    other machines fetch the base before they list issues, so they see either the
-    old bytes or the withdrawn approval. The lock is taken on its own descriptor,
-    so even a tick on this thread finds it busy.
-    """
-    store = StateStore.for_repo(repo)
-    path = store._tick_lock_path()
-    deadline = time.monotonic() + GATE_WAIT_S
-    while True:
-        with store._try_tick_lock(path) as acquired:
-            if acquired:
-                yield
-                return
-        if time.monotonic() >= deadline:
-            raise busy()
-        time.sleep(1)
 
 
 def _approval_times(tracker: Tracker, number: int) -> list[datetime]:
@@ -110,19 +92,30 @@ def _approval_times(tracker: Tracker, number: int) -> list[datetime]:
             if event.label == "approved" and event.action == "labeled"]
 
 
-def approve_after_edits(tracker: Tracker, number: int, approvers: list[str], language: str) -> None:
+def record_for(tracker: Tracker, number: int, config: Config, published: dict[str, str]) -> dict[str, str]:
+    """The published blobs of the locked files the gate will check for ``number``."""
+    paths = acceptance_paths(parse_body(tracker.get_issue(number).body).done_when_commands, config.acceptance_dir)
+    return {path: published[path] for path in paths if path in published}
+
+
+def approve_after_edits(tracker: Tracker, number: int, approvers: list[str], language: str,
+                        record: dict[str, str]) -> None:
     """Add ``approved`` so the gate reads it as a new approval, later than the last body edit.
 
     GitHub times have whole seconds. The gate refuses an approval whose time is not
     after the last body edit, and it keeps a snapshot whose time equals the latest
     approval's, so the new approval must also be later than every earlier one. The
     label is read back; an approval in such a second is withdrawn and added again a
-    second later.
+    second later. ``record`` (the approved blob hashes) is written right before each
+    attempt, so it belongs to that approval.
     """
     from foragent import scheduler_approval
 
     earlier = max(_approval_times(tracker, number), default=None)
     for _ in range(APPROVAL_ATTEMPTS):
+        # Written before each attempt, so the record precedes exactly that approval.
+        if record:
+            tracker.comment(number, approval_record.comment_body(record))
         tracker.add_labels(number, ["approved"])
         event, _ = scheduler_approval._latest_approval(tracker.label_events(number), approvers)
         if event is None:
@@ -133,34 +126,6 @@ def approve_after_edits(tracker: Tracker, number: int, approvers: list[str], lan
         tracker.remove_labels(number, ["approved"])
         time.sleep(1)
     raise TrackerError(text("order_locks_approval_unordered", language, number=number))
-
-
-def confirm_locked(tracker: Tracker, git: GitRepo, config: Config, shared: dict[int, list[str]],
-                   published: dict[str, str]) -> None:
-    """Check, on a fresh base, that each re-approved owner is held to the published bytes.
-
-    The gate locks an approval to the base at the approval time. A publication of
-    another machine may have replaced the tests between this push and the
-    re-approval; those owners would then be approved for bytes nobody reviewed, so
-    their approval is withdrawn and the publication reports them.
-    """
-    from foragent import scheduler_approval
-
-    git.fetch("origin", config.base_branch)
-    replaced: dict[int, list[str]] = {}
-    for number, paths in shared.items():
-        event, _ = scheduler_approval._latest_approval(tracker.label_events(number), config.approvers)
-        if event is None or "approved" not in tracker.get_issue(number).labels:
-            continue
-        ref = git.commit_before(f"origin/{config.base_branch}", event.created_at)
-        locked = git.blob_shas(ref, paths) if ref is not None else {}
-        wrong = sorted(path for path in paths if locked.get(path) != published[path])
-        if wrong:
-            replaced[number] = wrong
-    for number in replaced:
-        tracker.remove_labels(number, ["approved", "ready"])
-    if replaced:
-        raise TrackerError(text("order_locks_replaced", config.language, owners="\n".join(lines(replaced))))
 
 
 def lines(affected: dict[int, list[str]]) -> list[str]:

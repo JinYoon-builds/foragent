@@ -1,4 +1,3 @@
-import contextlib
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -17,7 +16,7 @@ from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
 from foragent.reasons import Reason, format_comment
-from foragent.scheduler import BUSY_TICK, TickContext, tick
+from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
@@ -999,6 +998,22 @@ def test_preread_gate_does_not_apply_without_approval(publishing, plan, monkeypa
 ])
 def test_preread_reply_lists_one_unknown_per_line(message, unknowns):
     assert order._unknowns(message) == unknowns
+
+
+@pytest.mark.parametrize("message,unknowns", [
+    ("Notes first.\nDECIDE: Use the catalog.\nNotes after.", []),
+    ("Plan notes.\n- APPROACH: Reuse the parser.\n* more notes", []),
+    ("Notes.\n1. QUESTION: Which locale?\nTrailing note.\nquestion: Which region?", ["Which locale?", "Which region?"]),
+    ("NONE\nDECIDE: Keep it.", []),
+])
+def test_structured_preread_reply_blocks_only_on_question_lines(message, unknowns):
+    assert order._unknowns(message) == unknowns
+
+
+def test_structured_preread_reply_keeps_decisions_and_approach():
+    message = "Note.\n- DECIDE: Use the catalog.\nAPPROACH: Reuse it.\nQUESTION: Which?"
+    assert order._decisions(message) == ["Use the catalog."]
+    assert order._approach(message) == ["Reuse it."]
 
 
 def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch):
@@ -2393,13 +2408,9 @@ def _assert_owners_renewed(case, *owners):
         assert {"approved", "ready"} <= case.tracker.get_issue(number).labels
 
 
-@pytest.mark.parametrize("lock", ["held", "not-held"])
-def test_shared_lock_ticks_between_push_and_reapproval_never_see_stale_approvals(locked_order, monkeypatch, lock):
-    """Ticks after the push and after the body edits: this machine's are held off by the tick
-    lock; one the lock cannot stop (``not-held``) sees withdrawn approvals, not old snapshots."""
+def test_shared_lock_ticks_between_push_and_reapproval_never_see_stale_approvals(locked_order, monkeypatch):
+    """Ticks after the push and after the body edits see withdrawn approvals, not old snapshots."""
     case, ticks = locked_order, []
-    if lock == "not-held":
-        monkeypatch.setattr(order_locks, "gate_paused", lambda repo, busy: contextlib.nullcontext())
     push_base, add_labels = case.git.push_base, case.tracker.add_labels
 
     def push_then_tick(branch):
@@ -2416,7 +2427,6 @@ def test_shared_lock_ticks_between_push_and_reapproval_never_see_stale_approvals
     _publish_locked(case, approve=True)
     assert len(ticks) >= 3
     assert not any("hash-mismatch" in action for report in ticks for action in report.actions), ticks
-    assert all((report.skipped == BUSY_TICK) == (lock == "held") for report in ticks), ticks
     # The injected ticks just refreshed the listing; the next one is due a tick period later.
     case.clock[0] += timedelta(minutes=10)
     tick(case.ctx)
@@ -2452,47 +2462,23 @@ def test_shared_lock_unordered_reapproval_stops_visibly_unapproved(locked_order,
     assert case.store.load_flag(2) is None
 
 
-def _hold_tick_lock(case):
-    import fcntl
-    stream = case.store._tick_lock_path().open("a")
-    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    return stream
+def test_shared_lock_running_tick_that_listed_the_old_approval_does_not_flag_it(locked_order):
+    """A tick listed an owner as approved before the withdrawal and checks it after the push."""
+    from foragent import scheduler_approval
+    from foragent.scheduler import TickReport
 
-
-def test_shared_lock_publication_waits_for_a_running_tick_before_withdrawing(locked_order, monkeypatch):
-    """A running tick may have read the old approvals; nothing changes until it has finished."""
     case = locked_order
-    running, waited = _hold_tick_lock(case), []
-    old_blob = case.git.blob_sha("origin/main", FILE)
-
-    def sleep(seconds):
-        # Still waiting: owners keep their approval and the base keeps the old bytes.
-        assert all("approved" in case.tracker.get_issue(n).labels for n in (2, 3))
-        assert case.git.blob_sha("origin/main", FILE) == old_blob
-        waited.append(seconds)
-        running.close()  # The tick finishes.
-
-    monkeypatch.setattr(order_locks.time, "sleep", sleep)
+    stale = {n: (case.tracker.get_issue(n), case.store.load_approval(n)) for n in (2, 3)}
     _publish_locked(case, approve=True)
-    assert waited == [1]
+    case.git.update_base("main")  # This machine's base moved with the push.
+    report = TickReport()
+    for number, (issue, approval) in stale.items():
+        assert not scheduler_approval._check_integrity(case.ctx, issue, approval, "origin/main", report)
+        assert case.store.load_flag(number) is None
+    assert not any("hash-mismatch" in action for action in report.actions), report.actions
     case.clock[0] += timedelta(minutes=10)
     tick(case.ctx)
     _assert_owners_renewed(case, 2, 3)
-
-
-def test_shared_lock_publication_refuses_when_the_gate_stays_busy(locked_order, monkeypatch):
-    case = locked_order
-    running = _hold_tick_lock(case)
-    monkeypatch.setattr(order_locks, "GATE_WAIT_S", 0)
-    old, old_blob = (case.root / FILE).read_bytes(), case.git.blob_sha("origin/main", FILE)
-    issues = dict(case.tracker.issues)
-    try:
-        with pytest.raises(order.PlanError, match="gate"):
-            _publish_locked(case, approve=True)
-    finally:
-        running.close()
-    assert (case.root / FILE).read_bytes() == old and case.git.blob_sha("origin/main", FILE) == old_blob
-    assert case.tracker.issues == issues
 
 
 def test_shared_lock_reapproval_postdates_an_approval_in_the_same_second(locked_order, monkeypatch):
@@ -2524,34 +2510,27 @@ def _push_elsewhere(case, content: str) -> None:
     git_command(case.origin, "fast-import", "--quiet", input=stream)
 
 
-def test_shared_lock_publication_lock_is_held_until_owners_are_reapproved(locked_order, monkeypatch):
-    """A second publication on this machine cannot push between this push and the re-approval."""
-    import fcntl
-    case, observed = locked_order, []
-    add_labels = case.tracker.add_labels
-    lock = case.root / ".git" / "foragent-publish.lock"
+def _record_of(case, number):
+    from foragent import approval_record, scheduler_approval
 
-    def probe(number, labels):
-        if "approved" in labels:
-            with lock.open("a") as stream:
-                try:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    observed.append(("held", number))
-                else:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-                    observed.append(("free", number))
-        return add_labels(number, labels)
+    events = case.tracker.label_events(number)
+    event, _ = scheduler_approval._latest_approval(events, case.config.approvers)
+    return approval_record.recorded(events, case.tracker.list_comments(number), event)
 
-    monkeypatch.setattr(case.tracker, "add_labels", probe)
+
+def test_shared_lock_reapproval_records_the_published_blobs(locked_order):
+    case = locked_order
     _publish_locked(case, approve=True)
-    assert observed and all(state == "held" for state, number in observed if number in (2, 3)), observed
+    case.git.update_base("main")  # A real push moves origin/main; the offline one does not.
+    published = case.git.blob_sha("origin/main", FILE)
+    assert all(_record_of(case, number) == {FILE: published} for number in (2, 3))
 
 
-def test_shared_lock_bytes_replaced_before_reapproval_leave_owners_unapproved(locked_order, monkeypatch):
-    """Another machine replaces the tests after this push: nobody is approved for those bytes."""
+def test_shared_lock_bytes_replaced_before_reapproval_are_never_snapshotted(locked_order, monkeypatch):
+    """Another clone replaces the tests after this push: the gate waits instead of locking them."""
     case, replaced = locked_order, []
     add_labels = case.tracker.add_labels
+    before = {n: case.store.load_approval(n) for n in (2, 3)}
 
     def replace_then_approve(number, labels):
         if "approved" in labels and not replaced:
@@ -2560,12 +2539,143 @@ def test_shared_lock_bytes_replaced_before_reapproval_leave_owners_unapproved(lo
         return add_labels(number, labels)
 
     monkeypatch.setattr(case.tracker, "add_labels", replace_then_approve)
-    with pytest.raises(TrackerError) as refused:
-        _publish_locked(case, approve=True)
-    assert f"#2: {FILE}" in str(refused.value) and f"#3: {FILE}" in str(refused.value)
-    for number in (2, 3):
-        assert "approved" not in case.tracker.get_issue(number).labels
+    _publish_locked(case, approve=True)
     case.clock[0] += timedelta(minutes=10)
-    tick(case.ctx)
+    report = tick(case.ctx)
     for number in (2, 3):
         assert case.store.load_flag(number) is None
+        assert case.store.load_approval(number) == before[number]  # Not snapshotted under the new approval.
+        assert any(f"#{number} approval waits" in action for action in report.actions), report.actions
+
+
+def _second_clone(case, tmp_path, monkeypatch, *, pause: bool):
+    """Another machine: its own clone and store, the same tracker; optionally its tick start fetch is stale."""
+    clone = tmp_path / "second"
+    git_command(tmp_path, "clone", "-q", str(case.origin), str(clone))
+    store = StateStore(tmp_path / "second-state", now=lambda: case.clock[0])
+    git = GitRepo(clone)
+    if pause:
+        fetch, calls = git.fetch, []
+
+        def stale_first_fetch(*args, **kwargs):
+            calls.append(args)
+            if len(calls) > 1:  # The tick fetched before the publication and paused across it.
+                return fetch(*args, **kwargs)
+
+        monkeypatch.setattr(git, "fetch", stale_first_fetch)
+    ctx = TickContext(repo="owner/repo", repo_root=clone, tracker=case.tracker, store=store, config=case.config,
+                      git=git, now=lambda: case.clock[0], launcher=lambda number: None, start_runs=False,
+                      runner_process_exists=lambda number: False)
+    return SimpleNamespace(root=clone, git=git, store=store, ctx=ctx)
+
+
+def test_shared_lock_second_clone_paused_across_the_publication_snapshots_the_new_bytes(
+        locked_order, tmp_path, monkeypatch):
+    case = locked_order
+    other = _second_clone(case, tmp_path, monkeypatch, pause=True)
+    old = other.git.blob_sha("origin/main", FILE)
+    _publish_locked(case, approve=True)
+    assert other.git.blob_sha("origin/main", FILE) == old  # Its tick starts on the old bytes.
+    tick(other.ctx)
+    case.git.update_base("main")  # A real push moves origin/main; the offline one does not.
+    published = case.git.blob_sha("origin/main", FILE)
+    for number in (2, 3):
+        assert other.store.load_flag(number) is None
+        assert other.store.load_approval(number).acceptance_blobs[FILE] == published != old
+    case.clock[0] += timedelta(minutes=10)
+    tick(other.ctx)  # Its next ordinary tick.
+    for number in (2, 3):
+        assert other.store.load_flag(number) is None
+        assert {"approved", "ready"} <= case.tracker.get_issue(number).labels
+
+
+def test_shared_lock_dry_run_on_a_stale_local_base_sees_what_another_clone_published(locked_order):
+    """Another clone pushed B and the owners were re-approved by hand; locally origin/main still has A."""
+    case = locked_order
+    stale = case.git.blob_sha("origin/main", FILE)
+    _push_elsewhere(case, "assert 2 == 2\n")
+    case.clock[0] += timedelta(minutes=1)
+    for number in (2, 3):
+        case.tracker.remove_labels(number, ["approved", "ready"])
+        case.tracker.add_labels(number, ["approved"])
+    case.plan["issues"][0]["acceptance_files"][FILE] = case.original  # The bytes the local base still has.
+    assert case.git.blob_sha("origin/main", FILE) == stale
+    assert _publish_locked(case, dry_run=True).affected == {2: [FILE], 3: [FILE]}
+
+
+def _budget_case(tmp_path, monkeypatch, budget):
+    """One store in a private machine root with ``budget`` slots and a calm machine."""
+    from datetime import UTC, datetime
+    from foragent import capacity
+
+    store = StateStore(tmp_path / "machine" / "owner__project")
+    store.root.mkdir(parents=True)
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    capacity.write_state(store, budget, datetime.now(UTC))
+    return store
+
+
+def test_perspectives_seat_without_a_slot_in_time_fails_in_the_configured_language(
+        tmp_path, monkeypatch, capsys, fake_process_table):
+    import shutil
+    from foragent import capacity, executors, order_perspectives
+
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree=sibling.worktree_path(99), pid=capacity.os.getpid())
+    clock = [0.0]
+    monkeypatch.setattr(capacity.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: pytest.fail("no seat may start without a slot"))
+    result = order_perspectives.run({"id": "p"}, tmp_path, Config(language="ko"), store)
+    assert result["questions"] == []
+    assert len(result["failures"]) == len(order_perspectives.SEATS)
+    assert all("시작하지 못했어요" in failure["error"] and "기계 여유" in failure["error"]
+               for failure in result["failures"])
+    err = capsys.readouterr().err
+    assert f"관점 자리 {len(order_perspectives.SEATS)}개" in err and "남은 칸은 0개" in err
+    assert capacity.machine_runs(store, capacity.datetime.now(capacity.UTC)) == 1  # Only the sibling's run.
+
+
+def test_perspectives_wave_notice_only_when_seats_outnumber_free_slots(tmp_path, monkeypatch, capsys):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.executors import ExecResult
+
+    class Worker:
+        def run(self, **kwargs):
+            return ExecResult(0, False, "NONE", kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    seats = len(order_perspectives.SEATS)
+    store = _budget_case(tmp_path / "wide", monkeypatch, seats)
+    (store.root.parent / "machine.yml").write_text(f"max_parallel: {seats}\n")
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    assert capsys.readouterr().err == ""
+    store = _budget_case(tmp_path / "narrow", monkeypatch, 2)
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    err = capsys.readouterr().err
+    assert f"{seats} perspective seats" in err and "2 free slot(s)" in err and f"{-(-seats // 2)} wave(s)" in err
+
+
+def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, monkeypatch, capsys,
+                                                   fake_process_table):
+    from foragent import capacity
+
+    root, config = publishing[0], publishing[1]
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree="other", pid=capacity.os.getpid())
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: sibling.active_runs() and sibling.finish_run(99, "merged"))
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    assert len(order.preread(plan, root, config)) == len(plan["issues"]) > 1
+    err = capsys.readouterr().err
+    assert f"Each of the {len(plan['issues'])} issues is read in its own turn" in err
+    assert "Waiting for machine capacity" in err
+    order.preread(plan, root, config)  # A free slot: no notice.
+    assert "own turn" not in capsys.readouterr().err
