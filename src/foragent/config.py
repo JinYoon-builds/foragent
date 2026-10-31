@@ -94,6 +94,8 @@ class Config:
     conflict_retries: int = 2
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
+    # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
+    merge_group_max: int = 4
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
