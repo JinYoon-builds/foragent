@@ -90,7 +90,7 @@ def _rule(tool: str, path: Path) -> str:
 
 
 def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptance_dir: str,
-                directory: Path) -> dict:
+                directory: Path, *, edit: bool = True) -> dict:
     """Executor options that confine the writer to the tree, ignoring any inherited authority.
 
     Codex runs without the user's config, execpolicy rules, hooks, notify program and MCP
@@ -99,6 +99,7 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
     MCP server is configured and all hooks are disabled; it may Edit only the tree's acceptance
     directory and its sandboxed shell may write only in the tree, never in a ``protected``
     directory (checkout, Git directory, state) or the tree's own Claude settings, with no network.
+    Without ``edit`` (the reviewer) Claude has no edit tools at all; its shell keeps the same sandbox.
     """
     if executor != "claude":
         return {"isolated": True}
@@ -107,9 +108,11 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
     denied = [place for place in protected if not tree.resolve().is_relative_to(place)] + [tree / ".claude"]
     settings = {
         "permissions": {
-            "allow": ["Read", "Glob", "Grep", "Bash", _rule("Edit", tests / "**"), _rule("Write", tests / "**")],
+            "allow": ["Read", "Glob", "Grep", "Bash"] + (
+                [_rule("Edit", tests / "**"), _rule("Write", tests / "**")] if edit else []),
             "deny": ["WebFetch", "WebSearch", *(_rule(tool, place / "**") for place in denied
-                                                for tool in ("Edit", "Write"))],
+                                                for tool in ("Edit", "Write"))]
+            + ([] if edit else ["Edit", "Write", "NotebookEdit"]),
         },
         "sandbox": {"enabled": True, "autoAllowBashIfSandboxed": True, "allowUnsandboxedCommands": False,
                     "filesystem": {"allowWrite": [str(tree)], "denyWrite": [str(place) for place in denied]},
@@ -119,6 +122,7 @@ def permissions(executor: str, tree: Path, protected: tuple[Path, ...], acceptan
         # (settings, agent or skill frontmatter, plugins): none run for the writer.
         "disableAllHooks": True,
     }
+    directory.mkdir(parents=True, exist_ok=True)
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {"settings_path": path, "permission_mode": "dontAsk", "setting_sources": "project"}
