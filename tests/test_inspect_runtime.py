@@ -225,16 +225,22 @@ def test_prepare_cleans_up_on_command_error_and_does_not_cache(ctx, monkeypatch)
 
 
 def test_store_card_precedes_pr_fallback_and_missing_card_is_optional(ctx):
-    merged(ctx)
+    """A merged PR is published: its body owns the card and a saved local copy never stands in."""
+    merged(ctx, card=WEB)
     merged(ctx, 2, "_not provided by the implementer_")
-    saved = ctx.store.root / "try/1.md"
-    saved.parent.mkdir(parents=True)
-    saved.write_text(WEB)
-    items = collect(ctx).items
-    assert items[0].try_card == parse_try(WEB)
-    assert items[1].try_card is None and items[1].prepared is None
+    pr = ctx.tracker.create_pr(head="foragent/issue-3", base="main", title="보고서", body="## Try it\n\n" + WEB)
+    ctx.tracker.merge_pr(pr, expected_head_sha=ctx.tracker.pr_head_sha(pr))
+    (ctx.store.root / "try").mkdir(parents=True)
+    for number in (1, 2, 3):
+        (ctx.store.root / f"try/{number}.md").write_text(CARD)
+    items = {item.number: item for item in collect(ctx).items}
+    assert items[1].try_card == parse_try(WEB)
+    assert items[2].try_card is None and items[2].prepared is None
+    assert items[3].try_card == parse_try(WEB)
+    ctx.tracker.update_pr(pr, base="main", title="보고서", body="Closes #3\n")
+    items = {item.number: item for item in collect(ctx).items}
+    assert items[3].try_card is None and items[3].prepared is None
     assert runtime.prepare(ctx) == []
-
 
 def test_pr_try_instructions_without_embedded_heading_are_parsed(ctx):
     merged(ctx, card="kind: cli\n```sh\necho 보고서\n```\n## Expect\n보고서")
