@@ -5,6 +5,7 @@ import re
 
 import pytest
 
+from test_architect_project_schedule import order_children
 from test_local_view import record_gh
 from test_orch_review_handoff import bind_cli, make_case, tick_context
 from test_skills_autosync import cli_exit, isolated_home
@@ -74,6 +75,11 @@ def test_lane_dream_empty_queue_completion_persists_per_lane_until_a_new_merge(
     case = dream_case(git_history, tmp_path, monkeypatch)
     dream_finish(case, 10, "orch")
     dream_finish(case, 20, "view")
+    case.tracker.add_issue(11, "Unfinished sibling", labels=["lane:orch"])
+    order_children(case, 900, [10, 20, 11])
+    assert dream_candidates(case) == set(), "Empty lane queues cannot finish an order"
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.close_issue(11)
     assert dream_candidates(case) == {"orch", "view"}
     case.clock[0] += timedelta(seconds=1)
     assert dreamed(case, "orch") == 0
@@ -85,6 +91,8 @@ def test_lane_dream_empty_queue_completion_persists_per_lane_until_a_new_merge(
     dream_finish(case, 30, outcome="blocked")
     assert dream_candidates(case) == {"view"}, "Elapsed time and failed work are not new merges"
     dream_finish(case, 40, "orch")
+    assert dream_candidates(case) == {"view"}, "A merge with an empty queue is not a finished order"
+    order_children(case, 901, [40])
     assert dream_candidates(case) == {"orch", "view"}
     assert dream_offline == []
 
@@ -92,26 +100,24 @@ def test_lane_dream_empty_queue_completion_persists_per_lane_until_a_new_merge(
 def test_lane_dream_backlogged_lane_is_due_at_ten_merges_since_its_last_dream(
     git_history, tmp_path, monkeypatch, dream_offline,
 ):
-    from foragent.scheduler import DREAM_EVERY_MERGES
-
-    assert DREAM_EVERY_MERGES == 10
     case = dream_case(git_history, tmp_path, monkeypatch)
     case.tracker.add_issue(500, "Keep this lane's queue occupied", labels=["approved", "ready", "lane:orch"])
     dream_finish(case, 2, outcome="blocked")
     dream_finish(case, 3, outcome="retries-exceeded")
-    for number in range(10, 19):
+    for number in range(10, 20):
         dream_finish(case, number)
-    assert dream_candidates(case) == set(), "Nine merges plus failed runs are still nine merges"
-    dream_finish(case, 19)
+    case.tracker.add_issue(100, "Unfinished sibling", labels=["lane:orch"])
+    order_children(case, 900, [*range(10, 20), 100])
+    assert dream_candidates(case) == set(), "Ten merges cannot wake dreams before the order finishes"
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.close_issue(100)
     assert dream_candidates(case) == {"orch"}
     case.clock[0] += timedelta(seconds=1)
     assert dreamed(case, "orch") == 0
     assert dream_candidates(case) == set()
-    for number in range(20, 29):
-        dream_finish(case, number)
-    assert dream_candidates(case) == set(), "The threshold counts from the completed dream"
-    dream_finish(case, 29)
-    assert dream_candidates(case) == {"orch"}
+    dream_finish(case, 20)
+    order_children(case, 901, [20])
+    assert dream_candidates(case) == {"orch"}, "One merged child finishing a new order is enough"
     assert "ready" in case.tracker.get_issue(500).labels
     assert dream_offline == []
 
@@ -125,6 +131,7 @@ def test_lane_dream_gate_respects_capacity_and_starts_only_one_per_tick_without_
     case = dream_case(git_history, tmp_path, monkeypatch)
     dream_finish(case, 10, "orch")
     dream_finish(case, 20, "view")
+    order_children(case, 900, [10, 20])
     for number in range(700, 700 + active_count):
         case.tracker.add_issue(number, "Already working", labels=["running"])
         case.store.start_run(number, branch=f"foragent/issue-{number}",
@@ -161,6 +168,7 @@ def test_lane_dream_worker_receives_memory_only_prompt_and_completion_records_pe
 
     case = dream_case(git_history, tmp_path, monkeypatch)
     dream_finish(case, 10)
+    order_children(case, 900, [10])
     log = case.store.log_path(10)
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text("Review finding: keep the user's locale.\nFailure reason: stale configuration.\n")
