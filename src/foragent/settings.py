@@ -50,6 +50,7 @@ SETTINGS = (
     Setting("orch_silent_alert_minutes", "team", 30, kind="range", low=0, high=1440),
     Setting("claude_quota.mode", "me", "keep", ("keep", "burn")),
     Setting("notify", "me", None, NOTIFY_FIXED, kind="notify"),
+    Setting("notify_filter", "me", "all", ("decisions", "all")),
     Setting("animation", "me", True, (True, False), kind="bool"),
     Setting("language", "me", "en", ("en", "ko")),
     Setting("view_glyphs", "me", "auto", ("auto", "emoji", "ascii")),
