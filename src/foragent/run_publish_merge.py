@@ -76,8 +76,12 @@ def _final_merge_inputs(
         return "base-changed"
 
     status = run_publish._ci_status(ctx, pr, git.root, ready_at)
-    # The merge's own fresh read also rechecks the owner: an edit during the run stops it here (#1004).
-    issue = run_publish.orch_scope.require(ctx, n, ctx.tracker.get_issue(n))
+    # This merge preflight's existing read is its one ownership snapshot (#1004).
+    issue = ctx.tracker.get_issue(n)
+    if (refusal := run_publish.orch_scope.merge_check(ctx, n, issue)) is not None:
+        from foragent.run_attempt import OwnershipLost
+
+        raise OwnershipLost(refusal)
     saved = ctx.store.load_approval(n)
     if (run_publish.APPROVED not in issue.labels
             or (approved_body_sha is not None and run_publish.body_hash(issue.body) != approved_body_sha)

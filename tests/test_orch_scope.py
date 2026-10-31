@@ -65,7 +65,7 @@ def test_merge_resolves_the_pr_to_its_issue_before_comparing():
     ctx = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="alice"),
                           store=SimpleNamespace(local_issues=lambda: []))
     assert pr != 3
-    assert orch_scope.refuse_verb(ctx, "merge", pr) == "#3 is worked by bob; this factory is alice."
+    assert orch_scope.merge_check(ctx, 3) == "#3 is worked by bob; this factory is alice."
     assert orch_scope.refuse_verb(ctx, "list", None) is None
 
 
@@ -96,277 +96,130 @@ def flush_case(tmp_path, *issues, legacy=None):
     return store, tracker, recorder, now
 
 
-def test_refused_replay_moves_aside_with_its_reason_and_frees_other_writes(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:bob"]), (2, ["by:alice"]))
-    store.queue_github_write(1, "comment", body="Foreign")
-    store.queue_github_write(2, "comment", body="Mine")
-    recorder.flush_outbox()
-    recorder.flush_outbox()
-    assert [c.body for c in tracker.list_comments(2)] == ["Mine"] and tracker.list_comments(1) == []
-    assert store.github_outbox() == [], "A refusal must not stay a global barrier for starts and writes"
-    [kept] = store.refused_github_writes()
-    assert kept["issue"] == 1 and kept["body"] == "Foreign" and "bob" in kept["refused"]
-    events = (store.root / "orch-events.jsonl").read_text().splitlines()
-    assert sum('"outbox-refused"' in line for line in events) == 1
-    recorder.comment(2, "Later")  # The next owned write goes straight out.
-    assert [c.body for c in tracker.list_comments(2)] == ["Mine", "Later"]
 
+def test_refused_replay_moves_aside_and_journals_owner_and_action(tmp_path):
+    import json
 
-def test_an_owner_label_edit_during_the_queue_keeps_the_write_refused_not_dropped(tmp_path):
-    store, tracker, recorder, now = flush_case(tmp_path, (1, []))
-    store.queue_github_write(1, "comment", body="Queued before the edit")
-    tracker.add_labels(1, ["by:bob"])
-    recorder.refresh_issues(observed_at=now)
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ['by:bob']), (2, ['by:alice']))
+    store.queue_github_write(1, 'comment', body='Foreign')
+    store.queue_github_write(2, 'comment', body='Mine')
+    recorder.flush_outbox()
     recorder.flush_outbox()
     assert tracker.list_comments(1) == []
-    [kept] = store.refused_github_writes()
-    assert kept["body"] == "Queued before the edit" and "by:bob" in kept["refused"]
+    assert [c.body for c in tracker.list_comments(2)] == ['Mine']
+    assert store.github_outbox() == []
+    [refused] = store.refused_github_writes()
+    assert refused['issue'] == 1 and refused['body'] == 'Foreign' and 'bob' in refused['refused']
+    [event] = [json.loads(line) for line in (store.root / 'orch-events.jsonl').read_text().splitlines()]
+    assert (event['kind'], event['issue'], event['action'], event['owner']) == ('ownership-refused', 1, 'comment', 'bob')
+    recorder.comment(2, 'Later')
+    assert [c.body for c in tracker.list_comments(2)] == ['Mine', 'Later']
 
 
-def test_an_ordinary_label_edit_still_drops_the_queued_write(tmp_path):
-    store, tracker, recorder, now = flush_case(tmp_path, (1, []))
-    store.queue_github_write(1, "add_labels", labels=["ready"])
-    tracker.add_labels(1, ["blocked"])
-    recorder.refresh_issues(observed_at=now)
-    assert store.github_outbox() == [] and store.refused_github_writes() == []
+import pytest
 
 
-def test_a_queued_pr_comment_follows_the_issue_the_pr_works(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:bob"]), legacy="alice")
-    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="t", body="b")
-    store.queue_github_write(pr, "comment", body="On Bob's PR")
-    recorder.flush_outbox()
-    assert tracker.list_comments(pr) == []
-    assert [entry["issue"] for entry in store.refused_github_writes()] == [pr]
+@pytest.mark.parametrize('action', ['comment', 'add_labels', 'remove_labels', 'update_issue', 'close_issue'])
+@pytest.mark.parametrize('pending', [False, True])
+def test_foreign_writes_are_refused_before_send_queue_or_local_changes(tmp_path, action, pending):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ['by:bob']), (2, ['by:alice']))
+    if pending:
+        store.queue_github_write(2, 'comment', body='Older')
+    before = {p.relative_to(store.root): p.read_bytes() for p in store.root.rglob('*') if p.is_file()}
+    issue_before = tracker.get_issue(1)
+    if action == 'update_issue':
+        recorder.update_issue(1, title='Changed', body='Changed')
+    else:
+        payload = ['ready'] if action.endswith('labels') else 'Changed'
+        getattr(recorder, action)(1, payload)
+    assert tracker.get_issue(1) == issue_before and tracker.list_comments(1) == []
+    assert {p.relative_to(store.root): p.read_bytes() for p in store.root.rglob('*') if p.is_file()} == before
 
 
-def test_question_addresses_the_effective_orderer_only_outside_the_singleton_path():
-    tracker = FakeTracker(login="alice")
-    tracker.add_issue(1, "Legacy", "", labels=[])
-    tracker.add_issue(2, "Bob's", "", labels=["by:bob"])
-    ctx = SimpleNamespace(tracker=tracker, config=Config())
-    assert orch_scope.ask_orderer(ctx, 1, "Decide.") == "Decide."
-    assert orch_scope.ask_orderer(ctx, 2, "Decide.") == "@bob Decide."
-    legacy = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="carol"))
-    assert orch_scope.ask_orderer(legacy, 1, "Decide.") == "@carol Decide."
+def test_scope_keeps_first_snapshot_and_the_next_operation_observes_relabel(tmp_path, monkeypatch):
+    store, tracker, recorder, now = flush_case(tmp_path, (1, ['by:alice']), legacy='alice')
+    assert orch_scope.check(recorder._context, 1, tracker.get_issue(1)) is None
+    tracker.remove_labels(1, ['by:alice'])
+    tracker.add_labels(1, ['by:bob'])
+    monkeypatch.setattr(orch_scope, 'current_issue', lambda *a, **k: pytest.fail('No ownership reread inside an operation'))
+    recorder.comment(1, 'Same operation')
+    assert [c.body for c in tracker.list_comments(1)] == ['Same operation']
+    store.refresh_local_issues([tracker.get_issue(1)], [], {}, now)
+    recorder._context._scope = orch_scope.Scope(recorder._context)
+    recorder.comment(1, 'Next operation')
+    assert [c.body for c in tracker.list_comments(1)] == ['Same operation']
 
 
-def test_singleton_replay_trusts_this_ticks_listing_without_another_read(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, []))
-    reads = []
+def test_missing_linked_issue_does_not_block_other_queued_writes(tmp_path, monkeypatch):
+    store, tracker, recorder, _ = flush_case(tmp_path, (2, ['by:alice']), legacy='alice')
+    pr = tracker.create_pr(head='foragent/issue-9', base='main', title='Missing issue', body='')
+    store.update_local_issue(9, pr_number=pr)  # Only PR metadata; issue #9 has never been observed.
+    store.queue_github_write(pr, 'comment', body='No owner evidence')
+    store.queue_github_write(2, 'comment', body='Mine')
     original = tracker.get_issue
-    tracker.get_issue = lambda n: reads.append(n) or original(n)
-    store.queue_github_write(1, "comment", body="Queued")
+
+    def missing(n):
+        if n == 9:
+            raise TrackerError('HTTP 404: Not Found')
+        return original(n)
+
+    monkeypatch.setattr(tracker, 'get_issue', missing)
     recorder.flush_outbox()
-    assert [c.body for c in tracker.list_comments(1)] == ["Queued"] and reads == []
+    assert tracker.list_comments(pr) == [] and store.github_outbox() == []
+    assert [c.body for c in tracker.list_comments(2)] == ['Mine']
+    [refused] = store.refused_github_writes()
+    assert refused['issue'] == pr and 'absent' in refused['refused']
 
 
-def test_question_still_posts_when_the_issue_cannot_be_read():
-    class Failing(FakeTracker):
-        def get_issue(self, n):
-            raise TrackerError("down")
+def test_pr_writes_use_the_linked_parent_ownership(tmp_path):
+    from foragent.tracker import WriteRefused
 
-    ctx = SimpleNamespace(tracker=Failing(login="alice"), config=Config())
-    assert orch_scope.ask_orderer(ctx, 1, "Decide.") == "Decide."
-
-
-def test_parent_aggregation_rereads_the_owner_before_closing(monkeypatch):
-    from datetime import UTC, datetime
-    from foragent import board, board_parents
-
-    closed = []
-    # The stored rows still say Alice for #1, and #5 has no row's owner at all; GitHub now decides.
-    rows = [{"number": 1, "state": "open", "labels": ["by:alice"], "children": [2]},
-            {"number": 3, "state": "open", "labels": ["by:alice"], "children": [4]}]
-    done = lambda n: Issue(n, "", "", frozenset(), "closed", state_reason="completed")
-    tracker = FakeTracker(login="alice")
-    tracker.add_issue(1, "Relabelled", "", labels=["by:bob"])
-    tracker.add_issue(3, "Mine", "", labels=["by:alice"])
-    monkeypatch.setattr(tracker, "sub_issues", lambda n: [done(n + 1)])
-    monkeypatch.setattr(tracker, "close_issue", lambda n, comment: closed.append(n))
-    moved = []
-    monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, **kw: moved.append((n, state)))
-    store = SimpleNamespace(local_issues=lambda: rows, load_flag=lambda n: None)
-    ctx = SimpleNamespace(store=store, tracker=tracker, config=Config(),
-                          now=lambda: datetime(2026, 10, 31, tzinfo=UTC))
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert closed == [3], "A parent relabelled to Bob after the listing is his factory's to close"
-    assert moved == [(3, "Done")], "A refused close also leaves Bob's card where it is"
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ['by:alice']), (9, ['by:bob']), legacy='alice')
+    pr = tracker.create_pr(head='foragent/batch-9', base='main', title='Bob', body='')
+    store.update_local_issue(9, pr_number=pr)
+    with pytest.raises(WriteRefused, match='bob'):
+        recorder.create_pr(head='foragent/batch-9', base='main', title='Bob', body='')
+    for effect in (lambda: recorder.update_pr(pr, base='main', title='Changed', body=''),
+                   lambda: recorder.close_pr(pr),
+                   lambda: recorder.merge_pr(pr, expected_head_sha='head')):
+        with pytest.raises(WriteRefused, match='bob'):
+            effect()
+    recorder.comment(1, 'Own child continues')
+    assert [c.body for c in tracker.list_comments(1)] == ['Own child continues']
+    assert tracker.merged_prs == [] and len(tracker.created_prs) == 1
 
 
-def test_without_a_team_setting_known_facts_decide_and_nothing_is_read_again():
-    class Counting(FakeTracker):
-        reads = 0
-
-        def get_issue(self, n):
-            Counting.reads += 1
-            return super().get_issue(n)
-
-    tracker = Counting(login="alice")
-    tracker.add_issue(1, "Legacy", "", labels=[])
-    tracker.add_issue(2, "Bob's", "", labels=["by:bob"])
-    rows = [{"number": 2, "labels": ["by:bob"]}]
-    ctx = SimpleNamespace(tracker=tracker, config=Config(), store=SimpleNamespace(local_issues=lambda: rows))
-    assert orch_scope.may_write(ctx, 1) and Counting.reads == 0
-    assert not orch_scope.may_write(ctx, 2), "A stored foreign owner still refuses"
-
-
-def test_replay_rechecks_the_owner_before_every_queued_write(tmp_path, monkeypatch):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    store.queue_github_write(1, "comment", body="First")
-    store.queue_github_write(1, "close_issue", body="Done")
-    comment = tracker.comment
-
-    def comment_then_handover(n, body):
-        result = comment(n, body)
-        tracker.remove_labels(1, ["by:alice"])
-        tracker.add_labels(1, ["by:bob"])
-        return result
-
-    monkeypatch.setattr(tracker, "comment", comment_then_handover)
-    recorder.flush_outbox()
-    assert [c.body for c in tracker.list_comments(1)] == ["First"]
-    assert tracker.get_issue(1).state == "open", "The close queued after the handover is Bob's to decide"
-    assert [entry["action"] for entry in store.refused_github_writes()] == ["close_issue"]
-
-
-def test_a_refresh_keeps_queued_pr_writes_for_replay(tmp_path):
-    store, tracker, recorder, now = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="t", body="b")
-    store.queue_github_write(pr, "comment", body="On my PR")
-    recorder.refresh_issues(observed_at=now)
-    assert [entry["issue"] for entry in store.github_outbox()] == [pr], "A PR is not a missing issue"
-    recorder.flush_outbox()
-    assert [c.body for c in tracker.list_comments(pr)] == ["On my PR"]
-
-
-def test_an_unresolvable_pr_write_is_refused_not_delivered(tmp_path, monkeypatch):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:bob"]), legacy="alice")
-    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="t", body="b")
-    monkeypatch.setattr(tracker, "list_prs", lambda state="open", head_prefix="": [])  # Closed, never merged.
-    store.queue_github_write(pr, "comment", body="On a closed PR")
-    recorder.flush_outbox()
-    assert tracker.list_comments(pr) == []
-    [kept] = store.refused_github_writes()
-    assert kept["issue"] == pr and f"#{pr}" in kept["refused"]
-
-
-def test_one_unreadable_target_is_refused_and_other_writes_still_go_out(tmp_path, monkeypatch):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]), legacy="alice")
-    get_issue = tracker.get_issue
-    monkeypatch.setattr(tracker, "get_issue", lambda n: (_ for _ in ()).throw(TrackerError("gh: HTTP 403"))
-                        if n == 1 else get_issue(n))
-    store.queue_github_write(1, "comment", body="Unreadable target")
-    store.queue_github_write(2, "comment", body="Mine")
-    recorder.flush_outbox()
-    assert [c.body for c in tracker.list_comments(2)] == ["Mine"]
-    [kept] = store.refused_github_writes()
-    assert kept["issue"] == 1 and "403" in kept["refused"]
-
-
-def test_a_malformed_owner_answer_is_no_permission_and_never_raises():
-    class Malformed(FakeTracker):
-        def get_issue(self, n):
-            raise ValueError("Expecting property name enclosed in double quotes")
-
-    ctx = SimpleNamespace(tracker=Malformed(login="alice"), config=Config(legacy_owner="alice"),
-                          store=SimpleNamespace(local_issues=lambda: []))
-    assert orch_scope.may_write(ctx, 1) is False
-    assert "#1" in orch_scope.current_refusal(ctx, 1)
-
-
-def test_the_write_boundary_rereads_a_stale_cached_owner_before_any_label_or_comment(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice", "blocked"]), legacy="alice")
-    tracker.remove_labels(1, ["by:alice"])  # Relabelled to Bob after the last listing.
-    tracker.add_labels(1, ["by:bob"])
-    recorder.add_labels(1, ["needs-human"])
-    recorder.comment(1, "<!-- foragent:needs-human reason=orchestrator-timeout -->")
-    recorder.close_issue(1, "closing")
-    issue = tracker.get_issue(1)
-    assert "needs-human" not in issue.labels and issue.state == "open" and tracker.list_comments(1) == []
-    row = next(row for row in store.local_issues() if row["number"] == 1)
-    assert "needs-human" not in row["labels"] and row["state"] == "open" and row["comments"] == []
-    events = (store.root / "orch-events.jsonl").read_text()
-    assert events.count('"write-refused"') == 3
-
-
-def test_the_write_boundary_lets_own_writes_through(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    recorder.add_labels(1, ["needs-human"])
-    recorder.comment(1, "Mine")
-    assert "needs-human" in tracker.get_issue(1).labels and [c.body for c in tracker.list_comments(1)] == ["Mine"]
-
-
-def test_a_queued_pr_comment_is_judged_by_its_linked_issue_without_a_team_setting(tmp_path):
-    store, tracker, recorder, now = flush_case(tmp_path, (1, ["by:alice"]))
-    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="t", body="b")
-    store.update_local_issue(1, pr_number=pr)
-    tracker.login = ""  # The signed-in account was lost: this factory cannot prove it is Alice's.
-    store.queue_github_write(pr, "comment", body="On the PR")
-    recorder.flush_outbox()
-    assert tracker.list_comments(pr) == []
-    assert [entry["issue"] for entry in store.refused_github_writes()] == [pr]
-
-
-def test_a_refused_queued_close_leaves_the_local_issue_open(tmp_path):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    store.queue_github_write(1, "close_issue", body="Done")
-    assert next(row for row in store.local_issues() if row["number"] == 1)["state"] == "closed"
-    tracker.remove_labels(1, ["by:alice"])
-    tracker.add_labels(1, ["by:bob"])
-    recorder.flush_outbox()
-    assert tracker.get_issue(1).state == "open"
-    row = next(row for row in store.local_issues() if row["number"] == 1)
-    assert row["state"] == "open", "Nothing was sent, so the local row returns to GitHub's facts"
-
-
-def test_a_board_card_write_passes_the_same_boundary(tmp_path):
+def test_board_writes_use_the_same_snapshot_gate(tmp_path):
     from foragent.board import Project
 
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]), legacy="alice")
-    tracker.remove_labels(1, ["by:alice"])  # Relabelled to Bob after the listing.
-    tracker.add_labels(1, ["by:bob"])
-    calls = []
-    recorder.graphql = lambda query, variables: calls.append(variables) or {"repository": {"issue": None}}
-    assert recorder.board_write_refused(1) and not recorder.board_write_refused(2)
-    Project(recorder, "owner/repo", "board").set_values(1, {"Status": "Done"})
-    assert calls == [], "No board read or write for a card that is Bob's now"
+    _, _, recorder, _ = flush_case(tmp_path, (1, ['by:bob']), legacy='alice')
+    recorder.graphql = lambda *a, **k: pytest.fail('No board reads or mutations for a foreign card')
+    Project(recorder, 'owner/repo', 'board').set_values(1, {'Status': 'Done'})
 
 
-def test_replaying_one_multi_label_removal_rechecks_between_labels(tmp_path, monkeypatch):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice", "ready", "running"]), legacy="alice")
-    store.queue_github_write(1, "remove_labels", labels=["ready", "running"])
-    remove = tracker.remove_labels
-
-    def remove_then_handover(n, labels):
-        result = remove(n, labels)
-        if labels == ["ready"]:
-            remove(1, ["by:alice"])
-            tracker.add_labels(1, ["by:bob"])
-        return result
-
-    monkeypatch.setattr(tracker, "remove_labels", remove_then_handover)
-    recorder.flush_outbox()
-    assert "running" in tracker.get_issue(1).labels, "The removal after the handover is Bob's to decide"
-    [kept] = store.refused_github_writes()
-    assert kept["labels"] == ["running"]
+def test_question_uses_entry_orderer_without_another_issue_read(tmp_path, monkeypatch):
+    _, tracker, recorder, _ = flush_case(tmp_path, (1, ['by:alice']), legacy='alice')
+    ctx = recorder._context
+    assert orch_scope.check(ctx, 1, tracker.get_issue(1)) is None
+    monkeypatch.setattr(tracker, 'get_issue', lambda n: pytest.fail('Use the entry snapshot'))
+    assert orch_scope.ask_orderer(ctx, 1, 'Choose.') == '@alice Choose.'
 
 
-def test_a_close_queued_during_a_refresh_is_refused_and_the_row_shows_github(tmp_path):
-    store, tracker, recorder, now = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    revision = store.issues_revision()
-    store.update_local_issue(1, title="Edited locally")  # A local change after the listing began…
-    store.queue_github_write(1, "close_issue", body="Done")  # …then a close queued while it was read.
-    tracker.remove_labels(1, ["by:alice"])
-    tracker.add_labels(1, ["by:bob"])
-    store.refresh_local_issues([tracker.get_issue(1)], [], {}, now, since_revision=revision)
-    row = next(row for row in store.local_issues() if row["number"] == 1)
-    assert row["state"] == "open" and "by:bob" in row["labels"] and store.github_outbox() == []
-    assert [entry["action"] for entry in store.refused_github_writes()] == ["close_issue"]
+def test_parent_reads_foreign_children_but_writes_only_owned_parents(tmp_path, monkeypatch):
+    from foragent import board, board_parents
 
-
-def test_a_question_keeps_its_mention_when_the_read_fails(tmp_path, monkeypatch):
-    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
-    monkeypatch.setattr(tracker, "get_issue", lambda n: (_ for _ in ()).throw(TrackerError("HTTP 502")))
-    ctx = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="alice"), store=store)
-    assert orch_scope.ask_orderer(ctx, 1, "Decide.") == "@alice Decide."
+    store, tracker, recorder, now = flush_case(tmp_path, (1, ['by:alice']), (2, ['by:bob']),
+                                              (3, ['by:bob']), legacy='alice')
+    tracker.issues[2] = Issue(2, 'Child', '', frozenset(['by:bob']), 'closed', state_reason='not_planned')
+    tracker.set_parent(2, 1)
+    tracker.set_parent(2, 3)
+    store.update_local_issue(1, children=[2])
+    store.update_local_issue(3, children=[2])
+    monkeypatch.setattr(tracker, 'sub_issues', lambda n: [tracker.get_issue(2)])
+    moved = []
+    monkeypatch.setattr(board, 'sync_status', lambda ctx, n, state, **kw: moved.append((n, state)))
+    ctx = recorder._context
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert tracker.get_issue(1).state == 'closed' and tracker.get_issue(3).state == 'open'
+    assert moved == [(1, 'Done')]
+    assert '#2' in tracker.list_comments(1)[0].body

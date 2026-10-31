@@ -79,13 +79,11 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
     why = " ".join(why.split())
     if not why:
         raise OrchError(text("orch_stop_why_required", language))
-    with _tick_lock(ctx, n):
-        from foragent import orch_scope
+    from foragent import orch_scope
 
-        # The owner may have changed while this waited for the tick lock (#1004): refuse
-        # before any signal, worktree change or label, as the verb's first check does.
-        if (refusal := orch_scope.current_refusal(ctx, n)) is not None:
-            raise OrchError(refusal)
+    if (refusal := orch_scope.check(ctx, n)) is not None:
+        raise OrchError(refusal)
+    with _tick_lock(ctx, n):
         # The fact `fa gate status` lists as active_runs: every unfinished issue record,
         # with or without live workers (#1207). Process liveness only picks the kill path.
         run = next((run for run in unfinished_runs(ctx.store) if run.number == n), None)

@@ -129,7 +129,13 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
+    from foragent import orch_scope
+
+    issue = orch_scope.scope(ctx).issue(n) if getattr(getattr(ctx, "_scope", None), "entry", False) else None
+    issue = issue or orch_scope.observe(ctx.tracker).get_issue(n)
+    if (refusal := orch_scope.check(ctx, n, issue)) is not None:
+        raise OrchError(refusal)
+    ctx.store.record_issue(issue, ctx.config.lanes)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
@@ -532,8 +538,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             if (issue := pr_issue_number(current.head)) is not None:
                 from foragent import orch_scope
 
-                # The owner may have changed during the pre-merge checks (#1004).
-                if (refusal := orch_scope.current_refusal(ctx, issue)) is not None:
+                # One ownership decision at the merge's remote preflight (#1004).
+                if (refusal := orch_scope.merge_check(ctx, issue)) is not None:
                     raise OrchError(refusal)
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event, stale_for_redo

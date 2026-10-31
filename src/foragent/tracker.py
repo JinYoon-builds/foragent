@@ -221,6 +221,8 @@ class RecordingTracker:
             return value
 
         def observe(*args, **kwargs):
+            if name in {"add_sub_issue", "add_blocked_by", "remove_blocked_by"}:
+                self._require(args[0] if args else kwargs.get("parent", kwargs.get("n")))
             result = value(*args, **kwargs)
             if isinstance(result, Issue):
                 self._context.store.record_issue(result, self._context.config.lanes)
@@ -257,11 +259,20 @@ class RecordingTracker:
 
         return orch_scope.replay_refusal(self._context, self._tracker, number)
 
-    def _outbox_refused(self, number, reason):
+    def _outbox_refused(self, number, reason, action="queued writes"):
         from foragent.orch_events import append_event
 
-        append_event(self._context.store, self._context.now(), number, "outbox-refused",
-                     f"#{number}: queued GitHub writes kept undelivered: {reason}")
+        from foragent import orch_scope
+        from foragent.ownership import OwnershipError, effective_orderer
+
+        snapshot = orch_scope.scope(self._context)
+        issue = snapshot.issue(number)
+        try:
+            owner = effective_orderer(issue, self._context.config, snapshot.login()) if issue else None
+        except OwnershipError:
+            owner = None
+        append_event(self._context.store, self._context.now(), number, "ownership-refused",
+                     f"#{number}: skipped queued {action}: {reason}", action=action, owner=owner)
 
     def refresh_issues(self, *, observed_at=None):
         """Publish a bulk observation once, preserving writes made during its reads.
@@ -416,42 +427,23 @@ class RecordingTracker:
         return False
 
     def _refused(self, n):
-        """The write boundary (#1004): the refusal for a write on ``#n`` now, recorded locally.
-
-        A run's own guard (orch_scope.RunTracker) raises instead, so a run stops.
-        """
+        """The sole write gate: the operation's frozen ownership decision (#1004)."""
         from foragent import orch_scope
 
-        if isinstance(self._tracker, orch_scope.RunTracker):
-            return None  # The run's guard checks the write's own target and raises.
-        if (refusal := orch_scope.write_refusal(self._context, self._tracker, n)) is not None:
-            from foragent.orch_events import append_event
-
-            append_event(self._context.store, self._context.now(), n, "write-refused",
-                         f"#{n}: GitHub write not sent: {refusal}")
-        return refusal
+        return orch_scope.write_refusal(self._context, self._tracker, n)
 
     def board_write_refused(self, n):
-        """Whether a board card write for ``#n`` must not be sent (the same write boundary)."""
-        from foragent import orch_scope
-
-        if isinstance(self._tracker, orch_scope.RunTracker):
-            try:
-                self._tracker.check_target(n)
-            except WriteRefused:
-                return True
-            return False
         return self._refused(n) is not None
 
     def _write(self, n, action, operation, **payload):
+        if self._refused(n) is not None:
+            return None, _REFUSED  # Neither sent nor queued, and no local effect.
         store = self._context.store
         pending = store.github_outbox()
         if (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
             return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
         try:
-            if self._refused(n) is not None:
-                return None, _REFUSED  # Nothing sent, so no local effect either.
             return operation(), None
         except TrackerError as exc:
             if not self.queue_writes or not exc.is_rate_limit:
@@ -462,7 +454,15 @@ class RecordingTracker:
             return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
 
     def flush_outbox(self):
-        """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
+        from foragent import orch_scope
+
+        if not self._context.store.github_outbox():
+            return
+        with orch_scope.replaying(self._context):
+            self._flush_outbox()
+
+    def _flush_outbox(self):
+        """Deliver a FIFO against one refreshed ownership snapshot."""
         from foragent.orch_github import pause
 
         store = self._context.store
@@ -472,23 +472,16 @@ class RecordingTracker:
             if number in dropped:
                 continue
             try:
-                # Current ownership before every entry, also for writes queued before #1004:
-                # an owner edit between two queued writes stops the second.
+                # Every target uses this replay's latest observed ownership snapshot.
                 if (refusal := self._replay_refusal(number)) is not None:
                     # Moved aside with its reason; later entries for other issues still go out.
                     store.refuse_github_writes(number, refusal)
-                    self._outbox_refused(number, refusal)
+                    self._outbox_refused(number, refusal, action)
                     dropped.add(number)
                     continue
                 if action == "remove_labels":
                     labels = entry["labels"]
                     for index, label in enumerate(labels):
-                        # Each removal is its own GitHub write: an owner edit between two stops the rest.
-                        if index and (refusal := self._replay_refusal(number)) is not None:
-                            store.refuse_github_writes(number, refusal)
-                            self._outbox_refused(number, refusal)
-                            dropped.add(number)
-                            break
                         self._tracker.remove_labels(number, [label])
                         store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
                 elif action == "update_issue":
@@ -574,6 +567,9 @@ class RecordingTracker:
         return self._context.store.local_board_value(n, project, field)
 
     def _record_pr(self, pr, head, base=None, *, merged=False):
+        from foragent import orch_scope
+
+        orch_scope.scope(self._context).link_pr(pr, head)
         if (number := pr_issue_number(head)) is not None:
             fields = {"pr_number": pr, "pr_head": head, "merged": merged}
             if base is not None:

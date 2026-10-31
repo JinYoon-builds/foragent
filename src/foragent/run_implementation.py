@@ -306,7 +306,9 @@ def _prepare_implementation(
         "goal": runner.goal_condition(ctx.config.acceptance_dir),
     } if native_claude else {}
     log = ctx.store.log_path(n)
-    issue = ctx.tracker.get_issue(n)
+    from foragent import orch_scope
+
+    issue = orch_scope.scope(ctx).issue(n) or ctx.tracker.get_issue(n)
     size = issue_size(issue.labels)
     baseline_sha = git.ref_sha(start_ref) if capture_baseline else None
     baseline_command = ctx.config.test_command

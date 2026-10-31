@@ -203,8 +203,6 @@ def follow_children(ctx, report) -> None:
                                children=", ".join(f"#{child}" for child in cancelled))
                 append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
                 report.actions.append(summary)
-        if closes and not orch_scope.may_write(ctx, number):
-            continue  # A refused close must not move the parent's card either (#1004).
         if closes:
             completed = sorted(child for child, gone in ended.items() if not gone)
             cancelled = sorted(child for child, gone in ended.items() if gone)

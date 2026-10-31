@@ -35,7 +35,7 @@ taste or preference, something hard to undo (delete, deploy, public release, `al
 from evidence (code, docs, logs, decision log), fix it first, then report it in one line and record
 it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a test that
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
-environment); the docs answer a spec question. Implementers never edit locked acceptance tests; as
+environment); the docs answer a spec question. Mention the issue's @orderer in issue-thread questions. Implementers never edit locked acceptance tests; as
 the test owner, the orchestrator corrects its own tests through an order edit and re-approval.
 A choice-free fix the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve` after a clean preread; a choice about behaviour, scope, screen wording or the approval boundary, or a real preread QUESTION, goes through the planning session to the person.
 

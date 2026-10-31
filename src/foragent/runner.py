@@ -149,6 +149,8 @@ class RunContext:
     monotonic: Callable[[], float] = time.monotonic
     lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
 
+    _scope: object | None = None  # Derived operation snapshot; copied with the run's lane config.
+
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
 
@@ -308,18 +310,23 @@ def review_only(
     previous = ctx.store.get_run(n)
     started = False
     try:
+        until = ctx.store.github_wait_until(ctx.now())
+        issue = (orch_scope.scope(ctx).issue(n) if getattr(getattr(ctx, "_scope", None), "entry", False) else None)
+        if issue is None and until is None:
+            issue = orch_scope.observe(ctx.tracker).get_issue(n)
+        orch_scope.require(ctx, n, issue, read=until is None)  # One entry decision, before records or label writes.
+        if issue is not None:
+            ctx.store.record_issue(issue, ctx.config.lanes)
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
-        if until := ctx.store.github_wait_until(ctx.now()):
+        if until:
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
-        issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
-        orch_scope.require(ctx, n, issue)  # Before the run record, labels or the reviewer (#1004).
         if RUNNING in issue.labels:
             raise TrackerError(f"issue #{n} already has a running execution")
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
@@ -328,7 +335,7 @@ def review_only(
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
-        with extend_deadline(partial(paused_seconds, n, ctx)), orch_scope.guarding(ctx, n):  # Talk pauses (D55 addendum).
+        with extend_deadline(partial(paused_seconds, n, ctx)):  # Talk pauses (D55 addendum).
             try:
                 outcome = _review_only(n, ctx, worktree, verdict_head)
             except AttemptFailure as exc:
@@ -342,6 +349,8 @@ def review_only(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
+        if outcome == "refused" and not started:
+            print(detail, file=sys.stderr)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
@@ -389,15 +398,21 @@ def run_issue(n: int, ctx: RunContext) -> str:
     detail = ""
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
+    entered = True
     try:
+        ctx._scope = None  # A direct run is a new operation, including a reused test context.
+        until = ctx.store.github_wait_until(ctx.now())
+        issue = None if until else orch_scope.observe(ctx.tracker).get_issue(n)
+        if (refusal := orch_scope.check(ctx, n, issue, read=until is None)) is not None:
+            print(refusal, file=sys.stderr)
+            entered = False
+            return "refused"
+        if issue is not None:
+            ctx.store.record_issue(issue, ctx.config.lanes)
         run = ctx.store.update_run(n, pid=os.getpid(),
                                    process_identities=observe_tree(roots=(os.getpid(),)))
-        if until := ctx.store.github_wait_until(ctx.now()):
+        if until:
             outcome = orch_github.wait_run(ctx, n, until)
-            return outcome
-        if (refusal := orch_scope.check(ctx, n)) is not None:  # #1004: before any label, comment or executor.
-            _append(log, refusal)
-            outcome, detail = "refused", refusal
             return outcome
         board.sync_status(ctx, n, "Running")
         from foragent.run_implementation import lane_config
@@ -410,8 +425,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
                       lane_executor=lane_settings.executor)
         try:
             # Every command's timeout grows by time a talk paused the run (D55 addendum).
-            # Every write of the run rechecks the owner first (#1004).
-            with extend_deadline(partial(paused_seconds, n, ctx)), orch_scope.guarding(ctx, n):
+            # The run retains its entry ownership snapshot (#1004).
+            with extend_deadline(partial(paused_seconds, n, ctx)):
                 outcome = _execute(n, ctx, worktree)
         except ExecutorStopped as exc:
             outcome = exc.outcome
@@ -446,10 +461,11 @@ def run_issue(n: int, ctx: RunContext) -> str:
         # A tick may already have finished the record while terminating this runner.
         try:
             run = ctx.store.get_run(n)
-            if run is not None and run.status != "finished":
+            if entered and run is not None and run.status != "finished":
                 ctx.store.finish_run(n, outcome=run.outcome or outcome, detail=detail)
         finally:
-            kick_tick(ctx.repo_root)
+            if entered:
+                kick_tick(ctx.repo_root)
     return outcome
 
 

@@ -87,6 +87,7 @@ def _check_prerequisites(
         )
         report.actions.append(f"#{issue.number} flagged no-machine-check")
         return False
+    scheduler.orch_scope.scope(ctx).refusal(issue)  # Reuse the caller's existing issue facts for questions.
     dependencies = scheduler._blockers(ctx, issue.number, confirmed=confirmed)
     cancelled = next(
         (dependency for dependency in dependencies

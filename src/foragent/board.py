@@ -165,8 +165,6 @@ class Project:
                 log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
                 return
         if item is None:
-            if refused is not None and refused(number):
-                return  # Changed hands during the lookup (#1004): no card is added for another person.
             try:
                 item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
                   addProjectV2ItemById(input: $input) { item { id } }
@@ -189,8 +187,6 @@ class Project:
                     if (record := getattr(self.tracker, "record_board_value", None)) is not None:
                         record(number, self.id, name, current["name"])
                     continue
-            if refused is not None and refused(number):
-                return  # Changed hands since the last check (#1004): the card is theirs to move.
             _data(self.tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
               updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
             }""", {"input": {"projectId": self.id, "itemId": item["id"], "fieldId": field["id"],

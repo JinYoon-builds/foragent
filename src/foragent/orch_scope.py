@@ -1,42 +1,25 @@
-"""The person boundary for this factory's effects (D78 revision, 2026-10-30).
+"""One ownership snapshot per tick, command or run (architect r85, #1004).
 
-Admission, orchestrator verbs, direct runs, queued-write replay, recovery and
-publication all ask one question here: may this factory act on this issue now?
-Ownership comes from ``foragent.ownership``; this module supplies the factory's
-login, the current issue (a PR resolves to the issue it works), and the unchanged
-singleton path, so callers never build their own owner rule.
-
-The singleton path: with no ``legacy_owner`` setting, an issue without any ``by:``
-label (and not published under the owner-label contract) keeps today's behaviour
-and needs no identity read. Every other case compares the issue's effective
-orderer with the authenticated login and refuses on any doubt.
-
-Two kinds of evidence, by use:
-- admission reads the bulk listing this tick just took (``Scope``);
-- every later shared effect rereads the issue at mutation time (``current_refusal``,
-  ``may_write``, ``require``). A failed read refuses; only a rate limit propagates,
-  so the existing limit wait still applies.
+Labels in the operation's existing snapshot decide ownership. Later reads and
+writes reuse that decision; a relabel is observed by the next operation. The
+RecordingTracker is the sole write gate, before both sending and queueing.
+Local process cleanup and work preservation do not require tracker permission.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from types import SimpleNamespace
 
 from foragent.i18n import text
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, parse_orderer, require_owned
 from foragent.tracker import Issue, RecordingTracker, TrackerError, pr_issue_number
 
-# Verbs that act on an issue; ``merge`` names a PR, resolved to its issue first.
 ISSUE_VERBS = frozenset({"stop", "retry", "park", "unpark", "resolve", "rerun-review", "escalate"})
 PR_VERBS = frozenset({"merge"})
 
 
 def singleton(issue, config) -> bool:
-    """The unchanged single-factory path: no ``legacy_owner`` and no owner on the issue."""
-    if getattr(config, "legacy_owner", None) is not None:
-        return False
-    if OWNED_MARKER in (getattr(issue, "body", None) or ""):
+    if getattr(config, "legacy_owner", None) is not None or OWNED_MARKER in (getattr(issue, "body", None) or ""):
         return False
     try:
         return parse_orderer(issue.labels) is None
@@ -45,30 +28,16 @@ def singleton(issue, config) -> bool:
 
 
 def factory_login(tracker) -> str | None:
-    """This factory's authenticated login, or None when it cannot be read."""
     read = getattr(tracker, "authenticated_login", None)
-    if read is None:
-        return None
     try:
-        return read()
-    except (TrackerError, OSError, ValueError):
+        return read() if read is not None else None
+    except Exception:
         return None
-
-
-def foreign_reason(issue, config, tracker) -> str | None:
-    """None when this factory may act on ``issue``; otherwise the one-line refusal."""
-    if singleton(issue, config):
-        return None
-    try:
-        require_owned(issue, config, factory_login(tracker))
-    except OwnershipError as exc:
-        return str(exc)
-    return None
 
 
 def observe(tracker):
-    """The tracker to read ownership through without recording the read locally."""
-    while isinstance(tracker, (RecordingTracker, RunTracker)):
+    """Read an entry snapshot without recording a refusal's lookup in local state."""
+    while isinstance(tracker, RecordingTracker):
         tracker = tracker._tracker
     return tracker
 
@@ -86,17 +55,15 @@ def _model(number: int, facts: dict) -> Issue:
 
 
 def local_issue(store, number: int):
-    """The stored row of ``#number`` as an issue model, or None when it is not stored."""
     row = next((row for row in _rows(store) if row["number"] == number), None)
     return None if row is None else _model(number, row)
 
 
 class Unresolved(TrackerError):
-    """A PR whose Foragent issue cannot be found; its owner is unknown, so effects refuse."""
+    """The linked issue of a PR is unknown."""
 
 
 def _linked_issue(store, tracker, pr: int):
-    """The Foragent issue a PR works: an issue number, None for a non-issue PR (dream, batch-less), or Unresolved."""
     for row in _rows(store):
         if row.get("pr_number") == pr:
             return row["number"]
@@ -108,27 +75,13 @@ def _linked_issue(store, tracker, pr: int):
 
 
 def current_issue(ctx, number: int, tracker=None):
-    """``#number`` as GitHub shows it now; a PR becomes the issue it works (None: a PR with no issue).
-
-    Raises TrackerError when GitHub cannot answer or a PR cannot be resolved.
-    """
+    """The command/run entry read; a PR resolves to the issue it works."""
     tracker = observe(tracker if tracker is not None else ctx.tracker)
     issue = tracker.get_issue(number)
-    if not issue.is_pull_request:
+    if not getattr(issue, "is_pull_request", False):
         return issue
     linked = _linked_issue(ctx.store, tracker, number)
     return None if linked is None else tracker.get_issue(linked)
-
-
-def _rate_limited(exc: Exception) -> bool:
-    return isinstance(exc, TrackerError) and exc.is_rate_limit
-
-
-def _refusal(ctx, issue, tracker=None) -> str | None:
-    scope = getattr(ctx, "_scope", None)
-    if scope is not None and tracker is None:
-        return scope.refusal(issue)
-    return foreign_reason(issue, ctx.config, tracker if tracker is not None else ctx.tracker)
 
 
 def _unreadable(ctx, number: int, exc: Exception) -> str:
@@ -136,257 +89,191 @@ def _unreadable(ctx, number: int, exc: Exception) -> str:
                 number=number, error=" ".join(str(exc).split())[:200])
 
 
-def _evidence_row(store, number: int) -> dict | None:
-    """The stored facts that decide ``#number``: a PR is judged by the issue it works.
-
-    A row that only a queued write created (no title, never listed) holds no facts.
-    """
-    rows = _rows(store)
-    row = next((row for row in rows if row.get("pr_number") == number and row["number"] != number), None)
-    if row is None:
-        row = next((row for row in rows if row["number"] == number), None)
-    if row is None or ("observed" not in row and not row.get("title") and not row.get("labels")):
-        return None
-    return row
-
-
-def stored_singleton(store, config, number: int) -> bool:
-    """The unchanged single-factory path, decided without a new read.
-
-    Team mode requires ``legacy_owner`` before a second factory joins (D78 revision,
-    decision 2), so with no setting this factory is the only one and the facts already
-    held decide: stored facts with an owner (in local intent or in what the last
-    listing observed, a PR's through its linked issue) still go through the full
-    check; a target with no stored facts keeps today's path. With ``legacy_owner``
-    set, every effect reads the issue now.
-    """
-    if getattr(config, "legacy_owner", None) is not None:
-        return False
-    row = _evidence_row(store, number)
-    if row is None:
-        return True
-    return all(singleton(_model(row["number"], facts), config) for facts in (row, row.get("observed") or row))
-
-
-def write_refusal(context, tracker, number: int) -> str | None:
-    """The refusal for one GitHub write on ``#number`` (issue or PR) right before it is sent.
-
-    The write boundary every comment, label, close and audit write passes: fresh facts,
-    a PR resolved to its linked issue, any failed or malformed read refuses; a rate
-    limit propagates to the caller's own wait. The unchanged single-factory path with
-    stored facts reads nothing.
-    """
-    if stored_singleton(context.store, context.config, number):
-        return None
-    ctx = SimpleNamespace(store=context.store, config=context.config, tracker=tracker)
-    try:
-        issue = current_issue(ctx, number, tracker)
-    except Exception as exc:
-        if _rate_limited(exc):
-            raise
-        return _unreadable(ctx, number, exc)
-    return None if issue is None else foreign_reason(issue, context.config, tracker)
-
-
-def current_refusal(ctx, number: int) -> str | None:
-    """The refusal for an effect on ``#number`` now; a read failure refuses, a rate limit raises."""
-    if stored_singleton(ctx.store, ctx.config, number):
-        return None
-    try:
-        issue = current_issue(ctx, number)
-    except Exception as exc:  # A malformed answer is no evidence either (#1004).
-        if _rate_limited(exc):
-            raise
-        return _unreadable(ctx, number, exc)
-    return None if issue is None else _refusal(ctx, issue)
-
-
-def check(ctx, number: int) -> str | None:
-    """Recheck ``#number``'s current owner on GitHub at mutation time."""
-    return current_refusal(ctx, number)
-
-
-def may_write(ctx, number) -> bool:
-    """Whether a cleanup or error path may still write GitHub for ``#number``; any doubt says no.
-
-    Cleanup of a process tree this factory launched, and keeping its work on the local
-    branch, never depend on this; only the GitHub side of cleanup does.
-    """
-    if not isinstance(number, int):
-        return True  # Dreams and other keyed runs have no issue owner.
-    try:
-        return current_refusal(ctx, number) is None
-    except Exception:  # Never raises: callers use it inside cleanup that must still keep local work.
-        return False
-
-
-# The one name recovery and parent aggregation use for the same question.
-shares = may_write
-
-
-def require(ctx, number: int, issue=None):
-    """``issue`` (or a fresh read) when this factory still owns ``#number``; else OwnershipLost."""
-    from foragent.run_attempt import OwnershipLost
-
-    if issue is None or issue.is_pull_request:
-        try:
-            issue = current_issue(ctx, number)
-        except Exception as exc:
-            if _rate_limited(exc):
-                raise
-            raise OwnershipLost(_unreadable(ctx, number, exc)) from exc
-    if issue is not None and (refusal := _refusal(ctx, issue)) is not None:
-        raise OwnershipLost(refusal)
-    return issue
-
-
-def replay_refusal(context, tracker, number: int) -> str | None:
-    """The refusal for replaying the next queued write on ``#number``.
-
-    Checked before every entry, so an owner edit between two writes stops the second.
-    The unchanged singleton path decides from the stored row (a refresh just moved
-    aside the writes of any issue whose owner label changed). A rate limit or a
-    confirmed-missing target propagates to the flush's own handling; any other failed
-    or malformed read refuses this issue's writes, so other issues still go out.
-    """
-    if stored_singleton(context.store, context.config, number):
-        return None
-    ctx = SimpleNamespace(store=context.store, config=context.config, tracker=tracker)
-    try:
-        issue = current_issue(ctx, number, tracker)
-    except Exception as exc:
-        if _rate_limited(exc) or (isinstance(exc, TrackerError) and exc.is_not_found
-                                  and not isinstance(exc, Unresolved)):
-            raise
-        return _unreadable(ctx, number, exc)
-    return None if issue is None else foreign_reason(issue, context.config, tracker)
-
-
-def refuse_verb(ctx, action: str, number: int | None) -> str | None:
-    """The one-line refusal for an orchestrator verb on another person's work, else None."""
-    if number is None or action not in ISSUE_VERBS | PR_VERBS:
-        return None
-    try:
-        if action in PR_VERBS:
-            linked = _linked_issue(ctx.store, observe(ctx.tracker), number)
-            if linked is None:
-                return None  # A PR with no Foragent issue (a dream); the verb's own checks decide.
-            number = linked
-        return current_refusal(ctx, number)
-    except Exception as exc:
-        return _unreadable(ctx, number, exc)
-
-
 class Scope:
-    """One tick's admission boundary: reads this factory's login at most once, and only when needed."""
+    """Frozen issue facts and decisions, with one lazy identity read for the operation.
 
-    def __init__(self, ctx):
+    A tick constructs this before refreshing but captures rows only on first use,
+    after refresh. An entry read can supply the command's exact issue snapshot.
+    No ownership lookup here performs a GitHub issue read.
+    """
+
+    def __init__(self, ctx, issue=None, *, issues=None):
         self._ctx, self._login, self._read = ctx, None, False
+        self.entry = False
+        self._issues, self._prs, self._decisions = None, {}, {}
+        if issues is not None or issue is not None:
+            self._capture()
+            self._issues.update((item.number, item) for item in issues or ())
+            if issue is not None:
+                self._issues[issue.number] = issue
+
+    def _capture(self):
+        if self._issues is not None:
+            return
+        rows = _rows(getattr(self._ctx, "store", None))
+        self._issues = {row["number"]: _model(row["number"], row.get("observed") or row) for row in rows
+                        if row.get("observed") or row.get("title") or row.get("labels")}
+        self._prs = {row["pr_number"]: row["number"] for row in rows if row.get("pr_number")}
 
     def login(self) -> str | None:
         if not self._read:
             self._login, self._read = factory_login(self._ctx.tracker), True
         return self._login
 
+    def issue(self, number):
+        self._capture()
+        return self._issues.get(self._prs.get(number, number))
+
+    def link_pr(self, number, head):
+        self._capture()
+        self._prs[number] = pr_issue_number(head)
+
     def refusal(self, issue) -> str | None:
-        if singleton(issue, self._ctx.config):
+        self._capture()
+        self._issues.setdefault(issue.number, issue)
+        return self.for_number(issue.number)
+
+    def for_number(self, number) -> str | None:
+        self._capture()
+        target = self._prs.get(number, number)
+        if (target != number and target is not None and target not in self._issues
+                and target not in self._decisions):
+            return _unreadable(self._ctx, target, Unresolved("linked issue absent from snapshot"))
+        number = target
+        if number is None:  # A dream PR has no issue target.
             return None
-        try:
-            require_owned(issue, self._ctx.config, self.login())
-        except OwnershipError as exc:
-            return str(exc)
-        return None
+        if number not in self._decisions:
+            issue = self._issues.get(number)
+            if issue is None:
+                # No team setting preserves the existing singleton's unknown-target path.
+                self._decisions[number] = (None if getattr(self._ctx.config, "legacy_owner", None) is None else
+                                          _unreadable(self._ctx, number, Unresolved("issue absent from snapshot")))
+            elif singleton(issue, self._ctx.config):
+                self._decisions[number] = None
+            else:
+                try:
+                    require_owned(issue, self._ctx.config, self.login())
+                except OwnershipError as exc:
+                    self._decisions[number] = str(exc)
+                else:
+                    self._decisions[number] = None
+        return self._decisions[number]
 
     def owns(self, issue) -> bool:
         return self.refusal(issue) is None
 
 
-def ask_orderer(ctx, number: int, summary: str) -> str:
-    """``summary`` addressed to the issue's effective orderer, for a question on its thread.
+def scope(ctx) -> Scope:
+    if getattr(ctx, "_scope", None) is None:
+        ctx._scope = Scope(ctx)
+    return ctx._scope
 
-    The orderer comes from the issue as GitHub shows it now, or, when that read
-    fails, from the stored facts of the last listing, so a passing read error never
-    drops the mention. The unchanged singleton path has nobody else to address.
-    """
+
+def foreign_reason(issue, config, tracker) -> str | None:
+    from types import SimpleNamespace
+
+    return Scope(SimpleNamespace(config=config, tracker=tracker), issue).refusal(issue)
+
+
+def stored_singleton(store, config, number: int) -> bool:
+    rows = _rows(store)
+    row = next((row for row in rows if row.get("pr_number") == number), None)
+    row = row or next((row for row in rows if row["number"] == number), None)
+    return getattr(config, "legacy_owner", None) is None and (row is None or singleton(_model(row["number"], row), config))
+
+
+def check(ctx, number: int, issue=None, *, read=True) -> str | None:
+    """Check once at entry, before any shared effect, and retain that snapshot."""
+    if getattr(ctx, "_scope", None) is not None and ctx._scope.entry:
+        return ctx._scope.for_number(number)
     try:
-        issue = observe(ctx.tracker).get_issue(number)
+        if read and issue is None and not stored_singleton(ctx.store, ctx.config, number):
+            issue = current_issue(ctx, number)
+        ctx._scope = Scope(ctx, issue)
+        ctx._scope.entry = True
+        if issue is not None and issue.number != number:
+            ctx._scope._prs[number] = issue.number
+        return ctx._scope.for_number(number)
+    except Exception as exc:
+        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise
+        return _unreadable(ctx, number, exc)
+
+
+# Compatibility names for cleanup/publication callers: all use the same decision,
+# never another ownership read. Cleanup itself remains outside the tracker gate.
+def current_refusal(ctx, number: int) -> str | None:
+    return scope(ctx).for_number(number)
+
+
+def write_refusal(context, tracker, number: int) -> str | None:
+    return scope(context).for_number(number)
+
+
+def may_write(ctx, number) -> bool:
+    if not isinstance(number, int):
+        return True
+    try:
+        return current_refusal(ctx, number) is None
     except Exception:
-        issue = local_issue(getattr(ctx, "store", None), number) if getattr(ctx, "store", None) is not None else None
-    if issue is None or singleton(issue, ctx.config):
-        return summary
-    try:
-        return f"@{effective_orderer(issue, ctx.config, factory_login(ctx.tracker))} {summary}"
-    except OwnershipError:
-        return summary  # Ambiguous or unconfirmed owner: the question still reaches the thread; nobody is guessed.
+        return False
 
 
-# Tracker calls that change an issue, its PR or its order on GitHub.
-WRITES = frozenset({"add_labels", "remove_labels", "comment", "close_issue", "update_issue", "create_pr",
-                    "update_pr", "close_pr", "merge_pr", "add_sub_issue", "add_blocked_by", "remove_blocked_by"})
+shares = may_write
 
 
-class RunTracker:
-    """A runner's tracker for issue ``number``: each write first rechecks the issue's owner.
+def require(ctx, number: int, issue=None, *, read=True):
+    from foragent.run_attempt import OwnershipLost
 
-    Whatever path a run takes (publication, a harness hold, a question, a policy hold,
-    CI repair), its next GitHub write after an owner edit raises OwnershipLost instead
-    of landing on another person's issue or PR. Reads pass through. On the unchanged
-    single-factory path the check reads nothing (``stored_singleton``).
-    """
+    if (refusal := check(ctx, number, issue, read=read)) is not None:
+        raise OwnershipLost(refusal)
+    return issue if issue is not None else scope(ctx).issue(number)
 
-    def __init__(self, ctx, number: int):
-        self._tracker = ctx.tracker._tracker if isinstance(ctx.tracker, RunTracker) else ctx.tracker
-        self._number = number
-        self._check = SimpleNamespace(store=ctx.store, config=ctx.config, tracker=self._tracker,
-                                      _scope=getattr(ctx, "_scope", None))
 
-    def check_target(self, target: int | None) -> None:
-        """Raise unless this run may write to ``target`` now.
+def merge_check(ctx, number: int, issue=None) -> str | None:
+    """The separate merge preflight uses its existing fresh issue read once."""
+    issue = issue if issue is not None else current_issue(ctx, number)
+    ctx._scope = Scope(ctx, issue)
+    ctx._scope.entry = True
+    return ctx._scope.for_number(number)
 
-        The run's own issue first: losing it raises OwnershipLost, so the run stops.
-        Any other target (an order parent's batch PR, a parent card) is checked in
-        its own right; a refusal there raises WriteRefused for that write alone.
-        """
-        require(self._check, self._number)
-        if target is not None and target != self._number:
-            if (refusal := write_refusal(self._check, self._tracker, target)) is not None:
-                from foragent.tracker import WriteRefused
 
-                raise WriteRefused(refusal)
-
-    def __getattr__(self, name):
-        value = getattr(self._tracker, name)
-        if not callable(value) or name not in WRITES and name != "graphql":
-            return value
-
-        def guarded(*args, **kwargs):
-            if name == "graphql":
-                if str(args[0] if args else kwargs.get("query", "")).lstrip().startswith("mutation"):
-                    self.check_target(None)  # A board card's own issue is checked before its mutation.
-            elif name == "create_pr":
-                self.check_target(pr_issue_number(kwargs.get("head", "")))
-            else:
-                self.check_target(args[0] if args else kwargs.get("pr", kwargs.get("n")))
-            return value(*args, **kwargs)
-
-        return guarded
+def replay_refusal(context, tracker, number: int) -> str | None:
+    return write_refusal(context, tracker, number)
 
 
 @contextmanager
-def guarding(ctx, number: int):
-    """Guard every write of ``ctx``'s tracker for the run of ``#number`` while the block runs.
+def replaying(ctx):
+    """Replay uses the latest observed rows, frozen once for the whole FIFO."""
+    previous = getattr(ctx, "_scope", None)
+    issues = None
+    if (getattr(ctx.config, "legacy_owner", None) is not None
+            and not any(row.get("observed") or row.get("title") or row.get("labels") for row in _rows(ctx.store))):
+        issues = observe(ctx.tracker).list_issues()  # A direct replay has no preceding tick's listing.
+    ctx._scope = Scope(ctx, issues=issues)
+    if previous is not None and previous._read:
+        ctx._scope._login, ctx._scope._read = previous._login, True
+    yield  # The rest of this tick uses this same snapshot and identity.
 
-    The guard sits inside the run's existing recorder, so the context, its recorder and
-    its local records stay the same objects; it is removed again when the block ends.
-    """
-    recorder = ctx.tracker
-    if not isinstance(recorder, RecordingTracker):
-        yield
-        return
-    inner = recorder._tracker
-    recorder._tracker = RunTracker(SimpleNamespace(tracker=inner, store=ctx.store, config=ctx.config,
-                                                   _scope=getattr(ctx, "_scope", None)), number)
+
+def refuse_verb(ctx, action: str, number: int | None) -> str | None:
+    if number is None or action not in ISSUE_VERBS | PR_VERBS:
+        return None
     try:
-        yield
-    finally:
-        recorder._tracker = inner
+        if action in PR_VERBS:
+            # Merge checks once at the remote preflight, after its checks and wait.
+            return None
+        ctx._scope = None  # A new command never inherits an earlier operation's snapshot.
+        return check(ctx, number, current_issue(ctx, number))
+    except Exception as exc:
+        return _unreadable(ctx, number, exc)
+
+
+def ask_orderer(ctx, number: int, summary: str) -> str:
+    issue = scope(ctx).issue(number)
+    if issue is None or singleton(issue, ctx.config):
+        return summary
+    try:
+        return f"@{effective_orderer(issue, ctx.config, scope(ctx).login())} {summary}"
+    except OwnershipError:
+        return summary
