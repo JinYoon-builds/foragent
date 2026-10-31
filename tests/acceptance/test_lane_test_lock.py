@@ -69,7 +69,7 @@ def test_mixed_plan_keeps_old_acceptance_files_and_requires_its_clean_preread(la
     case = lane_case
     legacy_path = "tests/acceptance/test_existing_notice.py"
     legacy = {"key": "legacy", "title": "Legacy notice", "goal": "Keep the old contract.",
-              "out_of_scope": "New delivery.", "done_when": [f"python {legacy_path}"],
+              "out_of_scope": "New delivery.", "done_when": [f"uv run python {legacy_path}"],
               "lane": "api", "size": "s", "acceptance_files": {legacy_path: "assert True\n"}}
     case.plan["issues"].append(legacy)
     case.save()

@@ -64,7 +64,9 @@ Use these commands as the corresponding facts become known (replace angle bracke
   Mark each cell only when its content is settled, including an explicitly empty skills
   list. An unanswered question leaves the cell empty; a filled cell clears its question.
 - Acceptance checks written: `fa order progress tests --done <n> --total <N>`;
-  count chunks with finished checks out of all chunks that need them.
+  count chunks with finished checks out of all chunks that need them. For an issue with
+  behaviour statements, its checks are finished only when `fa order prepare PLAN.json --status --json`
+  reports it `reviewed`; written but unreviewed tests do not count.
 - Successful plan dry-run: `fa order progress check`.
 - User approval received: `fa order progress approval`.
 - Each issue actually published or updated: `fa order progress publish --issue <number>`.
