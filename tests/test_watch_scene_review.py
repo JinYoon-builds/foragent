@@ -88,3 +88,42 @@ def test_the_turn_sentence_belongs_to_a_queued_next_acorn_not_a_parked_one():
     snapshot = _snapshot(row, park_facts={3: {"parked": True, "at": NOW.isoformat()}})
     current, upcoming = lane_items(snapshot, row)
     assert representative_wait(row, current, upcoming) == 4
+
+
+@pytest.mark.parametrize("ascii_glyphs", [False, True])
+def test_marked_fit_shows_every_cut_and_leaves_fitting_lines_alone(ascii_glyphs):
+    from foragent.watch_scene import fit_marked
+
+    mark = "..." if ascii_glyphs else "…"
+    line = [("LongLaneName" * 5, "bold"), (" ✓3", "green")]
+    cut = "".join(value for value, _ in fit_marked(line, 40, mark))
+    assert watch._cells(cut) <= 40 and cut.endswith(mark) and cut.startswith("LongLaneName")
+    assert fit_marked([("short", "")], 40, mark) == [("short", "")]
+
+
+def test_overlong_lane_and_idle_names_and_evidence_are_cut_with_the_mark():
+    from types import SimpleNamespace
+
+    from foragent.watch_sections.lane_blocks import _idle_block, _name_row
+
+    long = "LongLaneName" * 5
+    config = SimpleNamespace(language="en", lanes={long: {}})
+    row = {"slug": long, "lane_display": long}
+    snapshot = _snapshot(row, today_done={long: 2})
+    line, _ = _name_row(snapshot, config, row, 40, "…")
+    text = "".join(value for value, _ in line)
+    assert text.endswith("…") and watch._cells(text) <= 40 and text.startswith("LongLaneName")
+    lines, hits = _idle_block(snapshot, config, [row], 40, (False, False, False))
+    names = "".join(value for value, _ in lines[-1])
+    assert names.endswith("…") and watch._cells(names) <= 40
+    assert hits and hits[0][4] == ("squirrel", long)
+
+
+def test_a_bar_label_wider_than_the_row_is_cut_with_the_mark():
+    from foragent.watch_sections.lane_bubble import _bar
+
+    row = {"slug": "work", "running": [], "queued": [], "held": []}
+    snapshot = _snapshot(row, today=8)
+    snapshot.status["issues"] = {"running": [{"number": 1}, {"number": 2}]}
+    text = "".join(value for value, _ in _bar(snapshot, "en", 12, "…")[0])
+    assert text.endswith("…") and watch._cells(text) <= 12 and text.startswith("80%")

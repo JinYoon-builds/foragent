@@ -21,8 +21,11 @@ from foragent.watch_data import Snapshot
 ORDER = 12
 REPLACES = ("foragent.watch_sections.lanes", "foragent.watch_sections.acorns",
             "foragent.watch_sections.done", "foragent.watch_sections.finished")
-GAP = False
-GAP_AFTER = False
+GAP = False  # The blocks follow the bubble, its bar and the roles directly.
+# The lane blocks end the scene: an unreplaced section after them (the issue detail, the
+# other installed gates) keeps its own blank-row boundary, as it had after the old lane
+# rows. The pinned footer declares GAP = False, so it still follows directly.
+GAP_AFTER = True
 
 ART_CELLS = 11
 CONTENT_FROM = 14  # Art, then three spaces.
@@ -142,6 +145,9 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
     name_cells = watch._cells(name)
     if right and name_cells + 2 + watch._cells(right) > width:
         right = ""
+    if name_cells > width:
+        # The name goes last, and visibly: cut with the mark, never silently by the frame.
+        name = _cut(name, width, mark)
     room = width - name_cells - (2 + watch._cells(right) if right else 0) - 2
     line: Line = [(name, "bold")]
     if joined and room > watch._cells(mark):
@@ -200,7 +206,7 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
 def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], width: int,
                 modes: tuple[bool, bool, bool]) -> tuple[list[Line], list[Hit]]:
     """The shared block of idle lanes: '쉬고 있어요', then every name with ✓N and 💭."""
-    from foragent import watch
+    from foragent import watch, watch_scene
     from foragent.watch_dream import GLYPHS as DREAM
 
     pixels, ascii_glyphs, _ = modes
@@ -216,6 +222,8 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
             spans.append((f" {'v' if ascii_glyphs else '✓'}{count}", "green"))
         if row.get("dreaming"):
             spans.append((" " + DREAM["ascii" if ascii_glyphs else "emoji"], ""))
+        # An entry wider than the row keeps the mark that shows it was cut.
+        spans = watch_scene.fit_marked(spans, width, "..." if ascii_glyphs else "…")
         entries.append((spans, sum(watch._cells(value) for value, _ in spans), slug))
     line: Line = []
     used = 0
@@ -273,7 +281,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     out: list[Line] = []
     evidence = _evidence(snapshot, config, now)
     if evidence:
-        out.append(watch._fit(evidence, width))
+        out.append(watch_scene.fit_marked(evidence, width, "..." if ascii_glyphs else "…"))
     needs = watch_scene.questions(snapshot.status)
     lanes = []
     for row in snapshot.status.get("lanes", {}).values():

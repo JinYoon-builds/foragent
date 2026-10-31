@@ -83,8 +83,8 @@ def bar_counts(snapshot: Snapshot) -> tuple[int, int]:
     return done, done + len(left)
 
 
-def _bar(snapshot: Snapshot, language: str, width: int) -> list[Line]:
-    from foragent import watch
+def _bar(snapshot: Snapshot, language: str, width: int, mark: str = "…") -> list[Line]:
+    from foragent import watch, watch_scene
 
     done, total = bar_counts(snapshot)
     if not total:
@@ -94,7 +94,9 @@ def _bar(snapshot: Snapshot, language: str, width: int) -> list[Line]:
              else watch.text("lane_bubble_bar", language, percent=percent, done=done, total=total))
     cells = max(0, min(BAR_CELLS, width - watch._cells(label) - 2))
     filled = round(cells * done / total)
-    return [[("█" * filled, "green"), ("░" * (cells - filled), "dim"), ("  " if cells else "", ""), (label, "")]]
+    if not cells:
+        return [watch_scene.fit_marked([(label, "")], width, mark)]
+    return [[("█" * filled, "green"), ("░" * (cells - filled), "dim"), ("  ", ""), (label, "")]]
 
 
 def _clock(at: datetime, now: datetime, language: str) -> str:
@@ -250,7 +252,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             else _summary_rows(summary(snapshot, config, now), inside, mark))
     if width < 4:
         # Too narrow for borders: the sentences alone, cut to the width.
-        return [watch._fit(line, width) for line in body if line] + _bar(snapshot, config.language, width)
+        from foragent import watch_scene
+
+        return ([watch_scene.fit_marked(line, width, mark) for line in body if line]
+                + _bar(snapshot, config.language, width, mark))
     from foragent.watch_sections.lanes import glyph_mode
 
     box = _box(body, box_width, sprite, glyph_mode(config))
@@ -259,7 +264,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         box = [[*art[index], (" " * (SPRITE_CELLS - len(art[index]) + SPRITE_GAP), ""), *row]
                for index, row in enumerate(box)]
         hits.append((0, top, SPRITE_CELLS, top + len(box), ("orchestrator", None)))
-    return box + _bar(snapshot, config.language, width)
+    return box + _bar(snapshot, config.language, width, mark)
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,

@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from foragent.config import Config
+from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones
 
@@ -21,6 +22,23 @@ STEPS = {"baseline": "baseline", "implementing": "implementing", "resolving": "i
          "merge-lock-wait": "merging", "resolving-conflict": "merging"}
 # Acorn classes in the order a lane block is placed by.
 CATEGORIES = ("working", "question", "waiting", "idle")
+
+
+def fit_marked(line: Line, width: int, mark: str) -> Line:
+    """``line`` within ``width`` cells; when anything is cut away it ends in ``mark``.
+
+    watch._fit clips silently, which hides that a name, path or count was shortened.
+    """
+    from foragent import watch
+
+    if sum(watch._cells(value) for value, _ in line) <= width:
+        return list(line)
+    room = width - watch._cells(mark)
+    if room < 0:
+        return watch._fit([(mark, "")], width)
+    kept = watch._fit(line, room)
+    style = next((style for value, style in reversed(kept) if value.strip()), "")
+    return [*kept, (mark, style)]
 
 
 def questions(status: dict[str, Any]) -> set[int]:
