@@ -77,16 +77,18 @@ def signal_met(signal: dict[str, Any], files: set[str], kinds: set[str]) -> bool
 
 
 def observe(store: StateStore, config: Config, root: Path,
-            roles: dict[str, Any]) -> tuple[set[str], set[str], dict[str, Any]]:
-    """The inputs every signal check reads: recent merged files, and the kinds and kind numbers
-    `fa orch facts` reports.
+            roles: dict[str, Any]) -> tuple[set[str], set[str], dict[str, Any], dict[str, Any] | None]:
+    """The inputs every signal check reads: recent merged files, and the kinds, kind numbers and
+    binding constraint `fa orch facts` reports.
 
     The facts snapshot is read once, and only when some signal names a kind.
     """
     files = _recent_merged_files(store, store._now())
     wanted = any(signal.get("kinds") for entry in roles.values() for signal in entry["signals"])
     facts = orch_facts.collect(store, config, root, checkout=True) if wanted else {}
-    return files, set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {})
+    binding = facts.get("binding")
+    return (files, set(facts.get("kinds") or []), dict(facts.get("kind_numbers") or {}),
+            binding if isinstance(binding, dict) else None)
 
 
 def _removal_proposed(name: str, entry: dict[str, Any], events, now: datetime) -> bool:
@@ -105,7 +107,7 @@ def collect(store: StateStore, config: Config, root: Path) -> dict[str, Any]:
     roles = load_roles(config)
     now = store._now()
     events = _events(store, now)
-    files, kinds, _ = observe(store, config, root, roles)
+    files, kinds, _, _ = observe(store, config, root, roles)
     rows = {}
     for name, entry in roles.items():
         signals = [{"paths": list(signal.get("paths") or []), "kinds": list(signal.get("kinds") or []),
