@@ -139,7 +139,8 @@ def stall_store(tmp_path, monkeypatch):
     root = tmp_path / "project"
     root.mkdir()
     (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
-    now = datetime(2026, 10, 30, 12, tzinfo=UTC)
+    # The prompt hook reads notices against the real clock, so the fixture clock must follow it.
+    now = datetime.now(UTC).replace(microsecond=0)
     return root, StateStore.for_repo("offline/stall", now=lambda: now), now
 
 
