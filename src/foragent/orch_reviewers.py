@@ -1,8 +1,9 @@
-"""Per-issue review panel size, kept locally under ``<state>/review-reviewers.json``.
+"""Per-issue reviewer count, kept locally under ``<state>/review-reviewers.json``.
 
-`fa orch reviewers <issue> <N>` sets how many independent reviewers check one
-issue's risk-map PRs; it wins over `.foragent.yml` `review_reviewers`. The
-project config is never written. `--clear` removes the issue's value.
+`fa orch reviewers <issue> <N>` sets how many perspective reviewers may run at
+once on one issue's risk-map PRs; it wins over `.foragent.yml` `review_reviewers`.
+Every perspective still gets its own reviewer, so N never shrinks the panel.
+The project config is never written. `--clear` removes the issue's value.
 """
 
 from __future__ import annotations

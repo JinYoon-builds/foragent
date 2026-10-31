@@ -107,11 +107,15 @@ def _procedure(entry: dict, root: Path | None, executor: str, note: str) -> str:
 
 
 def build_prompt(why: str, root: Path | None = None, executor: str = "claude",
-                 role: str = ARCHITECT, entry: dict | None = None) -> str:
-    """The prompt for ``role``; ``entry`` defaults to the derived roles source of a bare config."""
+                 role: str = ARCHITECT, entry: dict | None = None, *, review_notes: str = "") -> str:
+    """The prompt for ``role``; ``entry`` defaults to the derived roles source of a bare config.
+
+    ``review_notes`` is the architect's section of recorded reviewer NOTE lines, appended when present.
+    """
     entry = entry if entry is not None else _entry(Config(), role)
     if role == ARCHITECT:
         procedure = _procedure(entry, root, executor, f"the old link {REFACTOR} points there")
-        return PROMPT.format(why=why, procedure=procedure, memory=_memory_file(entry))
+        prompt = PROMPT.format(why=why, procedure=procedure, memory=_memory_file(entry))
+        return f"{prompt}\n{review_notes}\n" if review_notes else prompt
     return ROLE_PROMPT.format(role=role, why=why, procedure=_procedure(entry, root, executor, ""),
                               memory=entry["memory"], memory_file=_memory_file(entry))

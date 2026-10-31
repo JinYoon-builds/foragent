@@ -286,7 +286,7 @@ def test_optimistic_overlap_order_plan_preserves_exclusive_paths_for_issues_and_
 
     item = {"key": "split", "title": "Split state", "lane": "main", "size": "m",
             "goal": "Split state without concurrent edits", "out_of_scope": "Other modules",
-            "done_when": [f"pytest {ACCEPTANCE}"], "files": [CLI], "exclusive": [STATE, "src/foragent/state/**"]}
+            "done_when": [f"uv run pytest {ACCEPTANCE}"], "files": [CLI], "exclusive": [STATE, "src/foragent/state/**"]}
     edit = {key: item[key] for key in ("goal", "out_of_scope", "done_when", "files", "exclusive")}
     edit["number"] = 145
     plan = {"id": "optimistic-overlap", "title": "Split state", "summary": "Reserve split paths",
@@ -304,7 +304,7 @@ def test_optimistic_overlap_order_plan_preserves_exclusive_paths_for_issues_and_
 def _runner_case(git_history, tmp_path, monkeypatch, files, **config):
     case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true",
                      lanes={"orch": {"paths": ["**"]}}, **config)
-    body = _body(files).replace(f"pytest {ACCEPTANCE}", "true")
+    body = _body(files).replace(f"uv run pytest {ACCEPTANCE}", "true")
     case.tracker.edit_body(1, body)
     case.tracker.add_labels(1, ["lane:orch"])
     case.store.save_approval(1, body=body, body_sha=body_hash(body),

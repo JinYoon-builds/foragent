@@ -1,0 +1,1 @@
+- Older lessons for this area are in ../fa-orch/MEMORY.md (lane split from orch on 2026-10-31); the orch dream drops lines that moved here.
