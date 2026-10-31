@@ -99,9 +99,11 @@ def test_quota_left_uses_keep_cap_in_keep_and_100_otherwise():
 
 def test_invite_needs_idle_lanes_and_sits_above_the_last_usage_line(tmp_path):
     left = {"usage": {"codex": record(10, NOW + timedelta(hours=1))}}
+    invite = "All lanes idle with quota left — type /fa to order work"
+    assert usage.lines(snapshot(left), config(), {"now": NOW})[0] == invite
+    # The frame's usage row (lane_footer) carries no invite; scene's bubble owns it.
     rows = render_frame(snapshot(left), config(), tmp_path, width=200, now=NOW).splitlines()
-    assert rows[-2] == "All lanes idle with quota left — type /fa to order work"
-    assert rows[-1].startswith("Claude — · Codex 10%")
+    assert invite not in rows and rows[-2].startswith("Claude — · Codex 10%")
     busy = snapshot(left, active_runs=[{"number": 1, "lane": "x"}])
     assert usage.lines(busy, config(), {"now": NOW})[0] is None
 
@@ -147,7 +149,7 @@ def test_m_is_ignored_while_an_issue_box_is_open(store):
 
 def test_help_line_lists_m(tmp_path):
     rows = render_frame(snapshot(), config(), tmp_path, width=200, now=NOW).splitlines()
-    assert "m keep/burn" in rows[-2]
+    assert "m usage mode" in rows[-1]
 
 
 def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
@@ -162,13 +164,9 @@ def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
                                    "waiting_for": []} for slug in lanes}
     rows = render_frame(snap, config(lanes=lanes), tmp_path, width=80, now=NOW).splitlines()
     reset = (NOW + timedelta(hours=1)).astimezone().strftime("%H:%M")
-    # The merge setting (#173) makes the usage line wrap between items onto a second row.
-    assert rows[-4:] == [
-        "j/k move · Enter open · f fold · a all · o orchestrator · m keep/burn · x close",
-        "All lanes idle with quota left — type /fa to order work",
-        f"Claude — · Codex 10% (10 min ago · {reset}) · running 0/2 · keep 80%",
-        "merge: batch · q quit"]
-    assert all(_cells(row) <= 80 for row in rows[-4:])
+    # The usage and hint rows stay one row each: no invite, count or merge item (lane_footer).
+    assert rows[-2:] == [f"Claude — · Codex 10% (10 min ago · {reset}) · keep 80%", "Click an acorn to see what it is · s settings · m usage mode · q quit"]
+    assert all(_cells(row) <= 80 for row in rows[-2:])
 
 
 @pytest.mark.parametrize("width", [20, 30, 44])
@@ -197,9 +195,9 @@ def test_usage_line_is_last_even_below_the_other_gates(tmp_path):
     rows = render_frame(snap, config(), tmp_path, width=200, now=NOW).splitlines()
     # The other gates keep the blank line before them; the footer follows them directly.
     assert rows[-4] == "" and "o/other" in rows[-3]
-    assert rows[-2].endswith("x close") and rows[-1].startswith("Claude —") and rows[-1].endswith("q quit")
+    assert rows[-2].startswith("Claude —") and rows[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit"
     plain = render_frame(snapshot(), config(), tmp_path, width=200, now=NOW).splitlines()
-    assert plain[-2].endswith("x close") and plain[-1].endswith("q quit"), "directly under the help line"
+    assert plain[-2].startswith("Claude —") and plain[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit", "hints directly under usage"
 
 
 def test_meter_without_a_machine_state_folder_counts_this_repository(tmp_path):

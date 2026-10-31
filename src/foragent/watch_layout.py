@@ -108,22 +108,21 @@ def _sections() -> list[ModuleType]:
     return [found[order] for order in sorted(found)]
 
 
-# A terminal's usual height; a plain frame keeps to it.
+# A terminal's usual height (kept for callers; frames are no longer cut to it).
 SCREEN_ROWS = 24
 
 
 def _frame(
     snapshot: Snapshot, config: Config, repo_root: Path, *, tick: int, width: int,
-    selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = SCREEN_ROWS,
+    selected: str | None, now: datetime, layout: dict[str, Any] | None = None, height: int | None = None,
     state: dict[str, Any] | None = None,
 ) -> list[Line]:
     """Stack the sections by ORDER with one blank line between non-empty ones.
 
-    Within ``height`` rows, sections marked KEEP (header, lane rows, details and
-    footer) always stay; the others give way from the bottom up. A section
-    marked STAYS (the fireworks band while it plays) stays too and is moved up into
-    the first screen when the KEEP sections push it below. ``state`` is the live view's
-    memory across frames (None for a stateless frame).
+    The frame is unbounded: every surviving row stays reachable, and the viewport
+    (``_window``) applies a screen height once. Only with an explicit ``height`` that
+    the frame overflows do TIGHT sections redraw compactly. ``state`` is the live
+    view's memory across frames (None for a stateless frame).
 
     A section's ``REPLACES`` names other sections by their full module name: after every
     section has drawn, their rows, click areas, issue rows and layout roles are dropped.
@@ -168,14 +167,12 @@ def _frame(
     rows_end = max((index for index, (section, *_) in enumerate(rendered)
                     if getattr(section, "KEEP", False) and (side is None or index < side)), default=-1)
 
-    stays: list[tuple[int, int]] = []  # Row spans of the STAYS sections in the last assembly.
     pins: dict[str, list[int]] = {"header": [], "footer": []}  # Rows of PIN sections, likewise.
 
     def assemble() -> tuple[list[Line], list[Hit], list[Mark]]:
         hits: list[Hit] = []
         marks: list[Mark] = []
         frame: list[Line] = []
-        stays.clear()
         for rows in pins.values():
             rows.clear()
         mark = None  # Where the sections beside the SIDE section begin.
@@ -205,8 +202,6 @@ def _frame(
                 state["settings_focus"] = (top + first, top + last)
             hits += [(x0, y0 + top, x1, y1 + top, target) for x0, y0, x1, y1, target in own]
             marks += [(y + top, number, lane) for y, number, lane in rows]
-            if getattr(section, "STAYS", False):
-                stays.append((top, top + len(lines)))
             if getattr(section, "PIN", None) in pins:
                 pins[section.PIN] += range(top, top + len(lines))
         return frame, hits, marks
@@ -224,44 +219,21 @@ def _frame(
             rendered[index] = draw(settings_window, room=max(1, screen - others))
     frame, hits, marks = assemble()
     if height is not None and len(frame) > height:
-        # A folded lane's last finished row and toggle give way first.
+        # An explicit height that overflows: a folded lane's last finished row and toggle
+        # give way. Nothing else is dropped or moved; the viewport scrolls the rest.
+        tight = False
         for index, (section, *_) in enumerate(rendered):
             if getattr(section, "TIGHT", False):
                 rendered[index] = draw(section, tight=True)
-        frame, hits, marks = assemble()
-    if height is not None and len(frame) > height:
-        # Lane rows win: the other sections give way from the bottom up.
-        order = reversed(range(len(rendered)))
-        for index in order:
-            section, lines, *_ = rendered[index]
-            if lines and not (getattr(section, "KEEP", False) or getattr(section, "STAYS", False)):
-                rendered[index] = (section, [], [], [])
-                if len(assemble()[0]) <= height:
-                    break
-        # The footer becomes one short line of the key letters.
-        for index, (section, *_) in enumerate(rendered):
-            if section.__name__.endswith(".help"):
-                rendered[index] = draw(section, short=True)
-        frame, hits, marks = assemble()
-    if height is not None:
-        # The live view shows the first height - 1 rows above the footer. A STAYS
-        # section pushed below them by the KEEP sections moves up to just above the
-        # footer, so it is on screen when the view opens; the rows it passes move down.
-        for start, end in stays:
-            size, target = end - start, height - 1 - (end - start)
-            if end <= height - 1 or target < 0:
-                continue
-            frame[target:end] = frame[start:end] + frame[target:start]
-            hits = [(x0, y0 + size, x1, y1 + size, item) if target <= y0 < start else (x0, y0, x1, y1, item)
-                    for x0, y0, x1, y1, item in hits]
-            marks = [(y + size, number, lane) if target <= y < start else (y, number, lane)
-                     for y, number, lane in marks]
-            for name, rows in pins.items():
-                pins[name] = [y + size if target <= y < start else y - (start - target) if start <= y < end else y
-                              for y in rows]
+                tight = True
+        if tight:
+            frame, hits, marks = assemble()
     if layout is not None:
         layout["hits"] = hits
         layout["offset"] = 0  # Hits are in F rows; a height render shifts them (``_window``).
+        # The pinned rows travel with the layout too, so a height render without a
+        # caller-owned state still keeps its header and footer on screen.
+        layout["pinned_rows"] = {name: sorted(rows) for name, rows in pins.items()}
     if state is not None:
         # Interaction data comes once from the final rows, never from a section draw that a
         # later trim replaced: the frame's size, its issue rows for the highlight, and the
@@ -280,8 +252,9 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
             layout: dict[str, Any] | None = None) -> list[Line]:
     """The rows a screen of ``height`` shows: one slice rule for render_frame and the live view.
 
-    ``frame`` is F, the heightless 24-row-trimmed frame (its footer row is an ordinary
-    row). When F fits, it is returned as it is. When it is taller, the screen shows
+    ``frame`` is F, the whole heightless frame. With pinned rows (``state['pinned_rows']``)
+    ``watch_viewport.window`` keeps the header and footer on screen and scrolls the body.
+    Without them, when F fits, it is returned as it is. When it is taller, the screen shows
     F[scroll : scroll + height - 1] and a position line with N = len(F); under
     MIN_SCREEN (3) rows it is F as it is, as with no height. ``scroll``
     stays within 0..len(F) - (height - 1), and ``layout['hits']`` moves to screen rows,
@@ -289,8 +262,16 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
     """
     from foragent import watch
 
+    from foragent import watch_viewport
+
     state = {} if state is None else state
     state.update(height=height, length=len(frame))
+    pins = (layout or {}).get("pinned_rows") or state.get("pinned_rows") or {}
+    if any(pins.values()):
+        # Pinned header and footer rows: they stay put and only the body scrolls.
+        return watch_viewport.window(frame, state, height, width, language, layout, pins)
+    for name in ("body_length", "body_height", "row_map"):
+        state.pop(name, None)
     if height < watch.MIN_SCREEN or len(frame) <= height:
         # F fits, or the screen is too short to scroll (under 3 rows counts as no height).
         state["scroll"] = 0
@@ -309,9 +290,7 @@ def _window(frame: list[Line], state: dict[str, Any] | None, height: int, width:
         layout["hits"] = [(x0, max(0, y0 - top), x1, min(rows, y1 - top), target)
                           for x0, y0, x1, y1, target in layout.get("hits", [])
                           if max(0, y0 - top) < min(rows, y1 - top)]
-    position = watch.text("acorns_position", language, first=top + 1, last=min(len(frame), top + rows),
-                          total=len(frame))
-    line = watch._fit(watch._line(f"{position} · {watch.text('acorns_select', language)}", "dim"), width)
+    line = watch_viewport.position_line(top + 1, min(len(frame), top + rows), len(frame), width, language)
     return frame[top:top + rows] + [line]
 
 
@@ -323,13 +302,17 @@ def render_frame(
     """A single plain-text frame, sharing the live view's layout and data.
 
     With ``height``, only the rows a screen that tall shows (``_window``): F, the
-    heightless 24-row-trimmed frame, sliced at ``state['scroll']`` with a position
+    whole heightless frame, sliced at ``state['scroll']`` with a position
     line when F is taller than the screen; hit boxes then use screen rows.
     """
     from foragent import watch
 
     if height is not None and state is not None:
         state["height"] = height  # The settings window fits itself to this screen.
+    if height is not None and layout is None:
+        # A private layout carries the frame's pinned rows to _window; sections draw the
+        # same with or without one, and a stateless frame stays stateless.
+        layout = {}
     frame = watch._frame(
         snapshot, config, repo_root, tick=tick, width=max(1, width), selected=selected,
         now=now or snapshot.captured_at, **({} if layout is None else {"layout": layout}),
