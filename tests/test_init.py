@@ -1371,7 +1371,7 @@ def _fa_allow_env(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     root = tmp_path / "project"
     (root / ".claude").mkdir(parents=True)
-    # Claude Code has already written project settings: the offer only extends existing ones.
+    # Existing settings use the direct CLI offer; new projects use the skill's question.
     (root / ".claude/settings.local.json").write_text("{}\n", encoding="utf-8")
     return root
 
@@ -1503,18 +1503,69 @@ def test_fa_allow_asks_nothing_in_a_project_without_claude_settings(tmp_path, mo
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     root = tmp_path / "project"
     (root / ".claude/agents").mkdir(parents=True)
-    assert offer_fa_allow(root, lambda prompt: pytest.fail("asked")) == "skipped"
+    for _ in range(2):
+        assert offer_fa_allow(root, lambda prompt: pytest.fail("asked")) == "skipped"
     assert sorted(path.name for path in (root / ".claude").iterdir()) == ["agents"]
-    assert not fa_allow_record_path().exists(), "a skipped offer must not consume the decision"
+    assert not fa_allow_record_path().parent.exists(), "a skipped offer must not create state or locks"
 
 
-def test_fa_allow_explicit_answer_works_without_existing_claude_settings(tmp_path, monkeypatch):
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_fa_allow_explicit_answer_works_without_existing_claude_settings(tmp_path, monkeypatch, answer):
     from foragent.init import fa_allow_record_path, offer_fa_allow
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     root = tmp_path / "project"
     root.mkdir()
-    assert offer_fa_allow(root, lambda prompt: "yes", require_settings=False) == "added"
-    assert json.loads((root / ".claude/settings.local.json").read_text()) == {
-        "permissions": {"allow": ["Bash(fa:*)"]}}
-    assert json.loads(fa_allow_record_path().read_text()) == {str(root.resolve()): "accepted"}
+    assert offer_fa_allow(root, lambda prompt: answer, require_settings=False) == (
+        "added" if answer == "yes" else "declined")
+    if answer == "yes":
+        assert json.loads((root / ".claude/settings.local.json").read_text()) == {
+            "permissions": {"allow": ["Bash(fa:*)"]}}
+    else:
+        assert not (root / ".claude").exists()
+    assert json.loads(fa_allow_record_path().read_text()) == {
+        str(root.resolve()): "accepted" if answer == "yes" else "declined"}
+    assert offer_fa_allow(root, lambda prompt: pytest.fail("asked again")) == "kept"
+
+
+@pytest.mark.parametrize("answer", [None, "yes", "no"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_init_new_project_reports_undecided_until_person_answers(setup, monkeypatch, capsys, answer, dry_run):
+    from foragent import cli
+    from foragent.commands import init as command
+    from foragent.init import fa_allow_record_path
+
+    monkeypatch.setattr(cli, "init_repo", lambda root, **kwargs: setup.init(**kwargs))
+    monkeypatch.setattr(cli, "_offer_statusline", lambda answer: None)
+    monkeypatch.setattr(command, "_offer_upstream_reports", lambda root: None)
+    monkeypatch.setattr(command, "_offer_starter", lambda *args: None)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("new project must use the skill's question"))
+    argv = ["init", "--repo-root", str(setup.root), "--no-push", "--no-launchd", "--no-board"]
+    if answer is not None:
+        argv += ["--fa-allow", answer]
+    if dry_run:
+        argv += ["--dry-run"]
+    note = "FA commands permission: not yet decided — /fa setup asks, or run `fa init --fa-allow yes|no`."
+    local = setup.root / ".claude/settings.local.json"
+    for _ in range(2):
+        assert cli.main(argv) == 0
+        output = capsys.readouterr().out
+        assert (note in output) == (answer is None and not dry_run)
+        if dry_run or answer is None:
+            assert not local.exists()
+            assert not fa_allow_record_path().parent.exists()
+        else:
+            assert json.loads(fa_allow_record_path().read_text()) == {
+                str(setup.root.resolve()): "accepted" if answer == "yes" else "declined"}
+            if answer == "yes":
+                assert json.loads(local.read_text()) == {"permissions": {"allow": ["Bash(fa:*)"]}}
+            else:
+                assert not local.exists()
+            assert "not yet decided" not in setup.init(no_push=True, no_launchd=True).summary()
+
+
+def test_init_existing_claude_settings_leave_the_offer_to_cli(setup):
+    local = setup.root / ".claude/settings.local.json"
+    local.parent.mkdir()
+    local.write_text("{}\n")
+    assert "not yet decided" not in setup.init(no_push=True, no_launchd=True).summary()

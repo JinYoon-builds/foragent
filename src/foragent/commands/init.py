@@ -132,6 +132,7 @@ def run(args) -> int:
         run_hours=args.run_hours, no_push=args.no_push, no_launchd=args.no_launchd,
         dry_run=args.dry_run, language=args.language, no_board=args.no_board,
         board_map=args.board_map,
+        **({"fa_allow": args.fa_allow} if args.fa_allow is not None else {}),
         # Only an explicit flag reaches setup; without it no claude_quota block is written.
         **({"claude_quota": args.claude_quota} if args.claude_quota else {}),
     )

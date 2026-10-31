@@ -253,7 +253,7 @@ def init_repo(
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
-    board_map: str | None = None, claude_quota: str | None = None,
+    board_map: str | None = None, claude_quota: str | None = None, fa_allow: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
@@ -465,6 +465,8 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
+    if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root)):
+        notes.append("FA commands permission: not yet decided — /fa setup asks, or run `fa init --fa-allow yes|no`.")
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)
@@ -549,13 +551,17 @@ def _fa_allow_decided(key: str) -> bool:
     return (_read_json_object(fa_allow_record_path()) or {}).get(key) in {"accepted", "declined"}
 
 
+def _has_claude_settings(root: Path) -> bool:
+    return any((root / ".claude" / name).exists() for name in ("settings.json", "settings.local.json"))
+
+
 def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_settings: bool = True) -> str:
     """Ask once whether Claude may run fa commands in this project; remember either answer.
 
     Returns "added", "declined", "present" (the rule was already there), "kept" (already
     decided), "busy" (another init is deciding for this project now), "skipped" (the project
-    has no Claude settings file yet, so there is nothing to extend and no question is added
-    to setup; pass ``require_settings=False`` when the person already gave an answer),
+    has no Claude settings file yet, so the fa-init skill asks using the summary note;
+    pass ``require_settings=False`` when the person already gave an answer),
     "unanswered" (no terminal) or "unreadable" (settings are not a JSON object). Raises OSError when a file
     cannot be written; then nothing is remembered.
 
@@ -566,6 +572,9 @@ def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_set
     import hashlib
 
     key = str(root.resolve())
+    # New projects defer the question to the skill without creating state or lock files.
+    if require_settings and not _has_claude_settings(root):
+        return "kept" if _fa_allow_decided(key) else "skipped"
     claude = root / ".claude"
     local_file = claude / "settings.local.json"
 
@@ -583,8 +592,6 @@ def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_set
         if rule_present():
             _remember_fa_allow(key, "accepted")
             return "present"
-        if require_settings and not (local_file.exists() or (claude / "settings.json").exists()):
-            return "skipped"
         if _read_json_object(local_file) is None:
             return "unreadable"
         try:
