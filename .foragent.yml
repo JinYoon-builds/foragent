@@ -1,5 +1,5 @@
 repo: JinYoon-builds/foragent  # 2026-10-30: pushes failed 255x with 'claude-push requires a repository' since >=10-28
-review: fast
+review: batch
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
 approvers:
