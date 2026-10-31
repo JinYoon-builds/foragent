@@ -2,15 +2,18 @@
 
 A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
-each tick that read the issue listing, and closes it once every child closed
-as completed. An approved issue with sub-issues stays ordinary work.
+each tick that read the issue listing, and closes it once no child is open.
+A child closed as not planned (for example replaced by a newer order) has
+ended too; the one closing comment names completed and cancelled children in
+separate groups. An approved issue with sub-issues stays ordinary work.
 
 An order record (plan marker, no lane label) also owns every issue its plan
 marker references: the map values and the issues in its acceptance (edit)
 map. Edit-only records and records older than native sub-issue edges have no
 sub-issues, so the close waits for those references as well (#837). A closed
-reference counts as done whatever its reason; native sub-issues keep the
-not_planned handling. Until a record closes, its card keeps today's handling.
+reference or sub-issue counts as ended whatever its reason. While any child is
+open, a cancelled child only flags the order for a decision. Until a record
+closes, its card keeps today's handling.
 """
 
 import json
@@ -46,7 +49,7 @@ def parent_state(children: Iterable[Issue], open_prs: set[int] = frozenset()) ->
     completed = [child for child in children if _completed(child)]
     if any(NEEDS_HUMAN in child.labels for child in open_children):
         return "Needs human"
-    if len(completed) == len(children):
+    if not open_children:
         return "Done"
     if completed or any(child.labels & {RUNNING, BLOCKED} or child.number in open_prs
                         for child in open_children):
@@ -112,15 +115,17 @@ def order_records(rows: list[dict[str, Any]]) -> tuple[dict[int, set[int]], set[
 
 
 def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]],
-                       listed_prs: set[int]) -> set[int] | None:
-    """The referenced issues if every one is closed now, or None while any is open or unreadable.
+                       listed_prs: set[int]) -> dict[int, bool] | None:
+    """Each referenced issue mapped to whether it was cancelled, if every one is closed now;
+    None while any is open or unreadable.
 
-    A closed reference counts as done whatever its close reason. Listed issues
+    A closed reference counts as ended whatever its close reason; it is
+    cancelled only when its reason is known to be not_planned. Listed issues
     answer from the listing, and only when all of them are closed is each
     unlisted reference read fresh, in this tick; nothing is kept between
     ticks. A number that reads as a pull request is ignored.
     """
-    closed, unlisted = set(), []
+    closed, unlisted = {}, []
     for number in sorted(references - listed_prs):
         row = rows.get(number)
         if row is None:
@@ -128,7 +133,7 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
         elif row.get("state") != "closed":
             return None  # Open work keeps the record open without spending reads.
         else:
-            closed.add(number)
+            closed[number] = row.get("state_reason") == "not_planned"
     for number in unlisted:
         try:
             issue = ctx.tracker.get_issue(number)
@@ -141,8 +146,17 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
             continue
         if issue.state != "closed":
             return None
-        closed.add(number)
+        closed[number] = getattr(issue, "state_reason", None) == "not_planned"
     return closed
+
+
+def closing_comment(language: str, completed: list[int], cancelled: list[int]) -> str:
+    """The one closing comment: the shared record line, then each non-empty group of children."""
+    parts = [text("order_record_closed", language, count=len(completed) + len(cancelled))]
+    for key, group in (("order_closed_completed", completed), ("order_closed_cancelled", cancelled)):
+        if group:
+            parts.append(text(key, language, children=", ".join(f"#{child}" for child in group)))
+    return " ".join(parts)
 
 
 def follow_children(ctx, report) -> None:
@@ -158,9 +172,22 @@ def follow_children(ctx, report) -> None:
         children = ctx.tracker.sub_issues(number) if by_number[number].get("children") else []
         # Until a record closes, only an order parent's sub-issues move its card (today's handling).
         state = parent_state(children, open_prs) if number in parents else None
+        work = {child.number for child in children}
+        ended = {child.number: not _completed(child) for child in children}  # number -> cancelled
+        if number in records:
+            done = None
+            if all(child.state == "closed" for child in children):
+                # Sub-issues already carry their state; read only the other references.
+                done = _closed_references(ctx, records[number] - work, by_number, listed_prs)
+            closes = done is not None and bool(work | done.keys())
+            ended.update(done or {})
+        elif number in unparseable:
+            closes = False  # Its work is unknown: skip the close quietly; the card keeps today's column.
+        else:
+            closes = state == "Done"
         cancelled = [child.number for child in children
                      if child.state == "closed" and not _completed(child)]
-        if cancelled and number in parents:
+        if cancelled and number in parents and not closes:  # A decision only while work remains.
             previous = ctx.store.load_flag(number)
             if previous is None or previous.reason != NOT_PLANNED_FLAG:
                 at = ctx.now()
@@ -169,22 +196,12 @@ def follow_children(ctx, report) -> None:
                                children=", ".join(f"#{child}" for child in cancelled))
                 append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)
                 report.actions.append(summary)
-        work = {child.number for child in children}
-        if number in records:
-            done = None
-            if all(_completed(child) for child in children):
-                # Sub-issues already carry their state; read only the other references.
-                done = _closed_references(ctx, records[number] - work, by_number, listed_prs)
-            closes = done is not None and bool(work | done)
-            work |= done or set()
-        elif number in unparseable:
-            closes = False  # Its work is unknown: skip the close quietly; the card keeps today's column.
-        else:
-            closes = state == "Done"
         if closes:
-            ctx.tracker.close_issue(number, text("order_record_closed", language, count=len(work)))
+            completed = sorted(child for child, gone in ended.items() if not gone)
+            cancelled = sorted(child for child, gone in ended.items() if gone)
+            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled))
             report.actions.append(text("parent_closed_report", language, number=number,
-                                       count=len(work)))
+                                       completed=len(completed), cancelled=len(cancelled)))
             state = "Done"
         if state is not None:
             board.sync_status(ctx, number, state, parent=True)
