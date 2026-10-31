@@ -43,7 +43,7 @@ def _publish_reviewed_in_turn(
     pushed (as the implementation path does after its review); without
     ``reverify`` or on a conflict it stops as base-changed.
     """
-    from foragent import run_group_check, runner
+    from foragent import run_group_check, run_group_evidence, runner
 
     worktree = git.root
     log = ctx.store.log_path(n)
@@ -133,6 +133,7 @@ def _publish_reviewed_in_turn(
             continue
         ctx.git.fetch("origin", pr.base)
         if (target_sha := ctx.git.ref_sha(base_ref)) != base_sha:
+            run_group_evidence.note(n, ctx, head, target_sha)  # recorded only; no reuse yet
             if stopped := refresh(target_sha):
                 return stopped
             continue
@@ -176,6 +177,7 @@ def _publish_reviewed_in_turn(
                     else:
                         failed_merge = exc
                 else:
+                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)

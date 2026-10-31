@@ -47,6 +47,8 @@ def _reason(row: dict[str, Any]) -> str | None:
 
 def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     """Build the shared status JSON from local records only."""
+    from foragent.scheduler_stop import unfinished_runs
+
     observation = store.issues_observation()
     rows = store.local_issues()
     states = {row["number"]: row["state"] for row in rows}
@@ -78,7 +80,8 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
         "failed_at": observation["failed_at"],
         # Dreams hold no issue. This lists every running record with its pid, whatever its
         # labels or worker, so a view can show a gone worker; working rows follow run_is_live.
-        "active_runs": [asdict(run) for run in store.active_runs() if run.kind == "issue"],
+        # fa orch stop accepts exactly these records (#1207).
+        "active_runs": [asdict(run) for run in unfinished_runs(store)],
         "history": [asdict(run) for run in store.read_history()[-10:]],
     }
 
