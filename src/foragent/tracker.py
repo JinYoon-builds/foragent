@@ -423,13 +423,25 @@ class RecordingTracker:
         from foragent import orch_scope
 
         if isinstance(self._tracker, orch_scope.RunTracker):
-            return None
+            return None  # The run's guard checks the write's own target and raises.
         if (refusal := orch_scope.write_refusal(self._context, self._tracker, n)) is not None:
             from foragent.orch_events import append_event
 
             append_event(self._context.store, self._context.now(), n, "write-refused",
                          f"#{n}: GitHub write not sent: {refusal}")
         return refusal
+
+    def board_write_refused(self, n):
+        """Whether a board card write for ``#n`` must not be sent (the same write boundary)."""
+        from foragent import orch_scope
+
+        if isinstance(self._tracker, orch_scope.RunTracker):
+            try:
+                self._tracker.check_target(n)
+            except WriteRefused:
+                return True
+            return False
+        return self._refused(n) is not None
 
     def _write(self, n, action, operation, **payload):
         store = self._context.store
@@ -471,6 +483,12 @@ class RecordingTracker:
                 if action == "remove_labels":
                     labels = entry["labels"]
                     for index, label in enumerate(labels):
+                        # Each removal is its own GitHub write: an owner edit between two stops the rest.
+                        if index and (refusal := self._replay_refusal(number)) is not None:
+                            store.refuse_github_writes(number, refusal)
+                            self._outbox_refused(number, refusal)
+                            dropped.add(number)
+                            break
                         self._tracker.remove_labels(number, [label])
                         store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
                 elif action == "update_issue":

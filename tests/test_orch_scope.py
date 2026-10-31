@@ -318,3 +318,55 @@ def test_a_refused_queued_close_leaves_the_local_issue_open(tmp_path):
     assert tracker.get_issue(1).state == "open"
     row = next(row for row in store.local_issues() if row["number"] == 1)
     assert row["state"] == "open", "Nothing was sent, so the local row returns to GitHub's facts"
+
+
+def test_a_board_card_write_passes_the_same_boundary(tmp_path):
+    from foragent.board import Project
+
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]), legacy="alice")
+    tracker.remove_labels(1, ["by:alice"])  # Relabelled to Bob after the listing.
+    tracker.add_labels(1, ["by:bob"])
+    calls = []
+    recorder.graphql = lambda query, variables: calls.append(variables) or {"repository": {"issue": None}}
+    assert recorder.board_write_refused(1) and not recorder.board_write_refused(2)
+    Project(recorder, "owner/repo", "board").set_values(1, {"Status": "Done"})
+    assert calls == [], "No board read or write for a card that is Bob's now"
+
+
+def test_replaying_one_multi_label_removal_rechecks_between_labels(tmp_path, monkeypatch):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice", "ready", "running"]), legacy="alice")
+    store.queue_github_write(1, "remove_labels", labels=["ready", "running"])
+    remove = tracker.remove_labels
+
+    def remove_then_handover(n, labels):
+        result = remove(n, labels)
+        if labels == ["ready"]:
+            remove(1, ["by:alice"])
+            tracker.add_labels(1, ["by:bob"])
+        return result
+
+    monkeypatch.setattr(tracker, "remove_labels", remove_then_handover)
+    recorder.flush_outbox()
+    assert "running" in tracker.get_issue(1).labels, "The removal after the handover is Bob's to decide"
+    [kept] = store.refused_github_writes()
+    assert kept["labels"] == ["running"]
+
+
+def test_a_close_queued_during_a_refresh_is_refused_and_the_row_shows_github(tmp_path):
+    store, tracker, recorder, now = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
+    revision = store.issues_revision()
+    store.update_local_issue(1, title="Edited locally")  # A local change after the listing began…
+    store.queue_github_write(1, "close_issue", body="Done")  # …then a close queued while it was read.
+    tracker.remove_labels(1, ["by:alice"])
+    tracker.add_labels(1, ["by:bob"])
+    store.refresh_local_issues([tracker.get_issue(1)], [], {}, now, since_revision=revision)
+    row = next(row for row in store.local_issues() if row["number"] == 1)
+    assert row["state"] == "open" and "by:bob" in row["labels"] and store.github_outbox() == []
+    assert [entry["action"] for entry in store.refused_github_writes()] == ["close_issue"]
+
+
+def test_a_question_keeps_its_mention_when_the_read_fails(tmp_path, monkeypatch):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ["by:alice"]), legacy="alice")
+    monkeypatch.setattr(tracker, "get_issue", lambda n: (_ for _ in ()).throw(TrackerError("HTTP 502")))
+    ctx = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="alice"), store=store)
+    assert orch_scope.ask_orderer(ctx, 1, "Decide.") == "@alice Decide."

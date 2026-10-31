@@ -61,16 +61,18 @@ class IssueRefreshMixin:
                     concurrent = since_revision is not None and expected.get("revision", 0) > since_revision
                     fields = ("labels", "state")
                     matches = all(remote[key] == expected.get(key) for key in fields)
+                    before, after = _owners(expected.get("labels", ())), _owners(remote["labels"])
+                    if before != after:
+                        # An owner edit is not a person overriding this write: keep it, refused (#1004),
+                        # also when the write was queued during this refresh. The row shows GitHub's facts.
+                        refused[issue.number] = (f"owner label changed from {', '.join(before) or 'none'} "
+                                                 f"to {', '.join(after) or 'none'} while the write was queued")
+                        rows[str(issue.number)] = remote
+                        continue
                     if concurrent or matches:
                         rows[str(issue.number)] = dict(old)
                         continue
-                    before, after = _owners(expected.get("labels", ())), _owners(remote["labels"])
-                    if before != after:
-                        # An owner edit is not a person overriding this write: keep it, refused (#1004).
-                        refused[issue.number] = (f"owner label changed from {', '.join(before) or 'none'} "
-                                                 f"to {', '.join(after) or 'none'} while the write was queued")
-                    else:
-                        dropped.add(issue.number)
+                    dropped.add(issue.number)
                 rows[str(issue.number)] = remote
             for number, row in rows.items():
                 # Order edges and dependencies are observations, never local intent.
@@ -109,7 +111,8 @@ class IssueRefreshMixin:
                 row["observed"] = {**facts[number], **listed}
             if since_revision is not None:
                 rows.update({number: row for number, row in previous.items()
-                             if row.get("revision", 0) > since_revision and int(number) not in dropped})
+                             if row.get("revision", 0) > since_revision
+                             and int(number) not in dropped and int(number) not in refused})
             snapshot.pop("refresh_failure", None)
             _refuse(snapshot, refused, self._timestamp())
             self._write_json(self.root / "issues.json", {

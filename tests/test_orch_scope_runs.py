@@ -269,3 +269,109 @@ def test_rerun_review_posts_no_audit_comment_after_the_owner_changed(git_history
     comments = list(case.tracker.list_comments(1))
     orch.rerun_review(case.ctx, 1)
     assert case.tracker.list_comments(1) == comments
+
+
+def test_a_child_run_does_not_open_a_batch_pr_for_a_parent_that_changed_hands():
+    from foragent import orch_scope
+    from foragent.tracker import WriteRefused
+
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Child", "", labels=["by:alice"])
+    tracker.add_issue(9, "Parent, Bob's now", "", labels=["by:bob"])
+    ctx = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="alice"),
+                          store=SimpleNamespace(local_issues=lambda: []))
+    guarded = orch_scope.RunTracker(ctx, 1)
+    for write in (lambda: guarded.create_pr(head="foragent/batch-9", base="main", title="t", body="b"),
+                  lambda: guarded.comment(9, "Batch PR ready")):
+        try:
+            write()
+        except WriteRefused:
+            continue
+        raise AssertionError("The child run wrote to Bob's order")
+    assert tracker.created_prs == [] and tracker.list_comments(9) == []
+    guarded.comment(1, "Own child")  # The run itself goes on.
+    assert [c.body for c in tracker.list_comments(1)] == ["Own child"]
+
+
+def test_stop_rechecks_the_owner_after_waiting_for_the_tick_lock(monkeypatch):
+    from contextlib import contextmanager
+    from foragent import orch_stop, scheduler
+    from foragent.orch import OrchError
+
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Mine", "", labels=["by:alice", "running"])
+    killed = []
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **kw: killed.append(a) or True)
+
+    @contextmanager
+    def lock_after_handover(ctx, n):
+        relabel(tracker, "bob")  # Bob took the issue while this stop waited.
+        yield
+
+    monkeypatch.setattr(orch_stop, "_tick_lock", lock_after_handover)
+    ctx = SimpleNamespace(tracker=tracker, config=Config(legacy_owner="alice"),
+                          store=SimpleNamespace(local_issues=lambda: []))
+    try:
+        orch_stop.stop(ctx, 1, "Replan")
+    except OrchError as exc:
+        assert "bob" in str(exc)
+    else:
+        raise AssertionError("A stop of Bob's issue reported success")
+    assert killed == []
+
+
+def test_a_board_card_is_not_added_or_moved_after_the_issue_changed_hands_during_lookup():
+    from foragent.board import Project
+
+    def project_tracker(card_exists):
+        answers = iter([False, True])  # Alice's at the first check, Bob's at the write.
+        calls = []
+
+        def graphql(query, variables):
+            calls.append(query.split("(")[0].split()[-1])
+            if "ForagentBoardFields" in query:
+                return {"node": {"fields": {"nodes": [{"id": "F", "name": "Status", "options": [
+                    {"id": "o1", "name": "Done"}, {"id": "o2", "name": "Ready"}]}],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+            if "ForagentBoardIssue" in query:
+                nodes = [{"id": "I", "project": {"id": "P"},
+                          "fieldValueByName": {"name": "Ready", "optionId": "o2"}}] if card_exists else []
+                return {"repository": {"issue": {"id": "C", "projectItems": {
+                    "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+            return {}
+
+        tracker = SimpleNamespace(graphql=graphql, board_write_refused=lambda n: next(answers))
+        return tracker, calls
+
+    for card_exists in (False, True):
+        tracker, calls = project_tracker(card_exists)
+        Project(tracker, "owner/repo", "P").set_values(1, {"Status": "Done"})
+        assert not [name for name in calls if name.startswith("ForagentAdd") or name.startswith("ForagentSet")], calls
+
+
+def test_a_start_whose_labels_were_refused_launches_nothing(git_history, tmp_path, monkeypatch):
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import make_case
+    from team_v1_support import factory, legacy
+
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    legacy(case.ctx.config)
+    case.store.finish_run(1, "blocked")
+    case.tracker.remove_labels(1, ["running"])
+    case.tracker.add_labels(1, ["by:alice"])
+    case.tracker.record_label(1, "approved", "human")
+    alice, starts = factory(case, tmp_path / "alice", "alice", monkeypatch)
+    remove = alice.tracker.remove_labels
+
+    def remove_then_handover(n, labels):
+        result = remove(n, labels)
+        if "ready" in labels:
+            relabel(alice.tracker, "bob")  # Bob takes it between the two start labels.
+        return result
+
+    monkeypatch.setattr(alice.tracker, "remove_labels", remove_then_handover)
+    tick(alice)
+    assert starts == []
+    run = alice.store.get_run(1)
+    assert run is None or run.status != "running"
+    assert "running" not in case.tracker.get_issue(1).labels

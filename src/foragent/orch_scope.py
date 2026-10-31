@@ -304,15 +304,20 @@ class Scope:
 def ask_orderer(ctx, number: int, summary: str) -> str:
     """``summary`` addressed to the issue's effective orderer, for a question on its thread.
 
-    The unchanged singleton path has nobody else to address and keeps the summary as is.
+    The orderer comes from the issue as GitHub shows it now, or, when that read
+    fails, from the stored facts of the last listing, so a passing read error never
+    drops the mention. The unchanged singleton path has nobody else to address.
     """
     try:
         issue = observe(ctx.tracker).get_issue(number)
-        if singleton(issue, ctx.config):
-            return summary
+    except Exception:
+        issue = local_issue(getattr(ctx, "store", None), number) if getattr(ctx, "store", None) is not None else None
+    if issue is None or singleton(issue, ctx.config):
+        return summary
+    try:
         return f"@{effective_orderer(issue, ctx.config, factory_login(ctx.tracker))} {summary}"
-    except (TrackerError, OwnershipError):
-        return summary  # The question still reaches the thread; nobody is guessed.
+    except OwnershipError:
+        return summary  # Ambiguous or unconfirmed owner: the question still reaches the thread; nobody is guessed.
 
 
 # Tracker calls that change an issue, its PR or its order on GitHub.
@@ -335,14 +340,33 @@ class RunTracker:
         self._check = SimpleNamespace(store=ctx.store, config=ctx.config, tracker=self._tracker,
                                       _scope=getattr(ctx, "_scope", None))
 
+    def check_target(self, target: int | None) -> None:
+        """Raise unless this run may write to ``target`` now.
+
+        The run's own issue first: losing it raises OwnershipLost, so the run stops.
+        Any other target (an order parent's batch PR, a parent card) is checked in
+        its own right; a refusal there raises WriteRefused for that write alone.
+        """
+        require(self._check, self._number)
+        if target is not None and target != self._number:
+            if (refusal := write_refusal(self._check, self._tracker, target)) is not None:
+                from foragent.tracker import WriteRefused
+
+                raise WriteRefused(refusal)
+
     def __getattr__(self, name):
         value = getattr(self._tracker, name)
         if not callable(value) or name not in WRITES and name != "graphql":
             return value
 
         def guarded(*args, **kwargs):
-            if name != "graphql" or str(args[0] if args else kwargs.get("query", "")).lstrip().startswith("mutation"):
-                require(self._check, self._number)
+            if name == "graphql":
+                if str(args[0] if args else kwargs.get("query", "")).lstrip().startswith("mutation"):
+                    self.check_target(None)  # A board card's own issue is checked before its mutation.
+            elif name == "create_pr":
+                self.check_target(pr_issue_number(kwargs.get("head", "")))
+            else:
+                self.check_target(args[0] if args else kwargs.get("pr", kwargs.get("n")))
             return value(*args, **kwargs)
 
         return guarded

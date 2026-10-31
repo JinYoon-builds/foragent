@@ -79,6 +79,12 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
     if not why:
         raise OrchError(text("orch_stop_why_required", language))
     with _tick_lock(ctx, n):
+        from foragent import orch_scope
+
+        # The owner may have changed while this waited for the tick lock (#1004): refuse
+        # before any signal, worktree change or label, as the verb's first check does.
+        if (refusal := orch_scope.current_refusal(ctx, n)) is not None:
+            raise OrchError(refusal)
         run = ctx.store.get_run(n)
         # The same rule as fa orch park (#435); a record without any process is
         # running there too, so the kill path finishes it here.

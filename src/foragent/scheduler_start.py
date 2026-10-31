@@ -268,6 +268,12 @@ def _start_ready(
         try:
             ctx.tracker.remove_labels(number, [scheduler.READY])
             ctx.tracker.add_labels(number, [scheduler.RUNNING])
+            if (refusal := scheduler.orch_scope.current_refusal(ctx, number)) is not None:
+                # Changed hands since the start checks (#1004): the label writes were refused,
+                # so no run record and no launch for another person's issue.
+                ctx.store.clear_run_start(number)
+                report.actions.append(f"#{number} not started: {refusal}")
+                continue
             scheduler.board.sync_status(ctx, number, "Running")
             until = ctx.store.github_wait_until(ctx.now())  # A queued label write may have met the limit.
             detail = f"GitHub rate limit until {until.isoformat()}" if until else ""
