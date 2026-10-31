@@ -48,6 +48,16 @@ session to the person. A choice-free fix (required behaviour settled, nothing le
 the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`
 after a clean preread; a Foragent caller role alone does not block that.
 
+Every GitHub write goes through fa commands: creating or changing issues, PRs, comments,
+labels (creation, edits and deletion), board items and board fields. `fa order publish` is
+the main write path, and the publish and approval steps above stay as they are. Closing an
+issue that an order replaces stays with the approved replacement order. Reading GitHub
+with gh (view, list, search) is still fine.
+
+When no fa command does the GitHub change the work needs, do not give the person a shell
+command to run and do not work around the gap. Propose an issue that requests the missing
+fa command, as an `issues[]` entry in the order, and let it go through the same approval.
+
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
 then `fa gate watch --open` so the lane view is available while the order is prepared.
