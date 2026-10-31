@@ -1,6 +1,5 @@
 """`fa order`: deterministic tools for fa-order."""
 
-from foragent import order_batch_cli
 from foragent.commands import facade, repo_store
 
 ORDER = 80
@@ -222,6 +221,8 @@ def _perspectives(args, root) -> int:
 
 
 def run(args) -> int:
+    from foragent import order_batch_cli
+
     cli = facade()
     root = args.repo_root.resolve()
     if args.action == "progress":

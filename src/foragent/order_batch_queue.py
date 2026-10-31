@@ -60,20 +60,26 @@ def _committed(root: Path, orders: dict[str, list[str]], notes: list[str], heads
 
 
 def _revalidate(root: Path, git) -> None:
-    """A committed checkpoint whose commit left HEAD's history waits again, files and all."""
-    found: dict[tuple, bool] = {}
+    """A committed checkpoint whose commit left HEAD's history is undone, then waits again.
+
+    Its files go back first (worktree and index, from the commit's undo record), so the
+    retry starts from the checkout the batch began with; the record goes last.
+    """
+    rows = [row for kind in ("orders", "notes") for row in _load(root)[kind] if row["status"] == COMMITTED]
+    commits = {row.get("commit") for row in rows}
+    gone = {commit for commit in commits if not journal.landed(git, commit)}  # the recovery predicate
+    directory = _directory(root)
+    for commit in sorted(gone, key=str):
+        if commit is not None:
+            journal.undo_commit(directory, root, git, commit)
 
     def change(current: dict) -> None:
         for row in [*current["orders"], *current["notes"]]:
-            if row["status"] != COMMITTED:
-                continue
-            commit = row.get("commit")
-            if commit not in found:
-                found[commit] = journal.landed(git, commit)  # the same predicate as recovery
-            if not found[commit]:
+            if row["status"] == COMMITTED and row.get("commit") in gone:
                 row["status"] = WAITING
                 for field in ("commit", "blobs"):
                     row.pop(field, None)
 
-    if any(row["status"] == COMMITTED for row in [*_load(root)["orders"], *_load(root)["notes"]]):
+    if gone:
         _update(root, change)
+    journal.forget(directory, {commit for commit in commits - gone if commit is not None})

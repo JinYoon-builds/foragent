@@ -3116,3 +3116,71 @@ def test_deferred_order_that_adds_lanes_publishes_now_and_leaves_the_queue_empty
     with pytest.raises(order.PlanError, match="adds lanes"):
         order_batch.defer(plan, "next-code-merge", root, load_config(root), tracker, repo="owner/repo")
     assert order_batch.pending(root) == {"orders": [], "notes": []}
+
+
+@pytest.mark.parametrize("stop", ["before_clear", "push"])
+def test_batch_commit_removed_by_a_mixed_reset_is_rolled_back_before_its_retry(publishing, plan, monkeypatch, stop):
+    from foragent import order_batch, order_batch_journal
+
+    root, git = _notes_case(publishing, plan)
+    events, base = publishing[4], git.head_sha()
+    spec = f"docs/specs/{plan['id']}.md"
+    if stop == "before_clear":
+        clear = order_batch_journal.clear
+        calls = []
+        monkeypatch.setattr(order_batch_journal, "clear",
+                            lambda directory: calls.append(1) or (_die() if len(calls) == 1 else clear(directory)))
+        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
+    else:
+        monkeypatch.setattr(git, "push_base", _die)
+    with pytest.raises(SystemExit):
+        _flush(publishing)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert (root / "docs/ideas.md").read_text().count("An idea.") == 1
+    # `git reset --mixed`: the commit leaves history, the checkout keeps what the batch wrote.
+    git.reset_to(base)
+    order_batch.recover(root, git)
+    for name in ("docs/ideas.md", "docs/decisions.md", "docs/rules.md"):
+        assert (root / name).read_text() == git.saved[name], f"{name} goes back before the retry"
+    assert not (root / spec).exists() and git.index == {}
+    _flush(publishing)
+    assert (root / "docs/ideas.md").read_text().count("An idea.") == 1
+    assert (root / "docs/decisions.md").read_text().count("D9. A decision.") == 1
+    assert (root / "docs/rules.md").read_text() == "# Rules\n- C. (D3)\n- Extra. (D4)\n"
+    assert git.saved["docs/ideas.md"].count("An idea.") == 1 and spec in git.saved
+    assert [event[0] for event in events].count("commit") == 2
+    state = order_batch.pending(root)
+    assert {row["status"] for row in [*state["orders"], *state["notes"]]} == {"published"}
+    assert not (root / ".foragent/order-batch-commits.json").exists() or \
+        json.loads((root / ".foragent/order-batch-commits.json").read_text()) == {}
+
+
+@pytest.mark.parametrize("reset", ["mixed", "soft"])
+def test_real_git_mixed_reset_after_an_interrupted_push_never_duplicates_a_note(offline_publication, plan,
+                                                                               monkeypatch, reset):
+    from foragent import order_batch
+
+    root, config, tracker, git, _calls, _origin = offline_publication
+    order_batch.note(root, "idea", "An idea.", "next-code-merge", "en")
+    order_batch.defer(plan, "next-code-merge", root, config, tracker, repo="owner/repo")
+    base = git_command(root, "rev-parse", "HEAD")
+    push = git.push_base
+    monkeypatch.setattr(git, "push_base", lambda branch: (_ for _ in ()).throw(GitError("push interrupted")))
+    with pytest.raises(GitError):
+        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git)
+    monkeypatch.setattr(git, "push_base", push)
+    # `git reset --mixed <base>` moves HEAD and the index back; `--soft` moves HEAD only, so
+    # the batch stays staged. Either way the checkout keeps what the batch wrote.
+    git_command(root, "update-ref", "HEAD", base)
+    if reset == "mixed":
+        git_command(root, "read-tree", base)
+    assert (root / "docs/ideas.md").read_text().count("An idea.") == 1
+    order_batch.recover(root, git)
+    assert git_command(root, "diff", "--cached", "--name-only") == "", "the undone batch is not left staged"
+    assert not (root / "docs/ideas.md").exists()
+    order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git)
+    assert (root / "docs/ideas.md").read_text().count("An idea.") == 1
+    assert git_command(root, "show", "HEAD:docs/ideas.md").count("An idea.") == 1
+    assert git_command(root, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert git_command(root, "diff", "--cached", "--name-only") == ""

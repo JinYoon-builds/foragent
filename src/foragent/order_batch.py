@@ -210,7 +210,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git)
                     # With nothing to commit, HEAD already holds the batch; record it the same way.
                     journal.batch_done(directory, git.head_sha())
                     _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
-                    journal.clear(directory)
+                    journal.retire(directory, git.head_sha())  # undoable until published
 
                 try:
                     for entry, files in prepared:
@@ -238,4 +238,8 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git)
                                    published_blobs=current["blobs"], **_approval(current))
             parents[entry["id"]] = report.parent
             _mark(root, "orders", {entry["revision"]}, status=PUBLISHED, published_at=_now(), parent=report.parent)
+        # Published batches need no undo record any more.
+        state = _load(root)
+        journal.forget(directory, {row.get("commit") for kind in ("orders", "notes") for row in state[kind]
+                                   if row["status"] == COMMITTED})
         return {"boundary": boundary, "orders": list(parents), "notes": sorted(published), "parents": parents}

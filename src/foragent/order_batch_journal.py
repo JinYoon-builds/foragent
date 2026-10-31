@@ -32,6 +32,8 @@ from foragent.paths import repo_path
 from foragent.state_locks import _file_lock
 
 JOURNAL_FILE = "order-batch-journal.json"
+# Each committed, not yet published batch keeps what undoing it needs, by its commit sha.
+COMMITS_FILE = "order-batch-commits.json"
 VERSION = 7
 
 
@@ -68,13 +70,51 @@ def _decoded(value: str | None) -> bytes | None:
     return None if value is None else base64.b64decode(value)
 
 
-def _save(directory: Path, value: dict) -> None:
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=".order-batch-journal.",
+def _save(directory: Path, value: dict, name: str = JOURNAL_FILE) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, prefix=f".{name}.",
                                      suffix=".tmp", delete=False) as stream:
         stream.write(json.dumps(value, ensure_ascii=False) + "\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(stream.name, directory / JOURNAL_FILE)
+    os.replace(stream.name, directory / name)
+
+
+def _commits(directory: Path) -> dict:
+    path = directory / COMMITS_FILE
+    if path.is_symlink():
+        raise order.PlanError(f"{path} must be a regular file, not a symlink")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def retire(directory: Path, sha: str) -> None:
+    """The batch commit ``sha`` holds the journal's paths: keep how to undo it, drop the journal.
+
+    A committed batch is only final once pushed; until then a reset can take the commit
+    away while the checkout still holds what it wrote, and ``undo_commit`` must undo that.
+    """
+    value = _load(directory)
+    records = _commits(directory)
+    records[sha] = {"base": value["base"], "files": value["files"]}
+    _save(directory, records, COMMITS_FILE)
+    clear(directory)
+
+
+def undo_commit(directory: Path, root: Path, git, sha: str) -> None:
+    """Put back the listed paths of a recorded batch commit that left HEAD's history."""
+    record = _commits(directory).get(sha)
+    if record is not None:
+        _put_back(root, git, record["base"], record["files"])
+
+
+def forget(directory: Path, keep: set[str]) -> None:
+    """Drop undo records of commits no committed row still names (published or undone)."""
+    records = _commits(directory)
+    if set(records) - keep:
+        _save(directory, {sha: record for sha, record in records.items() if sha in keep}, COMMITS_FILE)
 
 
 def _load(directory: Path) -> dict:
@@ -174,7 +214,7 @@ def recover(directory: Path, root: Path, git, mark_committed, language: str) -> 
         _finish(root, git, files)
         # Committed blobs come from that commit, so later commits cannot change them.
         mark_committed(value["orders"], value["notes"], git.blob_shas(commit, list(files)), commit)
-        clear(directory)
+        retire(directory, commit)
         return
     _put_back(root, git, value["base"], files)
     clear(directory)
