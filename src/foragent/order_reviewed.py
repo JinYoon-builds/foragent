@@ -12,6 +12,7 @@ the published bytes; this is only the approval lock's input check.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
@@ -28,25 +29,70 @@ def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
     return items
 
 
+_BEHAVIOUR = re.compile(r"^## Behaviour$", re.MULTILINE)
+
+
+def _record(plan: dict, repo: str | None) -> dict:
+    """This order's preparation record (issue key -> entry), read only; empty when none exists."""
+    from foragent.order_prepare import _read, _record_path
+    from foragent.state import StateStore
+
+    if not repo:
+        return {}
+    return _read(_record_path(StateStore.for_repo(repo), plan), plan)["issues"]
+
+
+def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dict[str, str],
+                       action: str) -> None:
+    """Refuse an issue or edit that left the statement route after taking it.
+
+    The ``statements`` field selects the route and the route is kept once taken: an issue this order
+    prepared (any outcome, a question too) or an existing issue published with a Behaviour section
+    cannot drop its statements to fall back to a clean legacy preread. ``bodies`` maps issue keys
+    (``#N`` for edits) to the current body of the issue they publish onto.
+    """
+    from foragent.order import PlanError
+
+    record = _record(plan, repo)
+    keys = [item["key"] for item in plan["issues"] if "statements" not in item]
+    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" not in item]
+    kept = [key for key in keys if key in record or _BEHAVIOUR.search(bodies.get(key) or "")]
+    if kept:
+        raise PlanError(text("reviewed_route_kept", _language(config), action=action, keys=", ".join(kept)))
+
+
+def landing(git: GitRepo, branch: str, *, refreshed: bool) -> str:
+    """The commit publication writes onto, which the reviewed evidence must have been made on.
+
+    After the lock's ``update_base`` that is HEAD itself. Before it the remote is fetched here: HEAD
+    fast-forwards to the remote branch unless it holds commits the remote lacks, which
+    ``update_base`` keeps and publication would commit on.
+    """
+    from foragent.order_scratch import base_revision
+
+    if refreshed:
+        return git.head_sha()
+    remote = base_revision(git, branch)
+    return remote if git.is_ancestor("HEAD", remote) else git.head_sha()
+
+
 def _language(config: Config) -> str:
     return (getattr(config, "language", None) or "en").lower().split("-")[0]
 
 
 def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
-                           items: list[dict]) -> dict[str, str]:
-    """The tested base revision of each statement issue; refuses unless every one has current evidence.
+                           items: list[dict]) -> dict[str, dict]:
+    """The reviewed record entry of each statement issue; refuses unless every one has current evidence.
 
     The base itself is checked by ``require_tested_base`` against the base actually published onto.
     """
     from foragent.order import PlanError
-    from foragent.order_prepare import _read, _record_path
     from foragent.order_prepare_cycle import identity
-    from foragent.state import StateStore
 
     if not items:
         return {}
     language = _language(config)
-    record = _read(_record_path(StateStore.for_repo(repo), plan), plan)["issues"]
+    record = _record(plan, repo)
     missing, stale, differ, bases = [], [], [], {}
     for item in items:
         key, entry = item["key"], record.get(item["key"])
@@ -59,7 +105,7 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
               or entry.get("done_when") != item.get("done_when")):
             differ.append(key)
         else:
-            bases[key] = entry.get("base_revision")
+            bases[key] = entry
     problems = []
     if missing:
         problems.append(text("reviewed_missing", language, keys=", ".join(missing)))
@@ -72,12 +118,49 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
     return bases
 
 
-def require_tested_base(git: GitRepo, config: Config, bases: dict[str, str], current: str) -> None:
-    """Refuse when the base moved since review; a base with the very same content keeps its evidence."""
+def require_reviewed_bytes(git: GitRepo, config: Config, items: list[dict], entries: dict[str, dict],
+                           files: dict[str, str | bytes]) -> None:
+    """Every file publication writes for a statement issue holds the bytes its reviewer checked.
+
+    The manifest is what ``validate_plan`` collected: the plan's acceptance files and the tests its
+    Done when commands name, the latter read from the checkout. A written test must equal the
+    reviewed candidate; any other named file must equal its copy on the reviewed base, which is the
+    tree the reviewer's scratch copy held. Files publication does not write land as they are on the
+    landing commit, which ``require_tested_base`` binds.
+    """
+    from foragent.issue import acceptance_paths
+    from foragent.order import PlanError
+
+    changed, keys = [], []
+    for item in items:
+        entry = entries.get(item["key"])
+        if entry is None:
+            continue
+        written = entry.get("written") or {}
+        names = set(item.get("acceptance_files") or {}) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
+        for name in sorted(names):
+            if name not in files:
+                continue
+            published = files[name]
+            published = published.decode("utf-8", "surrogateescape") if isinstance(published, bytes) else published
+            reviewed = written[name] if name in written else git.file_at(entry.get("base_revision") or "", name)
+            if published != reviewed:
+                changed.append(name)
+                keys.append(item["key"])
+    if changed:
+        raise PlanError(text("reviewed_bytes_changed", _language(config), paths=", ".join(dict.fromkeys(changed)),
+                             keys=", ".join(dict.fromkeys(keys))))
+
+
+def require_tested_base(git: GitRepo, config: Config, entries: dict[str, dict], current: str) -> None:
+    """Refuse unless the tests were reviewed on ``current``, the commit publication lands on (``landing``).
+
+    Another commit with the very same content keeps the evidence."""
     from foragent.order import PlanError
 
     moved = []
-    for key, base in bases.items():
+    for key, entry in entries.items():
+        base = entry.get("base_revision")
         if base == current:
             continue
         try:
@@ -88,4 +171,4 @@ def require_tested_base(git: GitRepo, config: Config, bases: dict[str, str], cur
             moved.append(key)
     if moved:
         raise PlanError(text("reviewed_base_moved", _language(config), keys=", ".join(moved),
-                             base=current[:12]))
+                             base=current[:12], branch=config.base_branch))

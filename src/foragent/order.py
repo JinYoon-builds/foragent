@@ -12,7 +12,7 @@ import re
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, order_reviewed, order_scratch, ownership
+from foragent import board, capacity, design, order_references, order_reviewed, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -665,6 +665,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
+    order_reviewed.require_route_kept(plan, config, repo, {
+        **{key: by_number[number].body for key, number in mapping.items() if number in by_number},
+        **{f"#{item['number']}": by_number[item["number"]].body for item in plan.get("edits", [])},
+    }, "publish")
     reviewed_bases = require_reviewed_tests(
         plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config)) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
@@ -685,16 +689,19 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     if reviewed_bases:
+        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config),
+                                              reviewed_bases, files)
         order_reviewed.require_tested_base(git, config, reviewed_bases,
-                                           order_scratch.base_revision(git, config.base_branch))
+                                           order_reviewed.landing(git, config.base_branch, refreshed=False))
     # The owner label exists before any file or issue does: without it, nothing is published.
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
         if reviewed_bases:
-            # The refreshed base is what the files land on: evidence for another base writes nothing.
+            # HEAD after the refresh is what the files land on, local commits included:
+            # evidence for another base writes nothing.
             order_reviewed.require_tested_base(git, config, reviewed_bases,
-                                               git.ref_sha(f"refs/remotes/origin/{config.base_branch}"))
+                                               order_reviewed.landing(git, config.base_branch, refreshed=True))
         published_blobs = _publish_files(plan, root, config, git, files, manager)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
@@ -1024,11 +1031,16 @@ def preread(plan: dict, root: Path, config: Config,
     # Statement issues are prepared and reviewed instead; preread reads only the legacy issues.
     items = [item for item in plan["issues"] if "statements" not in item]
     edits = [item for item in plan.get("edits", []) if "statements" not in item]
+    existing = {}
     if edits:
         if tracker is None:
             raise PlanError("prereading edits needs the tracker for the existing issues")
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in edits]
+        existing = {item["number"]: source.get_issue(item["number"]) for item in edits}
+        items += [edit_view(item, existing[item["number"]], config) for item in edits]
+    # An issue that took the statement route keeps it: no legacy evidence is made for it.
+    order_reviewed.require_route_kept(plan, config, repo or config.repo,
+                                      {f"#{n}": issue.body for n, issue in existing.items()}, "preread")
     waiting, lanes = _uncreated_lanes(plan, config, items)
     if waiting:
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.

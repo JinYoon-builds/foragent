@@ -337,7 +337,8 @@ commands enter the plan. Preread reads only the other issues. Publishing, with o
 `--approve`, uses that review without starting another model; a change to the issue, the
 other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
 needs `fa order prepare` again. A reviewer question goes back to planning: answer it in the
-statements, then prepare again.
+statements, then prepare again. Dropping the statements never returns a prepared or published
+issue to preread. Local commits on main that are not on origin must be pushed before publishing.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
 so preread refuses them: after the person's first-hand approval here, publish once without
 `--approve` to create the lanes, run preread, then publish again with `--approve`. Reuse that

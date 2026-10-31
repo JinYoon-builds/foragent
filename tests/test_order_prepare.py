@@ -4,7 +4,10 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 from conftest import git_command
 from foragent import order_prepare, order_prepare_setup, order_scratch, order_scratch_context
@@ -947,7 +950,7 @@ def test_base_moving_under_the_publication_lock_writes_nothing(request, git_hist
     case.git.update_base = moved_meanwhile
     code, out, err = cases.publish(case, capsys, "--approve")
     assert code != 0 and "prepare" in (out + err).lower(), out + err
-    assert "base branch moved" in out + err
+    assert "publication would land on" in out + err
     cases.assert_no_publication(case)
     assert not (case.root / cases.TEST_PATH).exists()
 
@@ -973,3 +976,146 @@ def test_a_review_still_waiting_or_questioned_is_named_with_its_status(request, 
     code, out, err = cases.publish(case, capsys)
     assert code != 0 and "notice (question)" in out + err and "no reviewed tests" in out + err
     cases.assert_no_publication(case)
+
+
+def _local_commit(root, name="local.txt", content="Not on origin, never reviewed.\n"):
+    """A commit on local main only, made with fast-import (the harness forbids `git commit`)."""
+    parent = git_command(root, "rev-parse", "HEAD")
+    data = content.encode("utf-8")
+    stream = ("commit refs/heads/main\ncommitter Local <local@example.com> 1792483200 +0000\n"
+              f"data 10\nLocal only\nfrom {parent}\nM 100644 inline {name}\ndata {len(data)}\n{content}\ndone\n")
+    git_command(root, "fast-import", "--quiet", input=stream)
+    git_command(root, "read-tree", "-m", "-u", parent, "HEAD")
+
+
+@pytest.mark.parametrize("options", [["--approve"], ["--approve-keys", "notice"], []],
+                         ids=["approve", "approve-keys", "no-approval"])
+def test_a_local_main_ahead_of_origin_is_not_the_reviewed_base(request, capsys, options):
+    """update_base keeps local commits, so publication would commit onto them: refused before writes."""
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    _local_commit(case.root)
+    refreshed = []
+    case.git.update_base = lambda branch: refreshed.append(branch)
+    code, out, err = cases.publish(case, capsys, *options)
+    assert code != 0 and "prepare" in (out + err).lower() and "not on origin" in out + err, out + err
+    assert refreshed == [], "The check before the lock already refuses; nothing is published or labelled"
+    cases.assert_no_publication(case)
+
+
+def test_a_local_commit_made_while_waiting_for_the_lock_is_caught_under_it(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    refresh = case.git.update_base
+
+    def committed_meanwhile(branch):
+        _local_commit(case.root)
+        refresh(branch)
+
+    case.git.update_base = committed_meanwhile
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and "not on origin" in out + err, out + err
+    cases.assert_no_publication(case)
+    assert not (case.root / cases.TEST_PATH).exists()
+
+
+@pytest.mark.parametrize("verdict", ["pass", "question"])
+def test_dropping_statements_after_preparation_cannot_fall_back_to_legacy_preread(request, capsys, verdict):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = [verdict]
+    cases.prepare(case, capsys)
+    case.plan = cases.disk_plan(case)
+    item = case.plan["issues"][0]
+    del item["statements"]
+    item["acceptance_files"], item["done_when"] = {}, ["true"]
+    case.save()
+    before = len(case.calls)
+    code, out, err = cases.invoke(case, capsys, "preread", str(case.path), "--json")
+    assert code != 0 and "notice" in out + err and "statements" in out + err, out + err
+    assert len(case.calls) == before, "No legacy evidence is made for a statement issue"
+    for options in (["--approve"], []):
+        code, out, err = cases.publish(case, capsys, *options)
+        assert code != 0 and "reviewed-tests route" in out + err, out + err
+        cases.assert_no_publication(case)
+    assert len(case.calls) == before
+
+
+def test_an_existing_issue_published_with_behaviour_keeps_its_route():
+    from foragent import order, order_reviewed
+
+    plan = {"id": "p", "issues": [{"key": "a"}], "edits": [{"number": 9}, {"number": 10}]}
+    config = Config(language="en")
+    published = "Goal\n\n## Behaviour\n- Sending reports one delivery.\n"
+    with pytest.raises(order.PlanError, match=r"issue\(s\) a, #9 were prepared or published"):
+        order_reviewed.require_route_kept(plan, config, None, {"a": published, "#9": published,
+                                                               "#10": "Goal only.\n"}, "publish")
+    # Legacy issues never on the route keep today's path.
+    order_reviewed.require_route_kept(plan, config, None, {"#10": "Goal only.\n"}, "publish")
+
+
+EXISTING = "tests/acceptance/test_existing_receipt.py"
+
+
+def test_a_named_test_weakened_in_the_checkout_after_review_is_not_published(request, git_history, capsys,
+                                                                             monkeypatch):
+    """Publication also writes tests its Done when names from the checkout: they must be the reviewed bytes."""
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    strong = "import sys\nsys.exit(1)\n"
+    git_history.update({EXISTING: strong})
+    git_command(case.root, "fetch", "origin", "main")
+    git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
+    git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
+    monkeypatch.setattr(cases, "CHECK", f"{cases.CHECK} && {sys.executable} {EXISTING}")
+    cases.prepare(case, capsys)
+    assert EXISTING in " ".join(cases.disk_plan(case)["issues"][0]["done_when"])
+    (case.root / EXISTING).write_text("pass\n")  # weakened after review, never reviewed
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and EXISTING in out + err and "prepare" in (out + err).lower(), out + err
+    cases.assert_no_publication(case)
+    (case.root / EXISTING).write_text(strong)
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code == 0, out + err
+    assert (case.root / EXISTING).read_text() == strong
+
+
+@pytest.mark.parametrize("changed", ["agent", "skills", "agent_text", "executor_list"])
+def test_a_changed_writer_setup_needs_a_new_review(request, capsys, monkeypatch, changed):
+    from dataclasses import replace as replaced
+
+    from foragent import cli
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    lane = dict(case.config.lanes["api"])
+    if changed == "agent":
+        lane["agent"] = "fa-receipts"
+    elif changed == "skills":
+        lane["skills"] = ["receipt-format"]
+    if changed == "agent_text":
+        (case.root / ".claude/agents/fa-api.md").write_text("---\nname: fa-api\n---\nLANE CONTEXT: anything goes\n")
+    else:
+        config = replaced(case.config, lanes={**case.config.lanes, "api": lane})
+        if changed == "executor_list":
+            config = replaced(config, executor_list=[{"name": "codex", "binary": "codex-other"}])
+        monkeypatch.setattr(cli, "load_config", lambda root: config)
+    before = len(case.calls)
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and "review" in (out + err).lower(), out + err
+    assert len(case.calls) == before
+    cases.assert_no_publication(case)
+
+
+def test_lane_memory_notes_written_after_review_keep_the_review(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    memory = case.root / ".claude/agent-memory/fa-api"
+    memory.mkdir(parents=True, exist_ok=True)
+    (memory / "MEMORY.new.md").write_text("- [id:x] a lane run learned something\n")
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code == 0, out + err

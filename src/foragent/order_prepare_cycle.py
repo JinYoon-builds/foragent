@@ -32,7 +32,13 @@ def _setup(config: Config, lane: str) -> dict:
     resolved = lane_config(config, lane)
     return {"executor": resolved.executor, "model": resolved.executor_model, "tiers": resolved.tiers,
             "reviewer": resolved_reviewer(resolved), "reviewer_model": resolved.reviewer_model,
-            "acceptance_dir": resolved.acceptance_dir, "base_branch": resolved.base_branch}
+            "acceptance_dir": resolved.acceptance_dir, "base_branch": resolved.base_branch,
+            # Every lane setting the writer's resolution reads (agent, skills, paths, model, effort...),
+            # whole rather than picked, and the global settings that resolve executors and skills.
+            "lane": config.lanes.get(lane) if lane != "main" else None,
+            "executor_list": resolved.executor_list, "fallback_model": resolved.executor_fallback_model,
+            "skill_libraries": resolved.skill_libraries, "skill_roles": resolved.skill_roles,
+            "language": resolved.language}
 
 
 def contracts(plan: dict, item: dict) -> dict:
@@ -78,10 +84,11 @@ def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
     requirements and legacy contracts, the shared spec and references, the risk guidance both agents
     read, and the executor setup. A change starts a new cycle with the history retained."""
     from foragent.order_prepare_prompt import _risk_notes
+    from foragent.order_prepare_setup import context_digest
 
     shared = {"item": {name: item.get(name) for name in _CYCLE_FIELDS}, "title": plan.get("title"),
               "risks": _risk_notes(root, config, item),
-              "setup": _setup(config, item["lane"]),
+              "setup": _setup(config, item["lane"]), "context": context_digest(plan, item, config, root),
               "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
               "new_lanes": plan.get("new_lanes"),
               "references": {name: hashlib.sha256(data).hexdigest()
