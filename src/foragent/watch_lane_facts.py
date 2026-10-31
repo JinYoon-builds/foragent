@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from foragent import issue
 from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN, RUNNING, WAITING_PERSON, issue_lane
 from foragent.state import StateStore
@@ -285,7 +286,8 @@ def waiting_facts(
 
     Open dependencies come first, then the recorded wait phase, then concrete overlap with
     active recorded claims (only under a known checkout root), then the meter's full slots
-    for queued work. Held people and blocked issues are left out.
+    for queued work. Authored waits also include unapproved and held issues, alongside
+    (rather than in place of) the existing recorded evidence.
     """
     states = {number: row["state"] for number, row in rows.items()}
     runs = {run["number"]: run for run in status.get("active_runs", [])}
@@ -306,6 +308,10 @@ def waiting_facts(
     for number, row in sorted(rows.items()):
         if row["state"] != "open":
             continue
+        authored = issue.read_waiting(row.get("body") or "")
+        if authored is not None:
+            found[number] = {"authored": authored, "lane": issue_lane(row.get("labels") or (), config.lanes),
+                             "title": row.get("title") or ""}
         run = runs.get(number)
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
@@ -351,7 +357,8 @@ def waiting_facts(
             if machine is None:
                 machine = [_held_by_machine(store, config, meter, starts)]
             kind = machine[0]
-        found[number] = {"kind": kind, "blocking_issues": sorted(blocking), "overlapping_files": sorted(paths)}
+        found.setdefault(number, {}).update(
+            kind=kind, blocking_issues=sorted(blocking), overlapping_files=sorted(paths))
     return found
 
 
