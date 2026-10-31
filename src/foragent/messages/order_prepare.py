@@ -27,6 +27,21 @@ MESSAGES = {
         "prepare_row_question": "  ? {text}",
         "prepare_help": "Let each statement issue's lane write its tests in a scratch copy of main",
         "prepare_help_status": "Only show the recorded preparation facts; start no agent",
+        "prepare_plan_changed": "The plan changed while its tests were prepared; run fa order prepare again for the new requirements.",
+        "prepare_review_question": "The reviewer needs planning to clarify a statement before the tests can be locked.",
+        "prepare_review_held": "The reviewer held this issue's tests twice; planning must answer before another attempt.",
+        "prepare_review_hold_question": ("An independent reviewer held the written tests {count} times: {reasons}. "
+                                         "What should the statements say so the lane can write passing tests?"),
+        "prepare_review_limit": "The reviewer's executor hit its usage limit; the review stays pending. Run fa order prepare again later.",
+        "prepare_review_failed": "The reviewer stopped (exit {code}{timeout}); the review stays pending, see {log}.",
+        "prepare_review_error": "The reviewer could not start, so the review stays pending: {error}",
+        "prepare_review_stopped": "Preparation stopped while the reviewer was running.",
+        "prepare_review_same_session": "The review ran in the writer's session; an independent session must review again.",
+        "prepare_review_changed": "The written tests changed after writing ({paths}); they cannot be reviewed as written.",
+        "prepare_review_bad_reply": "The reviewer's reply was not the expected JSON object; nothing was approved.",
+        "prepare_review_incomplete": "The reviewer's reply lacks agreed evidence ({missing}); nothing was approved and no hold was counted.",
+        "prepare_review_not_red": ("The written commands did not fail on current main ({commands}); a pass needs "
+                                   "tests that fail by assertion now."),
     },
     "ko": {
         "prepare_legacy": "동작 문장이 없어요. 이 이슈는 계획의 시험과 fa order preread 경로를 그대로 써요.",
@@ -52,5 +67,20 @@ MESSAGES = {
         "prepare_row_question": "  ? {text}",
         "prepare_help": "동작 문장 이슈마다 레인이 main 작업 사본에서 시험을 쓰게 해요",
         "prepare_help_status": "기록된 준비 사실만 보여 줘요. 에이전트는 시작하지 않아요",
+        "prepare_plan_changed": "시험을 준비하는 동안 계획이 바뀌었어요. 새 요구에 맞게 fa order prepare를 다시 실행하세요.",
+        "prepare_review_question": "검토자가 시험을 잠그기 전에 계획에서 문장을 분명히 해 달라고 해요.",
+        "prepare_review_held": "검토자가 이 이슈의 시험을 두 번 보류했어요. 다시 시도하기 전에 계획이 답해야 해요.",
+        "prepare_review_hold_question": ("독립 검토자가 쓴 시험을 {count}번 보류했어요: {reasons}. "
+                                         "레인이 통과할 시험을 쓰려면 문장을 어떻게 고쳐야 할까요?"),
+        "prepare_review_limit": "검토자 실행기가 사용 한도에 걸려 검토가 대기 중이에요. 나중에 fa order prepare를 다시 실행하세요.",
+        "prepare_review_failed": "검토자가 멈췄어요(종료 {code}{timeout}). 검토는 대기 중이에요. {log}를 보세요.",
+        "prepare_review_error": "검토자를 시작하지 못해 검토가 대기 중이에요: {error}",
+        "prepare_review_stopped": "검토자가 일하는 중에 준비가 멈췄어요.",
+        "prepare_review_same_session": "검토가 작성자 세션에서 돌았어요. 독립된 세션이 다시 검토해야 해요.",
+        "prepare_review_changed": "쓴 시험이 작성 뒤에 바뀌었어요({paths}). 쓴 그대로 검토할 수 없어요.",
+        "prepare_review_bad_reply": "검토자의 답이 약속한 JSON 객체가 아니에요. 아무것도 승인하지 않았어요.",
+        "prepare_review_incomplete": "검토자의 답에 약속한 증거가 없어요({missing}). 아무것도 승인하지 않았고 보류로 세지도 않았어요.",
+        "prepare_review_not_red": ("쓴 명령이 현재 main에서 실패하지 않았어요({commands}). 통과하려면 지금 단언으로 "
+                                   "실패하는 시험이 있어야 해요."),
     },
 }
