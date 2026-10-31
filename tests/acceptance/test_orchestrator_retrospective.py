@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from foragent import orch_events, orch_inbox, scheduler
-from test_architect_project_schedule import review_case  # noqa: F401
+from test_architect_project_schedule import add_record, order_children, review_case  # noqa: F401
 from test_order_machine_budget import fake_workloads  # noqa: F401
 from test_order_progress import offline_local_cli
 from test_orch_review_handoff import tick_context
@@ -50,19 +50,39 @@ def test_daily_retrospective_wake_is_derived_from_record_and_not_status_note(rev
         "memory": ".claude/agent-memory/fa-orchestrator/", "signals": []}})
     at = case.clock[0]
     orch_events.append_event(case.store, at, None, "note", "first review", now="first review", retrospective=True)
-    case.clock[0] += timedelta(hours=23, minutes=59)
+    case.tracker.add_issue(7, "Unfinished order child", case.tracker.get_issue(1).body)
+    order_children(case, 901, [7])
+    case.clock[0] += timedelta(minutes=1)
     scheduler.tick(tick_context(case))
     assert not [r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"]
     orch_inbox.write_note(case.store, "Watching the lanes", None, None, {"kind": "terminal"})
     case.clock[0] += timedelta(minutes=1)
     scheduler.tick(tick_context(case))
+    assert not [r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"], (
+        "Elapsed time since the last marked note cannot finish an order")
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.close_issue(7)
+    case.clock[0] += timedelta(seconds=1)
+    orch_inbox.write_note(case.store, "Order finished; watching the next one", None, None, {"kind": "terminal"})
+    scheduler.tick(tick_context(case))
     due = [r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"]
-    assert len(due) == 1, "Daily wake uses marked journal note, not latest status note"
+    assert len(due) == 1, "A finished order wakes retrospective within 24 hours using the marked record, not status notes"
     scheduler.tick(tick_context(case))
     assert [r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"] == due
     orch_events.append_event(case.store, case.clock[0], None, "note", "second review", now="second review", retrospective=True)
     orch_inbox.set_request_status(case.store, due[0]["id"], "done", "Recorded lessons")
     case.clock[0] += timedelta(hours=24)
+    scheduler.tick(tick_context(case))
+    assert len([r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"]) == 1, (
+        "Elapsed time without another finished order must not post another retrospective")
+    case.clock[0] += timedelta(seconds=1)
+    add_record(case, 8)
+    case.tracker.add_issue(8, "Next order child", case.tracker.get_issue(1).body, state="closed")
+    order_children(case, 902, [8])
+    case.clock[0] += timedelta(seconds=1)
+    orch_inbox.write_note(case.store, "Still watching", None, None, {"kind": "terminal"})
+    from foragent.state import StateStore
+    case.store = StateStore(case.store.root, now=lambda: case.clock[0])
     scheduler.tick(tick_context(case))
     assert len([r for r in orch_inbox.requests(case.store) if r.get("kind") == "retrospective"]) == 2
     # Retention must retain the latest completion as the source of last-retro.
@@ -79,5 +99,5 @@ def test_retrospective_skill_uses_record_and_orchestrator_memory_within_line_cap
     assert len(skill.splitlines()) <= 150
     assert "fa orch note" in skill + detail and "--retrospective" in skill + detail
     assert "MEMORY.md" in detail and "append" in detail.lower()
-    assert "retrospective" in detail.lower() and "24" in detail
+    assert "retrospective" in detail.lower() and "order" in detail.lower() and "finish" in detail.lower()
     assert "references/retrospective.md" in skill

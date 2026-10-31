@@ -20,12 +20,29 @@ from test_skills_autosync import isolated_home  # noqa: F401
 from test_order_machine_budget import fake_workloads  # noqa: F401
 
 
+def order_children(case, number, children):
+    """Published order facts: the existing plan marker and native child links."""
+    order_id = f"d99-order-{number}"
+    mapping = {f"child-{child}": child for child in children}
+    marker = (f"<!-- foragent:plan id={order_id} map={json.dumps(mapping)} "
+              "acceptance={} -->")
+    case.tracker.add_issue(number, f"Order {number}", f"Finish this order.\n\n{marker}")
+    for child in children:
+        issue = case.tracker.get_issue(child)
+        body = "\n".join(line for line in issue.body.splitlines()
+                         if not line.startswith("<!-- foragent:plan-child "))
+        case.tracker.edit_body(child, body + (
+            f"\n<!-- foragent:plan-child id={order_id} key=child-{child} -->\n"))
+        case.tracker.add_sub_issue(number, child)
+
+
 @pytest.fixture
 def review_case(git_history, tmp_path, monkeypatch, fake_workloads):
     case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true", language="en")
     case.store.finish_run(1, "merged")
     case.tracker.close_issue(1)
     case.tracker.remove_labels(1, ["running", "approved"])
+    order_children(case, 900, [1])
     case.ctx.config = replace(case.config, roles={"architect": {
         "agent": "fa-architect", "skills": ["fa-architect"],
         "memory": ".claude/agent-memory/fa-architect/", "signals": []}})
@@ -72,25 +89,39 @@ def add_record(case, number):
 
 def test_idle_tick_starts_one_project_review_without_role_signals_and_no_new_work_does_not_repeat(review_case):
     case = review_case
+    case.tracker.add_issue(2, "Unfinished sibling", case.tracker.get_issue(1).body)
+    order_children(case, 900, [1, 2])
     assert scheduler.tick(tick_context(case)).skipped is None
-    assert len(case.launches) == 1, "Idle project review must not depend on orchestrator judgment or signals"
+    assert case.launches == [], "Idle lanes with an unfinished order must not wake a review"
+    case.clock[0] += timedelta(minutes=1)
+    case.tracker.close_issue(2)
+    assert scheduler.tick(tick_context(case)).skipped is None
+    assert len(case.launches) == 1, "Finishing an order must wake a review without role signals"
     assert "run-architect" in case.launches[0].argv
     assert scheduler.tick(tick_context(case)).skipped is None
     assert len(case.launches) == 1, "A live role session must not be duplicated"
     complete(case)
+    case.clock[0] += timedelta(minutes=1)
+    case.tracker.add_issue(3, "Closed without new run input", state="closed")
+    order_children(case, 901, [3])
+    assert scheduler.tick(tick_context(case)).skipped is None
+    assert len(case.launches) == 1, "A finished order with no new merges or run records skips review"
     case.clock[0] += timedelta(days=2)
     assert scheduler.tick(tick_context(case)).skipped is None
-    assert len(case.launches) == 1, "A daily timer without new merges or run records must do no work"
+    assert len(case.launches) == 1, "Without a new finished order or new merge/run input there is no review"
 
 
 def test_busy_project_reviews_new_records_at_daily_boundary_without_signals(review_case):
     case = review_case
-    # The prior successful review is older than the new evidence; all lanes stay busy.
+    # New evidence alone is not a finished order; another lane stays busy throughout.
     at = case.clock[0]
     orch_events.append_event(case.store, at, None, "architect-done", "Nothing to change.",
                              started_at=at.isoformat(), covered_until=at.isoformat(), exit_code=0)
     case.clock[0] += timedelta(hours=1)
     add_record(case, 7)
+    case.tracker.add_issue(7, "Failed work closed", case.tracker.get_issue(1).body, state="closed")
+    case.tracker.add_issue(9, "Unfinished sibling", case.tracker.get_issue(1).body)
+    order_children(case, 901, [7, 9])
     case.tracker.add_issue(8, "Busy lane", case.tracker.get_issue(1).body, labels=["approved", "running"])
     case.store.start_run(8, branch="busy", worktree=case.store.worktree_path(8), pid=980099)
     case.alive.add(980099)
@@ -102,7 +133,11 @@ def test_busy_project_reviews_new_records_at_daily_boundary_without_signals(revi
     assert case.launches == []
     case.clock[0] += timedelta(minutes=1)
     assert scheduler.tick(tick_context(case)).skipped is None
-    assert len(case.launches) == 1, "Busy lanes must not postpone a project review indefinitely"
+    assert case.launches == [], "24 hours and new run records cannot finish an order"
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.close_issue(9)
+    assert scheduler.tick(tick_context(case)).skipped is None
+    assert len(case.launches) == 1, "A finished order must wake its review while unrelated work is busy"
 
 
 def test_success_watermark_covers_session_start_so_records_arriving_during_review_remain_due(review_case):
@@ -112,13 +147,20 @@ def test_success_watermark_covers_session_start_so_records_arriving_during_revie
     started = case.clock[0]
     case.clock[0] += timedelta(minutes=1)
     add_record(case, 7)
+    case.tracker.add_issue(7, "New run closed", case.tracker.get_issue(1).body, state="closed")
+    case.tracker.add_issue(9, "Unfinished sibling", case.tracker.get_issue(1).body)
+    order_children(case, 901, [7, 9])
     case.clock[0] += timedelta(minutes=1)
     covered = complete(case)
     events = [json.loads(line) for line in (case.store.root / "orch-events.jsonl").read_text().splitlines()]
     done = [event for event in events if event["kind"] == "architect-done"]
     assert len(done) == 1 and done[0]["covered_until"] == started.isoformat() == covered
     assert scheduler.tick(tick_context(case)).skipped is None
-    assert len(case.launches) == 2, "Finishing a review must not swallow evidence written after its input cutoff"
+    assert len(case.launches) == 1, "New evidence during review waits for its order to finish"
+    case.clock[0] += timedelta(seconds=1)
+    case.tracker.close_issue(9)
+    assert scheduler.tick(tick_context(case)).skipped is None
+    assert len(case.launches) == 2, "A new finished order retains evidence after the prior input cutoff"
 
 
 
