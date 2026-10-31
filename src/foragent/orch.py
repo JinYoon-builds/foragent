@@ -1,14 +1,14 @@
 """Orchestrator actions, with GitHub evidence and a local event journal."""
 
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shlex
 from tempfile import TemporaryDirectory
@@ -22,9 +22,6 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
-from foragent.orch_premerge_scope import (
-    base_ids, full_selection, prepare_base_checkout, selected_on_base, stepwise_options,
-)
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
@@ -310,16 +307,6 @@ class _Premerge:
 class _SuiteRun:
     passed: bool
     failing: frozenset[str] | None  # None: no per-test result to compare
-    passing: frozenset[str] = frozenset()  # no failure, error or skip; meaningful with `failing`
-    recorded: frozenset[str] = frozenset()  # every id the report names, in any outcome
-
-
-def _protected(ids, acceptance_dir: str, excluded: list[str]) -> frozenset[str]:
-    """Acceptance ids a merge must keep passing; files owned by open issues are not protected."""
-    root, owned = PurePosixPath(acceptance_dir), set(excluded)
-    return frozenset(node for node in ids
-                     if PurePosixPath(file := node.split("::", 1)[0]).is_relative_to(root)
-                     and file not in owned)
 
 
 def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
@@ -341,9 +328,8 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     pytest = _pytest_command(command) is not None
     if pytest:
         junit.unlink(missing_ok=True)
-        # --maxfail=0 last: an early stop (-x, --maxfail, addopts) would leave tests unmeasured.
         command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
-                   f"--junitxml={shlex.quote(str(junit.resolve()))} --maxfail=0")
+                   f"--junitxml={shlex.quote(str(junit.resolve()))}")
     result = _suite_process(ctx, n, command, worktree, log_path, label, slot)
     code, timed_out = result.exit_code, result.timed_out
     passed = code == 0 and not timed_out
@@ -361,8 +347,59 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     # Exit 1 is pytest's "some tests failed"; other codes are session failures.
     if code not in (0, 1) or (code == 1 and not failing):
         return _SuiteRun(False, None)
-    recorded = frozenset(node_id for case in cases if (node_id := junit_node_id(case)) is not None)
-    return _SuiteRun(passed, failing, frozenset(_passing_acceptance_ids(junit)), recorded)
+    return _SuiteRun(passed, failing)
+
+
+def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: bool, directory: Path,
+                      log_path: Path, slot: Callable[[], AbstractContextManager], wait,
+                      baseline=None) -> list[str]:
+    """#1105: the run baseline's passing acceptance tests that do not pass on the merge result.
+
+    The protected set is what implementation runs protect: the base's passing acceptance ids
+    from the shared baseline cache (or one capture), minus the current exclusions. It is
+    re-run with the runs' fixed invocation on a fresh merge result; a protected test that
+    fails, is skipped or is missing there is broken, and an unreadable report breaks them all.
+    The user's own command is never rewritten or replayed on the base.
+    """
+    from foragent.run_implementation import _detect_test_command_at
+
+    if baseline is None:  # The acceptance-only comparison may already hold this base's baseline.
+        test_command = ctx.config.test_command or _detect_test_command_at(ctx.git, base)
+        label = f"protected baseline base={base}"
+        baseline = _capture_baseline(
+            ctx, test_command, base, log=log_path, report=directory / "protected-baseline.xml",
+            check=lambda selection, root: _suite_process(ctx, n, selection, root, log_path, label, slot()),
+            prepare=lambda: None, wait=wait, required_ids=frozenset(),
+        )
+    if baseline is None:
+        return []
+    owned = set(baseline.excluded)  # A shared cache may come from a capture with fewer exclusions.
+    protected = sorted({node for node in baseline.node_ids if node.split("::", 1)[0] not in owned})
+    if not protected:
+        return []
+    worktree, junit = directory / "protected", directory / "protected.xml"
+    ctx.git.add_detached_worktree(worktree, head)
+    try:
+        if merged:
+            ctx.git.at(worktree)._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                        "merge", "--no-commit", "--no-ff", base])
+        # The protected tests' files, not their ids: a removed test id would make pytest reject the
+        # whole selection, so the report would lose every other protected result. A file the merge
+        # result no longer has leaves its ids absent from the report, which breaks them.
+        files = sorted({node.split("::", 1)[0] for node in protected
+                        if (worktree / node.split("::", 1)[0]).is_file()})
+        if files:
+            command = (f"{baseline.command} {shlex.join(files)} -o junit_family=legacy --junit-prefix= "
+                       f"--junitxml={shlex.quote(str(junit.resolve()))}")
+            _suite_process(ctx, n, command, worktree, log_path, f"protected baseline head={head}"
+                           + (f" merged with base={base}" if merged else ""), slot())
+    finally:
+        ctx.git.remove_worktree(worktree)
+    try:
+        passing = set(_passing_acceptance_ids(junit))
+    except (OSError, ET.ParseError):
+        passing = set()
+    return [node for node in protected if node not in passing]
 
 
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
@@ -433,7 +470,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             for i, command in enumerate(commands):
                 pytest_command = _pytest_command(command)
                 acceptance_only = ci_units and pytest_command is not None
-                selection = command if pytest_command is None else full_selection(command)
+                selection = command
                 if acceptance_only:
                     selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
                     selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
@@ -442,101 +479,68 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 else:
                     run = _run_suite(ctx, n, selection, worktree, Path(directory) / f"head-{i}.xml",
                                      log_path, label, test_slot(), allow_empty=acceptance_only)
-                runs.append((command, selection, run, acceptance_only))
+                runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
         tests = "pass"
-        unverified: list[str] = []
-        for i, (command, selection, run, acceptance_only) in enumerate(runs):
-            pytest = _pytest_command(command) is not None
-            if pytest and not acceptance_only and (stepwise := stepwise_options(command)):
-                # A stepwise run stops at its first failure, so it measures only part of the selection
-                # (an acceptance-only selection is rebuilt by _pytest_command without it).
+        captured = None
+        for i, (command, run, acceptance_only) in enumerate(runs):
+            if run.passed and not acceptance_only:
+                continue
+            if not run.passed and run.failing is None:
                 tests = "fail"
-                broken.extend(sorted(run.failing or ()))
-                unverified.append(f"{command}: {' '.join(stepwise)} stops at the first failure")
                 continue
-            if run.failing is None:
-                # Only a non-pytest suite is judged by its exit code; pytest must report each test.
-                if not run.passed or pytest:
-                    tests = "fail"
-                if pytest:
-                    unverified.append(f"{command}: no per-test result for the merge result")
-                continue
-
-            def base_slot(selection, root, label=f"base={base}"):
-                return _suite_process(ctx, n, selection, root, log_path, label, test_slot())
-
             # D53: failures the base already has do not block; any other failure does.
-            # #1105: an acceptance test passing on the base must pass on the merge result too;
-            # failing, skipped and removed tests block alike. Only tests in the head's own
-            # selection count, and each one not passing on the merge result needs a known
-            # base result. Conflicts block already (the head was tested without the base).
-            head_failing = run.failing
-            base_failing, base_passing, known = frozenset(), frozenset(), frozenset()
-            at_risk = frozenset()
-            if merged:
-                scope = selected_on_base(
-                    ctx, selection, base, log=log_path,
-                    check=lambda command, root: base_slot(command, root, f"base={base} selection"),
-                    acceptance=(ctx.config.acceptance_dir, excluded), head=head)
-                if scope is None:
-                    tests = "fail"
-                    unverified.append(f"{command}: the tests it selects on base {base} are unknown")
-                else:
-                    at_risk = _protected(scope, ctx.config.acceptance_dir, excluded) - run.passing
-            if run.passed and not acceptance_only and not at_risk:
-                continue  # Every base acceptance test in this selection passes on the merge result.
-            if acceptance_only or run.passed:
-                # Cache first; a cache missing any test at risk is rebuilt instead of trusted.
+            head_failing = run.failing or frozenset()
+            base_failing = frozenset()
+            if acceptance_only:
                 try:
                     baseline = _capture_baseline(
                         ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
-                        check=base_slot, prepare=lambda: None, wait=wait, required_ids=head_failing | at_risk,
+                        check=lambda selection, root: _suite_process(
+                            ctx, n, selection, root, log_path, f"base={base}", test_slot()),
+                        prepare=lambda: None, wait=wait, required_ids=head_failing,
                     )
-                except AttemptFailure as exc:
+                except AttemptFailure:
                     tests = "fail"
                     broken.extend(sorted(head_failing))
-                    unverified.append(f"{command}: {exc}")
                     continue
                 if baseline is not None:
-                    base_failing = frozenset(baseline.failing_ids or ())
-                    base_passing = frozenset(baseline.node_ids)
-                    known = frozenset(baseline.collected_ids or ()) | base_passing
+                    base_failing = frozenset(baseline.failing_ids)
+                    captured = captured or baseline
             else:
-                base_selection = selection
-                saved = _premerge_baseline(ctx, command, base, excluded, head_failing | at_risk)
-                if saved is not None:
-                    base_failing = frozenset(saved["failing_ids"])
-                    base_passing = frozenset(saved["node_ids"])
-                    known = frozenset(saved["collected_ids"])
-                    # Keep units and uncached/locked tests in the original full suite.
-                    base_selection += "".join(f" {shlex.quote('--deselect=' + node)}"
-                                              for node in [*saved["collected_ids"], *saved["excluded"]])
+                selection = command
+                if _pytest_command(command) is not None:
+                    saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
+                    if saved is not None:
+                        base_failing = frozenset(saved["failing_ids"])
+                        # Keep units and uncached/locked tests in the original full suite.
+                        selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                             for node in [*saved["collected_ids"], *saved["excluded"]])
                 ctx.git.add_detached_worktree(worktree, base)
                 try:
-                    # Selectors the PR added (new paths, a new -c config) must resolve here too.
-                    files = prepare_base_checkout(ctx, worktree, selection, base, head)
-                    on_base = _run_suite(ctx, n, base_selection, worktree, Path(directory) / f"base-{i}.xml",
+                    on_base = _run_suite(ctx, n, selection, worktree, Path(directory) / f"base-{i}.xml",
                                          log_path, f"base={base}", test_slot())
                 finally:
                     ctx.git.remove_worktree(worktree)
-                if on_base.failing is not None:
-                    base_failing |= base_ids(on_base.failing, files)
-                    base_passing |= base_ids(on_base.passing, files)
-                    known |= base_ids(on_base.recorded, files)
-            if unknown := at_risk - known:
-                tests = "fail"
-                unverified.append(f"{command}: no base result for {len(unknown)} tests not passing on the "
-                                  f"merge result: {', '.join(sorted(unknown)[:5])}")
-            regressions = (head_failing - base_failing) | (at_risk & base_passing)
-            broken.extend(sorted(regressions))
+                base_failing |= on_base.failing or frozenset()
+            broken.extend(sorted(head_failing - base_failing))
             failing_on_base.extend(sorted(head_failing & base_failing))
-            if regressions:
+            if head_failing - base_failing:
                 tests = "fail"
+        # A previously passing acceptance test must keep passing on the merge result (#1105).
+        try:
+            lost = _protected_broken(ctx, n, head, base, merged, Path(directory), log_path, test_slot, wait,
+                                     captured)
+        except AttemptFailure:
+            tests = "fail"  # No usable base baseline: the protected set cannot be shown to still pass.
+            lost = []
+        if lost:
+            tests = "fail"
+        broken = sorted(set(broken) | set(lost))
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
-              "broken": broken, "failing_on_base": failing_on_base, "unverified": unverified,
+              "broken": broken, "failing_on_base": failing_on_base,
               "waited_seconds": waited_seconds,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
@@ -572,8 +576,6 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     report = checked.report
     if not report["ready"]:
         broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
-        if report["unverified"]:
-            broken += f" (unverified: {'; '.join(report['unverified'])})"
         raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                         f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
     # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the

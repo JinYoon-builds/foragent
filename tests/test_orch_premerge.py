@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import BASE_TIME, git_command
+from conftest import ACCEPTANCE, BASE_TIME, git_command
 from foragent import orch
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
@@ -45,23 +45,6 @@ def merge_case(git_history, tmp_path):
     assert (h.clone / "local-draft.txt").read_text() == "keep me"
 
 
-# A stand-in suite program. As pytest it answers the base collection with an empty listing (its
-# path read from the listing hooks' conftest in the --confcutdir directory) and writes an empty
-# legacy JUnit report: a measured empty run. Collections are not recorded; the record lists the suites that were run.
-FAKE_SUITE = r"""#!/bin/sh
-hooks=
-for arg; do case "$arg" in --confcutdir=*) hooks="${arg#*=}/conftest.py";; esac; done
-case " $* " in *" --collect-only "*)
-  listing=$(sed -n "s/.*open('\([^']*\)'.*/\1/p" "$hooks")
-  printf '{"ids": [], "errors": 0, "rootdir": "%s"}' "$PWD" > "$listing"
-  exit 5;;
-esac
-printf "%s:%s\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD"
-for arg; do case "$arg" in --junitxml=*) printf '<testsuite tests="0"/>' > "${arg#*=}";; esac; done
-test -f suite-ok
-"""
-
-
 def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, monkeypatch):
     c = merge_case
     c.ctx.config = replace(c.ctx.config, test_command=None)
@@ -70,13 +53,17 @@ def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, mo
     record = tmp_path / "commands.txt"
     for name in ("uv", "pnpm", "go"):
         program = programs / name
-        program.write_text(FAKE_SUITE)
+        program.write_text(
+            '#!/bin/sh\n'
+            # Foragent's own fixed acceptance invocations (`-o addopts=`) are not the suites run.
+            'case " $* " in *" addopts= "*) ;; *) printf "%s:%s\\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD";; esac\n'
+            # Like pytest, report each test: an empty legacy JUnit report is a measured empty run.
+            'for arg; do case "$arg" in --junitxml=*) printf \'<testsuite tests="0"/>\' > "${arg#*=}";; esac; done\n'
+            'test -f suite-ok\n')
         program.chmod(0o755)
     monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("PREMERGE_RECORD", str(record))
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is True, (report["unverified"], report["broken"])
-    assert report["unverified"] == []
+    assert orch.premerge(c.ctx, c.pr)["ready"] is True
     uv, *others = record.read_text().splitlines()
     # pytest also writes JUnit so failures can be compared with the base.
     assert uv.startswith("uv:run pytest --rootdir=. -o junit_family=legacy --junit-prefix= --junitxml=")
@@ -478,21 +465,26 @@ def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_cas
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
 
 
-# #1105: an acceptance test that passes on the base must still pass on the merge result.
+# #1105: the run baseline's passing acceptance tests must keep passing on the merge result.
 SUITE_FILE = "tests/acceptance/test_kept.py"
 KEPT = f"{SUITE_FILE}::test_kept"
 NEIGHBOUR = f"{SUITE_FILE}::test_neighbour"
 UNIT_FILE = "tests/test_unit.py"
+NEIGHBOUR_SOURCE = "def test_neighbour():\n    assert False, 'not built yet'\n"
 BASE_SUITE = {
-    SUITE_FILE: "def test_kept():\n    assert True\n\ndef test_neighbour():\n    assert False, 'not built yet'\n",
+    SUITE_FILE: "def test_kept():\n    assert True\n\n" + NEIGHBOUR_SOURCE,
     UNIT_FILE: "def test_unit():\n    assert True\n",
 }
-SKIPPED = ("import pytest\n\n@pytest.mark.skip(reason='stopped checking')\ndef test_kept():\n    assert True\n\n"
-           "def test_neighbour():\n    assert False, 'not built yet'\n")
-REMOVED = "def test_neighbour():\n    assert False, 'not built yet'\n"
+CHANGES = {
+    "failed": "def test_kept():\n    assert False, 'broken by the PR'\n\n" + NEIGHBOUR_SOURCE,
+    "skipped": ("import pytest\n\n@pytest.mark.skip(reason='stopped checking')\ndef test_kept():\n"
+                "    assert True\n\n" + NEIGHBOUR_SOURCE),
+    "removed": NEIGHBOUR_SOURCE,
+}
+PYTEST = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
 
 
-def suite_case(git_history, tmp_path, head_files, *, mode, command=None, base_files=(), base_after=()):
+def suite_case(git_history, tmp_path, head_files, *, mode="all", command=PYTEST, base_files=()):
     """Real pytest on a real base and PR head; GitHub is the fake tracker."""
     h = git_history
     h.update({**BASE_SUITE, **dict(base_files)})
@@ -502,294 +494,82 @@ def suite_case(git_history, tmp_path, head_files, *, mode, command=None, base_fi
     git_command(h.origin, "update-ref", "refs/heads/foragent/issue-1", head)
     git_command(h.origin, "update-ref", "refs/heads/main", base)
     h.tip = base
-    h.update({"base.txt": "base advanced", **dict(base_after)})
+    h.update({"base.txt": "base advanced"})
     tracker = FakeTracker(now=lambda: BASE_TIME)
     pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Issue", body="Body")
     tracker.set_pr_head_sha(pr, head)
     tracker.set_pr_checks(pr, "pass")
     store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
-    config = Config(repo="owner/repo", runner_unit_tests=mode,
-                    test_command=command or f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider")
+    config = Config(repo="owner/repo", runner_unit_tests=mode, test_command=command)
     ctx = RunContext("owner/repo", h.clone, tracker, store, config, GitRepo(h.clone), now=lambda: BASE_TIME)
-    return SimpleNamespace(ctx=ctx, tracker=tracker, pr=pr)
+    return SimpleNamespace(ctx=ctx, tracker=tracker, pr=pr,
+                           log=lambda: (store.root / "runs" / f"premerge-pr-{pr}.log").read_text())
 
 
-@pytest.mark.parametrize("mode", ["all", "ci"])
-@pytest.mark.parametrize("change", ["skipped", "removed"])
-@pytest.mark.parametrize("neighbour_fixed", [False, True], ids=["neighbour-fails", "green-head"])
-def test_base_passing_acceptance_that_stops_passing_blocks_merge(git_history, tmp_path, mode, change,
-                                                                 neighbour_fixed):
-    source = SKIPPED if change == "skipped" else REMOVED
-    if neighbour_fixed:  # A fully green head must still be compared with the base.
-        source = source.replace("assert False, 'not built yet'", "assert True")
-    c = suite_case(git_history, tmp_path, {SUITE_FILE: source}, mode=mode)
-    report = orch.premerge(c.ctx, c.pr)
+def assert_refused(c, report, broken):
     assert report["ready"] is False and report["tests"] == "fail", report
-    assert report["broken"] == [KEPT], report
-    assert report["failing_on_base"] == ([] if neighbour_fixed else [NEIGHBOUR]), report
-    with pytest.raises(orch.OrchError, match=KEPT):
+    assert report["broken"] == broken, report
+    with pytest.raises(orch.OrchError, match="not ready"):
         orch.merge(c.ctx, c.pr, approved_by="jin")
     assert c.tracker.merged_prs == []
 
 
 @pytest.mark.parametrize("mode", ["all", "ci"])
-def test_base_failing_neighbour_alone_does_not_block(git_history, tmp_path, mode):
+@pytest.mark.parametrize("change", ["failed", "skipped", "removed"])
+def test_protected_acceptance_test_must_still_pass_on_the_merge_result(git_history, tmp_path, mode, change):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES[change]}, mode=mode)
+    report = orch.premerge(c.ctx, c.pr)
+    assert_refused(c, report, [KEPT])  # Once, even when the head comparison also catches it.
+    assert report["failing_on_base"] == [NEIGHBOUR], report  # The failing neighbour stays nonblocking.
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_green_head_that_drops_a_protected_test_is_refused(git_history, tmp_path, mode):
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: "def test_neighbour():\n    assert True\n"}, mode=mode)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), [KEPT])
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_memory_only_change_with_a_failing_neighbour_merges(git_history, tmp_path, mode):
     c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode)
     report = orch.premerge(c.ctx, c.pr)
     assert report["ready"] is True and report["broken"] == [], report
     assert report["failing_on_base"] == [NEIGHBOUR], report
+    assert "protected baseline head=" in c.log(), "The protected set ran on the merge result"
     orch.merge(c.ctx, c.pr, approved_by="jin")
     assert c.tracker.merged_prs == [c.pr]
 
 
-def test_skipped_unit_test_is_left_to_ci(git_history, tmp_path):
-    skip = "import pytest\n\n@pytest.mark.skip(reason='moved')\ndef test_unit():\n    assert True\n"
-    c = suite_case(git_history, tmp_path, {UNIT_FILE: skip}, mode="all")
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is True and report["broken"] == [], report
+def test_protected_ids_come_from_base_configuration_not_the_head_command(git_history, tmp_path):
+    """The base's own collection settings decide the protected set; the user command is not replayed."""
+    check = "tests/acceptance/check_kept.py"
+    base_files = {"pytest.ini": "[pytest]\npython_files = test_*.py check_*.py\n",
+                  check: "def test_check():\n    assert True\n"}
+    skipped = "import pytest\n\n@pytest.mark.skip(reason='gone')\ndef test_check():\n    assert True\n"
+    c = suite_case(git_history, tmp_path, {check: skipped}, base_files=base_files)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), [f"{check}::test_check"])
 
 
-@pytest.mark.parametrize("command", ["non-pytest", "no-junit"])
-def test_without_per_test_results_the_exit_code_decides(git_history, tmp_path, monkeypatch, command):
-    programs = tmp_path / "programs"
-    programs.mkdir()
-    (programs / "pytest").write_text("#!/bin/sh\nexit 0\n")  # Green, but writes no JUnit report.
-    (programs / "pytest").chmod(0o755)
-    monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
-    c = suite_case(git_history, tmp_path, {SUITE_FILE: SKIPPED}, mode="all",
-                   command="true" if command == "non-pytest" else "pytest")
-    report = orch.premerge(c.ctx, c.pr)
-    if command == "non-pytest":  # A suite that cannot report tests is judged by its exit code.
-        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], (
-            report["broken"], report["unverified"], report["failing_on_base"])
-    else:  # A pytest suite that reports no test cannot prove base tests still pass: fail closed.
-        assert report["ready"] is False and report["tests"] == "fail", report
-        assert report["unverified"] == ["pytest: no per-test result for the merge result"], report
+def test_unreadable_protected_report_breaks_every_protected_test(git_history, tmp_path, monkeypatch):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"})
+
+    def unreadable(report):
+        raise OSError("no report")
+
+    monkeypatch.setattr(orch, "_passing_acceptance_ids", unreadable)
+    assert_refused(c, orch.premerge(c.ctx, c.pr), sorted([f"{ACCEPTANCE}::test_feature", KEPT]))
 
 
-# Selection coverage: base-passing tests protect a merge only inside the selection the head ran.
-PYTEST = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
-UNIT_ONLY = f"{PYTEST} {UNIT_FILE}"
-UNIT_FAILS = {UNIT_FILE: "def test_unit():\n    assert False, 'known unit failure'\n"}
-
-
-@pytest.mark.parametrize("head_files", [{"notes.md": "memory only\n"}, {SUITE_FILE: SKIPPED}],
-                         ids=["memory-only", "acceptance-outside-selection"])
-def test_narrow_full_suite_command_does_not_protect_tests_it_never_runs(git_history, tmp_path, head_files):
-    c = suite_case(git_history, tmp_path, head_files, mode="all", command=UNIT_ONLY)
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is True and report["broken"] == [], report
-    log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
-    assert "Acceptance baseline count" not in log, "No base acceptance capture for a selection without acceptance tests"
-    orch.merge(c.ctx, c.pr, approved_by="jin")
-    assert c.tracker.merged_prs == [c.pr]
-
-
-@pytest.mark.parametrize("narrow", [True, False], ids=["unit-command", "whole-suite-command"])
-def test_cached_baseline_is_cut_to_the_head_selection(git_history, tmp_path, narrow):
-    command = UNIT_ONLY if narrow else PYTEST
-    head = {"notes.md": "memory only\n"} if narrow else {SUITE_FILE: SKIPPED}
-    c = suite_case(git_history, tmp_path, head, mode="ci", command=command, base_files=UNIT_FAILS)
-    orch.premerge(c.ctx, c.pr)  # Acceptance-only mode caches the base acceptance baseline.
-    c.ctx.config = replace(c.ctx.config, runner_unit_tests="all")
-    report = orch.premerge(c.ctx, c.pr)
-    log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
-    if narrow:
-        assert f"--deselect={KEPT}" in log, "The base run must reuse the cached acceptance baseline"
-        assert report["broken"] == [] and report["failing_on_base"] == [f"{UNIT_FILE}::test_unit"], report
-    else:  # The same cache still protects tests the whole-suite head did run.
-        assert report["broken"] == [KEPT] and report["ready"] is False, report
-
-
-def test_conflicting_head_is_not_compared_with_base_passing_tests(git_history, tmp_path):
-    added = "tests/acceptance/test_added_on_base.py"
-    c = suite_case(git_history, tmp_path, {"base.txt": "head version"}, mode="all",
-                   base_after={added: "def test_added():\n    assert True\n"})
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["conflicts"] == ["base.txt"] and report["ready"] is False, report
-    assert report["broken"] == [], "Tests the unmerged head never had are not regressions"
-
-
-# Fail closed: an early stop, a broken base module or an unknown selection never hides a lost test.
-ORDERED = "tests/acceptance/test_ordered.py"
-SIBLING = f"{ORDERED}::test_sibling"
-FIRST_FAILS = "def test_existing_failure():\n    assert False, 'known'\n\n"
-SIBLING_SOURCE = "def test_sibling():\n    assert True\n"
-
-
-@pytest.mark.parametrize("mode", ["all", "ci"])
-@pytest.mark.parametrize("stop", ["-x", "--maxfail=1"])
-def test_early_stop_options_cannot_hide_a_removed_sibling(git_history, tmp_path, mode, stop):
-    c = suite_case(git_history, tmp_path, {ORDERED: FIRST_FAILS}, mode=mode, command=f"{PYTEST} {stop}",
-                   base_files={ORDERED: FIRST_FAILS + SIBLING_SOURCE})
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and report["broken"] == [SIBLING], report
-    assert f"{ORDERED}::test_existing_failure" in report["failing_on_base"], report
-    with pytest.raises(orch.OrchError, match=SIBLING):
-        orch.merge(c.ctx, c.pr, approved_by="jin")
-    assert c.tracker.merged_prs == []
-
-
-BROKEN_MODULE = {"tests/acceptance/test_broken_import.py": "import not_a_module_anywhere\n"}
-
-
-@pytest.mark.parametrize("continue_flag", [True, False])
-def test_existing_collection_error_still_protects_collected_tests(git_history, tmp_path, continue_flag):
-    command = f"{PYTEST} --continue-on-collection-errors" if continue_flag else PYTEST
-    c = suite_case(git_history, tmp_path, {SUITE_FILE: SKIPPED}, mode="all", command=command,
-                   base_files=BROKEN_MODULE)
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and report["tests"] == "fail", report
-    if continue_flag:  # The base JUnit records the passing test that the head skips.
-        assert report["broken"] == [KEPT], report
-    else:  # Without per-test results the comparison is unusable, and says so.
-        assert report["unverified"], report
-    assert c.tracker.merged_prs == []
-
-
-@pytest.mark.parametrize("mode", ["all", "ci"])
-def test_unknown_base_selection_fails_closed_with_a_reason(git_history, tmp_path, monkeypatch, mode):
-    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode)
-    monkeypatch.setattr(orch, "selected_on_base", lambda *args, **kwargs: None)
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and report["tests"] == "fail", report
-    assert len(report["unverified"]) == 1 and "unknown" in report["unverified"][0], report
-    with pytest.raises(orch.OrchError, match="unverified"):
-        orch.merge(c.ctx, c.pr, approved_by="jin")
-    assert c.tracker.merged_prs == []
-
-
-def test_base_collection_with_errors_still_lists_its_tests(git_history, tmp_path):
-    from contextlib import nullcontext
-
-    from foragent.orch_premerge_scope import full_selection, selected_on_base
-
-    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode="all", base_files=BROKEN_MODULE)
-    c.ctx.git.fetch("origin", "main")
-    base = c.ctx.git.ref_sha("refs/remotes/origin/main")
-    log = tmp_path / "scope.log"
-    scope = selected_on_base(c.ctx, full_selection(PYTEST), base, log=log,
-                             check=lambda command, root: orch._suite_process(
-                                 c.ctx, c.pr, command, root, log, "scope", nullcontext()))
-    assert scope is not None and {KEPT, NEIGHBOUR, f"{UNIT_FILE}::test_unit"} <= scope, scope
-
-
-@pytest.mark.parametrize("mode", ["all", "ci"])
-def test_base_report_missing_a_test_at_risk_fails_closed(git_history, tmp_path, monkeypatch, mode):
-    """A base measurement that does not name a test the merge result no longer passes proves nothing."""
-    from foragent.run_baseline import AcceptanceBaseline
-
-    green = SKIPPED.replace("assert False, 'not built yet'", "assert True")
-    c = suite_case(git_history, tmp_path, {SUITE_FILE: green}, mode=mode)
-    monkeypatch.setattr(orch, "_capture_baseline", lambda ctx, command, base, **kwargs: AcceptanceBaseline(
-        command, (NEIGHBOUR,), (NEIGHBOUR,), (), (), base))
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and report["broken"] == [], report
-    assert len(report["unverified"]) == 1 and KEPT in report["unverified"][0], report
-
-
-# The configured command reaches the shell as written: globs, variables and quoting expand there.
-@pytest.mark.parametrize("selector", [
-    "tests/test_un*.py", '"$UNIT_DIR"/test_unit.py', "'tests/test_unit.py'",
-    "PYTHONPATH=. {pytest} tests/test_un*.py", "env PYTHONPATH=. {pytest} tests/test_un*.py",
-    "env -u PYTHONPATH {pytest} tests/test_un*.py", "{python} -I -m pytest -q -p no:cacheprovider tests",
-], ids=["glob", "variable", "quoted", "inline-pythonpath", "env-pythonpath", "env-unset-pythonpath",
-        "isolated-python"])
-def test_command_selectors_keep_their_shell_meaning(git_history, tmp_path, monkeypatch, selector):
-    monkeypatch.setenv("UNIT_DIR", "tests")
-    python = shlex.quote(sys.executable)
-    command = (selector.format(pytest=PYTEST, python=python) if "{" in selector
-               else f"{PYTEST} {selector}")
-    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode="all", command=command)
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is True and report["unverified"] == [], report
-    log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
-    assert "Pre-merge selection on base" not in log, "The base collection must list the selection"
-
-
-@pytest.mark.parametrize("mode,blocked", [("all", True), ("ci", False)])
-def test_stepwise_command_is_unusable_for_the_full_suite_comparison(git_history, tmp_path, mode, blocked):
-    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode,
-                   command=f"{shlex.quote(sys.executable)} -m pytest -q --sw")
-    report = orch.premerge(c.ctx, c.pr)
-    if blocked:
-        assert report["ready"] is False and report["unverified"] == [
-            f"{c.ctx.config.test_command}: --sw stops at the first failure"], report
-    else:  # The acceptance-only selection is rebuilt without --sw.
-        assert report["ready"] is True and report["unverified"] == [], report
-
-
-# Selectors the PR itself adds (new file, directory, glob or -c config) are valid on the merge
-# result; the base collection must resolve them instead of failing with a usage error.
-NEW_GREEN = {"tests/acceptance/test_new_green.py": "def test_new_green():\n    assert True\n"}
-NEW_DIR = {"tests/acceptance/added/test_added.py": "def test_added():\n    assert True\n"}
-NEW_CONFIG = {"ci.ini": "[pytest]\ntestpaths = tests/acceptance\n"}
-
-
-@pytest.mark.parametrize("files,selector", [
-    (NEW_GREEN, "tests/acceptance/test_new_green.py"),
-    (NEW_DIR, "tests/acceptance/added"),
-    (NEW_GREEN, "tests/acceptance/test_new_*.py"),
-    (NEW_CONFIG, "-c ci.ini"),
-], ids=["new-file", "new-directory", "new-only-glob", "new-config"])
-@pytest.mark.parametrize("skip_kept", [False, True], ids=["green", "skips-base-test"])
-def test_selectors_added_by_the_pr_resolve_on_the_base(git_history, tmp_path, files, selector, skip_kept):
-    head_files = dict(files)
-    if skip_kept:  # Still protected: the same command also selects the base's acceptance file.
-        head_files[SUITE_FILE] = SKIPPED
-        if not selector.startswith("-c"):
-            selector += f" {SUITE_FILE}"
-    c = suite_case(git_history, tmp_path, head_files, mode="all", command=f"{PYTEST} {selector}")
-    report = orch.premerge(c.ctx, c.pr)
-    if skip_kept:
-        assert report["ready"] is False and report["broken"] == [KEPT], report
+@pytest.mark.parametrize("case", ["not-pytest", "no-acceptance-directory", "nothing-passes"])
+def test_no_protected_set_skips_the_check(git_history, tmp_path, case):
+    if case == "not-pytest":
+        c = suite_case(git_history, tmp_path, {SUITE_FILE: CHANGES["removed"]}, command="true")
+    elif case == "no-acceptance-directory":
+        c = suite_case(git_history, tmp_path, {"notes.md": "x\n"}, command=f"{PYTEST} {UNIT_FILE}")
+        c.ctx.config = replace(c.ctx.config, acceptance_dir="tests/absent")
     else:
-        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], (
-            report["broken"], report["unverified"], report["failing_on_base"])
-    assert report["unverified"] == [], report
-
-
-def test_head_only_paths_reads_words_without_rebuilding_the_command():
-    from foragent.orch_premerge_scope import head_only_paths
-
-    base = {"tests/a/test_old.py", "pyproject.toml"}
-    head = sorted(base | {"tests/a/test_new.py", "tests/b/test_x.py", "ci.ini"})
-    command = "PYTEST_ADDOPTS= pytest tests/a/test_*.py tests/b --config-file=ci.ini tests/a/test_old.py::t"
-    # Directories become placeholders ("tests/b/"): nothing of the head's is put inside.
-    assert head_only_paths(command, base, head) == ["ci.ini", "tests/a/test_new.py", "tests/b/"]
-
-
-@pytest.mark.parametrize("mode", ["all", "ci"])
-def test_new_failing_test_named_by_the_command_stays_broken(git_history, tmp_path, mode):
-    """A head-only file copied into the base checkout is not base evidence for its own failure."""
-    new = "tests/acceptance/test_new_red.py"
-    c = suite_case(git_history, tmp_path, {new: "def test_new_red():\n    assert False, 'new'\n"},
-                   mode=mode, command=f"{PYTEST} {new} {SUITE_FILE}")
+        c = suite_case(git_history, tmp_path, {"notes.md": "x\n"}, base_files={
+            SUITE_FILE: NEIGHBOUR_SOURCE, ACCEPTANCE: "def test_feature():\n    assert False\n"})
     report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and f"{new}::test_new_red" in report["broken"], report
-    assert f"{new}::test_new_red" not in report["failing_on_base"], report
-
-
-# Head code never runs in the base measurement: a conftest or config the PR adds cannot hide a
-# base-passing test from the base evidence.
-DESELECT_KEPT_HOOK = (
-    "def pytest_collection_modifyitems(config, items):\n"
-    "    kept = [item for item in items if item.name == 'test_kept']\n"
-    "    config.hook.pytest_deselected(items=kept)\n"
-    "    items[:] = [item for item in items if item not in kept]\n"
-)
-
-
-@pytest.mark.parametrize("files,selector", [
-    ({"tests/acceptance/added/conftest.py": DESELECT_KEPT_HOOK, **NEW_DIR},
-     f"tests/acceptance/added {SUITE_FILE}"),
-    ({"ci.ini": f"[pytest]\naddopts = --deselect {KEPT}\n"}, "-c ci.ini"),
-], ids=["new-conftest-hook", "new-config-deselect"])
-def test_head_selection_code_cannot_hide_a_base_test(git_history, tmp_path, files, selector):
-    c = suite_case(git_history, tmp_path, files, mode="all", command=f"{PYTEST} {selector}")
-    report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is False and report["broken"] == [KEPT], report
-    assert report["failing_on_base"] == [NEIGHBOUR], report
-    with pytest.raises(orch.OrchError, match=KEPT):
-        orch.merge(c.ctx, c.pr, approved_by="jin")
-    assert c.tracker.merged_prs == []
+    assert report["ready"] is True and report["broken"] == [], report
+    assert "protected baseline head=" not in c.log(), "No protected run without a protected set"
