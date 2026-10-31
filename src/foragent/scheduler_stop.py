@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from foragent import processes, scheduler
 from foragent.orch_tick_outcome import step
+from foragent.reasons import one_line
 from foragent.state import Run
 
 if TYPE_CHECKING:
@@ -232,8 +233,8 @@ def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport
         and (started is None or scheduler.datetime.fromisoformat(event["at"]) >= started)
         for event in map(json.loads, journal.read_text(encoding="utf-8").splitlines())
     )):
-        ctx.tracker.comment(number, "<!-- foragent:orch -->\n" + text(
-            "orch_stop_done", ctx.config.language, n=number, why=why))
+        ctx.tracker.comment(number, one_line("<!-- foragent:orch -->", text(
+            "orch_stop_done", ctx.config.language, n=number, why=why)))
         scheduler.append_event(ctx.store, ctx.now(), number, "stop",
                                f"Stopped by fa orch stop; unfinished work kept on foragent/issue-{number}. Why: {why}")
     issue = ctx.tracker.get_issue(number)

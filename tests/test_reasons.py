@@ -32,17 +32,19 @@ def test_groups_cover_exact_contract_codes():
 @pytest.mark.parametrize("reason", list(Reason))
 @pytest.mark.parametrize("label", ["blocked", "needs-human"])
 def test_reason_round_trip(reason, label):
+    marker = f"<!-- foragent:{label} reason={reason.value} -->"
     body = format_comment(reason, "Human input is needed.", "Please choose an option.\nKeep this detail.", label=label)
-    assert body.splitlines()[0] == f"<!-- foragent:{label} reason={reason.value} -->"
-    assert body.splitlines()[1] == "**Human input is needed.**"
-    assert body.endswith("Please choose an option.\nKeep this detail.")
+    assert body == f"{marker} **Human input is needed.** ↵ Please choose an option. ↵ Keep this detail."
     assert parse_reason(body) == reason
-    assert parse_reason(body.replace("\n", "\r\n")) == reason
+    # Comments written before one-line announcements keep the marker on its own line.
+    old = f"{marker}\n**Human input is needed.**\n\nPlease choose an option."
+    assert parse_reason(old) == reason
+    assert parse_reason(old.replace("\n", "\r\n")) == reason
 
 
 def test_optional_details_and_one_line_summary():
     body = format_comment(Reason.STALLED, "  No progress\n for 30 minutes.  ")
-    assert body == "<!-- foragent:needs-human reason=stalled -->\n**No progress for 30 minutes.**"
+    assert body == "<!-- foragent:needs-human reason=stalled --> **No progress for 30 minutes.**"
 
 
 @pytest.mark.parametrize("body", [
@@ -50,7 +52,7 @@ def test_optional_details_and_one_line_summary():
     "\n<!-- foragent:needs-human reason=stalled -->",
     " <!-- foragent:needs-human reason=stalled -->",
     "<!-- foragent:needs-human reason=unknown -->",
-    "<!-- foragent:needs-human reason=stalled --> suffix",
+    "<!-- foragent:needs-human reason=stalled -->suffix",
     "<!-- foragent:needs-human reason=stalled",
 ])
 def test_invalid_or_non_first_line_reason_marker(body):

@@ -9,7 +9,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 from tempfile import TemporaryDirectory
 import time
@@ -25,6 +24,7 @@ from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
+from foragent.reasons import flag_marker, one_line
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
@@ -146,13 +146,14 @@ def _text(value: str, name: str) -> str:
 
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
-           say: str | None = None) -> dict:
+           say: str | None = None, changed: bool = True) -> dict:
+    """Journal every verb; comment only when it changed public state (one line)."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
-    if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
+    if not changed or ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
+        tracker.comment(number, one_line("<!-- foragent:orch -->", event["summary"]))
     return event
 
 
@@ -164,9 +165,8 @@ def list_blocked(ctx: RunContext) -> list[dict]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
         comments = [load_record(Comment, item) for item in row["comments"]]
-        flags = [(comment, match[1]) for comment in comments
-                 if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
-                                           comment.body.splitlines()[0] if comment.body else ""))]
+        flags = [(comment, found[1]) for comment in comments
+                 if (found := flag_marker(comment.body)) is not None and found[0] == BLOCKED]
         latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
@@ -185,9 +185,11 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+def _retry(ctx: RunContext, n: int, hint: str | None) -> bool:
+    """Queue a retry; True when it changes the pending hint."""
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
+    changed = (path.read_text(encoding="utf-8") if path.is_file() else None) != hint
     if hint is not None:
         ctx.store._atomic_write(path, hint)
     else:
@@ -199,13 +201,14 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    return changed
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
-    _retry(ctx, n, hint)
+    labels = _issue(ctx, n).labels
+    changed = _retry(ctx, n, hint) or READY not in labels or bool(labels & {BLOCKED, NEEDS_HUMAN})
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    _event(ctx, n, "retry", summary, say=say)
+    _event(ctx, n, "retry", summary, say=say, changed=changed)
     kick_tick(ctx.repo_root)
     return summary
 
@@ -259,12 +262,12 @@ def escalate(ctx: RunContext, n: int, summary: str, tried: str,
     options = [_text(option, "option") for option in (options or [])]
     if recommend is not None and not 1 <= recommend <= len(options):
         raise OrchError("recommend must be a 1-based option index")
-    lines = ["<!-- foragent:needs-human reason=escalated -->", summary, "", "What was tried:", tried]
+    lines = [summary, "", "What was tried:", tried]
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    tracker.comment(n, "\n".join(lines))
+    tracker.comment(n, one_line("<!-- foragent:needs-human reason=escalated -->", "\n".join(lines)))
     tracker.add_labels(n, [NEEDS_HUMAN])
     tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"

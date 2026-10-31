@@ -44,22 +44,50 @@ GROUP: dict[Reason, str] = {
 APPROVAL_MARKER = "<!-- foragent:approved"
 
 
+FLAG_MARKER = re.compile(r"<!-- foragent:(blocked|needs-human) reason=([a-z-]+) -->(?=[ \r\n]|$)")
+
+
+def one_line(marker: str, text: str = "") -> str:
+    """A state-change comment: its marker and its whole text on one line.
+
+    Line breaks in the text become " ↵ " so evidence stays complete and readable.
+    """
+    flat = " ↵ ".join(" ".join(line.split()) for line in text.splitlines() if line.strip())
+    return f"{marker} {flat}" if flat else marker
+
+
+def flag_marker(body: str) -> tuple[str, str, str] | None:
+    """(label, reason, text after the marker) of a blocked or needs-human comment.
+
+    Reads the one-line form and the older form with the marker on its own line.
+    """
+    match = FLAG_MARKER.match(body or "")
+    return (match[1], match[2], body[match.end():].strip()) if match else None
+
+
+def flag_text(body: str) -> tuple[str, str]:
+    """(bold summary, evidence) of a flag comment in either form; the evidence keeps its lines."""
+    found = flag_marker(body)
+    content = found[2] if found else body.partition("\n")[2].strip()
+    first, _, rest = content.partition("\n") if "\n" in content else content.partition(" ↵ ")
+    first = first.strip()
+    return first[2:-2] if first.startswith("**") and first.endswith("**") else first, rest.strip()
+
+
 def format_comment(
     reason: Reason, summary: str, details: str | None = None, *,
     label: Literal["blocked", "needs-human"] = "needs-human",
 ) -> str:
     summary = " ".join(summary.split())
-    body = f"<!-- foragent:{label} reason={reason.value} -->\n**{summary}**"
-    return f"{body}\n\n{details}" if details else body
+    return one_line(f"<!-- foragent:{label} reason={reason.value} -->",
+                    f"**{summary}**" + (f"\n{details}" if details else ""))
 
 
 def parse_reason(comment_body: str) -> Reason | None:
-    first_line = comment_body.split("\n", 1)[0].removesuffix("\r")
-    match = re.fullmatch(r"<!-- foragent:(?:blocked|needs-human) reason=([a-z-]+) -->", first_line)
-    if match is None:
+    if (found := flag_marker(comment_body)) is None:
         return None
     try:
-        return Reason(match[1])
+        return Reason(found[1])
     except ValueError:
         return None
 

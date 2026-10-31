@@ -12,7 +12,7 @@ import re
 from foragent.config import Config
 from foragent.git import GitRepo
 from foragent.labels import BLOCKED, NEEDS_HUMAN, issue_lane, lane_display
-from foragent.reasons import GROUP
+from foragent.reasons import GROUP, flag_marker, flag_text
 from foragent.records import load_record
 from foragent.state import StateStore
 from foragent.tracker import Comment, Tracker
@@ -129,11 +129,8 @@ def comment_key(comment: Comment) -> tuple[datetime, int]:
 
 def latest_flag(comments: list[Comment]) -> tuple[Comment, str] | None:
     for comment in sorted(comments, key=comment_key, reverse=True):
-        match = re.fullmatch(
-            r"<!-- foragent:needs-human reason=([a-z-]+) -->", comment.body.splitlines()[0]
-        ) if comment.body else None
-        if match:
-            return comment, match[1]
+        if (found := flag_marker(comment.body)) is not None and found[0] == NEEDS_HUMAN:
+            return comment, found[1]
     return None
 
 
@@ -142,10 +139,8 @@ def has_marker(comment: Comment, marker: str) -> bool:
 
 
 def _gate_text(comment: Comment) -> tuple[str, str]:
-    content = comment.body.split("\n", 1)[1].strip() if "\n" in comment.body else ""
-    first, _, rest = content.partition("\n")
-    summary = first[2:-2] if first.startswith("**") and first.endswith("**") else first
-    return summary or "Needs a human", rest.strip()[:4000]
+    summary, details = flag_text(comment.body)
+    return summary or "Needs a human", details[:4000]
 
 
 def _human_checks(body: str) -> str:
