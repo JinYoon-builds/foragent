@@ -22,7 +22,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
-from foragent.orch_premerge_scope import selected_on_base
+from foragent.orch_premerge_scope import full_selection, selected_on_base
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
@@ -309,6 +309,7 @@ class _SuiteRun:
     passed: bool
     failing: frozenset[str] | None  # None: no per-test result to compare
     passing: frozenset[str] = frozenset()  # no failure, error or skip; meaningful with `failing`
+    recorded: frozenset[str] = frozenset()  # every id the report names, in any outcome
 
 
 def _protected(ids, acceptance_dir: str, excluded: list[str]) -> frozenset[str]:
@@ -338,8 +339,9 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     pytest = _pytest_command(command) is not None
     if pytest:
         junit.unlink(missing_ok=True)
+        # --maxfail=0 last: an early stop (-x, --maxfail, addopts) would leave tests unmeasured.
         command = (f"{command} --rootdir=. -o junit_family=legacy --junit-prefix= "
-                   f"--junitxml={shlex.quote(str(junit.resolve()))}")
+                   f"--junitxml={shlex.quote(str(junit.resolve()))} --maxfail=0")
     result = _suite_process(ctx, n, command, worktree, log_path, label, slot)
     code, timed_out = result.exit_code, result.timed_out
     passed = code == 0 and not timed_out
@@ -357,7 +359,8 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     # Exit 1 is pytest's "some tests failed"; other codes are session failures.
     if code not in (0, 1) or (code == 1 and not failing):
         return _SuiteRun(False, None)
-    return _SuiteRun(passed, failing, frozenset(_passing_acceptance_ids(junit)))
+    recorded = frozenset(node_id for case in cases if (node_id := junit_node_id(case)) is not None)
+    return _SuiteRun(passed, failing, frozenset(_passing_acceptance_ids(junit)), recorded)
 
 
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
@@ -428,7 +431,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             for i, command in enumerate(commands):
                 pytest_command = _pytest_command(command)
                 acceptance_only = ci_units and pytest_command is not None
-                selection = command
+                selection = command if pytest_command is None else full_selection(command)
                 if acceptance_only:
                     selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
                     selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
@@ -437,87 +440,92 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 else:
                     run = _run_suite(ctx, n, selection, worktree, Path(directory) / f"head-{i}.xml",
                                      log_path, label, test_slot(), allow_empty=acceptance_only)
-                runs.append((command, run, acceptance_only))
+                runs.append((command, selection, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
         tests = "pass"
-        for i, (command, run, acceptance_only) in enumerate(runs):
+        unverified: list[str] = []
+        for i, (command, selection, run, acceptance_only) in enumerate(runs):
+            pytest = _pytest_command(command) is not None
             if run.failing is None:
-                # Without per-test results (not pytest, no usable JUnit) the exit code decides.
-                if not run.passed:
+                # Only a non-pytest suite is judged by its exit code; pytest must report each test.
+                if not run.passed or pytest:
                     tests = "fail"
+                if pytest:
+                    unverified.append(f"{command}: no per-test result for the merge result")
                 continue
+
+            def base_slot(selection, root, label=f"base={base}"):
+                return _suite_process(ctx, n, selection, root, log_path, label, test_slot())
+
             # D53: failures the base already has do not block; any other failure does.
-            # Acceptance tests that pass on the base must also pass on the merge result:
-            # a skip or a removal blocks just like a new failure (#1105).
+            # #1105: an acceptance test passing on the base must pass on the merge result too;
+            # failing, skipped and removed tests block alike. Only tests in the head's own
+            # selection count, and each one not passing on the merge result needs a known
+            # base result. Conflicts block already (the head was tested without the base).
             head_failing = run.failing
-            base_failing = frozenset()
-            base_passing = None
-            # Passing status is compared only over what the head ran, on a real merge result:
-            # acceptance-only runs share the baseline's selection by construction; a full-suite
-            # command is measured by its own collection on the base. Conflicts already block.
-            scope = None
-            compare = merged
-            if compare and not acceptance_only:
+            base_failing, base_passing, known = frozenset(), frozenset(), frozenset()
+            at_risk = frozenset()
+            if merged:
                 scope = selected_on_base(
-                    ctx, command, base, log=log_path, check=lambda selection, root: _suite_process(
-                        ctx, n, selection, root, log_path, f"base={base} selection", test_slot()))
-                compare = scope is not None
-            if (run.passed and not acceptance_only
-                    and not (compare and _protected(scope or (), ctx.config.acceptance_dir, excluded))):
-                continue  # A green head with no base-passing acceptance test in its selection.
+                    ctx, selection, base, log=log_path,
+                    check=lambda command, root: base_slot(command, root, f"base={base} selection"),
+                    acceptance=(ctx.config.acceptance_dir, excluded))
+                if scope is None:
+                    tests = "fail"
+                    unverified.append(f"{command}: the tests it selects on base {base} are unknown")
+                else:
+                    at_risk = _protected(scope, ctx.config.acceptance_dir, excluded) - run.passing
+            if run.passed and not acceptance_only and not at_risk:
+                continue  # Every base acceptance test in this selection passes on the merge result.
             if acceptance_only or run.passed:
-                # A green head still needs the base's passing ids; a cached baseline costs no run.
-                # A cache that excluded more files leaves those files unprotected, not blocked.
+                # Cache first; a cache missing any test at risk is rebuilt instead of trusted.
                 try:
                     baseline = _capture_baseline(
                         ctx, command, base, log=log_path, report=Path(directory) / f"base-{i}.xml",
-                        check=lambda selection, root: _suite_process(
-                            ctx, n, selection, root, log_path, f"base={base}", test_slot()),
-                        prepare=lambda: None, wait=wait, required_ids=head_failing,
+                        check=base_slot, prepare=lambda: None, wait=wait, required_ids=head_failing | at_risk,
                     )
-                except AttemptFailure:
-                    if acceptance_only:
-                        tests = "fail"
-                        broken.extend(sorted(head_failing))
-                    # A green full suite without usable base evidence keeps its exit-code verdict.
+                except AttemptFailure as exc:
+                    tests = "fail"
+                    broken.extend(sorted(head_failing))
+                    unverified.append(f"{command}: {exc}")
                     continue
                 if baseline is not None:
                     base_failing = frozenset(baseline.failing_ids or ())
                     base_passing = frozenset(baseline.node_ids)
+                    known = frozenset(baseline.collected_ids or ()) | base_passing
             else:
-                selection = command
-                saved = None
-                if _pytest_command(command) is not None:
-                    saved = _premerge_baseline(ctx, command, base, excluded, head_failing)
-                    if saved is not None:
-                        base_failing = frozenset(saved["failing_ids"])
-                        # Keep units and uncached/locked tests in the original full suite.
-                        selection += "".join(f" {shlex.quote('--deselect=' + node)}"
-                                             for node in [*saved["collected_ids"], *saved["excluded"]])
+                base_selection = selection
+                saved = _premerge_baseline(ctx, command, base, excluded, head_failing | at_risk)
+                if saved is not None:
+                    base_failing = frozenset(saved["failing_ids"])
+                    base_passing = frozenset(saved["node_ids"])
+                    known = frozenset(saved["collected_ids"])
+                    # Keep units and uncached/locked tests in the original full suite.
+                    base_selection += "".join(f" {shlex.quote('--deselect=' + node)}"
+                                              for node in [*saved["collected_ids"], *saved["excluded"]])
                 ctx.git.add_detached_worktree(worktree, base)
                 try:
-                    on_base = _run_suite(ctx, n, selection, worktree, Path(directory) / f"base-{i}.xml",
+                    on_base = _run_suite(ctx, n, base_selection, worktree, Path(directory) / f"base-{i}.xml",
                                          log_path, f"base={base}", test_slot())
                 finally:
                     ctx.git.remove_worktree(worktree)
-                base_failing |= on_base.failing or frozenset()
-                if saved is not None or on_base.failing is not None:
-                    base_passing = frozenset(saved["node_ids"] if saved is not None else ())
-                    if on_base.failing is not None:
-                        base_passing |= on_base.passing
-            lost = frozenset()
-            if compare and base_passing is not None:
-                measured = base_passing if scope is None else base_passing & scope
-                lost = _protected(measured, ctx.config.acceptance_dir, excluded) - run.passing
-            regressions = (head_failing - base_failing) | lost
+                if on_base.failing is not None:
+                    base_failing |= on_base.failing
+                    base_passing |= on_base.passing
+                    known |= on_base.recorded
+            if unknown := at_risk - known:
+                tests = "fail"
+                unverified.append(f"{command}: no base result for {len(unknown)} tests not passing on the "
+                                  f"merge result: {', '.join(sorted(unknown)[:5])}")
+            regressions = (head_failing - base_failing) | (at_risk & base_passing)
             broken.extend(sorted(regressions))
             failing_on_base.extend(sorted(head_failing & base_failing))
             if regressions:
                 tests = "fail"
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
-              "broken": broken, "failing_on_base": failing_on_base,
+              "broken": broken, "failing_on_base": failing_on_base, "unverified": unverified,
               "waited_seconds": waited_seconds,
               "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
     return _Premerge(pr, head, base, report)
@@ -553,6 +561,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     report = checked.report
     if not report["ready"]:
         broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+        if report["unverified"]:
+            broken += f" (unverified: {'; '.join(report['unverified'])})"
         raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                         f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
     # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the

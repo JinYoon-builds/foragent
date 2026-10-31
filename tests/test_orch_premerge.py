@@ -45,6 +45,27 @@ def merge_case(git_history, tmp_path):
     assert (h.clone / "local-draft.txt").read_text() == "keep me"
 
 
+# A stand-in suite program. As pytest it answers the base collection with an empty listing
+# (read from the listing plugin's source) and writes an empty legacy JUnit report: a measured
+# empty run. Collections are not recorded; the record lists the suites that were run.
+FAKE_SUITE = r"""#!/bin/sh
+plugin=
+previous=
+for arg; do
+  [ "$previous" = -p ] && plugin=$arg
+  previous=$arg
+done
+case " $* " in *" --collect-only "*)
+  listing=$(sed -n "s/.*open('\([^']*\)'.*/\1/p" "${PYTHONPATH%%:*}/$plugin.py")
+  printf '{"ids": [], "errors": 0, "rootdir": "%s"}' "$PWD" > "$listing"
+  exit 5;;
+esac
+printf "%s:%s\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD"
+for arg; do case "$arg" in --junitxml=*) printf '<testsuite tests="0"/>' > "${arg#*=}";; esac; done
+test -f suite-ok
+"""
+
+
 def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, monkeypatch):
     c = merge_case
     c.ctx.config = replace(c.ctx.config, test_command=None)
@@ -53,11 +74,13 @@ def test_detects_and_runs_every_full_suite_from_pr_head(merge_case, tmp_path, mo
     record = tmp_path / "commands.txt"
     for name in ("uv", "pnpm", "go"):
         program = programs / name
-        program.write_text('#!/bin/sh\nprintf "%s:%s\\n" "${0##*/}" "$*" >> "$PREMERGE_RECORD"\ntest -f suite-ok\n')
+        program.write_text(FAKE_SUITE)
         program.chmod(0o755)
     monkeypatch.setenv("PATH", str(programs) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("PREMERGE_RECORD", str(record))
-    assert orch.premerge(c.ctx, c.pr)["ready"] is True
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is True, (report["unverified"], report["broken"])
+    assert report["unverified"] == []
     uv, *others = record.read_text().splitlines()
     # pytest also writes JUnit so failures can be compared with the base.
     assert uv.startswith("uv:run pytest --rootdir=. -o junit_family=legacy --junit-prefix= --junitxml=")
@@ -540,7 +563,11 @@ def test_without_per_test_results_the_exit_code_decides(git_history, tmp_path, m
     c = suite_case(git_history, tmp_path, {SUITE_FILE: SKIPPED}, mode="all",
                    command="true" if command == "non-pytest" else "pytest")
     report = orch.premerge(c.ctx, c.pr)
-    assert report["ready"] is True and report["broken"] == [], report
+    if command == "non-pytest":  # A suite that cannot report tests is judged by its exit code.
+        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], report
+    else:  # A pytest suite that reports no test cannot prove base tests still pass: fail closed.
+        assert report["ready"] is False and report["tests"] == "fail", report
+        assert report["unverified"] == ["pytest: no per-test result for the merge result"], report
 
 
 # Selection coverage: base-passing tests protect a merge only inside the selection the head ran.
@@ -584,3 +611,81 @@ def test_conflicting_head_is_not_compared_with_base_passing_tests(git_history, t
     report = orch.premerge(c.ctx, c.pr)
     assert report["conflicts"] == ["base.txt"] and report["ready"] is False, report
     assert report["broken"] == [], "Tests the unmerged head never had are not regressions"
+
+
+# Fail closed: an early stop, a broken base module or an unknown selection never hides a lost test.
+ORDERED = "tests/acceptance/test_ordered.py"
+SIBLING = f"{ORDERED}::test_sibling"
+FIRST_FAILS = "def test_existing_failure():\n    assert False, 'known'\n\n"
+SIBLING_SOURCE = "def test_sibling():\n    assert True\n"
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+@pytest.mark.parametrize("stop", ["-x", "--maxfail=1"])
+def test_early_stop_options_cannot_hide_a_removed_sibling(git_history, tmp_path, mode, stop):
+    c = suite_case(git_history, tmp_path, {ORDERED: FIRST_FAILS}, mode=mode, command=f"{PYTEST} {stop}",
+                   base_files={ORDERED: FIRST_FAILS + SIBLING_SOURCE})
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["broken"] == [SIBLING], report
+    assert f"{ORDERED}::test_existing_failure" in report["failing_on_base"], report
+    with pytest.raises(orch.OrchError, match=SIBLING):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+
+
+BROKEN_MODULE = {"tests/acceptance/test_broken_import.py": "import not_a_module_anywhere\n"}
+
+
+@pytest.mark.parametrize("continue_flag", [True, False])
+def test_existing_collection_error_still_protects_collected_tests(git_history, tmp_path, continue_flag):
+    command = f"{PYTEST} --continue-on-collection-errors" if continue_flag else PYTEST
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: SKIPPED}, mode="all", command=command,
+                   base_files=BROKEN_MODULE)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["tests"] == "fail", report
+    if continue_flag:  # The base JUnit records the passing test that the head skips.
+        assert report["broken"] == [KEPT], report
+    else:  # Without per-test results the comparison is unusable, and says so.
+        assert report["unverified"], report
+    assert c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_unknown_base_selection_fails_closed_with_a_reason(git_history, tmp_path, monkeypatch, mode):
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode=mode)
+    monkeypatch.setattr(orch, "selected_on_base", lambda *args, **kwargs: None)
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["tests"] == "fail", report
+    assert len(report["unverified"]) == 1 and "unknown" in report["unverified"][0], report
+    with pytest.raises(orch.OrchError, match="unverified"):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+
+
+def test_base_collection_with_errors_still_lists_its_tests(git_history, tmp_path):
+    from contextlib import nullcontext
+
+    from foragent.orch_premerge_scope import full_selection, selected_on_base
+
+    c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode="all", base_files=BROKEN_MODULE)
+    c.ctx.git.fetch("origin", "main")
+    base = c.ctx.git.ref_sha("refs/remotes/origin/main")
+    log = tmp_path / "scope.log"
+    scope = selected_on_base(c.ctx, full_selection(PYTEST), base, log=log,
+                             check=lambda command, root: orch._suite_process(
+                                 c.ctx, c.pr, command, root, log, "scope", nullcontext()))
+    assert scope is not None and {KEPT, NEIGHBOUR, f"{UNIT_FILE}::test_unit"} <= scope, scope
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_base_report_missing_a_test_at_risk_fails_closed(git_history, tmp_path, monkeypatch, mode):
+    """A base measurement that does not name a test the merge result no longer passes proves nothing."""
+    from foragent.run_baseline import AcceptanceBaseline
+
+    green = SKIPPED.replace("assert False, 'not built yet'", "assert True")
+    c = suite_case(git_history, tmp_path, {SUITE_FILE: green}, mode=mode)
+    monkeypatch.setattr(orch, "_capture_baseline", lambda ctx, command, base, **kwargs: AcceptanceBaseline(
+        command, (NEIGHBOUR,), (NEIGHBOUR,), (), (), base))
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["broken"] == [], report
+    assert len(report["unverified"]) == 1 and KEPT in report["unverified"][0], report
