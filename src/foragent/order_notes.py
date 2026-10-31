@@ -13,9 +13,9 @@ from foragent.i18n import text
 from foragent.order import PlanError
 
 
-def entries(store) -> list[dict]:
+def entries(store, journal: str = "notes.jsonl") -> list[dict]:
     try:
-        stream = (store.root / "notes.jsonl").open("rb")
+        stream = (store.root / journal).open("rb")
     except FileNotFoundError:
         return []
     rows = []
@@ -44,21 +44,29 @@ def append(store, *, kind: str, boundary: str, content: str,
            "recorded_at": datetime.now(UTC).isoformat()}
     if replaces is not None:
         row["replaces"] = replaces
+    append_entry(store, row, language=language)
+    return {**row, "status": "waiting"}
+
+
+def append_entry(store, row: dict, *, journal: str = "notes.jsonl", language: str = "en") -> None:
+    """Append one durable record without taking publication, flush or store locks."""
     # A leading separator isolates a partial tail without rewriting any earlier byte.
     payload = ("\n" + json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
     store.root.mkdir(parents=True, exist_ok=True)
-    fd = os.open(store.root / "notes.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    fd = os.open(store.root / journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
         if os.write(fd, payload) != len(payload):
             raise OSError(text("order_notes_short_write", language))
         os.fsync(fd)
     finally:
         os.close(fd)
-    return {**row, "status": "waiting"}
 
 
 def pending(store) -> dict:
-    return {"orders": [], "notes": [{**row, "status": "waiting"} for row in entries(store)]}
+    from foragent import order_submissions
+
+    return {"orders": order_submissions.pending(store),
+            "notes": [{**row, "status": "waiting"} for row in entries(store)]}
 
 
 def run(args, root) -> int:
@@ -77,9 +85,11 @@ def run(args, root) -> int:
             result = pending(store)
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
-            elif not result["notes"]:
+            elif not result["notes"] and not result["orders"]:
                 print(say("order_notes_empty"))
             else:
+                for row in result["orders"]:
+                    print(say("order_submission_waiting", id=row["id"], boundary=row["boundary"]))
                 for row in result["notes"]:
                     print(say("order_notes_row", **{key: row[key] for key in ("id", "kind", "boundary", "text")}))
     except OSError as exc:

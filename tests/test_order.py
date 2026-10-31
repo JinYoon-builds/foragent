@@ -146,6 +146,57 @@ def publish(case, plan, **kwargs):
     return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **kwargs)
 
 
+@pytest.mark.parametrize("selection", [
+    {}, {"approve": True}, {"approve_keys": ["client", "api", "api"]}, {"approve_numbers": [101, 100]},
+])
+def test_deferred_order_retains_exact_plan_and_approval_selection(publishing, plan, selection):
+    from foragent import order_notes
+
+    original = deepcopy(plan)
+    report = publish(publishing, plan, defer="next-code-merge", **selection)
+    store = StateStore.for_repo("owner/repo")
+    row, = order_notes.pending(StateStore(store.root))["orders"]
+    assert row["plan"] == original
+    assert {key: row[key] for key in ("approve", "approve_keys", "approve_numbers")} == {
+        "approve": selection.get("approve", False), "approve_keys": selection.get("approve_keys", []),
+        "approve_numbers": selection.get("approve_numbers", []),
+    }
+    assert row["status"] == "waiting" and row["recorded_at"] and row["boundary"] == "next-code-merge"
+    assert "approved" not in row and "preread" not in row
+    assert "waiting" in report.summary() and "next-code-merge" in report.summary()
+    assert publishing[4] == [] and publishing[2].list_issues() == []
+    assert not (publishing[0] / FILE).exists()
+
+
+def test_deferred_order_replacement_only_appends_and_pending_does_not_write(publishing, plan):
+    from foragent import order_notes
+
+    publish(publishing, plan, defer="first", approve=True)
+    store = StateStore.for_repo("owner/repo")
+    journal = store.root / "orders.jsonl"
+    earlier = journal.read_bytes()
+    plan["summary"] = "Revised scope"
+    publish(publishing, plan, defer="second", approve_keys=["client"])
+    saved = journal.read_bytes()
+    assert saved.startswith(earlier) and len(saved) > len(earlier)
+    for _ in range(2):
+        row, = order_notes.pending(StateStore(store.root))["orders"]
+        assert row["plan"] == plan and row["boundary"] == "second"
+        assert row["approve"] is False and row["approve_keys"] == ["client"]
+        assert row["status"] == "waiting"
+        assert journal.read_bytes() == saved
+    assert len(order_notes.entries(store, "orders.jsonl")) == 2
+
+
+def test_deferred_dry_run_retains_nothing(publishing, plan):
+    from foragent import order_notes
+
+    report = publish(publishing, plan, defer="next-code-merge", approve=True, dry_run=True)
+    assert report.dry_run and report.waiting_for is None
+    assert order_notes.pending(StateStore.for_repo("owner/repo")) == {"orders": [], "notes": []}
+    assert publishing[4] == []
+
+
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_interactive_requires_boolean_before_writes(publishing, plan, value, dry_run):
