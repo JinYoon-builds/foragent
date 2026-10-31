@@ -45,7 +45,7 @@ plan, it sends the plan path to the planning session. Approval relayed from anot
 is not approval. This first-hand rule covers D71 choices: a choice about behaviour, scope,
 screen wording or the approval boundary, or a real preread QUESTION, comes through the planning
 session to the person. A choice-free fix (required behaviour settled, nothing left to choose)
-the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`
+the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve --defer <boundary>`
 after a clean preread; a Foragent caller role alone does not block that.
 
 Every GitHub write goes through fa commands: creating or changing issues, PRs, comments,
@@ -383,7 +383,23 @@ the dry-run and present the revised scope for approval.
 For a choice-free fix the orchestrator runs this step itself after a clean preread (the D71
 boundary above). After receiving the person's first-hand approval here, this planning session runs the
 validated `fa order publish PLAN.json` for real with
-`--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
+`--approve --defer <boundary>` (or `--approve-keys` for a partial approval). The agent
+chooses the shared publication boundary through planning judgment. Ordinary orders wait:
+the publication controls retain the full plan and its existing approval selection outside
+the shared checkout, even if the caller deletes the draft. Waiting is append-only; it
+takes neither the publication lock nor the flush lock and makes no commit or issues.
+Show the waiting summary and inspect retained orders with `fa order pending --json`.
+Waiting never grants approval: only explicit approval evidence supplies it, and neither
+time nor pending-view reads do. The same reviewed-tests and clean-preread requirements
+apply before retention; a later publication must check them again. A waiting submission
+has no published issue numbers, so keep its originating request processing until publication.
+
+If the person or agent explicitly judges the order urgent, add `--urgent` to publish it
+immediately. Urgency is a judgment, not a scripted classification. This uses the existing
+immediate publication path and leaves all ordinary waiting work untouched. The existing
+new-lane creation path in step 5 stays immediate so its agent and skills exist for preread.
+
+For immediate publication, `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
