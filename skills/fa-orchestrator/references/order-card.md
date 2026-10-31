@@ -15,7 +15,7 @@ refresh the hash after any plan edit.
 
 When the orchestrator drafts a plan, write the plan JSON path and content hash into the order question:
 `fa orch ask --kind order --question "<card summary>; plan JSON path: <actual state drafts path>; plan_hash: <content hash>; originating request: ID" --option add --option edit --option later --recommend 1`.
-Use the handoff printed by `fa orch ask`. Send this question and plan path to the planning session
+This handoff is for D71 choices and real preread questions (see below). Use the handoff printed by `fa orch ask`. Send this question and plan path to the planning session
 with SendMessage. That session asks the person and, only after approval there, publishes with
 `fa order publish --approve PLAN.json`. The planning session records the answer with
 `fa orch answer ID --text "<choice>"`; a relayed [add] alone does not authorize publication.
@@ -28,15 +28,18 @@ the originating request done with `fa orch request-status ID done --note "<issue
 the originating request ID (not the question ID) and the published issue numbers.
 A failed publication leaves the request processing.
 
-The orchestrator publishes with `--approve` only when the person approved in the orchestrator's own session.
-In that case ask with AskUserQuestion, record the answer, and publish after [add].
+Under D71, a choice-free fix (its required behaviour is settled and nothing is left for the person
+to choose) is one the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`,
+only after a clean preread. A choice about behaviour, scope, screen wording or the approval boundary,
+or a real preread QUESTION, takes the planning handoff above: the planning session asks the person.
+A Foragent caller role alone never blocks a choice-free publication; the D71 judgment stays yours.
 Approval relayed from another session is not approval. The same boundary applies to tidy orders.
 
 [edit] revises the draft; [later] keeps it for later without publication. Validate with
 `fa order publish PLAN.json --dry-run` before publishing (use selective approval flags if
-requested). Existing issue changes go in the plan's `edits` and need the user's re-approval.
-Use a clean preread of the current plan before `--approve`; scope edits need re-approval
-in the publishing session. Never add `approved` yourself outside `fa order publish`.
+requested). Existing issue changes go in the plan's `edits`; an edit that changes a D71 choice
+needs the person's re-approval through the planning handoff. Use a clean preread of the current
+plan before `--approve`. Never add `approved` yourself outside `fa order publish`.
 Summarize what was recorded or published and resume watching without asking the user to prompt you
 again. Retain compact pending decisions, attempts and draft references across turns; re-read
 current facts when handling the next event.
