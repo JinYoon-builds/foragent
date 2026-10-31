@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from foragent import orch, orch_stop, processes, scheduler
+from foragent.config import Config
 from foragent.processes import ProcessIdentity, ProcessTable
 from foragent.reasons import Reason
 from foragent.scheduler_stop import _restore_stopped
@@ -102,10 +103,54 @@ def test_a_reused_pid_with_another_start_time_is_refused_before_any_kill(case, m
     monkeypatch.setattr(processes, "list_processes",
                         lambda: ProcessTable((ProcessIdentity(RUNNER, 1, RUNNER, RUNNER, 99.0),)))
     monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: pytest.fail("A reused PID is not ours"))
-    # The recorded runner is gone, so stop agrees with park and status: not running (#435).
-    with pytest.raises(orch.OrchError, match="not running"):
+    # The record is unfinished, so status lists it (#1207); #261 still refuses to signal the PID.
+    with pytest.raises(orch.OrchError, match="a different process now has this PID"):
         orch.stop(case.ctx, 1, "reprioritize")
     assert case.store.get_run(1).status == "running"
+
+
+@pytest.mark.parametrize("outcome", ["stopped", "killed"])
+def test_an_explicit_stop_of_gone_workers_keeps_the_work_while_the_tick_records_a_crash(
+    case, monkeypatch, outcome,
+):
+    """#1207: a "gone" result finishes an explicit stop as stopped; the tick's kill stays a crash."""
+    from foragent import scheduler_recovery
+
+    monkeypatch.setattr(scheduler_recovery, "_stop_run_processes", lambda *a, **k: "gone")
+    saved, dead = [], []
+    monkeypatch.setattr(scheduler, "_remove_run_worktree",
+                        lambda ctx, n, wt, report, *, outcome, why="": saved.append((n, outcome, why)))
+    monkeypatch.setattr(scheduler_recovery, "_finish_dead_run", lambda ctx, run, report: dead.append(run.number))
+    ctx = SimpleNamespace(store=case.store, now=case.ctx.now)
+    detail = "keep it" if outcome == "stopped" else ""
+    killed = scheduler_recovery._kill_run(ctx, 1, scheduler.TickReport(), outcome=outcome, detail=detail)
+    if outcome == "stopped":
+        assert killed and saved == [(1, "stopped", "keep it")] and dead == []
+        assert (case.store.get_run(1).status, case.store.get_run(1).outcome) == ("finished", "stopped")
+        assert [run.outcome for run in case.store.read_history()] == ["stopped"]
+    else:
+        assert not killed and saved == [] and dead == [1] and case.store.get_run(1).status == "running"
+
+
+def test_stop_reads_the_same_unfinished_records_as_status_active_runs(case, monkeypatch):
+    """#1207: an implementing record whose workers are gone is listed by status and stopped."""
+    from foragent import status
+
+    monkeypatch.setattr(processes, "list_processes", lambda: ProcessTable(()))  # The workers are gone.
+    case.store.update_run(1, phase="implementing")
+    listed = status.collect(case.store, Config(), datetime(2026, 10, 27, tzinfo=UTC))["active_runs"]
+    assert [(run["number"], run["status"], run["phase"]) for run in listed] == [(1, "running", "implementing")]
+    calls = []
+
+    def kill(ctx, number, report, **kwargs):
+        calls.append(number)
+        ctx.store.finish_run(number, outcome="stopped", detail=kwargs["detail"])
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert calls == [1] and case.store.get_run(1).status == "finished"
+    assert status.collect(case.store, Config(), datetime(2026, 10, 27, tzinfo=UTC))["active_runs"] == []
 
 
 @pytest.mark.parametrize("table", [
