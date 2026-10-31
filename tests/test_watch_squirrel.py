@@ -376,3 +376,21 @@ def test_the_live_terminal_uses_its_own_width_for_the_column_rules(tmp_path, mon
     border = next(line for line in painted.values() if line.startswith("+-"))
     assert watch._cells(border.rstrip()) == columns, border
     assert all(watch._cells(line) <= columns for line in painted.values())
+
+
+@pytest.mark.parametrize("meter,queued,expected", [
+    ({"running": 1, "budget": 1}, True, "waiting its turn · file overlap: a.py · slots full"),
+    ({"running": 0, "budget": 1}, True, "waiting its turn · file overlap: a.py"),
+    ({"running": 1, "budget": 1}, False, "waiting its turn · file overlap: a.py"),
+    ({"running": 1, "budget": 0}, True, "waiting its turn · file overlap: a.py"),
+    ({"running": True, "budget": 1}, True, "waiting its turn · file overlap: a.py"),
+])
+def test_overlap_wait_also_names_full_slots_from_the_collected_meter(meter, queued, expected):
+    from foragent.watch_data import Snapshot
+    from foragent.watch_scene import waiting_reason
+
+    snapshot = Snapshot(status={}, done={}, order=None, completed=0, total=0, eta=None, events=[],
+                        captured_at=NOW, meter=meter, waiting_facts={2: {"kind": "file-overlap", "blocking_issues": [],
+                                           "overlapping_files": ["a.py"]}})
+    row = {"issue": 2, "queued": [{"number": 2}] if queued else []}
+    assert waiting_reason(snapshot, row, 2, "en") == expected

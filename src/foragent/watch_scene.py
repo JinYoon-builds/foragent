@@ -158,9 +158,22 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
         return t("lane_blocks_wait_machine")
     if kind == "file-overlap":
         paths = [str(path) for path in facts.get("overlapping_files") or ()]
-        return (t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
-                else t("lane_blocks_wait_overlap_unknown"))
+        reason = (t("lane_blocks_wait_overlap", paths=", ".join(paths)) if paths
+                  else t("lane_blocks_wait_overlap_unknown"))
+        # Facts name the overlap first (its kind order); a queued issue whose slots the
+        # collected meter also records as full waits for both, so both are shown.
+        queued = any(isinstance(item, dict) and item.get("number") == number for item in row.get("queued") or ())
+        return t("lane_blocks_wait_and_slots", reason=reason) if queued and slots_full(snapshot.meter) else reason
     return t("lane_blocks_wait")
+
+
+def slots_full(meter: Any) -> bool:
+    """The collected meter records every slot in use: numeric running >= a positive budget."""
+    if not isinstance(meter, dict):
+        return False
+    running, budget = meter.get("running"), meter.get("budget")
+    numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (running, budget))
+    return numeric and budget > 0 and running >= budget
 
 
 def activity_warning(snapshot: Snapshot, config: Config, row: dict[str, Any], item: dict[str, Any],
