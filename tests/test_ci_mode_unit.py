@@ -224,7 +224,8 @@ def test_suite_and_listing_rejections_name_field_observed_and_expected(damage, f
 def test_excluded_test_in_report_names_the_test_and_exclusions():
     checks = [report(), report(1)]
     excluded = ["tests/acceptance/test_keep_1.py"]
-    checks[1]['report']['excluded'] = checks[1]['report']['scope']['excluded'] = excluded
+    for check in checks:
+        check['report']['excluded'] = check['report']['scope']['excluded'] = list(excluded)
     with pytest.raises(UnusableComparison) as caught:
         comparison(checks, "owner/repo", "base", "head", excluded,
                    expected_scope=measurement_scope(Config(ci_shards=2), Path('.'), excluded),
@@ -232,6 +233,19 @@ def test_excluded_test_in_report_names_the_test_and_exclusions():
     message = str(caught.value)
     assert f'report.base.collected_ids: observed "{KEEP_1}"' in message, message
     assert '["tests/acceptance/test_keep_1.py"]' in message, message
+
+
+def test_shards_must_record_the_same_exclusions():
+    checks = [report(), report(1)]
+    excluded = ["tests/acceptance/test_other.py"]
+    checks[1]['report']['excluded'] = checks[1]['report']['scope']['excluded'] = excluded
+    with pytest.raises(UnusableComparison) as caught:
+        comparison(checks, "owner/repo", "base", "head", excluded,
+                   expected_scope=measurement_scope(Config(ci_shards=2), Path('.'), excluded),
+                   expected_shards=range(2))
+    message = str(caught.value)
+    assert 'report.excluded: observed ["tests/acceptance/test_other.py"]' in message, message
+    assert "exclusions of earlier shards" in message, message
 
 
 @pytest.mark.parametrize("key,value", [
