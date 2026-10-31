@@ -15,8 +15,9 @@ MESSAGES = {
         "batch_recover_format": "{path} was written by an older Foragent; check the files it lists against the last "
                                 "commit, then delete it and run fa order flush again",
         "batch_recover_branch": "an interrupted batch was written on {branch}; switch to {branch} and run fa order flush again",
-        "batch_manifest_missing": "the batch would commit {paths}, which its journal does not list; nothing was committed",
-        "batch_lane_conflict": "two waiting orders create the lane {lane} differently; make them agree first",
+        "batch_lanes_publish_now": "an order that adds lanes is not batched; publish it now, without --defer",
+        "batch_lanes_published_now": "Published now instead of waiting for {boundary}: this order adds lanes, "
+                                     "and orders that add lanes are never batched.",
         "batch_waiting": "Waiting for {boundary}: {title} ({approved} of {count} issue(s) approved). "
                          "Run fa order flush --boundary {boundary} when that boundary arrives.",
         "batch_note_waiting": "Waiting for {boundary}: {kind} note {id}. It is published with the next "
@@ -51,8 +52,9 @@ MESSAGES = {
         "batch_recover_format": "{path}은(는) 예전 Foragent가 썼어요. 적힌 파일을 마지막 커밋과 비교한 다음 지우고 "
                                 "fa order flush를 다시 실행해 주세요",
         "batch_recover_branch": "중단된 일괄 올리기는 {branch} 브랜치에서 쓰였어요. {branch}로 바꾼 다음 fa order flush를 다시 실행해 주세요",
-        "batch_manifest_missing": "일괄 커밋에 일지에 없는 {paths}이(가) 들어가려 했어요. 아무것도 커밋하지 않았어요",
-        "batch_lane_conflict": "기다리는 두 주문이 {lane} 레인을 서로 다르게 만들어요. 먼저 둘을 맞춰 주세요",
+        "batch_lanes_publish_now": "레인을 더하는 주문은 모아 올리지 않아요. --defer 없이 지금 발행해 주세요",
+        "batch_lanes_published_now": "{boundary}을(를) 기다리지 않고 지금 발행했어요. 이 주문은 레인을 더하고, "
+                                     "레인을 더하는 주문은 모아 올리지 않아요.",
         "batch_waiting": "{boundary}을(를) 기다려요: {title} (이슈 {count}개 중 {approved}개 승인). "
                          "그때가 오면 fa order flush --boundary {boundary}를 실행하세요.",
         "batch_note_waiting": "{boundary}을(를) 기다려요: {kind} 기록 {id}. 다음 "

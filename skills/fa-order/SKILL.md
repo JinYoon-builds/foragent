@@ -365,8 +365,11 @@ validated `fa order publish PLAN.json` for real with
 ordinary order waits for the shared publication boundary the person chose (for example
 `next-code-merge`, or a named publication time), so several orders and notes reach main in one
 commit. Waiting runs every publication check now, including the clean preread, and never
-approves anything by itself. Add `--urgent` only when the person or you explicitly judged this
-order urgent; it then publishes immediately. Queue an urgent order's decision and rule
+approves anything by itself. An order that adds lanes (`new_lanes`) is never batched: publish
+it without `--defer` (with `--defer` it still publishes immediately and says so), and keep the
+usual lane order of publishing without `--approve`, then preread, then `--approve`. Batching is
+for notes and for orders that add no lanes. Add `--urgent` only when the person or you
+explicitly judged this order urgent; it then publishes immediately. Queue an urgent order's decision and rule
 notes under a boundary of its own (for example `urgent-<order id>`) and run
 `fa order flush --boundary urgent-<order id>` right after it, so they land with it and
 ordinary waiting work keeps waiting. `fa order pending --json` shows what waits.

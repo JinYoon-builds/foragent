@@ -106,3 +106,15 @@ def test_summary_hour_rejects_invalid_configuration(tmp_path, hour):
     (tmp_path / '.foragent.yml').write_text(yaml.safe_dump({'notify_summary_hour': hour}))
     with pytest.raises(ConfigError, match='notify_summary_hour'):
         load_config(tmp_path, global_path=tmp_path / 'missing.yml')
+
+
+def test_inspect_names_question_merge_and_summary_kinds(ctx, monkeypatch):
+    human_question(ctx, 1)
+    flag(ctx, number=2, reason=Reason.RISK_HIGH)
+    pr(ctx, 2, body="Closes #2")
+    ctx.config = replace(ctx.config, notify_summary_hour=ctx.now().astimezone().hour)
+    kinds = []
+    monkeypatch.setattr('foragent.notify.deliver',
+                        lambda config, title, line, link=None, *, kind=None, root=None: kinds.append(kind))
+    notify(ctx)
+    assert sorted(kinds) == ['merge', 'question', 'summary']

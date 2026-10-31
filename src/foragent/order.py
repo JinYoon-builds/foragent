@@ -20,7 +20,7 @@ from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, late
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
-from foragent.lanes import add_lane, lane_files, resolve_skills, validate_lane
+from foragent.lanes import add_lane, lane_files, validate_lane
 from foragent.order_files import blob_id, check_destinations, check_write, issue_body, validate_paths, write_atomic
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -430,8 +430,8 @@ def write_order_files(plan: dict, root: Path, config: Config, git: GitRepo, file
                       manager: SkillManager | None, write_files: bool = True) -> None:
     """Write this order's own paths (and new lanes) on the refreshed base, without committing them.
 
-    New lanes commit through ``git``; a batch passes one that defers those commits to its own.
-    With ``write_files`` false only the checks and lanes run; ``write_files_now`` writes later."""
+    New lanes commit through ``git`` (a batch never has any). With ``write_files`` false only
+    the checks run, and ``write_files_now`` writes once the batch commit exists."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     roots = _own_roots(plan, config, files)
     check_destinations(root, files)
@@ -687,7 +687,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if lane["name"] in config.lanes:
             existing = config.lanes[lane["name"]]
             if (existing.get("paths", []) != lane["paths"] or existing.get("agent") != f"fa-{lane['name']}"
-                    or existing.get("skills", []) != resolve_skills(root, config, lane["skills"], manager)):
+                    or existing.get("skills", []) != [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]]):
                 raise PlanError(f"existing lane differs from plan: {lane['name']}")
         else:
             validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)

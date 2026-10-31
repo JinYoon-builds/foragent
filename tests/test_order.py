@@ -2174,38 +2174,6 @@ def test_batch_identical_notes_in_the_same_second_are_both_published(publishing,
     assert (root / "docs/decisions.md").read_text().count("Same text.") == 2
 
 
-def _lane_plan(plan, identity):
-    value = deepcopy(plan)
-    value["id"], value["title"] = f"2026-10-31-{identity}", f"Order {identity}"
-    value["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
-    value["issues"] = [dict(value["issues"][1], key=identity, title=f"{identity} web", lane="web", blocked_by=[])]
-    return value
-
-
-@pytest.mark.parametrize("count", [1, 2])
-def test_batch_orders_creating_the_same_new_lane_publish_with_the_created_lane(publishing, plan, count):
-    plans = [_lane_plan(plan, f"web{index}") for index in range(count)]
-    for value in plans:
-        _batch(publishing, value)
-    _flush(publishing)
-    root, tracker, events = publishing[0], publishing[2], publishing[4]
-    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
-    titles = {issue.title: issue for issue in tracker.list_issues()}
-    for value in plans:
-        assert "lane:web" in titles[value["issues"][0]["title"]].labels
-
-
-def test_batch_rejects_one_new_lane_declared_two_ways_before_writes(publishing, plan):
-    first, second = _lane_plan(plan, "one"), _lane_plan(plan, "two")
-    second["new_lanes"][0]["paths"] = ["site/**"]
-    _batch(publishing, first)
-    _batch(publishing, second)
-    with pytest.raises(order.PlanError, match="web"):
-        _flush(publishing)
-    assert publishing[4] == [] and not (publishing[0] / ".claude/agents/fa-web.md").exists()
-
-
 def test_batch_refuses_a_done_when_file_that_changed_after_deferral(publishing, plan):
     from foragent import order_batch
 
@@ -2410,101 +2378,6 @@ def test_batch_recovery_refuses_a_file_edited_after_the_killed_write(publishing,
     assert not (root / ".foragent/order-batch-journal.json").exists()
 
 
-def _skill_manager(root):
-    library = root.parent / f"{root.name}-library"
-    skill = library / "skills/testing-strategy"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("---\nname: testing-strategy\ndescription: Tests\n---\nUse tests.\n")
-    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
-    return SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
-                        run=lambda args: "a" * 40 + "\n")
-
-
-LANE_STEPS = ["skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit",
-              "batch_commit", "batch_unrecorded", "push"]
-
-
-@pytest.mark.parametrize("killed", [False, True], ids=["raised", "killed"])
-@pytest.mark.parametrize("step", LANE_STEPS)
-def test_batch_lane_creation_interrupted_at_each_write_resumes(publishing, plan, monkeypatch, step, killed):
-    import pathlib
-
-    from foragent import lanes, order_batch, order_batch_journal, skills
-
-    root, config, tracker, git, events = publishing
-    (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
-    git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
-    manager = _skill_manager(root)
-    value = _lane_plan(plan, "web0")
-    value["new_lanes"][0]["skills"] = ["local:testing-strategy"]
-    order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
-    attributes = (root / ".gitattributes").read_bytes() if (root / ".gitattributes").exists() else None
-    stop = SystemExit(9)
-    write_text, commit_paths = pathlib.Path.write_text, git.commit_paths
-    write_bytes = pathlib.Path.write_bytes
-
-    def raise_stop(*args, **kwargs):
-        raise stop
-
-    if step == "skill_copy":  # the process dies part way through copying the skill
-        def partial_copy(source, destination, *args, **kwargs):
-            destination.mkdir(parents=True)
-            (destination / "SKILL.md").write_text("---\nname: testing-str")
-            raise stop
-        monkeypatch.setattr(skills.shutil, "copytree", partial_copy)
-    elif step == "gitignore_written":  # .gitignore is cut short before .foragent.yml is saved
-        def truncated(path, data, *args, **kwargs):
-            if path.name == ".gitignore":
-                write_bytes(path, data[:len(data) // 2])
-                raise stop
-            return write_bytes(path, data, *args, **kwargs)
-        monkeypatch.setattr(pathlib.Path, "write_bytes", truncated)
-    elif step == "config_saved":  # .foragent.yml is saved; the agent file is not written yet
-        def agent_fails(path, *args, **kwargs):
-            if path.name == "fa-web.md":
-                raise stop
-            return write_text(path, *args, **kwargs)
-        monkeypatch.setattr(pathlib.Path, "write_text", agent_fails)
-    elif step == "agent_written":
-        monkeypatch.setattr(lanes, "lane_files", raise_stop)
-    elif step == "lane_commit":  # where add_lane commits: the batch defers that commit to its own
-        monkeypatch.setattr(order_batch._DeferredCommits, "commit_paths", raise_stop)
-    elif step == "batch_commit":
-        # `git add` runs before the failing commit, so its paths are left staged.
-        monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record, contents=None: (git.stage(paths), raise_stop()))
-    elif step == "batch_unrecorded":  # the batch commit landed; its sha is not recorded yet
-        monkeypatch.setattr(order_batch_journal, "batch_done", raise_stop)
-    else:
-        monkeypatch.setattr(git, "push_base", raise_stop)
-    if killed:
-        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
-    with pytest.raises(SystemExit):
-        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
-    monkeypatch.undo()
-    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    if not killed and step in {"skill_copy", "gitignore_written", "config_saved", "agent_written", "lane_commit",
-                               "batch_commit"}:
-        assert "web" not in load_config(root).lanes, "An uncommitted lane is undone with the batch"
-        assert not (root / ".claude/agents/fa-web.md").exists()
-        assert not (root / ".claude/skills/testing-strategy").exists()
-        assert (root / ".gitignore").read_text() == "THIRD_PARTY_NOTICES.md\n"
-        # add_lane also writes the lane-memory attributes; they go back with the rest.
-        assert ((root / ".gitattributes").read_bytes() if (root / ".gitattributes").exists() else None) == attributes
-    if not killed:
-        assert git.index == {}, "rollback unstages lane and batch paths alike"
-    stale = load_config(root)  # the CLI loads config before the flush settles the journal
-    order_batch.flush("next-code-merge", root, stale, tracker, repo="owner/repo", git=git, manager=manager)
-    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
-    assert (root / ".claude/agents/fa-web.md").is_file()
-    assert (root / ".claude/skills/testing-strategy/SKILL.md").is_file()
-    assert (root / ".gitignore").read_text().count("/.claude/skills/testing-strategy/") == 1
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes")
-    issue, = [issue for issue in tracker.list_issues() if issue.title == "web0 web"]
-    assert "lane:web" in issue.labels
-    assert order_batch.pending(root)["orders"][0]["status"] == "published"
-    assert not (root / ".foragent/order-batch-journal.json").exists()
-    assert git.index == {}
-
 
 @pytest.mark.parametrize("target", ["spec", "rules"])
 def test_batch_write_killed_mid_file_leaves_old_bytes_and_resumes(publishing, plan, monkeypatch, target):
@@ -2544,40 +2417,6 @@ def test_batch_write_killed_mid_file_leaves_old_bytes_and_resumes(publishing, pl
     assert leftovers == [], leftovers
 
 
-@pytest.mark.parametrize("killed", [False, True], ids=["raised", "killed"])
-def test_batch_second_new_lane_interrupted_keeps_the_committed_first_lane(publishing, plan, monkeypatch, killed):
-    import pathlib
-
-    from foragent import order_batch, order_batch_journal
-
-    root, config, tracker, git, events = publishing
-    git.saved[".foragent.yml"] = (root / ".foragent.yml").read_text()
-    value = _lane_plan(plan, "two")
-    value["new_lanes"].append({"name": "site", "paths": ["site/**"], "skills": []})
-    value["issues"].append(dict(value["issues"][0], key="site", title="two site", lane="site"))
-    _batch(publishing, value)
-    write_text = pathlib.Path.write_text
-
-    def second_agent_dies(path, *args, **kwargs):
-        if path.name == "fa-site.md":
-            raise SystemExit(9)
-        return write_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(pathlib.Path, "write_text", second_agent_dies)
-    if killed:
-        monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
-    with pytest.raises(SystemExit):
-        _flush(publishing)
-    monkeypatch.undo()
-    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    if not killed:
-        assert set(load_config(root).lanes) == {"api"}, "nothing of an uncommitted batch stays"
-    order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git)
-    assert {"web", "site"} <= set(load_config(root).lanes)
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md", ".claude/agents/fa-site.md")
-    assert order_batch.pending(root)["orders"][0]["status"] == "published"
-
-
 def _order_cli(publishing, monkeypatch):
     """The real `fa order` CLI on the offline tracker and Git, reading .foragent.yml from disk."""
     root, _config, tracker, git, _events = publishing
@@ -2586,58 +2425,6 @@ def _order_cli(publishing, monkeypatch):
     monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
     monkeypatch.setenv("FORAGENT_VIEW", "off")
     return lambda *args: cli.main(["order", *args, "--repo-root", str(root)])
-
-
-@pytest.mark.parametrize("damage", ["truncated", "empty"])
-def test_batch_cli_flush_recovers_a_damaged_configuration_before_reading_it(publishing, plan, monkeypatch,
-                                                                           capsys, damage):
-    from foragent import config as config_module, order_batch, order_batch_journal
-
-    root, config, tracker, git, events = publishing
-    original = (root / ".foragent.yml").read_text()
-    git.saved[".foragent.yml"] = original
-    _batch(publishing, _lane_plan(plan, "web0"))
-    save = config_module.LaneSettings.save
-
-    def dies_mid_save(self):  # a writer killed part way leaves damaged YAML behind
-        text = self.check()
-        self.path.write_text(text[:len(text) // 3] + "lanes: {web: [" if damage == "truncated" else "")
-        raise SystemExit(9)
-
-    real_recover = order_batch_journal.recover
-    monkeypatch.setattr(config_module.LaneSettings, "save", dies_mid_save)
-    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # killed: no cleanup
-    with pytest.raises(SystemExit):
-        _flush(publishing)
-    monkeypatch.setattr(config_module.LaneSettings, "save", save)
-    monkeypatch.setattr(order_batch_journal, "recover", real_recover)
-    run = _order_cli(publishing, monkeypatch)
-    assert run("pending", "--json") == 0  # the queue stays visible while the file is damaged
-    capsys.readouterr()
-    assert run("flush", "--boundary", "next-code-merge") == 0, capsys.readouterr().err
-    assert load_config(root).lanes["web"]["paths"] == ["web/**"]
-    assert order_batch.pending(root)["orders"][0]["status"] == "published"
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
-
-
-def test_lane_settings_save_is_atomic(tmp_path, monkeypatch):
-    import os
-
-    from foragent import config as config_module
-
-    path = tmp_path / ".foragent.yml"
-    path.write_text("lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
-    settings = config_module.LaneSettings(path)
-    settings.add_lane("web", {"paths": ["web/**"], "agent": "fa-web", "skills": []}, load_config(tmp_path).lanes)
-    replace = os.replace
-    monkeypatch.setattr(config_module.os, "replace", lambda *args: (_ for _ in ()).throw(SystemExit(9)))
-    with pytest.raises(SystemExit):
-        settings.save()
-    assert path.read_text() == "lanes: {api: {paths: ['api/**'], agent: fa-api}}\n"
-    assert [p.name for p in tmp_path.iterdir()] == [".foragent.yml"]
-    monkeypatch.setattr(config_module.os, "replace", replace)
-    settings.save()
-    assert "web" in load_config(tmp_path).lanes
 
 
 def test_batch_recovery_runs_only_on_the_branch_it_wrote_on(publishing, plan, monkeypatch):
@@ -2997,43 +2784,6 @@ def test_batch_failed_commit_leaves_nothing_staged_in_a_real_repository(offline_
 
 
 
-def _one_batch_commit(events, *lane_files):
-    """A batch with new lanes makes exactly one commit, and it carries the lanes' files."""
-    commits = [event for event in events if event[0] == "commit"]
-    assert [event[1].split(":")[0] for event in commits] == ["Foragent batch next-code-merge"], commits
-    assert set(lane_files) <= commits[0][2].keys(), sorted(commits[0][2])
-
-
-
-def test_batch_recovery_keeps_lane_files_someone_else_committed_meanwhile(publishing, plan, monkeypatch):
-    from foragent import order_batch, order_batch_journal
-
-    root, config, tracker, git, events = publishing
-    (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
-    git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
-    _batch(publishing, _lane_plan(plan, "web0"))
-    monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record, contents=None: (git.stage(paths), _die()))
-    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)  # killed before cleanup
-    with pytest.raises(SystemExit):
-        _flush(publishing)
-    monkeypatch.undo()
-    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    git.index.clear()
-    # Meanwhile someone commits another lane and an ignore rule on the same base.
-    site = "lanes: {api: {paths: ['api/**'], agent: fa-api}, site: {paths: ['site/**'], agent: fa-site}}\n"
-    git.unrelated_commit(".foragent.yml", site)
-    git.unrelated_commit(".gitignore", "THIRD_PARTY_NOTICES.md\n/site-cache/\n")
-    git.unrelated_commit(".claude/agents/fa-site.md", "site agent\n")
-    order_batch.recover(root, git)
-    assert (root / ".foragent.yml").read_text() == site, "committed work is never rolled back"
-    assert "/site-cache/" in (root / ".gitignore").read_text()
-    assert not (root / ".claude/agents/fa-web.md").exists() and git.index == {}
-    _flush(publishing)
-    assert set(load_config(root).lanes) == {"api", "site", "web"}
-    assert (root / ".claude/agents/fa-site.md").read_text() == "site agent\n"
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
-
-
 def _notes_case(publishing, plan):
     from foragent import order_batch
 
@@ -3139,62 +2889,6 @@ def test_real_git_commit_recorded_hands_over_the_sha_before_head_moves(git_histo
     with pytest.raises(SystemExit):
         repo.commit_recorded(["batch.txt"], "Foragent batch y", dies)
     assert repo.head_sha() == sha, "a death before recording never moves HEAD"
-
-
-def _aliased_manager(root):
-    """A library skill whose alias (its SKILL.md name) differs from its directory name."""
-    library = root.parent / f"{root.name}-aliases"
-    skill = library / "skills/testing-strategy"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("---\nname: tester\ndescription: Tests\n---\nUse tests.\n")
-    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\nMIT License\n")
-    return SkillManager(Config(skill_libraries=[{"name": "local", "repo": "local", "path": str(library)}]),
-                        run=lambda args: "a" * 40 + "\n")
-
-
-@pytest.mark.parametrize("second", ["local:tester", "local:testing-strategy"])
-def test_batch_new_lane_with_a_skill_alias_publishes_its_issues(publishing, plan, second):
-    from foragent import order_batch
-
-    root, config, tracker, git, events = publishing
-    manager = _aliased_manager(root)
-    plans = []
-    for index, identity in enumerate(["local:tester", second]):
-        value = _lane_plan(plan, f"web{index}")
-        value["new_lanes"][0]["skills"] = [identity]
-        order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
-        plans.append(value)
-    order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
-    assert load_config(root).lanes["web"]["skills"] == ["testing-strategy"]
-    titles = {issue.title for issue in tracker.list_issues()}
-    assert {"web0 web", "web1 web"} <= titles, "both orders name the same installed skill"
-    assert {row["status"] for row in order_batch.pending(root)["orders"]} == {"published"}
-
-
-def test_batch_existing_lane_files_are_in_the_manifest_and_unstaged_on_failure(publishing, plan, monkeypatch):
-    from foragent import order_batch
-
-    root, config, tracker, git, events = publishing
-    git.saved[".foragent.yml"] = (root / ".foragent.yml").read_text()
-    value = _lane_plan(plan, "web0")
-    # An earlier interrupted publication left the lane configured but not committed.
-    from foragent.lanes import add_lane
-
-    add_lane(root, "web", ["web/**"], git=SimpleNamespace(current_branch=lambda: "main",
-                                                            ensure_tracked=lambda paths: None,
-                                                            commit_paths=lambda paths, title: None), push=False)
-    before = _checkout(root)
-    config = load_config(root)
-    order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo")
-    monkeypatch.setattr(git, "commit_recorded", lambda paths, title, record, contents=None: (git.stage(paths), _die()))
-    with pytest.raises(SystemExit):
-        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git)
-    monkeypatch.undo()
-    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    assert git.index == {}, "every committed path is listed, so rollback unstages it"
-    assert _checkout(root) == before
-    order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git)
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
 
 
 @pytest.mark.parametrize("partial", ["parent-only", "unmapped-child"])
@@ -3326,13 +3020,11 @@ def test_batch_killed_before_its_commit_leaves_no_note_for_another_commit_to_pic
     assert [event[0] for event in events].count("commit") == 1
 
 
-def test_batch_landed_recovery_unstages_every_listed_path_lane_files_included(publishing, plan, monkeypatch):
+def test_batch_landed_recovery_unstages_every_listed_path(publishing, plan, monkeypatch):
     from foragent import order_batch, order_batch_journal
 
     root, config, tracker, git, events = publishing
-    git.saved[".foragent.yml"] = (root / ".foragent.yml").read_text()
-    value = _lane_plan(plan, "web0")
-    _batch(publishing, value)
+    _notes_case(publishing, plan)
     monkeypatch.setattr(order_batch, "_committed", _die)  # HEAD moved; the checkpoint is not written
     monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
     with pytest.raises(SystemExit):
@@ -3340,12 +3032,11 @@ def test_batch_landed_recovery_unstages_every_listed_path_lane_files_included(pu
     monkeypatch.undo()
     monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
     # A stop right after HEAD moved leaves the earlier index entries: a staged reversal.
-    git.index.update({".foragent.yml": "lanes: {api: {paths: ['api/**'], agent: fa-api}}\n",
-                      f"docs/specs/{value['id']}.md": None})
+    git.index.update({"docs/rules.md": "# Rules\n- A. (D1)\n", f"docs/specs/{plan['id']}.md": None})
     assert order_batch.recover(root, git) is True
     assert git.index == {}, "no reversal of the published batch stays staged"
     _flush(publishing)
-    _one_batch_commit(events, ".foragent.yml", ".claude/agents/fa-web.md")
+    assert [event[0] for event in events].count("commit") == 1
 
 
 def test_real_git_stop_after_head_moves_leaves_no_staged_reversal(offline_publication, plan, monkeypatch):
@@ -3396,30 +3087,32 @@ def test_batch_refuses_a_symlinked_note_destination_before_reading_or_committing
     assert not (root / ".foragent/order-batch-journal.json").exists()
 
 
-def test_batch_recovery_keeps_every_resource_of_a_lane_whose_configuration_stays(publishing, plan, monkeypatch):
-    from foragent import order_batch, order_batch_journal
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new-lane", "lane-already-configured"])
+def test_deferred_order_that_adds_lanes_publishes_now_and_leaves_the_queue_empty(
+        publishing, plan, monkeypatch, capsys, existing):
+    from foragent import order_batch
 
     root, config, tracker, git, events = publishing
-    (root / ".gitignore").write_text("THIRD_PARTY_NOTICES.md\n")
-    git.saved.update({name: (root / name).read_text() for name in (".foragent.yml", ".gitignore")})
-    manager = _skill_manager(root)
-    value = _lane_plan(plan, "web0")
-    value["new_lanes"][0]["skills"] = ["local:testing-strategy"]
-    order_batch.defer(value, "next-code-merge", root, config, tracker, repo="owner/repo", manager=manager)
-    monkeypatch.setattr(git, "commit_recorded", _die)  # killed before the batch commit
-    monkeypatch.setattr(order_batch_journal, "recover", lambda *args: None)
-    with pytest.raises(SystemExit):
-        order_batch.flush("next-code-merge", root, config, tracker, repo="owner/repo", git=git, manager=manager)
-    monkeypatch.undo()
-    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
-    # Another process commits only the lane configuration it found in the checkout.
-    git.unrelated_commit(".foragent.yml", (root / ".foragent.yml").read_text())
-    assert order_batch.recover(root, git) is True
-    assert "web" in load_config(root).lanes
-    for kept in (".claude/agents/fa-web.md", ".claude/skills/testing-strategy/SKILL.md"):
-        assert (root / kept).is_file(), f"a configured lane keeps {kept}"
-    assert "/.claude/skills/testing-strategy/" in (root / ".gitignore").read_text()
-    order_batch.flush("next-code-merge", root, load_config(root), tracker, repo="owner/repo", git=git,
-                      manager=manager)
-    assert order_batch.pending(root)["orders"][0]["status"] == "published"
-    assert "lane:web" in next(i for i in tracker.list_issues() if i.title == "web0 web").labels
+    plan["new_lanes"] = [{"name": "api" if existing else "web", "paths": ["api/**" if existing else "web/**"],
+                          "skills": []}]
+    if existing:  # the plan repeats a lane already in .foragent.yml; any new_lanes still counts
+        (root / ".claude/agents").mkdir(parents=True)
+        (root / ".claude/agents/fa-api.md").write_text("agent\n")
+    path = root / "PLAN.json"
+    path.write_text(json.dumps(plan))
+    run = _order_cli(publishing, monkeypatch)
+    assert run("publish", str(path), "--defer", "next-code-merge") == 0, capsys.readouterr().err
+    assert "Published now instead of waiting for next-code-merge" in capsys.readouterr().out
+    assert order_batch.pending(root) == {"orders": [], "notes": []}
+    # Today's immediate publication: the order's own commit (no batch commit) and a push.
+    assert [event[1] for event in events if event[0] == "commit"][-1].startswith(f"Foragent order {plan['id']}")
+    assert "push" in [event[0] for event in events]
+    assert not any(event[0] == "commit" and event[1].startswith("Foragent batch") for event in events)
+    assert any(issue.title == plan["title"] for issue in tracker.list_issues())
+    if not existing:
+        assert "web" in load_config(root).lanes
+    with pytest.raises(order.PlanError, match="adds lanes"):
+        order_batch.defer(plan, "next-code-merge", root, load_config(root), tracker, repo="owner/repo")
+    assert order_batch.pending(root) == {"orders": [], "notes": []}

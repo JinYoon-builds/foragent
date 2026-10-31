@@ -11,13 +11,12 @@ commit (``order_batch_journal``); issues are found again by their existing marke
 
 import hashlib
 import uuid
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from foragent import order
 from foragent import order_batch_journal as journal
-from foragent.config import Config, load_config
+from foragent.config import Config
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_batch_journal import _directory, _lock
@@ -67,16 +66,22 @@ def _approval(entry: dict) -> dict:
 
 def defer(plan: dict, boundary: str, root: Path, config: Config, tracker, *, repo: str,
           approve: bool = False, approve_keys: list[str] | None = None,
-          approve_numbers: list[int] | None = None, manager=None) -> dict:
-    """Check an order exactly as publication would, then keep its content waiting."""
+          approve_numbers: list[int] | None = None) -> dict:
+    """Check an order exactly as publication would, then keep its content waiting.
+
+    An order that adds lanes (``new_lanes``) is never queued: it publishes immediately,
+    as before batching, so a batch never creates or recovers lane configuration.
+    """
     boundary = _boundary(boundary, config.language)
+    if plan.get("new_lanes"):
+        raise order.PlanError(text("batch_lanes_publish_now", config.language))
     # Each queued version has its own revision; a time or plan id cannot tell versions apart.
     entry = {"id": plan["id"], "revision": uuid.uuid4().hex, "title": plan["title"],
              "boundary": boundary, "status": WAITING,
              "approve": approve, "approve_keys": list(approve_keys or []),
              "approve_numbers": list(approve_numbers or []), "queued_at": _now(), "plan": plan}
     # The same checks as publication, including a clean preread for approved issues.
-    order.publish(plan, root, config, tracker, repo=repo, check_only=True, manager=manager, **_approval(entry))
+    order.publish(plan, root, config, tracker, repo=repo, check_only=True, **_approval(entry))
     # Approval covers the files as they are now, including Done when tests read from disk.
     entry["files"] = _digests(order.validate_plan(plan, root, config))
 
@@ -121,21 +126,6 @@ def pending(root: Path) -> dict:
             "notes": [dict(row) for row in state["notes"]]}
 
 
-def _check_new_lanes(plans: list[dict], config: Config, root: Path, manager=None) -> None:
-    """Orders creating the same lane must agree on it, or the second would fail after the commit."""
-    from foragent.lanes import resolve_skills
-
-    seen: dict[str, tuple] = {}
-    for plan in plans:
-        for lane in plan.get("new_lanes", []):
-            if lane["name"] in config.lanes:
-                continue  # publish's own check compares it with the existing lane
-            # Skills compare by installed name, the same resolver add_lane and publish use.
-            shape = (lane["paths"], resolve_skills(root, config, lane["skills"], manager))
-            if seen.setdefault(lane["name"], shape) != shape:
-                raise order.PlanError(text("batch_lane_conflict", config.language, lane=lane["name"]))
-
-
 def _settle(root: Path, git, language: str) -> bool:
     """Undo or finish a flush that stopped mid-write; True when there was one."""
     directory = _directory(root)
@@ -159,26 +149,12 @@ def recover(root: Path, git, language: str = "en") -> bool:
         return settled
 
 
-class _DeferredCommits:
-    """The flush's Git, except that lane commits only collect paths for the batch commit."""
-
-    def __init__(self, git):
-        self._git, self.paths = git, []
-
-    def __getattr__(self, name):
-        return getattr(self._git, name)
-
-    def commit_paths(self, paths: list[str], title: str) -> None:
-        self.paths += [path for path in paths if path not in self.paths]
-
-
 def _require_base(git, config: Config) -> None:
     if git.current_branch() != config.base_branch:
         raise GitError(f"order flush must run on the base branch {config.base_branch!r}")
 
 
-def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
-          manager=None) -> dict:
+def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git) -> dict:
     """Publish what waits for ``boundary``: one commit and push, then each order's issues.
 
     Status moves waiting -> committed (the local commit exists) -> published. Before
@@ -188,9 +164,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
     boundary = _boundary(boundary, config.language)
     with _lock(root, "order-batch-flush.lock"):
         directory = _directory(root)
-        if _settle(root, git, config.language):
-            # Recovery may have undone a lane in .foragent.yml; the caller's config predates it.
-            config = replace(config, lanes=load_config(root).lanes)
+        _settle(root, git, config.language)
         _revalidate(root, git)
         state = _load(root)
         orders = [row for row in state["orders"] if row["status"] != PUBLISHED and row["boundary"] == boundary]
@@ -202,8 +176,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             if entry["status"] == COMMITTED:
                 continue  # its files are in a local commit; later edits to them must stay
             # Every order's own checks pass before anything is written for any of them.
-            order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, manager=manager,
-                          **_approval(entry))
+            order.publish(entry["plan"], root, config, tracker, repo=repo, check_only=True, **_approval(entry))
             files = order.validate_plan(entry["plan"], root, config)
             _unchanged_inputs(entry, files, config.language)
             prepared.append((entry, files))
@@ -213,7 +186,6 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                 if name in combined and combined[name] != content:
                     raise order.PlanError(text("batch_path_conflict", config.language, path=name))
                 combined[name] = content
-        _check_new_lanes([entry["plan"] for entry, _ in prepared], config, root, manager)
         _require_base(git, config)
         with git.publish_lock():
             git.update_base(config.base_branch)
@@ -228,10 +200,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                 planned = {**combined, **note_contents}
                 written = {"orders": {entry["revision"]: sorted(files) for entry, files in prepared},
                            "notes": [row["id"] for row in applying]}
-                lanes = journal.lane_writes(root, config, [lane for entry, _ in prepared
-                                                           for lane in entry["plan"].get("new_lanes", [])], manager)
-                journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha(),
-                              lanes=lanes)
+                journal.write(directory, root, planned, **written, branch=config.base_branch, base=git.head_sha())
 
                 def committed(blobs: dict[str, str]) -> None:
                     # The commit exists; only now do its order files and notes reach the checkout.
@@ -243,24 +212,15 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
                     _committed(root, written["orders"], written["notes"], blobs, git.head_sha())
                     journal.clear(directory)
 
-                deferred = _DeferredCommits(git)
                 try:
                     for entry, files in prepared:
-                        # Checks and new lanes only: no order file is in the checkout before the commit.
-                        order.write_order_files(entry["plan"], root, config, deferred, files, manager,
-                                                write_files=False)
-                        if any(lane["name"] not in config.lanes for lane in entry["plan"].get("new_lanes", [])):
-                            # Later orders and the issue pass see the lane this order just created.
-                            config = replace(config, lanes=load_config(root).lanes)
+                        # Destination checks only: no order file is in the checkout before the commit.
+                        order.write_order_files(entry["plan"], root, config, git, files, None, write_files=False)
                     title = f"Foragent batch {boundary}: {len(prepared)} order(s), {len(applying)} note(s)"
-                    if unlisted := sorted(set(deferred.paths) - set(lanes["files"]) - set(planned)):
-                        # Rollback can only undo and unstage listed paths; never commit any other.
-                        raise order.PlanError(text("batch_manifest_missing", config.language, paths=", ".join(unlisted)))
-                    # New lanes' files join this one commit: a single boundary to record and recover.
+                    # Exactly the listed paths, committed from memory: the journal can undo every one.
                     contents = {name: data.encode("utf-8") if isinstance(data, str) else data
                                 for name, data in planned.items()}
-                    order.commit_and_push(config, git, {**dict.fromkeys(deferred.paths), **planned}, title,
-                                          after_commit=committed, contents=contents,
+                    order.commit_and_push(config, git, planned, title, after_commit=committed, contents=contents,
                                           record=lambda sha: journal.batch_done(directory, sha))
                 except BaseException:
                     # Undo an uncommitted write now, so waiting work never stays in the checkout.
@@ -274,9 +234,7 @@ def flush(boundary: str, root: Path, config: Config, tracker, *, repo: str, git,
             current = next((row for row in _load(root)["orders"] if row.get("revision") == entry["revision"]), None)
             if current is None or current["status"] != COMMITTED:
                 continue  # replaced while flushing; the newer version waits for its own flush
-            if config.lanes.keys() != load_config(root).lanes.keys():
-                config = replace(config, lanes=load_config(root).lanes)
-            report = order.publish(current["plan"], root, config, tracker, repo=repo, git=git, manager=manager,
+            report = order.publish(current["plan"], root, config, tracker, repo=repo, git=git,
                                    published_blobs=current["blobs"], **_approval(current))
             parents[entry["id"]] = report.parent
             _mark(root, "orders", {entry["revision"]}, status=PUBLISHED, published_at=_now(), parent=report.parent)

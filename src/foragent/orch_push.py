@@ -147,7 +147,9 @@ def after_tick(ctx, spawned: bool) -> tuple[list[int], bool]:
         link = (f"https://github.com/{config.repo}/issues/{due[0]}"
                 if due and not outage_due and config.repo else None)
         try:
-            sent = notify.send(config, text("push_blocked_title", language), "\n".join(lines), link) is not False
+            with notify.sending("blocked" if due else "orchestrator-stopped", ctx.repo_root):
+                sent = notify.send(config, text("push_blocked_title", language), "\n".join(lines),
+                                   link) is not False
         except Exception:  # noqa: BLE001 - a failed push is retried on the next completing tick
             sent = False
     # An issue due but not sent stays out of the saved set, so the next tick sees it as new.

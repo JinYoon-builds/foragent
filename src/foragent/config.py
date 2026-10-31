@@ -4,11 +4,8 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
-import os
 from pathlib import Path
 import re
-import stat
-import tempfile
 from tempfile import NamedTemporaryFile
 from typing import Any
 
@@ -81,6 +78,8 @@ class Config:
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
     notify_summary_hour: int = 8
+    # Personal push filter (#1030): all pushes every kind; decisions pushes only decision kinds.
+    notify_filter: str = "all"
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
@@ -281,20 +280,7 @@ class LaneSettings:
         return text
 
     def save(self) -> None:
-        """Replace the file all at once, so an interrupted save never leaves damaged YAML."""
-        data = self.check().encode("utf-8")
-        mode = stat.S_IMODE(self.path.stat().st_mode) if self.path.is_file() else 0o644
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temporary, mode)
-            os.replace(temporary, self.path)
-        except BaseException:
-            Path(temporary).unlink(missing_ok=True)
-            raise
+        self.path.write_bytes(self.check().encode("utf-8"))
 
     def _mapping(self, lanes: dict[str, Any], indent: int, step: int) -> list[str]:
         lines = []
@@ -493,6 +479,7 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     local = _read_yaml(local_path)
     _overlay(values, local)
     _personal_glyphs(values, global_values)
+    _personal_notify_filter(values, global_values)
     _apply_executors(values, global_values, local)
     _validate(values)
     return Config(**values)
@@ -502,6 +489,12 @@ def _personal_glyphs(values: dict[str, Any], global_values: dict[str, Any]) -> N
     """A repository's view_glyphs auto makes no choice, so a person's own emoji or ascii applies (#173)."""
     if values.get("view_glyphs") == "auto" and global_values.get("view_glyphs") in ("emoji", "ascii"):
         values["view_glyphs"] = global_values["view_glyphs"]
+
+
+def _personal_notify_filter(values: dict[str, Any], global_values: dict[str, Any]) -> None:
+    """A person's own notify_filter wins: a project cannot turn a person's noise filter off (#1030)."""
+    if "notify_filter" in global_values:
+        values["notify_filter"] = global_values["notify_filter"]
 
 
 def _file_executors(source: dict[str, Any]) -> tuple[bool, Any]:

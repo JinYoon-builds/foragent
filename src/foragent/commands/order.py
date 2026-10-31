@@ -1,5 +1,6 @@
 """`fa order`: deterministic tools for fa-order."""
 
+from foragent import order_batch_cli
 from foragent.commands import facade, repo_store
 
 ORDER = 80
@@ -101,6 +102,11 @@ def add(commands) -> None:
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
+    prepare.add_argument("plan", type=cli.Path)
+    prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    prepare.add_argument("--status", action="store_true", help=say("prepare_help_status"))
+    prepare.add_argument("--json", action="store_true")
     perspectives = order_actions.add_parser("perspectives", help=say("perspectives_help"),
                                             description=say("perspectives_help"))
     perspectives.add_argument("target", help=say("perspectives_help_target"))
@@ -155,6 +161,24 @@ def _preread(args, root) -> int:
     return 0
 
 
+def _prepare(args, root) -> int:
+    from foragent import order_prepare
+
+    cli = facade()
+    config, repo, store = repo_store(root)
+    rows = order_prepare.prepare(cli.order.read_plan(args.plan), root, config, cli.GitRepo(root), store,
+                                 lambda: cli.GhTracker(repo), status=args.status)
+    if args.json:
+        print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+                           reason=row["reason"] or "-"))
+            for question in row["questions"]:
+                print(cli.text("prepare_row_question", config.language, text=question))
+    return 0
+
+
 def _perspectives(args, root) -> int:
     from foragent import order_perspectives
     from foragent.i18n import text
@@ -197,67 +221,6 @@ def _perspectives(args, root) -> int:
     return 0
 
 
-def _batch_local(args, root) -> int:
-    from foragent import order_batch
-    from foragent.i18n import text
-
-    cli = facade()
-    language = _help_language(root)  # the queue stays usable while .foragent.yml is damaged
-    say = lambda key, **values: text(key, language, **values)  # noqa: E731
-    if args.action == "note":
-        entry = order_batch.note(root, args.kind, args.text, args.defer, language,
-                                 replace=args.replace)
-        print(cli.json.dumps(entry, ensure_ascii=False) if args.json else
-              say("batch_note_waiting", boundary=entry["boundary"], kind=entry["kind"], id=entry["id"]))
-        return 0
-    shown = order_batch.pending(root)
-    if args.json:
-        print(cli.json.dumps(shown, ensure_ascii=False))
-        return 0
-    for row in shown["orders"]:
-        print(say("batch_pending_order", **{key: row[key] for key in ("status", "boundary", "id", "title")}))
-    for row in shown["notes"]:
-        print(say("batch_pending_note", **{key: row[key] for key in ("status", "boundary", "kind", "id", "text")}))
-    if not shown["orders"] and not shown["notes"]:
-        print(say("batch_pending_empty"))
-    return 0
-
-
-def _defer(args, root, config, tracker, repo, plan) -> int:
-    from foragent import order_batch
-    from foragent.i18n import text
-
-    entry = order_batch.defer(plan, args.defer, root, config, tracker, repo=repo, approve=args.approve,
-                              approve_keys=args.approve_keys, approve_numbers=args.approve_numbers)
-    count = len(plan["issues"]) + len(plan.get("edits", []))
-    approved = count if args.approve else len(args.approve_keys) + len(args.approve_numbers)
-    print(text("batch_waiting", config.language, boundary=entry["boundary"], title=plan["title"],
-               approved=min(approved, count), count=count))
-    return 0
-
-
-def _flush(args, root, config, tracker, repo, git) -> int:
-    from foragent import order_batch
-    from foragent.i18n import text
-
-    cli = facade()
-    result = order_batch.flush(args.boundary, root, config, tracker,
-                               repo=repo, git=git)
-    say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
-    if args.json:
-        print(cli.json.dumps(result, ensure_ascii=False))
-    elif not result["orders"] and not result["notes"]:
-        print(say("batch_nothing", boundary=result["boundary"]))
-    else:
-        print(say("batch_flushed", boundary=result["boundary"], orders=len(result["orders"]),
-                  notes=len(result["notes"])))
-        for identity, parent in result["parents"].items():
-            print(say("batch_flushed_order", id=identity, parent=parent))
-    if result["orders"]:
-        cli._open_lane_view(root)
-    return 0
-
-
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
@@ -273,7 +236,9 @@ def run(args) -> int:
     if args.action == "perspectives":
         return _perspectives(args, root)
     if args.action in {"note", "pending"}:
-        return _batch_local(args, root)
+        return order_batch_cli.local(args, root)
+    if args.action == "prepare":
+        return _prepare(args, root)
     git = cli.GitRepo(root)
     if args.action == "flush":
         from foragent import order_batch
@@ -290,10 +255,13 @@ def run(args) -> int:
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
     if args.action == "flush":
-        return _flush(args, root, config, tracker, repo, git)
+        return order_batch_cli.flush(args, root, config, tracker, repo, git)
     plan = cli.order.read_plan(args.plan)
     if args.defer is not None and not args.urgent and not args.dry_run:
-        return _defer(args, root, config, tracker, repo, plan)
+        if not plan.get("new_lanes"):
+            return order_batch_cli.defer(args, root, config, tracker, repo, plan)
+        # Orders that add lanes are never batched: they publish now, exactly as before.
+        print(cli.text("batch_lanes_published_now", config.language, boundary=args.defer))
     print(cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
