@@ -1,0 +1,1 @@
+- [id:1237-2026-10-31-goal-wording-pins] goal_condition wording (run_prompts.py) is pinned in tests/test_run_prompts.py, tests/test_run_execution.py (now built via goal_condition) and quoted in docs/impl/p7c-native.md; update all three when the goal text changes.
