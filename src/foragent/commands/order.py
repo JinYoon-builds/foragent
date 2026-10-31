@@ -15,12 +15,16 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
     "acceptance_files": {"tests/acceptance/test_login.py": "..."},
     "references": ["docs/design/login/HANDOFF.md"]}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
-    "checklist": [], "files": [], "acceptance_files": {}, "references": []}],
+    "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+edits[].blocked_by names this plan's issue keys and replaces the edited issue's native
+dependencies ([] clears them); omit it to keep them.
+A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
+publication comments one line when it changes and nothing when it is unchanged.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route

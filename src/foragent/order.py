@@ -12,7 +12,7 @@ import re
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, ownership
+from foragent import board, capacity, design, order_references, order_waiting, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -233,7 +233,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
-                         "state_group": state_group(issue, tracker)} for issue in issues],
+                         "state_group": state_group(issue, tracker),
+                         "waiting": order_waiting.section(issue.body)} for issue in issues],
         "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
@@ -302,7 +303,8 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
                                      "references", "statements"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "statements"}, label)
+                    else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
+                          "statements"}, label)
             if "statements" in item:
                 _strings(item["statements"], f"{label}.statements", nonempty=True)
                 if any("\n" in line or "\r" in line for line in item["statements"]):
@@ -334,6 +336,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
                 if type(item["number"]) is not int or item["number"] <= 0 or item["number"] in edits:
                     raise PlanError(f"{label}.number must be a unique positive integer")
                 edits.add(item["number"])
+                _strings(item.get("blocked_by", []), f"{label}.blocked_by")
             acceptance_files = item.get("acceptance_files", {})
             if not isinstance(acceptance_files, dict):
                 raise PlanError(f"{label}.acceptance_files must be an object")
@@ -385,6 +388,11 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 
     for key in dependencies:
         visit(key)
+    # An edit is no plan key, so nothing depends on it and it closes no cycle.
+    for item in plan.get("edits", []):
+        for key in item.get("blocked_by", []):
+            if key not in keys:
+                raise PlanError(f"unknown blocked_by key: {key}")
     check_destinations(root, files)
     return files
 
@@ -393,6 +401,9 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 def _plan_marker(identity: str, mapping: dict[str, int], acceptance: dict[str, dict[str, str]]) -> str:
     return (f"<!-- foragent:plan id={identity} map={json.dumps(mapping, sort_keys=True)} "
             f"acceptance={json.dumps(acceptance, sort_keys=True)} -->")
+
+
+_EDIT_MARKER = "<!-- foragent:edit plan="
 
 
 def _child_marker(identity: str, key: str) -> str:
@@ -659,7 +670,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         issue = by_number[item["number"]]
         rows.append({"number": issue.number, "title": issue.title, "size": issue_size(issue.labels),
                      "interactive": "interactive" in issue.labels,
-                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
+                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
+                                    else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
@@ -733,6 +745,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
+            order_waiting.announce(tracker, number, body)
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -741,6 +754,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
+            # A record follows the fact it describes: announce the wait the body now holds.
+            order_waiting.announce(tracker, number, body)
             tracker.remove_labels(number, [label for label in existing.labels
                                            if (label.startswith(("lane:", "size:")) or label == "interactive")
                                            and label not in labels])
@@ -766,15 +781,33 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
-            for name in sorted(blobs)}, sort_keys=True))
+            for name in sorted(blobs)}, sort_keys=True)
+            # Dependencies are part of what was approved; absent, the existing edges stay.
+            + (json.dumps(item["blocked_by"]) if "blocked_by" in item else ""))
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
-        prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
+        # Only the latest edit revision is what the issue stands approved for: an older
+        # matching revision (A, then B, then A again) does not keep B's approval.
+        latest = max((c for c in tracker.list_comments(number) if _EDIT_MARKER in c.body),
+                     key=comment_key, default=None)
+        current = latest is not None and latest.body == comment
+        changed = (existing.body != body or not current or "needs-human" in existing.labels
+                   or saved_blobs.get(str(number), {}) != blobs)
+        if changed:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
             tracker.update_issue(number, title=existing.title, body=body)
-            if not prior:
-                tracker.comment(number, comment)
+        # Records follow the facts they describe: the revision comment covers the body and
+        # the dependencies, and the waiting line the body's wait, so each comes after them.
+        if "blocked_by" in item:
+            desired = {mapping[key] for key in item["blocked_by"]}
+            edges = {dep.number for dep in tracker.blocked_by(number)}
+            for blocker in sorted(edges - desired):
+                tracker.remove_blocked_by(number, blocker)
+            for blocker in sorted(desired - edges):
+                tracker.add_blocked_by(number, blocker)
+        order_waiting.announce(tracker, number, body)
+        if changed and not current:
+            tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
     tracker.update_issue(parent, title=plan["title"], body=parent_body())
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
@@ -787,9 +820,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
         tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
-    for item, row in zip(plan["issues"], rows):
-        row["number"] = mapping[item["key"]]
-        row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
+    for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
+        row["number"] = mapping[item["key"]] if "key" in item else item["number"]
+        if "key" in item or "blocked_by" in item:
+            row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
     return PublishReport(plan["title"], parent, rows, sorted(files), False)

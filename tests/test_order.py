@@ -664,7 +664,9 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
     git.saved[name] = "first\n"
     publish(publishing, plan, approve_numbers=[9])
     assert [event.action for event in tracker.label_events(9)[len(events):]] == ["unlabeled", "labeled"]
-    assert len(tracker.list_comments(9)) == 2
+    # The latest revision was "second"; going back to "first" is a new change that needs approval.
+    comments = tracker.list_comments(9)
+    assert len(comments) == 3 and comments[-1].body == comments[0].body
     snapshot = json.loads(re.search(r"acceptance=(\{[^\n]*\}) -->", tracker.get_issue(10).body)[1])
     assert snapshot["9"] == {name: git.blob_shas(git.head_sha(), [name])[name]}
 
@@ -802,6 +804,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert result["decisions"][0]["body"] == "Current issue body"
     assert [item["state_group"] for item in result["open_issues"]] == ["unapproved", "needs-human", "needs-human", "needs-human", "running", "approved-waiting"]
     assert result["open_issues"][1]["lane"] == "api" and result["open_issues"][1]["size"] == "l"
+    assert {item["waiting"] for item in result["open_issues"]} == {None}
     assert result["specs"] == [{"path": "docs/specs/one.md", "heading": "First heading"}]
     assert result["repo"]["test_commands"] == ["uv run pytest", "pnpm test", "go test ./..."]
     assert result["repo"]["languages"] == ["Go", "JavaScript", "Python"]
@@ -2308,3 +2311,200 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "Waiting for machine capacity" in err
     order.preread(plan, root, config)  # A free slot: no notice.
     assert "own turn" not in capsys.readouterr().err
+
+
+def test_waiting_section_is_read_raw_and_ends_at_the_next_heading():
+    from foragent import order_waiting
+    body = "## Goal\nShip.\n\n## Waiting\nReason: A\n### Detail\nNext: B\n\n## Out of scope\nX\n"
+    assert order_waiting.section(body) == "Reason: A\n### Detail\nNext: B"
+    assert order_waiting.section("## Waiting\nNone.\n<!-- foragent:child plan=p key=k -->") == "None."
+    assert order_waiting.section("## Goal\nNo wait.") is None
+    line = order_waiting.comment_line("Reason: A\nNext: B")
+    assert len(line.splitlines()) == 1 and line.startswith("Waiting: Reason: A · Next: B <!--")
+    assert "cleared" in order_waiting.comment_line(None)
+
+
+def test_waiting_announcement_follows_the_latest_marker_on_the_issue():
+    from foragent import order_waiting
+    tracker = FakeTracker()
+    number = tracker.add_issue(1, "Wait", "", labels=[]).number
+    order_waiting.announce(tracker, number, "## Goal\nNo wait.\n")
+    assert tracker.list_comments(number) == []
+    order_waiting.announce(tracker, number, "## Waiting\nA\n")
+    order_waiting.announce(tracker, number, "## Waiting\nA\n")
+    assert len(tracker.list_comments(number)) == 1
+    order_waiting.announce(tracker, number, "## Goal\nDone.\n")
+    comments = tracker.list_comments(number)
+    assert len(comments) == 2 and comments[-1].body.startswith("Waiting: cleared")
+    order_waiting.announce(tracker, number, "## Goal\ny\n")
+    assert len(tracker.list_comments(number)) == 2
+    # A wait identical to an older one, after a different one, is a new transition.
+    order_waiting.announce(tracker, number, "## Waiting\nA\n")
+    assert len(tracker.list_comments(number)) == 3
+
+
+def test_edit_blocked_by_must_name_plan_keys(tmp_path, plan):
+    plan["edits"] = [{"number": 9, "goal": "g", "out_of_scope": "o", "done_when": ["true"], "blocked_by": ["nope"]}]
+    with pytest.raises(order.PlanError, match="unknown blocked_by key: nope"):
+        order.validate_plan(plan, tmp_path, Config(lanes={"api": {"paths": ["api/**"]}, "web": {"paths": ["web/**"]}}))
+    plan["edits"][0]["blocked_by"] = "api"
+    with pytest.raises(order.PlanError, match=r"edits\[0\]\.blocked_by"):
+        order.validate_plan(plan, tmp_path, Config(lanes={"api": {"paths": ["api/**"]}, "web": {"paths": ["web/**"]}}))
+
+
+def test_edit_dependency_change_alone_revokes_approval_and_absent_field_keeps_edges(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    api = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    report = publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    assert report.rows[-1]["blocked_by"] == [api]
+    tracker.add_labels(child, ["approved"])
+    publish(publishing, changed)
+    assert "approved" in tracker.get_issue(child).labels
+    del edit["blocked_by"]
+    publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    tracker.add_labels(child, ["approved"])
+    edit["blocked_by"] = []
+    publish(publishing, changed)
+    assert tracker.blocked_by(child) == [] and "approved" not in tracker.get_issue(child).labels
+
+
+def test_dependency_edit_back_to_an_older_revision_revokes_approval(publishing, plan):
+    """A -> B -> A: an older matching revision is not the approval the issue holds now."""
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    api = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    publish(publishing, changed)
+    edit["blocked_by"] = []
+    publish(publishing, changed)
+    tracker.add_labels(child, ["approved"])
+    edit["blocked_by"] = ["api"]
+    publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    assert "approved" not in tracker.get_issue(child).labels
+
+
+def test_waiting_comment_lost_after_child_creation_is_posted_on_retry(publishing, plan, monkeypatch):
+    from foragent import order_waiting
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: locale pending\n"
+    real = order_waiting.announce
+    monkeypatch.setattr(order_waiting, "announce", lambda *args: (_ for _ in ()).throw(TrackerError("comment failed")))
+    with pytest.raises(TrackerError):
+        publish(publishing, plan)
+    monkeypatch.setattr(order_waiting, "announce", real)
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    waiting = [c for c in tracker.list_comments(child) if "locale pending" in c.body]
+    assert len(waiting) == 1
+    publish(publishing, plan)
+    assert len([c for c in tracker.list_comments(child) if "locale pending" in c.body]) == 1
+
+
+def test_waiting_comment_lost_after_edit_body_update_is_posted_on_retry(publishing, plan, monkeypatch):
+    from foragent import order_waiting
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.\n\n## Waiting\nReason: catalog\n", "out_of_scope": "Other.",
+            "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    real_comment = tracker.comment
+
+    def failing(n, text):
+        if "foragent:waiting" in text:
+            raise TrackerError("comment failed")
+        return real_comment(n, text)
+
+    # The body is already written by an earlier attempt that stopped before commenting.
+    tracker.update_issue(child, title="Edited", body=order._with_contract(
+        order._published_body(changed, edit, "owner/repo", config), body))
+    monkeypatch.setattr(tracker, "comment", failing)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    monkeypatch.setattr(tracker, "comment", real_comment)
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(child) if "Reason: catalog" in c.body]) == 1
+
+
+def _failing_update(tracker, monkeypatch, number):
+    real = tracker.update_issue
+
+    def update(n, **kwargs):
+        if n == number:
+            raise TrackerError("update failed")
+        return real(n, **kwargs)
+    monkeypatch.setattr(tracker, "update_issue", update)
+    return real
+
+
+def test_failed_child_body_update_leaves_no_waiting_comment(publishing, plan, monkeypatch):
+    """The wait is announced only once the body holding it is written."""
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: A\n"
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    before = tracker.list_comments(child)
+    changed = deepcopy(plan)
+    changed["issues"][0]["goal"] = changed["issues"][0]["goal"].replace("Reason: A", "Reason: B")
+    real = _failing_update(tracker, monkeypatch, child)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+    monkeypatch.setattr(tracker, "update_issue", real)
+    publish(publishing, plan)
+    assert tracker.list_comments(child) == before
+
+
+def test_failed_edit_body_update_leaves_no_waiting_or_revision_comment(publishing, plan, monkeypatch):
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.\n\n## Waiting\nReason: A\n", "out_of_scope": "Other.", "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    publish(publishing, changed)
+    before = tracker.list_comments(child)
+    edit["goal"] = "Ship.\n\n## Waiting\nReason: B\n"
+    real = _failing_update(tracker, monkeypatch, child)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+    monkeypatch.setattr(tracker, "update_issue", real)
+    edit["goal"] = "Ship.\n\n## Waiting\nReason: A\n"
+    publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+
+
+def test_failed_edit_dependency_sync_leaves_no_revision_comment(publishing, plan, monkeypatch):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    real = tracker.add_blocked_by
+
+    def failing(n, blocker):
+        if n == child:
+            raise TrackerError("edge failed")
+        return real(n, blocker)
+    monkeypatch.setattr(tracker, "add_blocked_by", failing)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert not any("foragent:edit " in c.body for c in tracker.list_comments(child))
+    monkeypatch.setattr(tracker, "add_blocked_by", real)
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(child) if "foragent:edit " in c.body]) == 1
+    assert tracker.blocked_by(child) != []
