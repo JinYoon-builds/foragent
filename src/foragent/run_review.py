@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
-from foragent import cuts, harness_guard
+from foragent import capacity, cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE

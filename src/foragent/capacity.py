@@ -394,9 +394,14 @@ def _store_scan(
             return True
         return False
 
-    for workload in capacity_sessions.read(store.root):
-        if _alive(workload.pid) and not reuses(workload):
+    live = [workload for workload in capacity_sessions.read(store.root) if _alive(workload.pid)]
+    # A direct runner (no admitted run) holds its slot through a RUN_KIND workload: like a run
+    # record with its pid, it covers its own first further workload (its first reviewer).
+    for workload in sorted(live, key=lambda item: item.kind != RUN_KIND):
+        if not reuses(workload):
             holders.append(workload.label())
+            if workload.kind == RUN_KIND:
+                by_pid[workload.pid] += 1
     return holders, candidate is not None and reuses(candidate)
 
 
@@ -713,6 +718,10 @@ def hold_test_slot(
 
 # How often a waiting workload re-checks the machine budget and sensors.
 WORKLOAD_POLL_SECONDS = 2.0
+# The workload kind of a runner started without an admitted run; it holds that run's slot.
+RUN_KIND = "run"
+# A free slot behind a machine lock another admission holds for a moment is retried this soon.
+LOCK_RETRY_SECONDS = 0.05
 # The thread that holds each piece, with the workload record. A copied context
 # carries these values into other threads (run_review's reviewers do that), so
 # only the holding thread itself may reuse them: that is synchronous nesting.
@@ -785,7 +794,7 @@ def _acquire_workload(
     """
     from foragent import capacity_sessions
 
-    pid, shown = os.getpid(), None
+    pid, shown, busy_since = os.getpid(), None, None
     candidate = capacity_sessions.Workload(Path(), pid, kind, issue, role)
     while True:
         sensed = _sensor_block()  # Read outside the lock: waiting holds no lock.
@@ -806,10 +815,14 @@ def _acquire_workload(
             message = _workload_text("workload_timeout", language, reason, holders, budget, seconds=f"{wait_s:g}")
             _say(message, wait_s)
             raise TimeoutError(message)
-        if (reason, tuple(holders)) != shown:
+        # Concurrent admissions (N reviewers starting together) hold the lock only for one scan:
+        # retry soon, and report the lock only once it stays busy for a whole poll interval.
+        busy_since = (busy_since or time.monotonic()) if reason == "busy" else None
+        brief = busy_since is not None and time.monotonic() - busy_since < WORKLOAD_POLL_SECONDS
+        if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining))
+        time.sleep(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining))
 
 
 def _held_test_slots() -> int:

@@ -81,8 +81,8 @@ def _check(
 
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
-        if slot is None:
-            return timed(environment)
+        if slot is None:  # A caller that holds the slot itself (the Stop hook) marks it in this environment.
+            return timed({**environment, **(capacity.HELD_ENV if os.environ.get(capacity.TEST_SLOT_ENV) == "held" else {})})
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
             return timed({**environment, **capacity.HELD_ENV})
@@ -344,7 +344,7 @@ def _related_unit_tests(
 
 def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
     """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
-    from foragent import runner
+    from foragent import runner, run_check_slot
 
     directory = _claude_run_dir(snapshot)
     directory.mkdir(parents=True, exist_ok=True)
@@ -371,17 +371,18 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
         parsed = parse_body(approval.body)
         if not has_machine_check(parsed):
             raise ValueError("Done when has no machine check")
-        # Every failing command is reported, each with its own limited tail and cut notice.
-        for command in parsed.done_when_commands:
-            result = runner._check(command, worktree, directory / "check-done.log", 900)
+        budget = run_check_slot.StopHookBudget(directory, worktree)  # One deadline inside the hook timeout.
+        for command in parsed.done_when_commands:  # Each holds the machine test slot; every failure is reported.
+            with budget.slot():  # The command runs only for what the hook has left after the wait.
+                result = runner._check(command, worktree, directory / "check-done.log", budget.timeout())
             if result.exit_code != 0 or result.timed_out:
                 failures.append(result)
         if failures:
             return report()
-    except (OSError, ValueError, TypeError) as exc:
-        # Malformed snapshots and check-launch failures must also block a stop,
-        # still reporting the failures gathered before the error.
-        return report(f"Done when failed: {exc}")
+    except (OSError, ValueError, TypeError, KeyboardInterrupt) as exc:
+        # Malformed snapshots, check-launch failures, a slot wait past its deadline (TimeoutError)
+        # and an interruption must also block a stop, still reporting the failures gathered before.
+        return report(f"Done when failed: {str(exc) or type(exc).__name__}")
     print(f"Done when: all {len(parsed.done_when_commands)} commands passed; acceptance lock: {acceptance_dir}.")
     return 0
 
