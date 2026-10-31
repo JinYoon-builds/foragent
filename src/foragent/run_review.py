@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING
 
-from foragent import cuts, harness_guard
+from foragent import capacity, cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
@@ -310,6 +310,12 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
                                    **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
                                    flag_exhaustion=False, on_result=record)
 
+    def admitted(prompt: str, log_path: Path, k: int) -> ExecResult:
+        # Each simultaneous reviewer holds one shared machine slot; the run's own slot (its pid)
+        # covers the first, so N reviewers use N slots and a budget of 1 runs them one by one.
+        with capacity.hold_workload(ctx.store, ctx.config, kind="review", issue=n, role=f"reviewer {k}"):
+            return call(prompt, log_path)
+
     def failure(label: str, error: BaseException) -> str:
         return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
 
@@ -339,8 +345,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     try:
         with ThreadPoolExecutor(max_workers=len(prompts), thread_name_prefix=f"review-{n}") as pool:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
-            futures = [pool.submit(contextvars.copy_context().run, call, prompt, path)
-                       for prompt, path in zip(prompts, logs)]
+            futures = [pool.submit(contextvars.copy_context().run, admitted, prompt, path, k)
+                       for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)

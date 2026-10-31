@@ -305,6 +305,7 @@ def review_only(
     detail = ""
     previous = ctx.store.get_run(n)
     started = False
+    admission = ExitStack()
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -314,6 +315,9 @@ def review_only(
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
+        # The shared machine budget admits this review before any label or run-record change; a
+        # start the tick reserved reuses its slot. Once the run records this pid, the run holds it.
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, kind="review", issue=n))
         issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
@@ -322,6 +326,7 @@ def review_only(
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
                             lane=issue_lane(issue.labels, ctx.config.lanes))
         started = True
+        admission.close()
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
@@ -357,6 +362,7 @@ def review_only(
         detail = f"Review runner exited: {exc}"
         raise
     finally:
+        admission.close()
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
@@ -382,6 +388,16 @@ def review_only(
 
 
 def run_issue(n: int, ctx: RunContext) -> str:
+    """Run issue N. The tick admitted an active run, whose record holds its machine slot; a direct
+    start of a finished run first waits for the shared budget and holds one slot until it ends."""
+    with ExitStack() as admission:
+        current = ctx.store.get_run(n)
+        if current is not None and current.status == "finished":
+            admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, kind=capacity.RUN_KIND, issue=n))
+        return _run_issue(n, ctx)
+
+
+def _run_issue(n: int, ctx: RunContext) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)
