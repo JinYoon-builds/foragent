@@ -88,8 +88,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
 
 7. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
-   1. A line in the lane memory: edit `.claude/agent-memory/fa-<lane>/MEMORY.md` of the lane
-      that owns the area directly. The orchestrator commits it in its next batched commit.
+   1. A line in the lane memory: append one `- [id:<unique id>] <lesson>` line to the end of
+      `.claude/agent-memory/fa-<lane>/MEMORY.new.md` of the lane that owns the area. The lane
+      dream alone folds pending lessons into `MEMORY.md` and records their ids in
+      `MEMORY.consumed.ids`; never edit those two files. The orchestrator commits the
+      appended line in its next batched commit.
    2. A skill attached to the lane that owns the area: `fa lanes skills <lane> <skill-id>`
       (the lanes code is the one writer of lane skills).
    3. A reviewer perspective scoped to paths: add a `review_perspectives` entry
