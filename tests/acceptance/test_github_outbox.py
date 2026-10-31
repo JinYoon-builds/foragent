@@ -149,7 +149,9 @@ def assert_retry_pending(case, first_action, summary):
         elif row["action"] == "remove_labels":
             assert set(row["labels"]) == {"blocked", "needs-human"}
         else:
-            assert row["body"] == "<!-- foragent:orch -->\n" + summary
+            assert row["body"].startswith("<!-- foragent:orch -->")
+            assert summary in row["body"]
+            assert len(row["body"].splitlines()) == 1, "Queued transition comments must also be one line"
     return rows
 
 
