@@ -37,6 +37,7 @@ it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a 
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
 environment); the docs answer a spec question. Implementers never edit locked acceptance tests; as
 the test owner, the orchestrator corrects its own tests through an order edit and re-approval.
+A choice-free fix the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve` after a clean preread; a choice about behaviour, scope, screen wording or the approval boundary, or a real preread QUESTION, goes through the planning session to the person.
 
 ## Session note
 
@@ -145,5 +146,5 @@ The gate checks the schedule from local facts (`fa tidy due --json`: `merges` af
 the last tidy, or `idle-quota` when no lane runs and quota is left) and puts one "tidy due" request
 with the evidence numbers in `fa orch inbox` per due period; it never orders tidy work. Judge whether
 to call the architect (`fa orch architect --why "<numbers>"`), which reads widely, ranks and proposes
-refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the user
-approves in the publishing session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
+refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the person
+approves through the planning session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
