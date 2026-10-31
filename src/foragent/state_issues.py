@@ -13,8 +13,7 @@ def observed_issue_facts(issue: Any) -> dict[str, Any]:
         return dict(summary) if summary is not None else None
 
     return {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
-            "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
-            "updated_at": issue.updated_at,
+            "state": issue.state, "updated_at": issue.updated_at,
             # Link counts change with a sub-issue or dependency change even if updated_at does not.
             "sub_issues": counts(getattr(issue, "sub_issues_summary", None)),
             "dependencies": counts(getattr(issue, "dependencies_summary", None))}
@@ -98,13 +97,13 @@ class IssueSnapshotMixin:
         return _copy(_EMPTY) if read is None else read[1]
 
     def local_issues(self) -> list[dict[str, Any]]:
-        """Read the last observed issue facts without contacting the tracker."""
-        rows = self._issue_record()["issues"].values()
-        return [_copy(row) for row in sorted(rows, key=lambda row: row["number"])]
+        """The visible issues: each latest observation plus its unretired intents, without the tracker."""
+        record = self._issue_record()
+        return [self._visible(record, row) for row in sorted(record["issues"].values(), key=lambda row: row["number"])]
 
     def github_outbox(self) -> list[dict[str, Any]]:
-        """Read pending GitHub writes in their persisted delivery order."""
-        return _copy(self._issue_record().get("outbox", []))
+        """Pending GitHub writes, derived from the intent log, in queue order."""
+        return self._pending(self._issue_record())
 
     def local_board_value(self, number: int, project: str, field: str) -> Any:
         """The board value last recorded for an issue's card, copying only that value."""
@@ -112,15 +111,8 @@ class IssueSnapshotMixin:
         return _copy((row.get("board_values") or {}).get(project, {}).get(field))
 
     def drop_missing_github_issue(self, number: int) -> None:
-        """Remove a confirmed missing issue and all its pending writes atomically."""
-        with self._state_lock():
-            snapshot = self._issue_snapshot()
-            snapshot["outbox"] = [entry for entry in snapshot.get("outbox", [])
-                                  if entry["issue"] != number]
-            snapshot.get("outbox_base", {}).pop(str(number), None)
-            snapshot["issues"].pop(str(number), None)
-            snapshot["revision"] = snapshot.get("revision", 0) + 1
-            self._write_json(self.root / "issues.json", snapshot)
+        """Observe a confirmed missing issue now; its pending writes go with it."""
+        self.ingest_absence(number, self._now())
 
     def _local_issue(self, snapshot: dict[str, Any], number: int) -> dict[str, Any]:
         return snapshot["issues"].setdefault(str(number), {
@@ -146,81 +138,41 @@ class IssueSnapshotMixin:
             }]
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
-                           started_at: datetime | None = None, **payload: Any) -> dict[str, Any] | None:
-        """Persist the FIFO entry and its local effect in one transaction.
+                           started_at: datetime | None = None, premise: dict[str, Any] | None = None,
+                           dropped: list[bool] | None = None, **payload: Any) -> dict[str, Any]:
+        """Append one intent to the log.
 
-        ``queued_at`` is when the write began (``started_at``, default now):
-        a direct attempt that is queued after a rate limit counts from its start.
-        An observation newer than that start already judged the write, and
-        an absence newer than it removed the issue, so nothing is queued
-        (None); a comment is judged by absence only. The part of a late write
-        that a later-started local write on the same field overrides is not
-        queued either (``state_observe.unsuperseded``).
+        ``queued_at`` is when the write began (``started_at``, default now).
+        Its premise is the visible issue then (``premise``, default the
+        visible issue now). A write queued late is judged at once, by the same
+        rule as any read, against the issue's latest observation (facts or
+        absence) if that read started after it; ``dropped`` receives whether
+        that dropped it unsent. An issue observed missing gets no placeholder row.
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if started_at is not None and (
-                    _observe.missing_after(snapshot, str(number), started_at)
-                    or action != "comment" and _observe.judged_since(snapshot, number, started_at)):
-                return None
-            if started_at is not None:
-                payload = _observe.unsuperseded(snapshot, number, action, payload, started_at)
-                if payload is None:
-                    return None
-            row = self._local_issue(snapshot, number)
-            snapshot.setdefault("outbox_base", {}).setdefault(str(number), _state.deepcopy(row))
             identity = snapshot.get("outbox_sequence", 0) + 1
-            # Its revision is the one the save below gives; it breaks equal clock times (state_observe.after).
-            entry = {"id": identity, "issue": number, "action": action, "revision": snapshot.get("revision", 0) + 1,
-                     "queued_at": self._timestamp() if started_at is None
-                     else started_at.astimezone(_state.UTC).isoformat(), **payload}
-            snapshot.setdefault("outbox", []).append(entry)
+            when = self._now() if started_at is None else started_at
+            row = snapshot["issues"].get(str(number))
+            if premise is None and row is not None:
+                premise = _observations.observed_facts(self._visible(snapshot, row))
+            entry = {"id": identity, "issue": number, "action": action,
+                     "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
+            snapshot.setdefault("outbox", []).append({
+                **entry, "premise": premise, "attempts": [], "lanes": sorted(lanes or {})})
             snapshot["outbox_sequence"] = identity
-            self._apply_github_write(row, entry, lanes or {})
-            self._save_local_issue(snapshot, row)
+            facts, seen = _observations.latest(snapshot, number)
+            # Only a read that started after the write judges it now; one stored at the same
+            # instant was ingested before the write began.
+            lost = started_at is not None and seen is not None and seen > started_at and self._retire(
+                snapshot, number, facts, seen)
+            if dropped is not None:
+                dropped.append(bool(lost))
+            if not _observations.tombstoned(snapshot, number, when) and any(
+                    intent["issue"] == number for intent in snapshot["outbox"]):
+                row = self._local_issue(snapshot, number)
+            self._save_rows(snapshot, (number,))
             return entry
-
-    def deliver_github_write(self, entry: dict[str, Any], *, comment_id: int | None = None,
-                             remaining_labels: list[str] | None = None,
-                             started_at: datetime | None = None) -> None:
-        """Acknowledge delivery without losing concurrent appends or later local intent.
-
-        With ``started_at`` (when the delivery began) the delivered effect
-        stays an overlay until an observation at or after that start.
-        """
-        with self._state_lock():
-            snapshot = self._issue_snapshot()
-            pending = snapshot.get("outbox", [])
-            item = next((item for item in pending if item["id"] == entry["id"]), None)
-            if item is None:
-                return
-            delivered = dict(item)
-            if remaining_labels is not None:
-                delivered["labels"] = item["labels"][:len(item["labels"]) - len(remaining_labels)]
-                item["labels"] = remaining_labels
-            baseline = snapshot.get("outbox_base", {}).get(str(entry["issue"]))
-            if baseline is not None:
-                self._apply_github_write(baseline, delivered, {})
-            if not remaining_labels:
-                snapshot["outbox"] = [item for item in pending if item["id"] != entry["id"]]
-            if started_at is not None and delivered["action"] != "comment" and not _observe.judged_since(
-                    snapshot, delivered["issue"], started_at):
-                # Live from the delivery's start; ordered among other writes by its place in the queue.
-                self._add_overlay(snapshot, delivered["issue"], delivered["action"], started_at.isoformat(),
-                                  order_at=delivered["queued_at"],
-                                  **{key: delivered[key] for key in ("labels", "title", "body") if key in delivered
-                                     and not (delivered["action"] == "close_issue" and key == "body")})
-            row = self._local_issue(snapshot, entry["issue"])
-            if comment_id is not None:
-                for facts in (row, baseline or {}):
-                    for comment in facts.get("comments", []):
-                        if comment["id"] == -entry["id"]:
-                            comment["id"] = comment_id
-            if not any(item["issue"] == entry["issue"] for item in snapshot.get("outbox", [])):
-                snapshot.get("outbox_base", {}).pop(str(entry["issue"]), None)
-            elif baseline is not None:
-                baseline["revision"] = snapshot.get("revision", 0) + 1
-            self._save_local_issue(snapshot, row)
 
     def issues_observation(self) -> dict[str, Any]:
         """When the snapshot was last read and whether a later read failed."""
@@ -248,43 +200,43 @@ class IssueSnapshotMixin:
         refreshed = self._issue_record()["refreshed_at"]
         return refreshed is None or now - _state.datetime.fromisoformat(refreshed) >= _state.REFRESH_INTERVAL
 
-    def update_local_issue(self, number: int, **fields: Any) -> None:
-        """Record local fields; a change to observed issue facts is an overlay from now."""
+    def update_local_issue(self, number: int, *, observed_at: datetime | None = None, **fields: Any) -> None:
+        """Record local fields. Issue facts among them are an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+                return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
-            facts = {key: value for key, value in fields.items() if key in _observe.OBSERVED_FIELDS}
+            facts = {key: fields.pop(key) for key in _observations.FACTS if key in fields}
             if facts:
-                self._add_overlay(snapshot, number, "set_fields", self._timestamp(), fields=facts)
+                self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
+                              observed_at or self._now(), None, by_person=False)
+                row = self._local_issue(snapshot, number)
             if any(row.get(key) != value for key, value in fields.items()):
                 _state._forget_reads(row)
             row.update(fields)
             self._save_local_issue(snapshot, row)
 
-    def record_issue(self, issue: Any, lanes: dict) -> None:
-        from foragent.labels import issue_lane
+    def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
+        """Record an issue as an observation at its time (default now)."""
+        if not issue.is_pull_request:
+            self.ingest([issue], observed_at or self._now(), lanes)
 
+    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict,
+                      observed_at: datetime | None = None) -> None:
+        """A local label change, recorded as an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if issue.is_pull_request or any(
-                entry["issue"] == issue.number for entry in snapshot.get("outbox", [])
-            ):
-                return
-            row = self._local_issue(snapshot, issue.number)
-            facts = dict(title=issue.title, body=issue.body, labels=sorted(issue.labels), state=issue.state)
-            if any(row.get(key) != value for key, value in facts.items()):
-                _state._forget_reads(row)
-            row.update(facts, lane=issue_lane(issue.labels, lanes))
-            self._save_local_issue(snapshot, row)
-
-    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
-        """A local label change, an overlay from now until a later observation."""
-        with self._state_lock():
-            snapshot = self._issue_snapshot()
+            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+                return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
-            self._add_overlay(snapshot, number, "remove_labels" if remove else "add_labels", self._timestamp(),
-                              labels=list(labels))
-            self._record_labels(row, labels, remove=remove, lanes=lanes)
+            changed = dict(row, labels=list(row["labels"]))
+            self._record_labels(changed, labels, remove=remove, lanes=lanes)
+            self._observe(snapshot, number, _observations.observed_facts(changed), observed_at or self._now(), lanes,
+                          by_person=False)
+            row = self._local_issue(snapshot, number)
+            if "ready_approval" in changed:
+                row["ready_approval"] = changed["ready_approval"]
             self._save_local_issue(snapshot, row)
 
     def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict) -> None:
@@ -321,4 +273,4 @@ class IssueSnapshotMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
-import foragent.state_observe as _observe
+import foragent.state_observations as _observations

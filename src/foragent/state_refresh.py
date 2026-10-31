@@ -13,12 +13,16 @@ class IssueRefreshMixin:
         children: dict[int, list[int]] | None = None, complete_prs: bool = False,
         observed_at: datetime | None = None,
     ) -> list[int]:
-        """Replace remote facts, preserving local changes made since the refresh began.
+        """Ingest one complete listing that started at ``observed_at`` (default ``now``).
 
-        The listing is one observation started at ``observed_at`` (default
-        ``now``): rows with a strictly newer observation stay exactly as they
-        are, and an omitted issue is recorded missing unless it was seen later.
+        Each issue goes through the one observation ingest: a row whose stored
+        observation started later keeps everything (facts, edges, PRs,
+        comments). An omitted issue is observed absent unless seen later.
+        ``since_revision`` (the revision when the refresh began) only breaks
+        equal start times, and keeps the PR and comment records of a row
+        written during the refresh. Returns issues whose intents were dropped.
         """
+        from foragent.state_observations import EARLIEST, issue_facts, stamp
         from foragent.tracker import pr_issue_number
 
         at = observed_at or now
@@ -26,52 +30,37 @@ class IssueRefreshMixin:
         with self._state_lock():
             snapshot = self._issue_snapshot()
             previous = dict(snapshot["issues"])
-            absent = snapshot.setdefault("absent", {})
-            rows, facts, stale, local = {}, {}, set(), set()
+            if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
+                snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
-            dropped = set()
-            for number in {*previous, *absent} - {str(number) for number in observed}:
-                old = previous.get(number)
-                if _observe.seen_after(old, at, since_revision):
-                    rows[number] = old
-                    stale.add(number)
-                    continue
-                if self._forget_missing(snapshot, int(number), at, since_revision):
-                    dropped.add(int(number))
-                if number in snapshot["issues"]:
-                    # A local write started after this listing still sits on the row.
-                    rows[number] = old
-                    stale.add(number)
+            dropped, facts, fresh, local = set(), {}, set(), set()
             for issue in issues:
                 if issue.is_pull_request:
                     continue
-                key = str(issue.number)
-                old = previous.get(key)
-                if _observe.seen_after(old, at, since_revision) or _observe.missing_after(snapshot, key, at):
-                    if old is not None:
-                        rows[key] = old
-                        stale.add(key)
+                key, old = str(issue.number), previous.get(str(issue.number)) or {}
+                outcome = self._observe(snapshot, issue.number, issue_facts(issue), at, lanes,
+                                        since_revision=since_revision)
+                if outcome == "stale":
                     continue
-                absent.pop(key, None)
-                old = old or {}
-                facts[key] = _state.observed_issue_facts(issue)
-                # A local write during this refresh keeps its PR and comment
-                # records; the observed issue facts still advance underneath.
-                if since_revision is not None and old.get("revision", 0) > since_revision:
-                    local.add(key)
-                fresh = complete_prs and key not in local
-                rows[key], contradicted = self._ingest_observation(
-                    snapshot, old, issue, at, lanes, since_revision=since_revision,
-                    comments=None if key in local else comments.get(issue.number),
-                    pr_number=None if fresh else old.get("pr_number"),
-                    merged=False if fresh else old.get("merged", False),
-                    merged_at=None if fresh else old.get("merged_at"))
-                if contradicted:
+                if outcome == "dropped":
                     dropped.add(issue.number)
-            _observe.advance_complete_listing(snapshot, at)
-            for number, row in rows.items():
-                if number in stale:
+                fresh.add(key)
+                facts[key] = _state.observed_issue_facts(issue)
+                row = snapshot["issues"][key]
+                if since_revision is not None and old.get("revision", 0) > since_revision:
+                    local.add(key)  # Written during this refresh: keep its PR and comment records.
                     continue
+                if complete_prs:
+                    row.update(pr_number=None, merged=False, merged_at=None)
+                if issue.number in comments:
+                    row["comments"] = comments[issue.number]
+            for key in list(previous):
+                if int(key) not in observed and self._observe(
+                        snapshot, int(key), None, at, lanes, since_revision=since_revision) == "dropped":
+                    dropped.add(int(key))
+            rows = snapshot["issues"]
+            for number in fresh:
+                row = rows[number]
                 # Order edges and dependencies are observations, never local intent.
                 if parents is not None:
                     row["parent"] = parents.get(int(number))
@@ -87,42 +76,37 @@ class IssueRefreshMixin:
                 starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
-                if str(pr_issue_number(pr.head)) not in stale | local and (
-                        row := rows.get(str(pr_issue_number(pr.head)))) is not None:
+                key = str(pr_issue_number(pr.head))
+                if key in fresh and key not in local:
+                    row = rows[key]
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
                     if pr.merged_at is not None:
-                        _record_merge(row, pr, starts.get(row["number"], set()),
-                                      facts[str(row["number"])].get("updated_at"))
-                    pr_facts[str(pr_issue_number(pr.head))] = {
-                        "pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+                        _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
+                    pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
             for run in history:
-                if run.outcome == "merged" and str(run.number) not in stale and (
-                        row := rows.get(str(run.number))) is not None:
+                if run.outcome == "merged" and str(run.number) in fresh:
                     # A gate merge's size is the issue's size when the merge is first seen.
+                    row = rows[str(run.number)]
                     sizes = dict(row.get("run_sizes") or {})
                     sizes.setdefault(run.started_at, _size_of(row.get("labels", ())))
                     row["run_sizes"] = sizes
-            for number, row in rows.items():
-                if number in stale:
-                    continue
+            for number in fresh:
+                row = rows[number]
                 # What this listing showed, kept apart from later local intent.
                 pr_keys = ("pr_number", "pr_head", "merged")
                 if number in local:
-                    # This listing's PRs were not applied to the row, so its observed PRs stay.
                     listed = {key: (previous[number].get("observed") or {}).get(key) for key in pr_keys}
                 elif complete_prs:
                     listed = pr_facts.get(number, {"pr_number": None, "pr_head": None, "merged": False})
                 else:
                     listed = {key: row.get(key) for key in pr_keys}
                 row["observed"] = {**facts[number], **listed}
-                row["observed_at"] = at.isoformat()
+                row["updated_at"] = self._timestamp()
             snapshot.pop("refresh_failure", None)
-            last = _observe.stamp_time(snapshot.get("refreshed_at"))
-            self._write_json(self.root / "issues.json", {
-                **snapshot, "issues": rows,
-                "refreshed_at": (now if last is None or now >= last else last).isoformat(),
-            })
+            last = stamp(snapshot.get("refreshed_at"))
+            snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
+            self._write_json(self.root / "issues.json", snapshot)
             return sorted(dropped)
 
     def merged_pr_listing(self) -> dict[str, Any] | None:
@@ -258,4 +242,3 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
-import foragent.state_observe as _observe
