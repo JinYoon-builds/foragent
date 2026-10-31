@@ -8,6 +8,13 @@ that result in a detached temporary worktree: every member's Done when commands
 from its approval snapshot, current main's passing acceptance baseline once, and one
 related-unit run over the union of changed paths.
 
+The verdict fails closed (``judge``): ``passed`` only for a complete check (current
+main has a passing baseline) whose every command exited exactly 0 in time;
+``failed`` only for a real nonzero exit; anything else (unreadable result, unknown
+exit code, timeout, no baseline, git error) is ``void``, and members verify alone.
+Each member's combined tree is recorded so a follower can prove, before spending
+the pass, that main moved only by the earlier members' merges (run_group_evidence).
+
 State ownership: the result is written only to the leader's own log and one
 local journal event. No queue event is added and no other run's record is
 written; each member still checks, publishes and finishes itself. The check runs
@@ -128,46 +135,80 @@ def check(
     _append(log, f"\nGroup check of {numbers} on {base_sha}")
     results = []
     error = None
+    baseline = None
+    trees: list[str] = []
     try:
         combined = _combine(ctx.git, base_sha, group)
+        trees = _trees(ctx.git, base_sha, combined)
         baseline = _capture_acceptance_baseline(
             n, ctx, ctx.config.test_command or _detect_test_command_at(ctx.git, base_sha), base_sha)
-        with TemporaryDirectory(prefix=f"foragent-group-{n}-") as directory:
-            worktree = Path(directory) / "worktree"
-            ctx.git.add_detached_worktree(worktree, combined)
-            try:
-                def run(command: str):
-                    result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                           slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
-                    results.append(result)
-                    _progress(n, ctx)
+        # Without current main's passing baseline the check is incomplete: nothing to run.
+        if baseline is not None and baseline.node_ids:
+            with TemporaryDirectory(prefix=f"foragent-group-{n}-") as directory:
+                worktree = Path(directory) / "worktree"
+                ctx.git.add_detached_worktree(worktree, combined)
+                try:
+                    def run(command: str):
+                        result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
+                                               slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
+                        results.append(result)
+                        _progress(n, ctx)
 
-                for member in group:
-                    for command in member.commands:
-                        run(command)
-                if baseline is not None and baseline.node_ids:
+                    for member in group:
+                        for command in member.commands:
+                            run(command)
                     run(f"{baseline.command} {shlex.join(baseline.node_ids)}")
-                test_command = ctx.config.test_command
-                if test_command is None:
-                    test_command = next(iter(runner.detect_test_commands(worktree)), None)
-                unit_command = _pytest_command(test_command) if test_command else None
-                paths = [path for path in ctx.git._call(
-                    ["diff", "--name-only", "-z", base_sha, combined]).split("\0") if path]
-                own_only = ctx.config.runner_unit_tests != "all" and trusts_ci(worktree, ctx.config)
-                units = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir, own_only=own_only)
-                if unit_command and units:
-                    run(f"{unit_command} {shlex.join(units)}")
-            finally:
-                ctx.git.remove_worktree(worktree)
-    except (GitError, AttemptFailure) as exc:
+                    test_command = ctx.config.test_command
+                    if test_command is None:
+                        test_command = next(iter(runner.detect_test_commands(worktree)), None)
+                    unit_command = _pytest_command(test_command) if test_command else None
+                    paths = [path for path in ctx.git._call(
+                        ["diff", "--name-only", "-z", base_sha, combined]).split("\0") if path]
+                    own_only = ctx.config.runner_unit_tests != "all" and trusts_ci(worktree, ctx.config)
+                    units = _related_unit_tests(worktree, paths, ctx.config.acceptance_dir, own_only=own_only)
+                    if unit_command and units:
+                        run(f"{unit_command} {shlex.join(units)}")
+                finally:
+                    ctx.git.remove_worktree(worktree)
+    except (GitError, AttemptFailure, OSError) as exc:
+        # An unreadable result is an infrastructure fault, never a pass.
         error = str(exc).strip() or type(exc).__name__
-    passed = error is None and all(r.exit_code == 0 and not r.timed_out for r in results)
-    summary = (f"group check {'passed' if passed else 'failed'}: {numbers} on {base_sha}"
-               + (f" ({error})" if error else ""))
+    verdict, reason = judge(error, baseline, results)
+    summary = f"group check {verdict}: {numbers} on {base_sha}" + (f" ({reason})" if reason else "")
     _append(log, summary)
     orch_events.append_event(
         ctx.store, ctx.now(), n, "group-check", summary,
-        members=[{"n": member.n, "head_sha": member.head_sha} for member in group], base_sha=base_sha,
+        members=[{"n": member.n, "head_sha": member.head_sha,
+                  **({"tree": trees[i]} if len(trees) == len(group) else {})} for i, member in enumerate(group)],
+        base_sha=base_sha,
         checks=[{"command": r.command, "exit_code": r.exit_code, "timed_out": r.timed_out} for r in results],
-        passed=passed,
+        passed=verdict == "passed", verdict=verdict, reason=reason,
     )
+
+
+def judge(error: str | None, baseline, results: list) -> tuple[str, str | None]:
+    """``passed`` only for a complete check whose every command exited exactly 0 in time.
+
+    ``void`` (an infrastructure fault: members verify alone) for a check that could
+    not run or be read, has no passing baseline, timed out or has an unknown exit
+    code; ``failed`` only for a real nonzero exit.
+    """
+    if error is not None:
+        return "void", error
+    if baseline is None or not baseline.node_ids:
+        return "void", "no acceptance baseline on current main"
+    for result in results:
+        if result.timed_out:
+            return "void", f"timed out: {result.command}"
+        if type(result.exit_code) is not int:
+            return "void", f"unknown exit code: {result.command}"
+    failing = [result.command for result in results if result.exit_code != 0]
+    if failing:
+        return "failed", f"failed: {failing[0]}"
+    return "passed", None
+
+
+def _trees(git: GitRepo, base_sha: str, combined: str) -> list[str]:
+    """Each member's combined tree, in queue order: what main must hold after that member's merge."""
+    lines = git._call(["log", "--first-parent", "--reverse", "--format=%T", f"{base_sha}..{combined}"])
+    return [line.strip() for line in lines.splitlines() if line.strip()]

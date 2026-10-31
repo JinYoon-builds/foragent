@@ -28,7 +28,7 @@ def measured(monkeypatch, tmp_path):
     (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n", encoding="utf-8")
     monkeypatch.setattr(orch_role_raise, "load_config", lambda root: SimpleNamespace())
     monkeypatch.setattr(orch_role_raise, "load_roles", lambda config: {"security": {"signals": state["signals"]}})
-    monkeypatch.setattr(orch_roles, "observe", lambda store, config, root, roles: (set(), state["kinds"], state.get("numbers", {})))
+    monkeypatch.setattr(orch_roles, "observe", lambda store, config, root, roles: (set(), state["kinds"], state.get("numbers", {}), state.get("binding")))
     return state
 
 
@@ -108,6 +108,7 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
     measured["kinds"] = {"k0", "k1", "k2"}
     for day, count in ((3, 0), (2, 2), (1, 2)):  # Oldest first.
         store.clock[0] = NOW - timedelta(days=day, hours=1)
+        measured["numbers"] = {f"k{n}": {"day": day} for n in range(3)}  # New facts re-arm not-now (#1155).
         rows = orch_role_raise.raise_due(store, tmp_path, store.clock[0])[:count]
         for row in rows:
             orch_role_raise.answer(store, row["id"], "not-now", "later")
@@ -115,6 +116,7 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
             if row["status"] != "done":
                 orch_inbox.set_request_status(store, row["id"], "done")  # Done without an answer event.
     store.clock[0] = NOW
+    measured["numbers"] = {f"k{n}": {"day": 0} for n in range(3)}
     [today] = orch_role_raise.raise_due(store, tmp_path, NOW)[:1]
     orch_role_raise.answer(store, today["id"], "called", "looked")
     config = SimpleNamespace(roles={"security": {"agent": "fa-security"}})
@@ -283,3 +285,79 @@ def test_two_concurrent_answers_to_one_signal_record_one_answer(store, tmp_path,
     assert sorted(outcomes.values()) == ["ok", f"request {row['id']} is already done"], outcomes
     answers = [event for event in _jsonl(store.root / "orch-events.jsonl") if event.get("kind") == "role-signal-answer"]
     assert [event["answer"] for event in answers] == ["called"]
+
+
+def test_a_not_now_outlives_the_journal_retention_with_unchanged_facts(store, tmp_path, measured):
+    """#1155: the answer lives on the request, not only in the 30-day journal."""
+    measured["kinds"] = {"hot_overlap_files"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    store.clock[0] = NOW + timedelta(days=31)
+    store.trim_journals(store.clock[0])
+    assert orch_role_raise.answers(store) == {}, "Retention dropped the answer event"
+    assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == []
+    measured["numbers"] = {"hot_overlap_files": {"runs_by_file": {"src/a.py": 2}}}
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, "New facts still re-arm it"
+
+
+def test_a_tick_between_the_done_mark_and_the_answer_event_sees_the_answer(store, tmp_path, measured, monkeypatch):
+    """#1155: the not-now is set in the same locked step as done, before any event is appended."""
+    measured["kinds"] = {"hot_overlap_files"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    store.clock[0] = NOW + timedelta(hours=13)
+    seen = []
+
+    def tick_in_between(*args, **kwargs):
+        seen.append(orch_role_raise.raise_due(store, tmp_path, store.clock[0]))
+        raise RuntimeError("answer event not written yet")
+
+    monkeypatch.setattr(orch_role_raise.orch_events, "append_event", tick_in_between)
+    with pytest.raises(RuntimeError):
+        orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    assert seen == [[]], "Done with a not-now and unchanged facts: no new request"
+
+
+def test_a_clear_outlives_the_journal_retention(store, tmp_path, measured):
+    """#1155: a not-now signal that went unmet re-arms even after its clear event is trimmed."""
+    measured["kinds"] = {"hot_overlap_files"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    measured["kinds"] = set()
+    store.clock[0] = NOW + timedelta(hours=1)
+    orch_role_raise.raise_due(store, tmp_path, store.clock[0])
+    store.clock[0] = NOW + timedelta(days=31)
+    store.trim_journals(store.clock[0])
+    assert clears(store) == [], "Retention dropped the clear event"
+    measured["kinds"] = {"hot_overlap_files"}
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1
+    assert len(clears(store)) == 0 and len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 0
+
+
+@pytest.mark.parametrize("kind", [kind for kind in orch_facts_kinds.KINDS
+                                  if "binding" not in orch_facts_kinds.SHARED_FACTS.get(kind, ())])
+def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, tmp_path, measured, kind):
+    """#1155: only kinds about the binding constraint fingerprint it; the others keep their own facts."""
+    measured["signals"][:] = [{"paths": [], "kinds": [kind]}]
+    measured["kinds"], measured["numbers"] = {kind}, {kind: {"n": 1}}
+    measured["binding"] = {"kind": "cap", "normal": False, "detail": "no free slot"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
+    store.clock[0] = NOW + timedelta(hours=13)
+    assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
+    measured["numbers"] = {kind: {"n": 2}}
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
+
+
+def test_a_binding_change_rearms_the_kinds_that_declare_it(store, tmp_path, measured):
+    kinds = [kind for kind, names in orch_facts_kinds.SHARED_FACTS.items() if "binding" in names]
+    assert kinds == ["idle_lanes_with_backlog"]
+    measured["signals"][:] = [{"paths": [], "kinds": kinds}]
+    measured["kinds"], measured["numbers"] = set(kinds), {kinds[0]: {"n": 1}}
+    measured["binding"] = {"kind": "cap", "normal": False, "detail": "slot for #41"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    measured["binding"]["detail"] = "slot for #42"
+    assert orch_role_raise.raise_due(store, tmp_path, NOW) == [], "The detail text is not a fact change"
+    measured["binding"] = {"kind": "quota", "normal": True, "detail": "pause"}
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW)) == 1
