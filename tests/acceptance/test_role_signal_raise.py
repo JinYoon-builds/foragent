@@ -83,7 +83,9 @@ def test_an_answered_signal_waits_for_the_cooldown_while_it_stays_met(tmp_path, 
     completed(case, 1, finished=NOW - timedelta(hours=1), paths=["src/payment/charge.py"])
     [first] = raise_at(case, NOW)
     case.clock[0] = NOW + timedelta(minutes=10)
-    assert answer(case, first["id"], "not-now", "typo fix only") == 0
+    # #1155 (2026-10-31): a not-now answer now stays quiet until the facts change; the cooldown
+    # is checked with a called answer.
+    assert answer(case, first["id"], "called", "security reviewed it") == 0
     assert raise_at(case, NOW + timedelta(hours=11)) == [], "Still met inside the cooldown: stay quiet"
     again = raise_at(case, NOW + COOLDOWN + timedelta(minutes=5))
     assert len(again) == 1 and again[0]["role"] == "security", "After the default 12-hour cooldown, raise again"
