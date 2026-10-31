@@ -28,7 +28,7 @@ def measured(monkeypatch, tmp_path):
     (tmp_path / ".foragent.yml").write_text("repo: owner/repo\n", encoding="utf-8")
     monkeypatch.setattr(orch_role_raise, "load_config", lambda root: SimpleNamespace())
     monkeypatch.setattr(orch_role_raise, "load_roles", lambda config: {"security": {"signals": state["signals"]}})
-    monkeypatch.setattr(orch_roles, "observe", lambda store, config, root, roles: (set(), state["kinds"], state.get("numbers", {}), None))
+    monkeypatch.setattr(orch_roles, "observe", lambda store, config, root, roles: (set(), state["kinds"], state.get("numbers", {}), state.get("binding")))
     return state
 
 
@@ -331,3 +331,33 @@ def test_a_clear_outlives_the_journal_retention(store, tmp_path, measured):
     measured["kinds"] = {"hot_overlap_files"}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1
     assert len(clears(store)) == 0 and len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 0
+
+
+@pytest.mark.parametrize("kind", [kind for kind in orch_facts_kinds.KINDS
+                                  if "binding" not in orch_facts_kinds.SHARED_FACTS.get(kind, ())])
+def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, tmp_path, measured, kind):
+    """#1155: only kinds about the binding constraint fingerprint it; the others keep their own facts."""
+    measured["signals"][:] = [{"paths": [], "kinds": [kind]}]
+    measured["kinds"], measured["numbers"] = {kind}, {kind: {"n": 1}}
+    measured["binding"] = {"kind": "cap", "normal": False, "detail": "no free slot"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
+    store.clock[0] = NOW + timedelta(hours=13)
+    assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
+    measured["numbers"] = {kind: {"n": 2}}
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
+
+
+def test_a_binding_change_rearms_the_kinds_that_declare_it(store, tmp_path, measured):
+    kinds = [kind for kind, names in orch_facts_kinds.SHARED_FACTS.items() if "binding" in names]
+    assert kinds == ["idle_lanes_with_backlog"]
+    measured["signals"][:] = [{"paths": [], "kinds": kinds}]
+    measured["kinds"], measured["numbers"] = set(kinds), {kinds[0]: {"n": 1}}
+    measured["binding"] = {"kind": "cap", "normal": False, "detail": "slot for #41"}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "considered")
+    measured["binding"]["detail"] = "slot for #42"
+    assert orch_role_raise.raise_due(store, tmp_path, NOW) == [], "The detail text is not a fact change"
+    measured["binding"] = {"kind": "quota", "normal": True, "detail": "pause"}
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW)) == 1

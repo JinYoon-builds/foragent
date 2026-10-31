@@ -24,7 +24,7 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_inbox, orch_roles
+from foragent import orch_events, orch_facts_kinds, orch_inbox, orch_roles
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -102,15 +102,19 @@ def fingerprint(signal: dict[str, Any], files: set[str], kinds: set[str], number
                 binding: dict[str, Any] | None) -> dict[str, Any]:
     """The facts a signal is about, never the observation time (#1155).
 
-    The matched files of its paths, the facts numbers of each met kind and, for a signal with
-    kinds, the binding constraint's kind and whether it is normal (its detail text churns).
+    The matched files of its paths and, for each met kind, that kind's facts numbers plus the
+    shared facts it is about (``orch_facts_kinds.SHARED_FACTS``): for the binding constraint,
+    only its kind and whether it is normal (its detail text churns). A kind never carries
+    another kind's facts, so a change elsewhere leaves a not-now signal quiet.
     """
+    shared = {"binding": binding and {"kind": binding.get("kind"), "normal": binding.get("normal")}}
     facts: dict[str, Any] = {}
     if signal.get("paths"):
         facts["files"] = sorted(orch_roles.matching_files(signal, files))
     if signal.get("kinds"):
-        facts["kinds"] = {kind: numbers.get(kind) for kind in signal["kinds"] if kind in kinds}
-        facts["binding"] = binding and {"kind": binding.get("kind"), "normal": binding.get("normal")}
+        facts["kinds"] = {kind: {"numbers": numbers.get(kind),
+                                 **{name: shared[name] for name in orch_facts_kinds.SHARED_FACTS.get(kind, ())}}
+                          for kind in signal["kinds"] if kind in kinds}
     return json.loads(json.dumps(facts, sort_keys=True, default=str))
 
 
