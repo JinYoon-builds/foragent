@@ -2,16 +2,17 @@
 
 This command alone owns the preparation record and the scratch trees. The writer, started
 with the same setup as preread for its lane and size, may only add test files and helpers
-under the acceptance directory of a scratch copy of current main. Its candidates wait for
-review in the record; the plan and the original checkout are never written here.
+under the acceptance directory of a scratch copy of current main. An independent reviewer
+then checks them (`order_prepare_review`); only reviewed bytes reach the plan file
+(`order_prepare_cycle.promote`). The original checkout is never written here.
 
 Record (``<state>/prepare/<order id>.json``)::
 
     {"plan": "<order id>", "issues": {"<key>": {
-        "key", "status", "phase", "questions", "holds", "reason", "updated_at",
-        "base_revision", "scratch", "written": {path: text}, "done_when": [command],
-        "ignored": [tool output directory],
-        "attempts": [{"attempt", "role": "writer", "started_at", "finished_at", "status",
+        "key", "status", "phase", "questions", "reason", "updated_at",
+        "base_revision", "scratch", "cycle", "written": {path: text}, "done_when": [command],
+        "ignored": [tool output directory], "coverage", "red",
+        "attempts": [{"attempt", "role": "writer", "cycle", "started_at", "finished_at", "status",
                       "base_revision", "scratch", "executor", "model", "options", "log",
                       "exit_code", "timed_out", "session_id", "written", "done_when",
                       "skills_missing", "questions", "refused", "ignored", "reason"}]}}}
@@ -91,17 +92,22 @@ def _owner(path: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _envelope(message: str) -> dict | None:
-    """The writer's JSON object: the whole reply, a fenced block, or the outermost braces."""
+def _envelope_text(message: str):
+    """Every JSON value in an agent's reply: the whole reply, a fenced block, the outermost braces."""
     texts = [message.strip()]
     texts += re.findall(r"```(?:json)?\s*\n(.*?)```", message, re.DOTALL)
     if "{" in message:
         texts.append(message[message.index("{"):message.rindex("}") + 1])
     for candidate in texts:
         try:
-            value = json.loads(candidate)
+            yield json.loads(candidate)
         except ValueError:
             continue
+
+
+def _envelope(message: str) -> dict | None:
+    """The writer's JSON object, or None when no reply has the agreed shape."""
+    for value in _envelope_text(message):
         files, commands, questions = (value.get(key) if isinstance(value, dict) else None
                                       for key in ("acceptance_files", "done_when", "questions"))
         if (isinstance(files, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
@@ -160,9 +166,11 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
 
 
 def _row(key: str, entry: dict | None, config: Config) -> dict:
+    from foragent.order_prepare_cycle import holds
+
     entry = entry or {"status": "not_prepared", "reason": text("prepare_none", config.language)}
     row = {"key": key, "status": entry["status"], "phase": entry.get("phase"),
-           "questions": entry.get("questions", []), "holds": entry.get("holds", 0),
+           "questions": entry.get("questions", []), "holds": len(holds(entry)),
            "reason": entry.get("reason"), "updated_at": entry.get("updated_at"),
            "base_revision": entry.get("base_revision")}
     for name in ("scratch", "done_when", "ignored", "red", "coverage"):
@@ -176,18 +184,23 @@ def _row(key: str, entry: dict | None, config: Config) -> dict:
 
 
 def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRepo,
-                 path: Path, record: dict, base: str) -> None:
+                 path: Path, record: dict, base: str, cycle: str) -> None:
     """One writer attempt in a new scratch tree; the record is saved before and after the agent."""
+    from foragent.order_prepare_cycle import revision_notes
+
     entries = record["issues"]
-    entry = entries.setdefault(item["key"], {"key": item["key"], "holds": 0, "attempts": []})
+    entry = entries.setdefault(item["key"], {"key": item["key"], "attempts": []})
+    revision = revision_notes(entry) if entry.get("cycle") == cycle else ""
     attempt = len(entry["attempts"]) + 1
     home = path.parent / _slug(plan["id"]) / _slug(item["key"])
     # Earlier attempts' trees stay for inspection; each attempt gets its own new tree.
     tree, log = home / f"attempt-{attempt}" / "tree", home / f"attempt-{attempt}" / "writer.log"
-    facts = {"attempt": attempt, "role": "writer", "started_at": _now(), "base_revision": base,
+    facts = {"attempt": attempt, "role": "writer", "cycle": cycle, "started_at": _now(), "base_revision": base,
              "scratch": str(tree), "log": str(log)}
     entry["attempts"].append(facts)
-    entry.update(status="writing_tests", phase="writing_tests", questions=[], reason=None,
+    for stale in ("coverage", "red"):
+        entry.pop(stale, None)
+    entry.update(status="writing_tests", phase="writing_tests", questions=[], reason=None, cycle=cycle,
                  updated_at=facts["started_at"], base_revision=base, scratch=str(tree))
     _write(path, record)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
@@ -215,7 +228,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             failure = {"status": "waiting", "reason": say("prepare_missing_skills", skills=", ".join(start.missing_skills))}
             return
         _write(path, record)
-        prompt = start.notes + writer_prompt(plan, item, lane_config, root, tree, base) + start.memory_notice
+        prompt = start.notes + writer_prompt(plan, item, lane_config, root, tree, base) + revision + start.memory_notice
         before = order_scratch.stamps(tree, manifest)  # taken last, right before the writer starts
         result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
                                                   timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
@@ -241,9 +254,15 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
 
 
 def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateStore,
-            tracker: Callable[[], Tracker] | None = None, *, status: bool = False) -> list[dict]:
-    """Per-issue preparation facts; with ``status`` only the record is read, no agent starts."""
+            tracker: Callable[[], Tracker] | None = None, *, status: bool = False,
+            plan_path: Path | None = None) -> list[dict]:
+    """Per-issue preparation facts; with ``status`` only the record is read, no agent starts.
+
+    Reviewed tests and their commands are written into ``plan_path`` while this command still
+    owns the order's preparation.
+    """
     from foragent.order import PlanError, edit_view, validate_plan
+    from foragent.order_prepare_cycle import prepare_issue
 
     try:
         validate_plan(plan, root, config)
@@ -272,7 +291,6 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
             "statements" in item for item in items) else None
         for item in items:
             if "statements" in item:
-                _write_tests(plan, item, root, config, git, path, record, base)
+                prepare_issue(plan, item, root, config, git, path, record, base, plan_path)
         return [_row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy, config)
                 for item in items]
-
