@@ -22,6 +22,7 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
+from foragent.orch_premerge_scope import selected_on_base
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
@@ -452,6 +453,19 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             head_failing = run.failing
             base_failing = frozenset()
             base_passing = None
+            # Passing status is compared only over what the head ran, on a real merge result:
+            # acceptance-only runs share the baseline's selection by construction; a full-suite
+            # command is measured by its own collection on the base. Conflicts already block.
+            scope = None
+            compare = merged
+            if compare and not acceptance_only:
+                scope = selected_on_base(
+                    ctx, command, base, log=log_path, check=lambda selection, root: _suite_process(
+                        ctx, n, selection, root, log_path, f"base={base} selection", test_slot()))
+                compare = scope is not None
+            if (run.passed and not acceptance_only
+                    and not (compare and _protected(scope or (), ctx.config.acceptance_dir, excluded))):
+                continue  # A green head with no base-passing acceptance test in its selection.
             if acceptance_only or run.passed:
                 # A green head still needs the base's passing ids; a cached baseline costs no run.
                 # A cache that excluded more files leaves those files unprotected, not blocked.
@@ -493,8 +507,9 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                     if on_base.failing is not None:
                         base_passing |= on_base.passing
             lost = frozenset()
-            if base_passing is not None:
-                lost = _protected(base_passing, ctx.config.acceptance_dir, excluded) - run.passing
+            if compare and base_passing is not None:
+                measured = base_passing if scope is None else base_passing & scope
+                lost = _protected(measured, ctx.config.acceptance_dir, excluded) - run.passing
             regressions = (head_failing - base_failing) | lost
             broken.extend(sorted(regressions))
             failing_on_base.extend(sorted(head_failing & base_failing))
