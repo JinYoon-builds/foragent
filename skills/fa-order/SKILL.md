@@ -119,15 +119,23 @@ The person's current words take precedence over old documents and the ledger.
   ask once: "D18 says X; this request needs Y" with **Change / Keep / Exception this once**.
   Recommend the option that best fits the current request and explain the tradeoff.
   Apply the answer without repeating the conflict question.
-- For Change, update the decision ledger immediately and include both record updates in
-  the same approved order. Append a dated replacement with its reason and a "Supersedes"
-  link to the old entry in the repository's decision log, or `docs/decisions.md` if none
-  exists; leave earlier entries as they are, because the history is append-only. Then
-  replace the affected line in `docs/rules.md` with the new rule so readers of current
-  rules see it. If the project has no `docs/rules.md`, record the decision only and do
-  not create the file. For Exception this once, record its scope in the order spec and
-  ledger without replacing the standing rule or touching `docs/rules.md`. For Keep, adapt
-  the plan. Persist changes with the approved order so lane agents read the current decision.
+- For Change, update the session's decision ledger immediately, then retain a dated
+  replacement and its reason with `fa order note --defer <boundary> --kind decision --text '<dated decision, reason, Supersedes link to the earlier entry>'`.
+  For an earlier waiting decision, add `--replaces <id>` as a new append; keep the old
+  entry intact. This history is append-only. Planning only appends waiting entries;
+  only flush owns publication checkpoints. Choose what deserves recording and the
+  publication boundary through planning judgment, and inspect retained notes with
+  `fa order pending --json` in later sessions.
+  At publication, include both record updates in the same approved order: append the
+  dated replacement with its reason and Supersedes link to `docs/decisions.md` (or the
+  project's decision log), and replace the affected line in existing `docs/rules.md`.
+  Planning leaves published documents, issues, the shared checkout and index untouched;
+  if there is no rules file, do not create one. For Exception this once, retain its
+  scope in a decision note and the order spec without replacing the standing rule.
+  For Keep, adapt the plan.
+- Retain an idea worth carrying to later planning sessions with
+  `fa order note --defer <boundary> --kind idea --text '<idea>'`. Choose its boundary
+  yourself; an interruption requires no shared-checkout edits to undo.
 
 ## 2. Interview
 Native is the default interview. Read `interview.engine` from `fa order context --json`
