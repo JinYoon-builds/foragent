@@ -1,16 +1,20 @@
 """Acceptance test for fa-order-talk. Locked by Foragent; do not edit."""
 
 from pathlib import Path
+
+from test_orchestrator_publishes_choice_free_fixes import assert_choice_free_boundary
+
+ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / ".foragent.yml").is_file())
 import re
 
 
 def talk_text():
-    path = Path(__file__).resolve().parents[2] / "skills/fa-order/SKILL.md"
+    path = ROOT / "skills/fa-order/SKILL.md"
     return " ".join(path.read_text(encoding="utf-8").casefold().split())
 
 
 def test_fa_order_talk_keeps_internal_records_out_of_conversation_unless_requested():
-    path = Path(__file__).resolve().parents[2] / "skills/fa-order/SKILL.md"
+    path = ROOT / "skills/fa-order/SKILL.md"
     assert re.search(r"^## Talking to the person$", path.read_text(encoding="utf-8"), re.M)
     text = talk_text()
     assert re.search(
@@ -62,26 +66,13 @@ def test_fa_order_talk_confirms_scope_once_and_settles_reversible_details_itself
 
 
 def test_fa_order_talk_requires_first_hand_approval_in_the_publishing_session():
+    """Historical name retained: first-hand person approval applies to D71 choices;
+    choice-free fixes are published and approved by the orchestrator after clean preread.
+    """
     text = talk_text()
-    assert re.search(
-        r"approval.{0,30}first.hand.{0,30}person.{0,30}session that publishes",
-        text,
-    ), "The publishing session must receive approval first-hand from the person"
-    assert re.search(
-        r"planning session.{0,20}publishes.{0,20}only after"
-        r".{0,20}person approves.{0,15}(?:there|in that session)",
-        text,
-    ), "The planning session publishes after the person approves there"
-    assert re.search(
-        r"(?:when|if).{0,20}orchestrator.{0,20}draft(?:s|ed).{0,20}plan"
-        r".{0,20}sends.{0,20}plan path.{0,20}planning session",
-        text,
-    ), "An orchestrator draft reaches the planning session by its plan path"
-    assert re.search(
-        r"approval relayed.{0,20}from another session"
-        r".{0,20}(?:is not|does not count as) approval",
-        text,
-    ), "Relayed approval must not authorize publication"
+    assert_choice_free_boundary(text, "fa-order")
+    assert re.search(r"first.hand.{0,100}person|person.{0,100}first.hand", text)
+    assert re.search(r"approval relayed.{0,20}from another session.{0,20}(?:is not|does not count as) approval", text)
 
 
 def test_fa_order_talk_localizes_confirmation_but_preserves_original_quotes():

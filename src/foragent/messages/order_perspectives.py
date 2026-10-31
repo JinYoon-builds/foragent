@@ -19,6 +19,9 @@ MESSAGES = {
         "perspectives_error_missing": "neither codex nor claude is installed, so this seat could not run",
         "perspectives_error_raised": "the executor stopped with {kind}: {message}",
         "perspectives_error_timeout": "no answer within {seconds} s; see {log}: {message}",
+        "perspectives_error_capacity": "this seat never started: {message}",
+        "perspectives_waves": ("{seats} perspective seats share the machine budget, which has {free} free slot(s) now, "
+                               "so they run in about {waves} wave(s); a seat waits for a slot before it starts."),
         "perspectives_error_exit": "the executor exited with code {code}; see {log}: {message}",
         "perspectives_unknown_id": "no perspective question has id {id}; run fa order perspectives PLAN.json first",
         "perspectives_mark_usage": "usage: fa order perspectives mark ID --changed yes|no",
@@ -47,6 +50,9 @@ MESSAGES = {
         "perspectives_error_missing": "codex와 claude가 모두 설치되어 있지 않아 이 자리를 실행하지 못했어요",
         "perspectives_error_raised": "실행기가 {kind}로 멈췄어요: {message}",
         "perspectives_error_timeout": "{seconds}초 안에 답이 없었어요. {log}를 보세요: {message}",
+        "perspectives_error_capacity": "이 자리는 시작하지 못했어요: {message}",
+        "perspectives_waves": ("관점 자리 {seats}개가 기계 예산을 함께 써요. 지금 남은 칸은 {free}개라서 "
+                               "약 {waves}번에 나눠 돌아요. 자리마다 칸이 날 때까지 기다린 뒤 시작해요."),
         "perspectives_error_exit": "실행기가 종료 코드 {code}로 끝났어요. {log}를 보세요: {message}",
         "perspectives_unknown_id": "id가 {id}인 관점 질문이 없어요. 먼저 fa order perspectives PLAN.json을 실행하세요",
         "perspectives_mark_usage": "사용법: fa order perspectives mark ID --changed yes|no",
