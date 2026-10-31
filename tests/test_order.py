@@ -532,6 +532,67 @@ def test_republication_reconciles_removed_and_replaced_dependencies(publishing, 
     assert [dep.number for dep in tracker.blocked_by(3)] == expected
 
 
+@pytest.mark.parametrize("target", ["child", "edit"])
+@pytest.mark.parametrize("change", ["add", "restore", "remove", "replace"])
+@pytest.mark.parametrize("reapprove", [False, True])
+def test_dependency_reconciliation_invalidates_before_edges(publishing, plan, monkeypatch, target, change, reapprove):
+    tracker = publishing[2]
+    other = {**deepcopy(plan["issues"][1]), "key": "other", "title": "Other", "blocked_by": []}
+    plan["issues"].append(other)
+    if target == "edit":
+        tracker.add_issue(70, "Edited", "old", ["size:s"])
+        item = {"number": 70, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        plan["edits"] = [item]
+    else:
+        item = plan["issues"][1]
+    item["blocked_by"] = [] if change == "add" else ["api"]
+    first = publish(publishing, plan, approve=True)
+    numbers = {row["title"]: row["number"] for row in first.rows}
+    number = numbers["Edited" if target == "edit" else "Login client"]
+    api, other_number = numbers["Login API"], numbers["Other"]
+    if change == "restore":
+        # The recorded plan and body still match; the native edge was removed by hand.
+        tracker.remove_blocked_by(number, api)
+    elif change == "add":
+        item["blocked_by"] = ["api"]
+    elif change == "remove":
+        item["blocked_by"] = []
+    else:
+        item["blocked_by"] = ["other"]
+    tracker.add_labels(number, ["ready"])
+    before_comments = tracker.list_comments(number)
+    calls = []
+
+    def checked(action, real):
+        def mutate(n, blocker):
+            if n == number:
+                assert not {"approved", "ready"} & tracker.get_issue(n).labels
+                calls.append((action, blocker))
+            return real(n, blocker)
+        return mutate
+
+    monkeypatch.setattr(tracker, "add_blocked_by", checked("add", tracker.add_blocked_by))
+    monkeypatch.setattr(tracker, "remove_blocked_by", checked("remove", tracker.remove_blocked_by))
+    report = publish(publishing, plan, approve=reapprove)
+    expected = [] if change == "remove" else [other_number if change == "replace" else api]
+    assert [dep.number for dep in tracker.blocked_by(number)] == expected
+    assert calls == ({"add": [("add", api)], "restore": [("add", api)],
+                      "remove": [("remove", api)], "replace": [("remove", api), ("add", other_number)]}[change])
+    assert "ready" not in tracker.get_issue(number).labels
+    assert ("approved" in tracker.get_issue(number).labels) == reapprove
+    assert next(row for row in report.rows if row["number"] == number)["approved"] == reapprove
+    if change == "restore":
+        assert tracker.list_comments(number) == before_comments
+    # An unchanged retry neither mutates edges nor repeats approval invalidation.
+    events = tracker.label_events(number)
+    comments = tracker.list_comments(number)
+    calls.clear()
+    publish(publishing, plan, approve=reapprove)
+    assert calls == []
+    assert tracker.label_events(number) == events
+    assert tracker.list_comments(number) == comments
+
+
 def test_partial_failure_before_parent_map_update_recovers_child(publishing, plan, monkeypatch):
     tracker = publishing[2]
     update = tracker.update_issue

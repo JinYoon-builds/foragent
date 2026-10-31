@@ -585,6 +585,19 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     return number
 
 
+def _reconcile_dependencies(tracker: Tracker, number: int, desired: set[int]) -> None:
+    """Invalidate approval before changing native edges, including restoring hand removals."""
+    existing = {dep.number for dep in tracker.blocked_by(number)}
+    if existing != desired:
+        # Approval covers the dependency contract; ready must be reconsidered by the gate.
+        # Do this before either mutation so an interrupted sync cannot leave stale readiness.
+        tracker.remove_labels(number, ["approved", "ready"])
+    for blocker in sorted(existing - desired):
+        tracker.remove_blocked_by(number, blocker)
+    for blocker in sorted(desired - existing):
+        tracker.add_blocked_by(number, blocker)
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -769,12 +782,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
-        desired = {mapping[key] for key in item.get("blocked_by", [])}
-        existing = {dep.number for dep in tracker.blocked_by(number)}
-        for blocker in sorted(existing - desired):
-            tracker.remove_blocked_by(number, blocker)
-        for blocker in sorted(desired - existing):
-            tracker.add_blocked_by(number, blocker)
+        _reconcile_dependencies(tracker, number, {mapping[key] for key in item.get("blocked_by", [])})
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
@@ -804,12 +812,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         # Records follow the facts they describe: the revision comment covers the body and
         # the dependencies, and the waiting line the body's wait, so each comes after them.
         if "blocked_by" in item:
-            desired = {mapping[key] for key in item["blocked_by"]}
-            edges = {dep.number for dep in tracker.blocked_by(number)}
-            for blocker in sorted(edges - desired):
-                tracker.remove_blocked_by(number, blocker)
-            for blocker in sorted(desired - edges):
-                tracker.add_blocked_by(number, blocker)
+            _reconcile_dependencies(tracker, number, {mapping[key] for key in item["blocked_by"]})
         order_waiting.announce(tracker, number, body, config.language)
         if changed and not current:
             tracker.comment(number, comment)
