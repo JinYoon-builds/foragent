@@ -881,19 +881,25 @@ def _preread_lines(message: str) -> list[str]:
     return [line for line in lines if line and line != "NONE"]
 
 
+_TAG = re.compile(r"(?i)^(APPROACH|DECIDE|QUESTION):\s*")
+
+
 def _unknowns(message: str) -> list[str]:
-    """QUESTION lines, and unprefixed lines as before; the lane's APPROACH and DECIDE lines do not block."""
-    unknowns = []
-    for line in _preread_lines(message):
-        if re.match(r"(?i)^(?:APPROACH|DECIDE):", line):
-            continue
-        unknowns.append(re.sub(r"(?i)^QUESTION:\s*", "", line))
-    return unknowns
+    """What blocks approval. Once any line carries a tag, only QUESTION lines do and the
+    unprefixed lines are notes; an all-plain reply keeps every line as an unknown."""
+    lines = _preread_lines(message)
+    if not any(_TAG.match(line) for line in lines):
+        return lines
+    return _tagged(message, "QUESTION")
 
 
 def _tagged(message: str, tag: str) -> list[str]:
-    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
-            if re.match(rf"(?i)^{tag}:", line)]
+    tagged = []
+    for line in _preread_lines(message):
+        match = _TAG.match(line)
+        if match and match.group(1).upper() == tag:
+            tagged.append(line[match.end():])
+    return tagged
 
 
 def _decisions(message: str) -> list[str]:

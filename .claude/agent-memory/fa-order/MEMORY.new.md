@@ -1,0 +1,1 @@
+- [id:1108-2026-10-31-structured-preread-notes] #1108: preread 답에 APPROACH/DECIDE/QUESTION 표시 줄이 하나라도 있으면 `_unknowns`는 QUESTION 내용만 돌려주고 표시 없는 줄은 메모다. 표시가 하나도 없으면 모든 줄이 unknown(옛 동작). 표시 판정은 `order._TAG` 하나를 `_tagged`와 함께 쓴다. `test_worker_launch_budget.py` 4개와 `test_order_machine_budget.py` 11개는 기준 코드에서도 실패한다. 기준 비교는 파일 하나씩 돌린다(여러 파일을 묶으면 `fa test` 10분 제한에 걸림).
