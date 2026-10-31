@@ -9,6 +9,7 @@
 .claude/agent-memory/fa-orch/MEMORY.md !merge
 .claude/agent-memory/fa-order/MEMORY.md !merge
 .claude/agent-memory/fa-review-engine/MEMORY.md !merge
+.claude/agent-memory/fa-roles/MEMORY.md !merge
 .claude/agent-memory/fa-skills/MEMORY.md !merge
 .claude/agent-memory/fa-view/MEMORY.md !merge
 # Pending lane lessons only gain lines; keep both sides when lane clones merge.
