@@ -7,9 +7,9 @@ only exact scope is the command's own collection on a checkout of the base.
 
 from __future__ import annotations
 
+import fnmatch
 import json
-import re
-import secrets
+import os
 import shlex
 import tempfile
 from collections.abc import Callable
@@ -28,9 +28,6 @@ if TYPE_CHECKING:
 # rewritten (globs, $VAR, ~ and quoting must reach the shell as written), so such a command is
 # reported as unusable for the comparison instead of being edited.
 STEPWISE = {"--sw", "--stepwise", "--sw-skip", "--stepwise-skip"}
-# One shell word as written (quotes and escapes kept), and a leading NAME=value assignment.
-_WORD = re.compile(r"""(?:'[^']*'|"(?:\\.|[^"\\])*"|\\.|[^\s'"\\])+""")
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 
 def stepwise_options(command: str) -> list[str]:
@@ -48,44 +45,85 @@ def full_selection(command: str) -> str:
     return f"PYTEST_ADDOPTS= {command}"
 
 
-def _with_plugin_path(command: str, directory: str) -> str:
-    """Put ``directory`` on PYTHONPATH without touching the rest of ``command``.
+def head_only_paths(command: str, base_files: set[str], head_files: list[str]) -> list[str]:
+    """Files the command names (paths, globs, ``opt=path``) that exist only at the head.
 
-    Only the leading assignment and ``env`` words are read, as written. An inline PYTHONPATH
-    assignment would replace an outer one, so the directory is appended to that word itself.
+    A selector the PR added (a new test file or directory, a new ``-c`` config) is valid on the
+    merge result but makes a base collection fail with a usage error. Read only: the words are
+    inspected, never used to rebuild the command.
     """
-    inline = []
-    for match in _WORD.finditer(command):
-        word = match.group()
-        if not (_ASSIGNMENT.match(word) or word == "env" or word.endswith("/env")):
-            break
-        if word.startswith("PYTHONPATH="):
-            inline.append(match.end())
-    quoted = shlex.quote(directory)
-    if not inline:
-        return f"PYTHONPATH={quoted}${{PYTHONPATH:+:\"$PYTHONPATH\"}} {command}"
-    for end in reversed(inline):
-        command = f"{command[:end]}:{quoted}{command[end:]}"
-    return command
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return []
+    found = set()
+    head_dirs = {"/".join(parts[:i]) for path in head_files
+                 for parts in [path.split("/")] for i in range(1, len(parts))}
+    for word in words:
+        for candidate in (word, word.partition("=")[2]):
+            candidate = os.path.expanduser(os.path.expandvars(candidate.split("::", 1)[0]))
+            candidate = candidate.removeprefix("./").rstrip("/")
+            if not candidate or candidate.startswith("-"):
+                continue
+            if any(char in candidate for char in "*?["):
+                found.update(path for path in head_files
+                             if fnmatch.fnmatch(path, candidate) and path not in base_files)
+            elif candidate in head_dirs and not any(path.startswith(candidate + "/") for path in base_files):
+                found.add(candidate + "/")  # A directory placeholder: nothing of the head's inside.
+            elif candidate in head_files and candidate not in base_files:
+                found.add(candidate)
+    return sorted(found)
+
+
+def prepare_base_checkout(ctx: RunContext, worktree: Path, command: str, base: str,
+                          head: str | None) -> set[str]:
+    """Make head-only paths ``command`` names resolve in a base checkout; return the base's files.
+
+    Each such path gets an empty placeholder (an empty file, or a directory for a path the head
+    has files under), never the head's content: a head conftest, config or test module must not
+    run in, or reshape, the base measurement. A placeholder selects nothing, so the base answers
+    for its own tests only, and an empty ``-c`` config only widens what the base selects.
+    """
+    base_files = set(ctx.git.tree_files(base))
+    if head is None:
+        return base_files
+    head_files = ctx.git.tree_files(head)
+    for path in head_only_paths(command, base_files, head_files):
+        if path.endswith("/"):
+            (worktree / path).mkdir(parents=True, exist_ok=True)
+        else:
+            (worktree / path).parent.mkdir(parents=True, exist_ok=True)
+            (worktree / path).touch()
+    return base_files
+
+
+def base_ids(ids, base_files: set[str]) -> frozenset[str]:
+    return frozenset(node for node in ids if node.split("::", 1)[0] in base_files)
 
 
 def selected_on_base(ctx: RunContext, command: str, base: str, *, log: Path,
                      check: Callable[[str, Path], CheckResult],
-                     acceptance: tuple[str, list[str]] | None = None) -> frozenset[str] | None:
+                     acceptance: tuple[str, list[str]] | None = None,
+                     head: str | None = None) -> frozenset[str] | None:
     """Node ids ``command`` collects on ``base``; None when collection gives no exact listing.
 
     Collection errors do not make the listing inexact: a module that fails to import has no
     items on the base, so none of its tests passed there. With ``acceptance`` (directory,
     excluded files) a base with no remaining acceptance file selects nothing worth protecting,
     so pytest is not started. ``command`` is a ``full_selection`` (or acceptance) command.
+
+    With ``head``, paths the command names that only the head has get empty placeholders in the
+    base checkout (``prepare_base_checkout``), so the head's selectors resolve without any head
+    code running; ids from files the base does not track are left out.
     """
     with tempfile.TemporaryDirectory(prefix="foragent-premerge-scope-") as directory:
         worktree = Path(directory) / "worktree"
         listing = Path(directory) / "collected.json"
-        plugins = Path(directory) / "plugins"
-        plugins.mkdir()
-        plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
-        (plugins / f"{plugin}.py").write_text(COLLECT_PLUGIN.format(listing=str(listing)), encoding="utf-8")
+        # The listing hooks live in a conftest one level above the checkout, loaded through
+        # --confcutdir: no PYTHONPATH or -p, which the command's own `env -u`, `env -i` or
+        # `python -I` would drop, and nothing added to the checkout itself.
+        (Path(directory) / "conftest.py").write_text(COLLECT_PLUGIN.format(listing=str(listing)),
+                                                     encoding="utf-8")
         ctx.git.add_detached_worktree(worktree, base)
         try:
             if acceptance is not None:
@@ -94,8 +132,9 @@ def selected_on_base(ctx: RunContext, command: str, base: str, *, log: Path,
                         path.is_file() and path.relative_to(worktree).as_posix() not in excluded
                         for path in root.rglob("*")):
                     return frozenset()
+            base_files = prepare_base_checkout(ctx, worktree, command, base, head)
             # The head ran with --rootdir=.; collect the same way so ids match its JUnit ids.
-            collect = _with_plugin_path(f"{command} --rootdir=. --collect-only -p {plugin}", str(plugins))
+            collect = f"{command} --rootdir=. --confcutdir={shlex.quote(directory)} --collect-only"
             result = check(collect, worktree)
             try:
                 _validate_baseline_checkout(ctx.git.at(worktree), base)
@@ -111,6 +150,7 @@ def selected_on_base(ctx: RunContext, command: str, base: str, *, log: Path,
                     stream.write(f"Pre-merge selection on base={base} unknown (exit_code={result.exit_code}, "
                                  f"timed_out={result.timed_out})\n")
                 return None
-            return frozenset(node if prefix == "." else f"{prefix}/{node}" for node in ids)
+            ids = (node if prefix == "." else f"{prefix}/{node}" for node in ids)
+            return base_ids(ids, base_files)
         finally:
             ctx.git.remove_worktree(worktree)

@@ -45,18 +45,14 @@ def merge_case(git_history, tmp_path):
     assert (h.clone / "local-draft.txt").read_text() == "keep me"
 
 
-# A stand-in suite program. As pytest it answers the base collection with an empty listing
-# (read from the listing plugin's source) and writes an empty legacy JUnit report: a measured
-# empty run. Collections are not recorded; the record lists the suites that were run.
+# A stand-in suite program. As pytest it answers the base collection with an empty listing (its
+# path read from the listing hooks' conftest in the --confcutdir directory) and writes an empty
+# legacy JUnit report: a measured empty run. Collections are not recorded; the record lists the suites that were run.
 FAKE_SUITE = r"""#!/bin/sh
-plugin=
-previous=
-for arg; do
-  [ "$previous" = -p ] && plugin=$arg
-  previous=$arg
-done
+hooks=
+for arg; do case "$arg" in --confcutdir=*) hooks="${arg#*=}/conftest.py";; esac; done
 case " $* " in *" --collect-only "*)
-  listing=$(sed -n "s/.*open('\([^']*\)'.*/\1/p" "${PYTHONPATH%%:*}/$plugin.py")
+  listing=$(sed -n "s/.*open('\([^']*\)'.*/\1/p" "$hooks")
   printf '{"ids": [], "errors": 0, "rootdir": "%s"}' "$PWD" > "$listing"
   exit 5;;
 esac
@@ -564,7 +560,8 @@ def test_without_per_test_results_the_exit_code_decides(git_history, tmp_path, m
                    command="true" if command == "non-pytest" else "pytest")
     report = orch.premerge(c.ctx, c.pr)
     if command == "non-pytest":  # A suite that cannot report tests is judged by its exit code.
-        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], report
+        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], (
+            report["broken"], report["unverified"], report["failing_on_base"])
     else:  # A pytest suite that reports no test cannot prove base tests still pass: fail closed.
         assert report["ready"] is False and report["tests"] == "fail", report
         assert report["unverified"] == ["pytest: no per-test result for the merge result"], report
@@ -695,10 +692,14 @@ def test_base_report_missing_a_test_at_risk_fails_closed(git_history, tmp_path, 
 @pytest.mark.parametrize("selector", [
     "tests/test_un*.py", '"$UNIT_DIR"/test_unit.py', "'tests/test_unit.py'",
     "PYTHONPATH=. {pytest} tests/test_un*.py", "env PYTHONPATH=. {pytest} tests/test_un*.py",
-], ids=["glob", "variable", "quoted", "inline-pythonpath", "env-pythonpath"])
+    "env -u PYTHONPATH {pytest} tests/test_un*.py", "{python} -I -m pytest -q -p no:cacheprovider tests",
+], ids=["glob", "variable", "quoted", "inline-pythonpath", "env-pythonpath", "env-unset-pythonpath",
+        "isolated-python"])
 def test_command_selectors_keep_their_shell_meaning(git_history, tmp_path, monkeypatch, selector):
     monkeypatch.setenv("UNIT_DIR", "tests")
-    command = selector.format(pytest=PYTEST) if "{pytest}" in selector else f"{PYTEST} {selector}"
+    python = shlex.quote(sys.executable)
+    command = (selector.format(pytest=PYTEST, python=python) if "{" in selector
+               else f"{PYTEST} {selector}")
     c = suite_case(git_history, tmp_path, {"notes.md": "memory only\n"}, mode="all", command=command)
     report = orch.premerge(c.ctx, c.pr)
     assert report["ready"] is True and report["unverified"] == [], report
@@ -716,3 +717,79 @@ def test_stepwise_command_is_unusable_for_the_full_suite_comparison(git_history,
             f"{c.ctx.config.test_command}: --sw stops at the first failure"], report
     else:  # The acceptance-only selection is rebuilt without --sw.
         assert report["ready"] is True and report["unverified"] == [], report
+
+
+# Selectors the PR itself adds (new file, directory, glob or -c config) are valid on the merge
+# result; the base collection must resolve them instead of failing with a usage error.
+NEW_GREEN = {"tests/acceptance/test_new_green.py": "def test_new_green():\n    assert True\n"}
+NEW_DIR = {"tests/acceptance/added/test_added.py": "def test_added():\n    assert True\n"}
+NEW_CONFIG = {"ci.ini": "[pytest]\ntestpaths = tests/acceptance\n"}
+
+
+@pytest.mark.parametrize("files,selector", [
+    (NEW_GREEN, "tests/acceptance/test_new_green.py"),
+    (NEW_DIR, "tests/acceptance/added"),
+    (NEW_GREEN, "tests/acceptance/test_new_*.py"),
+    (NEW_CONFIG, "-c ci.ini"),
+], ids=["new-file", "new-directory", "new-only-glob", "new-config"])
+@pytest.mark.parametrize("skip_kept", [False, True], ids=["green", "skips-base-test"])
+def test_selectors_added_by_the_pr_resolve_on_the_base(git_history, tmp_path, files, selector, skip_kept):
+    head_files = dict(files)
+    if skip_kept:  # Still protected: the same command also selects the base's acceptance file.
+        head_files[SUITE_FILE] = SKIPPED
+        if not selector.startswith("-c"):
+            selector += f" {SUITE_FILE}"
+    c = suite_case(git_history, tmp_path, head_files, mode="all", command=f"{PYTEST} {selector}")
+    report = orch.premerge(c.ctx, c.pr)
+    if skip_kept:
+        assert report["ready"] is False and report["broken"] == [KEPT], report
+    else:
+        assert report["ready"] is True and report["broken"] == [] and report["unverified"] == [], (
+            report["broken"], report["unverified"], report["failing_on_base"])
+    assert report["unverified"] == [], report
+
+
+def test_head_only_paths_reads_words_without_rebuilding_the_command():
+    from foragent.orch_premerge_scope import head_only_paths
+
+    base = {"tests/a/test_old.py", "pyproject.toml"}
+    head = sorted(base | {"tests/a/test_new.py", "tests/b/test_x.py", "ci.ini"})
+    command = "PYTEST_ADDOPTS= pytest tests/a/test_*.py tests/b --config-file=ci.ini tests/a/test_old.py::t"
+    # Directories become placeholders ("tests/b/"): nothing of the head's is put inside.
+    assert head_only_paths(command, base, head) == ["ci.ini", "tests/a/test_new.py", "tests/b/"]
+
+
+@pytest.mark.parametrize("mode", ["all", "ci"])
+def test_new_failing_test_named_by_the_command_stays_broken(git_history, tmp_path, mode):
+    """A head-only file copied into the base checkout is not base evidence for its own failure."""
+    new = "tests/acceptance/test_new_red.py"
+    c = suite_case(git_history, tmp_path, {new: "def test_new_red():\n    assert False, 'new'\n"},
+                   mode=mode, command=f"{PYTEST} {new} {SUITE_FILE}")
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and f"{new}::test_new_red" in report["broken"], report
+    assert f"{new}::test_new_red" not in report["failing_on_base"], report
+
+
+# Head code never runs in the base measurement: a conftest or config the PR adds cannot hide a
+# base-passing test from the base evidence.
+DESELECT_KEPT_HOOK = (
+    "def pytest_collection_modifyitems(config, items):\n"
+    "    kept = [item for item in items if item.name == 'test_kept']\n"
+    "    config.hook.pytest_deselected(items=kept)\n"
+    "    items[:] = [item for item in items if item not in kept]\n"
+)
+
+
+@pytest.mark.parametrize("files,selector", [
+    ({"tests/acceptance/added/conftest.py": DESELECT_KEPT_HOOK, **NEW_DIR},
+     f"tests/acceptance/added {SUITE_FILE}"),
+    ({"ci.ini": f"[pytest]\naddopts = --deselect {KEPT}\n"}, "-c ci.ini"),
+], ids=["new-conftest-hook", "new-config-deselect"])
+def test_head_selection_code_cannot_hide_a_base_test(git_history, tmp_path, files, selector):
+    c = suite_case(git_history, tmp_path, files, mode="all", command=f"{PYTEST} {selector}")
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["ready"] is False and report["broken"] == [KEPT], report
+    assert report["failing_on_base"] == [NEIGHBOUR], report
+    with pytest.raises(orch.OrchError, match=KEPT):
+        orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == []

@@ -22,7 +22,9 @@ from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
-from foragent.orch_premerge_scope import full_selection, selected_on_base, stepwise_options
+from foragent.orch_premerge_scope import (
+    base_ids, full_selection, prepare_base_checkout, selected_on_base, stepwise_options,
+)
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
@@ -477,7 +479,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 scope = selected_on_base(
                     ctx, selection, base, log=log_path,
                     check=lambda command, root: base_slot(command, root, f"base={base} selection"),
-                    acceptance=(ctx.config.acceptance_dir, excluded))
+                    acceptance=(ctx.config.acceptance_dir, excluded), head=head)
                 if scope is None:
                     tests = "fail"
                     unverified.append(f"{command}: the tests it selects on base {base} are unknown")
@@ -513,14 +515,16 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                                               for node in [*saved["collected_ids"], *saved["excluded"]])
                 ctx.git.add_detached_worktree(worktree, base)
                 try:
+                    # Selectors the PR added (new paths, a new -c config) must resolve here too.
+                    files = prepare_base_checkout(ctx, worktree, selection, base, head)
                     on_base = _run_suite(ctx, n, base_selection, worktree, Path(directory) / f"base-{i}.xml",
                                          log_path, f"base={base}", test_slot())
                 finally:
                     ctx.git.remove_worktree(worktree)
                 if on_base.failing is not None:
-                    base_failing |= on_base.failing
-                    base_passing |= on_base.passing
-                    known |= on_base.recorded
+                    base_failing |= base_ids(on_base.failing, files)
+                    base_passing |= base_ids(on_base.passing, files)
+                    known |= base_ids(on_base.recorded, files)
             if unknown := at_risk - known:
                 tests = "fail"
                 unverified.append(f"{command}: no base result for {len(unknown)} tests not passing on the "
