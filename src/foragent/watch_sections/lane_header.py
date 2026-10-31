@@ -22,12 +22,19 @@ GAP = False
 GAP_AFTER = False
 
 
-def _questions(status: dict[str, Any]) -> int:
-    """Distinct issues with a question to answer: the needs-human group only.
+def _questions(status: dict[str, Any], snapshot: Snapshot | None = None) -> int:
+    """The person's questions to answer.
 
-    Parked work waiting for a person and open PRs also count as waiting_human in the
-    summary, but they ask nothing, so the summary is not a fallback.
+    With collected question facts (watch_questions): issues whose question awaits the
+    person, plus open inbox questions that list no issue; an answered question counts
+    no more, though its needs-human label may remain. Without them: distinct issues
+    in the needs-human group. Parked work waiting for a person and open PRs also count
+    as waiting_human in the summary, but they ask nothing, so the summary is not a fallback.
     """
+    if snapshot is not None and snapshot.questions is not None:
+        from foragent import watch_questions
+
+        return watch_questions.waiting(snapshot.questions, snapshot.unlinked_questions)[watch_questions.PERSON]
     issues = status.get("issues")
     group = issues.get("needs-human") if isinstance(issues, dict) else None
     return len({item.get("number") for item in group or () if isinstance(item, dict)})
@@ -66,7 +73,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     ascii_glyphs = glyph_mode(config) == "ascii"
     gear = t("lane_header_settings_ascii" if ascii_glyphs else "lane_header_settings")
     spans: Line = [(word + "  ", "yellow") for word in _warnings(snapshot, language, context["now"])]
-    questions = _questions(status)
+    questions = _questions(status, snapshot)
     if questions:
         spans.append(("● " if not ascii_glyphs else "* ", "question"))
         spans.append((t("lane_header_question") if questions == 1

@@ -35,6 +35,8 @@ ACORNS = ("implementing", "checking", "reviewing", "ci", "merging")
 BASELINE_PHASES = frozenset({"baseline", "baseline-wait"})
 # The orchestrator's conflict fix comes after code, local tests and review.
 RESOLVING_DONE = 3
+# Recipients of a question still waiting for an answer (watch_questions).
+ASKING = frozenset({"person", "orchestrator"})
 
 
 def glyph_mode(config: Config) -> str:
@@ -52,8 +54,18 @@ def glyph_mode(config: Config) -> str:
     return "emoji" if "UTF8" in locale.upper().replace("-", "") else "ascii"
 
 
-def _kind(state: str, phase: str | None) -> tuple[str, str]:
-    """The glyph kind and phase-word key of one row's facts."""
+def _kind(state: str, phase: str | None, question: str | None = None) -> tuple[str, str]:
+    """The glyph kind and phase-word key of one row's facts.
+
+    ``question`` is whose turn the issue's question awaits (watch_questions): a
+    question names its recipient; an answered one waits to restart, naming nobody.
+    """
+    if question == "person":
+        return "person", "squirrel_answer"
+    if question == "orchestrator":
+        return "wait", "squirrel_orchestrator"
+    if question == "answered" and state in {"blocked", "waiting-human"}:
+        return "wait", "squirrel_restart"
     if state == "waiting-human" or phase in PERSON_PHASES:
         return "person", "squirrel_person"
     if state == "blocked":
@@ -141,7 +153,9 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     from foragent import watch
 
     language = config.language
-    kind, words = _kind(state, phase)
+    # Whatever the work state, a question names its recipient (#1160).
+    question = (snapshot.questions or {}).get(number)
+    kind, words = _kind(state, phase, question)
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The run behind the row: the active one, else (except for a queued issue, which has no
     # run yet) the issue's latest recorded run from the full history, then status.history.
@@ -172,7 +186,8 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     done = finished_acorns(phase, events, started, waiting_from)
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
-            "words": watch.text(words, language), "activity": activity,
+            "words": watch.text(words, language, who=watch.text("question_person", language)),
+            "activity": activity,
             # Without a recorded time (a queued issue, a row with no run) the cell says so.
             "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}
@@ -253,6 +268,14 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                                      item.get("title") or snapshot.titles.get(number) or "", glyphs, now))
         shown = {item["issue"] for item in active}
         queued = [item for item in row.get("queued", []) if item["number"] not in shown]
+        # An open question on an issue no status list shows (unapproved work, say) still gets a row.
+        listed = shown | {item["number"] for item in queued}
+        asking = [item for number, item in sorted(snapshot.question_issues.items())
+                  if item.get("lane") == slug and number not in listed]
+        for item in asking:
+            active.append(_issue_row(snapshot, config, row, name, item["number"], None, item.get("state"),
+                                     None, item.get("title") or "", glyphs, now))
+        shown |= {item["number"] for item in asking}
         finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in shown]
         rows: list[dict[str, Any]] = []
         if not active and not queued:
@@ -265,16 +288,21 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
         else:
-            hideable = max(0, len(finished) - 1) + max(0, len(queued) - 1)
+            # Folded, a lane keeps its next queued issue and every queued issue with an open question.
+            questions = snapshot.questions or {}
+            kept = [item for position, item in enumerate(queued) if is_open or position == 0
+                    or questions.get(item["number"]) in ASKING]
+            hideable = max(0, len(finished) - 1) + len(queued) - len(kept)
             last = last_finished(snapshot, finished)
             for issue in finished if is_open else [last] if last is not None and not tight else []:
                 rows.append(_finished_row(snapshot, config, issue, name, glyphs))
             rows += active
-            for item in queued if is_open else queued[:1]:
+            for item in kept:
                 # A queued issue has no run: neither the lane's phase nor its acorns are its own.
                 waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued", None,
                                      item.get("title") or snapshot.titles.get(item["number"]) or "", glyphs, now)
-                rows.append({**waiting, "style": "dim"})
+                # A question keeps its own emphasis; plain queued work is dim.
+                rows.append(waiting if questions.get(item["number"]) in ASKING else {**waiting, "style": "dim"})
         found += [{**item, "slug": slug} for item in rows]
         if hideable and (is_open or not tight):
             words = (watch.text("acorns_fold", language) if is_open

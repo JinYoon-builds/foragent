@@ -205,14 +205,18 @@ def test_statusline_counts_open_questions_only_in_the_planning_session(stall_sto
     root, store, now = stall_store
     assert presence.statusline_segment(root, now) == STALL_BASE
     first = orch_inbox.ask(store, "One?", ["a", "b"], 1)
+    # An open question with no issue is the person's: every session names the recipient,
+    # only the planning session adds where to answer.
     assert presence.statusline_segment(root, now) == (
-        STALL_BASE + " · 1 question needs your answer in the planning session")
+        STALL_BASE + " · questions: you 1 · 1 question needs your answer in the planning session")
     orch_inbox.ask(store, "Two?", ["a", "b"], 1)
-    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 2 · 2 questions need your answer in the planning session")
     orch_inbox.answer(store, first["id"], "a")
-    assert presence.statusline_segment(root, now).endswith(" · 1 question needs your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 1 · 1 question needs your answer in the planning session")
     monkeypatch.setenv("FORAGENT_ROLE", "orchestrator")
-    assert presence.statusline_segment(root, now) == STALL_BASE
+    assert presence.statusline_segment(root, now) == STALL_BASE + " · questions: you 1"
 
 
 def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_store):
@@ -255,7 +259,7 @@ def test_a_corrupt_question_file_hides_no_valid_question_count(stall_store, brok
     orch_inbox.ask(store, "Valid?", ["a", "b"], 1, issues=[5])
     (store.root / "inbox" / "questions" / "broken.json").write_text(broken, encoding="utf-8")
     # The last case is an object with wrong field types: skipped alone like the others.
-    question = " · 1 question needs your answer in the planning session"
+    question = " · questions: you 1 · 1 question needs your answer in the planning session"
     assert presence.statusline_segment(root, now) == "🐿 0 lanes working · ✋ 1 · 0 merged today" + question
     assert presence.session_start_message(root, None, now) == (
         "since the last report: 0 merges · ✋ 1 · /fa for the report")

@@ -76,6 +76,29 @@ class Snapshot:
     role_facts: dict[str, dict] = field(default_factory=dict)
     waiting_facts: dict[int, dict] = field(default_factory=dict)
     park_facts: dict[int, dict] = field(default_factory=dict)
+    # Whose turn each issue's question awaits (watch_questions.collect) and the open inbox
+    # questions that list no issue; None when not collected (the header then reads status).
+    questions: dict[int, str] | None = None
+    unlinked_questions: int = 0
+    # Each open issue whose question awaits someone: its number, lane slug, title and row state.
+    question_issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+
+def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
+    """Snapshot fields for whose turn each question awaits; unreadable facts leave them uncollected."""
+    from foragent import watch_questions
+
+    try:
+        found = watch_questions.collect(store, history)
+    except (OSError, ValueError):
+        return {}
+    asking = {number for number, who in found.issues.items()
+              if who in (watch_questions.PERSON, watch_questions.ORCHESTRATOR)}
+    issues = {number: {"number": number, "lane": row.get("lane"), "title": row.get("title"),
+                       "state": issue_state(row.get("labels") or (), False)}
+              for row in store.local_issues()
+              if (number := row["number"]) in asking and row.get("state") == "open"}
+    return {"questions": found.issues, "unlinked_questions": found.unlinked, "question_issues": issues}
 
 
 # The checkout a refresh reads root-dependent facts under. watch.run binds it around its
@@ -300,4 +323,5 @@ def collect(
                           role_facts=watch_role_facts.collect(store),
                           waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
                                                                        rows, found_meter, history),
-                          park_facts=watch_lane_facts.park_facts(events))
+                          park_facts=watch_lane_facts.park_facts(events),
+                          **_questions(store, history))
