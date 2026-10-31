@@ -42,7 +42,11 @@ while the scope still fits; ask again only when the scope changes.
 Approval must come first-hand from the person in the session that publishes. The planning
 session publishes only after the person approves there. When the orchestrator drafts the
 plan, it sends the plan path to the planning session. Approval relayed from another session
-is not approval.
+is not approval. This first-hand rule covers D71 choices: a choice about behaviour, scope,
+screen wording or the approval boundary, or a real preread QUESTION, comes through the planning
+session to the person. A choice-free fix (required behaviour settled, nothing left to choose)
+the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`
+after a clean preread; a Foragent caller role alone does not block that.
 
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
@@ -353,7 +357,8 @@ Record `fa order progress approval` once the user approves. If the plan changes,
 the dry-run and present the revised scope for approval.
 
 ## 7. Publish
-After receiving the person's first-hand approval here, this planning session runs the
+For a choice-free fix the orchestrator runs this step itself after a clean preread (the D71
+boundary above). After receiving the person's first-hand approval here, this planning session runs the
 validated `fa order publish PLAN.json` for real with
 `--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and

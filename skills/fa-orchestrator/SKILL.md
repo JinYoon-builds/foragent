@@ -37,6 +37,7 @@ it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a 
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
 environment); the docs answer a spec question. Implementers never edit locked acceptance tests; as
 the test owner, the orchestrator corrects its own tests through an order edit and re-approval.
+A choice-free fix the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve` after a clean preread; a choice about behaviour, scope, screen wording or the approval boundary, or a real preread QUESTION, goes through the planning session to the person.
 
 ## Session note
 
