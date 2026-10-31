@@ -9,6 +9,7 @@ Only the existing offline tracker, Git adapter and executor fixtures are used.
 
 from copy import deepcopy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -66,8 +67,12 @@ def pending(case, capsys):
 
 def shared_files(case):
     # Local control state may change; the shared checkout's content must not.
+    # #1263 (2026-11-01, test owner): the person's FA state under an isolated HOME that sits
+    # inside case.root is not checkout content either.
+    home = Path.home().resolve()
     return {p.relative_to(case.root).as_posix(): p.read_bytes() for p in case.root.rglob("*")
-            if p.is_file() and not {".git", ".foragent"}.intersection(p.relative_to(case.root).parts)}
+            if p.is_file() and not {".git", ".foragent"}.intersection(p.relative_to(case.root).parts)
+            and not p.resolve().is_relative_to(home)}
 
 
 def note(case, capsys, kind, text):
