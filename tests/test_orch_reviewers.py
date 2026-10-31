@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
@@ -11,7 +12,7 @@ from foragent.executors import ExecResult  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
 from foragent.state import StateStore  # noqa: E402
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
+from test_review_perspectives import CHECKLIST, perspective_case, review_offline  # noqa: E402,F401
 from test_risk_map import copy_history, offline  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
 
@@ -34,11 +35,47 @@ def test_override_wins_rejects_below_one_and_clears(tmp_path):
 
 
 def test_shares_are_round_robin_and_capped():
-    names = [item["name"] for item in review_perspectives.perspectives(Config())]
-    assert [[item["name"] for item in share] for share in review_perspectives.shares(Config(), 2)] == [
-        names[0::2], names[1::2]]
-    assert len(review_perspectives.shares(Config(), 99)) == len(names)
-    assert len(review_perspectives.shares(Config(), 1)) == 1
+    # Name kept from #533; since #1167 every perspective is its own share, whatever the reviewer count.
+    project = Config(review_perspectives=[{"name": "ops", "focus": "Deploy rollback"}])
+    names = [item["name"] for item in review_perspectives.perspectives(project)]
+    assert [[item["name"] for item in share] for share in review_perspectives.shares(project)] == [
+        [name] for name in names]
+    assert len(names) == len(review_perspectives.DEFAULT_PERSPECTIVES) + 1 and names[-1] == "ops"
+
+
+class SlowPanel(PanelExecutor):
+    """Each reviewer stays busy briefly, so an unbounded pool would show more than the limit at once."""
+
+    def __init__(self, messages, **kwargs):
+        super().__init__(messages, **kwargs)
+        self.busy = self.peak = 0
+
+    def run(self, **kwargs):
+        with self.lock:
+            reviewing = len(self.calls) < len(self.messages)
+            self.busy += reviewing
+            self.peak = max(self.peak, self.busy)
+        try:
+            if reviewing:
+                time.sleep(0.1)
+            return super().run(**kwargs)
+        finally:
+            with self.lock:
+                self.busy -= reviewing
+
+
+def test_reviewer_count_limits_concurrency_but_never_drops_a_perspective(git_history, tmp_path, monkeypatch):
+    for count in (1, 2):
+        root = tmp_path / f"count-{count}"
+        case = perspective_case(copy_history(git_history, root), root, monkeypatch, count=count,
+                                review_max=0, max_retries=1)
+        panel = SlowPanel(["VERDICT: PASS"] * len(CHECKLIST), overlap=count)
+        install_panel(case, panel)
+        assert run_issue(1, case.ctx) == "merged"
+        assert len(panel.reviews) == len(CHECKLIST) and len(panel.merges) == 1, count
+        assert panel.peak == count and not panel.overlap_errors and not panel.early_merge, count
+        covered = [item["name"] for call in panel.reviews for item in CHECKLIST if item["focus"] in call["prompt"]]
+        assert sorted(covered) == sorted(item["name"] for item in CHECKLIST), count
 
 
 class LimitPanel(PanelExecutor):
@@ -60,11 +97,12 @@ class LimitPanel(PanelExecutor):
 
 def test_panel_usage_limit_is_limit_wait_and_discards_the_round(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = LimitPanel(["VERDICT: PASS"] * 2)
+    panel = LimitPanel(["VERDICT: PASS"] * len(CHECKLIST))
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
     assert outcome == "limit-wait"
-    assert len(panel.reviews) == 2 and panel.merges == [], "A limited round must not reach the merge call"
+    # Reviewers still queued behind the limit may never start: the round is discarded anyway.
+    assert 2 <= len(panel.reviews) <= len(CHECKLIST) and panel.merges == [], "A limited round must not reach the merge call"
     labels = case.tracker.get_issue(1).labels
     assert "ready" in labels and "blocked" not in labels
     runs = case.store.root / "runs" / "issue-1"
@@ -73,17 +111,17 @@ def test_panel_usage_limit_is_limit_wait_and_discards_the_round(git_history, tmp
 
 def test_parallel_reviewers_get_distinct_log_paths(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=3, review_max=0, max_retries=1)
-    panel = PanelExecutor(["VERDICT: PASS"] * 3)
+    panel = PanelExecutor(["VERDICT: PASS"] * len(CHECKLIST))
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "merged"
     paths = [call["log_path"] for call in panel.reviews]
-    assert len(set(paths)) == 3, "Concurrent reviewers must not share a log (and its derived .stdout file)"
+    assert len(set(paths)) == len(CHECKLIST), "Concurrent reviewers must not share a log (and its derived .stdout file)"
     assert case.store.log_path(1) not in paths
 
 
 def test_reviewer_without_verdict_makes_round_unusable_without_merge(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = PanelExecutor(["VERDICT: PASS", "I could not finish the review."])
+    panel = PanelExecutor(["VERDICT: PASS", "I could not finish the review."] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2))
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
     assert panel.merges == [], "A reviewer with no verdict must not reach the merge call"
@@ -128,7 +166,7 @@ def run_outcome_panel(git_history, tmp_path, monkeypatch, panel):
 def test_usage_limit_wins_over_another_reviewers_exhausted_retries(git_history, tmp_path, monkeypatch):
     for order in ({0: "transient", 1: "limit"}, {0: "limit", 1: "transient"}):
         root = tmp_path / "-".join(order.values())
-        panel = OutcomePanel(["VERDICT: PASS"] * 2, order)
+        panel = OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), order)
         case, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, panel)
         assert outcome == "limit-wait", order
         labels = case.tracker.get_issue(1).labels
@@ -138,9 +176,9 @@ def test_usage_limit_wins_over_another_reviewers_exhausted_retries(git_history, 
 
 def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path, monkeypatch):
     cases = {
-        "exhausted": OutcomePanel(["VERDICT: PASS"] * 2, {1: "transient"}),
-        "raised": OutcomePanel(["VERDICT: PASS"] * 2, {0: RuntimeError("reviewer crashed")}),
-        "merge-raised": OutcomePanel(["VERDICT: PASS"] * 2, {}, merge_error=RuntimeError("merge crashed")),
+        "exhausted": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {1: "transient"}),
+        "raised": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {0: RuntimeError("reviewer crashed")}),
+        "merge-raised": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {}, merge_error=RuntimeError("merge crashed")),
     }
     for name, panel in cases.items():
         root = tmp_path / name

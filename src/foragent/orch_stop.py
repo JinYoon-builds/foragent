@@ -4,7 +4,8 @@ The command takes the tick lock, so it is the only kill writer besides the tick,
 checks #261's rules on the recorded PIDs without signaling, and calls
 scheduler._kill_run(outcome="stopped"): the existing path terminates the tree and
 saves the WIP (named `[stopped: <why>]`). _restore_stopped then returns the issue
-to ready with one stop event.
+to ready with one stop event. Every unfinished record `fa gate status` lists is
+stoppable; when its workers are already gone the same path saves the work (#1207).
 """
 
 from __future__ import annotations
@@ -72,17 +73,17 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
     """Stop issue N's run through scheduler._kill_run and return it to ready, keeping its work."""
     from foragent import scheduler
     from foragent.orch import OrchError
-    from foragent.scheduler_stop import _restore_stopped, run_is_live
+    from foragent.scheduler_stop import _restore_stopped, unfinished_runs
 
     language = ctx.config.language
     why = " ".join(why.split())
     if not why:
         raise OrchError(text("orch_stop_why_required", language))
     with _tick_lock(ctx, n):
-        run = ctx.store.get_run(n)
-        # The same rule as fa orch park (#435); a record without any process is
-        # running there too, so the kill path finishes it here.
-        if not run_is_live(run):
+        # The fact `fa gate status` lists as active_runs: every unfinished issue record,
+        # with or without live workers (#1207). Process liveness only picks the kill path.
+        run = next((run for run in unfinished_runs(ctx.store) if run.number == n), None)
+        if run is None:
             raise OrchError(text("orch_stop_not_running", language, n=n))
         if (unsafe := unsafe_target(run)) is not None:
             role, pid, rule = unsafe
