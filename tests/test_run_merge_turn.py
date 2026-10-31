@@ -77,17 +77,58 @@ def test_dead_entries_are_skipped_and_targets_are_separate(tmp_path):
 
 
 def test_waiting_run_sleeps_until_turn_or_time_budget(tmp_path, monkeypatch):
+    from foragent.runner import _remaining
+
     ctx = make_ctx(tmp_path, 1, 2)
-    flags = []
-    monkeypatch.setattr(turn, "_timeout", lambda n, ctx: flags.append(n) or "timeout")
+    ctx.config = replace(ctx.config, max_runtime_minutes=1)
+    ctx.clock[0] += timedelta(seconds=40)
+    ctx.store.update_run(2, phase="checking")
     turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
     second = turn.seat(ctx, 2, "main")
-    ctx.sleep = lambda seconds: ctx.clock.__setitem__(0, ctx.clock[0] + timedelta(seconds=seconds))
-    assert turn.await_turn(2, ctx, second, "b") == (True, "timeout")
-    assert flags == [2]
-    assert ctx.store.get_run(2).phase == "merge-lock-wait"
-    ctx.store.finish_run(1, outcome="crashed")
+    sleeps = []
+
+    def sleep(seconds):
+        run = ctx.store.get_run(2)
+        assert run.phase == "merge-lock-wait"
+        assert datetime.fromisoformat(run.waiting_until) > ctx.now()
+        assert _remaining(2, ctx) == 20
+        assert run.waited_seconds == sum(sleeps)
+        sleeps.append(seconds)
+        ctx.clock[0] += timedelta(seconds=seconds)
+        if sum(sleeps) >= 90:
+            ctx.store.finish_run(1, outcome="merged")
+
+    ctx.sleep = sleep
+    assert turn.await_turn(2, ctx, second, "b") == (True, None)
+    assert sleeps == [30, 30, 30]
+    run = ctx.store.get_run(2)
+    assert run.waited_seconds == 90
+    assert run.waiting_until is None and run.pause_regions == {}
+    assert run.phase == "checking"
+    assert ctx.store.load_flag(2) is None
+    assert _remaining(2, ctx) == 20
     assert turn.await_turn(2, ctx, second, "b") == (False, None)
+    assert ctx.store.get_run(2).waited_seconds == 90
+    ctx.clock[0] += timedelta(seconds=21)
+    assert _remaining(2, ctx) == 0
+
+
+def test_interrupted_merge_wait_credits_elapsed_time_and_restores_phase(tmp_path):
+    ctx = make_ctx(tmp_path, 1, 2)
+    ctx.store.update_run(2, phase="checking")
+    turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+
+    def sleep(seconds):
+        ctx.clock[0] += timedelta(seconds=7)
+        raise RuntimeError("interrupted")
+
+    ctx.sleep = sleep
+    with pytest.raises(RuntimeError, match="interrupted"):
+        turn.await_turn(2, ctx, turn.seat(ctx, 2, "main"), "b")
+    run = ctx.store.get_run(2)
+    assert run.waited_seconds == 7
+    assert run.waiting_until is None and run.pause_regions == {}
+    assert run.phase == "checking"
 
 
 @pytest.mark.parametrize("leave", [False, True])
@@ -196,5 +237,6 @@ def test_failed_merge_rejoins_at_the_tail_and_takes_a_later_turn(run_case, monke
     assert own == [("ready", None), ("turn", "merged"), ("turn", "failed"), ("withdrawn", None),
                    ("ready", None), ("turn", "merged")]
     assert sleeps == [30], "The retry is spaced out once before rejoining"
+    assert c.store.get_run(1).waited_seconds == 30
     assert "rejoining the merge queue: Pull request is not mergeable" in c.store.log_path(1).read_text()
     assert path == "review-only" or started == c.store.get_run(1).started_at
