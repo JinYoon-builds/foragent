@@ -934,6 +934,61 @@ def test_a_live_log_left_open_after_the_run_is_never_shown_as_its_resume_termina
     assert len(terminals.opened()) == 2 and "resume thread-1" in create[create.index("--command") + 1]
 
 
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_a_run_finishing_after_delivery_never_sends_the_message_again_as_a_resume_prompt(
+    store, tmp_path, monkeypatch, executor,
+):
+    session(store, executor)
+    terminals = Terminals(monkeypatch)
+    deliver = lane_talk_open._deliver
+
+    def deliver_then_finish(*args):
+        line = deliver(*args)
+        store.finish_run(1, "blocked")  # The worker ends before talk takes the worktree lock.
+        return line
+
+    monkeypatch.setattr(lane_talk_open, "_deliver", deliver_then_finish)
+    accepted = []
+    lanes.talk(1, message="Keep labels.", store=store, config=config(executor=executor), repo_root=tmp_path,
+               accepted=accepted.append)
+    sends = [argv for argv in terminals.calls if Path(argv[0]).name == "codex" and "queue" in argv]
+    hint = store.root / "hints/1.txt"
+    delivered = len(sends) + (hint.read_text(encoding="utf-8").count("Keep labels.") if hint.exists() else 0)
+    assert delivered == 1, terminals.calls
+    assert not any("Keep labels." in " ".join(argv) for argv in terminals.opened()), terminals.opened()
+    assert accepted == ["Keep labels."]
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_a_run_starting_before_the_lock_still_receives_the_message_exactly_once(
+    store, tmp_path, monkeypatch, executor,
+):
+    session(store, executor, status="blocked")
+    terminals = Terminals(monkeypatch)
+    lock, started = store.worktree_lock, []
+
+    def start_then_lock(*args, **kwargs):
+        if not started:  # The tick starts the blocked issue after talk's first read, before its lock.
+            started.append(True)
+            store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1), pid=None)
+            path = store.root / "runs/1.json"  # Its worker has recorded a live session.
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.update(session_id="thread-2", session_executor=executor, session_stale=False)
+            path.write_text(json.dumps(record), encoding="utf-8")
+        return lock(*args, **kwargs)
+
+    monkeypatch.setattr(store, "worktree_lock", start_then_lock)
+    accepted = []
+    line = lanes.talk(1, message="Keep labels.", store=store, config=config(executor=executor),
+                      repo_root=tmp_path, accepted=accepted.append)
+    sends = [argv for argv in terminals.calls if Path(argv[0]).name == "codex" and "queue" in argv]
+    hint = store.root / "hints/1.txt"
+    hinted = hint.read_text(encoding="utf-8").count("Keep labels.") if hint.exists() else 0
+    resumed = [argv for argv in terminals.opened() if "Keep labels." in " ".join(argv)]
+    assert len(sends) + hinted + len(resumed) == 1, (terminals.calls, line)
+    assert resumed == [] and accepted == ["Keep labels."]
+
+
 def test_a_finished_issues_message_opens_a_new_resume_terminal_with_it(store, tmp_path, monkeypatch):
     session(store, "codex", status="blocked")
     terminals = Terminals(monkeypatch)

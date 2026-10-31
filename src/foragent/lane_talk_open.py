@@ -11,6 +11,7 @@ Terminal.app gives no handle, so its terminals get no event and pause nothing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 import os
 from pathlib import Path
@@ -24,7 +25,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.lanes import LaneError
 from foragent.orch_events import append_event
-from foragent.run_previous import hint_path
+from foragent.run_previous import add_hint
 from foragent.state import StateStore
 from foragent.state_locks import LockBusy
 from foragent.state_records import Run
@@ -102,13 +103,6 @@ def _launch(opener: dict, cwd: Path, title: str, command: list[str]) -> str | No
     return None
 
 
-def _save_hint(store: StateStore, number: int, message: str) -> None:
-    path = hint_path(store.root, number)
-    with store._state_lock():
-        unused = path.read_text(encoding="utf-8") if path.is_file() else ""
-        store._atomic_write(path, f"{unused.rstrip()}\n\n{message}" if unused.strip() else message)
-
-
 def _queue(thread: str, message: str, cwd: Path, number: int, language: str) -> None:
     codex = shutil.which("codex") or "codex"
     try:
@@ -126,15 +120,21 @@ TALK_LOCK_WAIT = 10  # Seconds `fa lanes talk` waits for the issue's worktree lo
 
 
 def talk(number: int, *, message: str | None = None, store: StateStore, config: Config,
-         repo_root: Path | None = None, now: datetime | None = None) -> str:
+         repo_root: Path | None = None, now: datetime | None = None,
+         accepted: Callable[[str], None] | None = None) -> str:
     """Open or bring forward the issue's talk terminal; return the line to print on stdout.
 
     An active run gets a live-mode terminal (its log), any other run a resume-mode one,
     chosen from the run record. A running issue's ``--message`` is delivered first (Codex
     queue or Claude hint), before any lock; a failed Codex send opens and writes nothing.
+    The run is read again under the lock; whichever read first sees it running delivers the
+    message, and a delivered message is never also a resume prompt, so it is taken exactly once.
     The decision (read the derived talk, probe it, re-show, unknown exit or launch, append
     the event) then runs under ``worktree_lock(n)``, the lock the tick's stall and runtime
     stop also take, with the opener lock inside it.
+
+    ``accepted(message)`` runs once the message is accepted (delivered to the running
+    worker, or given to a launched resume terminal), after the locks are released.
     """
     language = config.language
     root = (repo_root or Path.cwd()).resolve()
@@ -146,15 +146,19 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
     if session is None and not (running and executor == "claude"):
         raise TalkError(text("talk_no_session", language, n=number))
     sent = _deliver(store, run, number, executor, message, root, language) if running and message else ""
+    taken: list[bool] = []  # The message was accepted under the lock.
     try:
         with store.worktree_lock(number, timeout=TALK_LOCK_WAIT), orch_spawn.watch_open._opening(store):
-            return _decide(number, message, store, config, root, now, sent) or sent
+            return _decide(number, message, store, config, root, now, sent, taken) or sent
     except LockBusy as exc:
         raise TalkError(text("talk_busy", language, n=number), stdout=sent) from exc
+    finally:
+        if message and accepted is not None and (sent or taken):
+            accepted(message)
 
 
 def _decide(number: int, message: str | None, store: StateStore, config: Config, root: Path,
-            now: datetime | None, sent: str) -> str:
+            now: datetime | None, sent: str, taken: list[bool]) -> str:
     """Under the worktree and opener locks: re-show, report unknown, or launch and append the event."""
     language = config.language
     run = store.get_run(number)  # Read again under the lock: the run may have finished meanwhile.
@@ -163,6 +167,13 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
     mode = "live" if running else "resume"
     if session is None and not (running and executor == "claude"):
         raise TalkError(text("talk_no_session", language, n=number), stdout=sent)
+    if running and message and not sent:
+        # The run started after talk's first read: deliver to the worker now, exactly once.
+        sent = _deliver(store, run, number, executor, message, root, language)
+        taken.append(True)
+    # A message already given to the worker (Codex queue or Claude hint) is never sent again as a
+    # resume terminal's first prompt, even when the run finished between delivery and this read.
+    prompt = None if sent else message
     worktree = store.worktree_path(number)
     cwd = worktree if worktree.is_dir() else root
     # A unique title lets a later probe find a terminal whose handle was never saved.
@@ -175,7 +186,7 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         title = f"resume #{number} {token}"
         program = shutil.which(executor) or executor
         # A person's first prompt goes after "--", so text such as "--help" is never read as an option.
-        extra = ["--", message] if message else []
+        extra = ["--", prompt] if prompt else []
         command = ([program, "resume", session, "-C", str(cwd), *extra] if executor == "codex"
                    else [program, "--resume", session, *extra])
     if running:
@@ -183,7 +194,7 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
     else:
         # Only resume-mode events of the issue's latest run; a --message always opens a new one.
         resumes = store.resume_events(run)
-        current = resumes[-1] if resumes and not message else None
+        current = resumes[-1] if resumes and not prompt else None
     target = probe.resolved(current, cwd) if current is not None else None
     state = None if current is None else probe.liveness(target, cwd) if target is not None else probe.UNKNOWN
     if running and state == probe.UNKNOWN:
@@ -209,6 +220,8 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         if trackable:
             _opened(store, run, number, executor, mode, opener, title, None, now)
         raise TalkError(text("talk_open_unknown", language, n=number), stdout=sent) from exc
+    if prompt and not running:
+        taken.append(True)  # The resume terminal received the message as its first prompt.
     if trackable:
         _opened(store, run, number, executor, mode, opener, title, handle, now)
     opened = text("talk_log_opened" if running else "talk_resume_opened", language, n=number, screen=opener["kind"])
@@ -223,7 +236,7 @@ def _deliver(store: StateStore, run: Run, number: int, executor: str, message: s
         # The session is read from the run record now, at send time: never an earlier copy.
         _queue(_current_session(store, run, number, language), message, cwd, number, language)
         return text("talk_sent", language, n=number)
-    _save_hint(store, number, message)
+    add_hint(store, number, message)
     return text("talk_hint_saved", language, n=number)
 
 

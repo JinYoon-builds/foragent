@@ -151,8 +151,10 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
     return lane
 
 
-def talk(number: int, *, message: str | None = None, store, config: Config, repo_root: Path | None = None) -> str:
+def talk(number: int, *, message: str | None = None, store, config: Config, repo_root: Path | None = None,
+         accepted=None) -> str:
     """Open issue ``number``'s live log or resume terminal (``fa lanes talk``); return the line to print."""
     from foragent import lane_talk_open
 
-    return lane_talk_open.talk(number, message=message, store=store, config=config, repo_root=repo_root)
+    return lane_talk_open.talk(number, message=message, store=store, config=config, repo_root=repo_root,
+                               accepted=accepted)
