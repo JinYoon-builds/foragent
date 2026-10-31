@@ -23,6 +23,8 @@ def add(commands) -> None:
                       help="Default Claude quota mode: keep stops at keep_percent, burn runs to the limit")
     init.add_argument("--statusline", choices=("yes", "no"),
                       help="Answer the Claude statusline question without a prompt")
+    init.add_argument("--fa-allow", choices=("yes", "no"),
+                      help="Answer the project Bash(fa:*) permission offer without a prompt")
     init.add_argument("--starter", choices=("yes", "no"),
                       help="Answer the starter order offer without a prompt")
 
@@ -48,6 +50,27 @@ def _offer_statusline(answer: str | None) -> None:
         except Exception:  # Outside a readable Foragent config, speak English.
             language = "en"
         print(cli.text("statusline_hook_added", language))
+
+
+def _offer_fa_allow(root, answer: str | None) -> None:
+    """Offer the one project rule that lets Claude run fa commands; only an explicit yes adds it."""
+    from foragent.init import FA_ALLOW_RULE, offer_fa_allow
+
+    try:
+        outcome = offer_fa_allow(root, input if answer is None else lambda _prompt: answer)
+    except OSError as exc:
+        print(f"FA commands: not allowed ({exc}); fa init will ask again next time.")
+        return
+    if outcome == "added":
+        print(f"FA commands: allowed in this project ({FA_ALLOW_RULE} in .claude/settings.local.json).")
+    elif outcome == "declined":
+        print("FA commands: not allowed; Claude keeps asking per command and fa init will not ask again.")
+    elif outcome == "unanswered":
+        print("FA commands: not asked (no terminal); rerun with --fa-allow yes|no.")
+    elif outcome == "busy":
+        print("FA commands: not asked; another fa init is asking about this project now.")
+    elif outcome == "unreadable":
+        print("FA commands: not asked (.claude/settings.local.json is not a JSON object).")
 
 
 def _offer_upstream_reports(root) -> None:
@@ -114,6 +137,7 @@ def run(args) -> int:
     print(report.summary())
     if not args.dry_run:
         cli._offer_statusline(args.statusline)
+        _offer_fa_allow(report.normalized_root or root, args.fa_allow)
         _offer_upstream_reports(report.normalized_root or root)
         _offer_starter(report.normalized_root or root, getattr(report, "tracker", None), args.starter)
         cli._open_lane_view(report.normalized_root or root)

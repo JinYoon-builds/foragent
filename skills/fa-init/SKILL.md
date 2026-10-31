@@ -40,6 +40,15 @@ description: Set up a project folder for Foragent.
    command cannot prompt (no terminal), ask this once with AskUserQuestion (or the
    available question tool): Yes (recommended) or No, then rerun with
    `--statusline yes|no`. Either answer is remembered and never asked again; skip the question if the summary already reports a decision.
+   `fa init` also offers one optional project step: adding the single rule
+   `Bash(fa:*)` to this project's `.claude/settings.local.json`, so Claude can
+   run fa commands here without a prompt each time. It covers this project
+   only, never the account, and adds nothing else. fa commands do not expose
+   permanent deletion, money transactions, sending to others, or widening
+   permissions. Add it only after the person explicitly accepts; never answer
+   for them. When the command cannot prompt, ask once with AskUserQuestion:
+   Yes or No, then rerun with `--fa-allow yes|no` using their answer. Either
+   answer is remembered for this project; a dry run neither asks nor grants.
 
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
    public repositories (hosted Actions minutes are free), or `local` for private
