@@ -41,6 +41,11 @@ the current base, over the same runs.
   a one-line reason.
 - While a lane's dream PR is open, the lane does not dream; merge or close the PR to let it dream
   again. Every dream starts from the base: a dream PR you close is not carried into the next one.
+- To replace a stale dream with a fresh one, run `fa orch dream --redo <lane>`. It records the redo
+  and makes the lane due even without new merges. The next tick closes only that lane's open dream
+  PR built before the redo, even one opened after you ran the command, and starts the fresh dream
+  through the usual checks. `fa orch merge` refuses such a PR. Notebooks and pending lessons on the
+  base stay as they are.
 - Before it pushes, the dream checks that the base still holds the `MEMORY.md` and
   `MEMORY.consumed.ids` it read. If either changed, it pushes nothing and the lane dreams again
   later. Lessons appended to `MEMORY.new.md` meanwhile do not matter.
