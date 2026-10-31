@@ -153,7 +153,9 @@ def moved_files_section(moved_files: list[str]) -> str:
 
 def goal_condition(acceptance_dir: str) -> str:
     prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
-    suffix = " is modified, and no files outside this repository are changed. Or stop after 40 turns."
+    suffix = (" is modified, and you did not edit files outside this repository."
+              " Files that test tooling writes outside the repository do not count as your edits."
+              " At 40 turns, end the run without repeating the stop check.")
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 
 
