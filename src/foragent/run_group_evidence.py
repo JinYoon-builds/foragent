@@ -31,9 +31,9 @@ each runner writes only its own log and its own ``group-evidence`` /
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Callable
 
+from foragent import orch_events
 from foragent.git import GitError
 from foragent.tracker import TrackerError
 
@@ -215,20 +215,7 @@ def _same_result(ctx: RunContext, expected: str, tree: str, neutral_paths: set[s
 
 
 def _events(ctx: RunContext, kind: str) -> list[dict]:
-    path = ctx.store.root / "orch-events.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except (FileNotFoundError, NotADirectoryError):
-        return []
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get("kind") == kind:
-            events.append(event)
-    return events
+    return orch_events.events(ctx.store, kind)
 
 
 def _has_followers(ctx: RunContext, n: int, head_sha: str) -> bool:

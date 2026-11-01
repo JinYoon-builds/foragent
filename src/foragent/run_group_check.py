@@ -19,7 +19,7 @@ import json
 import shlex
 from tempfile import TemporaryDirectory
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from foragent import cuts
 from foragent.git import GitError
@@ -27,10 +27,33 @@ from foragent.issue import parse_body
 from foragent.run_waits import _progress, _test_slot
 
 if TYPE_CHECKING:
+    from foragent.config import Config
     from foragent.run_merge_turn import Seat
     from foragent.runner import RunContext
+    from foragent.state import StateStore
 
 IDENTITY = ["-c", "user.name=Foragent", "-c", "user.email=foragent@localhost"]
+AUTO_START = 4
+AUTO_MAX = 8
+AUTO_FLOOR = 2
+
+
+def group_limit(store: StateStore, config: Config) -> tuple[int, Literal["auto", "fixed"]]:
+    """Derive the repository's limit from retained results, without persisting it."""
+    from foragent.orch_events import events
+
+    if isinstance(config.merge_group_max, int):
+        return config.merge_group_max, "fixed"
+    limit = AUTO_START
+    for event in events(store, "group-check"):
+        members = event.get("members")
+        if not isinstance(members, list):
+            continue
+        if event.get("verdict") == "passed" and len(members) >= limit:
+            limit = min(AUTO_MAX, limit + 1)
+        elif event.get("verdict") == "failed":
+            limit = max(AUTO_FLOOR, limit - 1)
+    return limit, "auto"
 
 
 @dataclass(frozen=True)
@@ -48,7 +71,7 @@ def members(ctx: RunContext, place: Seat, head_sha: str) -> list[Member]:
     """
     from foragent import run_merge_turn as turn
 
-    limit = ctx.config.merge_group_max
+    limit, _ = group_limit(ctx.store, ctx.config)
     leader = _member(ctx, place.n, head_sha)
     if limit <= 1 or leader is None:
         return []
@@ -119,7 +142,7 @@ def check(
     from foragent.run_checks import _append, _protected_limit, _pytest_command, _related_unit_tests, trusts_ci
     from foragent.run_implementation import _detect_test_command_at
 
-    if ctx.config.merge_group_max <= 1:
+    if group_limit(ctx.store, ctx.config)[0] <= 1:
         return
     ci = enabled(ctx, place.target)
     if ci:

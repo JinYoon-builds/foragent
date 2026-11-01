@@ -21,12 +21,26 @@ def write_settings(path, settings):
     path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
 
+@pytest.mark.parametrize("value", ["auto", 1, 3, 12])
+def test_merge_group_max_accepts_auto_or_positive_integer(repo, value):
+    write_settings(repo / ".foragent.yml", {"merge_group_max": value})
+    assert load_config(repo).merge_group_max == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "4", "Auto", " auto", "auto ", None, [], {}])
+def test_merge_group_max_error_names_both_forms(repo, value):
+    write_settings(repo / ".foragent.yml", {"merge_group_max": value})
+    with pytest.raises(ConfigError) as error:
+        load_config(repo)
+    assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": 4, "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
