@@ -934,6 +934,61 @@ def test_a_live_log_left_open_after_the_run_is_never_shown_as_its_resume_termina
     assert len(terminals.opened()) == 2 and "resume thread-1" in create[create.index("--command") + 1]
 
 
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_a_run_finishing_after_delivery_never_sends_the_message_again_as_a_resume_prompt(
+    store, tmp_path, monkeypatch, executor,
+):
+    session(store, executor)
+    terminals = Terminals(monkeypatch)
+    deliver = lane_talk_open._deliver
+
+    def deliver_then_finish(*args):
+        line = deliver(*args)
+        store.finish_run(1, "blocked")  # The worker ends before talk takes the worktree lock.
+        return line
+
+    monkeypatch.setattr(lane_talk_open, "_deliver", deliver_then_finish)
+    accepted = []
+    lanes.talk(1, message="Keep labels.", store=store, config=config(executor=executor), repo_root=tmp_path,
+               accepted=accepted.append)
+    sends = [argv for argv in terminals.calls if Path(argv[0]).name == "codex" and "queue" in argv]
+    hint = store.root / "hints/1.txt"
+    delivered = len(sends) + (hint.read_text(encoding="utf-8").count("Keep labels.") if hint.exists() else 0)
+    assert delivered == 1, terminals.calls
+    assert not any("Keep labels." in " ".join(argv) for argv in terminals.opened()), terminals.opened()
+    assert accepted == ["Keep labels."]
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_a_run_starting_before_the_lock_still_receives_the_message_exactly_once(
+    store, tmp_path, monkeypatch, executor,
+):
+    session(store, executor, status="blocked")
+    terminals = Terminals(monkeypatch)
+    lock, started = store.worktree_lock, []
+
+    def start_then_lock(*args, **kwargs):
+        if not started:  # The tick starts the blocked issue after talk's first read, before its lock.
+            started.append(True)
+            store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1), pid=None)
+            path = store.root / "runs/1.json"  # Its worker has recorded a live session.
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.update(session_id="thread-2", session_executor=executor, session_stale=False)
+            path.write_text(json.dumps(record), encoding="utf-8")
+        return lock(*args, **kwargs)
+
+    monkeypatch.setattr(store, "worktree_lock", start_then_lock)
+    accepted = []
+    line = lanes.talk(1, message="Keep labels.", store=store, config=config(executor=executor),
+                      repo_root=tmp_path, accepted=accepted.append)
+    sends = [argv for argv in terminals.calls if Path(argv[0]).name == "codex" and "queue" in argv]
+    hint = store.root / "hints/1.txt"
+    hinted = hint.read_text(encoding="utf-8").count("Keep labels.") if hint.exists() else 0
+    resumed = [argv for argv in terminals.opened() if "Keep labels." in " ".join(argv)]
+    assert len(sends) + hinted + len(resumed) == 1, (terminals.calls, line)
+    assert resumed == [] and accepted == ["Keep labels."]
+
+
 def test_a_finished_issues_message_opens_a_new_resume_terminal_with_it(store, tmp_path, monkeypatch):
     session(store, "codex", status="blocked")
     terminals = Terminals(monkeypatch)
@@ -1359,3 +1414,128 @@ def test_fa_takes_an_option_like_message_in_its_attached_form(store, tmp_path, m
     Terminals(monkeypatch)
     assert _cli(store, monkeypatch, tmp_path, "--message=--help", executor="claude") == 0
     assert (store.root / "hints/1.txt").read_text() == "--help" and "next attempt" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("mode", ["live", "resume", "started-between-reads"])
+def test_talk_records_publication_before_every_delivery_effect(
+    store, tmp_path, monkeypatch, executor, mode,
+):
+    session(store, executor, status="running" if mode == "live" else "blocked")
+    terminals = Terminals(monkeypatch)
+    message = "Keep  labels\n\n  exactly"
+    publication = []
+    if mode == "started-between-reads":
+        lock, started = store.worktree_lock, []
+
+        def start_then_lock(*args, **kwargs):
+            if not started:
+                started.append(True)
+                store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+                store.update_run(1, session_id="thread-2", session_executor=executor, session_stale=False)
+            return lock(*args, **kwargs)
+
+        monkeypatch.setattr(store, "worktree_lock", start_then_lock)
+    deliver, launch = lane_talk_open._deliver, lane_talk_open._launch
+    effects = []
+
+    def checked(effect):
+        def call(*args, **kwargs):
+            assert publication == [message]  # Actual boundary before append, queue or resume launch.
+            assert [entry["body"] for entry in store.github_outbox()] == [message]
+            effects.append(effect.__name__)
+            return effect(*args, **kwargs)
+        return call
+
+    monkeypatch.setattr(lane_talk_open, "_deliver", checked(deliver))
+    monkeypatch.setattr(lane_talk_open, "_launch", checked(launch))
+
+    def accept(body):
+        store.queue_github_write(1, "comment", body=body)
+        publication.append(body)
+
+    lanes.talk(1, message=message, store=store, config=config(executor=executor), repo_root=tmp_path,
+               accepted=accept)
+    assert publication == [message] and effects
+    assert len(terminals.opened()) == 1
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("status", ["running", "blocked"])
+def test_talk_publication_failure_prevents_local_acceptance_or_delivery(
+    store, tmp_path, monkeypatch, executor, status,
+):
+    session(store, executor, status=status)
+    terminals = Terminals(monkeypatch)
+
+    def refuse(message):
+        raise OSError("cannot persist publication")
+
+    with pytest.raises(OSError, match="cannot persist publication"):
+        lanes.talk(1, message="No private facts", store=store, config=config(executor=executor),
+                   repo_root=tmp_path, accepted=refuse)
+    assert not (store.root / "hints/1.txt").exists()
+    assert not terminals.opened()
+    assert not any(Path(argv[0]).name == "codex" for argv in terminals.calls)
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("outcome", ["blocked", "merged"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_manual_resume_advice_is_public_before_the_command_is_printed(
+    store, tmp_path, monkeypatch, capsys, executor, outcome, queued,
+):
+    import shlex
+
+    from foragent import cli, orch_advice
+    from foragent.commands import lanes as lane_command
+    from foragent.tracker import FakeTracker, TrackerError
+
+    session(store, executor)
+    store.finish_run(1, outcome=outcome)
+    terminals = Terminals(monkeypatch, opener="none")
+    tracker = FakeTracker()
+    tracker.add_issue(1, "Keep the selected locale")
+    monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
+    if queued:
+        def refuse(number, body):
+            raise TrackerError("HTTP 502: Bad Gateway")
+        monkeypatch.setattr(tracker, "comment", refuse)
+    message = "Keep  labels\n\n  '한국어' and --help"
+    printed = []
+    original_print = print
+
+    def print_after_publication(value, *args, **kwargs):
+        if kwargs.get("file") is None:
+            bodies = [comment.body for comment in tracker.list_comments(1)]
+            bodies += [entry["body"] for entry in store.github_outbox() if entry["action"] == "comment"]
+            assert bodies == [orch_advice.talk_body(message)]
+            printed.append(value)
+        original_print(value, *args, **kwargs)
+
+    monkeypatch.setattr(lane_command, "print", print_after_publication, raising=False)
+    assert _cli(store, monkeypatch, tmp_path, "--message", message, executor=executor) == 0
+    assert len(printed) == 1
+    words = shlex.split(printed[0].split("run: ", 1)[1])
+    assert words[-2:] == ["--", message]
+    assert words[4:6] == ["resume" if executor == "codex" else "--resume", "thread-1"]
+    assert printed[0] in capsys.readouterr().out
+    assert not terminals.opened() and not (store.root / "hints/1.txt").exists()
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("outcome", ["blocked", "merged"])
+def test_manual_resume_does_not_expose_advice_when_publication_cannot_be_saved(
+    store, tmp_path, monkeypatch, executor, outcome,
+):
+    session(store, executor)
+    store.finish_run(1, outcome=outcome)
+    terminals = Terminals(monkeypatch, opener="none")
+
+    def refuse(message):
+        raise OSError("cannot persist publication")
+
+    with pytest.raises(OSError, match="cannot persist publication"):
+        lanes.talk(1, message="Keep this on the issue", store=store, config=config(executor=executor),
+                   repo_root=tmp_path, accepted=refuse)
+    assert not terminals.opened() and not (store.root / "hints/1.txt").exists()
