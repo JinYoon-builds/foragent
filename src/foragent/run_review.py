@@ -16,7 +16,7 @@ from foragent import cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
-from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
+from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
 from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
@@ -164,7 +164,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
     mode = path.stat().st_mode if path.exists() else None
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
-        f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        f"{authored_body(body)}\n\n{review_scope_rules(acceptance_dir)}\n\n"
         + (f"{lane_decisions}\n\n" if lane_decisions else "")
         + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")

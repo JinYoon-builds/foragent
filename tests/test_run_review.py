@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from foragent.executors import ExecResult
-from foragent.issue import parse_body
+from foragent.issue import authored_body, parse_body
 from foragent.reasons import Reason
 from foragent.runner import REVIEW_PROMPT, _review, parse_code_review, run_issue
 
@@ -41,7 +41,7 @@ def test_review_pass_opens_pr_and_records_review(run_case, message, note):
     assert "diff --git a/feature.txt b/feature.txt" in call["prompt"]
     assert "PRIVATE IMPLEMENTER LOG" not in call["prompt"]
     assert "untrusted model message" not in call["prompt"]
-    assert "Looks right to a human" not in call["prompt"]
+    assert "- [x] Looks right to a human" in call["prompt"]
     body = c.tracker.created_prs[0].body
     assert "## Review" in body and "Round 1: VERDICT: PASS" in body
     if note:
@@ -550,7 +550,7 @@ def test_claude_review_scope_restores_original_or_removes_temporary_file(review_
     head = ctx.git.head_sha()
     expected = (
         "# Review scope (written by Foragent for this review only)\n\n"
-        + BODY + "\n\n" + expected_review_rules(ctx.config.acceptance_dir) + "\n\n"
+        + authored_body(BODY) + "\n\n" + expected_review_rules(ctx.config.acceptance_dir) + "\n\n"
     ).encode() + (original if original is not None else b"")
     calls = []
 
@@ -584,6 +584,18 @@ def test_claude_review_scope_restores_original_or_removes_temporary_file(review_
         assert path.read_bytes() == original and path.stat().st_mode & 0o777 == 0o640
     assert ctx.git.staged_tree_sha() == tree and ctx.git.head_sha() == head
     assert git_command(ctx.git.root, "ls-files", "--", "CLAUDE.local.md") == ""
+
+
+def test_claude_review_scope_carries_authored_content_without_gate_writing(review_context):
+    from foragent import run_review
+
+    git = review_context.git
+    body = ("<!-- foragent:v1 -->\n## Goal\nShip it.\n\n## Waiting\nGate bookkeeping\n\n"
+            "## Contracts\nThe API stays.\n<!-- foragent:plan-child id=a key=b -->\n")
+    with run_review._claude_review_scope(git, body, "tests/acceptance/"):
+        scope = (git.root / "CLAUDE.local.md").read_text()
+    assert "## Goal\nShip it.\n\n## Contracts\nThe API stays." in scope
+    assert "Gate bookkeeping" not in scope and "<!-- foragent:" not in scope
 
 
 def test_claude_review_scope_does_not_accumulate_between_reviews(review_context):
