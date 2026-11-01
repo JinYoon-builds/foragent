@@ -127,7 +127,7 @@ def test_selecting_an_authored_wait_shows_its_canonical_context_not_a_guessed_tu
     ('overlap-wait', 'waiting for shared files', '공유 파일 기다려요'),
     ('test-slot-wait', 'waiting for a test slot', '시험 자리 기다리는 중'),
     ('baseline-wait', 'waiting for the baseline', '기준선 기다려요'),
-    ('limit-wait', 'Waiting its turn.', '순서를 기다려요.'),
+    ('limit-wait', 'waiting for the usage limit', '사용량 한도 기다려요'),
     ('executor-wait', 'waiting to retry the model', '모델 재시도 기다려요'),
 ])
 def test_authored_context_keeps_the_recorded_phase_time_and_warning(
@@ -317,3 +317,84 @@ def test_resolved_authored_lane_still_routes_one_acorn_to_its_recorded_lane(lang
         body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
             snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', number)}))
         assert (f'{lane} 레인' if language == 'ko' else f'lane {lane}') in body, body
+
+
+def _phases_the_runner_sets():
+    """Every literal phase passed to the runner's phase setters, read from the source."""
+    import ast
+    from pathlib import Path
+
+    import foragent
+
+    setters = {"_phase", "in_phase", "_credited_wait", "WaitPhase"}
+    found = set()
+    for path in Path(foragent.__file__).parent.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) in setters:
+                found |= {leaf.value for arg in node.args for leaf in ast.walk(arg)
+                          if isinstance(leaf, ast.Constant) and isinstance(leaf.value, str)}
+    return found
+
+
+def _worker(phase, state="working"):
+    return {"number": 7, "class": "wait" if phase in WAIT_PHASES or state == "blocked" else "working",
+            "phase": phase, "state": state}
+
+
+WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait"})
+
+
+def test_the_source_scan_finds_the_phases_of_each_setter():
+    """A scan that misses a setter would leave a new phase untested."""
+    assert {"implementing", "resolving-conflict", "checking", "reviewing", "ci", "merging", "baseline",
+            "baseline-wait", "overlap-wait", "test-slot-wait", "executor-wait",
+            "merge-lock-wait"} <= _phases_the_runner_sets()
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("phase", sorted(_phases_the_runner_sets() | WAIT_PHASES))
+def test_every_phase_the_runner_can_set_has_a_word_on_the_acorn(phase, language):
+    from foragent import watch_scene
+
+    assert watch_scene.WAIT_PHASES == WAIT_PHASES
+    snapshot = _snapshot(row())
+    current, _ = watch_scene.lane_items(snapshot, {
+        "slug": "work", "state": "working", "issue": 7, "phase": phase, "running": [{"number": 7}]})
+    word = lane_blocks._word(current[0], language)
+    assert word and word.strip(), f"{phase} leaves the acorn with only its number"
+    assert word != watch.text("lane_blocks_word_wait", language), f"{phase} has no word of its own"
+    assert f"#7 {word}" in "".join(value for value, _ in lane_blocks._acorn(current[0], language, 0, True))
+
+
+@pytest.mark.parametrize("language, phase, word", [
+    ("en", "overlap-wait", "wait: shared files"), ("ko", "overlap-wait", "대기: 공유 파일"),
+    ("en", "test-slot-wait", "wait: test slot"), ("ko", "test-slot-wait", "대기: 시험 자리"),
+    ("en", "baseline-wait", "wait: baseline"), ("ko", "baseline-wait", "대기: 기준선"),
+    ("en", "limit-wait", "wait: usage limit"), ("ko", "limit-wait", "대기: 사용량 한도"),
+    ("en", "executor-wait", "wait: model retry"), ("ko", "executor-wait", "대기: 모델 재시도"),
+    ("en", None, "prep"), ("ko", None, "준비"),
+])
+def test_a_worker_says_what_it_waits_for_or_that_it_is_preparing(language, phase, word):
+    assert lane_blocks._word(_worker(phase), language) == word
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_an_unknown_phase_or_a_block_shows_the_generic_wait_word_never_blank(language):
+    generic = watch.text("lane_blocks_word_wait", language)
+    assert generic and lane_blocks._word(_worker("a-phase-from-tomorrow"), language) == generic
+    assert lane_blocks._word(_worker("implementing", "blocked"), language) == generic
+
+
+def test_queued_work_still_says_nothing_beside_its_number():
+    for kind in ("next", "authored"):
+        assert lane_blocks._word({"class": kind, "phase": None}, "en") == ""
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("phase", sorted(WAIT_PHASES))
+def test_a_wait_phase_explains_itself_on_click(phase, language, tmp_path):
+    work = {"slug": "work", "state": "working", "issue": 7, "phase": phase, "running": [{"number": 7}]}
+    rows = lane_bubble.explain(("acorn", 7), _snapshot(work), Config(language=language), tmp_path,
+                               now=NOW, width=80, state={})
+    value = "\n".join("".join(part for part, _ in line) for line in rows)
+    assert watch.text(phase, language) in value

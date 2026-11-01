@@ -243,3 +243,112 @@ def test_authored_wait_uses_its_recorded_lane_when_a_listing_still_names_another
     old_items = sum(lane_items(snapshot, old), [])
     assert [(item["number"], item["title"]) for item in old_items] == [(999, "Recorded title")]
     assert sum(lane_items(snapshot, new), []) == []
+
+
+def _running_row(*running, **extra):
+    return {"slug": "work", "state": "working", "issue": 1, "phase": "implementing", "queued": [], "held": [],
+            "running": [{"number": 1, "title": "One"}, *running], **extra}
+
+
+def _run(number):
+    return {"number": number, "lane": "work", "status": "running", "phase": "implementing", "started_at": None}
+
+
+def _acorn_and_click(snapshot, tmp_path, number):
+    from foragent.config import Config
+    from foragent.watch_sections.lane_blocks import _word
+    from foragent.watch_scene import lane_items
+    from foragent.watch_sections.lane_bubble import explain
+
+    row = snapshot.status["lanes"]["work"]
+    current, upcoming = lane_items(snapshot, row)
+    item = next(item for item in current + upcoming if item["number"] == number)
+    rows = explain(("acorn", number), snapshot, Config(language="en"), tmp_path, now=NOW, width=70, state={})
+    return _word(item, "en"), "\n".join("".join(value for value, _ in line) for line in rows)
+
+
+@pytest.mark.parametrize("with_run", [True, False], ids=["active-run", "listed-only"])
+@pytest.mark.parametrize("states", [("waiting-human", "working"), ("working", "waiting-human"),
+                                    ("waiting-human", None), (None, "waiting-human"),
+                                    ("blocked", "waiting-human"), ("waiting-human", "blocked")])
+def test_duplicate_running_entries_keep_the_question_in_any_order(states, with_run, tmp_path):
+    row = _running_row(*[{"number": 7, "title": "Ask", **({"state": state} if state else {})} for state in states])
+    snapshot = _snapshot(row)
+    snapshot.status["active_runs"] = [_run(7)] if with_run else []
+    assert _classes(snapshot, row)[7] == "question"
+    word, click = _acorn_and_click(snapshot, tmp_path, 7)
+    assert word == "question" and watch.text("lane_bubble_question_click", "en") in click
+
+
+@pytest.mark.parametrize("with_run", [True, False], ids=["active-run", "listed-only"])
+@pytest.mark.parametrize("where", ["held", "running-state", "running-duplicate", "worker-state", "queued-too"])
+def test_a_running_issue_recorded_as_blocked_anywhere_is_a_wait_acorn(where, with_run, tmp_path):
+    block = {"number": 7, "title": "Stuck", "state": "blocked"}
+    plain = {"number": 7, "title": "Stuck"}
+    row = _running_row({"held": plain, "worker-state": plain, "queued-too": plain}.get(where, block))
+    if where == "held":
+        row["held"] = [block]
+    elif where == "queued-too":
+        row["queued"] = [block]
+    elif where == "running-duplicate":
+        row["running"] = [row["running"][0], plain, block, plain]
+    snapshot = _snapshot(row, **({"worker_states": {7: "blocked"}} if where == "worker-state" else {}))
+    snapshot.status["active_runs"] = [_run(7)] if with_run else []
+    assert _classes(snapshot, row)[7] == "wait"
+    word, click = _acorn_and_click(snapshot, tmp_path, 7)
+    assert word == "wait" and watch.text("blocked", "en") in click and "writing code" not in click
+
+
+def test_a_block_or_question_never_gives_way_to_a_weaker_later_record():
+    row = _running_row({"number": 7, "state": "waiting-human"}, {"number": 7, "state": "blocked"},
+                       {"number": 8, "state": "blocked"}, {"number": 8, "state": "working"})
+    row["held"] = [{"number": 7, "state": "working"}, {"number": 8, "state": "working"}]
+    snapshot = _snapshot(row, worker_states={7: "working", 8: "working"})
+    classes = _classes(snapshot, row)
+    assert classes[7] == "question" and classes[8] == "wait" and classes[1] == "working"
+
+
+def test_a_records_block_does_not_spread_to_the_other_running_issues():
+    row = _running_row({"number": 7, "state": "blocked"}, {"number": 8})
+    assert _classes(_snapshot(row), row) == {1: "working", 7: "wait", 8: "working"}
+
+
+@pytest.mark.parametrize("listing", ["running", "held"])
+def test_a_later_record_of_the_wait_phase_reaches_the_acorn(listing, tmp_path):
+    row = _running_row({"number": 7, "title": "Slot"}, {"number": 7, "title": "Slot", "phase": "test-slot-wait"})
+    if listing == "held":
+        row["running"].pop()
+        row["held"] = [{"number": 7, "title": "Slot", "state": "working", "phase": "test-slot-wait"}]
+    snapshot = _snapshot(row)
+    word, click = _acorn_and_click(snapshot, tmp_path, 7)
+    assert word == "wait: test slot" and watch.text("test-slot-wait", "en") in click
+
+
+def test_a_live_runs_phase_beats_a_listing_of_the_same_issue():
+    from foragent.watch_scene import lane_items
+
+    row = _running_row({"number": 7, "phase": "test-slot-wait"})
+    snapshot = _snapshot(row)
+    snapshot.status["active_runs"] = [_run(7)]
+    assert next(item for item in lane_items(snapshot, row)[0] if item["number"] == 7)["phase"] == "implementing"
+
+
+def test_a_queued_issue_keeps_its_recorded_block_and_says_why_the_lane_waits(tmp_path):
+    from foragent.watch_scene import category, lane_items, representative_wait
+
+    row = {"slug": "work", "state": "queued", "issue": 7, "running": [], "held": [],
+           "queued": [{"number": 7, "title": "Stuck", "state": "blocked"}, {"number": 8, "title": "Next"}]}
+    snapshot = _snapshot(row)
+    current, upcoming = lane_items(snapshot, row)
+    assert [item["class"] for item in upcoming] == ["wait", "next"] and current == []
+    assert category(current, upcoming) == "waiting" and representative_wait(row, current, upcoming) == 7
+    word, click = _acorn_and_click(snapshot, tmp_path, 7)
+    assert word == "wait" and watch.text("blocked", "en") in click
+
+
+@pytest.mark.parametrize("listing, recorded, expected", [
+    ("held", "waiting-human", "question"), ("queued", "waiting-human", "question"), ("queued", "blocked", "wait")])
+def test_the_workers_own_recorded_state_reaches_a_held_or_queued_acorn(listing, recorded, expected):
+    row = {"slug": "work", "state": "working", "issue": 1, "running": [{"number": 1}], "queued": [],
+           "held": [], listing: [{"number": 7, "state": "blocked" if listing == "held" else "queued"}]}
+    assert _classes(_snapshot(row, worker_states={7: recorded}), row)[7] == expected

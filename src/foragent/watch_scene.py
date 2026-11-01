@@ -22,6 +22,15 @@ STEPS = {"baseline": "baseline", "implementing": "implementing", "resolving": "i
          "merge-lock-wait": "merging", "resolving-conflict": "merging"}
 # Acorn classes in the order a lane block is placed by.
 CATEGORIES = ("working", "question", "waiting", "idle")
+# How firmly a recorded state holds an issue. One issue may be recorded in several places
+# (its run, duplicate listings, the held list, its labels); its acorn keeps the firmest.
+HOLDS = {"blocked": 1, "waiting-human": 2}
+
+
+def _firmest(*states: Any) -> Any:
+    """The firmest recorded state; the earliest one when they hold equally."""
+    return max((state for state in states if state and isinstance(state, str)),
+               key=lambda state: HOLDS.get(state, 0), default=None)
 
 
 def fit_marked(line: Line, width: int, mark: str, *, omitted: bool = False) -> Line:
@@ -149,12 +158,13 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         fact = row_of(snapshot.waiting_facts, number)
         if number in authored and authored[number]["lane"] != row.get("slug"):
             return  # The recorded active lane wins over a subsequently edited label.
+        state = _firmest(state, worker_states.get(number))
         if number in seen:
-            # One acorn per issue, but question evidence from any listing still counts.
+            # One acorn per issue, but what any record says about it still counts.
             entry = seen[number]
-            if state == "waiting-human" and entry["state"] != "waiting-human":
-                entry["state"] = state
-                entry["class"] = acorn_class(snapshot, row, number, state, entry["phase"], needs)
+            entry["state"] = _firmest(entry["state"], state)
+            entry["phase"] = entry["phase"] or phase
+            entry["class"] = acorn_class(snapshot, row, number, entry["state"], entry["phase"], needs)
             return
         title = titles.get(number) or (snapshot.titles or {}).get(number) or fact.get("title") or (
             row.get("title") if number == row.get("issue") else "") or ""
@@ -163,21 +173,18 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         seen[number] = entry
         target.append(entry)
 
-    def worker(number: int, run: dict[str, Any] | None, listed: str | None = None) -> None:
+    def worker(number: int, run: dict[str, Any] | None, item: dict[str, Any] | None = None) -> None:
         own = number == row.get("issue")
         state = worker_states.get(number) or (row.get("state") if own else "working") or "working"
-        if listed == "waiting-human":
-            state = listed  # The listing's own question wins over any other state.
-        phase = (run or {}).get("phase") or (row.get("phase") if own else None)
-        add(current, number, state, phase, run)
+        item = item or {}
+        phase = (run or {}).get("phase") or item.get("phase") or (row.get("phase") if own else None)
+        add(current, number, _firmest(state, item.get("state")), phase, run)
 
     # Running runs first, in start order (ties by issue number), then any other running issue.
-    listed = {item["number"]: item.get("state") for item in numbered(row.get("running"))
-              if isinstance(item.get("state"), str)}
     for number, run in runs.items():
-        worker(number, run, listed.get(number))
+        worker(number, run)
     for item in numbered(row.get("running")):
-        worker(item["number"], runs.get(item["number"]), listed.get(item["number"]))
+        worker(item["number"], runs.get(item["number"]), item)
     for item in numbered(row.get("held")):
         number, state = item["number"], item.get("state") or "blocked"
         phase = item.get("phase") or (run_phases.get(number) if state == "working" else None)
@@ -190,9 +197,9 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         add(current, number, state, phase, None)
     upcoming: list[dict[str, Any]] = []
     for item in numbered(row.get("queued")):
-        # A queued item keeps a recorded question; any other state of the queue is next.
-        add(upcoming, item["number"], "waiting-human" if item.get("state") == "waiting-human" else "queued",
-            None, None)
+        # A queued item keeps a recorded question or block; any other state of the queue is next.
+        add(upcoming, item["number"], item["state"] if item.get("state") in HOLDS else "queued",
+            item.get("phase"), None)
     # An authored wait is visible even without approval or a scheduler queue entry.
     # add() keeps a listed worker/held/queued acorn and its class instead of duplicating it.
     for number, fact in authored.items():
@@ -221,8 +228,8 @@ def representative_wait(row: dict[str, Any], current: list[dict[str, Any]],
     or queued acorns) shows the reason of its first waiting acorn, else of its first queued
     acorn classed next (its own issue first); parked and question acorns wait for no turn.
     """
-    # Current wait states keep their sentence even when they also have authored context.
-    waiting = [item["number"] for item in current if item["class"] == "wait"]
+    # Wait states keep their sentence even when they also have authored context.
+    waiting = [item["number"] for item in current + upcoming if item["class"] == "wait"]
     if row.get("issue") in waiting:
         return row["issue"]
     if any(item["class"] in {"working", "question"} for item in current + upcoming):

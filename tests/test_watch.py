@@ -75,7 +75,7 @@ def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
     lines = output.splitlines()
     # One lane block: its name row, the worker's acorn, then the queue on the next row.
     name = next(index for index, line in enumerate(lines) if line[14:].startswith("Server"))
-    assert "◖█#1▌" in lines[name + 1]
+    assert "◖█#1 prep▌" in lines[name + 1], "a worker with no recorded step yet is preparing"
     queue = next(line for line in lines[name:] if "next  " in line)
     assert "◖█#1" not in queue and [f"#{item['number']}" for item in result.status["lanes"]["api"]["queued"]] == [
         part.strip("◖█▌") for part in queue[14:].removeprefix("next  ").split("  ")]

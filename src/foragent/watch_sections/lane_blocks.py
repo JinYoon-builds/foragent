@@ -32,8 +32,7 @@ CONTENT_FROM = 14  # Art, then three spaces.
 ART_ROWS = 4
 PIXELS_FROM = 40
 ACORN_ROWS = 2  # Current acorns and queued ones each take at most this many rows.
-WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_parked",
-         "wait": "lane_blocks_word_wait"}
+WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_parked"}
 # Hit = (x0, y0, x1, y1, target) in this block's own rows; Mark = (row, number).
 Hit = tuple[int, int, int, int, Any]
 
@@ -47,10 +46,30 @@ def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
     return config.animation and not ascii_glyphs and not narrow, ascii_glyphs, narrow
 
 
+def _word(item: dict[str, Any], language: str) -> str:
+    """What the acorn says beside its number. Queued work says nothing; a worker always says
+    something: its step, what it waits for, or, for a phase no one named, that it waits."""
+    from foragent import watch, watch_scene
+
+    kind, phase = item["class"], item["phase"]
+    if kind == "working" and phase is None:
+        key = "lane_blocks_step_baseline"  # A run that recorded no step yet is still preparing.
+    elif kind == "working" and phase in watch_scene.STEPS:
+        key = f"lane_blocks_step_{watch_scene.STEPS[phase]}"
+    elif kind == "wait" and phase in watch_scene.WAIT_PHASES:
+        key = f"lane_blocks_word_{phase}"
+    elif kind in {"working", "wait"}:
+        key = "lane_blocks_word_wait"
+    elif kind in WORDS:
+        key = WORDS[kind]
+    else:
+        return ""
+    return watch.text(key, language)
+
+
 def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True) -> Line:
     """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the step word
     does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
-    from foragent import watch, watch_scene
     from foragent.watch_art import sideways_acorn
 
     kind = item["class"]
@@ -58,13 +77,8 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
         return sideways_acorn(item["number"], "", {"working": "working", "question": "question",
                                                    "parked": "parked"}.get(kind, "next"),
                               tick=tick, ascii=ascii_glyphs)
-    if kind == "working":
-        step = watch_scene.STEPS.get(item["phase"])
-        word = watch.text(f"lane_blocks_step_{step}", language) if step else ""
-    else:
-        word = watch.text(WORDS[kind], language) if kind in WORDS else ""
     style = {"working": "working", "question": "question", "parked": "parked"}.get(kind, "next")
-    return sideways_acorn(item["number"], word, style, tick=tick, ascii=ascii_glyphs)
+    return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs)
 
 
 def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefix: Line, mark: str,

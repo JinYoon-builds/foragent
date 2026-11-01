@@ -160,7 +160,7 @@ def test_each_worker_row_shows_its_own_state(tmp_path):
     tracker.remove_labels(2, ["blocked"])
     tracker.add_labels(2, ["needs-human"])
     text = frame(tracker, store, config, clock)
-    assert "◖█#1▌" in text and "◖█#2 question▌" in text, text
+    assert "◖█#1 prep▌" in text and "◖█#2 question▌" in text, text
 
 
 def test_elapsed_counts_from_each_runs_start(tmp_path):

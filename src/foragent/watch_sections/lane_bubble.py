@@ -302,12 +302,9 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         if reason != t("lane_blocks_wait"):
             rows.append([(reason, "")])
         return rows
-    from foragent import i18n
-
     if kind == "wait":
         key = "blocked" if item["state"] == "blocked" and phase not in watch_scene.WAIT_PHASES else phase
-        known = key in i18n.MESSAGES.get(language, i18n.MESSAGES["en"])
-        rows.append([(t(key) if known else t("lane_bubble_wait_fallback"), "")])
+        rows.append([(t(key), "")])
     else:
         step = watch_scene.STEPS.get(phase)
         rows.append([(t(f"lane_bubble_phase_{step}" if step else "lane_bubble_phase_working"), "")])
