@@ -90,6 +90,11 @@ Use `fa order publish` below to perform the approved publication itself.
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
+- Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
+  no linked issue yet: context for what to propose, defer or discuss, not a work list.
+  A missing link is not proof the decision is unimplemented (older issues are linked only
+  by exact D-number citations in their published spec). Each row has `observed_at`, the
+  age of the issue facts behind its state. You decide what to order.
 - Present issue questions only from `decisions`: these belong to this factory's effective
   orderer and are answered in that person's planning session. Reuse the existing @orderer
   GitHub issue comment and decision flow. Keep foreign questions as read-only facts in
@@ -316,6 +321,10 @@ freeze a lane's private implementation.
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
   when the affected files are not yet known. The published issue lists these under `## Files`.
+- Set an issue's or edit's **`decisions`** (for example, `["D79"]`) to the ledger decisions
+  the work carries out, so `fa decisions` links them. Use heading IDs only (`D79`, not
+  `D79-1`). Omitting it on a republication or edit keeps the issue's existing links; `[]`
+  clears them. Decisions cited only as rationale do not go here.
 - Put the shared outcome and cross-issue constraints in the parent summary, not in children.
 
 Record the lane map before writing acceptance tests: chunk × goal / out of scope /
@@ -374,6 +383,14 @@ approval, under "the lane will decide these" (in the person's language). They ne
 planning approval and no loop to remove every guess; the lane records them in its PR.
 `--approve` refuses issues whose latest preread of the current content is missing or still
 has open questions; any plan edit needs a new preread. The dry-run is never blocked.
+Issues with behaviour `statements` take `fa order prepare PLAN.json --json` instead of preread:
+their lane writes the tests, an independent reviewer checks them, and the reviewed files and
+commands enter the plan. Preread reads only the other issues. Publishing, with or without
+`--approve`, uses that review without starting another model; a change to the issue, the
+other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
+needs `fa order prepare` again. A reviewer question goes back to planning: answer it in the
+statements, then prepare again. Dropping the statements never returns a prepared or published
+issue to preread. Local commits on main that are not on origin must be pushed before publishing.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
 so preread refuses them: after the person's first-hand approval here, publish once without
 `--approve` to create the lanes, run preread, then publish again with `--approve`. Reuse that
@@ -423,7 +440,7 @@ it cannot fast-forward, report the error instead of rebasing or committing by ha
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
-`fa orch request-status ID done --note "<issues>"`, using the originating request ID and the
+`fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run

@@ -14,6 +14,49 @@ if TYPE_CHECKING:
     from foragent.state import Approval
 
 
+def _reviewed_base_changed(n: int, ctx: RunContext, pr) -> str:
+    link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+    run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
+    return "base-changed"
+
+
+def _refresh_reviewed_head(
+    n: int, ctx: RunContext, git: GitRepo, pr, head: str, target_sha: str,
+    reverify: Callable[[str], str | None] | None,
+) -> tuple[str, str | None]:
+    """Carry review through a clean base merge, verifying its exact head before pushing."""
+    from foragent import runner
+
+    if runner._remaining(n, ctx) <= 0:
+        return head, run_publish._timeout(n, ctx)
+    if reverify is None:
+        return head, run_publish._reviewed_base_changed(n, ctx, pr)
+    run_publish._phase(n, ctx, "checking")
+    if git.head_sha() != head or ctx.tracker.pr_head_sha(pr.number) != head:
+        link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+        return head, run_publish._hold_changed_head(n, ctx, link)
+    log = ctx.store.log_path(n)
+    run_publish._append(log, f"{run_publish.REVERIFY}: {target_sha}")
+    try:
+        git.merge_base(target_sha)
+    except run_publish.GitError:
+        if not git.conflict_paths():
+            raise
+        git.quit_merge()
+        return head, run_publish._reviewed_base_changed(n, ctx, pr)
+    new_head = git.head_sha()
+    if stopped := reverify(new_head):
+        return head, stopped
+    run_publish._check_publication(git, pr.base, target_sha)
+    git.push_head(pr.head, lease=head)
+    ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
+    run_publish._append(log, f"Pushed verified HEAD: {new_head}")
+    if ctx.tracker.pr_head_sha(pr.number) != new_head:
+        link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+        return new_head, run_publish._hold_changed_head(n, ctx, link)
+    return new_head, None
+
+
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
     approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
@@ -46,7 +89,6 @@ def _publish_reviewed_in_turn(
     """
     from foragent import run_group_check, run_group_ci, run_group_evidence, runner
 
-    worktree = git.root
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
     # A pass applies only to this head and these instructions. Neither the
@@ -60,14 +102,10 @@ def _publish_reviewed_in_turn(
                         if item.number == pr.number), None)
         # A moved target SHA is no stop here: the turn holder refreshes it (#712).
         if current is None or current.base != pr.base:
-            return base_changed()
+            return run_publish._reviewed_base_changed(n, ctx, pr)
         if not run_publish._acceptance_matches(n, ctx, git, approval):
             return "hash-mismatch"
         return None
-
-    def base_changed() -> str:
-        run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
-        return "base-changed"
 
     if stopped := unchanged():
         return stopped
@@ -75,30 +113,12 @@ def _publish_reviewed_in_turn(
     def refresh(target_sha: str) -> str | None:
         """Merge the moved base into the reviewed head, re-verify and push it."""
         nonlocal head, base_sha, started, ci_wait, queued_status
-        if runner._remaining(n, ctx) <= 0:
-            return run_publish._timeout(n, ctx)
-        if reverify is None:
-            return base_changed()
-        run_publish._append(log, f"{run_publish.REVERIFY}: {target_sha}")
-        try:
-            git.merge_base(target_sha)
-        except run_publish.GitError:
-            if not git.conflict_paths():
-                raise
-            git.quit_merge()
-            return base_changed()
-        new_head = git.head_sha()
-        if stopped := reverify(new_head):
+        head, stopped = run_publish._refresh_reviewed_head(n, ctx, git, pr, head, target_sha, reverify)
+        if stopped:
             return stopped
-        run_publish._check_publication(git, pr.base, target_sha)
-        git.push_head(pr.head, lease=head)
-        ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
-        run_publish._append(log, f"Pushed verified HEAD: {new_head}")
-        head, base_sha = new_head, target_sha
+        base_sha = target_sha
         started = ctx.now().timestamp()
         ci_wait, queued_status = run_publish._CIWait(started), None
-        if ctx.tracker.pr_head_sha(pr.number) != head:
-            return run_publish._hold_changed_head(n, ctx, link)
         return None
 
     def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
@@ -136,6 +156,7 @@ def _publish_reviewed_in_turn(
         return True
 
     while True:
+        run_publish._phase(n, ctx, "ci")
         if stopped := run_publish._wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
             lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,

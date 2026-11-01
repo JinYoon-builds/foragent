@@ -68,7 +68,7 @@ def _read_log(path: Path) -> str:
 def _issue_records(store: StateStore, issue: int) -> list[tuple[str, str]]:
     """Where an issue's failure is recorded, as (kind, text): the runner flags `retries-exceeded`
     and appends the traceback to the issue log, so the flag reason alone rarely holds it."""
-    flag = store.load_flag(issue)
+    flag = store.load_local_flag(issue)
     run = store.get_run(issue)
     return [("text", flag.reason if flag else ""), ("text", run.detail if run else ""),
             ("log", _read_log(store.log_path(issue)))]
@@ -83,7 +83,7 @@ def _source(store: StateStore, source: str) -> tuple[list[tuple[str, str]], int 
     if kind not in {"flag", "event"} or not number.isdigit() or int(number) < 1:
         raise ReportError("report_bad_source")
     if kind == "flag":
-        flag = store.load_flag(int(number))
+        flag = store.load_local_flag(int(number))
         if flag is None:
             raise ReportError("report_source_missing")
         return _issue_records(store, flag.number), flag.number, "flag"

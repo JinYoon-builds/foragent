@@ -9,6 +9,7 @@ import pytest
 from foragent import ci_mode, run_baseline, run_group_check, run_group_ci as group_ci, run_group_evidence, run_merge_turn, runner
 from foragent.ci_workflow import read_exclusions
 from foragent.git import GitError, GitRepo
+from foragent.state import StateStore
 from foragent.tracker import TrackerError
 from conftest import git_command
 from test_ci_mode_unit import report
@@ -22,6 +23,7 @@ def ci_case(tmp_path, monkeypatch):
     ctx.repo, ctx.repo_root = "owner/repo", Path.cwd()
     clock, calls = [NOW], []
     ctx.now = lambda: clock[0]
+    ctx.monotonic = lambda: (clock[0] - NOW).total_seconds()
     ctx.sleep = lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds))
     reports = [report(), report(1)]
     ctx.git = SimpleNamespace(
@@ -36,6 +38,103 @@ def ci_case(tmp_path, monkeypatch):
     monkeypatch.setattr(group_ci, "_baseline_exclusions", lambda *args: [])
     monkeypatch.setattr(runner, "_remaining", lambda *args: 2000)
     return SimpleNamespace(ctx=ctx, calls=calls, reports=reports, clock=clock)
+
+
+@pytest.mark.parametrize("result", ["passed", "transport-error"])
+def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_path, monkeypatch, result):
+    import os
+
+    from foragent import capacity
+
+    c = ci_case
+    for n in (5, 1, 4):
+        c.ctx.store.update_run(n, phase="ci", phase_started_at=NOW.isoformat())
+    c.ctx.store.update_run(5, pid=os.getpid())
+    capacity.write_state(c.ctx.store, 1, NOW)
+    other = StateStore(tmp_path / "other", now=c.ctx.now)
+    transport, polls, sleeps = c.ctx.git._call, [], []
+
+    def git(args):
+        assert c.ctx.store.get_run(5).phase == "checking"
+        assert capacity.machine_runs(c.ctx.store, c.ctx.now()) == 1
+        return transport(args)
+
+    def reports(head):
+        assert c.ctx.store.get_run(5).phase == "ci"
+        assert capacity.machine_runs(c.ctx.store, c.ctx.now()) == (1 if polls else 0)
+        polls.append(head)
+        if len(polls) == 1:
+            return []
+        if result == "transport-error":
+            raise TrackerError("reports unavailable")
+        return deepcopy(c.reports)
+
+    def ci_sleep(seconds):
+        c.clock[0] += timedelta(seconds=seconds)
+        other.start_run(90, branch="other", worktree="other", pid=os.getpid())
+
+    def slot_sleep(seconds):
+        assert c.ctx.store.get_run(5).phase == "ci"
+        assert ("close", 99) not in c.calls
+        assert len([call for call in c.calls if call[0] == "push"]) == 1
+        sleeps.append(seconds)
+        c.clock[0] += timedelta(seconds=seconds)
+        other.finish_run(90, outcome="merged")
+
+    monkeypatch.setattr(c.ctx.git, "_call", git)
+    monkeypatch.setattr(c.ctx.tracker, "pr_acceptance_reports", reports)
+    c.ctx.sleep = ci_sleep
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=slot_sleep))
+    verdict, reason, _ = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    assert verdict == ("passed" if result == "passed" else "void")
+    if result == "passed":
+        assert reason is None
+    else:
+        assert reason == "reports unavailable"
+    assert polls == ["head", "head"] and sleeps == [capacity.WORKLOAD_POLL_SECONDS]
+    assert c.ctx.store.get_run(5).waited_seconds == sum(sleeps)
+    assert ("close", 99) in c.calls
+    assert len([call for call in c.calls if call[0] == "push"]) == 2
+
+
+@pytest.mark.parametrize("damage", ["full", "lock", "free"])
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit, RuntimeError])
+def test_interrupted_group_ci_cleans_up_without_queueing_or_replacing_the_interruption(
+    ci_case, tmp_path, monkeypatch, exception, damage,
+):
+    import os
+
+    from foragent import capacity
+
+    c, error, closed = ci_case, exception("cancelled"), []
+    for n in (5, 1, 4):
+        c.ctx.store.update_run(n, phase="ci", phase_started_at=NOW.isoformat())
+    c.ctx.store.update_run(5, pid=os.getpid())
+    capacity.write_state(c.ctx.store, 1, NOW)
+    other = StateStore(tmp_path / "other", now=c.ctx.now)
+
+    def unusable(path):
+        raise PermissionError(path)
+
+    def reports(head):
+        assert c.ctx.store.get_run(5).phase == "ci"
+        if damage == "full":
+            other.start_run(90, branch="other", worktree="other", pid=os.getpid())
+        elif damage == "lock":
+            monkeypatch.setattr(capacity, "_try_flock", unusable)
+        raise error
+
+    def slot_sleep(seconds):
+        pytest.fail("A cancellation must not queue for a machine slot")
+
+    monkeypatch.setattr(c.ctx.tracker, "pr_acceptance_reports", reports)
+    monkeypatch.setattr(c.ctx.tracker, "close_pr", lambda pr: closed.append(c.ctx.store.get_run(5).phase))
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=slot_sleep))
+    with pytest.raises(exception) as caught:
+        group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    assert caught.value is error
+    assert closed == ["checking" if damage == "free" else "ci"]
+    assert len([call for call in c.calls if call[0] == "push"]) == 2
 
 
 @pytest.mark.parametrize("result", ["passed", "failed", "void", "timeout", "transport", "create"])
@@ -243,17 +342,23 @@ def test_ci_preparation_fault_records_mode_and_never_regroups_its_members(ci_cas
 
 
 @pytest.mark.parametrize("excluded", [None, [], ["pending-b.py", "pending-a.py", "pending-b.py"]])
-def test_combined_ci_commit_carries_the_exclusions_protocol_without_changing_trees(git_history, excluded):
+@pytest.mark.parametrize("cut", [False, True])
+def test_combined_ci_commit_carries_the_exclusions_protocol_without_changing_trees(git_history, excluded, cut):
     history = git_history
     base = history.tip
     history.update({"member-5.py": "VALUE = 5\n"})
     head5 = history.tip
     history.update({"member-1.py": "VALUE = 1\n"})
     head1 = history.tip
+    members = [run_group_check.Member(5, head5, ()), run_group_check.Member(1, head1, ())]
+    if cut:
+        history.tip = base
+        git_command(history.origin, "update-ref", "refs/heads/main", base)
+        history.update({"member-5.py": "CONFLICT = True\n"})
+        members.extend([run_group_check.Member(4, history.tip, ()),
+                        run_group_check.Member(7, "must-not-be-read", ())])
     git = GitRepo(history.origin)
-    combined = run_group_check._combine(git, base, [
-        run_group_check.Member(5, head5, ()), run_group_check.Member(1, head1, ()),
-    ], excluded=excluded)
+    combined = run_group_check._combine(git, base, members, excluded=excluded)
     trees = run_group_check._trees(git, base, combined)
     assert len(trees) == 2
     assert trees[-1] == git_command(history.origin, "rev-parse", f"{head1}^{{tree}}")

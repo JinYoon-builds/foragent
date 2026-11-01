@@ -13,8 +13,9 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_events, orch_facts, orch_inbox
+from foragent import orch_events, orch_facts, orch_inbox, orch_role_decisions
 from foragent.config import Config
+from foragent.orch_role_decisions import decisions
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.policy import _matches
 from foragent.roles import DEFAULT_ROLES, load_roles
@@ -31,28 +32,12 @@ def call_kind(name: str) -> str:
 
 
 def _events(store: StateStore, now: datetime) -> list[tuple[datetime, dict[str, Any]]]:
-    """Journal events at or before now, oldest first."""
+    """Local events at or before now, with authoritative inbox decisions, oldest first."""
     rows = [(at, event) for event in _jsonl(store.root / "orch-events.jsonl")
-            if (at := _time(event.get("at"))) is not None and at <= now]
+            if event.get("kind") != "role-proposal"
+            and (at := _time(event.get("at"))) is not None and at <= now]
+    rows.extend(orch_role_decisions.recorded(store, now))
     return sorted(rows, key=lambda row: row[0])
-
-
-def decisions(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One decision per (role, request id), oldest first: a repeated or corrected decision replaces the earlier one.
-
-    The journal is append-only, so `fa orch role-decision` run again for one request adds an event;
-    only the latest one (by time, then journal order) counts. A decision without a request id stands alone.
-    """
-    latest: dict[Any, tuple[tuple, dict[str, Any]]] = {}
-    for index, event in enumerate(events):
-        if event.get("kind") != "role-proposal" or type(event.get("accepted")) is not bool:
-            continue
-        request = event.get("request_id")
-        key = (event.get("role"), request if request is not None else ("line", index))
-        order = (_time(event.get("at")), index)
-        if key not in latest or order >= latest[key][0]:
-            latest[key] = (order, event)
-    return [event for _, event in sorted(latest.values(), key=lambda item: item[0])]
 
 
 def _recent_merged_files(store: StateStore, now: datetime) -> set[str]:
@@ -127,9 +112,13 @@ def scorecard(store: StateStore, config: Config, card: dict[str, Any]) -> dict[s
     from foragent import orch_role_raise, orch_scorecard
 
     days = card["days"]
-    names = list(dict.fromkeys([*load_roles(config), *_signal_roles(store, days)]))
+    now = store._now()
+    pairs = [(bucket, event) for at, event in _events(store, now)
+             if (bucket := orch_scorecard._bucket(at, now, days)) is not None]
+    proposal_roles = [event["role"] for _, event in pairs
+                      if event.get("kind") == "role-proposal" and event.get("role")]
+    names = list(dict.fromkeys([*load_roles(config), *_signal_roles(store, days), *proposal_roles]))
     daily = [{name: {"calls": 0, "accepted_proposals": 0} for name in names} for _ in range(days)]
-    pairs = orch_scorecard._events(store, store._now(), days)
     # Each call event is one launched session; a decision counts once per request (see decisions).
     counted = {id(event) for event in decisions([event for _, event in pairs])}
     for bucket, event in pairs:
@@ -229,19 +218,24 @@ def human(payload: dict[str, Any]) -> str:
     return "\n".join(lines) or "No roles."
 
 
-def decide(store: StateStore, request_id: str, decision: str, role: str | None) -> dict[str, Any]:
-    """Record the orchestrator's decision on one role proposal and close its request."""
-    record = next((row for row in orch_inbox.requests(store) if row.get("id") == request_id), None)
-    if record is None:
-        raise orch_inbox.InboxError(f"no request with id {request_id!r}")
-    name = record.get("role") or role
-    if not name:
-        raise orch_inbox.InboxError(f"request {request_id} names no role; pass --role")
-    event = orch_events.append_event(store, store._now(), None, "role-proposal",
-                                     f"{name}: {request_id} {decision}", role=name, request_id=request_id,
-                                     accepted=decision == "accepted")
-    orch_inbox.set_request_status(store, request_id, "done", f"role {name} proposal {decision}")
-    return event
+def decide(store: StateStore, request_id: str, decision: str, role: str | None,
+           answer: str | None = None) -> dict[str, Any]:
+    """Record answer and explicit decision with the done mark under the inbox lock."""
+    if decision not in ("accepted", "rejected"):
+        raise orch_inbox.InboxError("decision must be accepted or rejected")
+
+    def proposal(record: dict[str, Any]) -> None:
+        name = record.get("role") or role
+        if not name:
+            raise orch_inbox.InboxError(f"request {request_id} names no role; pass --role")
+        record.update(role=name, accepted=decision == "accepted", decided_at=store._timestamp())
+
+    record = orch_inbox.set_request_status(store, request_id, "done", f"role proposal {decision}",
+                                           check=proposal, answer=answer, require_answer=True)
+    name = record["role"]
+    return orch_events.append_event(store, store._now(), None, "role-proposal",
+                                    f"{name}: {request_id} {decision}", role=name, request_id=request_id,
+                                    accepted=record["accepted"])
 
 
 def add_parser(orch_actions) -> None:
@@ -251,13 +245,14 @@ def add_parser(orch_actions) -> None:
     decision = orch_actions.add_parser("role-decision", help="Record a role proposal as accepted or rejected")
     decision.add_argument("id", help="Request id of the proposal")
     decision.add_argument("decision", choices=("accepted", "rejected"))
+    decision.add_argument("--answer", help="What was done or why the proposal was rejected")
     decision.add_argument("--role", help="Role name when the request names none")
     decision.add_argument("--repo-root", type=Path, default=Path.cwd())
 
 
 def command(args, store: StateStore, config: Config) -> None:
     if args.action == "role-decision":
-        event = decide(store, args.id, args.decision, args.role)
+        event = decide(store, args.id, args.decision, args.role, args.answer)
         print(f"Role {event['role']}: proposal {args.id} {args.decision}.")
         return
     payload = collect(store, config, args.repo_root.resolve())

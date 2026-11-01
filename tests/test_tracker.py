@@ -6,6 +6,8 @@ import subprocess
 
 import pytest
 
+from test_scheduler import ctx as scheduler_context  # noqa: F401
+
 from foragent.tracker import (
     Comment, Dependency, FakeTracker, GhTracker, Issue, LabelEvent, LabelSpec, PullRequest, TrackerError,
 )
@@ -589,6 +591,7 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
         json.dumps({"head": {"sha": head}}),
         json.dumps(runs) + "\n" + json.dumps(second_page),
         failed_job(11), "[]", "discard me" + "A" * 4000,
+        "[]",  # The unfinished run 3 has no failed job yet.
         failed_job(14), "[]", "discard me too" + "B" * 4000,
     )
     logs = GhTracker(REPO, run).pr_failed_logs(42)
@@ -602,10 +605,11 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
           f"repos/owner/repo/actions/runs?head_sha={head}&per_page=100"], None),
         (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/1/jobs?per_page=100"], None),
         (["api", "--paginate", "repos/owner/repo/check-runs/11/annotations"], None),
-        (["run", "view", "1", "-R", REPO, "--log-failed"], None),
+        (["run", "view", "1", "-R", REPO, "--job", "11", "--log-failed"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/3/jobs?per_page=100"], None),
         (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/4/jobs?per_page=100"], None),
         (["api", "--paginate", "repos/owner/repo/check-runs/14/annotations"], None),
-        (["run", "view", "4", "-R", REPO, "--log-failed"], None),
+        (["run", "view", "4", "-R", REPO, "--job", "14", "--log-failed"], None),
     ]
 
 
@@ -617,12 +621,20 @@ def test_gh_failed_logs_empty_when_head_has_no_failed_actions():
 
 
 def test_gh_failed_log_errors_propagate():
-    run = ScriptedRun(
-        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]",
-        subprocess.CalledProcessError(1, ["gh"], stderr="logs unavailable"),
-    )
-    with pytest.raises(TrackerError, match="logs unavailable"):
+    limited = gh_error("gh: API rate limit exceeded for user (HTTP 403)")
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]", limited)
+    with pytest.raises(TrackerError, match="rate limit"):
         GhTracker(REPO, run).pr_failed_logs(42)
+
+
+def test_gh_failed_log_read_error_becomes_a_notice_and_keeps_annotation():
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11),
+        json.dumps([{"message": "assert failed"}]), gh_error("HTTP 500 boom"),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: log of job test: HTTP 500 boom" in logs
+    assert "assert failed" in logs and "Job test failed" in logs and not logs.not_started
 
 
 @pytest.mark.parametrize("steps,annotation", [
@@ -666,6 +678,159 @@ def test_gh_failed_run_without_failed_jobs_is_a_code_failure():
                       "invalid workflow file")
     logs = GhTracker(REPO, run).pr_failed_logs(42)
     assert not logs.not_started and "invalid workflow file" in logs
+
+
+IN_PROGRESS = '[{"id":7,"name":"ci","status":"in_progress","conclusion":null}]'
+JOBS_7 = "repos/owner/repo/actions/runs/7/jobs?per_page=100"
+
+
+def pending_job(number=79):
+    return {"id": number, "name": "pending", "status": "in_progress", "conclusion": None, "steps": []}
+
+
+def test_gh_failed_logs_read_every_failed_job_of_an_unfinished_run_while_siblings_pend(tmp_path):
+    jobs = (json.loads(failed_job(70, "unit")) + json.loads(failed_job(71, "acceptance (0)"))
+            + [pending_job()])
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps(jobs),
+        json.dumps([{"message": "unit broke"}]), "first" + "A" * 4000,
+        json.dumps([{"message": "lost ids"}]), "second" + "B" * 4000,
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42, full_text_dir=tmp_path)
+    assert not logs.not_started and "Actions run 7 (ci) in_progress" in logs
+    assert "A" * 4000 in logs and "B" * 4000 in logs, "One job's output must not hide another's"
+    assert "firstA" not in logs and "secondB" not in logs
+    assert logs.index("Job unit failed") < logs.index("unit broke") < logs.index("A" * 4000)
+    assert logs.index("A" * 4000) < logs.index("Job acceptance (0) failed") < logs.index("lost ids")
+    assert (tmp_path / "ci-job-70.log").read_text().startswith("first")
+    assert (tmp_path / "ci-job-71.log").read_text().startswith("second")
+    assert [call[0] for call in run.calls[-4:]] == [
+        ["api", "--paginate", "repos/owner/repo/check-runs/70/annotations"],
+        ["api", "--allow-escape-sequences", "repos/owner/repo/actions/jobs/70/logs"],
+        ["api", "--paginate", "repos/owner/repo/check-runs/71/annotations"],
+        ["api", "--allow-escape-sequences", "repos/owner/repo/actions/jobs/71/logs"],
+    ]
+
+
+def test_gh_failed_job_log_removes_terminal_control_and_keeps_the_text():
+    raw = "\ufeff\x1b[36;1muv run pytest\x1b[0m\r\n\x1b]8;;https://evil\x07link\x1b]8;;\x1b\\\tFAILED tests/a.py::b\x07\x1b\n"
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, failed_job(70), "[]", raw)
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "uv run pytest\nlink\tFAILED tests/a.py::b\n" in logs
+    assert "\x1b" not in logs and "\x07" not in logs and "\r" not in logs and "evil" not in logs
+
+
+def test_gh_log_of_only_terminal_control_is_empty():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, failed_job(70), "[]", "\x1b[0m\n")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "GitHub returned an empty log" in logs
+
+
+def test_gh_unfinished_run_without_failed_jobs_adds_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps([pending_job()]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs == "" and not logs.not_started
+
+
+def test_gh_not_started_job_of_an_unfinished_run_stays_not_started_without_log_reads():
+    jobs = json.loads(failed_job(70, steps="[]")) + [pending_job()]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps(jobs),
+                      json.dumps([{"message": "A runner could not be provisioned."}]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "A runner could not be provisioned." in logs
+    assert "Job test did not start" in logs and len(run.calls) == 4
+
+
+def test_gh_not_started_in_one_run_is_not_erased_by_a_pending_run():
+    runs = '[{"id":6,"conclusion":"failure"},{"id":7,"status":"queued","conclusion":null}]'
+    run = ScriptedRun('{"head":{"sha":"abc"}}', runs, failed_job(60, steps="[]"), "[]", json.dumps([pending_job()]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "Actions run 7" not in logs
+
+
+def test_gh_runs_unreadable_is_a_notice_that_proves_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', gh_error("HTTP 502 runs"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: workflow runs: HTTP 502 runs" in logs and not logs.not_started
+
+
+def test_gh_unreadable_changed_files_keep_measurement_runs_out_of_the_evidence():
+    from foragent.ci_workflow import WORKFLOW
+
+    runs = [{"id": 6, "path": WORKFLOW, "conclusion": "failure"},
+            {"id": 7, "path": ".github/workflows/ci.yml", "conclusion": "failure"}]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', json.dumps(runs), gh_error("HTTP 502 files"),
+                      failed_job(70), "[]", "ordinary tail")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: changed files of the pull request: HTTP 502 files" in logs
+    assert "ordinary tail" in logs and "Actions run 6" not in logs and not logs.not_started
+    assert all("/runs/6/" not in call[0][-1] for call in run.calls)
+
+
+def test_gh_unreadable_jobs_of_a_completed_run_keep_its_run_wide_log():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]',
+                      gh_error("HTTP 403 jobs"), "run-wide tail")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: jobs of run 7: HTTP 403 jobs" in logs
+    assert "run-wide tail" in logs and not logs.not_started
+    assert run.calls[-1][0] == ["run", "view", "7", "-R", REPO, "--log-failed"]
+
+
+def test_gh_unreadable_jobs_of_an_unfinished_run_do_not_prove_not_started_or_read_refused_logs():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, gh_error("HTTP 403 jobs"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: jobs of run 7: HTTP 403 jobs" in logs and not logs.not_started
+    assert run.calls[-1][0][-1] == JOBS_7
+
+
+def test_gh_unreadable_annotations_keep_the_log_and_prove_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', failed_job(70),
+                      gh_error("HTTP 403 annotations"), "failing test id")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: annotations of job test: HTTP 403 annotations" in logs
+    assert "failing test id" in logs and "Job test failed" in logs and not logs.not_started
+
+
+def test_gh_job_without_steps_stays_not_started_when_only_its_annotations_are_unreadable():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]',
+                      failed_job(70, steps="[]"), gh_error("HTTP 403 annotations"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "CI evidence unavailable: annotations of job test" in logs
+
+
+@pytest.mark.parametrize("runs", ['[{"id":7,"conclusion":"failure"}]', IN_PROGRESS])
+@pytest.mark.parametrize("empty", ["", " \n"])
+def test_gh_empty_job_log_is_a_notice_not_a_blank(runs, empty):
+    run = ScriptedRun('{"head":{"sha":"abc"}}', runs, failed_job(70), "[]", empty)
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: log of job test: GitHub returned an empty log" in logs
+    assert "Job test failed" in logs and not logs.not_started
+
+
+def test_gh_empty_run_wide_log_is_a_notice_not_a_blank():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"startup_failure"}]', "[]", "")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: failed log of run 7: GitHub returned an empty log" in logs
+    assert not logs.not_started
+
+
+@pytest.mark.parametrize("before", [
+    pytest.param([], id="runs"),
+    pytest.param(['[{"id":7,"path":"%s","conclusion":"failure"}]'], id="changed-files"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]'], id="jobs"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]', failed_job(70)], id="annotations"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]', failed_job(70), "[]"], id="job-log"),
+    pytest.param(['[{"id":7,"conclusion":"null"}]'.replace('"null"', "null"), failed_job(70), "[]"], id="rest-log"),
+    pytest.param(['[{"id":7,"conclusion":"startup_failure"}]', "[]"], id="run-log"),
+])
+def test_gh_rate_limit_on_every_evidence_read_propagates(before):
+    from foragent.ci_workflow import WORKFLOW
+
+    before = [item.replace("%s", WORKFLOW) for item in before]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', *before, gh_error("gh: API rate limit exceeded for user (HTTP 403)"))
+    with pytest.raises(TrackerError) as error:
+        GhTracker(REPO, run).pr_failed_logs(42)
+    assert error.value.is_rate_limit
 
 
 def gh_error(stderr, stdout="", code=1):
@@ -1296,10 +1461,19 @@ def test_default_gh_timeout_is_wrapped(monkeypatch):
 
 
 @pytest.mark.parametrize("comment", [None, "Closed by Foragent retry"])
-def test_close_pr_deletes_branch_and_records_optional_comment(comment):
+def test_close_pr_deletes_branch_and_records_optional_comment(comment, monkeypatch):
     fake = FakeTracker()
     pr = fake.create_pr(head="foragent/issue-1", base="main", title="PR", body="")
+    issue_closes = []
+    close_issue = fake.close_issue
+
+    def observe_issue_close(n, comment=None):
+        issue_closes.append(n)
+        close_issue(n, comment)
+
+    monkeypatch.setattr(fake, "close_issue", observe_issue_close)
     fake.close_pr(pr, comment)
+    assert issue_closes == []
     assert fake.get_issue(pr).state == "closed"
     assert fake.deleted_branches == ["foragent/issue-1"]
     assert [item.body for item in fake.list_comments(pr)] == ([] if comment is None else [comment])
@@ -1723,3 +1897,221 @@ def test_bounded_gh_caps_each_call_and_starts_none_once_the_shared_budget_is_spe
             tracker.sub_issues(3)  # Nothing left: no subprocess at all.
     tracker.sub_issues(4)  # Outside a bounded block the usual timeout applies.
     assert timeouts == [4, 2, 120]
+
+
+@pytest.mark.parametrize("error", ["HTTP 403 Issue is locked", "HTTP 422 Body is too long"])
+def test_refused_evidence_does_not_block_workflow_or_later_evidence(outbox_context, monkeypatch, error):
+    ctx = outbox_context
+    from foragent import orch_advice
+    assert orch_advice.publish(ctx.tracker, ctx, 1, "Refused exact\n\n advice") is None
+    refused, = ctx.store.github_outbox()
+    ctx.store.queue_github_write(1, "comment", body="Later evidence", evidence=True)
+    ctx.store.queue_github_write(1, "add_labels", labels=["ready"])
+    ctx.clock[0] = ctx.reset
+    post = ctx.remote.comment
+    attempts = []
+
+    def comment(number, body):
+        attempts.append(body)
+        if body == refused["body"]:
+            raise TrackerError(error)
+        return post(number, body)
+
+    monkeypatch.setattr(ctx.remote, "comment", comment)
+    ctx.tracker.flush_outbox()
+    ctx.tracker.flush_outbox()
+    assert attempts == [refused["body"], "Later evidence", refused["body"]]
+    assert ctx.store.github_outbox() == [refused]
+    assert ctx.store.github_blocking_outbox() == []
+    assert [comment.body for comment in ctx.remote.list_comments(1)] == ["Later evidence"]
+    assert "ready" in ctx.remote.get_issue(1).labels
+    ctx.tracker.add_labels(1, ["running"])
+    assert "running" in ctx.remote.get_issue(1).labels
+    monkeypatch.setattr(ctx.remote, "comment", post)
+    ctx.tracker.flush_outbox()
+    ctx.tracker.flush_outbox()
+    assert [comment.body for comment in ctx.remote.list_comments(1)] == ["Later evidence", refused["body"]]
+    assert ctx.store.github_outbox() == []
+
+
+def test_evidence_publishes_while_label_send_is_in_flight(outbox_context, monkeypatch):
+    ctx = outbox_context
+    ctx.clock[0] = ctx.reset
+    send = ctx.remote.add_labels
+
+    def labels(number, values):
+        from foragent import orch_advice
+        assert orch_advice.publish(ctx.tracker, ctx, number, "  Exact advice\n") is None
+        assert [comment.body for comment in ctx.remote.list_comments(number)] == ["  Exact advice\n"]
+        return send(number, values)
+
+    monkeypatch.setattr(ctx.remote, "add_labels", labels)
+    ctx.tracker.add_labels(1, ["ready"])
+    assert ctx.store.github_outbox() == []
+
+
+@pytest.mark.parametrize("read", ["current_issue", "sub_issues"])
+def test_evidence_does_not_mask_current_remote_issue(outbox_context, read):
+    ctx = outbox_context
+    ctx.store.queue_github_write(1, "comment", body="Advice", evidence=True)
+    ctx.remote.add_issue(2, "Parent")
+    ctx.remote.add_sub_issue(2, 1)
+    ctx.remote.add_labels(1, ["human"])
+    if read == "current_issue":
+        issue = ctx.tracker.current_issue(1)
+    else:
+        issue, = ctx.tracker.sub_issues(2)
+    assert "human" in issue.labels
+    assert issue == ctx.remote.get_issue(1)
+    assert len(ctx.store.github_outbox()) == 1
+
+
+@pytest.mark.parametrize("evidence", [True, False])
+def test_only_evidence_outbox_allows_new_run(scheduler_context, evidence):
+    from foragent import scheduler, scheduler_start
+    from test_scheduler import approve
+
+    ctx = scheduler_context
+    approve(ctx)
+    scheduler.tick(ctx)
+    ctx.store.queue_github_write(1, "comment", body="Pending", **({"evidence": True} if evidence else {}))
+    launched = []
+    ctx.launcher = lambda number: launched.append(number) or 7001
+    report = scheduler.TickReport()
+    result = scheduler_start._start_ready(ctx, {"main": [1]}, lambda issue: "main", "origin/main",
+                                          report, ("normal", 0.0))
+    assert result is evidence
+    assert launched == ([1] if evidence else [])
+    assert len(ctx.store.github_outbox()) == 1
+    assert ("running" in ctx.tracker.get_issue(1).labels) is evidence
+
+
+def test_older_evidence_keeps_foreground_publication_in_order(outbox_context):
+    from foragent import orch_advice
+
+    ctx = outbox_context
+    orch_advice.publish(ctx.tracker, ctx, 1, "First")
+    ctx.clock[0] = ctx.reset
+    orch_advice.publish(ctx.tracker, ctx, 1, "Second")
+    assert ctx.remote.list_comments(1) == []
+    assert [entry["body"] for entry in ctx.store.github_outbox()] == ["First", "Second"]
+    ctx.tracker.flush_outbox()
+    ctx.tracker.flush_outbox()
+    assert [comment.body for comment in ctx.remote.list_comments(1)] == ["First", "Second"]
+    assert ctx.store.github_outbox() == []
+
+
+@pytest.mark.parametrize("action", ["comment", "add_labels", "remove_labels", "update_issue", "close_issue"])
+@pytest.mark.parametrize("same_issue", [False, True])
+@pytest.mark.parametrize("queue_writes", [False, True])
+def test_evidence_never_creates_workflow_debt(outbox_context, monkeypatch, action, same_issue, queue_writes):
+    from foragent import orch_advice
+
+    ctx = outbox_context
+    ctx.remote.add_issue(2, "Other issue", labels=["running"])
+    ctx.remote.add_labels(1, ["running"])
+    ctx.tracker.get_issue(2)
+    orch_advice.publish(ctx.tracker, ctx, 1, "Refused evidence")
+    evidence, = ctx.store.github_outbox()
+    ctx.clock[0] = ctx.reset
+    post = ctx.remote.comment
+
+    def comment(number, body):
+        if body == evidence["body"]:
+            raise TrackerError("HTTP 422 Body is too long")
+        return post(number, body)
+
+    monkeypatch.setattr(ctx.remote, "comment", comment)
+    ctx.tracker.flush_outbox()
+    ctx.tracker.queue_writes = queue_writes
+    target = 1 if same_issue else 2
+    operations = {
+        "comment": lambda: ctx.tracker.comment(target, "Workflow transition"),
+        "add_labels": lambda: ctx.tracker.add_labels(target, ["ready"]),
+        "remove_labels": lambda: ctx.tracker.remove_labels(target, ["running"]),
+        "update_issue": lambda: ctx.tracker.update_issue(target, title="Changed", body="New body"),
+        "close_issue": lambda: ctx.tracker.close_issue(target),
+    }
+    operations[action]()
+    actual = ctx.remote.get_issue(target)
+    effects = {
+        "comment": [comment.body for comment in ctx.remote.list_comments(target)] == ["Workflow transition"],
+        "add_labels": "ready" in actual.labels,
+        "remove_labels": "running" not in actual.labels,
+        "update_issue": (actual.title, actual.body) == ("Changed", "New body"),
+        "close_issue": actual.state == "closed",
+    }
+    assert effects[action], "Evidence must not defer an otherwise writable workflow operation"
+    assert ctx.store.github_outbox() == [evidence]
+    assert ctx.store.github_blocking_outbox() == []
+
+
+@pytest.mark.parametrize("error", ["HTTP 403 Issue is locked", "HTTP 422 Body is too long"])
+def test_tick_starts_after_post_flush_transition_despite_other_issue_evidence(
+    scheduler_context, monkeypatch, error,
+):
+    from foragent import orch_advice, scheduler
+    from test_scheduler import approve
+
+    ctx = scheduler_context
+    approve(ctx)
+    scheduler.tick(ctx)
+    remote = ctx.tracker._tracker
+    remote.add_issue(2, "Evidence owner")
+    post = remote.comment
+    events, launched = [], []
+
+    def comment(number, body):
+        if number == 2:
+            events.append("evidence")
+            raise TrackerError(error)
+        events.append("posted")
+        return post(number, body)
+
+    monkeypatch.setattr(remote, "comment", comment)
+    assert orch_advice.publish(ctx.tracker, ctx, 2, "Refused evidence")
+    evidence, = ctx.store.github_outbox()
+    events.clear()
+    waits = scheduler.orch_waits.tick
+
+    def transition_after_flush(context, report, **kwargs):
+        result = waits(context, report, **kwargs)
+        events.append("transition")
+        context.tracker.comment(1, "Workflow transition")
+        return result
+
+    monkeypatch.setattr(scheduler.orch_waits, "tick", transition_after_flush)
+
+    def launch(number):
+        events.append("launch")
+        launched.append(number)
+        return 7001
+
+    ctx.launcher, ctx.start_runs = launch, True
+    scheduler.tick(ctx)
+    assert launched == [1]
+    assert events.index("evidence") < events.index("transition") < events.index("launch")
+    assert [comment.body for comment in remote.list_comments(1)].count("Workflow transition") == 1
+    assert remote.get_issue(1).labels == {"approved", "running"}
+    assert ctx.store.get_run(1).status == "running"
+    assert ctx.store.github_outbox() == [evidence]
+    assert ctx.store.github_blocking_outbox() == []
+
+
+@pytest.mark.parametrize("same_issue", [False, True])
+@pytest.mark.parametrize("queue_writes", [False, True])
+def test_evidence_does_not_hide_workflow_comment_errors(outbox_context, monkeypatch, same_issue, queue_writes):
+    ctx = outbox_context
+    evidence = ctx.store.queue_github_write(1, "comment", body="Evidence", evidence=True)
+    ctx.remote.add_issue(2, "Other issue")
+    ctx.clock[0] = ctx.reset
+    ctx.tracker.queue_writes = queue_writes
+
+    def refuse(number, body):
+        raise TrackerError("HTTP 422 Workflow comment refused")
+
+    monkeypatch.setattr(ctx.remote, "comment", refuse)
+    with pytest.raises(TrackerError, match="Workflow comment refused"):
+        ctx.tracker.comment(1 if same_issue else 2, "Workflow transition")
+    assert ctx.store.github_outbox() == [evidence]
+    assert ctx.store.github_blocking_outbox() == []

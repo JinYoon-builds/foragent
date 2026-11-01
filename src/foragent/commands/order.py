@@ -26,6 +26,8 @@ dependencies ([] clears them); omit it to keep them.
 A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
 publication comments one line when it changes and nothing when it is unchanged.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
+decision marker. Omitted keeps an issue's existing marker; [] clears its links.
 issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
@@ -159,6 +161,8 @@ def _preread(args, root) -> int:
                                           f"{len(result['unknowns'])} unknown(s)"))
             for unknown in result["unknowns"]:
                 print(f"  - {unknown}")
+            if "current" in result:
+                print(result["current"])
     return 0
 
 
