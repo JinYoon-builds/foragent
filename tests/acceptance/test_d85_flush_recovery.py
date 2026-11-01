@@ -323,7 +323,7 @@ def import_later_commit(case, *, parent=None, name="later.txt"):
     stream = ("commit refs/heads/main\ncommitter Offline Tests <tests@example.com> 1793443201 +0000\n"
               f"data 5\nLater\nfrom {parent}\nM 100644 inline {name}\n"
               f"data {len(content.encode())}\n{content}\n\ndone\n")
-    git_command(case.root, "fast-import", "--quiet", input=stream)
+    git_command(case.root, "fast-import", "--quiet", "--force", input=stream)  # replace main without containing it
     (case.root / name).write_text(content)
     git_command(case.root, "add", "--", name)
     return case.git_adapter.head_sha()

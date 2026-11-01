@@ -648,6 +648,7 @@ def test_init_honors_choice_over_recommendation_and_keeps_it_on_rerun(
 def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_outputs(
     git_history, tmp_path, monkeypatch,
 ):
+    """Reject omitting PR evidence or imposing PR-only outputs on a push-only base producer."""
     case = init_case(git_history, tmp_path, monkeypatch, private=False)
     assert case.main(case.argv) == 0
     path = case.root / WORKFLOW
@@ -656,7 +657,13 @@ def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_
     events = document.get("on", document.get(True))
     assert "pull_request" in events
     jobs = document["jobs"]
-    sharded = [job for job in jobs.values() if "shard" in job.get("strategy", {}).get("matrix", {})]
+    # Push-only base producers have no PR comparison artifact/output. Check
+    # the jobs reachable by this PR, preserving all existing PR obligations.
+    from test_ci_base_cache_workflow import active_steps, event_context
+
+    active_jobs = {id(row["job"]) for row in active_steps(document, event_context("pull_request", "main"))}
+    sharded = [job for job in jobs.values() if id(job) in active_jobs
+               and "shard" in job.get("strategy", {}).get("matrix", {})]
     assert sharded, "Acceptance must be distributed over a shard matrix"
     for job_config in sharded:
         strategy = job_config["strategy"]

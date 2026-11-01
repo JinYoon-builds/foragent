@@ -46,7 +46,7 @@ def test_consecutive_fifo_heads_share_one_complete_check_on_current_main(group_c
     assert [row.issue for row in case.merges] == list(case.members)
     assert all(case.outcomes[n] == "merged" for n in case.members)
     assert getattr(load_config(case.root, global_path=case.root / "absent.yml"),
-                   "merge_group_max", None) == 4
+                   "merge_group_max", None) == "auto"  # absent key: auto, which starts at 4
 
 
 def test_explicit_maximum_counts_the_holder_and_one_disables_grouping(group_case):
