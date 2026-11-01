@@ -1296,10 +1296,19 @@ def test_default_gh_timeout_is_wrapped(monkeypatch):
 
 
 @pytest.mark.parametrize("comment", [None, "Closed by Foragent retry"])
-def test_close_pr_deletes_branch_and_records_optional_comment(comment):
+def test_close_pr_deletes_branch_and_records_optional_comment(comment, monkeypatch):
     fake = FakeTracker()
     pr = fake.create_pr(head="foragent/issue-1", base="main", title="PR", body="")
+    issue_closes = []
+    close_issue = fake.close_issue
+
+    def observe_issue_close(n, comment=None):
+        issue_closes.append(n)
+        close_issue(n, comment)
+
+    monkeypatch.setattr(fake, "close_issue", observe_issue_close)
     fake.close_pr(pr, comment)
+    assert issue_closes == []
     assert fake.get_issue(pr).state == "closed"
     assert fake.deleted_branches == ["foragent/issue-1"]
     assert [item.body for item in fake.list_comments(pr)] == ([] if comment is None else [comment])
