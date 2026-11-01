@@ -3255,3 +3255,61 @@ def test_shared_publication_preflight_refuses_stale_targets_before_writes(publis
     assert "approved" in tracker.get_issue(number).labels
     assert {name: (root / name).read_bytes() for name in contents} == contents
     assert not (StateStore.for_repo("owner/repo").root / "flush-journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_preread_preparation_failure_propagates_without_refreshing_failed_target(publishing, plan, monkeypatch, failed_index):
+    from foragent import order_observed
+
+    root, config, tracker, _, _ = publishing
+    report = publish(publishing, plan)
+    numbers = [row["number"] for row in report.rows]
+    for number in numbers:
+        issue = tracker.get_issue(number)
+        tracker.update_issue(number, title=issue.title + " external", body=issue.body)
+    original_target, original_save = order.preread_target, order_observed.save
+    worker, saved = _NoUnknowns(), []
+    failure = RuntimeError("preread preparation failed")
+
+    def prepare(plan, item, *args):
+        if item["key"] == plan["issues"][failed_index]["key"]:
+            raise failure
+        return original_target(plan, item, *args)
+
+    def save(root, identity, values, language):
+        saved.extend(values)
+        return original_save(root, identity, values, language)
+
+    monkeypatch.setattr(order, "preread_target", prepare)
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    monkeypatch.setattr(order_observed, "save", save)
+    with pytest.raises(RuntimeError) as caught:
+        order.preread(plan, root, config, lambda: tracker)
+    assert caught.value is failure
+    assert len(worker.calls) == failed_index
+    assert saved == [str(number) for number in numbers[:failed_index]]
+    # A failed read must still refuse the changed issue, including after an earlier successful read.
+    with pytest.raises(order.PlanError, match=f"#{numbers[failed_index]}"):
+        order_observed.check(root, plan["id"], [tracker.get_issue(numbers[failed_index])], "en")
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_stale_publication_dry_run_previews_without_checking_or_refreshing_base(publishing, plan, monkeypatch, approve):
+    from foragent import order_observed
+
+    root, _, tracker, _, events = publishing
+    report = publish(publishing, plan)
+    number = report.rows[0]["number"]
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title + " external", body=issue.body)
+    before, facts = list(events), dict(tracker.issues)
+    observed = (root / order_observed.FILE).read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(order_observed, "check", lambda *args: pytest.fail("dry-run reached the stale guard"))
+        preview = publish(publishing, plan, dry_run=True, approve=approve)
+    assert preview.dry_run is True and preview.rows[0]["number"] == number
+    assert events == before and tracker.issues == facts
+    assert (root / order_observed.FILE).read_bytes() == observed
+    # Preview neither refreshes the base nor disables protection for the following real publish.
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        publish(publishing, plan, approve=approve)
