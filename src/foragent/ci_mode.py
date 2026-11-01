@@ -423,7 +423,7 @@ def review_checks(n, ctx, git, target_branch):
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),
-                                            max(1, runner._remaining(n, ctx))))
+                                            max(1, runner._remaining(n, ctx)), base))
     for result in checks:
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)

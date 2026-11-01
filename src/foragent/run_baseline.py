@@ -474,6 +474,71 @@ def pytest_sessionfinish(session, exitstatus):
     with open({listing!r}, "w", encoding="utf-8") as stream:
         json.dump({{"ids": _ids, "errors": _errors, "rootdir": str(session.config.rootpath)}}, stream)
 """
+# A base run's interpreter is the head's, and its installation can resolve the project
+# anywhere: another checkout, a finder, a built copy. Ask the interpreter itself where
+# each project module resolves, as test subprocesses would too. Any place outside the
+# base checkout and the standard library ends the run with an exit no measurement accepts.
+RELATED_BASE_PLUGIN = """\
+import importlib.util
+import os
+import sys
+
+_checkout = {checkout!r}
+_head = {head!r}
+_prefixes = [os.path.realpath(prefix) for prefix in (sys.prefix, sys.exec_prefix, sys.base_prefix)]
+_not_project = {{"test", "tests", "node_modules", "site-packages", "dist-packages", "__pycache__"}}
+_not_imported = {{"__init__", "__main__", "conftest", "setup"}}
+
+
+def _inside(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+
+def _is_base_code(path):
+    path = os.path.realpath(path)
+    return _inside(path, _checkout) or (
+        any(_inside(path, root) for root in _prefixes)
+        and not {{"site-packages", "dist-packages"}} & set(path.split(os.sep)))
+
+
+def _project_modules():
+    # Directories inside a regular package never start an import path, so vendored copies do not count.
+    names = set()
+    for directory, subdirs, files in os.walk(_checkout):
+        subdirs[:] = [name for name in subdirs if not name.startswith(".") and name not in _not_project]
+        names.update(name[:-3] for name in files if name.endswith(".py"))
+        names.update(name for name in subdirs
+                     if any(file.endswith(".py") for file in os.listdir(os.path.join(directory, name))))
+        subdirs[:] = [name for name in subdirs if not os.path.exists(os.path.join(directory, name, "__init__.py"))]
+    return {{name for name in names if name.isidentifier() and name not in _not_imported}}
+
+
+def _foreign_modules():
+    found = []
+    for name in sorted(_project_modules()):
+        try:
+            spec = importlib.util.find_spec(name)
+        except Exception as exc:  # A finder that cannot answer proves nothing about the base.
+            found.append(f"{{name}} ({{exc}})")
+            continue
+        if spec is not None:
+            places = [*(spec.submodule_search_locations or []), *([spec.origin] if spec.has_location else [])]
+            found.extend(f"{{name}} ({{place}})" for place in places if place and not _is_base_code(place))
+    return found
+
+
+def pytest_sessionfinish(session):
+    found = _foreign_modules()
+    for module in list(sys.modules.values()):
+        file = getattr(module, "__dict__", {{}}).get("__file__")
+        if isinstance(file, str) and _inside(os.path.realpath(file), _head) and not _is_base_code(file):
+            found.append(file)
+    if found:
+        print("foragent: base run did not import only base code: " + ", ".join(sorted(set(found))))
+        session.exitstatus = 3  # Not 0 or 1: this run measured nothing about the base.
+"""
+
+
 def _with_python_path(command: str, directory: str) -> str:
     """Give only this subprocess ``directory`` on PYTHONPATH, joined with the command's own.
 

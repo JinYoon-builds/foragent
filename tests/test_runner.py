@@ -365,3 +365,452 @@ def test_tracker_exception_after_push_still_cleans_up_and_finishes(run_case, mon
     assert run_issue(1, c.ctx) == "error"
     assert "PR creation unavailable" in c.store.log_path(1).read_text()
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+
+
+def _junit(path, cases):
+    body = "".join(f'<testcase file="tests/test_a.py" classname="tests.test_a" name="{name}">{inner}</testcase>'
+                   for name, inner in cases)
+    path.write_text(f"<testsuites><testsuite>{body}</testsuite></testsuites>", encoding="utf-8")
+    return path
+
+
+def test_related_base_comparison_exempts_only_nodes_that_fail_on_base(tmp_path):
+    from foragent.run_checks import junit_failing_ids, split_base_failures
+
+    head = junit_failing_ids(_junit(tmp_path / "head.xml", [
+        ("test_old", "<failure/>"), ("test_regressed", "<error/>"), ("test_new", "<failure/>"), ("test_ok", "")]), 1)
+    assert head == {"tests/test_a.py::test_old", "tests/test_a.py::test_regressed", "tests/test_a.py::test_new"}
+    base = junit_failing_ids(_junit(tmp_path / "base.xml", [("test_old", "<failure/>"), ("test_regressed", "")]), 1)
+    exempt, blocking = split_base_failures(head, base)
+    assert exempt == {"tests/test_a.py::test_old"}
+    assert blocking == {"tests/test_a.py::test_regressed", "tests/test_a.py::test_new"}
+    # An unmeasured base proves nothing.
+    assert split_base_failures(head, None) == (frozenset(), head)
+
+
+@pytest.mark.parametrize("exit_code, cases", [
+    (2, [("test_old", "<failure/>")]),  # interrupted or collection error
+    (1, [("test_ok", "")]),  # exit 1 that no test case explains
+    (None, [("test_old", "<failure/>")]),  # timed out
+])
+def test_related_failures_are_unmeasured_unless_the_report_explains_the_exit(tmp_path, exit_code, cases):
+    from foragent.run_checks import junit_failing_ids
+
+    assert junit_failing_ids(_junit(tmp_path / "r.xml", cases), exit_code) is None
+    assert junit_failing_ids(tmp_path / "missing.xml", 1) is None
+
+
+def test_related_base_run_imports_base_sources_not_the_head_installation(git_history, tmp_path, monkeypatch):
+    """A head regression in a source module must not fail on base too through the head's import path."""
+    from acceptance.test_acceptance_baseline import make_case
+
+    git_history.update({
+        "src/relmod.py": "VALUE = 1\n",
+        "tests/test_relmod.py": "import relmod\n\ndef test_old():\n    assert False\n\n"
+                                "def test_value():\n    assert relmod.VALUE == 1\n",
+    })
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
+    case = make_case(git_history, tmp_path, monkeypatch, test_command=f"{sys.executable} -m pytest -q",
+                     max_retries=0, runner_unit_tests="all")
+
+    def regress(kwargs):
+        case.implement(kwargs)
+        # Stands in for the head's editable installation: the head sources are on every import path.
+        monkeypatch.setenv("PYTHONPATH", str(kwargs["worktree"] / "src"))
+        (kwargs["worktree"] / "src/relmod.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    case.implementer.steps = [regress]
+    assert run_issue(1, case.ctx) != "merged"
+    log = case.store.log_path(1).read_text(encoding="utf-8")
+    assert "Related base comparison: base_failing=['tests/test_relmod.py::test_old'] " \
+           "blocking=['tests/test_relmod.py::test_value']" in log
+
+
+@pytest.mark.parametrize("launcher", ["module", "console"])
+@pytest.mark.parametrize("layout, root, blocking", [
+    ("head-pth", "src", ["test_value"]),  # the checkout's src/ wins, so the base is measured
+    ("head-pth", "lib", ["test_old", "test_value"]),  # every other result is unmeasured
+    ("sibling-pth", "lib", ["test_old", "test_value"]),
+    ("clone-pth", "lib", ["test_old", "test_value"]),
+    ("clone-pythonpath", "lib", ["test_old", "test_value"]),
+    ("built-copy", "lib", ["test_old", "test_value"]),
+    ("head-finder", "lib", ["test_old", "test_value"]),
+    ("head-finder-subprocess", "lib", ["test_old", "test_value"]),
+])
+def test_related_base_run_never_measures_another_checkouts_installation(
+    git_history, tmp_path, monkeypatch, launcher, layout, root, blocking,
+):
+    """A real installation holding the head's change must not make a base-passing regression exempt."""
+    import venv
+    from pathlib import Path
+    from acceptance.test_acceptance_baseline import make_case
+
+    value = "assert relmod.VALUE == 1"
+    if layout == "head-finder-subprocess":
+        # Only a child process imports the project, so the parent's own modules say nothing.
+        value = "subprocess.run([sys.executable, '-c', 'import relmod; assert relmod.VALUE == 1'], check=True)"
+    module = f"{root}/relmod.py"
+    git_history.update({
+        module: "VALUE = 1\n",
+        "tests/test_relmod.py": "import subprocess, sys\n" + ("" if "subprocess" in layout else "import relmod\n")
+                                + f"\ndef test_old():\n    assert False\n\ndef test_value():\n    {value}\n",
+    })
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
+    env = tmp_path / "env"
+    venv.create(env, with_pip=False, symlinks=True)
+    site = next(env.glob("lib/python*/site-packages"))
+    pytest_home = Path(pytest.__file__).resolve().parent.parent
+    python = env / "bin" / "python"
+    command = f"{python} -m pytest -q"
+    if launcher == "console":
+        console = env / "bin" / "pytest"
+        console.write_text(f"#!{python}\nimport sys, pytest\nsys.exit(pytest.console_main())\n", encoding="utf-8")
+        console.chmod(0o755)
+        command = f"{console} -q"
+    case = make_case(git_history, tmp_path, monkeypatch, test_command=command, max_retries=0, runner_unit_tests="all")
+
+    def regress(kwargs):
+        case.implement(kwargs)
+        head = kwargs["worktree"]
+        (head / module).write_text("VALUE = 2\n", encoding="utf-8")
+        # A changed test file is what selects this related check; `relmod` is not a path-named module.
+        with (head / "tests/test_relmod.py").open("a", encoding="utf-8") as stream:
+            stream.write("\n# feature work\n")
+        installation = ""
+        other = tmp_path / "other"
+        if layout == "sibling-pth":
+            git_command(head, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+        elif layout.startswith("clone-"):
+            git_command(tmp_path, "clone", "-q", str(head), str(other))
+        if other.exists():
+            (other / module).write_text("VALUE = 2\n", encoding="utf-8")
+        if layout == "head-pth":
+            installation = f"{head / root}\n"
+        elif layout in {"sibling-pth", "clone-pth"}:
+            installation = f"{other / root}\n"
+        elif layout == "clone-pythonpath":
+            monkeypatch.setenv("PYTHONPATH", str(other / root))
+        elif layout == "built-copy":
+            (site / "relmod.py").write_text("VALUE = 2\n", encoding="utf-8")
+        else:
+            (site / "_finder.py").write_text(
+                "import importlib.util, sys\n"
+                "class Finder:\n"
+                "    @staticmethod\n"
+                "    def find_spec(name, path=None, target=None):\n"
+                "        if name == 'relmod':\n"
+                f"            return importlib.util.spec_from_file_location(name, {str(head / module)!r})\n"
+                "sys.meta_path.append(Finder)\n", encoding="utf-8")
+            installation = "import _finder\n"
+        (site / "_installed.pth").write_text(f"{pytest_home}\n{installation}", encoding="utf-8")
+
+    case.implementer.steps = [regress]
+    assert run_issue(1, case.ctx) != "merged"
+    log = case.store.log_path(1).read_text(encoding="utf-8")
+    exempt = sorted({"test_old", "test_value"} - set(blocking))
+    assert "Related base comparison: base_failing=" + repr([f"tests/test_relmod.py::{name}" for name in exempt]) + \
+           " blocking=" + repr([f"tests/test_relmod.py::{name}" for name in blocking]) in log, log
+
+
+def test_related_base_plugin_counts_only_project_modules_outside_the_checkout(tmp_path, monkeypatch):
+    import runpy
+    from types import ModuleType, SimpleNamespace
+    from foragent.run_baseline import RELATED_BASE_PLUGIN
+
+    checkout, head, third_party = tmp_path / "checkout", tmp_path / "head", tmp_path / "site-packages"
+    for path in (checkout / "src/pkg/vendor", checkout / "scripts", checkout / "tests", head, third_party):
+        path.mkdir(parents=True)
+    # A stdlib name, a copy vendored inside a package and a test helper are not the project's own modules.
+    (checkout / "src/pkg/__init__.py").write_text("", encoding="utf-8")
+    (checkout / "src/pkg/vendor/__init__.py").write_text("", encoding="utf-8")
+    (checkout / "src/pkg/vendor/dep.py").write_text("", encoding="utf-8")
+    (checkout / "scripts/json.py").write_text("", encoding="utf-8")
+    (checkout / "tests/helper.py").write_text("", encoding="utf-8")
+    (third_party / "dep.py").write_text("", encoding="utf-8")
+    (third_party / "helper.py").write_text("", encoding="utf-8")
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text(RELATED_BASE_PLUGIN.format(checkout=str(checkout.resolve()), head=str(head.resolve())),
+                      encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(checkout / "src"), str(checkout), str(third_party), *sys.path])
+    loaded = runpy.run_path(str(plugin))
+    assert loaded["_foreign_modules"]() == []
+    session = SimpleNamespace(exitstatus=1)
+    loaded["pytest_sessionfinish"](session)
+    assert session.exitstatus == 1
+    # A module only the head has is no project module of the base, but its load still counts.
+    only_on_head = ModuleType("only_on_head")
+    only_on_head.__file__ = str(head / "only_on_head.py")
+    monkeypatch.setitem(sys.modules, "only_on_head", only_on_head)
+    loaded["pytest_sessionfinish"](session)
+    assert session.exitstatus == 3
+    monkeypatch.delitem(sys.modules, "only_on_head")
+    # The same project module found first in another place counts, wherever it is.
+    (third_party / "pkg").mkdir()
+    (third_party / "pkg/__init__.py").write_text("", encoding="utf-8")
+    sys.path.insert(0, str(third_party))
+    assert loaded["_foreign_modules"]() == [f"pkg ({third_party / 'pkg'})", f"pkg ({third_party / 'pkg/__init__.py'})"]
+
+
+@pytest.mark.parametrize("exit_code, inner", [(0, ""), (1, "<failure/>")])
+def test_related_report_must_describe_the_requested_files(tmp_path, exit_code, inner):
+    from foragent.run_checks import junit_failing_ids
+
+    report = _junit(tmp_path / "report.xml", [("test_old", inner)])
+    assert junit_failing_ids(report, exit_code, ["tests/test_other.py"]) is None
+    assert junit_failing_ids(report, exit_code, ["tests/test_a.py"]) == (
+        {"tests/test_a.py::test_old"} if exit_code else frozenset())
+
+
+def test_related_base_symlinked_temporary_root_preserves_node_identity(git_history, tmp_path, monkeypatch):
+    import tempfile
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent import run_checks
+    from foragent.git import GitRepo
+    from foragent.state import StateStore
+
+    git_history.update({"tests/test_a.py": "def test_old(): assert False\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(linked))
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="test", worktree=root)
+    ctx = SimpleNamespace(git=GitRepo(root), store=store, monotonic=time.monotonic,
+                          config=Config(), now=store._now)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    result = run_checks.run_related_check(
+        1, ctx, root, f"{sys.executable} -m pytest -q --rootdir=. -p no:cacheprovider",
+        ["tests/test_a.py"], 1, 30, "origin/main")
+    assert result.exit_code == 0, store.log_path(1).read_text()
+    assert store.get_run(1).related_tests[0]["base_failing"] == ["tests/test_a.py::test_old"]
+
+
+@pytest.mark.parametrize("stage,error", [
+    (None, None), ("resolve", "git"), ("create", "git"), ("cleanup", "git"),
+    ("resolve", "os"), ("create", "os"), ("cleanup", "os"),
+])
+def test_related_base_unavailability_keeps_head_failure_and_record(
+    git_history, tmp_path, monkeypatch, stage, error,
+):
+    import shlex
+    from types import SimpleNamespace
+    from foragent import run_checks
+    from foragent.config import Config
+    from foragent.git import GitError, GitRepo
+    from foragent.state import StateStore
+
+    git_history.update({"tests/test_a.py": "def test_old(): assert True\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    git = GitRepo(root)
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="test", worktree=root)
+    ctx = SimpleNamespace(git=git, store=store, monotonic=lambda: 0, config=Config(), now=store._now)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    calls = []
+
+    def check(command, cwd, *args, **kwargs):
+        words = shlex.split(command)
+        report = store.root / "runs" / ("issue-1-related.xml" if cwd == root else "issue-1-related-base.xml")
+        failed = cwd == root
+        if not failed:
+            # Base requests identify files in their own checkout, never head's
+            # repo-relative selection, even when the two runs select the same file.
+            assert words[-1] == str(cwd / "tests/test_a.py")
+        calls.append(cwd)
+        _junit(report, [("test_old", "<failure/>" if failed else "")])
+        report.write_text(report.read_text().replace('<testcase ', '<testcase time="3.25" '))
+        return run_checks.CheckResult(command, int(failed), False, "head failure" if failed else "", 7)
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    if stage:
+        method = {"resolve": "at", "create": "add_detached_worktree", "cleanup": "remove_worktree"}[stage]
+        original = getattr(git, method)
+
+        def unavailable(*args):
+            if stage == "cleanup":
+                original(*args)
+            raise (GitError if error == "git" else OSError)("base workspace unavailable")
+
+        monkeypatch.setattr(git, method, unavailable)
+    result = run_checks.run_related_check(1, ctx, root, "pytest", ["tests/test_a.py"], 2, 30, "origin/main")
+    assert result.exit_code == 1 and result.output == "head failure"
+    assert store.get_run(1).related_tests == [{
+        "changed_file_count": 2, "selected_files": ["tests/test_a.py"],
+        "file_seconds": {"tests/test_a.py": 3.25}, "total_seconds": 7, "timed_out": False,
+    }]
+    assert len(calls) == (1 if stage in {"resolve", "create"} else 2)
+    assert not (store.root / "runs" / "issue-1-related.xml").exists()
+
+
+@pytest.mark.parametrize("stage", ["resolve", "create"])
+def test_related_base_real_git_failure_is_unmeasured(git_history, tmp_path, monkeypatch, stage):
+    from types import SimpleNamespace
+    from foragent import run_checks
+    from foragent.config import Config
+    from foragent.git import GitRepo
+    from foragent.state import StateStore
+
+    git_history.update({"tests/test_a.py": "def test_old(): assert True\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="test", worktree=root)
+    ctx = SimpleNamespace(git=GitRepo(root), store=store, monotonic=lambda: 0, config=Config(), now=store._now)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    calls = []
+
+    def check(command, cwd, *args, **kwargs):
+        calls.append(cwd)
+        _junit(store.root / "runs" / "issue-1-related.xml", [("test_old", "<failure/>")])
+        return run_checks.CheckResult(command, 1, False, "head failure", 7)
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    base_ref = "origin/absent"
+    if stage == "create":
+        # Git itself refuses this commit, so `worktree add` fails without a stubbed error.
+        base_ref = "origin/main"
+        monkeypatch.setattr(GitRepo, "_own_base", lambda self, ref: "0" * 40)
+    result = run_checks.run_related_check(1, ctx, root, "pytest", ["tests/test_a.py"], 2, 30, base_ref)
+    assert result.exit_code == 1 and result.output == "head failure"
+    assert calls == [root]
+    assert [check["selected_files"] for check in store.get_run(1).related_tests] == [["tests/test_a.py"]]
+    assert "base_failing" not in store.get_run(1).related_tests[0]
+
+
+@pytest.mark.parametrize("kind", ["inherited", "imported"])
+@pytest.mark.parametrize("outcome", ["passing", "already-failing", "regressed"])
+def test_related_collected_identity_survives_foreign_definitions(
+    git_history, tmp_path, monkeypatch, kind, outcome,
+):
+    from types import SimpleNamespace
+    from foragent import run_checks
+    from foragent.config import Config
+    from foragent.git import GitRepo
+    from foragent.state import StateStore
+
+    value = 0 if outcome == "already-failing" else 1
+    support = (f"VALUE = {value}\n\ndef shared():\n    assert VALUE == 1\n\n"
+               "class Shared:\n    def test_shared(self):\n        assert VALUE == 1\n")
+    if kind == "inherited":
+        collection = "from tests.test_support import Shared\nclass TestSelected(Shared): pass\n"
+        foreign_node = "tests/test_selected.py::TestSelected::test_shared"
+    else:
+        collection = "from tests.test_support import shared as test_imported\n"
+        foreign_node = "tests/test_selected.py::test_imported"
+    git_history.update({
+        "tests/__init__.py": "", "tests/test_support.py": support,
+        "tests/test_selected.py": collection + "\ndef test_old(): assert False\n",
+    })
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    if outcome == "regressed":
+        (root / "tests/test_support.py").write_text(support.replace("VALUE = 1", "VALUE = 0"))
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="test", worktree=root)
+    ctx = SimpleNamespace(git=GitRepo(root), store=store, monotonic=time.monotonic,
+                          config=Config(), now=store._now)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    command = run_checks._pytest_command(f"{sys.executable} -m pytest --junit-prefix=custom")
+    result = run_checks.run_related_check(
+        1, ctx, root, command, ["tests/test_selected.py"], 1, 30, "origin/main")
+    assert result.exit_code == (1 if outcome == "regressed" else 0), store.log_path(1).read_text()
+    exempt = ["tests/test_selected.py::test_old"]
+    if outcome == "already-failing":
+        exempt.append(foreign_node)
+    assert store.get_run(1).related_tests[0]["base_failing"] == sorted(exempt)
+    if outcome == "regressed":
+        assert f"blocking={[foreign_node]}" in store.log_path(1).read_text()
+
+
+def test_related_shared_definition_does_not_merge_distinct_collected_nodes(tmp_path):
+    from foragent.run_checks import junit_failing_ids, split_base_failures
+
+    reports = []
+    for filename, second_fails in [("head.xml", True), ("base.xml", False)]:
+        report = tmp_path / filename
+        report.write_text(
+            '<testsuite><testcase file="tests/support.py" classname="tests.test_a.TestA" '
+            'name="test_shared"><failure/></testcase><testcase file="tests/support.py" '
+            'classname="tests.test_b.TestB" name="test_shared">'
+            + ("<failure/>" if second_fails else "") + "</testcase></testsuite>")
+        reports.append(junit_failing_ids(report, 1, ["tests/test_a.py", "tests/test_b.py"]))
+    assert split_base_failures(*reports) == (
+        {"tests/test_a.py::TestA::test_shared"}, {"tests/test_b.py::TestB::test_shared"})
+
+
+def test_related_ambiguous_collected_module_is_unmeasured(tmp_path):
+    from foragent.run_checks import junit_failing_ids
+
+    report = _junit(tmp_path / "report.xml", [("test_old", "<failure/>")])
+    report.write_text(report.read_text().replace('classname="tests.test_a"', 'classname="tests.test_a.Inner"'))
+    assert junit_failing_ids(report, 1, ["tests/test_a.py", "tests/test_a/Inner.py"]) is None
+
+
+@pytest.mark.parametrize("head_seconds,limit,expected_base_limit,expected_checkouts", [
+    (800, 900, 60, 1), (20, 100, 100, 1), (900, 900, None, 0), (880, 900, None, 1),
+])
+def test_related_base_refreshes_budget_after_head_and_checkout(
+    git_history, tmp_path, monkeypatch, head_seconds, limit, expected_base_limit, expected_checkouts,
+):
+    from types import SimpleNamespace
+    from foragent import run_checks
+    from foragent.config import Config
+    from foragent.git import GitRepo
+    from foragent.state import StateStore
+
+    git_history.update({"tests/test_a.py": "def test_old(): assert False\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    now = [BASE_TIME]
+    store = StateStore(tmp_path / "state", now=lambda: now[0])
+    store.start_run(1, branch="test", worktree=root)
+    git = GitRepo(root)
+    ctx = SimpleNamespace(git=git, store=store, monotonic=lambda: 0, now=lambda: now[0],
+                          config=Config(max_runtime_minutes=15))
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    checkouts = []
+    original = git.add_detached_worktree
+
+    def checkout(*args):
+        original(*args)
+        checkouts.append(args[0])
+        now[0] += timedelta(seconds=40)
+
+    monkeypatch.setattr(git, "add_detached_worktree", checkout)
+    base_limits = []
+
+    def check(command, cwd, log, timeout_s, **kwargs):
+        if cwd == root:
+            assert timeout_s == limit
+            now[0] += timedelta(seconds=head_seconds + 120)
+            store.update_run(1, waited_seconds=120)
+            report, seconds = "issue-1-related.xml", head_seconds
+        else:
+            base_limits.append(timeout_s)
+            report, seconds = "issue-1-related-base.xml", 1
+        _junit(store.root / "runs" / report, [("test_old", "<failure/>")])
+        return run_checks.CheckResult(command, 1, False, "head failure", seconds)
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    result = run_checks.run_related_check(1, ctx, root, "pytest", ["tests/test_a.py"], 1, limit, "origin/main")
+    assert base_limits == ([] if expected_base_limit is None else [expected_base_limit])
+    assert len(checkouts) == expected_checkouts
+    assert result.exit_code == (1 if expected_base_limit is None else 0)
+    assert store.get_run(1).related_tests[0]["total_seconds"] == head_seconds
