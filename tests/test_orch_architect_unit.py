@@ -258,10 +258,12 @@ def budget_case(tmp_path, fake_process_table, monkeypatch):
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
     monkeypatch.setattr(orch_architect, "os", capacity.os)
     capacity.write_state(store, 1, datetime.now(UTC))
-    launches = []
+    launches, stopped, waited = [], [], []
 
     def launch(argv, **kwargs):
-        child = SimpleNamespace(pid=980001 + len(launches))
+        pid = 980001 + len(launches)
+        child = SimpleNamespace(pid=pid, kill=lambda: (stopped.append(pid), fake_process_table.exit(pid)),
+                                wait=lambda: waited.append(pid))
         launches.append(child)
         fake_process_table.add(child.pid, cwd=tmp_path, start_time=float(child.pid))
         return child
@@ -269,7 +271,7 @@ def budget_case(tmp_path, fake_process_table, monkeypatch):
     monkeypatch.setattr(orch_architect.subprocess, "Popen", launch)
     now = datetime(2026, 10, 27, tzinfo=UTC)
     case = SimpleNamespace(root=tmp_path, store=store, config=Config(executor="claude", language="en"),
-                           now=now, launches=launches, table=fake_process_table)
+                           now=now, launches=launches, stopped=stopped, waited=waited, table=fake_process_table)
     case.call = lambda: orch_architect.call(tmp_path, store, case.config, "evidence", now)
     case.finish = lambda: orch_architect.run_session(
         tmp_path, store, case.config, "evidence", orch_architect.read_record(store)["started_at"], lambda: now)
@@ -362,3 +364,85 @@ def test_a_late_old_session_leaves_the_new_sessions_slot(budget_case, monkeypatc
     orch_architect.run_session(budget_case.root, budget_case.store, budget_case.config, "evidence",
                                old_started_at, lambda: budget_case.now)
     assert budget_case.holders() == ["owner__project role architect"]
+
+
+def test_the_slot_passes_to_the_session_without_ever_counting_twice_or_opening_to_others(budget_case, monkeypatch):
+    """Every record change during a start: one holder, and no other admission can run in between."""
+    seen = []
+    workloads = capacity_sessions.directory(budget_case.store.root)
+
+    def observe():
+        with capacity._try_flock(budget_case.store.root.parent / capacity.LOCK_FILE) as free:
+            seen.append((len(budget_case.holders()), free))
+
+    write, replace = budget_case.store._write_json, orch_architect.os.replace
+
+    def observed_write(path, value):
+        write(path, value)
+        if path.parent == workloads and value.get("pid") == 980001:
+            observe()
+
+    def observed_replace(source, target):
+        replace(source, target)
+        observe()
+
+    monkeypatch.setattr(budget_case.store, "_write_json", observed_write)
+    monkeypatch.setattr(orch_architect.os, "replace", observed_replace, raising=False)
+    budget_case.call()
+    assert seen, "The session's slot must have been written"
+    assert all(count == 1 and not free for count, free in seen), seen
+    assert [item.pid for item in capacity_sessions.read(budget_case.store.root)] == [980001]
+
+
+@pytest.mark.parametrize("step,failure", [
+    ("session slot", OSError("no space left")),
+    ("slot move", OSError("no space left")),
+    ("role record", OSError("no space left")),
+    ("role record", KeyboardInterrupt()),
+])
+def test_a_start_that_cannot_record_its_session_stops_it_and_frees_the_slot(budget_case, monkeypatch, step, failure):
+    """A live session that nothing counts or finds must not stay running."""
+    write = budget_case.store._write_json
+
+    def fail():
+        assert budget_case.stopped == [], "The session must still be running when the failure happens"
+        raise failure
+
+    def failing_write(path, value):
+        if step == "role record" and path == orch_architect.record_path(budget_case.store):
+            fail()
+        if step == "session slot" and value.get("pid") == 980001:
+            fail()
+        write(path, value)
+
+    monkeypatch.setattr(budget_case.store, "_write_json", failing_write)
+    if step == "slot move":
+        monkeypatch.setattr(orch_architect.os, "replace", lambda source, target: fail(), raising=False)
+    with pytest.raises(type(failure)):
+        budget_case.call()
+    assert budget_case.stopped == [980001] and budget_case.waited == [980001]
+    assert budget_case.holders() == [] and budget_case.files() == []
+    assert not orch_architect.record_path(budget_case.store).exists()
+    assert not (budget_case.store.root / "orch-events.jsonl").exists()
+
+
+def test_a_session_that_starts_normally_is_never_stopped(budget_case):
+    budget_case.call()
+    assert budget_case.stopped == [] and budget_case.waited == []
+
+
+def test_a_start_inside_an_outer_hold_keeps_that_hold_and_adds_the_session(budget_case):
+    capacity.write_state(budget_case.store, 2, datetime.now(UTC))
+    with capacity.hold_workload(budget_case.store, budget_case.config, wait_s=0, kind="order"):
+        budget_case.call()
+        assert sorted(budget_case.holders()) == ["owner__project order", "owner__project role architect"]
+    assert budget_case.holders() == ["owner__project role architect"]
+
+
+def test_a_start_inside_an_outer_hold_is_refused_when_that_hold_fills_the_budget(budget_case):
+    with capacity.hold_workload(budget_case.store, budget_case.config, wait_s=0, kind="order"):
+        with pytest.raises(orch_architect.ArchitectRefused, match="order"):
+            budget_case.call()
+        assert budget_case.launches == []
+        assert budget_case.holders() == ["owner__project order"]
+    assert budget_case.files() == []
