@@ -521,11 +521,20 @@ def note_location(environ: dict[str, str], title: str | None = None,
     return {"kind": "terminal"}
 
 
-def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
-               where: dict[str, Any]) -> dict[str, Any]:
-    """Replace the latest note and journal a response for each issue it names."""
+def require_note_text(now: str) -> None:
     if not now.strip():
         raise InboxError("--now must not be empty")
+
+
+def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
+               where: dict[str, Any], *, retrospective: bool = False) -> dict[str, Any]:
+    """Replace the latest note, journal a response for each issue it names, and append its ``note`` event.
+
+    The latest note is a projection for the screens; the events are the history. Only
+    ``retrospective`` marks a note as a finished retrospective, and an unmarked note never
+    changes one. The event is the last write, so a failed note leaves no event behind.
+    """
+    require_note_text(now)
     record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
     store.root.mkdir(parents=True, exist_ok=True)
     summary = "\n".join(text for text in (now, why, next_step) if text)
@@ -534,6 +543,9 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
         for number in sorted({int(n) for n in re.findall(r"#(\d+)", summary)}):
             append_event(store, datetime.fromisoformat(record["at"]), number, "acknowledged", summary,
                          locked=True)
+        marked = {"retrospective": True} if retrospective else {}
+        append_event(store, datetime.fromisoformat(record["at"]), None, "note", now, locked=True,
+                     now=now, why=why, next=next_step, where=where, **marked)
     return record
 
 

@@ -38,6 +38,8 @@ class LogRetentionMixin:
         state lock, which every journal append also takes. The talk events of a run
         still active stay whatever their age: its talk state and paused time are
         derived from them (D95), so trimming one would end a talk without evidence.
+        The newest marked retrospective note also stays whatever its age: the last
+        retrospective time is derived from it.
         """
         cutoff, trimmed = now - JOURNAL_RETENTION, []
         with self._state_lock():
@@ -48,12 +50,30 @@ class LogRetentionMixin:
                     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
                 except FileNotFoundError:
                     continue
-                kept = [line for line in lines if not self._journal_line_expired(line, cutoff, active)]
+                newest = self._newest_retrospective(lines)
+                kept = [line for index, line in enumerate(lines)
+                        if index == newest or not self._journal_line_expired(line, cutoff, active)]
                 if len(kept) != len(lines):
                     self._atomic_write(path, "".join(kept))
                     trimmed.append(path)
         self.trimmed_journals = trimmed  # The tick's housekeeping reports the trim prune_logs did.
         return trimmed
+
+    @staticmethod
+    def _newest_retrospective(lines: list[str]) -> int | None:
+        """The index of the newest ``note`` line marked ``retrospective``, or None."""
+        newest, newest_at = None, None
+        for index, line in enumerate(lines):
+            try:
+                value = _state.json.loads(line)
+            except ValueError:
+                continue
+            if not (isinstance(value, dict) and value.get("kind") == "note" and value.get("retrospective") is True):
+                continue
+            at = _parse_time(value.get("at"))
+            if at is not None and (newest_at is None or at >= newest_at):
+                newest, newest_at = index, at
+        return newest
 
     @staticmethod
     def _journal_line_expired(line: str, cutoff: datetime, active: set = frozenset()) -> bool:
