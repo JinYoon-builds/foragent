@@ -25,7 +25,7 @@ session; otherwise record the question with `fa orch ask`, send it to planning a
 planning session runs `fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a
 planning handoff without a push: send it to planning as a cross-session message with SendMessage. If it is absent or
 its heartbeat is stale, `fa orch ask` sends the push itself, so do not add `fa notify`. New requests and answers wake
-`fa orch watch --follow` ([watch](references/watch.md)).
+`fa orch watch --follow` ([watch](references/watch.md)). Handle wait-resume notices: [waiting](references/waiting.md).
 
 ## Ask only D71 choices
 
