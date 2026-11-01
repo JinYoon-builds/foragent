@@ -29,18 +29,20 @@ base. The dream folds the pending lessons into `MEMORY.md` and appends their ids
 changed it, and ends a dream that rewrote earlier ids). A dream that changed its files opens a PR
 titled `Lane <lane> memory: <date>`; its `dream-published` event in `fa orch log` names the PR. A
 failed dream publishes nothing, so the base keeps every file. A dream is complete only when its PR
-merges: the gate then records `dream-done`. If you close the PR instead, the lane dreams again from
-the current base, over the same runs.
+merges: the gate then records `dream-done`. If a redo (`fa orch dream --redo <lane>`) closes the PR
+instead, the lane dreams again from the current base, over the same runs.
 
 - Dream PRs are the exception to SKILL.md's human merge rule (decision in issue #189, 2026-10-27):
   merge an open dream PR yourself, without asking the person, once its CI passes and its diff
   touches only that lane's memory directory (every path in `gh pr diff PR --name-only` starts with
   `.claude/agent-memory/<memory dir>/`). Run
   `fa orch merge PR --approved-by "$(gh api user --jq .login)"`, your own gh login.
-- A dream PR whose diff touches anything else is not a memory edit: do not merge it; close it with
-  a one-line reason.
-- While a lane's dream PR is open, the lane does not dream; merge or close the PR to let it dream
-  again. Every dream starts from the base: a dream PR you close is not carried into the next one.
+- A dream PR whose diff touches anything else is not a memory edit: do not merge it; run
+  `fa orch dream --redo <lane>` so the next tick closes it, and record the one-line reason with
+  `fa orch note --why "<reason>"`.
+- While a lane's dream PR is open, the lane does not dream; merge it, or run
+  `fa orch dream --redo <lane>`, to let it dream again. Every dream starts from the base: a dream PR
+  a redo closes is not carried into the next one.
 - To replace a stale dream with a fresh one, run `fa orch dream --redo <lane>`. It records the redo
   and makes the lane due even without new merges. The next tick closes only that lane's open dream
   PR built before the redo, even one opened after you ran the command, and starts the fresh dream
@@ -53,7 +55,8 @@ the current base, over the same runs.
   as written on its branch. `fa orch merge` compares the current base and PR head with them. A
   change (a hand edit of `MEMORY.md` on the base, or a PR head that is no longer the dream's work)
   makes the PR stale: `fa orch merge` refuses it, or one with no recorded digests, and names the
-  changed files. Close it with that reason; the lane dreams again from the current base.
+  changed files. Run `fa orch dream --redo <lane>` and record that reason with
+  `fa orch note --why "<reason>"`; the lane dreams again from the current base.
 
 ## Moving a project to the split
 
@@ -113,7 +116,8 @@ them in this order:
    there.
 3. Show the person the preservation diff (the merged change from step 2) and ask them to confirm
    closing both PRs. Do not infer approval.
-4. Only after the person confirms: close #898 and #901 without merging, with a comment that names
-   the commit from step 2, and let the lanes dream again from the current base. The dream folds the
+4. Only after the person confirms: run `fa orch dream --redo <lane>` for each of the two lanes, so
+   the next tick closes #898 and #901 without merging, and record the commit from step 2 with
+   `fa orch note --why "<commit>"`. The lanes then dream again from the current base. The dream folds the
    carried lessons and records their ids; the evidence block stays in `MEMORY.new.md` and in Git
    history.
