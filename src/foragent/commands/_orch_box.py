@@ -165,13 +165,14 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         orch_plan_cli.lane_queue(args, store, config)
         return
     if args.action == "request":
-        record = box.add_request(store, args.source, args.text)
+        from foragent import orch_role_decisions
+
+        record = orch_role_decisions.add_request(store, config, args.source, args.text)
         print(f"Request {record['id']} saved ({record['status']}).")
     elif args.action == "request-status":
-        record = box.set_request_status(store, args.id, args.status, args.note,
-                                        answer=args.answer, require_answer=True,
-                                        empty_answer_reason=("Legacy request-status completion: --answer was omitted."
-                                                             if args.answer is None else None))
+        from foragent import orch_role_decisions
+
+        record = orch_role_decisions.request_status(store, config, args.id, args.status, args.note, args.answer)
         print(f"Request {record['id']}: {record['status']}.")
     elif args.action == "note":
         if args.person_found is not None:

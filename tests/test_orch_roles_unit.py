@@ -157,3 +157,15 @@ def test_role_decision_uses_the_record_inside_the_completion_lock(store, monkeyp
     event = orch_roles.decide(store, request["id"], "accepted", "architect", answer="Applied")
     assert event["role"] == "docs"
     assert orch_inbox.requests(store)[0]["role"] == "docs"
+
+
+def test_role_removal_reads_recorded_decisions_even_without_the_journal(store, tmp_path):
+    config = SimpleNamespace(roles={"security": {"agent": "fa-security", "created_at": NOW.isoformat()}})
+    for n in range(3):
+        request = orch_inbox.add_request(store, "security", f"proposal {n}", {"role": "security"})
+        orch_roles.decide(store, request["id"], "rejected", None, answer="Kept current design")
+    (store.root / "orch-events.jsonl").write_text("")
+    assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is True
+    orch_roles.decide(store, request["id"], "accepted", None, answer="Applied after reconsidering")
+    (store.root / "orch-events.jsonl").write_text("")
+    assert orch_roles.collect(store, config, tmp_path)["roles"]["security"]["removal_proposed"] is False

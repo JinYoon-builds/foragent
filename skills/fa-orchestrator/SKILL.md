@@ -16,7 +16,7 @@ To assign an issue's executor and model, or to read Jin's goal and deadline, als
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json` (planning
 requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
 `fa orch request --from planning --text "..."`; mark progress with
-`fa orch request-status ID processing|done --answer "..."`. Every request or question sent as a cross-session message is
+`fa orch request-status ID processing|done --note "..." --answer "..."`. Every request or question sent as a cross-session message is
 also written to the box, even when the message itself arrives, so nothing is lost on restart. Record each D71 question
 below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1` (`--kind merge` for a merge
 approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text "..."`, which

@@ -211,7 +211,7 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
 
     has_answer = bool(answer and answer.strip())
     has_reason = bool(empty_answer_reason and empty_answer_reason.strip())
-    if status == "done" and require_answer and not (has_answer or has_reason):
+    if require_answer and answer is not None and not has_answer:
         raise InboxError("closing a request needs a non-empty --answer")
 
     def change(record: dict[str, Any]) -> None:
@@ -222,12 +222,17 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
                 raise InboxError("close role signals with fa orch signal-answer")
         if check is not None:
             check(record)
+        stored_answer = record.get("answer")
+        has_stored_answer = isinstance(stored_answer, str) and bool(stored_answer.strip())
+        if status == "done" and require_answer and not (has_answer or has_stored_answer or has_reason):
+            raise InboxError("closing a request needs a non-empty --answer")
         if answer is not None:
             record["answer"] = answer
             record.pop("empty_answer_reason", None)
+        elif status == "done" and has_stored_answer:
+            record.pop("empty_answer_reason", None)
         elif status == "done" and has_reason:
-            record.pop("answer", None)
-            record["empty_answer_reason"] = empty_answer_reason
+            record.setdefault("empty_answer_reason", empty_answer_reason)
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})

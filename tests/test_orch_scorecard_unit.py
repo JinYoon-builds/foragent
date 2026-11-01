@@ -383,3 +383,54 @@ def test_proposal_retry_and_correction_count_only_the_latest_explicit_acceptance
     orch_roles.decide(store, proposal["id"], "rejected", None, answer="Reconsidered")
     assert count() == 0
     assert orch_inbox.requests(store)[1]["accepted"] is False
+
+
+@pytest.mark.parametrize("stage", ["status-event", "proposal-event"])
+@pytest.mark.parametrize("decision", ["accepted", "rejected"])
+def test_scorecard_uses_committed_decision_when_its_audit_event_fails(store, monkeypatch, stage, decision):
+    from types import SimpleNamespace
+    from foragent import orch_events, orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    request = orch_inbox.add_request(store, "architect", "proposal")
+    previous = "rejected" if decision == "accepted" else "accepted"
+    orch_roles.decide(store, request["id"], previous, "architect", answer="Earlier decision")
+    store.clock[0] += timedelta(minutes=1)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("audit write failed")
+
+    target = orch_inbox if stage == "status-event" else orch_events
+    monkeypatch.setattr(target, "append_event", unavailable)
+    with pytest.raises(OSError, match="audit write failed"):
+        orch_roles.decide(store, request["id"], decision, None, answer="Corrected decision")
+    reopened = StateStore(store.root, now=lambda: store.clock[0])
+    [row] = orch_inbox.requests(reopened)
+    assert row["status"] == "done"
+    assert row["answer"] == "Corrected decision"
+    assert row["accepted"] is (decision == "accepted")
+    assert row["decided_at"] == store.clock[0].isoformat()
+
+    def count():
+        card = orch_roles.scorecard(reopened, config, orch_scorecard.collect(reopened, days=2))
+        return card["window"]["today"]["roles"]["architect"]["accepted_proposals"]
+
+    assert count() == int(decision == "accepted")
+    assert count() == int(decision == "accepted"), "Reading must not duplicate the acceptance"
+    (store.root / "orch-events.jsonl").write_text("")
+    assert count() == int(decision == "accepted"), "Journal retention must not erase an inbox decision"
+
+
+def test_scorecard_keeps_the_decision_day_after_a_later_status_note(store):
+    from types import SimpleNamespace
+    from foragent import orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    store.clock[0] = NOW - timedelta(hours=30)
+    request = orch_inbox.add_request(store, "architect", "proposal")
+    orch_roles.decide(store, request["id"], "accepted", "architect", answer="Applied")
+    store.clock[0] = NOW
+    orch_inbox.set_request_status(store, request["id"], "processing", "Follow-up")
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=2))
+    assert card["window"]["today"]["roles"]["architect"]["accepted_proposals"] == 0
+    assert card["window"]["previous"]["roles"]["architect"]["accepted_proposals"] == 1
