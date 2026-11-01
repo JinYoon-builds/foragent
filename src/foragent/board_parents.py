@@ -247,10 +247,10 @@ def follow_children(ctx, report) -> None:
         cancelled = [child.number for child in children
                      if child.state == "closed" and not _completed(child)]
         if cancelled and number in parents and not closes:  # A decision only while work remains.
-            previous = ctx.store.load_flag(number)
+            previous = ctx.store.load_local_flag(number)
             if previous is None or previous.reason != NOT_PLANNED_FLAG:
                 at = ctx.now()
-                ctx.store.save_flag(number, NOT_PLANNED_FLAG, flagged_at=at.isoformat())
+                ctx.store.save_flag(number, NOT_PLANNED_FLAG, flagged_at=at.isoformat(), local_only=True)
                 summary = text("parent_child_not_planned", language, number=number,
                                children=", ".join(f"#{child}" for child in cancelled))
                 append_event(ctx.store, at, number, NOT_PLANNED_FLAG, summary)

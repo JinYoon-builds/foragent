@@ -74,8 +74,8 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
         local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
-        load_flag=lambda n: flags.get(n),
-        save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
+        load_local_flag=lambda n: flags.get(n),
+        save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned"),
                     child(4)]}
@@ -176,8 +176,8 @@ def _record_ctx(monkeypatch, rows, remote, children=None, root=None, clock=None)
         return issue
 
     store = SimpleNamespace(
-        root=root, local_issues=lambda: rows, load_flag=lambda n: flags.get(n),
-        save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
+        root=root, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
+        save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     def reference_states(numbers):
         # Like GitHub's one bulk read, any unreadable number fails the whole call.
@@ -403,7 +403,7 @@ def test_order_whose_last_child_was_cancelled_closes_without_a_decision_flag(mon
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert out.closed == [(1, board_parents.closing_comment("en", [2], [3]))]
-    assert out.events == [] and ctx.store.load_flag(1) is None, "A closed order needs no decision"
+    assert out.events == [] and ctx.store.load_local_flag(1) is None, "A closed order needs no decision"
     assert report.actions == [text("parent_closed_report", "en", number=1, completed=1, cancelled=1)]
     assert out.synced == [(1, "Done", True)]
 

@@ -32,7 +32,13 @@ def _setup(config: Config, lane: str) -> dict:
     resolved = lane_config(config, lane)
     return {"executor": resolved.executor, "model": resolved.executor_model, "tiers": resolved.tiers,
             "reviewer": resolved_reviewer(resolved), "reviewer_model": resolved.reviewer_model,
-            "acceptance_dir": resolved.acceptance_dir, "base_branch": resolved.base_branch}
+            "acceptance_dir": resolved.acceptance_dir, "base_branch": resolved.base_branch,
+            # Every lane setting the writer's resolution reads (agent, skills, paths, model, effort...),
+            # whole rather than picked, and the global settings that resolve executors and skills.
+            "lane": config.lanes.get(lane) if lane != "main" else None,
+            "executor_list": resolved.executor_list, "fallback_model": resolved.executor_fallback_model,
+            "skill_libraries": resolved.skill_libraries, "skill_roles": resolved.skill_roles,
+            "language": resolved.language}
 
 
 def contracts(plan: dict, item: dict) -> dict:
@@ -47,41 +53,18 @@ def contracts(plan: dict, item: dict) -> dict:
         "done_when": None if "statements" in other else other.get("done_when")} for other in others}
 
 
-def _lines(values) -> str:
-    return "".join(f"  - {value}\n" for value in values or []) or "  (none)\n"
-
-
-def other_issues(plan: dict, item: dict) -> str:
-    """Every other issue and edit of the order as the writer and reviewer read them: the same
-    ``contracts`` the cycle binds, so a contract declared only in another issue's words reaches both."""
-    blocks = []
-    for key, other in contracts(plan, item).items():
-        tests = "".join(f"\n#### {path} (locked)\n```\n{content}\n```\n"
-                        for path, content in (other["acceptance_files"] or {}).items())
-        commands = "" if other["done_when"] is None else f"Done when:\n{_lines(other['done_when'])}"
-        blocks.append(
-            f"### {'Edit of existing issue ' if other['number'] is not None else 'Issue '}{key}"
-            f"{': ' + other['title'] if other.get('title') else ''}\n"
-            f"Lane: {other.get('lane') or '(from the tracker)'}\n"
-            f"Goal: {other.get('goal') or '(unchanged)'}\n"
-            f"Behaviour statements:\n{_lines(other.get('statements'))}"
-            f"Out of scope: {other.get('out_of_scope') or '(unchanged)'}\n"
-            f"Checklist:\n{_lines(other.get('checklist'))}"
-            f"Blocked by: {', '.join(other.get('blocked_by') or []) or '(none)'}\n"
-            f"Files expected to change: {', '.join(other.get('files') or []) or '(not listed)'}\n"
-            f"{commands}{tests}")
-    return "\n".join(blocks) or "No other issue in this order."
-
-
-def identity(plan: dict, item: dict, config: Config, root: Path) -> str:
+def identity(plan: dict, item: dict, config: Config, root: Path, files: dict | None = None) -> str:
     """What the tests are written and reviewed for: the issue's requirements, every other issue's
     requirements and legacy contracts, the shared spec and references, the risk guidance both agents
-    read, and the executor setup. A change starts a new cycle with the history retained."""
+    read, and the executor setup. A change starts a new cycle with the history retained. Publication
+    passes the ``files`` it will write, so the identity it checks is of exactly those bytes."""
     from foragent.order_prepare_prompt import _risk_notes
+    from foragent.order_prepare_setup import context_digest, published_digest
 
     shared = {"item": {name: item.get(name) for name in _CYCLE_FIELDS}, "title": plan.get("title"),
               "risks": _risk_notes(root, config, item),
-              "setup": _setup(config, item["lane"]),
+              "setup": _setup(config, item["lane"]), "context": context_digest(plan, item, config, root),
+              "published": published_digest(plan, root, config, files),
               "summary": plan.get("summary"), "spec": plan.get("spec_markdown"),
               "new_lanes": plan.get("new_lanes"),
               "references": {name: hashlib.sha256(data).hexdigest()
@@ -101,6 +84,12 @@ def requirement(plan: dict, item: dict) -> str:
              "references": {name: hashlib.sha256(data).hexdigest()
                             for name, data in sorted(_references(plan, item).items())}}
     return hashlib.sha256(json.dumps(asked, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def behaviour(item: dict) -> str:
+    """The behaviour planning states for this issue: only a change here answers the lane's question."""
+    stated = {name: item.get(name) for name in ("goal", "statements", "out_of_scope", "checklist")}
+    return hashlib.sha256(json.dumps(stated, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _scoped(entry: dict, attempt: dict) -> bool:
@@ -145,7 +134,8 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
                    record: dict, base: str, plan_path: Path | None, store=None) -> None:
     """Write, review and promote one statement issue, reusing what this cycle already settled.
 
-    An open question starts no agent until planning changes this issue's requirement.
+    An open question starts no agent until planning clarifies this issue's behaviour (its goal,
+    statements, scope or checklist); a change to the order's summary, spec or setup leaves it open.
     A reviewed result is reused, and written candidates waiting for review are reviewed without a new
     writer, only while they were made for the current cycle on the current ``base``; otherwise the lane
     writes again on a new scratch copy, keeping the holds of the unchanged requirement.
@@ -157,11 +147,19 @@ def prepare_issue(plan: dict, item: dict, root: Path, config: Config, git: GitRe
     entry = record["issues"].get(item["key"])
     current = entry is not None and entry.get("cycle") == cycle
     fresh = current and entry.get("base_revision") == base
-    # A question waits for planning to change this issue's requirement, whatever else changed.
-    question = entry is not None and entry["status"] == "question" and same_requirement(entry, cycle, asked)
-    settled = question or (fresh and entry["status"] == "reviewed")
+    # A question waits for planning to clarify this issue's behaviour, whatever else changed.
+    question = entry is not None and entry["status"] == "question" and (
+        same_requirement(entry, cycle, asked) or entry.get("behaviour") == behaviour(item))
+    if question and not same_requirement(entry, cycle, asked):
+        entry.update(reason=text("prepare_question_open", config.language))
+        _write(path, record)
+    from foragent.order_prepare_setup import others_digest
+
+    beside = entry is not None and entry.get("others") == others_digest(plan, record, item)
+    settled = question or (fresh and entry["status"] == "reviewed" and beside)
     if not settled:
-        pending = fresh and bool(entry.get("written")) and (entry["status"] == "written" or (
+        # Another issue's tests changed beside reviewed ones: review the same tests again, write nothing.
+        pending = fresh and bool(entry.get("written")) and (entry["status"] in {"written", "reviewed"} or (
             entry["status"] in {"waiting", "interrupted", "reviewing_tests"} and entry.get("phase") == "reviewing_tests"))
         if not pending:
             _write_tests(plan, item, root, config, git, path, record, base, cycle, asked, store)
