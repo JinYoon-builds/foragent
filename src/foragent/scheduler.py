@@ -172,6 +172,9 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     else:
         recovered = set()
     optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
+    if listing_current:  # Parents first: batch reads repeat every tick, and a parent's two calls must both fit.
+        with step("parent_sync"):
+            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     with step("batch_reconcile"):
         _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
     ready: dict[str, list[int]] = {}
@@ -282,8 +285,6 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     raise
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
-        if listing_current:  # Children change only through observed facts and this tick's writes.
-            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report

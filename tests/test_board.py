@@ -597,3 +597,74 @@ def test_waiting_refresh_uses_issue_body_to_repair_a_manual_board_edit(recording
     assert ctx.tracker.board_value(1, project.id, "Waiting") == WAITING
     board.refresh_cards(ctx)
     assert waiting_value(remote, project.id) == WAITING
+
+
+def test_moving_an_existing_card_takes_two_calls_with_a_retry_that_fits_one_bounded_tick(monkeypatch):
+    """A third call would never fit two four-second calls per tick, and a retry starts over."""
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    board.add_issue(tracker, "owner/repo", project_id, 1)
+    project = board.Project(tracker, "owner/repo", project_id)
+    project.set_values(1, {"Status": board.board_column("Ready")})
+    calls = []
+    graphql = tracker.graphql
+
+    def counted(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(tracker, "graphql", counted)
+    column = board.board_column("Running")
+    project.set_values(1, {"Status": column})
+    assert len(calls) == 2 and "ForagentBoardIssue" in calls[0] and "ForagentSetBoardValue" in calls[1]
+    assert any(value.get("name") == column for value in
+               snapshot(tracker, project_id)["items"]["nodes"][0]["fieldValues"]["nodes"])
+
+
+def test_moving_a_card_reads_all_fields_when_one_read_cannot_carry_them(monkeypatch):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    board.add_issue(tracker, "owner/repo", project_id, 1)
+    graphql = tracker.graphql
+    calls = []
+
+    def more_fields(query, variables):
+        calls.append(query)
+        result = graphql(query, variables)
+        if "ForagentBoardIssue" in query:
+            result["data"]["node"]["fields"]["pageInfo"]["hasNextPage"] = True
+            result["data"]["node"]["fields"]["nodes"] = []
+        return result
+
+    monkeypatch.setattr(tracker, "graphql", more_fields)
+    column = board.board_column("Running")
+    board.Project(tracker, "owner/repo", project_id).set_values(1, {"Status": column})
+    assert any("ForagentBoardFields" in query for query in calls)
+    assert any(value.get("name") == column for value in
+               snapshot(tracker, project_id)["items"]["nodes"][0]["fieldValues"]["nodes"])
+
+
+def test_adding_a_card_keeps_its_progress_when_the_budget_ends_before_the_status_write(monkeypatch):
+    tracker = FakeTracker()
+    tracker.add_issue(1)
+    project_id = board.ensure(tracker, "owner/repo")
+    graphql = tracker.graphql
+    calls = []
+
+    def out_of_time(query, variables):
+        calls.append(query)
+        if "ForagentSetBoardValue" in query:
+            raise TrackerError("gh time budget exhausted")
+        return graphql(query, variables)
+
+    monkeypatch.setattr(tracker, "graphql", out_of_time)
+    column = board.board_column("Running")
+    with pytest.raises(TrackerError):
+        board.Project(tracker, "owner/repo", project_id).set_values(1, {"Status": column})
+    assert len(calls) == 3 and "ForagentAddBoardItem" in calls[1]
+    calls.clear()
+    monkeypatch.setattr(tracker, "graphql", lambda query, variables: (calls.append(query), graphql(query, variables))[1])
+    board.Project(tracker, "owner/repo", project_id).set_values(1, {"Status": column})
+    assert len(calls) == 2 and not any("ForagentAddBoardItem" in query for query in calls), "The card stays added"

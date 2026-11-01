@@ -3,6 +3,7 @@
 A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
 each tick that read the issue listing, and closes it once no child is open.
+The listing is the fact source: per-issue reads are only for what it cannot show.
 A child closed as not planned (for example replaced by a newer order) has
 ended too; the one closing comment names completed and cancelled children in
 separate groups. An approved issue with sub-issues stays ordinary work.
@@ -16,6 +17,7 @@ open, a cancelled child only flags the order for a decision. Until a record
 closes, its card keeps today's handling.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -121,9 +123,10 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
 
     A closed reference counts as ended whatever its close reason; it is
     cancelled only when its reason is known to be not_planned. Listed issues
-    answer from the listing, and only when all of them are closed is each
-    unlisted reference read fresh, in this tick; nothing is kept between
-    ticks. A number that reads as a pull request is ignored.
+    answer from the listing, and only when all of them are closed are the
+    unlisted references read fresh, in one call of this tick: separate reads
+    could outgrow the tick's budget and start over every time, since nothing
+    is kept between ticks. A number that reads as a pull request is ignored.
     """
     closed, unlisted = {}, []
     for number in sorted(references - listed_prs):
@@ -134,19 +137,22 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
             return None  # Open work keeps the record open without spending reads.
         else:
             closed[number] = row.get("state_reason") == "not_planned"
-    for number in unlisted:
-        try:
-            issue = ctx.tracker.get_issue(number)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
-            log.warning("Could not read #%s, which an order record references: %s", number, exc)
-            return None
-        if issue.is_pull_request:
+    if not unlisted:
+        return closed
+    try:
+        states = ctx.tracker.reference_states(unlisted)
+    except TrackerError as exc:
+        if exc.is_rate_limit:
+            raise
+        log.warning("Could not read %s, which an order record references: %s",
+                    ", ".join(f"#{number}" for number in unlisted), exc)
+        return None
+    for reference in states:
+        if reference.is_pull_request:
             continue
-        if issue.state != "closed":
+        if reference.state != "closed":
             return None
-        closed[number] = getattr(issue, "state_reason", None) == "not_planned"
+        closed[reference.number] = reference.state_reason == "not_planned"
     return closed
 
 
@@ -159,8 +165,45 @@ def closing_comment(language: str, completed: list[int], cancelled: list[int]) -
     return " ".join(parts)
 
 
+def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]]) -> list[Issue] | None:
+    """A parent's children as this tick's listing shows them; None when only a read can tell.
+
+    Child rows carry state, close reason and labels, so a child-only change is
+    seen even if the parent's own row did not change. The native summary only
+    checks the edges and, for a child with no row, shows open work; it never
+    closes anything by itself. GitHub's completed count includes cancelled
+    children, so completed < total means some child is open.
+    """
+    numbers = row.get("children") or []
+    known = [_listed_issue(rows[number]) for number in numbers if number in rows]
+    summary = (row.get("observed") or {}).get("sub_issues") or {}
+    total = summary.get("total")
+    if total is not None and total != len(numbers):
+        return None
+    if len(known) == len(numbers):
+        return known
+    if total is not None and summary.get("completed", total) < total:
+        return [*known, Issue(0, "", "", frozenset(), "open")]  # Stands for the unlisted open work.
+    return None
+
+
+def _listed_issue(row: dict[str, Any]) -> Issue:
+    return Issue(row["number"], row.get("title") or "", row.get("body") or "", frozenset(row.get("labels", ())),
+                 row.get("state", "open"), state_reason=row.get("state_reason"))
+
+
 def follow_children(ctx, report) -> None:
-    """Move each order parent's card to its children's column; close it when all its work is done."""
+    """Move each order parent's card to its children's column; close it when all its work is done.
+
+    Everything the listing establishes costs no GitHub call, so an unchanged
+    parent spends none of the shared budget. Parents ready to close go first,
+    lowest number first: a close succeeds once and leaves the list. The others
+    follow in an order drawn from the tick's time, with nothing stored, so a
+    parent that spends the budget on every tick (an unlisted reference is read
+    fresh each time) cannot keep starving a later one.
+    One parent's failure defers only that parent, and the step still reports
+    it; a rate limit stops the step at once.
+    """
     rows = ctx.store.local_issues()
     by_number = {row["number"]: row for row in rows}
     open_prs = {row["number"] for row in rows if row.get("pr_number") and not row.get("merged")}
@@ -168,8 +211,17 @@ def follow_children(ctx, report) -> None:
     parents = order_parents(rows)
     records, unparseable = order_records(rows)
     language = ctx.config.language
-    for number in sorted(parents | records.keys()):
-        children = ctx.tracker.sub_issues(number) if by_number[number].get("children") else []
+
+    def needs_read(number: int, children: list[Issue] | None) -> bool:
+        if children is None:
+            return True
+        if number not in records or any(child.state != "closed" for child in children):
+            return False
+        references = records[number] - {child.number for child in children} - listed_prs
+        return (all(by_number[n].get("state") == "closed" for n in references if n in by_number)
+                and any(n not in by_number for n in references))
+
+    def decide(number: int, children: list[Issue]) -> tuple[str | None, bool, dict[int, bool]]:
         # Until a record closes, only an order parent's sub-issues move its card (today's handling).
         state = parent_state(children, open_prs) if number in parents else None
         work = {child.number for child in children}
@@ -185,6 +237,13 @@ def follow_children(ctx, report) -> None:
             closes = False  # Its work is unknown: skip the close quietly; the card keeps today's column.
         else:
             closes = state == "Done"
+        return state, closes, ended
+
+    def visit(number: int) -> None:
+        children = listed[number]
+        if children is None:
+            children = ctx.tracker.sub_issues(number)
+        state, closes, ended = decide(number, children)
         cancelled = [child.number for child in children
                      if child.state == "closed" and not _completed(child)]
         if cancelled and number in parents and not closes:  # A decision only while work remains.
@@ -205,3 +264,24 @@ def follow_children(ctx, report) -> None:
             state = "Done"
         if state is not None:
             board.sync_status(ctx, number, state, parent=True)
+
+    listed = {number: _listed_children(by_number[number], by_number) for number in parents | records.keys()}
+    seed = ctx.now().isoformat()
+    closing, others = [], []
+    for number, children in listed.items():
+        ready = not needs_read(number, children) and decide(number, children)[1]
+        (closing if ready else others).append(number)
+
+    def drawn(number: int) -> bytes:
+        return hashlib.sha256(f"{seed}/{number}".encode()).digest()
+
+    failure = None
+    for number in [*sorted(closing), *sorted(others, key=drawn)]:
+        try:
+            visit(number)
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
+            failure = exc
+    if failure is not None:
+        raise failure  # The tick records the deferral; the next listing tick tries again.

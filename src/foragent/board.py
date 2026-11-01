@@ -45,6 +45,22 @@ FIELD_SELECTION = """... on ProjectV2SingleSelectField {
 } ... on ProjectV2Field { id name dataType } ... on ProjectV2IterationField { id name }"""
 
 
+BOARD_ISSUE_QUERY = """query ForagentBoardIssue(
+  $owner: String!, $name: String!, $number: Int!, $cursor: String, $id: ID!
+) {
+  repository(owner: $owner, name: $name) { issue(number: $number) {
+    id projectItems(first: 100, after: $cursor) {
+      nodes { id project { id } fieldValueByName(name: "Status") {
+        ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+      } } pageInfo { hasNextPage endCursor }
+    }
+  } }
+  node(id: $id) { ... on ProjectV2 {
+    fields(first: 100) { nodes { """ + FIELD_SELECTION + """ } pageInfo { hasNextPage } }
+  } }
+}"""
+
+
 def _data(tracker: Tracker, query: str, variables: dict) -> dict:
     result = tracker.graphql(query, variables)
     if result.get("errors"):
@@ -81,6 +97,13 @@ class Project:
             if not connection["pageInfo"]["hasNextPage"]:
                 return fields
             cursor = connection["pageInfo"]["endCursor"]
+
+    def _fields_from(self, node: dict | None) -> dict[str, dict]:
+        """The fields a card read carried, or a full paged read when it could not carry them all."""
+        connection = (node or {}).get("fields")
+        if connection is None or connection["pageInfo"]["hasNextPage"]:
+            return self.fields()  # Also reports a deleted board.
+        return {field["name"]: field for field in connection["nodes"] if field}
 
     def ensure_fields(self, desired: dict[str, Iterable[str] | None], *, new_project: bool = False,
                       fields: dict[str, dict] | None = None) -> dict[str, dict]:
@@ -137,26 +160,18 @@ class Project:
         if not add and recorded is not None and recorded(number, self.id, "Status") == NO_CARD:
             return  # The last board read found no card for this issue.
         owner, name = self.repo.split("/", 1)
-        fields = self.fields() if add else None
-        if fields is not None and "Status" in values and not any(
-            option["name"] == values["Status"] for option in fields.get("Status", {}).get("options", [])
-        ):
-            log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
-            return
+        fields = None
         cursor = None
         item = None
         while True:
-            content = _data(self.tracker, """query ForagentBoardIssue(
-              $owner: String!, $name: String!, $number: Int!, $cursor: String
-            ) {
-              repository(owner: $owner, name: $name) { issue(number: $number) {
-                id projectItems(first: 100, after: $cursor) {
-                  nodes { id project { id } fieldValueByName(name: "Status") {
-                    ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
-                  } } pageInfo { hasNextPage endCursor }
-                }
-              } }
-            }""", {"owner": owner, "name": name, "number": number, "cursor": cursor})["repository"]["issue"]
+            # One read names both the card and the fields, so moving a card takes
+            # two calls and fits one bounded tick; a failed try keeps no partial work.
+            data = _data(self.tracker, BOARD_ISSUE_QUERY, {
+                "owner": owner, "name": name, "number": number, "cursor": cursor, "id": self.id,
+            })
+            if fields is None:
+                fields = self._fields_from(data.get("node"))
+            content = data["repository"]["issue"]
             connection = content["projectItems"]
             item = next((node for node in connection["nodes"] if node["project"]["id"] == self.id), None)
             if item or not connection["pageInfo"]["hasNextPage"]:
@@ -167,12 +182,11 @@ class Project:
             if record is not None:
                 record(number, self.id, "Status", NO_CARD)
             return
-        if fields is None:
-            fields = self.fields()
-            if not any(option["name"] == values["Status"]
-                       for option in fields.get("Status", {}).get("options", [])):
-                log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
-                return
+        if "Status" in values and not any(
+            option["name"] == values["Status"] for option in fields.get("Status", {}).get("options", [])
+        ):
+            log.warning("Board column %s is unavailable; skipping issue #%s", values["Status"], number)
+            return
         if item is None:
             try:
                 item = _data(self.tracker, """mutation ForagentAddBoardItem($input: AddProjectV2ItemByIdInput!) {
