@@ -440,7 +440,7 @@ it cannot fast-forward, report the error instead of rebasing or committing by ha
 existing issues go into `edits`. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
-`fa orch request-status ID done --note "<issues>"`, using the originating request ID and the
+`fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
