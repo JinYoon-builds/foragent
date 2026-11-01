@@ -21,7 +21,8 @@ def make_ctx(tmp_path, *numbers):
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     for n in numbers:
         store.start_run(n, branch=f"foragent/issue-{n}", worktree=store.worktree_path(n))
-    return SimpleNamespace(store=store, now=lambda: clock[0], clock=clock, config=Config())
+    return SimpleNamespace(store=store, now=lambda: clock[0], clock=clock, config=Config(),
+                           monotonic=lambda: (clock[0] - NOW).total_seconds())
 
 
 def rows(ctx):
@@ -131,6 +132,55 @@ def test_interrupted_merge_wait_credits_elapsed_time_and_restores_phase(tmp_path
     assert run.phase == "checking"
 
 
+@pytest.mark.parametrize("path", ["queue", "retry"])
+def test_wait_limit_releases_live_seat_before_reporting(tmp_path, monkeypatch, path):
+    from foragent import orch_inbox
+    from foragent.run_attempt import ExecutorStopped
+
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    first, own, following = (turn.seat(ctx, n, "main") for n in (1, 2, 3))
+    ctx.tracker = SimpleNamespace(add_labels=lambda *_: None, remove_labels=lambda *_: None)
+    monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 30)
+    if path == "queue":
+        turn.join(ctx, first, "a")
+    else:
+        turn.join(ctx, own, "b")
+        turn.join(ctx, following, "c")
+
+    def sleep(seconds):
+        assert seconds == 30
+        if path == "queue":
+            turn.join(ctx, following, "c")
+        else:
+            # A refused merge must let the next run proceed during its pause.
+            assert turn.holds_turn(ctx.store, following)
+        ctx.clock[0] += timedelta(seconds=seconds)
+
+    report = orch_inbox.add_request
+    reports = []
+
+    def report_after_release(*args, **kwargs):
+        assert ctx.store.get_run(2).status == "running"
+        assert own.key not in turn._waiting(rows(ctx), "main")
+        ctx.store.finish_run(1, outcome="merged")
+        assert turn.holds_turn(ctx.store, following)
+        reports.append(report(*args, **kwargs))
+
+    ctx.sleep = sleep
+    monkeypatch.setattr(orch_inbox, "add_request", report_after_release)
+    with pytest.raises(ExecutorStopped, match="Merge-turn wait limit"):
+        if path == "queue":
+            turn.await_turn(2, ctx, own, "b")
+        else:
+            turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"))
+    assert len(reports) == 1
+    turn.withdraw(ctx, own)  # The caller's final cleanup must remain idempotent.
+    assert [row["event"] for row in rows(ctx) if row["n"] == 2] == ["ready", "withdrawn"]
+    run = ctx.store.get_run(2)
+    assert run.status == "running" and run.waited_seconds == 30
+    assert run.waiting_until is None and run.pause_regions == {}
+
+
 @pytest.mark.parametrize("leave", [False, True])
 def test_implementation_run_merges_without_withdrawing_and_withdraws_when_it_leaves(run_case, monkeypatch, leave):
     c = run_case
@@ -204,6 +254,57 @@ def queue_behind_live_run(c, monkeypatch):
     monkeypatch.setattr(turn, "_live", lambda store, key: ahead_live[0] if key[0] == 9 else live(store, key))
     turn.join(c.ctx, turn.Seat(9, "2026-10-20T08:00:00+00:00", "main"), "a" * 40)
     return ahead_live
+
+
+@pytest.mark.parametrize("path", ["implementation", "review-only"])
+@pytest.mark.parametrize("advance_clock", [True, False], ids=["elapsed-wait", "frozen-clock"])
+def test_merge_wait_limit_preserves_pr_and_reports_elapsed_wait(run_case, monkeypatch, path, advance_clock):
+    from foragent import orch_inbox, runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, max_runtime_minutes=1)
+    if path == "review-only":
+        c.ctx.config = replace(c.ctx.config, review="careful")
+        assert run_issue(1, c.ctx) == "pr-open"
+        c.now[0] += timedelta(seconds=1)
+        c.ctx.config = replace(c.ctx.config, review="fast")
+    queue_behind_live_run(c, monkeypatch)
+    monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 90)
+    sleeps, remaining = [], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) <= 3, "The wait must end even when clock and sleep are frozen"
+        remaining.append(runner._remaining(1, c.ctx))
+        if advance_clock:
+            c.now[0] += timedelta(seconds=seconds)
+
+    c.ctx.sleep = sleep
+    outcome = (runner.review_only(1, c.ctx, verdict_head=c.tracker.pr_head_sha(2))
+               if path == "review-only" else run_issue(1, c.ctx))
+    assert outcome == "merge-wait"
+    assert sleeps == [30, 30, 30] and remaining == [60, 60, 60]
+    run = StateStore(c.store.root).get_run(1)
+    assert run.outcome == "merge-wait" and run.merge_wait_polls == 3
+    elapsed = 90 if advance_clock else 0
+    assert run.merge_waited_seconds == run.waited_seconds == elapsed
+    assert run.waiting_until is None and run.pause_regions == {}
+    assert f"after {elapsed}s (3 polls)" in run.detail
+    requests = orch_inbox.requests(c.store, pending=True)
+    assert len(requests) == 1
+    request = requests[0]
+    assert request["kind"] == "merge-wait" and request["issue"] == 1
+    assert request["waited_seconds"] == elapsed and request["polls"] == 3
+    assert c.tracker.find_pr("foragent/issue-1") == 2
+    assert c.tracker.get_issue(2).state == "open" and c.tracker.merged_prs == []
+    assert len(c.tracker.created_prs) == 1
+    assert c.store.load_flag(1) is None
+    assert c.tracker.get_issue(1).labels & {"blocked"}
+    assert not c.tracker.get_issue(1).labels & {"running", "ready", "needs-human"}
+    comments = "\n".join(row.body for row in c.tracker.list_comments(1))
+    assert "Too big for one session" not in comments and "split it in order" not in comments
+    assert [row["event"] for row in rows(c.ctx) if row["n"] == 1
+            and row.get("started_at") == run.started_at][-1] == "withdrawn"
 
 
 @pytest.mark.parametrize("path", ["implementation", "review-only"])
