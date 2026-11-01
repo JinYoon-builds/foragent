@@ -108,10 +108,11 @@ def test_each_idle_lane_has_one_row_with_its_whole_name_and_done_count(tmp_path)
     finish(tracker, store, 1, 90, lane="lane-0")
     frame = watch.render_frame(collected(tracker, store, config), config, tmp_path, width=80)
     assert all(watch._cells(line) <= 80 for line in frame.splitlines())
+    # The idle lanes share one sleeping block; each whole name shows once, today's count after it.
     for lane in lanes.values():
-        rows = [line for line in frame.splitlines() if line.startswith("💤") and lane["title"] in line]
+        rows = [line for line in frame.splitlines() if f"🧩 {lane['title']}" in line]
         assert len(rows) == 1, lane
-    assert "Long lane name 0 ✓ 1 done" in frame and "✓1" not in frame
+    assert "🧩 Long lane name 0 ✓1" in frame and "✓ 1 done" not in frame
     assert "▶" not in frame
 
 
