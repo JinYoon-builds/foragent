@@ -441,7 +441,7 @@ def test_other_memory_scopes_are_not_native_lane_memory():
 def finished_order(*children):
     """A tracker listing one published order whose children are all closed."""
     mapping = json.dumps({f"child-{child}": child for child in children})
-    issues = [Issue(child, "Child", "", frozenset(), "closed") for child in children]
+    issues = [Issue(child, "Child", "", frozenset(), "closed", updated_at="2026-10-20T08:00:00+00:00") for child in children]
     issues.append(Issue(900, "Order", f"<!-- foragent:plan id=order map={mapping} acceptance={{}} -->", frozenset(), "open"))
     return SimpleNamespace(list_issues=lambda state="all": issues)
 

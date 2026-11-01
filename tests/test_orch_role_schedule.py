@@ -74,11 +74,49 @@ def test_a_lane_dream_needs_a_finished_order_with_a_merge_of_that_lane_since_its
     case.store.finish_run(5, "merged")
     case.store.start_run(6, branch="b6", worktree=case.store.worktree_path(6), lane="view")
     case.store.finish_run(6, "merged")
-    issues = [Issue(5, "", "", frozenset(), "closed"), Issue(6, "", "", frozenset(), "open"),
+    at = case.clock[0].isoformat()
+    issues = [Issue(5, "", "", frozenset(), "closed", updated_at=at), Issue(6, "", "", frozenset(), "open"),
               Issue(9, "", marker(5), frozenset(), "open"), Issue(10, "", marker(5, 6), frozenset(), "open")]
     tracker = SimpleNamespace(list_issues=lambda state="all": issues)
     assert orch_dream.dream_due(case.store, config, tracker, case.clock[0]) == ["orch"], (
         "A merge in view belongs to an unfinished order")
+
+
+def test_an_order_finishing_after_a_dream_keeps_its_turn_for_merges_that_dream_already_saw(review_case):
+    case = review_case
+    config = replace(case.ctx.config, lanes={"orch": {"paths": ["a/**"]}})
+    for number in (5, 6, 7):  # 5 is order A's child; 6 and 7 are order B's, and 7 stays open past A's dream.
+        case.store.start_run(number, branch=f"b{number}", worktree=case.store.worktree_path(number), lane="orch")
+        case.store.finish_run(number, "merged" if number != 7 else "blocked")
+    early = case.clock[0].isoformat()
+    closed = [Issue(5, "", "", frozenset(), "closed", updated_at=early), Issue(6, "", "", frozenset(), "closed", updated_at=early)]
+    orders = [Issue(9, "", marker(5), frozenset(), "open"), Issue(10, "", marker(6, 7), frozenset(), "open")]
+
+    def due(seven):
+        tracker = SimpleNamespace(list_issues=lambda state="all": [*closed, *orders, seven])
+        return orch_dream.dream_due(case.store, config, tracker, case.clock[0])
+
+    assert due(Issue(7, "", "", frozenset(), "open")) == ["orch"], "Order A finished"
+    case.clock[0] += timedelta(minutes=1)
+    orch_dream.record_done(case.store, "orch", 0, "en", case.clock[0])
+    assert due(Issue(7, "", "", frozenset(), "open")) == [], "A's dream answered A; B has not finished"
+    case.clock[0] += timedelta(minutes=1)
+    assert due(Issue(7, "", "", frozenset(), "closed", updated_at=case.clock[0].isoformat())) == ["orch"], (
+        "B finished after the dream, so its earlier merge in the lane still earns B a dream")
+    case.clock[0] += timedelta(minutes=1)
+    orch_dream.record_done(case.store, "orch", 0, "en", case.clock[0])
+    assert due(Issue(7, "", "", frozenset(), "closed", updated_at=early)) == []
+
+
+def test_a_lane_with_only_failed_work_in_a_finished_order_does_not_dream(review_case):
+    case = review_case
+    config = replace(case.ctx.config, lanes={"orch": {"paths": ["a/**"]}})
+    case.store.start_run(5, branch="b5", worktree=case.store.worktree_path(5), lane="orch")
+    case.store.finish_run(5, "blocked")
+    issues = [Issue(5, "", "", frozenset(), "closed", updated_at=case.clock[0].isoformat()),
+              Issue(9, "", marker(5), frozenset(), "open")]
+    tracker = SimpleNamespace(list_issues=lambda state="all": issues)
+    assert orch_dream.dream_due(case.store, config, tracker, case.clock[0]) == []
 
 
 def test_docs_starts_after_the_architect_each_in_its_own_tick(review_case):
@@ -251,6 +289,48 @@ def test_one_pending_retrospective_names_every_finished_order_and_a_marked_note_
     scheduler.tick(tick_context(case))
     assert len(retrospectives(case)) == 1
     assert facts(case, "retrospective")["last_success"] is not None
+
+
+def test_an_order_finishing_while_a_request_waits_is_not_covered_by_the_note_that_answers_the_request(review_case):
+    from foragent import orch_events
+
+    case = review_case
+    roles(case, "orchestrator")
+    scheduler.tick(tick_context(case))
+    first, = retrospectives(case)
+    assert first["orders"] == [900]
+    case.clock[0] += timedelta(minutes=1)
+    case.tracker.add_issue(3, "Closed", state="closed")
+    order_children(case, 901, [3])
+    scheduler.tick(tick_context(case))
+    assert len(retrospectives(case)) == 1, "One pending request at a time"
+    case.clock[0] += timedelta(minutes=1)
+    orch_events.append_event(case.store, case.clock[0], None, "note", "reviewed", now="reviewed", retrospective=True)
+    orch_inbox.set_request_status(case.store, first["id"], "done", "Recorded lessons")
+    scheduler.tick(tick_context(case))
+    rows = retrospectives(case)
+    assert len(rows) == 2 and rows[1]["orders"] == [901], "The note answered 900, which the request named; 901 waits"
+    case.clock[0] += timedelta(minutes=1)
+    orch_events.append_event(case.store, case.clock[0], None, "note", "reviewed", now="reviewed", retrospective=True)
+    orch_inbox.set_request_status(case.store, rows[1]["id"], "done", "Recorded lessons")
+    case.clock[0] += timedelta(hours=2)
+    scheduler.tick(tick_context(case))
+    assert len(retrospectives(case)) == 2
+
+
+def test_a_note_answers_an_open_request_so_a_new_order_does_not_wait_for_it_to_close(review_case):
+    from foragent import orch_events
+
+    case = review_case
+    roles(case, "orchestrator")
+    scheduler.tick(tick_context(case))
+    case.clock[0] += timedelta(minutes=1)
+    orch_events.append_event(case.store, case.clock[0], None, "note", "reviewed", now="reviewed", retrospective=True)
+    case.clock[0] += timedelta(minutes=1)
+    case.tracker.add_issue(3, "Closed", state="closed")
+    order_children(case, 901, [3])
+    scheduler.tick(tick_context(case))
+    assert [row["orders"] for row in retrospectives(case)] == [[900], [901]]
 
 
 def test_only_listed_roles_wake_and_the_rest_show_as_unavailable(review_case):

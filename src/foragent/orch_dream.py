@@ -1,8 +1,8 @@
 """Lane dreams (#189): between work, a lane tidies its own memory.
 
-The gate decides from local facts only when a lane is due: an order finished (D99,
-``orch_role_schedule.finished_orders``) with a child that merged in this lane since the
-lane's last dream, or a redo waits for an answer. A dream runs the lane's implementer at tier s in its own worktree on
+The gate decides from local facts only when a lane is due: an order finished after the
+lane's last dream (D99, ``orch_role_schedule.orders_finished_at``) with a child that merged
+in this lane, whenever it merged, or a redo waits for an answer. A dream runs the lane's implementer at tier s in its own worktree on
 ``foragent/dream-<lane>``; it edits only ``.claude/agent-memory/<dir>/`` and may
 propose a cross-project media bundle that the worker copies outside the
 repository. A changed memory becomes a normal PR; an unchanged one makes no
@@ -149,11 +149,11 @@ def _runs_since(store: StateStore, lane: str, since: datetime | None) -> list[tu
 def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list[str]:
     """Configured lanes due to dream, each once; a lane with any active run of its own is not due."""
     from foragent import lane_memory
-    from foragent.orch_role_schedule import finished_orders
+    from foragent.orch_role_schedule import orders_finished_at
 
     active = store.active_runs()
     due = []
-    children = set().union(*finished_orders(tracker.list_issues("all")).values())
+    orders = orders_finished_at(store, tracker.list_issues("all"))
     for lane in config.lanes:
         if lane_memory.is_role_memory(config, lane):
             continue  # The lane uses a role's memory, which the role curates; no dream rewrites it.
@@ -164,8 +164,10 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
         if redo_requested(store, lane):
             due.append(lane)
             continue
-        if any(run.outcome == "merged" and run.number in children
-               for run, _ in _runs_since(store, lane, last_dream_at(store, lane))):
+        # By its finish, not by its merges: a dream before an order ended leaves that order's turn.
+        covered = last_dream_at(store, lane)
+        merged = {run.number for run, _ in _runs_since(store, lane, None) if run.outcome == "merged"}
+        if any(children & merged and (covered is None or finished > covered) for children, finished in orders):
             due.append(lane)
     return due
 

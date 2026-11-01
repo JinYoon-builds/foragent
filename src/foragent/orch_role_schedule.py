@@ -14,9 +14,11 @@ Each role compares those events with its own completion and stores nothing else:
   merge or run record after the cutoff. Each takes a machine slot the ready issues left free.
 - the retrospective is one inbox request for the orchestrator, with no machine slot. Only a
   marked note (``retrospective`` on a ``note`` event) completes it: a request or its closing
-  does not. An order named by a request older than that note is covered as well.
+  does not. A note answers the requests posted since the note before it and covers only the
+  orders they name, so an order that finished meanwhile still gets its own request. A note
+  with no such request covers every order finished by then.
 
-Lane dreams use ``finished_orders`` too but keep their own start path in ``orch_dream``.
+Lane dreams use ``orders_finished_at`` too but keep their own start path in ``orch_dream``.
 
 A role wakes only when ``.foragent.yml`` lists it: a config from before roles derives the default
 entries for commands a caller runs by hand, and shows here as unavailable.
@@ -101,6 +103,20 @@ def _events(store: StateStore) -> list[dict]:
 def _orders(events: list[dict]) -> list[dict]:
     return [event for event in events if event.get("kind") == ORDER_FINISHED
             and stamp(event.get("finished_at")) is not None]
+
+
+def orders_finished_at(store: StateStore, issues: Iterable[Any]) -> list[tuple[set[int], datetime]]:
+    """Each finished order's children and when it finished: its recorded time, else its children's latest
+    listed change. An order with neither is past the journal's lifetime, so it wakes nothing."""
+    issues = list(issues)
+    changed = {issue.number: stamp(getattr(issue, "updated_at", None)) for issue in issues}
+    recorded = {event["order"]: stamp(event["finished_at"]) for event in _orders(_events(store))}
+    found = []
+    for number, children in finished_orders(issues).items():
+        at = recorded.get(number) or max((changed[child] for child in children if changed[child]), default=None)
+        if at is not None:
+            found.append((children, at))
+    return found
 
 
 def _closed_at(row: dict, now: datetime) -> datetime:
@@ -251,15 +267,24 @@ def _request_time(row: dict) -> datetime | None:
 
 
 def _retrospective_facts(store: StateStore, config: Config, now: datetime, events: list[dict]) -> dict:
-    notes = [stamp(event["at"]) for event in events
-             if event.get("kind") == "note" and event.get("retrospective") is True]
-    last = max(notes, default=None)
+    notes = sorted(stamp(event["at"]) for event in events
+                   if event.get("kind") == "note" and event.get("retrospective") is True)
+    last = notes[-1] if notes else None
     requests = _retrospective_requests(store)
-    covered = {order for row in requests for order in row.get("orders") or []
-               if last is not None and _request_time(row) is not None and _request_time(row) <= last}
-    orders = [event["order"] for event in _orders(events)
-              if event["order"] not in covered and (last is None or stamp(event["finished_at"]) > last)]
-    pending = next((row for row in requests if row["status"] != "done"), None)
+    covered, covered_until, previous = set(), None, None
+    for note in notes:
+        answered = [row for row in requests if (at := _request_time(row)) is not None and at <= note
+                    and (previous is None or at > previous)]
+        if answered:
+            covered.update(order for row in answered for order in row.get("orders") or [])
+        else:
+            covered_until = note
+        previous = note
+    orders = [event["order"] for event in _orders(events) if event["order"] not in covered
+              and (covered_until is None or stamp(event["finished_at"]) > covered_until)]
+    # A marked note answered every request older than it, even one still open; it holds nothing back.
+    pending = next((row for row in requests if row["status"] != "done"
+                    and (last is None or (_request_time(row) or now) > last)), None)
     # A request closed with no marked note since it was posted was not a retrospective; ask again after the floor.
     unanswered = [_closed_time(row) for row in requests if row["status"] == "done"
                   and (last is None or (_request_time(row) or now) > last)]
