@@ -573,7 +573,7 @@ def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkey
 
 
 @pytest.mark.parametrize("measured,remaining,expected", [
-    (736, 5000, 1472), (100, 5000, 900), (2000, 5000, 3600), (736, 1000, 1000),
+    (736, 5000, 1472), (1200, 5000, 2400), (100, 5000, 900), (2000, 5000, 3600), (736, 1000, 1000),
     (None, 5000, 1600),
 ])
 def test_protected_allowance_uses_selection_measurement_and_remaining_time(
