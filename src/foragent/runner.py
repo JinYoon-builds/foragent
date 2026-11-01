@@ -180,7 +180,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = f"origin/{branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
-    if not _restore_approved_base(n, ctx, git, approval, target_branch):
+    if not _restore_approved_base(n, ctx, git, approval, target_branch, branch=branch):
         return "hash-mismatch"
     _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
     _progress(n, ctx)
@@ -194,6 +194,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
 def _restore_approved_base(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
+    *, branch: str,
 ) -> bool:
     """Distinguish inherited old locks from edits belonging to the saved issue branch."""
     locks = approval.acceptance_blobs
@@ -208,7 +209,7 @@ def _restore_approved_base(
     if git.is_ancestor("HEAD", base):
         # No own commits: recreate at the approved base without a merge commit.
         ctx.git.remove_worktree(git.root)
-        ctx.git.add_worktree(git.root, f"foragent/issue-{n}", base)
+        ctx.git.add_worktree(git.root, branch, base)
     else:
         try:
             git.merge_base(base)
