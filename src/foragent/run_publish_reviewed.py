@@ -163,7 +163,7 @@ def _publish_reviewed_in_turn(
             comparison_mode=comparison_attempt is not None,
         ):
             return stopped
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number)
         if stopped:
             return stopped
         if waited:
@@ -247,7 +247,7 @@ def _publish_reviewed_in_turn(
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
-            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge, pr.number)
             queued_status = None
             continue
         if inputs.stop is not None:
