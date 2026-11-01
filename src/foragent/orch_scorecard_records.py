@@ -226,7 +226,7 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
     flag = store.load_flag(row["number"])
     return {"events": events, "approved_at": approved_at, "labels": set(row.get("labels") or ()),
             "open_until": (_time(row.get("merged_at")) if closed else None), "closed": closed,
-            "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag else None,
+            "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag and not flag.local_only else None,
             "updated_at": _time(row.get("updated_at")),
             "lane": issue_lane(row.get("labels") or (), lanes)}
 

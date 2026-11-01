@@ -282,6 +282,16 @@ def test_committed_workflow_matches_public_generation(tmp_path, monkeypatch):
     measurement_job(document)
 
 
+def test_measurement_job_has_a_time_limit_well_under_the_six_hour_default(tmp_path, monkeypatch):
+    settings = yaml.safe_load((ROOT / ".foragent.yml").read_text())
+    document, _ = generate(tmp_path / "workflow", monkeypatch, settings)
+    jobs = [job for job in document["jobs"].values()
+            if "shard" in job.get("strategy", {}).get("matrix", {})]
+    assert len(jobs) == 1
+    limit = jobs[0].get("timeout-minutes")
+    assert isinstance(limit, int) and 0 < limit <= 30
+
+
 def test_cache_acceptance_fixture_accepts_extended_real_measurement_outputs(shard_case):
     """Keep output compatibility independent of the unfinished cache producer feature."""
     payload = shard_case.invoke(cache=False)

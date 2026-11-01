@@ -2401,7 +2401,7 @@ def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
 
 def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT]
     with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
         publish(publishing, plan, approve=True)
@@ -2415,7 +2415,7 @@ def test_invalid_statements_name_the_field(publishing, plan, value):
 
 
 def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
     publish(publishing, plan)
     body = publishing[2].get_issue(2).body

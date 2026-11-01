@@ -591,6 +591,7 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
         json.dumps({"head": {"sha": head}}),
         json.dumps(runs) + "\n" + json.dumps(second_page),
         failed_job(11), "[]", "discard me" + "A" * 4000,
+        "[]",  # The unfinished run 3 has no failed job yet.
         failed_job(14), "[]", "discard me too" + "B" * 4000,
     )
     logs = GhTracker(REPO, run).pr_failed_logs(42)
@@ -604,10 +605,11 @@ def test_gh_failed_logs_use_head_sha_all_pages_and_per_run_tails():
           f"repos/owner/repo/actions/runs?head_sha={head}&per_page=100"], None),
         (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/1/jobs?per_page=100"], None),
         (["api", "--paginate", "repos/owner/repo/check-runs/11/annotations"], None),
-        (["run", "view", "1", "-R", REPO, "--log-failed"], None),
+        (["run", "view", "1", "-R", REPO, "--job", "11", "--log-failed"], None),
+        (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/3/jobs?per_page=100"], None),
         (["api", "--paginate", "--jq", ".jobs", "repos/owner/repo/actions/runs/4/jobs?per_page=100"], None),
         (["api", "--paginate", "repos/owner/repo/check-runs/14/annotations"], None),
-        (["run", "view", "4", "-R", REPO, "--log-failed"], None),
+        (["run", "view", "4", "-R", REPO, "--job", "14", "--log-failed"], None),
     ]
 
 
@@ -619,12 +621,20 @@ def test_gh_failed_logs_empty_when_head_has_no_failed_actions():
 
 
 def test_gh_failed_log_errors_propagate():
-    run = ScriptedRun(
-        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]",
-        subprocess.CalledProcessError(1, ["gh"], stderr="logs unavailable"),
-    )
-    with pytest.raises(TrackerError, match="logs unavailable"):
+    limited = gh_error("gh: API rate limit exceeded for user (HTTP 403)")
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11), "[]", limited)
+    with pytest.raises(TrackerError, match="rate limit"):
         GhTracker(REPO, run).pr_failed_logs(42)
+
+
+def test_gh_failed_log_read_error_becomes_a_notice_and_keeps_annotation():
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', '[{"id":1,"conclusion":"failure"}]', failed_job(11),
+        json.dumps([{"message": "assert failed"}]), gh_error("HTTP 500 boom"),
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: log of job test: HTTP 500 boom" in logs
+    assert "assert failed" in logs and "Job test failed" in logs and not logs.not_started
 
 
 @pytest.mark.parametrize("steps,annotation", [
@@ -668,6 +678,159 @@ def test_gh_failed_run_without_failed_jobs_is_a_code_failure():
                       "invalid workflow file")
     logs = GhTracker(REPO, run).pr_failed_logs(42)
     assert not logs.not_started and "invalid workflow file" in logs
+
+
+IN_PROGRESS = '[{"id":7,"name":"ci","status":"in_progress","conclusion":null}]'
+JOBS_7 = "repos/owner/repo/actions/runs/7/jobs?per_page=100"
+
+
+def pending_job(number=79):
+    return {"id": number, "name": "pending", "status": "in_progress", "conclusion": None, "steps": []}
+
+
+def test_gh_failed_logs_read_every_failed_job_of_an_unfinished_run_while_siblings_pend(tmp_path):
+    jobs = (json.loads(failed_job(70, "unit")) + json.loads(failed_job(71, "acceptance (0)"))
+            + [pending_job()])
+    run = ScriptedRun(
+        '{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps(jobs),
+        json.dumps([{"message": "unit broke"}]), "first" + "A" * 4000,
+        json.dumps([{"message": "lost ids"}]), "second" + "B" * 4000,
+    )
+    logs = GhTracker(REPO, run).pr_failed_logs(42, full_text_dir=tmp_path)
+    assert not logs.not_started and "Actions run 7 (ci) in_progress" in logs
+    assert "A" * 4000 in logs and "B" * 4000 in logs, "One job's output must not hide another's"
+    assert "firstA" not in logs and "secondB" not in logs
+    assert logs.index("Job unit failed") < logs.index("unit broke") < logs.index("A" * 4000)
+    assert logs.index("A" * 4000) < logs.index("Job acceptance (0) failed") < logs.index("lost ids")
+    assert (tmp_path / "ci-job-70.log").read_text().startswith("first")
+    assert (tmp_path / "ci-job-71.log").read_text().startswith("second")
+    assert [call[0] for call in run.calls[-4:]] == [
+        ["api", "--paginate", "repos/owner/repo/check-runs/70/annotations"],
+        ["api", "--allow-escape-sequences", "repos/owner/repo/actions/jobs/70/logs"],
+        ["api", "--paginate", "repos/owner/repo/check-runs/71/annotations"],
+        ["api", "--allow-escape-sequences", "repos/owner/repo/actions/jobs/71/logs"],
+    ]
+
+
+def test_gh_failed_job_log_removes_terminal_control_and_keeps_the_text():
+    raw = "\ufeff\x1b[36;1muv run pytest\x1b[0m\r\n\x1b]8;;https://evil\x07link\x1b]8;;\x1b\\\tFAILED tests/a.py::b\x07\x1b\n"
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, failed_job(70), "[]", raw)
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "uv run pytest\nlink\tFAILED tests/a.py::b\n" in logs
+    assert "\x1b" not in logs and "\x07" not in logs and "\r" not in logs and "evil" not in logs
+
+
+def test_gh_log_of_only_terminal_control_is_empty():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, failed_job(70), "[]", "\x1b[0m\n")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "GitHub returned an empty log" in logs
+
+
+def test_gh_unfinished_run_without_failed_jobs_adds_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps([pending_job()]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs == "" and not logs.not_started
+
+
+def test_gh_not_started_job_of_an_unfinished_run_stays_not_started_without_log_reads():
+    jobs = json.loads(failed_job(70, steps="[]")) + [pending_job()]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, json.dumps(jobs),
+                      json.dumps([{"message": "A runner could not be provisioned."}]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "A runner could not be provisioned." in logs
+    assert "Job test did not start" in logs and len(run.calls) == 4
+
+
+def test_gh_not_started_in_one_run_is_not_erased_by_a_pending_run():
+    runs = '[{"id":6,"conclusion":"failure"},{"id":7,"status":"queued","conclusion":null}]'
+    run = ScriptedRun('{"head":{"sha":"abc"}}', runs, failed_job(60, steps="[]"), "[]", json.dumps([pending_job()]))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "Actions run 7" not in logs
+
+
+def test_gh_runs_unreadable_is_a_notice_that_proves_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', gh_error("HTTP 502 runs"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: workflow runs: HTTP 502 runs" in logs and not logs.not_started
+
+
+def test_gh_unreadable_changed_files_keep_measurement_runs_out_of_the_evidence():
+    from foragent.ci_workflow import WORKFLOW
+
+    runs = [{"id": 6, "path": WORKFLOW, "conclusion": "failure"},
+            {"id": 7, "path": ".github/workflows/ci.yml", "conclusion": "failure"}]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', json.dumps(runs), gh_error("HTTP 502 files"),
+                      failed_job(70), "[]", "ordinary tail")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: changed files of the pull request: HTTP 502 files" in logs
+    assert "ordinary tail" in logs and "Actions run 6" not in logs and not logs.not_started
+    assert all("/runs/6/" not in call[0][-1] for call in run.calls)
+
+
+def test_gh_unreadable_jobs_of_a_completed_run_keep_its_run_wide_log():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]',
+                      gh_error("HTTP 403 jobs"), "run-wide tail")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: jobs of run 7: HTTP 403 jobs" in logs
+    assert "run-wide tail" in logs and not logs.not_started
+    assert run.calls[-1][0] == ["run", "view", "7", "-R", REPO, "--log-failed"]
+
+
+def test_gh_unreadable_jobs_of_an_unfinished_run_do_not_prove_not_started_or_read_refused_logs():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', IN_PROGRESS, gh_error("HTTP 403 jobs"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: jobs of run 7: HTTP 403 jobs" in logs and not logs.not_started
+    assert run.calls[-1][0][-1] == JOBS_7
+
+
+def test_gh_unreadable_annotations_keep_the_log_and_prove_nothing():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]', failed_job(70),
+                      gh_error("HTTP 403 annotations"), "failing test id")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: annotations of job test: HTTP 403 annotations" in logs
+    assert "failing test id" in logs and "Job test failed" in logs and not logs.not_started
+
+
+def test_gh_job_without_steps_stays_not_started_when_only_its_annotations_are_unreadable():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"failure"}]',
+                      failed_job(70, steps="[]"), gh_error("HTTP 403 annotations"))
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert logs.not_started and "CI evidence unavailable: annotations of job test" in logs
+
+
+@pytest.mark.parametrize("runs", ['[{"id":7,"conclusion":"failure"}]', IN_PROGRESS])
+@pytest.mark.parametrize("empty", ["", " \n"])
+def test_gh_empty_job_log_is_a_notice_not_a_blank(runs, empty):
+    run = ScriptedRun('{"head":{"sha":"abc"}}', runs, failed_job(70), "[]", empty)
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: log of job test: GitHub returned an empty log" in logs
+    assert "Job test failed" in logs and not logs.not_started
+
+
+def test_gh_empty_run_wide_log_is_a_notice_not_a_blank():
+    run = ScriptedRun('{"head":{"sha":"abc"}}', '[{"id":7,"conclusion":"startup_failure"}]', "[]", "")
+    logs = GhTracker(REPO, run).pr_failed_logs(42)
+    assert "CI evidence unavailable: failed log of run 7: GitHub returned an empty log" in logs
+    assert not logs.not_started
+
+
+@pytest.mark.parametrize("before", [
+    pytest.param([], id="runs"),
+    pytest.param(['[{"id":7,"path":"%s","conclusion":"failure"}]'], id="changed-files"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]'], id="jobs"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]', failed_job(70)], id="annotations"),
+    pytest.param(['[{"id":7,"conclusion":"failure"}]', failed_job(70), "[]"], id="job-log"),
+    pytest.param(['[{"id":7,"conclusion":"null"}]'.replace('"null"', "null"), failed_job(70), "[]"], id="rest-log"),
+    pytest.param(['[{"id":7,"conclusion":"startup_failure"}]', "[]"], id="run-log"),
+])
+def test_gh_rate_limit_on_every_evidence_read_propagates(before):
+    from foragent.ci_workflow import WORKFLOW
+
+    before = [item.replace("%s", WORKFLOW) for item in before]
+    run = ScriptedRun('{"head":{"sha":"abc"}}', *before, gh_error("gh: API rate limit exceeded for user (HTTP 403)"))
+    with pytest.raises(TrackerError) as error:
+        GhTracker(REPO, run).pr_failed_logs(42)
+    assert error.value.is_rate_limit
 
 
 def gh_error(stderr, stdout="", code=1):
