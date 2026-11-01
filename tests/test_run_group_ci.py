@@ -12,7 +12,7 @@ from foragent.git import GitError, GitRepo
 from foragent.tracker import TrackerError
 from conftest import git_command
 from test_ci_mode_unit import report
-from test_run_group_check import NOW, make_ctx
+from test_run_group_check import NOW, make_ctx, record_result
 
 
 @pytest.fixture
@@ -87,6 +87,37 @@ def test_group_ci_rejects_uncovered_measurements(ci_case, damage, monkeypatch):
         monkeypatch.setattr(ci_mode, "changed_workflows", lambda *args: "changed.yml")
     verdict, reason, _ = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
     assert verdict == "void" and reason
+
+
+@pytest.mark.parametrize("result", ["passed", "failed", "outage", "rate-limit", "timeout"])
+def test_ci_groups_use_auto_limit_and_journal_results_for_next_group(ci_case, monkeypatch, result):
+    c = ci_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max="auto")
+    record_result(c.ctx.store, "failed", 4)
+    record_result(c.ctx.store, "failed", 3)
+    c.ctx.tracker.find_pr = lambda branch: int(branch.rsplit("-", 1)[1]) if "/issue-" in branch else 99
+    monkeypatch.setattr(ci_mode, "enabled", lambda *args: True)
+    monkeypatch.setattr(run_baseline, "_baseline_exclusions", lambda *args: [])
+    combined_members = []
+    monkeypatch.setattr(run_group_check, "_combine", lambda git, base, members, **kwargs: (
+        combined_members.append([m.n for m in members]) or "head"))
+    monkeypatch.setattr(run_group_check, "_trees", lambda *args: ["t5", "t1"])
+    if result == "failed":
+        c.reports[0]["report"]["head"]["passing_ids"] = []
+    elif result == "timeout":
+        c.reports.clear()
+    elif result in {"outage", "rate-limit"}:
+        def unavailable(*args):
+            raise TrackerError("HTTP 429" if result == "rate-limit" else "unavailable")
+
+        c.ctx.tracker.pr_acceptance_reports = unavailable
+    run_group_check.check(5, c.ctx, run_merge_turn.seat(c.ctx, 5, "main"), "h5", "base", set())
+    assert combined_members == [[5, 1]]
+    event, _ = run_group_evidence.latest(c.ctx, 1)
+    assert event["mode"] == "ci"
+    assert [m["n"] for m in event["members"]] == [5, 1]
+    assert event["verdict"] == (result if result in {"passed", "failed"} else "void")
+    assert run_group_check.group_limit(c.ctx.store, c.ctx.config) == (3 if result == "passed" else 2, "auto")
 
 
 @pytest.mark.parametrize("damage", [None, "provenance", "scope", "reports", "workflow"])
