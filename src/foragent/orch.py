@@ -29,9 +29,11 @@ from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_checks_approved import acceptance_refusal, done_when_refusal
 from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
+from foragent.state import Approval
 from foragent.tracker import Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
@@ -303,6 +305,8 @@ class _Premerge:
     head: str
     base: str
     report: dict
+    approved: tuple[Approval, str] | None = None
+    refused: str | None = None  # One line: the approved input this PR no longer honours.
 
 
 @dataclass(frozen=True)
@@ -352,6 +356,22 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     return _SuiteRun(passed, failing)
 
 
+def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
+    """The approval of a linked issue's PR and the configured base SHA its locks must match.
+
+    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    """
+    number = pr_issue_number(pr.head)
+    if number is None or pr.head.startswith("foragent/batch-"):
+        return None
+    if (approval := ctx.store.load_approval(number)) is None:
+        return None
+    if pr.base == ctx.config.base_branch:
+        return approval, base
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    return approval, ctx.git.ref_sha(f"refs/remotes/origin/{ctx.config.base_branch}")
+
+
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
     pr = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
@@ -360,6 +380,10 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    approved = _approved_inputs(ctx, pr, base)
+    refused = None
+    if approved is not None:
+        refused = acceptance_refusal(ctx.git, approved[0], {"head": head, "base": approved[1]})
     waited_seconds = 0.0
 
     def wait(acquire):
@@ -409,9 +433,13 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 conflicts.extend(merge_conflicts)
                 probe._call(["merge", "--abort"])
                 merged = False
-            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
+            if approved is not None and refused is None and merged:
+                # Conflicts have no merged tree to judge; the conflict refusal decides those.
+                refused = done_when_refusal(pr_issue_number(pr.head), ctx, approved[0], worktree, log_path, test_slot)
+            # A refused PR cannot merge whatever the suite says: free the merge lock early.
+            commands = ([] if refused else [ctx.config.test_command] if ctx.config.test_command is not None
                         else detect_test_commands(worktree))
-            if not commands:
+            if not commands and not refused:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
             ci_units = trusts_ci(ctx.repo_root, ctx.config)
             excluded = _baseline_exclusions(ctx, base, log_path)
@@ -433,7 +461,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
-        tests = "pass"
+        tests = "not run" if refused else "pass"
         for i, (command, run, acceptance_only) in enumerate(runs):
             if run.passed and not acceptance_only:
                 continue
@@ -481,9 +509,9 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
               "broken": broken, "failing_on_base": failing_on_base,
-              "waited_seconds": waited_seconds,
-              "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
-    return _Premerge(pr, head, base, report)
+              "waited_seconds": waited_seconds, "approved_inputs": refused,
+              "ready": not refused and tests == "pass" and not conflicts and ci in {"pass", "none"}}
+    return _Premerge(pr, head, base, report, approved, refused)
 
 
 def premerge(ctx: RunContext, n: int) -> dict:
@@ -524,6 +552,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         with ctx.store.merge_lock():
             checked = _premerge(ctx, n)
             report = checked.report
+            if checked.refused:
+                raise OrchError(f"PR #{n} is not ready: {checked.refused}")
             if not report["ready"]:
                 broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
                 raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
@@ -532,7 +562,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
-                    or ctx.tracker.pr_head_sha(n) != checked.head):
+                    or ctx.tracker.pr_head_sha(n) != checked.head
+                    or _approved_inputs(ctx, current, checked.base) != checked.approved):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event, stale_for_redo
