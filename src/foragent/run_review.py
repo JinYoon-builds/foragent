@@ -24,7 +24,7 @@ from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
-from foragent.run_execution import _available_executor
+from foragent.run_execution import _available_executor, _requeue_limit
 from foragent.run_prompts import (
     build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
 )
@@ -305,11 +305,11 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
 
-    def call(prompt: str, log_path: Path = log) -> ExecResult:
+    def call(prompt: str, log_path: Path = log, *, requeue: bool = True) -> ExecResult:
         # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
                                    **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
-                                   flag_exhaustion=False, on_result=record)
+                                   flag_exhaustion=False, on_result=record, requeue=requeue)
 
     def failure(label: str, error: BaseException) -> str:
         return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
@@ -344,7 +344,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
         with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
                                     kind="review", issue=n, role=f"reviewer {k}"):
-            return call(prompt, log_path)
+            return call(prompt, log_path, requeue=False)
 
     before = git.review_state()
     try:
@@ -361,11 +361,13 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     # before any usage limit discards the round and it skips the merge call (which could drop it).
     member_conflicts = spec_conflicts(*(
         _raw_text(reviewer, _message(future.result())) for future, error in zip(futures, errors) if error is None))
-    # Outcome order: an interrupt propagates first; then any usage limit wins over every other
-    # reviewer outcome (the round is discarded and runs again in full); other errors are UNUSABLE.
+    # Interrupts propagate first. A completed spec conflict wins over limits; otherwise a limit
+    # requeues the discarded round once, after every member finishes. Other errors are UNUSABLE.
     raised = [error for error in errors if error is not None]
     for error in ([error for error in raised if not isinstance(error, Exception)]
                   + ([] if member_conflicts else [error for error in raised if _is_limit(error)])):
+        if _is_limit(error):
+            _requeue_limit(n, ctx)
         raise error
     problems: list[str] = []
     raws = []
