@@ -16,6 +16,17 @@ from test_publish_out_of_scope import publish_cli
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
+def checkout_files(case):
+    """The shared checkout's files; the person's FA state under HOME is not the checkout.
+
+    #1262 (2026-11-01, test owner): the isolated HOME lives inside case.root here, so the
+    shared-checkout snapshot excludes that subtree.
+    """
+    home = Path.home().resolve()
+    return {name: data for name, data in shared_files(case).items()
+            if not (case.root / name).resolve().is_relative_to(home)}
+
+
 def retained_files(case, marker):
     """Find the recorded bytes by their content, without fixing a private path."""
     roots = (case.root, Path.home())
@@ -25,10 +36,10 @@ def retained_files(case, marker):
 
 def test_decisions_and_ideas_wait_without_changing_shared_checkout(batch, capsys):
     case = batch
-    before = shared_files(case)
+    before = checkout_files(case)
     for kind, text in (("decision", DECISION), ("idea", IDEA)):
         call(case, capsys, "note", "--defer", BOUNDARY, "--kind", kind, "--text", text)
-    assert shared_files(case) == before, "Planning records notes in FA, outside shared content"
+    assert checkout_files(case) == before, "Planning records notes in FA, outside shared content"
     assert case.events == [] and case.tracker.list_issues() == []
     for _ in range(2):  # Separate CLI invocations must see durable notes.
         rows = pending(case, capsys)["notes"]
@@ -40,7 +51,7 @@ def test_decisions_and_ideas_wait_without_changing_shared_checkout(batch, capsys
 
 def test_a_later_append_never_rewrites_or_removes_previous_notes(batch, capsys):
     case = batch
-    before = shared_files(case)
+    before = checkout_files(case)
     call(case, capsys, "note", "--defer", BOUNDARY, "--kind", "decision", "--text", DECISION)
     recorded = retained_files(case, DECISION)
     assert recorded, "The completed append must retain the decision durably"
@@ -52,7 +63,7 @@ def test_a_later_append_never_rewrites_or_removes_previous_notes(batch, capsys):
     rows = pending(case, capsys)["notes"]
     assert [row["text"] for row in rows].count(DECISION) == 1
     assert [row["text"] for row in rows].count(IDEA) == 1
-    assert shared_files(case) == before and case.events == []
+    assert checkout_files(case) == before and case.events == []
 
 
 def test_order_skill_routes_planning_decisions_and_ideas_through_fa():
@@ -75,8 +86,8 @@ def test_planning_append_preserves_a_real_checkout_and_its_staged_bytes(
     main = publish_cli(publication, monkeypatch)
     monkeypatch.chdir(root)
     case = SimpleNamespace(root=root, main=main, gh=record_gh(monkeypatch))
-    shared = shared_files(case)
+    shared = checkout_files(case)
     call(case, capsys, "note", "--defer", BOUNDARY, "--kind", "decision", "--text", DECISION)
     call(case, capsys, "note", "--defer", BOUNDARY, "--kind", "idea", "--text", IDEA)
     assert git_command(root, "ls-files", "--stage") == before
-    assert shared_files(case) == shared and tracker.list_issues() == []
+    assert checkout_files(case) == shared and tracker.list_issues() == []

@@ -2,6 +2,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from foragent import run_group_check as group
 from foragent import run_merge_turn as turn
 from foragent.config import Config
@@ -66,24 +68,42 @@ def test_a_lone_holder_is_no_group(tmp_path):
     assert numbers(ctx, 5) == []
 
 
-def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("measured,remaining,expected", [
+    (736, 5000, 1472), (2000, 5000, 3600), (736, 1000, 1000), (100, 5000, 900),
+    (None, 5000, 1600),
+])
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
+    tmp_path, monkeypatch, measured, remaining, expected, timed_out,
+):
     from contextlib import nullcontext
 
-    from foragent import ci_mode, run_baseline, run_implementation, runner
+    from foragent import (
+        ci_mode, orch_events, run_baseline, run_baseline_limits, run_checks, run_implementation, runner,
+    )
     from foragent.run_baseline import AcceptanceBaseline
     from foragent.run_checks import CheckResult
 
     ctx = make_ctx(tmp_path, (5, 1))
     ctx.config = replace(ctx.config, test_command="pytest -q")
     ctx.repo_root = tmp_path
+    ctx.monotonic = lambda: 0
+    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
     captured, ran = [], []
+    monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
+    monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *args, **kwargs: ["tests/test_related.py"])
     monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: (
-        captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",))))
+        captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
     monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
-    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: ran.append(command) or CheckResult(command, 0, False, ""))
+
+    def check(command, worktree, log, limit, **kwargs):
+        ran.append((command, limit, kwargs.get("clock")))
+        return CheckResult(command, 0, timed_out and "tests/acceptance/" in command, "")
+
+    monkeypatch.setattr(runner, "_check", check)
     ctx.git = SimpleNamespace(add_detached_worktree=lambda path, ref: None, remove_worktree=lambda path: None,
                               _call=lambda args: "")
     place = turn.seat(ctx, 5, "main")
@@ -91,4 +111,12 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(tmp_pat
     group.check(5, ctx, place, "h5", "main-sha", done)
     group.check(5, ctx, place, "h5", "main-sha", done)  # once per (main, heads)
     assert captured == [(5, "pytest -q", "main-sha")]
-    assert ran == ["echo member-5", "echo member-1", "pytest -q tests/acceptance/test_a.py::t"]
+    assert ran == [
+        ("echo member-5", 900, None),
+        ("echo member-1", 900, None),
+        ("pytest -q tests/acceptance/test_a.py::t", expected, ctx.monotonic),
+        ("PYTEST_ADDOPTS= pytest -o addopts= --rootdir=. --maxfail=0 "
+         "-p no:cacheprovider tests/test_related.py", 900, None),
+    ]
+    assert orch_events.has_event(ctx.store, 5, "group-check", passed=not timed_out,
+                                 verdict="void" if timed_out else "passed")
