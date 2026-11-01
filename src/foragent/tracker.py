@@ -201,10 +201,11 @@ def local_issue_models(store) -> list[Issue]:
 class RecordingTracker:
     """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
 
-    def __init__(self, tracker, context, *, queue_writes=False):
+    def __init__(self, tracker, context, *, queue_writes=False, direct=False):
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
+        self._direct = direct
         # GitHub calls made for this context count in its own store and clock.
         store, now = getattr(context, "store", None), getattr(context, "now", None)
         if store is not None and now is not None:
@@ -275,6 +276,14 @@ class RecordingTracker:
             return {}
         return {issue.number: issue for issue in local_issue_models(self._context.store)
                 if issue.number in pending}
+
+    def unqueued(self):
+        """The same tracker for writes whose caller reconciles failures itself: they are sent now or raise."""
+        return RecordingTracker(self._tracker, self._context, direct=True)
+
+    def pending_issue(self, n):
+        """The issue as unsent writes will leave it, or None when no write waits."""
+        return self._pending_issues().get(n)
 
     def current_issue(self, n):
         """Read local intent while delivery is pending, otherwise observe GitHub."""
@@ -477,8 +486,8 @@ class RecordingTracker:
             preceding = [entry for entry in pending if entry.get("evidence")]
         else:
             preceding = store.github_blocking_outbox()
-        if (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
-                (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
+        if not self._direct and (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
+                                 (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
         # A direct combined close exposes only its field effect to concurrent flushes.
         # Its comment is send-only; the composite payload enters the retry queue only on failure.

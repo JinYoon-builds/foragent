@@ -3554,6 +3554,200 @@ def test_replacement_closes_through_a_batch_flush_and_its_resume(publishing, pla
     assert len(tracker.list_comments(41)) == 1
 
 
+def _replacing_two(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    tracker.add_issue(42, "Other old work", "body")
+    plan["issues"][0]["replaces"] = [41, 42]
+    return tracker
+
+
+def _replaced_once(tracker):
+    for number in (41, 42):
+        old = tracker.get_issue(number)
+        assert old.state == "closed" and old.state_reason == "not_planned"
+        assert len(tracker.list_comments(number)) == 1
+
+
+def test_replacement_starting_before_the_lock_refuses_before_any_write(publishing, plan, monkeypatch):
+    tracker, git, events = _replacing_two(publishing, plan), publishing[3], publishing[-1]
+    update = git.update_base
+    monkeypatch.setattr(git, "update_base", lambda branch: (tracker.add_labels(42, ["running"]), update(branch))[1])
+    with pytest.raises(order.PlanError, match=r"#42.*running"):
+        publish(publishing, plan, approve=True)
+    assert events == []
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+
+
+@pytest.mark.parametrize("route", ["immediate", "flush"])
+def test_replacement_starting_after_the_writes_refuses_the_whole_set(publishing, plan, monkeypatch, route):
+    tracker = _replacing_two(publishing, plan)
+    add_labels = tracker.add_labels
+
+    def started_meanwhile(number, labels):
+        add_labels(number, labels)
+        if "approved" in labels:
+            add_labels(42, ["running"])
+
+    if route == "flush":
+        publish(publishing, plan, defer="chosen", approve=True)
+    deliver = (lambda: flush_waiting(publishing)) if route == "flush" else (lambda: publish(publishing, plan, approve=True))
+    monkeypatch.setattr(tracker, "add_labels", started_meanwhile)
+    with pytest.raises(order.PlanError, match=r"#42.*running.*nothing was closed"):
+        deliver()
+    monkeypatch.setattr(tracker, "add_labels", add_labels)
+    # #41 comes first in the plan: it must not close while #42 refuses the set.
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+    assert tracker.get_issue(42).state == "open" and tracker.list_comments(42) == []
+    tracker.remove_labels(42, ["running"])
+    deliver()
+    _replaced_once(tracker)
+
+
+def _flush_interrupted_after_push(publishing, plan, monkeypatch):
+    """Leave a deferred batch committed and pushed, its issue effects still to do."""
+    tracker = publishing[2]
+    publish(publishing, plan, defer="chosen", approve=True)
+    create = tracker.create_issue
+
+    def interrupted(*args, **kwargs):
+        raise TrackerError("interrupted after the push")
+
+    monkeypatch.setattr(tracker, "create_issue", interrupted)
+    with pytest.raises(TrackerError):
+        flush_waiting(publishing)
+    monkeypatch.setattr(tracker, "create_issue", create)
+
+
+def _replacement_route(route, publishing, plan, monkeypatch):
+    if route == "immediate":
+        return lambda: publish(publishing, plan, approve=True)
+    if route == "flush":
+        publish(publishing, plan, defer="chosen", approve=True)
+    else:
+        _flush_interrupted_after_push(publishing, plan, monkeypatch)
+    return lambda: flush_waiting(publishing)
+
+
+@pytest.mark.parametrize("route", ["immediate", "flush", "resumed"])
+def test_replacement_starting_during_the_comment_lookup_refuses_the_whole_set(publishing, plan, monkeypatch, route):
+    tracker = _replacing_two(publishing, plan)
+    deliver = _replacement_route(route, publishing, plan, monkeypatch)
+    lookup = tracker.list_comments
+
+    def started_meanwhile(number):
+        if number == 41:
+            tracker.add_labels(42, ["running"])
+        return lookup(number)
+
+    monkeypatch.setattr(tracker, "list_comments", started_meanwhile)
+    with pytest.raises(order.PlanError, match=r"#42.*running.*nothing was closed"):
+        deliver()
+    monkeypatch.setattr(tracker, "list_comments", lookup)
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+    assert tracker.get_issue(42).state == "open" and tracker.list_comments(42) == []
+    tracker.remove_labels(42, ["running"])
+    deliver()
+    _replaced_once(tracker)
+
+
+@pytest.mark.parametrize("route", ["immediate", "flush", "resumed"])
+def test_replacement_starting_during_an_earlier_close_is_never_closed(publishing, plan, monkeypatch, route):
+    tracker = _replacing_two(publishing, plan)
+    deliver = _replacement_route(route, publishing, plan, monkeypatch)
+    close = tracker.close_issue
+
+    def started_meanwhile(number, *args, **options):
+        result = close(number, *args, **options)
+        if number == 41:
+            tracker.add_labels(42, ["running"])
+        return result
+
+    monkeypatch.setattr(tracker, "close_issue", started_meanwhile)
+    with pytest.raises(order.PlanError, match=r"#42.*running.*#41 already closed"):
+        deliver()
+    monkeypatch.setattr(tracker, "close_issue", close)
+    assert tracker.get_issue(42).state == "open" and tracker.list_comments(42) == []
+    assert tracker.get_issue(41).state_reason == "not_planned"
+    tracker.remove_labels(42, ["running"])
+    deliver()
+    _replaced_once(tracker)
+
+
+def test_replacement_close_failing_after_its_comment_stays_retryable(publishing, plan, monkeypatch):
+    tracker = _replacing_two(publishing, plan)
+    close = tracker.close_issue
+
+    def like_gh(number, comment=None, **options):
+        # GitHub's CLI posts --comment before it closes, so a failed close keeps the comment.
+        if comment is not None:
+            tracker.comment(number, comment)
+        raise TrackerError("close refused")
+
+    monkeypatch.setattr(tracker, "close_issue", like_gh)
+    with pytest.raises(TrackerError):
+        publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+    monkeypatch.setattr(tracker, "close_issue", close)
+    publish(publishing, plan, approve=True)
+    _replaced_once(tracker)
+
+
+@pytest.mark.parametrize("posted", [False, True], ids=["unsent", "sent-but-reported-failed"])
+def test_replacement_comment_failing_after_the_close_is_completed_once(publishing, plan, monkeypatch, posted):
+    tracker = _replacing_two(publishing, plan)
+    comment, closes = tracker.comment, []
+    close = tracker.close_issue
+
+    def counted(number, *args, **options):
+        closes.append(number)
+        return close(number, *args, **options)
+
+    def failing(number, body):
+        if "foragent:replaced" in body:
+            if posted:
+                comment(number, body)
+            raise TrackerError("comment failed")
+        return comment(number, body)
+
+    monkeypatch.setattr(tracker, "close_issue", counted)
+    monkeypatch.setattr(tracker, "comment", failing)
+    with pytest.raises(TrackerError):
+        publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "closed"
+    monkeypatch.setattr(tracker, "comment", comment)
+    publish(publishing, plan, approve=True)
+    _replaced_once(tracker)
+    assert closes == [41, 42]
+
+
+def test_replacement_keeps_closures_it_did_not_make(publishing, plan):
+    tracker = _replacing_two(publishing, plan)
+    tracker.close_issue(41, reason="completed")
+    tracker.close_issue(42, reason="not_planned")
+    tracker.add_labels(42, ["running"])  # A leftover label on closed work is not running work.
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state_reason == "completed" and tracker.list_comments(41) == []
+    assert tracker.get_issue(42).state_reason == "not_planned"
+
+
+def test_replacement_preview_lists_only_what_this_publication_closes(publishing, plan):
+    tracker = _replacing_two(publishing, plan)
+    tracker.add_issue(43, "Third old work", "body")
+    tracker.add_issue(44, "Fourth old work", "body")
+    plan["issues"][0]["replaces"] = [41, 42, 43]
+    plan["issues"][1]["replaces"] = [44]
+    previewed = lambda **options: " ".join(publish(publishing, plan, dry_run=True, **options).closures)
+    assert previewed() == ""
+    chosen = previewed(approve_keys=[plan["issues"][1]["key"]])
+    assert "#44" in chosen and "#41" not in chosen
+    assert all(f"#{n}" in previewed(approve=True) for n in (41, 42, 43, 44))
+    tracker.close_issue(42, reason="completed")
+    publish(publishing, plan, approve=True)
+    tracker.issues[41] = replace(tracker.get_issue(41), state="open", state_reason=None)
+    assert previewed(approve=True) == ""
+
+
 def test_planning_notes_replacement_and_interrupted_tail(tmp_path):
     from foragent import order_notes
     from foragent.state import StateStore

@@ -1882,6 +1882,117 @@ def test_close_not_planned_survives_recording_and_outbox(tmp_path):
     assert next(row for row in store.local_issues() if row["number"] == 42)["state_reason"] == "not_planned"
 
 
+def _replacement_tracker(tmp_path, labels=()):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    remote = FakeTracker()
+    remote.add_issue(41, "Old work", "body", list(labels))
+    store.record_issue(remote.get_issue(41), {})
+    return store, remote, RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+
+
+def _replace_41(tracker):
+    from foragent import order_replaces
+
+    order_replaces.close_replaced({"id": "order", "issues": []}, {41: ["new"]}, tracker, {"new": 7}, {7}, "en")
+
+
+def test_replacement_behind_queued_writes_closes_and_comments_once(tmp_path):
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    for _ in range(2):  # Republishing must not repeat anything, delivered or not.
+        _replace_41(tracker)
+    # The closure never waits in the outbox, where a later flush could act on stale facts.
+    assert not [entry for entry in store.github_outbox() if entry["action"] in ("close_issue", "comment")]
+    assert remote.get_issue(41).state_reason == "not_planned"
+    assert len(remote.list_comments(41)) == 1 and "#7" in remote.list_comments(41)[0].body
+    tracker.flush_outbox()
+    tracker.flush_outbox()
+    assert len(remote.list_comments(41)) == 1
+
+
+def test_replacement_comment_sent_but_reported_failed_is_not_retried_by_a_flush(tmp_path, monkeypatch):
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    post = remote.comment
+
+    def sent_then_failed(number, body):
+        post(number, body)
+        raise TrackerError("connection lost after the post")
+
+    monkeypatch.setattr(remote, "comment", sent_then_failed)
+    with pytest.raises(TrackerError):
+        _replace_41(tracker)
+    monkeypatch.setattr(remote, "comment", post)
+    tracker.flush_outbox()
+    _replace_41(tracker)
+    tracker.flush_outbox()
+    assert len(remote.list_comments(41)) == 1
+    assert not [entry for entry in store.github_outbox() if entry["action"] == "comment"]
+
+
+def test_replacement_rate_limit_stays_out_of_the_outbox(tmp_path, monkeypatch):
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    tracker.queue_writes = True
+    close = remote.close_issue
+
+    def limited(*args, **kwargs):
+        raise TrackerError("HTTP 403 API rate limit exceeded")
+
+    monkeypatch.setattr(remote, "close_issue", limited)
+    with pytest.raises(TrackerError):
+        _replace_41(tracker)
+    assert store.github_outbox() == []
+    monkeypatch.setattr(remote, "close_issue", close)
+    _replace_41(tracker)
+    assert remote.get_issue(41).state_reason == "not_planned" and len(remote.list_comments(41)) == 1
+
+
+def test_replacement_leaves_a_close_already_waiting_to_be_sent(tmp_path):
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    store.queue_github_write(41, "close_issue", body=None, reason="completed")
+    _replace_41(tracker)
+    assert remote.get_issue(41).state == "open" and remote.list_comments(41) == []
+    assert [entry["reason"] for entry in store.github_outbox()] == ["completed"]
+
+
+def test_replacement_sees_a_running_label_still_waiting_to_be_sent(tmp_path):
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    store.queue_github_write(41, "add_labels", labels=["running"])
+    with pytest.raises(ValueError, match="#41.*running"):
+        _replace_41(tracker)
+    assert remote.get_issue(41).state == "open"
+
+
+def test_replacement_sees_a_run_on_github_behind_unsent_writes(tmp_path):
+    from foragent import order_replaces
+
+    store, remote, tracker = _replacement_tracker(tmp_path)
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    remote.add_labels(41, ["running"])  # The local view of the issue still shows it idle.
+    plan = {"id": "order", "issues": [{"key": "new", "replaces": [41]}]}
+    with pytest.raises(ValueError, match="#41.*running"):
+        order_replaces.plan_closures(plan, tracker, None, {}, "en")
+    with pytest.raises(ValueError, match="#41.*running"):
+        _replace_41(tracker)
+    assert remote.get_issue(41).state == "open" and remote.list_comments(41) == []
+    tracker.flush_outbox()
+    assert remote.get_issue(41).state == "open"
+
+
+def test_replacement_trusts_github_over_an_unsent_label_removal(tmp_path):
+    store, remote, tracker = _replacement_tracker(tmp_path, ["running"])
+    store.queue_github_write(41, "remove_labels", labels=["running"])
+    assert "running" not in tracker.pending_issue(41).labels
+    with pytest.raises(ValueError, match="#41.*running"):
+        _replace_41(tracker)
+    assert remote.get_issue(41).state == "open"
+
+
 def test_pending_close_reason_waits_for_the_matching_observation(tmp_path):
     from types import SimpleNamespace
     from foragent.config import Config
