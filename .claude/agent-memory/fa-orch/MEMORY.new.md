@@ -20,3 +20,5 @@
 - [id:wait-resume-2026-10-31-1181-public-reader] #1181: 대기 원문은 order_waiting.section()이 공개 reader다. orch_waits는 이를 그대로 요청에 싣고 역할·이유·조건을 다시 파싱하지 않는다. 성공한 최신 listing 뒤에만 scheduler._blockers(confirmed=True)를 읽어, blocker 변경의 기존 링크 무효화와 변경 없는 refresh의 조회 재사용을 함께 따른다.
 - [id:wait-resume-2026-10-31-1181-receipt] #1181: wait_resume_key(이슈 번호·대기 원문 SHA256·저장소를 포함한 닫힌 blocker 집합)는 inbox 요청 자체가 유일한 전송 영수증이다. tick lock 안에서 모든 상태(done 포함)의 요청을 읽어 재시작·완료 뒤에도 중복을 막고, 별도 claim 파일 없이 쓰기 실패는 재시도한다. 한 이슈의 일반 오류는 다음 이슈를 막지 않으며 한도 오류는 기존 tick pause로 전파한다.
 - [id:wait-resume-2026-10-31-1181-break-it] #1181: tests/test_orch_waits_unit.py의 14개 사례 모두가 임시 src 사본의 변형을 하나 이상 잡았고, 전달 생략·중복·옛 listing·임의 승인 등 18개 변형을 모두 거절했다. PYTHONPATH 사본 검증은 실제 import된 orch_waits.__file__을 먼저 확인해야 한다. 인수 시험이나 작업 트리 소스를 변형하지 않는다.
+
+- [id:1141-2026-11-01-resume-validation] #1141 재개: HEAD가 origin/main 전체와 #1295·#1347을 이미 포함하면 재베이스 대신 기존 구현을 보존한다. 이번 fa test는 공용 test-slots.lock EPERM으로 시작 전 종료됐다. 저장된 check-done.log의 지정 3/4 통과와 logs/issue-1141.log의 관련 39 통과는 이전 실행 근거이며, git diff fb1ead5d HEAD로 해당 소스·시험 6파일 동일성을 확인해도 새 base 재실행 통과와 구분한다. 재생성 때 사라진 TRY·SEARCHED·REBUTTAL을 복원한다.
