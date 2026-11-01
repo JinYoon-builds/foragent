@@ -43,6 +43,7 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     if run.attempts >= ctx.config.max_retries + 1:
         run_publish.flag(ctx, n, run_publish.Reason.RETRIES_EXCEEDED, "CI failed after all attempts.", f"{failure}\n\n{link}")
         raise run_publish.ExecutorStopped("ci-failed", str(failure))
+    run_publish._phase(n, ctx, "implementing")
     ctx.store.update_run(n, attempts=run.attempts + 1)
     raise failure
 

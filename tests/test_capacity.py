@@ -105,6 +105,21 @@ def start(store, number, pid):
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number), pid=pid)
 
 
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("phase", [None, "implementing", "checking", "reviewing", "resolving-conflict",
+                                   "test-slot-wait", "executor-wait", "limit-wait", "legacy-phase",
+                                   "merge-turn-wait", "merge-lock-wait", "ci", "overlap-wait"])
+def test_only_the_four_idle_phases_release_machine_slots(tmp_path, phase, live):
+    own, sibling = StateStore(tmp_path / "own"), StateStore(tmp_path / "sibling")
+    for store in (own, sibling):
+        start(store, 1, os.getpid())
+        store.prepare_run_start(1)  # A waiting run must not become a launch reservation again.
+        store.update_run(1, phase=phase)
+    expected = 0 if phase in {"merge-turn-wait", "merge-lock-wait", "ci", "overlap-wait"} else 2
+    assert len(capacity.machine_holders(own, datetime.now(UTC), live=live)) == expected
+    assert len(own.active_runs()) == len(sibling.active_runs()) == 1
+
+
 def test_machine_runs_counts_own_runs_and_live_sibling_runs(tmp_path):
     own, other = StateStore(tmp_path / "own"), StateStore(tmp_path / "other", now=lambda: NOW)
     start(own, 1, dead_pid())  # Recovery, not the budget, settles this store's own runs.

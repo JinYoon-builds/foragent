@@ -162,10 +162,12 @@ def _merge_wait(n: int, ctx: RunContext):
         )
         return now
 
+    completed = False
     try:
         yield credit
+        completed = True
     finally:
-        wait.close(credit(close=True))
+        wait.close(credit(close=True), resume=completed)
 
 
 def _wait_limit_reached(n: int, ctx: RunContext) -> bool:

@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 from foragent import cuts
 from foragent.git import GitError
 from foragent.issue import parse_body
-from foragent.run_waits import _progress, _test_slot
+from foragent.run_waits import _progress, _test_slot, in_phase
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -144,12 +144,7 @@ def check(
     Every entrypoint measures the captured base: locally against its passing
     baseline, or through exact base/head acceptance reports in CI mode.
     """
-    from foragent import orch_events, runner
     from foragent.ci_mode import enabled
-    from foragent.run_attempt import AttemptFailure
-    from foragent.run_baseline import _capture_acceptance_baseline
-    from foragent.run_checks import _append, _protected_limit, _pytest_command, _related_unit_tests, trusts_ci
-    from foragent.run_implementation import _detect_test_command_at
 
     if group_limit(ctx.store, ctx.config)[0] <= 1:
         return
@@ -168,6 +163,18 @@ def check(
     if not group or key in done:
         return
     done.add(key)
+    with in_phase(n, ctx, "checking"):
+        _check_group(n, ctx, place, base_sha, group, ci)
+
+
+def _check_group(n: int, ctx: RunContext, place: Seat, base_sha: str, group: list[Member], ci: bool) -> None:
+    """Measure the captured group while its leader holds a machine slot."""
+    from foragent import orch_events, runner
+    from foragent.run_attempt import AttemptFailure
+    from foragent.run_baseline import _capture_acceptance_baseline
+    from foragent.run_checks import _append, _protected_limit, _pytest_command, _related_unit_tests, trusts_ci
+    from foragent.run_implementation import _detect_test_command_at
+
     log = ctx.store.log_path(n)
     numbers = [member.n for member in group]
     results = []
