@@ -346,7 +346,7 @@ def test_publish_preserves_issue_files_as_metadata(publishing, plan, kind):
     if kind == "edits":
         publish(publishing, plan)
         item = {"number": 2, "goal": "Updated login.", "out_of_scope": "Payments.",
-                "done_when": ["true"], "checklist": ["Looks right"], "files": paths}
+                "done_when": [f"uv run pytest -q {FILE}", "true"], "checklist": ["Looks right"], "files": paths}
         plan["id"] = "2026-10-21-login-update"
         plan["issues"], plan["edits"] = [], [item]
     else:
@@ -2686,7 +2686,7 @@ def test_partial_publication_records_each_written_target_before_followup_failure
     if route == "edit":
         item = plan["issues"][0]
         plan["issues"] = []
-        plan["edits"] = [{"number": number, **{key: item[key] for key in ("goal", "out_of_scope", "done_when")}}]
+        plan["edits"] = [{"number": number, **{key: item[key] for key in ("goal", "out_of_scope", "done_when", "checklist")}}]
         plan["edits"][0]["goal"] = "Revised edit goal."
         plan["id"] += "-edit"
         monkeypatch.setattr(order, "executor_for", lambda name: _NoUnknowns())
@@ -4029,3 +4029,253 @@ def test_statement_issue_refused_as_stale_can_be_reread_without_a_reader(publish
     item["goal"] += " Reconciled."
     publish(publishing, plan)
     assert "Reconciled." in tracker.get_issue(number).body
+
+
+# Done when lines an edit may not lose silently (#1556).
+
+DONE_WHEN_BODY = ("<!-- foragent:v1 -->\n## Goal\nKeep it.\n\n## Out of scope\nNothing.\n\n"
+                  "## Done when\n```sh\ntrue\n```\n```sh\ntest  -s kept.txt\n```\n- [x] Stay checked.\n- [ ] Stay open.\n")
+
+
+def _edit_plan(identity="keep-lines", **fields):
+    edit = {"number": 40, "goal": "Keep it.", "out_of_scope": "Nothing.", "done_when": ["true", "test  -s kept.txt"],
+            "checklist": ["Stay checked.", "Stay open."], **fields}
+    return {"id": identity, "title": "Keep lines", "summary": "Keep.", "spec_markdown": "# Keep\n",
+            "issues": [], "edits": [edit]}
+
+
+def _edit_case(publishing, body=DONE_WHEN_BODY):
+    root, config, tracker, git, _ = publishing
+    tracker.add_issue(40, "Keep lines", body, labels=["lane:api", "size:m"])
+    return root, config, tracker, git
+
+
+def _publish_edit(case, plan, **options):
+    root, config, tracker, git = case
+    return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **options)
+
+
+def _drop_command(reason="A newer proof covers it."):
+    return {"done_when": ["true"], "done_when_removals": [{"line": "test  -s kept.txt", "reason": reason}]}
+
+
+def test_removal_record_survives_later_edits_and_never_reads_as_done_when(publishing):
+    case = _edit_case(publishing)
+    tracker = case[2]
+    _publish_edit(case, _edit_plan(**_drop_command("Line one.\n  Line two.")))
+    body = tracker.get_issue(40).body
+    assert parse_body(body).done_when_commands == ["true"]
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
+    # A later order that names nothing keeps the history, and adds its own after it.
+    _publish_edit(case, _edit_plan("keep-lines-2", goal="Keep it better.", done_when=["true"]))
+    body = tracker.get_issue(40).body
+    assert parse_body(body).goal == "Keep it better."
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
+    _publish_edit(case, _edit_plan("keep-lines-3", done_when=["true"], checklist=["Stay open."], done_when_removals=[
+        {"line": "Stay checked.", "reason": "Done elsewhere."}]))
+    assert [entry["line"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
+        "test  -s kept.txt", "Stay checked."]
+
+
+@pytest.mark.parametrize("line", [
+    "printf '## Goal\\n'\n\n```\nsecond  line", "```", "<!-- foragent:done-when-removed -->",
+])
+def test_removal_record_round_trips_lines_that_look_like_structure(line):
+    written = order.order_done_when.with_record(DONE_WHEN_BODY, None, [{"line": line, "reason": "## Goal"}], "an-order")
+    assert order.order_done_when.records(written) == [{"line": line, "order": "an-order", "reason": "## Goal"}]
+    assert order.order_done_when.without_record(written).strip() == DONE_WHEN_BODY.strip()
+    assert parse_body(written) == parse_body(DONE_WHEN_BODY)
+
+
+def test_body_without_removals_stays_byte_identical():
+    assert order.order_done_when.with_record(DONE_WHEN_BODY, DONE_WHEN_BODY, []) == DONE_WHEN_BODY
+    assert order.order_done_when.without_record(DONE_WHEN_BODY) == DONE_WHEN_BODY
+
+
+def test_republishing_an_applied_removal_keeps_the_body_and_its_approval(publishing):
+    """Publish, preread, then approve the same plan: the applied line is gone but the record names it."""
+    case = _edit_case(publishing)
+    tracker = case[2]
+    plan = _edit_plan(**_drop_command())
+    _publish_edit(case, plan)
+    body = tracker.get_issue(40).body
+    _publish_edit(case, plan, approve=True)
+    assert tracker.get_issue(40).body == body and "approved" in tracker.get_issue(40).labels
+    _publish_edit(case, plan)
+    issue = tracker.get_issue(40)
+    assert issue.body == body and "approved" in issue.labels
+    assert len(order.order_done_when.records(body)) == 1
+
+
+@pytest.mark.parametrize("route", ["publish", "dry-run", "preread"])
+def test_a_new_order_cannot_reuse_a_removal_another_order_recorded(publishing, route):
+    """History authorizes nothing: the line is absent from the current Done when, so it is refused."""
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    before = tracker.get_issue(40).body
+    plan = _edit_plan("another-order", **_drop_command())
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        if route == "preread":
+            order.preread(plan, root, config, lambda: tracker, repo="owner/repo")
+        else:
+            _publish_edit(case, plan, dry_run=route == "dry-run")
+    assert "absent from the current Done when" in refused.value.lines[0]
+    assert refused.value.lines[0].endswith("test  -s kept.txt") and "#40" in refused.value.lines[0]
+    assert tracker.get_issue(40).body == before
+
+
+def test_a_later_order_records_its_own_removal_of_a_line_put_back(publishing):
+    """The same line and reason from another order is a new removal, so its record is not merged away."""
+    case = _edit_case(publishing)
+    tracker = case[2]
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    restored = "keep-lines-back"
+    _publish_edit(case, _edit_plan(restored))
+    _publish_edit(case, _edit_plan("keep-lines-again", **_drop_command()))
+    assert [entry["order"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
+        "keep-lines", "keep-lines-again"]
+
+
+def test_a_recorded_line_with_a_different_reason_is_still_absent(publishing):
+    case = _edit_case(publishing)
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        _publish_edit(case, _edit_plan(**_drop_command("Another story.")))
+    assert "#40" in refused.value.lines[0] and "test  -s kept.txt" in refused.value.lines[0]
+
+
+@pytest.mark.parametrize("fields,line", [
+    ({"done_when_removals": [{"line": "true", "reason": "Not actually gone."}]}, "true"),
+    ({"done_when": ["true", "test  -s kept.txt", "test -s new"],
+      "done_when_removals": [{"line": "test -s new", "reason": "Added by this very edit."}]}, "test -s new"),
+])
+def test_declaring_a_line_the_edit_keeps_is_refused(publishing, fields, line):
+    """A record must never claim a removal that did not happen."""
+    case = _edit_case(publishing)
+    before = case[2].get_issue(40).body
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        _publish_edit(case, _edit_plan(**fields))
+    assert refused.value.lines[0].endswith(line) and "still keeps" in refused.value.lines[0]
+    assert case[2].get_issue(40).body == before
+
+
+def test_moving_a_command_to_the_checklist_needs_a_reason(publishing):
+    case = _edit_case(publishing)
+    moved = {"done_when": ["true"], "checklist": ["Stay checked.", "Stay open.", "test  -s kept.txt"]}
+    with pytest.raises(order.DoneWhenRemovalError, match="test  -s kept.txt"):
+        _publish_edit(case, _edit_plan(**moved))
+    _publish_edit(case, _edit_plan(**moved, done_when_removals=[{"line": "test  -s kept.txt", "reason": "Manual now."}]))
+    assert parse_body(case[2].get_issue(40).body).done_when_commands == ["true"]
+
+
+def test_every_issue_and_line_is_reported_at_once_in_the_configured_language(publishing):
+    root, config, tracker, git = _edit_case(publishing)
+    tracker.add_issue(41, "Other", DONE_WHEN_BODY, labels=["lane:api", "size:m"])
+    plan = _edit_plan(done_when=["true"], checklist=[])
+    plan["edits"].append({**plan["edits"][0], "number": 41})
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        order.publish(plan, root, replace(config, language="ko"), tracker, repo="owner/repo", git=git, dry_run=True)
+    lines = refused.value.lines
+    assert [line.split(":")[0] for line in lines[:-1]] == ["#40"] * 3 + ["#41"] * 3
+    assert lines[0].endswith("test  -s kept.txt") and "이유 없이" in lines[0]
+
+
+def test_a_line_added_after_the_first_check_is_refused_under_the_publication_lock(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    update_base = git.update_base
+
+    def someone_adds_a_line(branch):
+        update_base(branch)
+        tracker.update_issue(40, title="Keep lines", body=DONE_WHEN_BODY + "- [ ] Added meanwhile.\n")
+
+    git.update_base = someone_adds_a_line
+    with pytest.raises(order.DoneWhenRemovalError, match="Added meanwhile."):
+        _publish_edit(case, _edit_plan())
+    assert ("push", "main") not in publishing[4]
+
+
+def test_a_deferred_order_is_refused_before_it_is_retained_and_a_landed_batch_is_not_rechecked(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    plan = _edit_plan(done_when=["true"])
+    with pytest.raises(order.DoneWhenRemovalError):
+        _publish_edit(case, plan, defer="merge-group")
+    from foragent import order_submissions
+    assert order_submissions.pending(StateStore.for_repo("owner/repo")) == []
+    # A batch whose commit landed resumes only its issue effects; its checks already passed.
+    publication = order._publication_checks(plan, root, config, tracker, repo="owner/repo", git=git, landed=True)
+    assert publication.edit_numbers == {40}
+
+
+@pytest.mark.parametrize("value,message", [
+    ("line", "must be an array"),
+    (["line"], "exactly line and reason"),
+    ([{"line": "true"}], "exactly line and reason"),
+    ([{"line": "true", "reason": 1}], "must be strings"),
+    ([{"line": "true", "reason": "a"}, {"line": "true", "reason": "b"}], "names a line twice"),
+])
+def test_removal_declarations_have_one_shape(publishing, value, message):
+    case = _edit_case(publishing)
+    with pytest.raises(order.PlanError, match=message):
+        _publish_edit(case, _edit_plan(done_when_removals=value), dry_run=True)
+
+
+def test_new_issues_do_not_take_removal_declarations(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    plan["issues"][0]["done_when_removals"] = []
+    with pytest.raises(order.PlanError, match="done_when_removals"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git, dry_run=True)
+
+
+def test_preread_prompt_gains_the_removals_only_when_declared(publishing):
+    root, config, tracker, _ = _edit_case(publishing)
+    plain = _edit_plan()
+    item = order.edit_view(plain["edits"][0], tracker.get_issue(40), config)
+    assert "Removed from Done when" not in order.preread_prompt(plain, item, root)
+    plan = _edit_plan(**_drop_command("Covered.\nElsewhere."))
+    item = order.edit_view(plan["edits"][0], tracker.get_issue(40), config)
+    assert "- test  -s kept.txt\n  Reason: Covered. Elsewhere.\n" in order.preread_prompt(plan, item, root)
+
+
+def test_a_republished_child_keeps_the_removal_record_written_on_it(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    for item in plan["issues"]:
+        item["out_of_scope"] = "Nothing."
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    report_number = next(issue.number for issue in tracker.list_issues() if issue.title == plan["issues"][0]["title"])
+    child = tracker.get_issue(report_number)
+    marked = order.order_done_when.with_record(child.body, child.body, [{"line": "old", "reason": "Why."}], "earlier")
+    tracker.update_issue(report_number, title=child.title, body=marked)
+    order.order_observed.save(root, plan["id"], {str(report_number): order.order_observed.fields(tracker.get_issue(report_number))}, "en")
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert order.order_done_when.records(tracker.get_issue(report_number).body) == [
+        {"line": "old", "order": "earlier", "reason": "Why."}]
+
+
+def test_seed_carries_the_sections_an_edit_would_otherwise_lose(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    edit = _edit_plan(goal="Keep it.\n\n## Waiting\nReason: a release.", exclusive=["src/x.py"], files=["src/**"],
+                      statements=["It keeps going.", "It stays."])["edits"][0]
+    body = order.issue_body(edit, "owner/repo", "main").replace("\n", "\r\n")
+    seeded = order.order_done_when.seed(SimpleNamespace(number=40, body=body))
+    assert {key: seeded[key] for key in ("goal", "exclusive", "files", "statements", "done_when", "checklist")} == {
+        key: edit[key] for key in ("goal", "exclusive", "files", "statements", "done_when", "checklist")}
+    plain = order.order_done_when.seed(tracker.get_issue(40))
+    assert set(plain) == {"number", "goal", "out_of_scope", "files", "done_when", "checklist"}
+    assert plain["checklist"] == ["Stay checked.", "Stay open."]
+
+
+def test_preread_proposal_reaches_the_implementer_of_an_edit_with_a_removal_record(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    body = _child_body(plan, plan["issues"][0], config)
+    head, marker = body.split("<!-- foragent:plan-child", 1)
+    recorded = order.order_done_when.with_record(head.removesuffix("\n"), None, [{"line": "old", "reason": "Why."}])
+    assert _handover(root, 7, recorded + "\n<!-- foragent:plan-child" + marker, API_FILES) == _handover(root, 7, body, API_FILES)
+    assert _handover(root, 7, body, API_FILES) is not None
