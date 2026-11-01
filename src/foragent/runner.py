@@ -338,6 +338,7 @@ def review_only(
     detail = ""
     previous = ctx.store.get_run(n)
     started = False
+    admission = ExitStack()
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -347,6 +348,10 @@ def review_only(
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
+        # The shared machine budget admits this review before any label or run-record change; a
+        # start the tick reserved reuses its slot. Once the run records this pid, the run holds it.
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind="review", issue=n))
         issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
@@ -355,6 +360,7 @@ def review_only(
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
                             lane=issue_lane(issue.labels, ctx.config.lanes))
         started = True
+        admission.close()
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
@@ -390,6 +396,7 @@ def review_only(
         detail = f"Review runner exited: {exc}"
         raise
     finally:
+        admission.close()
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
@@ -414,14 +421,46 @@ def review_only(
     return outcome
 
 
+def _admission_seconds(ctx: RunContext) -> int:
+    """A direct start waits for a slot as long as one run may take: the work ahead of it is valid."""
+    return int(ctx.config.max_runtime_minutes) * 60
+
+
 def run_issue(n: int, ctx: RunContext) -> str:
+    """Run issue N once the shared budget admits it, before it claims the run record's pid.
+
+    Admission reads the live slot holders, never the record's status: a record the tick
+    launched this process for (its pid is this one) or a fresh reservation is reused at once;
+    a finished record, or a running one whose pid has died, must fit the budget. Once the
+    run is started (or its running record claims this pid), that record holds the slot
+    and the temporary admission is released.
+    """
+    with ExitStack() as admission:
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n))
+        return _run_issue(n, ctx, admission)
+
+
+def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        run = ctx.store.update_run(n, pid=os.getpid(),
-                                   process_identities=observe_tree(roots=(os.getpid(),)))
+        run = ctx.store.get_run(n)
+        if run is not None and run.status == "finished":
+            # update_run deliberately leaves finished records untouched. A direct retry needs
+            # a new lifecycle, including the running identity the merge queue admits.
+            run = ctx.store.start_run(
+                n, branch=run.branch, worktree=worktree, pid=os.getpid(), lane=run.lane,
+                tier=run.tier, implementer=run.implementer, executor=run.executor,
+                reviewer=run.reviewer, executor_model=run.executor_model,
+            )
+        else:
+            run = ctx.store.update_run(n, pid=os.getpid(),
+                                       process_identities=observe_tree(roots=(os.getpid(),)))
+        if run.status == "running":
+            admission.close()  # The record now names this live process: it holds the slot.
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
