@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 
+from foragent.state_locks import _file_lock
+
 # Days a finished run's logs stay, by its newest run's outcome; any non-merged outcome keeps 30.
 # Merged runs keep `fa settings` log_retention_days (#160), 7 by default.
 MERGED_RETENTION_DAYS = 7
@@ -18,6 +20,12 @@ JOURNAL_RETENTION = timedelta(days=30)
 JOURNALS = ("orch-events.jsonl", "gate-events.jsonl")
 # issue-N.log and its companions issue-N.<anything> and issue-N-<anything>.
 _ISSUE_FILE = re.compile(r"issue-(\d+)[.-]")
+# Flow observations: two whole generations, so every retained file set stays finite
+# (2,048 lines and 7 MiB) and rotation never rewrites an accepted line.
+FLOW_FILE, FLOW_OLD_FILE, FLOW_LOCK = "flow-records.jsonl", "flow-records.1.jsonl", "flow.lock"
+FLOW_GENERATION_LINES = 1024
+FLOW_GENERATION_BYTES = 3584 * 1024
+FLOW_RECORD_BYTES = 1024 * 1024
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -28,6 +36,80 @@ def _parse_time(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def _flow_value(value: object) -> str:
+    return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+class FlowRecordsMixin:
+    """The local, append-only observation log. Its leaf lock takes no other lock."""
+
+    def record_flow(self, kind: str, *, issue: int | None = None, run_started_at: str | None = None,
+                    **data: object) -> None:
+        """Append one observation at the store's UTC clock; a failure never reaches the caller.
+
+        Callable while holding the state lock. The time is read inside the lock, so file
+        order is time order. An oversized record keeps only its size, its content unknown.
+        """
+        try:
+            with _file_lock(self.root / FLOW_LOCK):
+                record = {"at": self._now().astimezone(_state.UTC).isoformat(), "kind": kind, "issue": issue,
+                          "run_started_at": run_started_at, "data": data}
+                line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+                if len(line) > FLOW_RECORD_BYTES:
+                    record["data"] = {"oversized_bytes": len(line)}
+                    line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+                if len(line) <= FLOW_RECORD_BYTES:
+                    self._append_flow_line(line)
+        except Exception:
+            return
+
+    def _append_flow_line(self, line: bytes) -> None:
+        path = self.root / FLOW_FILE
+        try:
+            current = path.read_bytes()
+        except FileNotFoundError:
+            current = b""
+        torn = bool(current) and not current.endswith(b"\n")  # An earlier write ended early.
+        lines = current.count(b"\n") + torn
+        if lines >= FLOW_GENERATION_LINES or len(current) + torn + len(line) > FLOW_GENERATION_BYTES:
+            _state.os.replace(path, self.root / FLOW_OLD_FILE)
+            torn = False
+        with path.open("ab") as stream:
+            stream.write(b"\n" + line if torn else line)
+
+    def flow_records(self, *, since: datetime | None = None, until: datetime | None = None) -> list[dict]:
+        """Retained observations in ``[since, until)``, oldest first; unreadable lines are unknown.
+
+        Reading creates and changes nothing, and takes only a shared flow lock.
+        """
+        try:
+            with (self.root / FLOW_LOCK).open("rb") as stream:
+                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_SH)
+                raw = b"".join(self._flow_generation(name) for name in (FLOW_OLD_FILE, FLOW_FILE))
+        except OSError:
+            return []  # No lock file: nothing was ever recorded here.
+        rows = []
+        for line in raw.split(b"\n"):
+            try:
+                value = _state.json.loads(line)
+            except ValueError:
+                continue
+            at = _parse_time(value.get("at")) if isinstance(value, dict) else None
+            if at is None or not isinstance(value.get("kind"), str) or not isinstance(value.get("data"), dict):
+                continue
+            if (since is None or at >= since) and (until is None or at < until):
+                rows.append((at, {key: value.get(key) for key in ("at", "kind", "issue", "run_started_at", "data")}))
+        rows.sort(key=lambda row: row[0])  # Stable: equal times keep their written order.
+        return [row for _, row in rows]
+
+    def _flow_generation(self, name: str) -> bytes:
+        try:
+            content = (self.root / name).read_bytes()
+        except FileNotFoundError:
+            return b""
+        return content if content.endswith(b"\n") else content + b"\n"
 
 
 class LogRetentionMixin:

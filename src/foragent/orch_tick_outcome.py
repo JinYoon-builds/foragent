@@ -112,11 +112,14 @@ def run_recorded(store: StateStore, config: Config, repo: str, run: Callable[[],
             result = run()
         except Exception as exc:
             _CURRENT.reset(token)
-            record_failure(store, config, repo, exc, steps=steps.items,
-                           duration_seconds=_duration(started, steps.items))
+            duration = _duration(started, steps.items)
+            store.record_flow("tick", status="failed", duration_seconds=duration, steps=steps.items)
+            record_failure(store, config, repo, exc, steps=steps.items, duration_seconds=duration)
             raise
         _CURRENT.reset(token)
-        record_success(store, steps=steps.items, duration_seconds=_duration(started, steps.items))
+        duration = _duration(started, steps.items)
+        store.record_flow("tick", status="ok", duration_seconds=duration, steps=steps.items)
+        record_success(store, steps=steps.items, duration_seconds=duration)
         return result
 
 
