@@ -120,7 +120,7 @@ def check(
     from foragent.ci_mode import enabled
     from foragent.run_attempt import AttemptFailure
     from foragent.run_baseline import _capture_acceptance_baseline
-    from foragent.run_checks import _append, _baseline_verification_limit, _pytest_command, _related_unit_tests, trusts_ci
+    from foragent.run_checks import _append, _pytest_command, _related_unit_tests, trusts_ci
     from foragent.run_implementation import _detect_test_command_at
 
     if ctx.config.merge_group_max <= 1 or enabled(ctx, place.target):
@@ -148,8 +148,8 @@ def check(
                 worktree = Path(directory) / "worktree"
                 ctx.git.add_detached_worktree(worktree, combined)
                 try:
-                    def run(command: str, limit: int = 900):
-                        result = runner._check(command, worktree, log, limit, progress=lambda: _progress(n, ctx),
+                    def run(command: str):
+                        result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
                                                slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
                         results.append(result)
                         _progress(n, ctx)
@@ -157,7 +157,7 @@ def check(
                     for member in group:
                         for command in member.commands:
                             run(command)
-                    run(f"{baseline.command} {shlex.join(baseline.node_ids)}", _baseline_verification_limit(n, ctx))
+                    run(f"{baseline.command} {shlex.join(baseline.node_ids)}")
                     test_command = ctx.config.test_command
                     if test_command is None:
                         test_command = next(iter(runner.detect_test_commands(worktree)), None)

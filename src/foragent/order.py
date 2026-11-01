@@ -3,16 +3,18 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, ownership
+from foragent import board, capacity, design, order_references, order_waiting, ownership
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -233,7 +235,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "feedback": feedback, "decisions": decisions,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
-                         "state_group": state_group(issue, tracker)} for issue in issues],
+                         "state_group": state_group(issue, tracker),
+                         "waiting": order_waiting.section(issue.body)} for issue in issues],
         "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
@@ -302,7 +305,8 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
                                      "references", "statements"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "statements"}, label)
+                    else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
+                          "statements"}, label)
             if "statements" in item:
                 _strings(item["statements"], f"{label}.statements", nonempty=True)
                 if any("\n" in line or "\r" in line for line in item["statements"]):
@@ -334,6 +338,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
                 if type(item["number"]) is not int or item["number"] <= 0 or item["number"] in edits:
                     raise PlanError(f"{label}.number must be a unique positive integer")
                 edits.add(item["number"])
+                _strings(item.get("blocked_by", []), f"{label}.blocked_by")
             acceptance_files = item.get("acceptance_files", {})
             if not isinstance(acceptance_files, dict):
                 raise PlanError(f"{label}.acceptance_files must be an object")
@@ -385,6 +390,11 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 
     for key in dependencies:
         visit(key)
+    # An edit is no plan key, so nothing depends on it and it closes no cycle.
+    for item in plan.get("edits", []):
+        for key in item.get("blocked_by", []):
+            if key not in keys:
+                raise PlanError(f"unknown blocked_by key: {key}")
     check_destinations(root, files)
     return files
 
@@ -393,6 +403,9 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 def _plan_marker(identity: str, mapping: dict[str, int], acceptance: dict[str, dict[str, str]]) -> str:
     return (f"<!-- foragent:plan id={identity} map={json.dumps(mapping, sort_keys=True)} "
             f"acceptance={json.dumps(acceptance, sort_keys=True)} -->")
+
+
+_EDIT_MARKER = "<!-- foragent:edit plan="
 
 
 def _child_marker(identity: str, key: str) -> str:
@@ -411,8 +424,12 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
+    waiting_for: str | None = None
+    language: str = "en"
 
     def summary(self) -> str:
+        if self.waiting_for is not None:
+            return text("order_submission_waiting", self.language, id=self.title, boundary=self.waiting_for)
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
@@ -574,10 +591,24 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     return number
 
 
+def _reconcile_dependencies(tracker: Tracker, number: int, desired: set[int]) -> None:
+    """Invalidate approval before changing native edges, including restoring hand removals."""
+    existing = {dep.number for dep in tracker.blocked_by(number)}
+    if existing != desired:
+        # Approval covers the dependency contract; ready must be reconsidered by the gate.
+        # Do this before either mutation so an interrupted sync cannot leave stale readiness.
+        tracker.remove_labels(number, ["approved", "ready"])
+    for blocker in sorted(existing - desired):
+        tracker.remove_blocked_by(number, blocker)
+    for blocker in sorted(desired - existing):
+        tracker.add_blocked_by(number, blocker)
+
+
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             git: GitRepo | None = None, manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            defer: str | None = None, urgent: bool = False) -> PublishReport:
     try:
         files = validate_plan(plan, root, config)
     except ValueError as exc:
@@ -664,7 +695,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         issue = by_number[item["number"]]
         rows.append({"number": issue.number, "title": issue.title, "size": issue_size(issue.labels),
                      "interactive": "interactive" in issue.labels,
-                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
+                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
+                                    else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return PublishReport(plan["title"], parent, rows, sorted(files), True)
@@ -681,6 +713,11 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    if defer is not None and not urgent:
+        from foragent import order_submissions
+        order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
+                                 approve_numbers=approve_numbers, language=config.language)
+        return PublishReport(plan["title"], parent, rows, sorted(files), False, defer, config.language)
     owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                          [by_number[n] for n in mapping.values()])
     git = git or GitRepo(root)
@@ -731,6 +768,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         owned = existing is None or OWNED_MARKER in existing.body
         body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
                 + (f"{OWNED_MARKER}\n" if owned else ""))
+        # The written body itself records the wait it replaces, so the transition survives a lost comment.
+        body = order_waiting.stamp(existing.body if existing else None, body)
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
@@ -738,6 +777,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
+            order_waiting.announce(tracker, number, body, config.language)
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -746,6 +786,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
+            # A record follows the fact it describes: announce the wait the body now holds.
+            order_waiting.announce(tracker, number, body, config.language)
             tracker.remove_labels(number, [label for label in existing.labels
                                            if (label.startswith(("lane:", "size:")) or label == "interactive")
                                            and label not in labels])
@@ -757,29 +799,40 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
-        desired = {mapping[key] for key in item.get("blocked_by", [])}
-        existing = {dep.number for dep in tracker.blocked_by(number)}
-        for blocker in sorted(existing - desired):
-            tracker.remove_blocked_by(number, blocker)
-        for blocker in sorted(desired - existing):
-            tracker.add_blocked_by(number, blocker)
+        _reconcile_dependencies(tracker, number, {mapping[key] for key in item.get("blocked_by", [])})
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
         # An edit rewrites the whole body; the issue's owner-label contract survives it.
-        body = _with_contract(_published_body(plan, item, repo, config), existing.body)
+        body = order_waiting.stamp(existing.body, _with_contract(_published_body(plan, item, repo, config), existing.body))
+        # A rewrite gets its own id, so the revision comment below names this write: a body
+        # written back over a hand edit is a new change that comments, not an old one repeated.
+        body = order_waiting.mark_write(existing.body, body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
-            for name in sorted(blobs)}, sort_keys=True))
+            for name in sorted(blobs)}, sort_keys=True)
+            # Dependencies are part of what was approved; absent, the existing edges stay.
+            + (json.dumps(item["blocked_by"]) if "blocked_by" in item else ""))
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
-        prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
+        # Only the latest edit revision is what the issue stands approved for: an older
+        # matching revision (A, then B, then A again) does not keep B's approval.
+        latest = max((c for c in tracker.list_comments(number) if _EDIT_MARKER in c.body),
+                     key=comment_key, default=None)
+        current = latest is not None and latest.body == comment
+        changed = (existing.body != body or not current or "needs-human" in existing.labels
+                   or saved_blobs.get(str(number), {}) != blobs)
+        if changed:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
             tracker.update_issue(number, title=existing.title, body=body)
-            if not prior:
-                tracker.comment(number, comment)
+        # Records follow the facts they describe: the revision comment covers the body and
+        # the dependencies, and the waiting line the body's wait, so each comes after them.
+        if "blocked_by" in item:
+            _reconcile_dependencies(tracker, number, {mapping[key] for key in item["blocked_by"]})
+        order_waiting.announce(tracker, number, body, config.language)
+        if changed and not current:
+            tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
     tracker.update_issue(parent, title=plan["title"], body=parent_body())
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
@@ -792,9 +845,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
         tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
-    for item, row in zip(plan["issues"], rows):
-        row["number"] = mapping[item["key"]]
-        row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
+    for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
+        row["number"] = mapping[item["key"]] if "key" in item else item["number"]
+        if "key" in item or "blocked_by" in item:
+            row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
     return PublishReport(plan["title"], parent, rows, sorted(files), False)
@@ -878,6 +932,41 @@ def _preread_records(root: Path) -> dict:
     except ValueError as exc:
         raise PlanError(f"{PREREAD_FILE} is not valid JSON; delete it and run fa order preread again") from exc
     return records if isinstance(records, dict) else {}
+
+
+def _record_preread(root: Path, directory: Path, digest: str, record: dict) -> None:
+    """Merge one answer into the records under a lock, so concurrent prereads keep every answer.
+
+    The lock covers only re-reading, adding and replacing, never an agent turn. Each write
+    uses its own exclusively created temporary file, so no other writer can remove or
+    overwrite it before it replaces the records. Nothing here follows a symlink.
+    """
+    flags = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    path = directory / "preread.json.lock"
+    if path.is_symlink():
+        raise PlanError(f"{path} must be a regular file, not a symlink")
+    lock = os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        records = _preread_records(root)
+        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
+        records.pop(digest, None)
+        records[digest] = record
+        while True:
+            temporary = directory / f"preread.json.{secrets.token_hex(8)}.tmp"
+            try:
+                os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600))
+                break
+            except FileExistsError:
+                continue
+        try:
+            temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, directory / "preread.json")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    finally:
+        os.close(lock)  # closing releases the lock
 
 
 def _preread_lines(message: str) -> list[str]:
@@ -1065,18 +1154,12 @@ def preread(plan: dict, root: Path, config: Config,
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
-        records = _preread_records(root)
         decisions = _decisions(result.last_message)
         approach = _approach(result.last_message)
-        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
-        records.pop(digest, None)
-        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-                           "unknowns": unknowns, "decisions": decisions, "approach": approach,
-                           "at": datetime.now(UTC).isoformat(timespec="seconds")}
-        temporary = root / (PREREAD_FILE + ".tmp")
-        temporary.unlink(missing_ok=True)  # never write through a leftover link
-        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, root / PREREAD_FILE)
+        _record_preread(root, directory, digest, {
+            "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
+            "unknowns": unknowns, "decisions": decisions, "approach": approach,
+            "at": datetime.now(UTC).isoformat(timespec="seconds")})
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
