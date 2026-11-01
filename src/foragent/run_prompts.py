@@ -10,12 +10,16 @@ from foragent import cuts
 from foragent.issue import ParsedIssue
 
 
+REVIEW_VERDICT_CONTRACT = (
+    "Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
+    "followed by every finding, each one line with file:line and the concrete failure."
+)
+
 REVIEW_PROMPT = (
     "Review this change for defects that break the stated goal, violate Out of scope, "
     "or would make the Done when commands pass without the goal being met "
     "(weakened checks, special-casing test inputs). Ignore style and nice-to-haves. "
-    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
-    "followed by every finding, each one line with file:line and the concrete failure."
+    "Do not edit files. " + REVIEW_VERDICT_CONTRACT
 )
 REVIEW_FEEDBACK_INSTRUCTIONS = (
     "For each review finding, name the defect class it belongs to, "
@@ -48,12 +52,23 @@ PANEL_MERGE_PROMPT = (
     "format above. Reviewer verdicts do not count; only yours does."
 )
 
+CONFIRM_PROMPT = (
+    "Limit this review to confirming that the first-round defect classes below are fixed. "
+    "For every class, verify the fix across all instances throughout the changed code, including "
+    "instances beyond the cited lines and files. Use all the first-round evidence and affected "
+    "instances as the starting point for your own search. Judge the implementer's rebuttals. "
+    "This is one confirmation task, not another perspective review or findings merge. "
+    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
+    "every remaining finding, each one line with file:line and the concrete failure."
+)
+
 
 def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     """Scope rules for reviewers; PR bodies pass the repository language for the human-read question."""
     from foragent.i18n import text
 
     return (
+        REVIEW_VERDICT_CONTRACT + "\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
@@ -81,6 +96,7 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
+    task: str = REVIEW_PROMPT,
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
@@ -88,7 +104,7 @@ def build_review_prompt(
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
-        f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
+        f"{task}\n\n{review_scope_rules(acceptance_dir)}"
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
@@ -96,6 +112,17 @@ def build_review_prompt(
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
+
+
+def build_confirm_prompt(
+    parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "",
+) -> str:
+    """The complete first-round result and current change for one confirming reviewer."""
+    return build_review_prompt(
+        parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT,
+    ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
 def parent_section(parent_context: str) -> str:
