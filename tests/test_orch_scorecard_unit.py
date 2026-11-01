@@ -38,6 +38,28 @@ def test_bucket_edges_are_newer_inclusive_and_older_exclusive():
     assert orch_scorecard._bucket(NOW + timedelta(seconds=1), NOW, 7) is None
 
 
+@pytest.mark.parametrize("sibling", [False, True])
+def test_open_idle_phase_releases_historical_and_current_occupancy(store, sibling):
+    import os
+
+    from foragent.orch_scorecard_records import _executions, _occupancy, _phase_intervals
+
+    source = StateStore(store.root.parent / "sibling", now=store._now) if sibling else store
+    start, wait = NOW - timedelta(minutes=30), NOW - timedelta(minutes=20)
+    store.clock[0] = start
+    source.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    source.update_run(1, phase="checking", phase_started_at=start.isoformat())
+    store.clock[0] = wait
+    source.update_run(1, phase="ci", phase_started_at=wait.isoformat())
+    store.clock[0] = NOW
+    executions, phases = _executions(store, NOW), _phase_intervals(store, NOW)
+    occupied, testing = _occupancy(store, NOW, executions, phases, open_end=NOW + timedelta(days=1))
+    assert [span for _, span in occupied] == [(start, wait)]
+    assert testing == [(start, wait)]
+    assert not any(a <= NOW < b for _, (a, b) in occupied)
+    assert source.get_run(1).phase == "ci" and len(source.active_runs()) == 1
+
+
 def test_pr_open_counts_as_merged_only_after_a_merge_and_otherwise_is_no_failure(store):
     finish(store, 1, at=NOW - timedelta(hours=2), outcome="pr-open", minutes=20,
            merged_at=NOW - timedelta(hours=1))
@@ -173,6 +195,32 @@ def test_flow_idle_counts_sibling_repositories_on_the_shared_budgets(tmp_path, m
     sibling.update_run(5, pid=4242, phase="checking", phase_started_at=start.isoformat())
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0, (
         "A sibling's live run and its checking phase fill the machine-wide budgets")
+
+
+def test_waiting_run_keeps_its_project_place_without_becoming_ready_work(store, monkeypatch, tmp_path):
+    import os
+
+    from foragent import capacity
+    from foragent.config import Config
+    from foragent.issue import body_hash
+    from foragent.orch_scorecard_flow import binding_at
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    start = NOW - timedelta(hours=1)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    for number in (1, 2):
+        store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                            approved_by="human", approved_at=start.isoformat())
+    store.update_local_issue(1, title="waiter", body=body, labels=["approved", "running"], state="open", blocked_by=[])
+    store.clock[0] = start
+    store.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    store.update_run(1, phase="ci", phase_started_at=start.isoformat())
+    capacity.write_state(store, 2, start)
+    store.clock[0] = NOW
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0
+    store.update_local_issue(2, title="ready", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    assert binding_at(store, Config(max_parallel=1, overlap_per_file=1), tmp_path, NOW, current=True) == "cap"
+    assert binding_at(store, Config(max_parallel=None, overlap_per_file=1), tmp_path, NOW, current=True) == "structure"
 
 
 def test_flow_waste_counts_ongoing_runtime_and_merged_running_records(store):

@@ -113,7 +113,43 @@ def phase_identity(run) -> dict:
 def restore_phase(n: int, ctx: RunContext, identity: dict) -> None:
     run = ctx.store.get_run(n)
     if phase_identity(run) != identity:
-        ctx.store.update_run(n, **identity, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+        _set_phase(n, ctx, identity)
+
+
+def _set_phase(n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None) -> None:
+    """Every exit from an idle phase must acquire capacity before doing work."""
+    run = ctx.store.get_run(n)
+    if capacity.phase_holds_slot(run.phase) or not capacity.phase_holds_slot(identity["phase"]):
+        ctx.store.update_run(n, **identity, phase_started_at=(started or ctx.now()).astimezone(UTC).isoformat())
+        return
+    from foragent import runner
+    from foragent.run_attempt import ExecutorStopped
+
+    began, mono = ctx.now(), ctx.monotonic()
+    deadline = capacity.time.monotonic() + runner._remaining(n, ctx)
+    key = f"run-slot-{uuid4().hex}"
+    queued = False
+
+    def credit(close: bool = False) -> None:
+        now = ctx.now()
+        ctx.store.add_waited(
+            n, key=key, start=began, end=began + timedelta(seconds=max(0, ctx.monotonic() - mono)),
+            close=close, last_progress_at=now.astimezone(UTC).isoformat(),
+            waiting_until=None if close else (now + timedelta(seconds=60)).astimezone(UTC).isoformat(),
+        )
+
+    def waiting() -> None:
+        nonlocal queued
+        queued = True
+        credit()
+
+    try:
+        capacity.admit_run(ctx.store, n, identity, deadline=deadline, now=ctx.now, waiting=waiting)
+    except TimeoutError:
+        raise ExecutorStopped(runner._timeout(n, ctx)) from None
+    finally:
+        if queued:
+            credit(close=True)
 
 
 class WaitPhase:
@@ -132,8 +168,7 @@ class WaitPhase:
 
     def open(self) -> None:
         if not self.opened and self.previous["phase"] != self.phase:
-            self.ctx.store.update_run(self.n, phase=self.phase,
-                                      phase_started_at=self.started.astimezone(UTC).isoformat())
+            _set_phase(self.n, self.ctx, {"phase": self.phase}, started=self.started)
             self.opened = True
 
     def close(self, now: datetime | None = None) -> None:
@@ -141,7 +176,7 @@ class WaitPhase:
         if not self.opened and now > self.started:
             self.open()
         if self.opened:
-            self.ctx.store.update_run(self.n, **self.previous, phase_started_at=now.astimezone(UTC).isoformat())
+            _set_phase(self.n, self.ctx, self.previous, started=now)
             self.opened = False
 
 
@@ -161,7 +196,7 @@ def in_phase(n: int, ctx: RunContext, phase: str):
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:
     if ctx.store.get_run(n).phase != phase:
-        ctx.store.update_run(n, phase=phase, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+        _set_phase(n, ctx, {"phase": phase})
 
 
 def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:

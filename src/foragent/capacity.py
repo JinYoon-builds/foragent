@@ -54,6 +54,8 @@ HELD_ENV = {TEST_SLOT_ENV: "held"}
 SLOT_POLL_SECONDS = 0.1
 # How often a waiting test command reports that it is still waiting.
 SLOT_HEARTBEAT_SECONDS = 10.0
+# Only these idle phases release the run's machine slot. Unknown/legacy phases count.
+IDLE_RUN_PHASES = frozenset({"merge-turn-wait", "merge-lock-wait", "ci", "overlap-wait"})
 
 # Inside observing(), machine_load() reads the sensors without writing their baselines.
 _OBSERVING: ContextVar[bool] = ContextVar("foragent_capacity_observing", default=False)
@@ -352,6 +354,10 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def phase_holds_slot(phase: str | None) -> bool:
+    return phase not in IDLE_RUN_PHASES
+
+
 def _holds_slot(run: Run, now: datetime) -> bool:
     if run.pid is None:
         # Between its record and its launch; after the grace it is a leftover.
@@ -376,7 +382,7 @@ def _store_scan(
 
     runs = store.active_runs()
     running = {run.number for run in runs}
-    counted = [run for run in runs if _holds_slot(run, now)] if live else runs
+    counted = [run for run in runs if phase_holds_slot(run.phase) and (not live or _holds_slot(run, now))]
     holders = [f"#{run.number}" for run in counted]
     # A start reserves its slot before the GitHub labels and the run record.
     starts = [number for number, prepared_at in store.run_starts().items()
@@ -772,6 +778,29 @@ def _say(message: str, wait_s: float) -> None:
 
 # One admission try at a time per process; the scan and record write inside are short.
 _ADMISSION = threading.Lock()
+
+
+def admit_run(
+    store: StateStore, number: int, identity: dict[str, Any], *, deadline: float,
+    now: Callable[[], datetime], waiting: Callable[[], None],
+) -> None:
+    """Reclaim an idle run's slot and publish its active phase under the machine lock.
+
+    Keep the idle phase while queued. The run record itself holds the admitted
+    slot, so returning work needs no extra reservation or workload record.
+    """
+    while True:
+        sensed = _sensor_block()
+        with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
+            holders, _ = _machine_scan(store, datetime.now(UTC), live=True)
+            if locked and sensed is None and len(holders) < workload_budget(store):
+                store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
+                return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("No machine run slot became free in time")
+        waiting()
+        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining))
 
 
 def _acquire_workload(

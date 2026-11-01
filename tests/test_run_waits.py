@@ -165,11 +165,16 @@ def test_backoff_oversleep_preserves_runtime_for_next_executor(run_case, monkeyp
 
 
 def test_merge_lock_heartbeat_records_wait_and_clears_it_after_acquisition(tmp_path, monkeypatch):
+    from foragent.config import Config
+
     now = [BASE_TIME]
     store = StateStore(tmp_path / "state", now=lambda: now[0])
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, waited_seconds=10, executor_waited_seconds=5)
-    ctx = SimpleNamespace(store=store, now=lambda: now[0], monotonic=lambda: (now[0] - BASE_TIME).total_seconds())
+    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=Config(),
+                          monotonic=lambda: (now[0] - BASE_TIME).total_seconds())
+    monkeypatch.setattr("foragent.capacity.machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr("foragent.capacity.kernel_pressure", lambda: "normal")
 
     def acquire(execute, poll):
         now[0] += timedelta(minutes=20)
@@ -247,3 +252,89 @@ def test_test_slot_wait_is_a_phase_only_when_the_run_queues(tmp_path, monkeypatc
     # The queue segment starts when the run asks for a slot, so checking closes at 0 seconds.
     expected = [("checking -> test-slot-wait", 0), ("test-slot-wait -> checking", 45)] if queued else []
     assert [(event["summary"], event["seconds"]) for event in events] == expected
+
+
+@pytest.mark.parametrize("transition", ["phase", "context", "restore", "close"])
+@pytest.mark.parametrize("idle", ["merge-turn-wait", "merge-lock-wait", "ci", "overlap-wait"])
+def test_idle_exit_queues_before_restoring_work_and_credits_queue_time(tmp_path, monkeypatch, transition, idle):
+    import os
+
+    from foragent import capacity, run_waits
+    from foragent.config import Config
+
+    clock = [BASE_TIME]
+    store = StateStore(tmp_path / "own", now=lambda: clock[0])
+    other = StateStore(tmp_path / "other", now=lambda: clock[0])
+    store.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    store.update_run(1, phase="reviewing", phase_work_id="review-head")
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0],
+                          monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
+    identity = run_waits.phase_identity(store.get_run(1))
+    wait = run_waits.WaitPhase(1, ctx, idle)
+    wait.open()
+    other.start_run(2, branch="b", worktree="w", pid=os.getpid())
+    capacity.write_state(store, 1, clock[0])
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    sleeps = []
+
+    def sleep(seconds):
+        assert store.get_run(1).phase == idle
+        assert capacity.machine_runs(store, clock[0]) == 1
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+        other.finish_run(2, outcome="merged")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(sleep=sleep, monotonic=ctx.monotonic))
+
+    def working():
+        run = store.get_run(1)
+        assert run.phase == "reviewing" and capacity.machine_runs(store, clock[0]) == 1
+        assert run.phase_started_at == clock[0].isoformat()
+        if transition in {"restore", "close"}:
+            assert run_waits.phase_identity(run) == identity
+
+    if transition == "phase":
+        run_waits._phase(1, ctx, "reviewing")
+        working()
+    elif transition == "context":
+        with run_waits.in_phase(1, ctx, "reviewing"):
+            working()
+        assert store.get_run(1).phase == idle
+    elif transition == "restore":
+        run_waits.restore_phase(1, ctx, identity)
+        working()
+    else:
+        wait.close()
+        working()
+    run = store.get_run(1)
+    assert sleeps == [capacity.WORKLOAD_POLL_SECONDS]
+    assert run.waited_seconds == sum(sleeps) and run.waiting_until is None
+    store.finish_run(1, outcome="merged")
+    assert capacity.machine_runs(store, clock[0]) == 0
+
+
+def test_idle_exit_timeout_preserves_idle_phase_and_closes_credited_wait(tmp_path, monkeypatch):
+    from foragent import capacity, runner, run_waits
+    from foragent.config import Config
+    from foragent.run_attempt import ExecutorStopped
+
+    clock = [BASE_TIME]
+    store = StateStore(tmp_path / "own", now=lambda: clock[0])
+    store.start_run(1, branch="b", worktree="w")
+    store.update_run(1, phase="ci")
+    clock[0] += timedelta(seconds=57)
+    ctx = SimpleNamespace(store=store, config=Config(max_runtime_minutes=1), now=lambda: clock[0],
+                          monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(
+        monotonic=ctx.monotonic, sleep=lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds))))
+    stops = []
+    monkeypatch.setattr(runner, "_timeout", lambda n, ctx: stops.append(n) or "timeout")
+    with pytest.raises(ExecutorStopped) as stopped:
+        run_waits._phase(1, ctx, "implementing")
+    assert stopped.value.outcome == "timeout" and stops == [1]
+    run = store.get_run(1)
+    assert run.phase == "ci" and run.waiting_until is None and run.waited_seconds == 3
+    assert capacity.machine_runs(store, clock[0]) == 0

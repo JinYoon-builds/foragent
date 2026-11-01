@@ -79,6 +79,7 @@ def _publish_reviewed_in_turn(
             return run_publish._timeout(n, ctx)
         if reverify is None:
             return base_changed()
+        run_publish._phase(n, ctx, "checking")
         run_publish._append(log, f"{run_publish.REVERIFY}: {target_sha}")
         try:
             git.merge_base(target_sha)
@@ -136,6 +137,7 @@ def _publish_reviewed_in_turn(
         return True
 
     while True:
+        run_publish._phase(n, ctx, "ci")
         if stopped := run_publish._wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
             lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
@@ -182,6 +184,7 @@ def _publish_reviewed_in_turn(
             # A base that moved during lock acquisition is refreshed unlocked, like the implementation path.
             moved = continue_merge and inputs.base_sha != base_sha
             if continue_merge and not moved:
+                run_publish._phase(n, ctx, "merging")
                 run_publish._check_publication(git, pr.base, inputs.base_sha)
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(

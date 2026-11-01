@@ -26,6 +26,37 @@ def now():
     return datetime.now(UTC)
 
 
+@pytest.mark.parametrize("hold", ["critical", "overload", "lock"])
+def test_returning_run_obeys_sensor_holds_and_the_machine_lock(case, monkeypatch, hold):
+    case.store.start_run(7, branch="b", worktree="w", pid=capacity.os.getpid())
+    case.store.update_run(7, phase="ci")
+    clock, queued = [0.0], []
+    lock = (case.root / capacity.LOCK_FILE).open("a")
+    if hold == "lock":
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if hold == "critical" and not clock[0] else "normal")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 2.0 if hold == "overload" and not clock[0] else 0.5))
+
+    def waiting():
+        assert case.store.get_run(7).phase == "ci"
+        assert capacity.machine_runs(case.store, now()) == 0
+        queued.append(True)
+
+    def sleep(seconds):
+        clock[0] += seconds
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    try:
+        capacity.admit_run(case.store, 7, {"phase": "checking"}, deadline=5, now=now, waiting=waiting)
+    finally:
+        lock.close()
+    assert queued == [True] and clock[0] == capacity.WORKLOAD_POLL_SECONDS
+    assert case.store.get_run(7).phase == "checking" and capacity.machine_runs(case.store, now()) == 1
+    case.store.finish_run(7, outcome="merged")
+    assert capacity.machine_runs(case.store, now()) == 0
+
+
 def test_dead_workload_stops_counting_and_readers_keep_its_file(case):
     sibling = StateStore(case.root / "other")
     case.table.add(42001, cwd=case.root, start_time=1)
