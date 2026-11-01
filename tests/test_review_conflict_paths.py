@@ -53,7 +53,7 @@ def test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(ru
     from foragent.orch_facts_reviews import _artifacts
 
     c = run_case
-    enable_native_reviewer(c, [json.dumps({"result": f"- feature.txt:1 — bug\n  class: stale-base\n{CONFLICT}"})])
+    enable_native_reviewer(c, [json.dumps({"result": f"VERDICT: FAIL\n- feature.txt:1 — bug\n  class: stale-base\n{CONFLICT}"})])
     assert run_issue(1, c.ctx) == "spec-question"
     event, = review_events(c.store)
     assert (event["verdict"], event["review_verdict"]) == ("SPEC-CONFLICT", "FAIL")
@@ -192,12 +192,32 @@ def assert_conflict_result(case, panel):
     assert "blocked" in case.tracker.get_issue(1).labels
 
 
-def test_panel_member_conflict_wins_over_another_members_usage_limit(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize("deferred_comments", [False, True], ids=["ordinary", "queued-comment"])
+def test_panel_member_conflict_wins_over_another_members_usage_limit(
+    git_history, tmp_path, monkeypatch, deferred_comments,
+):
+    if deferred_comments:
+        from foragent.tracker import RecordingTracker
+
+        def queue_comment(self, number, body):
+            entry = self._queue(number, "comment", self._started(), self._premise(number), {"body": body})
+            return -entry["id"]
+
+        monkeypatch.setattr(RecordingTracker, "comment", queue_comment)
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
     panel = install_ordered_panel(case, monkeypatch)
     assert run_issue(1, case.ctx) == "spec-question"
     assert panel.merges == [], "A member conflict needs no merge call"
-    assert CONFLICT in questions(case.tracker)[0]
+    assert case.store.load_flag(1).reason == "spec-question"
+    # RecordingTracker may queue a question behind an earlier write to this issue.
+    pending = case.store.github_outbox()
+    if deferred_comments:
+        assert not questions(case.tracker)
+        assert any(entry["action"] == "comment" and CONFLICT in entry.get("body", "") for entry in pending), pending
+    case.ctx.tracker.flush_outbox()
+    comments = questions(case.tracker)
+    assert comments, f"Spec-conflict question comment was not delivered; queued writes: {pending}"
+    assert CONFLICT in comments[0]
     assert [event["verdict"] for event in review_events(case.store)] == ["SPEC-CONFLICT"]
     assert_conflict_result(case, panel)
 
@@ -243,3 +263,31 @@ def test_panel_without_conflict_records_quota_and_requeues_once(git_history, tmp
     pauses = json.loads((case.store.root / "executor-pauses.json").read_text())
     assert notes and {name: note["until"] for name, note in notes.items()} == pauses
     assert "usage limit" in case.store.get_run(1).detail.lower() or "paused" in case.store.get_run(1).detail.lower()
+
+
+def test_break_it_conflict_receipt_must_keep_the_reviewers_verdict(run_case, monkeypatch):
+    from foragent import run_review
+
+    journal = run_review._journal_review
+
+    def lose_reviewer_verdict(*args, **kwargs):
+        if "review_verdict" in kwargs:
+            kwargs["review_verdict"] = "UNUSABLE"
+        return journal(*args, **kwargs)
+
+    monkeypatch.setattr(run_review, "_journal_review", lose_reviewer_verdict)
+    with pytest.raises(AssertionError, match="FAIL"):
+        test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(run_case)
+
+
+@pytest.mark.parametrize("skip", ["flush", "send"])
+def test_break_it_conflict_priority_requires_delivery_of_the_question(git_history, tmp_path, monkeypatch, skip):
+    from foragent.tracker import FakeTracker, RecordingTracker
+
+    # Keep the local flag and outcome, but skip either the flush or the external send.
+    if skip == "flush":
+        monkeypatch.setattr(RecordingTracker, "flush_outbox", lambda self: None)
+    else:
+        monkeypatch.setattr(FakeTracker, "comment", lambda *args, **kwargs: 1)
+    with pytest.raises(AssertionError, match="question comment was not delivered"):
+        test_panel_member_conflict_wins_over_another_members_usage_limit(git_history, tmp_path, monkeypatch, True)
