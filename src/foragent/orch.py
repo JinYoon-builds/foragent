@@ -511,21 +511,22 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         datetime.fromisoformat(at)
     except ValueError as exc:
         raise OrchError("at must be an ISO8601 timestamp") from exc
-    checked = _premerge(ctx, n)
-    report = checked.report
-    if not report["ready"]:
-        broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
-        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
-                        f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
-    # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the
-    # turn claim to the merge, so every freshness check below runs after any lock wait.
+    # Refuse a live holder before waiting on its merge lock or doing premerge work.
+    # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
+    head = ctx.tracker.pr_head_sha(n)
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
-    with ctx.store.merge_lock():
-        if (holder := merge_turn.claim(ctx, place, checked.head)) is not None:
-            raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
-                            "run again after it finishes")
-        try:
+    if (holder := merge_turn.claim(ctx, place, head)) is not None:
+        raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
+                        "run again after it finishes")
+    try:
+        with ctx.store.merge_lock():
+            checked = _premerge(ctx, n)
+            report = checked.report
+            if not report["ready"]:
+                broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+                raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
+                                f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
             current = _open_pr(ctx, n)
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head
@@ -564,9 +565,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise
-        except BaseException:
-            merge_turn.withdraw(ctx, place)
-            raise
+    except BaseException:
+        merge_turn.withdraw(ctx, place)
+        raise
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)
