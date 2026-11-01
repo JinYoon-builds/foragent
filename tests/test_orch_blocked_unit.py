@@ -93,3 +93,12 @@ def test_timeout_clock_starts_at_this_issues_latest_run_end(ctx, tmp_path):
     ctx.now = lambda: started + timedelta(minutes=8, seconds=1)
     tick(ctx)
     assert "needs-human" in ctx.tracker.get_issue(1).labels
+
+
+def test_new_marker_prevents_reapproval_using_an_old_local_hash_mismatch(ctx):
+    ctx.store.save_flag(1, "hash-mismatch", flagged_at=(ctx.now() - timedelta(days=1)).isoformat())
+    ctx.tracker.comment(1, "<!-- foragent:blocked reason=spec-question -->\nChoose a locale")
+    ctx.tracker.record_label(1, "approved", "human")
+    assert tick(ctx).skipped is None
+    assert ctx.tracker.get_issue(1).labels == {"blocked", "approved"}
+    assert ctx.store.load_flag(1).reason == "spec-question"

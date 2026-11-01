@@ -167,7 +167,9 @@ changed Done when commands. This applies with or without `--approve`; `--dry-run
 remains a preview.
 
 Run `fa order preread PLAN.json` to explicitly re-read: the implementer sees the
-current GitHub title and full body before the observed base is refreshed. Resolve
+current GitHub title and full body before the observed base is refreshed. A statement
+issue has no reader turn, so the command itself prints those fields for the agent that
+ran it (`current` with `--json`) and refreshes the base. Resolve
 the requirements in the plan before publishing again; no automatic merge chooses
 which requirement wins. Each successful issue write immediately records the title
 and body it wrote as the next base, before labels, links or comments are updated.

@@ -31,6 +31,8 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
     logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
+    if not logs.strip():
+        logs = "(CI evidence unavailable: GitHub reported a failure but gave no matching run or job evidence)"
     failure = run_publish.CIFailure(logs, target_branch)
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != head:

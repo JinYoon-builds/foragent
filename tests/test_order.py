@@ -2403,7 +2403,7 @@ def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
 
 def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT]
     with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
         publish(publishing, plan, approve=True)
@@ -2417,7 +2417,7 @@ def test_invalid_statements_name_the_field(publishing, plan, value):
 
 
 def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
     publish(publishing, plan)
     body = publishing[2].get_issue(2).body
@@ -3844,3 +3844,38 @@ def test_observed_base_holds_the_decision_marker_publish_wrote(publishing, plan,
         publish(publishing, plan)
     assert f"#{number}" in str(refusal.value) and "D79" in str(refusal.value) and "D80" in str(refusal.value)
     assert tracker.get_issue(number).body == changed
+
+
+@pytest.mark.parametrize("route", ["child", "edit"])
+def test_statement_issue_refused_as_stale_can_be_reread_without_a_reader(publishing, plan, monkeypatch, route):
+    """Statement issues get no preread turn; the refusal's way back must still reach them."""
+    from foragent import order_observed
+
+    root, config, tracker = publishing[:3]
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: {})
+    monkeypatch.setattr(order, "executor_for", lambda name: pytest.fail("a statement issue has no reader turn"))
+    if route == "edit":
+        tracker.add_issue(9, "Existing", "old", [])
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                          "statements": ["Sending prints nothing."]}]
+    else:
+        plan["issues"] = plan["issues"][:1]
+        plan["issues"][0]["statements"] = ["Sending prints nothing."]
+    publish(publishing, plan)
+    item = plan["edits"][0] if route == "edit" else plan["issues"][0]
+    number = 9 if route == "edit" else next(i.number for i in tracker.list_issues() if i.title == item["title"])
+    key = "#9" if route == "edit" else item["key"]
+    written = tracker.get_issue(number)
+    tracker.update_issue(number, title=written.title, body=written.body + "\nChanged on GitHub.\n")
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        publish(publishing, plan)
+    changed = tracker.get_issue(number).body
+    assert changed == written.body + "\nChanged on GitHub.\n"
+    rows = order.preread(plan, root, config, lambda: tracker, repo=REPO)
+    assert [(row["key"], row["unknowns"]) for row in rows] == [(key, [])]
+    assert "Changed on GitHub." in rows[0]["current"] and written.title in rows[0]["current"]
+    order_observed.check(root, plan["id"], [tracker.get_issue(number)], config.language)
+    item["goal"] += " Reconciled."
+    publish(publishing, plan)
+    assert "Reconciled." in tracker.get_issue(number).body
