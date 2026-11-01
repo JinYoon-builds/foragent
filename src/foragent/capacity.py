@@ -781,13 +781,14 @@ _ADMISSION = threading.Lock()
 
 
 def admit_run(
-    store: StateStore, number: int, identity: dict[str, Any], *, deadline: float,
+    store: StateStore, number: int, identity: dict[str, Any], *, deadline: float | None,
     now: Callable[[], datetime], waiting: Callable[[], None],
 ) -> None:
     """Reclaim an idle run's slot and publish its active phase under the machine lock.
 
     Keep the idle phase while queued. The run record itself holds the admitted
     slot, so returning work needs no extra reservation or workload record.
+    ``deadline=None`` waits until a slot opens; the caller credits this paused time.
     """
     while True:
         sensed = _sensor_block()
@@ -796,11 +797,11 @@ def admit_run(
             if locked and sensed is None and len(holders) < workload_budget(store):
                 store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
                 return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             raise TimeoutError("No machine run slot became free in time")
         waiting()
-        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining))
+        time.sleep(WORKLOAD_POLL_SECONDS if remaining is None else min(WORKLOAD_POLL_SECONDS, remaining))
 
 
 def _acquire_workload(

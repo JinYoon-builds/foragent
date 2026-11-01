@@ -233,7 +233,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 move = run_publish.capture_move(git, inputs.base_sha)
             if continue_merge and move is None and inputs.comparison_current:
                 run_publish._check_publication(git, attempt.target_branch, inputs.base_sha)
-                run_publish._phase(n, ctx, "merging")
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(
                     ctx, pr, title=title, current_title=attempt.pr_title,

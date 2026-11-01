@@ -14,6 +14,168 @@ from conftest import BASE_TIME
 from runner_support import conflicting_lanes, run_case, scripted_results
 
 
+@pytest.fixture
+def slot_case(tmp_path, monkeypatch):
+    import os
+
+    from foragent import capacity
+    from foragent.config import Config
+
+    clock = [BASE_TIME]
+    store = StateStore(tmp_path / "own", now=lambda: clock[0])
+    other = StateStore(tmp_path / "other", now=lambda: clock[0])
+    store.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    store.update_run(1, phase="reviewing", phase_started_at=clock[0].isoformat())
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0],
+                          monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        pytest.fail("An abandoned operation must not queue for a machine slot")
+
+    def occupy():
+        other.start_run(9, branch="other", worktree="other", pid=os.getpid())
+
+    capacity.write_state(store, 1, clock[0])
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
+    return SimpleNamespace(ctx=ctx, store=store, other=other, clock=clock, sleeps=sleeps, occupy=occupy)
+
+
+@pytest.mark.parametrize("kind", ["credited", "lazy-credited", "merge-lock", "executor", "test-slot",
+                                   "context", "baseline", "local-baseline"])
+@pytest.mark.parametrize("exception", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_failed_phase_restoration_does_not_reenter_or_replace_the_exception(slot_case, monkeypatch, kind, exception):
+    from foragent import capacity, ci_local, run_baseline, run_waits
+
+    c, error = slot_case, exception("original failure")
+
+    def fail(*args, **kwargs):
+        run_waits._phase(1, c.ctx, "overlap-wait")
+        c.occupy()
+        c.clock[0] += timedelta(seconds=3)
+        raise error
+
+    @contextmanager
+    def failed_lock():
+        fail()
+        yield
+
+    @contextmanager
+    def failed_test_slot(slots, *, waiting):
+        waiting()
+        fail()
+        yield
+
+    with pytest.raises(exception) as caught:
+        if kind in {"credited", "lazy-credited"}:
+            run_waits._credited_wait(1, c.ctx, fail, "overlap-wait", eager=kind == "credited")
+        elif kind == "merge-lock":
+            monkeypatch.setattr(c.store, "merge_lock", failed_lock)
+            with _merge_lock(1, c.ctx):
+                pytest.fail("A failed acquisition cannot enter the merge body")
+        elif kind == "executor":
+            c.ctx.sleep = fail
+            run_waits._executor_wait(1, c.ctx, 5)
+        elif kind == "test-slot":
+            monkeypatch.setattr(capacity, "hold_test_slot", failed_test_slot)
+            with run_waits._test_slot(1, c.ctx):
+                pytest.fail("A failed acquisition cannot enter the test body")
+        elif kind == "context":
+            with run_waits.in_phase(1, c.ctx, "checking"):
+                fail()
+        elif kind == "baseline":
+            monkeypatch.setattr(run_baseline, "_capture_baseline", fail)
+            run_baseline._capture_acceptance_baseline(1, c.ctx, "pytest", "base")
+        else:
+            monkeypatch.setattr(ci_local, "_capture_local_only", fail)
+            ci_local.capture_local_only(1, c.ctx, None, "pytest", "base", [])
+    assert caught.value is error and c.sleeps == []
+    assert c.store.get_run(1).phase in capacity.IDLE_RUN_PHASES
+    assert c.store.get_run(1).waiting_until is None
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+    if kind in {"credited", "lazy-credited", "merge-lock", "executor", "test-slot"}:
+        assert c.store.get_run(1).waited_seconds == 3
+
+
+@pytest.mark.parametrize("full", ["before-lock", "after-lock", "never"])
+def test_merge_slot_wait_releases_the_lock_and_retries_before_entering(slot_case, monkeypatch, full):
+    import fcntl
+
+    from foragent import capacity, run_waits
+
+    c = slot_case
+    run_waits._phase(1, c.ctx, "ci")
+    if full == "before-lock":
+        c.occupy()
+    lock, attempts, effects = c.store.merge_lock, [], []
+
+    @contextmanager
+    def acquire():
+        assert c.store.get_run(1).phase == "merge-lock-wait"
+        with lock():
+            attempts.append(True)
+            if full == "after-lock" and len(attempts) == 1:
+                c.occupy()  # A new start claims the slot released while waiting for the merge lock.
+            yield
+
+    def sleep(seconds):
+        # Check the kernel lock, not a self-reported lock flag.
+        with (c.store.root / "merge.lock").open("a") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        assert c.store.get_run(1).phase in capacity.IDLE_RUN_PHASES
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1 and effects == []
+        c.sleeps.append(seconds)
+        c.clock[0] += timedelta(seconds=seconds)
+        c.other.finish_run(9, outcome="merged")
+
+    monkeypatch.setattr(c.store, "merge_lock", acquire)
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=sleep))
+    with _merge_lock(1, c.ctx):
+        assert c.store.get_run(1).phase == "merging"
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+        effects.append("merged")
+        c.clock[0] += timedelta(seconds=4)
+        c.store.record_merge(1, c.ctx.now())
+    assert effects == ["merged"] and len(attempts) == (2 if full == "after-lock" else 1)
+    assert c.sleeps == ([] if full == "never" else [capacity.WORKLOAD_POLL_SECONDS])
+    run = c.store.get_run(1)
+    assert run.merge_lock_held_seconds == 4
+    assert run.waited_seconds == sum(c.sleeps) and run.waiting_until is None
+    c.store.finish_run(1, outcome="merged")
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 0
+
+
+def test_successful_wait_inside_an_exception_handler_still_reacquires_capacity(slot_case, monkeypatch):
+    from foragent import capacity, run_waits
+
+    c = slot_case
+
+    def acquire():
+        c.occupy()
+        c.clock[0] += timedelta(seconds=3)
+
+    def sleep(seconds):
+        assert c.store.get_run(1).phase == "overlap-wait"
+        c.sleeps.append(seconds)
+        c.clock[0] += timedelta(seconds=seconds)
+        c.other.finish_run(9, outcome="merged")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=sleep))
+    try:
+        raise RuntimeError("already handled")
+    except RuntimeError:
+        run_waits._credited_wait(1, c.ctx, acquire, "overlap-wait")
+        assert c.store.get_run(1).phase == "reviewing"
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+    assert c.sleeps == [capacity.WORKLOAD_POLL_SECONDS]
+    assert c.store.get_run(1).waited_seconds == 3 + sum(c.sleeps)
+
+
 @pytest.mark.parametrize("operation", ["get_issue", "pr_checks", "merge_pr", "board"])
 def test_github_limit_from_runner_stages_waits_without_followup_calls(run_case, monkeypatch, operation):
     c = run_case
@@ -314,27 +476,62 @@ def test_idle_exit_queues_before_restoring_work_and_credits_queue_time(tmp_path,
     assert capacity.machine_runs(store, clock[0]) == 0
 
 
-def test_idle_exit_timeout_preserves_idle_phase_and_closes_credited_wait(tmp_path, monkeypatch):
+@pytest.mark.parametrize("transition", ["phase", "context", "restore", "close", "merge-lock"])
+@pytest.mark.parametrize("hold", ["full", "critical", "overload"])
+def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_case, monkeypatch, transition, hold):
     from foragent import capacity, runner, run_waits
     from foragent.config import Config
-    from foragent.run_attempt import ExecutorStopped
 
-    clock = [BASE_TIME]
-    store = StateStore(tmp_path / "own", now=lambda: clock[0])
-    store.start_run(1, branch="b", worktree="w")
-    store.update_run(1, phase="ci")
-    clock[0] += timedelta(seconds=57)
-    ctx = SimpleNamespace(store=store, config=Config(max_runtime_minutes=1), now=lambda: clock[0],
-                          monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
-    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical")
-    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
-    monkeypatch.setattr(capacity, "time", SimpleNamespace(
-        monotonic=ctx.monotonic, sleep=lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds))))
-    stops = []
-    monkeypatch.setattr(runner, "_timeout", lambda n, ctx: stops.append(n) or "timeout")
-    with pytest.raises(ExecutorStopped) as stopped:
-        run_waits._phase(1, ctx, "implementing")
-    assert stopped.value.outcome == "timeout" and stops == [1]
-    run = store.get_run(1)
-    assert run.phase == "ci" and run.waiting_until is None and run.waited_seconds == 3
-    assert capacity.machine_runs(store, clock[0]) == 0
+    c = slot_case
+    c.ctx.config = Config(max_runtime_minutes=1)
+    identity = run_waits.phase_identity(c.store.get_run(1))
+    wait = run_waits.WaitPhase(1, c.ctx, "ci")
+    wait.open()
+    c.clock[0] += timedelta(seconds=57)
+    assert runner._remaining(1, c.ctx) == 3
+    released = []
+    if hold == "full":
+        c.occupy()
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if hold == "critical" and not released else "normal")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 2.0 if hold == "overload" and not released else 0.5))
+    monkeypatch.setattr(runner, "_timeout", lambda *args: pytest.fail("Paused queue time cannot exhaust runtime"))
+
+    def sleep(seconds):
+        assert c.store.get_run(1).phase == "ci"
+        assert runner._remaining(1, c.ctx) == 3
+        assert capacity.machine_runs(c.store, c.ctx.now()) == (1 if hold == "full" else 0)
+        c.sleeps.append(seconds)
+        c.clock[0] += timedelta(seconds=seconds)
+        if sum(c.sleeps) >= 10:
+            released.append(True)
+            if hold == "full":
+                c.other.finish_run(9, outcome="merged")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=sleep))
+
+    def work():
+        assert released and sum(c.sleeps) == 10
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+        assert runner._remaining(1, c.ctx) == 3
+        c.clock[0] += timedelta(seconds=3)
+        assert runner._remaining(1, c.ctx) == 0, "Real work still spends the original runtime budget"
+
+    if transition == "phase":
+        run_waits._phase(1, c.ctx, "implementing")
+        work()
+    elif transition == "context":
+        with run_waits.in_phase(1, c.ctx, "checking"):
+            work()
+    elif transition == "restore":
+        run_waits.restore_phase(1, c.ctx, identity)
+        work()
+    elif transition == "close":
+        wait.close()
+        work()
+    else:
+        with _merge_lock(1, c.ctx):
+            work()
+    run = c.store.get_run(1)
+    assert run.waited_seconds == 10 and run.waiting_until is None
+    c.store.finish_run(1, outcome="merged")
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 0

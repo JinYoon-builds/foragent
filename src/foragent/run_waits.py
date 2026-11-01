@@ -90,13 +90,15 @@ def _test_slot(n: int, ctx: RunContext):
         ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
 
     with ExitStack() as stack:
+        acquired = False
         try:
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
+            acquired = True
         finally:
             if waited:
                 now = credit(close=True)
                 ctx.store.update_run(n, waiting_until=None)
-                wait.close(now)
+                wait.close(now, resume=acquired)
         yield
 
 
@@ -110,23 +112,25 @@ def phase_identity(run) -> dict:
             "phase_work_started_at": run.phase_work_started_at}
 
 
-def restore_phase(n: int, ctx: RunContext, identity: dict) -> None:
+def restore_phase(n: int, ctx: RunContext, identity: dict, *, resume: bool = True) -> None:
+    """Restore interrupted work; an exceptional exit must not reenter work from an idle phase."""
     run = ctx.store.get_run(n)
     if phase_identity(run) != identity:
-        _set_phase(n, ctx, identity)
+        _set_phase(n, ctx, identity, resume=resume)
 
 
-def _set_phase(n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None) -> None:
+def _set_phase(
+    n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None, resume: bool = True,
+) -> bool:
     """Every exit from an idle phase must acquire capacity before doing work."""
     run = ctx.store.get_run(n)
     if capacity.phase_holds_slot(run.phase) or not capacity.phase_holds_slot(identity["phase"]):
         ctx.store.update_run(n, **identity, phase_started_at=(started or ctx.now()).astimezone(UTC).isoformat())
-        return
-    from foragent import runner
-    from foragent.run_attempt import ExecutorStopped
-
+        return True
+    if not resume:
+        # Work is abandoned or deferred; keep it idle until its caller actually resumes it.
+        return False
     began, mono = ctx.now(), ctx.monotonic()
-    deadline = capacity.time.monotonic() + runner._remaining(n, ctx)
     key = f"run-slot-{uuid4().hex}"
     queued = False
 
@@ -144,12 +148,12 @@ def _set_phase(n: int, ctx: RunContext, identity: dict, *, started: datetime | N
         credit()
 
     try:
-        capacity.admit_run(ctx.store, n, identity, deadline=deadline, now=ctx.now, waiting=waiting)
-    except TimeoutError:
-        raise ExecutorStopped(runner._timeout(n, ctx)) from None
+        # Queue time is paused runtime, not a separate wall-clock time budget.
+        capacity.admit_run(ctx.store, n, identity, deadline=None, now=ctx.now, waiting=waiting)
     finally:
         if queued:
             credit(close=True)
+    return True
 
 
 class WaitPhase:
@@ -166,17 +170,17 @@ class WaitPhase:
         self.previous = phase_identity(ctx.store.get_run(n))
         self.opened = False
 
-    def open(self) -> None:
+    def open(self, *, resume: bool = True) -> None:
         if not self.opened and self.previous["phase"] != self.phase:
-            _set_phase(self.n, self.ctx, {"phase": self.phase}, started=self.started)
-            self.opened = True
+            self.opened = _set_phase(self.n, self.ctx, {"phase": self.phase}, started=self.started, resume=resume)
 
-    def close(self, now: datetime | None = None) -> None:
+    def close(self, now: datetime | None = None, *, resume: bool = True) -> None:
+        """Close the wait; ``resume=False`` leaves idle work deferred without admission."""
         now = now or self.ctx.now()
         if not self.opened and now > self.started:
-            self.open()
+            self.open(resume=resume)
         if self.opened:
-            _set_phase(self.n, self.ctx, self.previous, started=now)
+            _set_phase(self.n, self.ctx, self.previous, started=now, resume=resume)
             self.opened = False
 
 
@@ -188,10 +192,12 @@ def in_phase(n: int, ctx: RunContext, phase: str):
         yield
         return
     _phase(n, ctx, phase)
+    completed = False
     try:
         yield
+        completed = True
     finally:
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
 def _phase(n: int, ctx: RunContext, phase: str) -> None:
@@ -222,8 +228,10 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
     )
+    completed = False
     try:
         ctx.sleep(seconds)
+        completed = True
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
         ctx.store.add_waited(
@@ -231,16 +239,18 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
-        wait.close()
+        wait.close(resume=completed)
 
 
 def _credited_wait(
     n: int, ctx: RunContext, acquire: Callable[[], object], phase: str, *, eager: bool = True,
+    resume: bool = True,
 ) -> None:
     """Block in acquire as the ``phase`` wait; credit the time as waited and keep tick informed.
 
     ``eager=False`` opens the wait phase only once the wait lasts (a lock that is usually
     free adds no phase events when it is acquired at once).
+    ``resume=False`` leaves admission to the resource owner, which must release it before queueing.
     """
     from foragent import runner
 
@@ -263,8 +273,10 @@ def _credited_wait(
         credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
 
     progress(polled=False)
+    acquired = False
     try:
         runner.poll_executor(acquire, progress)
+        acquired = True
     finally:
         credit(close=True, waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())
-        wait.close()
+        wait.close(resume=acquired and resume)

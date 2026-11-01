@@ -24,6 +24,41 @@ from runner_support import BODY, COMMAND, batch_setup, enable_reviewer, run_case
 CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
 
 
+def test_protected_collection_after_ci_base_move_still_holds_a_slot(run_case, monkeypatch):
+    import shlex
+    import sys
+
+    from foragent import capacity, runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max=1,
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider")
+    c.history.update({"tests/acceptance/test_unowned_collection.py": "def test_unowned():\n    assert True\n"})
+    c.ctx.git.fetch("origin", "main")
+    moved, collected = [], []
+    execute = runner.run_logged
+
+    def checks(pr):
+        if not moved:
+            c.history.update({"src/after_ci.py": "VALUE = 1\n"})
+            moved.append(c.history.tip)
+        return "pass"
+
+    def command(argv, **kwargs):
+        if "--collect-only" in argv[-1]:
+            assert moved, "Exercise the protected collection after the CI wait"
+            assert capacity.phase_holds_slot(c.store.get_run(1).phase)
+            assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+            collected.append(argv[-1])
+        return execute(argv, **kwargs)
+
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    monkeypatch.setattr(runner, "run_logged", command)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(collected) == 1
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 0
+
+
 @pytest.mark.parametrize("idle", ["ci", "merge-turn-wait", "merge-lock-wait", "overlap-wait"])
 @pytest.mark.parametrize("head_changed", [False, True])
 def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(tmp_path, monkeypatch, idle, head_changed):

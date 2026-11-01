@@ -19,8 +19,9 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     from foragent import runner
     from foragent.run_checks import _append
     from foragent.run_publish_ci import _CIWait
-    from foragent.run_waits import _progress
+    from foragent.run_waits import _phase, _progress, in_phase
 
+    _phase(n, ctx, "checking")
     branch = f"foragent/group-{n}-{combined[:12]}"
     pr = None
     published = False
@@ -37,19 +38,20 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
         pr = ctx.tracker.create_pr(head=branch, base=target, title=f"Foragent group check: {n}",
                                    body=f"Temporary acceptance comparison on {base_sha}.")
         metadata["pr"] = pr
-        while True:
-            reports = ctx.tracker.pr_acceptance_reports(combined)
-            try:
-                lost, duration = ci_mode.comparison(
-                    reports, ctx.repo, base_sha, combined, excluded, expected_scope=scope,
-                    expected_shards=range(ctx.config.ci_shards))
-                break
-            except (ci_mode.MissingComparison, ci_mode.StaleComparison):
-                remaining = min(wait.deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
-                if remaining <= 0:
-                    raise ci_mode.UnusableComparison("group CI evidence timed out")
-                _progress(n, ctx)
-                ctx.sleep(min(30, remaining))
+        with in_phase(n, ctx, "ci"):
+            while True:
+                reports = ctx.tracker.pr_acceptance_reports(combined)
+                try:
+                    lost, duration = ci_mode.comparison(
+                        reports, ctx.repo, base_sha, combined, excluded, expected_scope=scope,
+                        expected_shards=range(ctx.config.ci_shards))
+                    break
+                except (ci_mode.MissingComparison, ci_mode.StaleComparison):
+                    remaining = min(wait.deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
+                    if remaining <= 0:
+                        raise ci_mode.UnusableComparison("group CI evidence timed out")
+                    _progress(n, ctx)
+                    ctx.sleep(min(30, remaining))
         metadata.update(scope=scope, reports_sha256=_report_digest(reports), duration_seconds=duration,
                         run_ids=sorted({report["run"]["id"] for report in reports}))
         verdict = "failed" if lost else "passed"
@@ -59,6 +61,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
         reason = str(exc).strip() or type(exc).__name__
     finally:
         if published:
+            _phase(n, ctx, "checking")  # Cleanup publishes Git changes too; CI waiting has ended.
             # A PR creation failure can still leave a published ref (or an open PR
             # when the response was lost). Only this leader owns these resources.
             try:

@@ -203,7 +203,6 @@ def _publish_reviewed_in_turn(
             # A base that moved during lock acquisition is refreshed unlocked, like the implementation path.
             moved = continue_merge and inputs.base_sha != base_sha
             if continue_merge and not moved:
-                run_publish._phase(n, ctx, "merging")
                 run_publish._check_publication(git, pr.base, inputs.base_sha)
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(
