@@ -14,6 +14,7 @@ import pytest
 from foragent import orch_dream, orch_dream_worker, processes, scheduler
 from foragent.config import Config
 from foragent.state import StateStore
+from foragent.tracker import Issue
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
 KEY = "dream-orch"
@@ -97,9 +98,16 @@ def merged_run(world, number=3):
     world.store.finish_run(number, outcome="merged")
 
 
-def due(world):
-    return orch_dream.dream_due(world.store, world.config, SimpleNamespace(list_open_issues=lambda: []),
-                                world.clock[0])
+def finished_order(*children):
+    """A tracker listing one published order whose children are all closed."""
+    mapping = json.dumps({f"child-{child}": child for child in children})
+    issues = [Issue(child, "Child", "", frozenset(), "closed") for child in children]
+    issues.append(Issue(900, "Order", f"<!-- foragent:plan id=order map={mapping} acceptance={{}} -->", frozenset(), "open"))
+    return SimpleNamespace(list_issues=lambda state="all": issues)
+
+
+def due(world, tracker=None):
+    return orch_dream.dream_due(world.store, world.config, tracker or finished_order(3), world.clock[0])
 
 
 def test_reused_worker_pid_finishes_the_dream_as_error_and_the_lane_is_due(world):

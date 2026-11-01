@@ -1,8 +1,8 @@
 """Lane dreams (#189): between work, a lane tidies its own memory.
 
-The gate decides from local facts only when a lane is due: its queue is empty
-after at least one merge since its last dream, or ten merges have landed since
-then. A dream runs the lane's implementer at tier s in its own worktree on
+The gate decides from local facts only when a lane is due: an order finished (D99,
+``orch_role_schedule.finished_orders``) with a child that merged in this lane since the
+lane's last dream, or a redo waits for an answer. A dream runs the lane's implementer at tier s in its own worktree on
 ``foragent/dream-<lane>``; it edits only ``.claude/agent-memory/<dir>/`` and may
 propose a cross-project media bundle that the worker copies outside the
 repository. A changed memory becomes a normal PR; an unchanged one makes no
@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from foragent.i18n import text
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, issue_lane
 from foragent.orch_events import append_event
 from foragent.state import StateStore
 
@@ -27,13 +26,12 @@ if TYPE_CHECKING:
     from foragent.runner import RunContext
     from foragent.scheduler import TickContext, TickReport
 
-DREAM_EVERY_MERGES = 10
 DONE = "dream-done"
 # A dream that opened a memory PR is complete only once that PR merges (D95); until then
 # its runs stay counted, and a closed PR lets the lane dream again.
 PUBLISHED = "dream-published"
 # A person or the orchestrator asked for a fresh dream (`fa orch dream --redo`); the lane is due
-# until a completed dream follows it, whatever its merge count.
+# until a completed dream follows it, whatever its orders and merges.
 REDO = "dream-redo"
 
 
@@ -148,21 +146,14 @@ def _runs_since(store: StateStore, lane: str, since: datetime | None) -> list[tu
     return sorted(rows, key=lambda row: row[1] or row[0].started_at)
 
 
-def _queue_empty(config: Config, tracker, lane: str) -> bool:
-    for issue in tracker.list_open_issues():
-        if issue.is_pull_request or issue.labels & {BLOCKED, NEEDS_HUMAN}:
-            continue
-        if issue.labels & {APPROVED, READY} and issue_lane(issue.labels, config.lanes) == lane:
-            return False
-    return True
-
-
 def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list[str]:
     """Configured lanes due to dream, each once; a lane with any active run of its own is not due."""
+    from foragent import lane_memory
+    from foragent.orch_role_schedule import finished_orders
+
     active = store.active_runs()
     due = []
-    from foragent import lane_memory
-
+    children = set().union(*finished_orders(tracker.list_issues("all")).values())
     for lane in config.lanes:
         if lane_memory.is_role_memory(config, lane):
             continue  # The lane uses a role's memory, which the role curates; no dream rewrites it.
@@ -173,8 +164,8 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
         if redo_requested(store, lane):
             due.append(lane)
             continue
-        merges = sum(run.outcome == "merged" for run, _ in _runs_since(store, lane, last_dream_at(store, lane)))
-        if merges >= DREAM_EVERY_MERGES or (merges and _queue_empty(config, tracker, lane)):
+        if any(run.outcome == "merged" and run.number in children
+               for run, _ in _runs_since(store, lane, last_dream_at(store, lane))):
             due.append(lane)
     return due
 
@@ -185,10 +176,10 @@ class LocalIssues:
     def __init__(self, store: StateStore):
         self.store = store
 
-    def list_open_issues(self):
+    def list_issues(self, state: str = "all"):
         from foragent.tracker import local_issue_models
 
-        return [issue for issue in local_issue_models(self.store) if issue.state == "open"]
+        return [issue for issue in local_issue_models(self.store) if state in ("all", issue.state)]
 
 
 def _quota_exhausted(store: StateStore, now: datetime) -> bool:

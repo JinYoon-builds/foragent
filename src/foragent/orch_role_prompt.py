@@ -11,7 +11,7 @@ from foragent.roles import load_roles
 REFACTOR = "skills/fa-orchestrator/references/refactor.md"
 
 # The procedure lives in the architect's skills; the prompt keeps the evidence, the why and a pointer.
-PROMPT = """You are the architect for this repository. The orchestrator started you with this evidence:
+PROMPT = """You are the architect for this repository. You were started with this evidence:
 
 {why}
 
@@ -49,7 +49,7 @@ End with a one-line summary of what you proposed, or "Nothing to change.".
 ARCHITECT = "architect"
 
 # Every other role: the evidence, the role's skills and memory, and the one way out (the orchestrator).
-ROLE_PROMPT = """You are the {role} role for this repository. The orchestrator started you with this evidence:
+ROLE_PROMPT = """You are the {role} role for this repository. You were started with this evidence:
 
 {why}
 
