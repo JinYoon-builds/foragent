@@ -18,34 +18,44 @@ if TYPE_CHECKING:
     from foragent.state import StateStore
 
 
-def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
-    """Read the earliest saved round at call time, excluding individual panel members.
+def _saved_rounds(store: StateStore, n: int) -> list[tuple[int, Path]]:
+    """Numbered review rounds, excluding the individual perspective artifacts."""
+    return [(int(path.stem.removeprefix("review-")), path)
+            for path in (store.root / "runs" / f"issue-{n}").glob("review-*.txt")
+            if path.stem.removeprefix("review-").isdigit()]
 
-    A missing or finding-free first review leaves the ordinary review path in charge.
+
+def next_review_round(n: int, ctx: RunContext) -> int:
+    return max((number for number, _ in _saved_rounds(ctx.store, n)), default=0) + 1
+
+
+def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
+    """Read the earliest usable defect review, excluding individual panel members.
+
+    Failed or finding-free rounds leave the full review in charge until it produces findings.
+    Those first usable findings remain the confirmation scope for every later round.
     Native Claude reviews have no VERDICT line, so recognize their existing findings format too.
     """
     from foragent.run_review import code_review_findings, parse_review
 
     if round_number <= 1:
         return ""
-    rounds = [(int(path.stem.removeprefix("review-")), path)
-              for path in (store.root / "runs" / f"issue-{n}").glob("review-*.txt")
-              if path.stem.removeprefix("review-").isdigit()]
-    if not rounds:
-        return ""
-    number, path = min(rounds)
-    if number >= round_number:
-        return ""
-    # Failed calls and incomplete panels also save raw findings; they are not an authoritative review.
-    if (orch_events.has_event(store, n, "review", round=number, verdict="UNUSABLE")
-            or orch_events.has_event(store, n, "review", round=number, review_verdict="UNUSABLE")):
-        return ""
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    review = parse_review(raw)
-    if review.verdict == "UNUSABLE":
-        verdict, findings, _ = code_review_findings(raw)
-        return raw if verdict == "FAIL" and findings else ""
-    return raw if review.verdict == "FAIL" and review.findings.strip() else ""
+    for number, path in sorted(_saved_rounds(store, n)):
+        if number >= round_number:
+            break
+        # Failed calls and incomplete panels save raw findings, but cannot define the confirmation scope.
+        if (orch_events.has_event(store, n, "review", round=number, verdict="UNUSABLE")
+                or orch_events.has_event(store, n, "review", round=number, review_verdict="UNUSABLE")):
+            continue
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        review = parse_review(raw)
+        if review.verdict == "UNUSABLE":
+            verdict, findings, _ = code_review_findings(raw)
+            if verdict == "FAIL" and findings:
+                return raw
+        elif review.verdict == "FAIL" and review.findings.strip():
+            return raw
+    return ""
 
 
 def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,

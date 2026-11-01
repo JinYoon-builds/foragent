@@ -28,7 +28,7 @@ from foragent.run_execution import _available_executor, _requeue_limit
 from foragent.run_prompts import (
     build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
 )
-from foragent.review_single import first_review_findings, single_review
+from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
 from foragent.run_waits import _phase, _progress, _timeout
 
 if TYPE_CHECKING:
@@ -439,13 +439,6 @@ def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-
-
-def _next_review_round(n: int, ctx: RunContext) -> int:
-    rounds = [int(path.stem.removeprefix("review-"))
-              for path in (ctx.store.root / "runs" / f"issue-{n}").glob("review-*.txt")
-              if path.stem.removeprefix("review-").isdigit()]
-    return max(rounds, default=0) + 1
 
 
 def _normalized_findings(review: ReviewResult) -> set[str]:

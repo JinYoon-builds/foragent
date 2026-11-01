@@ -36,12 +36,29 @@ def events(store):
 
 @pytest.mark.parametrize("reviewer,scope", [("codex", "claude-local"), ("claude", "claude-local"),
                                            ("claude", "pr-body")])
-def test_later_rounds_use_one_prompt_with_the_earliest_complete_review(review_context, monkeypatch, reviewer, scope):
+@pytest.mark.parametrize("earlier_raw,recorded", [
+    (None, None),
+    (FIRST, "UNUSABLE"),
+    ("Reviewer 1:\n" + FIRST + "\nReviewer 2 failed", "UNUSABLE"),
+    (FIRST, "SPEC-CONFLICT"),
+    ("unrecognized output", None),
+    ("VERDICT: PASS", None),
+    ("VERDICT: FAIL", None),
+    ("VERDICT: FAIL\nNOTE: design", None),
+])
+def test_later_rounds_use_one_prompt_with_the_earliest_complete_review(
+    review_context, monkeypatch, reviewer, scope, earlier_raw, recorded,
+):
     ctx = review_context
     ctx.config = replace(ctx.config, reviewer=reviewer, review_scope=scope, reviewer_model="review-model")
     # Numeric order, not lexicographic or modification order; member artifacts are not rounds.
     save(ctx.store, "review-10.txt", "VERDICT: FAIL\nsrc/new.py:1 — LATEST-ONLY")
     save(ctx.store, "review-1-1.txt", "VERDICT: FAIL\nsrc/raw.py:1 — RAW-MEMBER")
+    if earlier_raw is not None:
+        save(ctx.store, "review-1.txt", earlier_raw)
+    if recorded is not None:
+        _journal_review(1, ctx, recorded, "", 1,
+                        review_verdict="UNUSABLE" if recorded == "SPEC-CONFLICT" else None)
     first = save(ctx.store, "review-2.txt", FIRST)
     rebuttal = ctx.git.root / ".foragent/REBUTTAL.md"
     rebuttal.parent.mkdir(exist_ok=True)
@@ -59,7 +76,7 @@ def test_later_rounds_use_one_prompt_with_the_earliest_complete_review(review_co
         return ExecResult(0, False, "tail only", kwargs["log_path"], full_message="VERDICT: PASS\nNOTE: design")
 
     ctx.executor_factory = lambda name: SimpleNamespace(run=execute)
-    for number in (11, 12):
+    for number in (3, 11):
         result = _review(1, ctx, ctx.git, parse_body(BODY), "origin/main", round_number=number, pr=42)
         assert result.verdict == "PASS" and result.review_notes == ("design",)
         assert (ctx.store.root / f"runs/issue-1/review-{number}.txt").read_text() == result.raw
@@ -75,7 +92,38 @@ def test_later_rounds_use_one_prompt_with_the_earliest_complete_review(review_co
             assert call["model"] == (ctx.config.tiers["l"]["claude_model"] or "review-model")
         else:
             assert call["model"] == "review-model" and call["effort"] == ctx.config.tiers["l"]["codex_effort"]
-    assert [event["round"] for event in events(ctx.store) if event["kind"] == "review"] == [11, 12]
+    assert [event["round"] for event in events(ctx.store) if event["kind"] == "review"] == (
+        ([1] if recorded else []) + [3, 11])
+
+
+def test_multiple_unusable_rounds_do_not_hide_a_later_native_defect_review(review_context, monkeypatch):
+    ctx = review_context
+    ctx.config = replace(ctx.config, reviewer="claude")
+    for number in (1, 2):
+        save(ctx.store, f"review-{number}.txt", f"VERDICT: FAIL\nsrc/invalid.py:1 — UNUSABLE-{number}")
+        _journal_review(1, ctx, "UNUSABLE", "", number)
+    native = json.dumps([{"file": "src/one.py", "line": 8, "summary": "an old writer wins",
+                          "class": "stale-owner", "instances": ["src/two.py:12"]}])
+    save(ctx.store, "review-3.txt", native)
+    calls = []
+
+    def no_panel(*args, **kwargs):
+        pytest.fail("A complete native defect review must end full review retries")
+
+    monkeypatch.setattr("foragent.run_review._risk_notes", no_panel)
+
+    def execute(**kwargs):
+        calls.append(kwargs)
+        return ExecResult(0, False, "VERDICT: PASS", kwargs["log_path"])
+
+    ctx.executor_factory = lambda name: SimpleNamespace(run=execute)
+    for number in (4, 5):
+        result = _review(1, ctx, ctx.git, parse_body(BODY), "origin/main", round_number=number)
+        assert result.verdict == "PASS"
+    assert len(calls) == 2
+    for call in calls:
+        assert call["prompt"].startswith(CONFIRM_PROMPT) and native in call["prompt"]
+        assert "UNUSABLE-" not in call["prompt"] and "review_level" not in call
 
 
 @pytest.mark.parametrize("first", [None, "VERDICT: PASS", "VERDICT: FAIL", "unrecognized output",
@@ -86,9 +134,8 @@ def test_no_first_round_findings_keeps_the_full_review_path(review_context, firs
     save(ctx.store, "review-1-1.txt", FIRST)
     if first is not None:
         save(ctx.store, "review-1.txt", first)
-    save(ctx.store, "review-2.txt", FIRST)  # Do not substitute later findings for an empty first round.
-    if first is None:
-        (ctx.store.root / "runs/issue-1/review-2.txt").unlink()
+    save(ctx.store, "review-2.txt", "VERDICT: PASS")
+    save(ctx.store, "review-10.txt", FIRST)  # A future artifact cannot supply this round's evidence.
     calls = []
 
     def execute(**kwargs):
