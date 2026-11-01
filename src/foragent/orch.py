@@ -28,6 +28,7 @@ from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
+from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
@@ -419,6 +420,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
             ci_units = trusts_ci(ctx.repo_root, ctx.config)
             excluded = _baseline_exclusions(ctx, base, log_path)
+            pending = set(pending_acceptance_exclusions(ctx, (base, head), log_path))
             label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
             runs = []
             for i, command in enumerate(commands):
@@ -427,7 +429,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 selection = command
                 if acceptance_only:
                     selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
-                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in sorted(pending))
                 if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
                     run = _SuiteRun(True, frozenset())
                 else:
@@ -444,7 +446,8 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            head_failing = run.failing or frozenset()
+            head_failing = frozenset(node for node in (run.failing or ())
+                                     if node.split("::", 1)[0] not in pending)
             base_failing = frozenset()
             if acceptance_only:
                 try:

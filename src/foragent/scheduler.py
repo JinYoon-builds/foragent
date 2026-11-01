@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_scope, orch_role_raise, orch_spawn, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_scope, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -152,6 +152,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             ctx.tracker.flush_outbox()
     if skipped := orch_push.refresh_waited(ctx, _github_wait(ctx, {}, "github_wait_after_refresh")):  # #129
         return TickReport(skipped=skipped)
+    timed("waiting_resume", lambda: orch_waits.tick(ctx, report, confirmed=listing_current))
     snapshot = current_snapshot()
     processes_available = snapshot is None or snapshot.available
     # Unknown liveness defers routine recovery while the queue keeps moving.
