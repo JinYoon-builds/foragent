@@ -349,3 +349,50 @@ def test_human_lines_are_localized_and_name_the_hold(review_case):
     section = schedule.facts(case.store, case.ctx.config, case.clock[0])
     assert any("held (switch)" in line for line in schedule.human_lines(section, "en"))
     assert any("보류됨 (switch)" in line for line in schedule.human_lines(section, "ko"))
+
+
+def test_with_no_opener_the_request_stays_pending_and_a_launch_is_no_completion(review_case, monkeypatch):
+    case = review_case
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    roles(case, "orchestrator")
+    scheduler.tick(tick_context(case))
+    request, = retrospectives(case)
+    case.clock[0] += timedelta(minutes=5)
+    scheduler.tick(tick_context(case))
+    item = facts(case, "retrospective")
+    assert (item["pending"], item["reason"], item["pending_age_seconds"]) == (request["id"], "pending_request", 300)
+    assert item["last_success"] is None and item["last_attempt"] is not None
+    assert len(retrospectives(case)) == 1
+    orch_inbox.write_note(case.store, "Opened a session", None, None, {"kind": "terminal"})
+    assert facts(case, "retrospective")["last_success"] is None, "An ordinary note is not completion"
+    assert facts(case, "retrospective")["pending"] == request["id"]
+
+
+def test_the_last_retrospective_outlives_the_trim_and_later_status_notes(review_case):
+    case = review_case
+    roles(case, "orchestrator")
+    orch_inbox.write_note(case.store, "Lessons", None, None, {"kind": "terminal"}, retrospective=True)
+    last = facts(case, "retrospective")["last_success"]
+    assert last is not None
+    case.clock[0] += timedelta(days=40)
+    orch_inbox.write_note(case.store, "Watching", None, None, {"kind": "terminal"})
+    case.store.prune_logs(case.clock[0])
+    assert facts(case, "retrospective")["last_success"] == last
+
+
+def test_a_refused_retrospective_note_writes_nothing_even_with_person_found(tmp_path, monkeypatch, capsys):
+    from test_order_progress import offline_local_cli
+    from test_skills_autosync import cli_exit
+
+    case = offline_local_cli(tmp_path, monkeypatch)
+    journal = case.store.root / "orch-events.jsonl"
+    before = journal.read_bytes() if journal.exists() else b""
+    command = ["orch", "note", "--retrospective", "--person-found", "Found it", "--repo-root", str(case.root)]
+    assert cli_exit(case.main, command) != 0
+    assert (journal.read_bytes() if journal.exists() else b"") == before
+    assert cli_exit(case.main, [*command, "--now", "Lessons"]) == 0
+    rows = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [row["kind"] for row in rows if row["kind"] in ("person-found", "note")] == ["person-found", "note"]
+    assert next(row for row in rows if row["kind"] == "note")["retrospective"] is True
+    output = capsys.readouterr().out
+    assert "Person-found event recorded" in output and "Retrospective note saved" in output
