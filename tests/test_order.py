@@ -2944,3 +2944,24 @@ def test_planning_notes_reject_invalid_replacement_without_writing(tmp_path, kin
         order_notes.append(store, kind=kind, boundary="chosen", content="Replacement",
                            replaces=first["id"] if replaces == "earlier" else replaces)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_missing_done_when_is_a_plan_error_before_executable_preflight(
+        publishing, plan, monkeypatch, kind, dry_run):
+    root, config, tracker, git, events = publishing
+    if kind == "edits":
+        plan["edits"] = [{"number": 70, "goal": "Update the goal.", "out_of_scope": "Other work."}]
+    else:
+        del plan["issues"][0]["done_when"]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Malformed plans must stop before executable checks or tracker reads")
+
+    monkeypatch.setattr(order, "check_done_when_executables", forbidden)
+    monkeypatch.setattr(tracker, "list_issues", forbidden)
+    with pytest.raises(order.PlanError, match=rf"{kind}\[0\]: missing fields: done_when"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git, dry_run=dry_run)
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
+    assert not (root / "docs").exists()
