@@ -427,6 +427,132 @@ def test_related_base_run_imports_base_sources_not_the_head_installation(git_his
            "blocking=['tests/test_relmod.py::test_value']" in log
 
 
+@pytest.mark.parametrize("launcher", ["module", "console"])
+@pytest.mark.parametrize("layout, root, blocking", [
+    ("head-pth", "src", ["test_value"]),  # the checkout's src/ wins, so the base is measured
+    ("head-pth", "lib", ["test_old", "test_value"]),  # every other result is unmeasured
+    ("sibling-pth", "lib", ["test_old", "test_value"]),
+    ("clone-pth", "lib", ["test_old", "test_value"]),
+    ("clone-pythonpath", "lib", ["test_old", "test_value"]),
+    ("built-copy", "lib", ["test_old", "test_value"]),
+    ("head-finder", "lib", ["test_old", "test_value"]),
+    ("head-finder-subprocess", "lib", ["test_old", "test_value"]),
+])
+def test_related_base_run_never_measures_another_checkouts_installation(
+    git_history, tmp_path, monkeypatch, launcher, layout, root, blocking,
+):
+    """A real installation holding the head's change must not make a base-passing regression exempt."""
+    import venv
+    from pathlib import Path
+    from acceptance.test_acceptance_baseline import make_case
+
+    value = "assert relmod.VALUE == 1"
+    if layout == "head-finder-subprocess":
+        # Only a child process imports the project, so the parent's own modules say nothing.
+        value = "subprocess.run([sys.executable, '-c', 'import relmod; assert relmod.VALUE == 1'], check=True)"
+    module = f"{root}/relmod.py"
+    git_history.update({
+        module: "VALUE = 1\n",
+        "tests/test_relmod.py": "import subprocess, sys\n" + ("" if "subprocess" in layout else "import relmod\n")
+                                + f"\ndef test_old():\n    assert False\n\ndef test_value():\n    {value}\n",
+    })
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    git_command(git_history.clone, "merge", "-q", "--ff-only", "origin/main")
+    env = tmp_path / "env"
+    venv.create(env, with_pip=False, symlinks=True)
+    site = next(env.glob("lib/python*/site-packages"))
+    pytest_home = Path(pytest.__file__).resolve().parent.parent
+    python = env / "bin" / "python"
+    command = f"{python} -m pytest -q"
+    if launcher == "console":
+        console = env / "bin" / "pytest"
+        console.write_text(f"#!{python}\nimport sys, pytest\nsys.exit(pytest.console_main())\n", encoding="utf-8")
+        console.chmod(0o755)
+        command = f"{console} -q"
+    case = make_case(git_history, tmp_path, monkeypatch, test_command=command, max_retries=0, runner_unit_tests="all")
+
+    def regress(kwargs):
+        case.implement(kwargs)
+        head = kwargs["worktree"]
+        (head / module).write_text("VALUE = 2\n", encoding="utf-8")
+        # A changed test file is what selects this related check; `relmod` is not a path-named module.
+        with (head / "tests/test_relmod.py").open("a", encoding="utf-8") as stream:
+            stream.write("\n# feature work\n")
+        installation = ""
+        other = tmp_path / "other"
+        if layout == "sibling-pth":
+            git_command(head, "worktree", "add", "-q", "--detach", str(other), "HEAD")
+        elif layout.startswith("clone-"):
+            git_command(tmp_path, "clone", "-q", str(head), str(other))
+        if other.exists():
+            (other / module).write_text("VALUE = 2\n", encoding="utf-8")
+        if layout == "head-pth":
+            installation = f"{head / root}\n"
+        elif layout in {"sibling-pth", "clone-pth"}:
+            installation = f"{other / root}\n"
+        elif layout == "clone-pythonpath":
+            monkeypatch.setenv("PYTHONPATH", str(other / root))
+        elif layout == "built-copy":
+            (site / "relmod.py").write_text("VALUE = 2\n", encoding="utf-8")
+        else:
+            (site / "_finder.py").write_text(
+                "import importlib.util, sys\n"
+                "class Finder:\n"
+                "    @staticmethod\n"
+                "    def find_spec(name, path=None, target=None):\n"
+                "        if name == 'relmod':\n"
+                f"            return importlib.util.spec_from_file_location(name, {str(head / module)!r})\n"
+                "sys.meta_path.append(Finder)\n", encoding="utf-8")
+            installation = "import _finder\n"
+        (site / "_installed.pth").write_text(f"{pytest_home}\n{installation}", encoding="utf-8")
+
+    case.implementer.steps = [regress]
+    assert run_issue(1, case.ctx) != "merged"
+    log = case.store.log_path(1).read_text(encoding="utf-8")
+    exempt = sorted({"test_old", "test_value"} - set(blocking))
+    assert "Related base comparison: base_failing=" + repr([f"tests/test_relmod.py::{name}" for name in exempt]) + \
+           " blocking=" + repr([f"tests/test_relmod.py::{name}" for name in blocking]) in log, log
+
+
+def test_related_base_plugin_counts_only_project_modules_outside_the_checkout(tmp_path, monkeypatch):
+    import runpy
+    from types import ModuleType, SimpleNamespace
+    from foragent.run_baseline import RELATED_BASE_PLUGIN
+
+    checkout, head, third_party = tmp_path / "checkout", tmp_path / "head", tmp_path / "site-packages"
+    for path in (checkout / "src/pkg/vendor", checkout / "scripts", checkout / "tests", head, third_party):
+        path.mkdir(parents=True)
+    # A stdlib name, a copy vendored inside a package and a test helper are not the project's own modules.
+    (checkout / "src/pkg/__init__.py").write_text("", encoding="utf-8")
+    (checkout / "src/pkg/vendor/__init__.py").write_text("", encoding="utf-8")
+    (checkout / "src/pkg/vendor/dep.py").write_text("", encoding="utf-8")
+    (checkout / "scripts/json.py").write_text("", encoding="utf-8")
+    (checkout / "tests/helper.py").write_text("", encoding="utf-8")
+    (third_party / "dep.py").write_text("", encoding="utf-8")
+    (third_party / "helper.py").write_text("", encoding="utf-8")
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text(RELATED_BASE_PLUGIN.format(checkout=str(checkout.resolve()), head=str(head.resolve())),
+                      encoding="utf-8")
+    monkeypatch.setattr(sys, "path", [str(checkout / "src"), str(checkout), str(third_party), *sys.path])
+    loaded = runpy.run_path(str(plugin))
+    assert loaded["_foreign_modules"]() == []
+    session = SimpleNamespace(exitstatus=1)
+    loaded["pytest_sessionfinish"](session)
+    assert session.exitstatus == 1
+    # A module only the head has is no project module of the base, but its load still counts.
+    only_on_head = ModuleType("only_on_head")
+    only_on_head.__file__ = str(head / "only_on_head.py")
+    monkeypatch.setitem(sys.modules, "only_on_head", only_on_head)
+    loaded["pytest_sessionfinish"](session)
+    assert session.exitstatus == 3
+    monkeypatch.delitem(sys.modules, "only_on_head")
+    # The same project module found first in another place counts, wherever it is.
+    (third_party / "pkg").mkdir()
+    (third_party / "pkg/__init__.py").write_text("", encoding="utf-8")
+    sys.path.insert(0, str(third_party))
+    assert loaded["_foreign_modules"]() == [f"pkg ({third_party / 'pkg'})", f"pkg ({third_party / 'pkg/__init__.py'})"]
+
+
 @pytest.mark.parametrize("exit_code, inner", [(0, ""), (1, "<failure/>")])
 def test_related_report_must_describe_the_requested_files(tmp_path, exit_code, inner):
     from foragent.run_checks import junit_failing_ids
@@ -525,6 +651,43 @@ def test_related_base_unavailability_keeps_head_failure_and_record(
     }]
     assert len(calls) == (1 if stage in {"resolve", "create"} else 2)
     assert not (store.root / "runs" / "issue-1-related.xml").exists()
+
+
+@pytest.mark.parametrize("stage", ["resolve", "create"])
+def test_related_base_real_git_failure_is_unmeasured(git_history, tmp_path, monkeypatch, stage):
+    from types import SimpleNamespace
+    from foragent import run_checks
+    from foragent.config import Config
+    from foragent.git import GitRepo
+    from foragent.state import StateStore
+
+    git_history.update({"tests/test_a.py": "def test_old(): assert True\n"})
+    root = git_history.clone
+    git_command(root, "fetch", "-q", "origin")
+    git_command(root, "merge", "-q", "--ff-only", "origin/main")
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="test", worktree=root)
+    ctx = SimpleNamespace(git=GitRepo(root), store=store, monotonic=lambda: 0, config=Config(), now=store._now)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    calls = []
+
+    def check(command, cwd, *args, **kwargs):
+        calls.append(cwd)
+        _junit(store.root / "runs" / "issue-1-related.xml", [("test_old", "<failure/>")])
+        return run_checks.CheckResult(command, 1, False, "head failure", 7)
+
+    monkeypatch.setattr("foragent.runner._check", check)
+    base_ref = "origin/absent"
+    if stage == "create":
+        # Git itself refuses this commit, so `worktree add` fails without a stubbed error.
+        base_ref = "origin/main"
+        monkeypatch.setattr(GitRepo, "_own_base", lambda self, ref: "0" * 40)
+    result = run_checks.run_related_check(1, ctx, root, "pytest", ["tests/test_a.py"], 2, 30, base_ref)
+    assert result.exit_code == 1 and result.output == "head failure"
+    assert calls == [root]
+    assert [check["selected_files"] for check in store.get_run(1).related_tests] == [["tests/test_a.py"]]
+    assert "base_failing" not in store.get_run(1).related_tests[0]
 
 
 @pytest.mark.parametrize("kind", ["inherited", "imported"])

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -294,12 +295,12 @@ def split_base_failures(head: frozenset[str], base: frozenset[str] | None) -> tu
 
 
 def _related_base_failures(
-    n: int, ctx: RunContext, unit_command: str, failing: frozenset[str], base_sha: str, limit: int,
+    n: int, ctx: RunContext, worktree: Path, unit_command: str, failing: frozenset[str], base_sha: str, limit: int,
 ) -> frozenset[str] | None:
     """Run the files holding head failures on a fresh base checkout; None when unmeasured."""
     import tempfile
     from foragent import runner
-    from foragent.run_baseline import _with_python_path
+    from foragent.run_baseline import RELATED_BASE_PLUGIN, _with_python_path
 
     if runner._remaining(n, ctx) <= 0:
         return None
@@ -319,11 +320,16 @@ def _related_base_failures(
             junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy --junit-prefix="
             # The base sources must win over the head's editable installation (or an inherited
             # PYTHONPATH): otherwise a head regression would fail on "base" too and be exempted.
-            roots = os.pathsep.join(str(root) for root in (checkout / "src", checkout) if root.is_dir())
+            plugins = Path(directory) / "plugins"
+            plugins.mkdir()
+            plugin = f"_foragent_related_base_{secrets.token_hex(8)}"
+            (plugins / f"{plugin}.py").write_text(RELATED_BASE_PLUGIN.format(
+                checkout=str(checkout), head=os.path.realpath(worktree)), encoding="utf-8")
+            roots = os.pathsep.join(str(root) for root in (checkout / "src", checkout, plugins) if root.is_dir())
             # Qualify the comparison selection with its checkout, independently of
             # the head's repo-relative related-check request and its retry history.
             paths = [str(checkout / name) for name in files]
-            command = _with_python_path(f"{unit_command} {junit} {shlex.join(paths)}", roots)
+            command = _with_python_path(f"{unit_command} -p {plugin} {junit} {shlex.join(paths)}", roots)
             # The head check and checkout preparation have already consumed run
             # time. Queue waits are credited by the slot, not charged again here.
             base_limit = min(limit, runner._remaining(n, ctx))
@@ -369,7 +375,7 @@ def run_related_check(
             base_sha = None  # an unknown base proves no failure on it
     if failing and base_sha:
         try:
-            base_failures = _related_base_failures(n, ctx, unit_command, failing, base_sha, limit)
+            base_failures = _related_base_failures(n, ctx, worktree, unit_command, failing, base_sha, limit)
         except (GitError, OSError) as exc:
             # Checkout creation, report I/O and cleanup can all make a base
             # measurement unavailable. Keep the head failure and its record.
