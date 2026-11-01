@@ -50,8 +50,10 @@ jobs:
         FA_BASE_CACHE_MATCHED_KEY: ${{ steps.base-cache.outputs.cache-matched-key
           }}
         FA_BASE_CACHE_REF: refs/heads/main
-      run: uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'
-        python -m foragent.ci_base_cache
+      run: "if ! uv run --no-project --python 3.12 --with pytest --with 'foragent\
+        \ @ git+https://github.com/JinYoon-builds/foragent' python -m foragent.ci_base_cache;\
+        \ then\n  rm -f -- \"$FA_BASE_CACHE_FILE\"\n  echo \"Trusted base cache verification\
+        \ unavailable; measuring selected base nodes.\"\nfi\n"
     - name: Compare acceptance passing sets
       id: compare
       working-directory: ${{ runner.temp }}
@@ -85,6 +87,7 @@ jobs:
         persist-credentials: false
     - uses: astral-sh/setup-uv@v6
     - name: Measure full portable base selection
+      id: produce
       working-directory: ${{ runner.temp }}
       env:
         FA_REPOSITORY: ${{ github.repository }}
@@ -93,10 +96,17 @@ jobs:
         FA_HEAD_SHA: ${{ github.sha }}
         FA_BASE_CACHE_MODE: produce
         FA_BASE_CACHE_FILE: ${{ runner.temp }}/acceptance-base.json
-      run: uv run --no-project --python 3.12 --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'
-        python -m foragent.ci_shard
+      run: "rm -f -- \"$FA_BASE_CACHE_FILE\"\nif uv run --no-project --python 3.12\
+        \ --with pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'\
+        \ python -c 'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard,\
+        \ \"produce\", None)))'; then\n  uv run --no-project --python 3.12 --with\
+        \ pytest --with 'foragent @ git+https://github.com/JinYoon-builds/foragent'\
+        \ python -m foragent.ci_shard\n  if [ -s \"$FA_BASE_CACHE_FILE\" ]; then\n\
+        \    echo \"cache=true\" >> \"$GITHUB_OUTPUT\"\n  fi\nelse\n  echo \"Trusted\
+        \ tool has no base cache producer; skipping reusable base results.\"\nfi\n"
     - name: Save trusted base node results
       uses: actions/cache/save@v4
+      if: steps.produce.outputs.cache == 'true'
       with:
         path: ${{ runner.temp }}/acceptance-base.json
         key: foragent-acceptance-base-v1-${{ github.sha }}

@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -87,6 +88,8 @@ def workflow_text(config):
     base = config.base_branch.replace("'", "''")
     cache_file = "${{ runner.temp }}/acceptance-base.json"
     base_key = "foragent-acceptance-base-v1-${{ github.event.pull_request.base.sha }}"
+    producer_probe = TRUSTED_RUNNER.removesuffix("-m ") + "-c " + shlex.quote(
+        'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard, "produce", None)))')
     job = {
         "if": ("github.event_name == 'pull_request' && "
                "github.event.pull_request.head.repo.full_name == github.repository && "
@@ -108,7 +111,12 @@ def workflow_text(config):
                      "FA_BASE_CACHE_KEY": base_key,
                      "FA_BASE_CACHE_MATCHED_KEY": "${{ steps.base-cache.outputs.cache-matched-key }}",
                      "FA_BASE_CACHE_REF": f"refs/heads/{config.base_branch}"},
-             "run": TRUSTED_RUNNER + "foragent.ci_base_cache"},
+             # The introducing PR still installs the trusted tool from before
+             # cache support. Never pass an unverified restore to comparison.
+             "run": (f"if ! {TRUSTED_RUNNER}foragent.ci_base_cache; then\n"
+                     '  rm -f -- "$FA_BASE_CACHE_FILE"\n'
+                     '  echo "Trusted base cache verification unavailable; measuring selected base nodes."\n'
+                     "fi\n")},
             {"name": "Compare acceptance passing sets", "id": "compare",
              "working-directory": "${{ runner.temp }}",
              "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
@@ -131,12 +139,24 @@ def workflow_text(config):
             {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "fetch-depth": 0,
                                                       "persist-credentials": False}},
             {"uses": "astral-sh/setup-uv@v6"},
-            {"name": "Measure full portable base selection", "working-directory": "${{ runner.temp }}",
+            {"name": "Measure full portable base selection", "id": "produce",
+             "working-directory": "${{ runner.temp }}",
              "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
                      "FA_BASE_SHA": "${{ github.sha }}", "FA_HEAD_SHA": "${{ github.sha }}",
                      "FA_BASE_CACHE_MODE": "produce", "FA_BASE_CACHE_FILE": cache_file},
-             "run": TRUSTED_RUNNER + "foragent.ci_shard"},
+             # Legacy ci_shard has no producer mode. Clear any old file before
+             # probing, and only publish a fresh successful production result.
+             "run": ('rm -f -- "$FA_BASE_CACHE_FILE"\n'
+                     f"if {producer_probe}; then\n"
+                     f"  {TRUSTED_RUNNER}foragent.ci_shard\n"
+                     '  if [ -s "$FA_BASE_CACHE_FILE" ]; then\n'
+                     '    echo "cache=true" >> "$GITHUB_OUTPUT"\n'
+                     "  fi\n"
+                     "else\n"
+                     '  echo "Trusted tool has no base cache producer; skipping reusable base results."\n'
+                     "fi\n")},
             {"name": "Save trusted base node results", "uses": "actions/cache/save@v4",
+             "if": "steps.produce.outputs.cache == 'true'",
              "with": {"path": cache_file, "key": "foragent-acceptance-base-v1-${{ github.sha }}"}},
         ],
     }
