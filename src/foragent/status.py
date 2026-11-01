@@ -12,7 +12,7 @@ from typing import Any
 from foragent.config import Config
 from foragent.labels import (APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, WAITING_PERSON, issue_lane,
                              lane_display, lane_order)
-from foragent.reasons import parse_reason
+from foragent.reasons import comment_order, parse_reason
 from foragent.state import StateStore
 from foragent.tracker import Issue
 
@@ -40,7 +40,7 @@ def local_group(row: dict[str, Any]) -> str:
 
 def _reason(row: dict[str, Any]) -> str | None:
     comments = sorted(row.get("comments") or [],
-                      key=lambda comment: (datetime.fromisoformat(comment["created_at"]), comment["id"]))
+                      key=comment_order)
     return next((reason.value for comment in reversed(comments)
                  if (reason := parse_reason(comment["body"])) is not None), None)
 

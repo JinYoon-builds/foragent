@@ -12,7 +12,7 @@ import pytest
 from foragent.executors import ExecResult
 from foragent.git import GitRepo
 from foragent.issue import body_hash
-from foragent.reasons import Reason, parse_reason
+from foragent.reasons import Reason, flag_text, parse_reason
 from foragent.runner import _batch_pr, run_issue
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
@@ -605,7 +605,7 @@ def test_ci_retry_preserves_worktree_logs_and_all_checks(run_case, monkeypatch, 
         assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
         assert c.tracker.get_issue(1).labels & {"blocked", "needs-human"} == {"blocked"}
         if expected == "ci-failed":
-            assert logs in c.tracker.list_comments(1)[-1].body
+            assert logs in flag_text(c.tracker.list_comments(1)[-1].body)[1]
 
 
 def test_ci_retry_after_base_refresh_keeps_merged_base_and_rereviews(run_case, monkeypatch):

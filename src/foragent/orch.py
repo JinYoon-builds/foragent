@@ -9,7 +9,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 from tempfile import TemporaryDirectory
 import time
@@ -23,14 +22,16 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issu
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
+from foragent.orch_transition import transition_state
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
+from foragent.reasons import ORCH_MARKER, comment_order, flag_marker, one_line
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
-from foragent.run_previous import add_hint, retry_marker
+from foragent.run_previous import add_hint, holds_hint, pending_hint, retry_marker, with_hint
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
@@ -130,7 +131,8 @@ def watch(ctx: RunContext, *, interval: float = 5, follow: bool = False,
 
 
 def _issue(ctx: RunContext, n: int) -> Issue:
-    issue = RecordingTracker(ctx.tracker, ctx).get_issue(n)
+    # Local intent still waiting for GitHub delivery wins over GitHub's older labels.
+    issue = RecordingTracker(ctx.tracker, ctx).current_issue(n)
     if issue.is_pull_request or issue.state != "open":
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
@@ -147,15 +149,20 @@ def _text(value: str, name: str) -> str:
 
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
-           say: str | None = None) -> dict:
-    """Journal the verb and comment it on the issue."""
+           say: str | None = None, changed: bool = True) -> dict:
+    """Journal every verb; announce changes on one line with the exact original summary."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
-    if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
+    if not changed:
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
-        tracker.comment(number, "<!-- foragent:orch -->\n" + event["summary"])
+        tracker.comment(number, orch_record(summary))
     return event
+
+
+def orch_record(summary: str) -> str:
+    """The one-line orchestrator record comment for a verb."""
+    return one_line(ORCH_MARKER, summary)
 
 
 def list_blocked(ctx: RunContext) -> list[dict]:
@@ -166,10 +173,9 @@ def list_blocked(ctx: RunContext) -> list[dict]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
         comments = [load_record(Comment, item) for item in row["comments"]]
-        flags = [(comment, match[1]) for comment in comments
-                 if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
-                                           comment.body.splitlines()[0] if comment.body else ""))]
-        latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
+        flags = [(comment, found[1]) for comment in comments
+                 if (found := flag_marker(comment.body)) is not None and found[0] == BLOCKED]
+        latest = max(flags, key=lambda item: comment_order(item[0]), default=None)
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
             reviews.append({"path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})
@@ -187,14 +193,13 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
+def _retry(ctx: RunContext, n: int, hint: str | None, *, record: str | None = None) -> str | None:
+    """Publish advice before adding it; preserve earlier undelivered hints and branch work."""
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    # Undelivered advice (an earlier hint or a talk message) is kept; only delivery removes it.
-    error = None
+    if hint and holds_hint(pending_hint(ctx.store.root, n)[1], hint):
+        hint = None  # Still waiting, and already public: it is neither repeated to the worker nor on the issue.
+    error = orch_advice.publish_retry(ctx.tracker, ctx, n, hint, record)
     if hint:
-        # The public fact (or durable publication intent) must precede deliverable local advice.
-        error = orch_advice.publish(ctx.tracker, ctx, n,
-                                    "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
         add_hint(ctx.store, n, hint)
     # The next implementer receives the keep-work/defect-class default before any hint.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
@@ -207,10 +212,14 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
-    publication_error = _retry(ctx, n, hint)
+    before = transition_state(ctx, n, _issue(ctx, n))
+    pending = with_hint(before.hint, hint)
+    after = before.after(add=[READY], remove=[BLOCKED, NEEDS_HUMAN], hint=pending)
+    changed = before != after
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    _event(ctx, n, "retry", summary, say=say)
+    publication_error = _retry(ctx, n, hint if pending != before.hint else None,
+                               record=orch_record(summary) if pending != before.hint else None)
+    _event(ctx, n, "retry", summary, say=say, changed=changed and pending == before.hint)
     kick_tick(ctx.repo_root)
     if publication_error:
         return f"{summary} (issue comment queued for the gate after: {publication_error})"
@@ -261,21 +270,28 @@ def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = 
 
 def escalate(ctx: RunContext, n: int, summary: str, tried: str,
              options: list[str] | None = None, recommend: int | None = None, say: str | None = None) -> str:
-    _issue(ctx, n)
+    before = transition_state(ctx, n, _issue(ctx, n))
     summary, tried = _text(summary, "summary"), _text(tried, "tried")
     options = [_text(option, "option") for option in (options or [])]
     if recommend is not None and not 1 <= recommend <= len(options):
         raise OrchError("recommend must be a 1-based option index")
-    lines = ["<!-- foragent:needs-human reason=escalated -->", summary, "", "What was tried:", tried]
+    lines = [summary, "", "What was tried:", tried]
     if options:
         lines.extend(["", "Options:", *(f"{i}. {option}" + (" (recommended)" if i == recommend else "")
                                            for i, option in enumerate(options, 1))])
+    question = "\n".join(lines)
+    body = one_line("<!-- foragent:needs-human reason=escalated -->", question)
+    after = before.after(add=[NEEDS_HUMAN], remove=[READY], blocked_reason=("escalated", question))
+    changed = before != after
+    if changed:
+        ctx.store.save_flag(n, "escalated", summary=question, flagged_at=ctx.now().astimezone(UTC).isoformat())
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    tracker.comment(n, "\n".join(lines))
+    if changed:
+        tracker.comment(n, body)
     tracker.add_labels(n, [NEEDS_HUMAN])
     tracker.remove_labels(n, [READY])
     event_summary = f"#{n}: escalated to human; {summary}; tried: {tried}"
-    _event(ctx, n, "escalate", event_summary, say=say)
+    _event(ctx, n, "escalate", event_summary, say=say, changed=changed)
     return event_summary
 
 

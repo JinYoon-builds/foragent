@@ -11,7 +11,7 @@ import pytest
 
 from foragent.executors import ExecResult
 from foragent.issue import parse_body
-from foragent.reasons import Reason
+from foragent.reasons import Reason, flag_text
 from foragent.runner import REVIEW_PROMPT, _review, parse_code_review, run_issue
 
 from conftest import ACCEPTANCE, git_command
@@ -711,7 +711,7 @@ def test_unusable_review_saves_full_result_and_hands_off_full_raw_text(run_case,
     assert (directory / "review-1.txt").read_text() == first
     assert (directory / "review-2.txt").read_text() == second
     assert "A reviewer said (verbatim):\n" + first in c.executor.calls[1]["prompt"]
-    assert second in c.tracker.list_comments(1)[-1].body
+    assert second in flag_text(c.tracker.list_comments(1)[-1].body)[1]
     assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
 
 

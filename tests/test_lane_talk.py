@@ -1537,3 +1537,37 @@ def test_manual_resume_does_not_expose_advice_when_publication_cannot_be_saved(
         lanes.talk(1, message="Keep this on the issue", store=store, config=config(executor=executor),
                    repo_root=tmp_path, accepted=refuse)
     assert not terminals.opened() and not (store.root / "hints/1.txt").exists()
+
+
+def test_repeating_a_pending_claude_message_publishes_and_saves_it_once(store, tmp_path, monkeypatch):
+    Terminals(monkeypatch)
+    published, hint = [], store.root / "hints/1.txt"
+    for message in ("First  note\n\n  second paragraph", "Second note", "First  note\n\n  second paragraph",
+                    "Second note"):
+        lanes.talk(1, message=message, store=store, config=config(executor="claude"), repo_root=tmp_path,
+                   accepted=published.append)
+    assert published == ["First  note\n\n  second paragraph", "Second note"]
+    assert hint.read_text(encoding="utf-8") == "First  note\n\n  second paragraph\n\nSecond note"
+
+
+def test_a_message_resembling_pending_text_is_published_and_saved(store, tmp_path, monkeypatch):
+    Terminals(monkeypatch)
+    published, hint = [], store.root / "hints/1.txt"
+    for message in ("Second note", "note"):
+        lanes.talk(1, message=message, store=store, config=config(executor="claude"), repo_root=tmp_path,
+                   accepted=published.append)
+    assert published == ["Second note", "note"]
+    assert hint.read_text(encoding="utf-8") == "Second note\n\nnote"
+
+
+def test_a_hint_pending_for_claude_does_not_silence_a_codex_send(store, tmp_path, monkeypatch):
+    session(store, "codex")
+    Terminals(monkeypatch)
+    hint = store.root / "hints/1.txt"
+    hint.parent.mkdir(parents=True)
+    hint.write_text("Same note", encoding="utf-8")
+    published = []
+    lanes.talk(1, message="Same note", store=store, config=config(executor="codex"), repo_root=tmp_path,
+               accepted=published.append)
+    assert published == ["Same note"], "A live Codex send is not pending advice: each send stays public"
+    assert hint.read_text(encoding="utf-8") == "Same note"

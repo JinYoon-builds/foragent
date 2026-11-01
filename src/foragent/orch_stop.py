@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from foragent import processes
 from foragent.i18n import text
+from foragent.orch_transition import transition_state
 from foragent.state import Run
 
 if TYPE_CHECKING:
@@ -88,6 +89,7 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
         if (unsafe := unsafe_target(run)) is not None:
             role, pid, rule = unsafe
             raise OrchError(text("orch_stop_unsafe", language, n=n, role=role, pid=pid, rule=rule))
+        before = transition_state(ctx, n)
         tick_ctx = scheduler.TickContext(
             repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store,
             config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
@@ -98,5 +100,5 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
             if not report.actions:
                 raise OrchError(text("orch_stop_not_running", language, n=n))
             raise OrchError(text("orch_stop_failed", language, n=n, actions="; ".join(report.actions)))
-        _restore_stopped(tick_ctx, n, why, report)
+        _restore_stopped(tick_ctx, n, why, report, before)
     return text("orch_stop_done", language, n=n, why=why)  # _restore_stopped posted it as the audit comment.

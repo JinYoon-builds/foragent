@@ -177,6 +177,36 @@ def test_flag_needs_human_blocks_and_hands_over_with_one_marked_comment(tmp_path
     assert tracker.list_comments(1)[-1].body.startswith("<!-- foragent:blocked reason=timeout -->")
 
 
+def test_flag_repeating_the_observed_blocker_adds_no_comment(tmp_path):
+    from foragent.actions import flag
+
+    tracker = FakeTracker(now=lambda: NOW)
+    tracker.add_issue(1, "Issue", "body", labels=["running"])
+    ctx = SimpleNamespace(store=StateStore(tmp_path / "state", now=lambda: NOW), tracker=tracker,
+                          now=lambda: NOW, config=Config(), repo="owner/repo")
+
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out", "line one\nline two")
+    first = tracker.list_comments(1)
+    assert len(first) == 1 and len(first[0].body.splitlines()) == 1
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out", "line one\nline two")
+    assert tracker.list_comments(1) == first, "The observed state already includes the first transition"
+
+    ctx.store.record_comments(1, [])  # Missing comment history cannot change the decision.
+    assert ctx.store.local_issues()[0]["comments"] == []
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out", "line three")
+    assert tracker.list_comments(1) == first, "Evidence alone does not change the recorded reason or labels"
+    assert "blocked" in tracker.get_issue(1).labels
+
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out again", "line three")
+    assert len(tracker.list_comments(1)) == 2, "A changed recorded reason summary is a state change"
+    assert "CI timed out again" in tracker.list_comments(1)[-1].body
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out again", "line three", needs_human=True)
+    handed_over = tracker.list_comments(1)
+    assert len(handed_over) == 3 and "needs-human" in tracker.get_issue(1).labels
+    flag(ctx, 1, Reason.TIMEOUT, "CI timed out again", "line three", needs_human=True)
+    assert tracker.list_comments(1) == handed_over, "An unchanged handover also adds no comment"
+
+
 def test_acceptance_comparisons_guard_the_exact_head_before_reading_evidence(monkeypatch, tmp_path):
     from foragent import ci_mode, harness_guard
     from foragent.run_attempt import ExecutorStopped

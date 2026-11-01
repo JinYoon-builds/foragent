@@ -13,6 +13,14 @@ from foragent.tracker import RecordingTracker, TrackerError
 TALK_MARKER = "<!-- foragent:talk -->"
 
 
+def publish_retry(tracker, context, n: int, hint: str | None, record: str | None) -> str | None:
+    """A retry's state line also owns its advice; review retries retain their public copy."""
+    body = record
+    if body is None and hint:
+        body = "<!-- foragent:orch -->\nRetry advice:\n\n" + hint
+    return publish(tracker, context, n, body) if body is not None else None
+
+
 def publish(tracker, context, n: int, body: str) -> str | None:
     """Comment ``body`` on issue ``n`` or queue it; return the error that forced a queue, if any.
 

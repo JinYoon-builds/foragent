@@ -38,9 +38,12 @@ def _escalate(ctx, minutes: int):
     return _escalate_overdue_blocker(ctx, issue, TickReport())
 
 
-def _comment(identity, kind, at=START, *, legacy=False, number=1):
+def _comment(identity, kind, at=START, *, legacy=False, number=1, single_line=False):
+    from foragent.reasons import one_line
+
     marker = "<!-- foragent:orch -->" if legacy else f"<!-- foragent:orch kind={kind} -->"
-    return {"id": identity, "body": f"{marker}\n#{number}: {kind}; why: wait",
+    summary = f"#{number}: {kind}; why: wait"
+    return {"id": identity, "body": one_line(marker, summary) if single_line else f"{marker}\n{summary}",
             "created_at": at.isoformat(), "author": "bot"}
 
 
@@ -67,12 +70,14 @@ def test_parked_intent_ignores_the_journal_and_reads_issue_comments(ctx):
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_newest_comment_wins_by_time_then_id_not_listing_order(ctx, legacy):
-    rows = [_comment(30, "parked", START - timedelta(minutes=1), legacy=legacy),
-            _comment(3, "unparked", legacy=legacy), _comment(2, "parked", legacy=legacy)]
+@pytest.mark.parametrize("single_line", [False, True])
+def test_newest_comment_wins_by_time_then_id_not_listing_order(ctx, legacy, single_line):
+    options = dict(legacy=legacy, single_line=single_line)
+    rows = [_comment(30, "parked", START - timedelta(minutes=1), **options),
+            _comment(3, "unparked", **options), _comment(2, "parked", **options)]
     ctx.store.record_comments(1, rows)
     assert not orch_park.is_parked(ctx.store, 1)
-    ctx.store.record_comments(1, rows + [_comment(4, "parked", legacy=legacy)])
+    ctx.store.record_comments(1, rows + [_comment(4, "parked", **options)])
     assert orch_park.is_parked(ctx.store, 1)
 
 
@@ -89,6 +94,27 @@ def test_unpark_reads_remote_intent_without_local_journal_or_cache(ctx):
     assert not orch_park.is_parked(ctx.store, 1)
     comments = ctx.tracker.list_comments(1)
     assert len(comments) == 2 and comments[-1].body.startswith("<!-- foragent:orch kind=unparked -->")
+
+
+def test_park_comments_compare_labels_wait_and_public_intent_together(ctx):
+    import json
+    from foragent import order_waiting
+
+    for why in ("Wait for English", "Wait for English", "Wait for Korean", "Wait for Korean"):
+        orch_park.park(ctx, 1, why)
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 2 and all(len(c.body.splitlines()) == 1 for c in comments)
+    assert "Wait for English" in comments[0].body and "Wait for Korean" in comments[1].body
+    assert "Wait for Korean" in order_waiting.section(ctx.tracker.get_issue(1).body)
+    assert orch_park.is_parked(ctx.store, 1)
+    assert ctx.tracker.get_issue(1).labels == set()
+    orch_park.unpark(ctx, 1)
+    assert order_waiting.section(ctx.tracker.get_issue(1).body) is None
+    assert not orch_park.is_parked(ctx.store, 1)
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 3 and len(comments[-1].body.splitlines()) == 1
+    events = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["parked"] * 4 + ["unparked"]
 
 
 def test_rate_limited_commands_keep_one_marker_each_and_fifo_intent(ctx):

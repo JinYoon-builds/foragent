@@ -13,9 +13,10 @@ import pytest
 from foragent import orch, orch_stop, processes, scheduler
 from foragent.config import Config
 from foragent.processes import ProcessIdentity, ProcessTable
-from foragent.reasons import Reason
+from foragent.reasons import ORCH_MARKER, Reason, flag_text, parse_reason
 from foragent.scheduler_stop import _restore_stopped
 from foragent.state import StateStore
+from foragent.tracker import FakeTracker, RecordingTracker, TrackerError
 
 RUNNER = 42000
 
@@ -40,7 +41,7 @@ class _Tracker:
         self.issue.labels = self.issue.labels - set(labels)
 
     def comment(self, n, body):
-        self.calls.append(("comment", body.splitlines()[0]))
+        self.calls.append(("comment", body.partition("-->")[0] + "-->"))  # The marker of a one-line comment.
 
 
 @pytest.fixture
@@ -237,10 +238,45 @@ def _restore(case, **tracker):
     return case.ctx.tracker, flags
 
 
-def test_an_open_pr_is_flagged_as_a_stall_and_kept_open(case):
-    tracker, flags = _restore(case, pr=17)
-    assert flags == [Reason.STALLED] and not any(call[0] == "add" for call in tracker.calls)
-    assert len([event for event in _events(case.store) if event["kind"] == "stop"]) == 1
+def _recording_tracker(case):
+    case.store.finish_run(1, outcome="stopped", detail="reprioritize")
+    tracker = FakeTracker(now=case.ctx.now)
+    tracker.add_issue(1, "Locale", labels=["approved", "running"])
+    tracker.create_pr(head="foragent/issue-1", base="main", title="Locale", body="WIP")
+    case.ctx.config = Config()
+    case.ctx.tracker = RecordingTracker(tracker, case.ctx, queue_writes=True)
+    case.ctx.tracker.get_issue(1)
+    return tracker
+
+
+@pytest.mark.parametrize("limited_action", [None, "remove_labels", "comment"])
+def test_an_open_pr_is_flagged_as_a_stall_and_kept_open(case, monkeypatch, limited_action):
+    tracker = _recording_tracker(case)
+    if limited_action:
+        original = getattr(tracker, limited_action)
+        limited = [True]
+
+        def write(*args):
+            if limited:
+                limited.pop()
+                raise TrackerError("API rate limit exceeded")
+            return original(*args)
+
+        monkeypatch.setattr(tracker, limited_action, write)
+    why = "reprioritize ↵ locale"
+    _restore_stopped(case.ctx, 1, why, scheduler.TickReport())
+    _restore_stopped(case.ctx, 1, why, scheduler.TickReport())
+    assert case.ctx.tracker.current_issue(1).labels == {"approved", "blocked"}
+    assert len(_stops(case)) == 1
+    case.ctx.tracker.flush_outbox()
+    bodies = [comment.body for comment in tracker.list_comments(1)]
+    assert len(bodies) == 1 and len(bodies[0].splitlines()) == 1, "One stop owes one public line, including after recovery"
+    assert parse_reason(bodies[0]) == Reason.STALLED
+    summary, evidence = flag_text(bodies[0])
+    assert summary == case.store.load_flag(1).summary == "Runner stopped with an open PR; rerun review or retry implementation."
+    assert evidence.startswith(ORCH_MARKER) and why in evidence, "The same line keeps the exact stop audit"
+    assert tracker.get_issue(1).labels == {"approved", "blocked"}
+    assert tracker.find_pr("foragent/issue-1") == 2 and tracker.deleted_branches == []
 
 
 @pytest.mark.parametrize("tracker", [{"state": "closed"}, {"labels": ("approved", "running", "blocked")},
@@ -267,8 +303,7 @@ def _stops(case):
 
 
 def test_a_board_rate_limit_after_ready_keeps_running_for_the_retry_and_records_once(case, monkeypatch):
-    from foragent.tracker import TrackerError
-
+    case.store.finish_run(1, outcome="stopped", detail="reprioritize")
     limited = [TrackerError("API rate limit exceeded")]
 
     def board(ctx, n, status):
@@ -284,24 +319,63 @@ def test_a_board_rate_limit_after_ready_keeps_running_for_the_retry_and_records_
     assert "running" in case.ctx.tracker.issue.labels, "Orphan recovery still finds the issue"
     _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())  # The next tick's retry.
     assert len(_stops(case)) == 1
-    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1, (
+        "Completing the same stop after a board failure must not announce it twice")
     assert case.ctx.tracker.issue.labels == {"approved", "ready"}
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1, "Ready already: no transition"
+    assert len(_stops(case)) == 1
 
 
-def test_a_failing_open_pr_flag_still_leaves_the_stop_event_and_comment(case):
-    case.ctx.tracker = _Tracker(pr=17)
-    scheduler_flag = scheduler.flag
+@pytest.mark.parametrize("failed_step", ["board", "flag", "remove_labels"])
+def test_a_failing_open_pr_flag_still_leaves_the_stop_event_and_comment(case, monkeypatch, failed_step):
+    tracker = _recording_tracker(case)
+    owner, method = ((scheduler.board, "sync_status") if failed_step == "board" else
+                     (scheduler, "flag") if failed_step == "flag" else (tracker, "remove_labels"))
+    original, limited = getattr(owner, method), [True]
 
-    def flag(*args):
-        raise RuntimeError("board rate limit inside flag")
+    def fail_once(*args, **kwargs):
+        if limited:
+            limited.pop()
+            raise RuntimeError("flag transition unavailable")
+        return original(*args, **kwargs)
 
-    scheduler.flag = flag
-    try:
-        with pytest.raises(RuntimeError):
-            _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
-    finally:
-        scheduler.flag = scheduler_flag
-    assert len(_stops(case)) == 1 and ("comment", "<!-- foragent:orch -->") in case.ctx.tracker.calls
+    monkeypatch.setattr(owner, method, fail_once)
+    with pytest.raises(RuntimeError, match="flag transition unavailable"):
+        _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    first = tracker.list_comments(1)
+    assert len(_stops(case)) == len(first) == 1 and ORCH_MARKER in first[0].body
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert len(_stops(case)) == 1 and tracker.list_comments(1) == first
+    assert case.ctx.tracker.current_issue(1).labels == {"approved", "blocked"}
+    case.ctx.tracker.flush_outbox()
+    assert tracker.get_issue(1).labels == {"approved", "blocked"}
+    assert len(_stops(case)) == 1 and tracker.list_comments(1) == first
+
+
+@pytest.mark.parametrize("state,labels", [
+    ("closed", ("approved", "running")),
+    ("open", ("blocked", "running")), ("open", ("needs-human", "running")),
+])
+def test_stop_audit_is_not_repeated_when_label_removal_fails(case, monkeypatch, state, labels):
+    case.store.finish_run(1, outcome="stopped", detail="reprioritize")
+    tracker = case.ctx.tracker = _Tracker(state=state, labels=labels)
+    remove, limited = tracker.remove_labels, [True]
+
+    def remove_once(*args):
+        if limited:
+            limited.pop()
+            raise RuntimeError("label removal unavailable")
+        remove(*args)
+
+    monkeypatch.setattr(tracker, "remove_labels", remove_once)
+    with pytest.raises(RuntimeError, match="label removal unavailable"):
+        _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert "running" in tracker.issue.labels
+    assert len(_stops(case)) == tracker.calls.count(("comment", ORCH_MARKER)) == 1
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert tracker.issue.labels == set(labels) - {"running"}
+    assert len(_stops(case)) == tracker.calls.count(("comment", ORCH_MARKER)) == 1
 
 
 def test_the_command_posts_one_audit_comment(case, monkeypatch):
@@ -312,3 +386,43 @@ def test_the_command_posts_one_audit_comment(case, monkeypatch):
     monkeypatch.setattr(scheduler, "_kill_run", kill)
     orch.stop(case.ctx, 1, "reprioritize")
     assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+
+
+@pytest.mark.parametrize("state,labels", [
+    ("closed", ("approved",)), ("open", ("blocked",)),
+    ("open", ("needs-human",)), ("open", ("approved", "ready")),
+])
+def test_stop_restoration_comments_only_when_the_observed_issue_state_changes(case, monkeypatch, state, labels):
+    case.store.finish_run(1, outcome="stopped", detail="reprioritize")
+    case.ctx.tracker = _Tracker(state=state, labels=labels)
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert not [call for call in case.ctx.tracker.calls if call[0] == "comment"]
+    assert len(_stops(case)) == 1, "Every completed stop still has its run journal event"
+    case.ctx.tracker.issue.labels |= {"running"}
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert not [call for call in case.ctx.tracker.calls if call[0] == "comment"], "A recovery retry belongs to the same stop"
+    now = lambda: datetime(2026, 10, 28, tzinfo=UTC)
+    monkeypatch.setattr(case.store, "_now", now)
+    monkeypatch.setattr(case.ctx, "now", now)
+    case.store.start_run(1, branch="foragent/issue-1", worktree=case.store.worktree_path(1))
+    case.store.finish_run(1, outcome="stopped", detail="reprioritize")
+    case.ctx.tracker.issue.labels |= {"running"}
+    _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
+    assert case.ctx.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert "running" not in case.ctx.tracker.issue.labels
+
+
+
+def test_stop_keeps_the_opening_snapshot_when_the_kill_changes_labels(case, monkeypatch):
+    # An exited runner can have removed running by the time restoration begins.
+    case.tracker.issue.labels = frozenset({"running", "approved"})
+
+    def kill(ctx, number, report, **kwargs):
+        case.tracker.issue.labels = frozenset({"blocked", "approved"})
+        ctx.store.finish_run(number, outcome="stopped", detail=kwargs["detail"])
+        return True
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+    assert case.tracker.issue.labels == {"blocked", "approved"}

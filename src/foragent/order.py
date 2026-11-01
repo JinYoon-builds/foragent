@@ -27,6 +27,7 @@ from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_gr
 from foragent.lanes import add_lane, lane_files, validate_lane
 from foragent.order_files import check_destinations, check_write, issue_body, validate_paths
 from foragent.paths import repo_path
+from foragent.reasons import flag_text
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
@@ -216,8 +217,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
             if flag and flag[1] in {"spec-question", "no-machine-check"}:
                 answer = max((comment for comment in comments if has_marker(comment, DECISION_MARKER)),
                              key=comment_key, default=None)
-                content = flag[0].body.partition("\n")[2]
-                summary, _, details = content.partition("\n")
+                summary, details = flag_text(flag[0].body)
                 decisions.append({
                     "number": issue.number, "title": issue.title, "body": issue.body,
                     "reason": flag[1], "question": details.strip() or summary.strip().strip("*"),
