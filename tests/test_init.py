@@ -1569,3 +1569,42 @@ def test_init_existing_claude_settings_leave_the_offer_to_cli(setup):
     local.parent.mkdir()
     local.write_text("{}\n")
     assert "not yet decided" not in setup.init(no_push=True, no_launchd=True).summary()
+
+
+@pytest.mark.parametrize("answer", ["yes", "no"])
+@pytest.mark.parametrize("root_kind", ["relative", "symlink"])
+def test_fa_allow_summary_reuses_decision_for_git_root_alias(setup, tmp_path, monkeypatch, answer, root_kind):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = setup.root.resolve()
+    monkeypatch.chdir(tmp_path)
+    if root_kind == "relative":
+        alias = Path("project")
+    else:
+        alias = tmp_path / "project-link"
+        alias.symlink_to(root, target_is_directory=True)
+
+    def never(prompt):
+        pytest.fail("the same project's decision must not be requested again")
+
+    def respond(prompt):
+        # Alias and canonical paths must share the lock while the first question waits.
+        assert offer_fa_allow(root, never, require_settings=False) == "busy"
+        return answer
+
+    assert offer_fa_allow(alias, respond, require_settings=False) == ("added" if answer == "yes" else "declined")
+    expected = {str(root): "accepted" if answer == "yes" else "declined"}
+    assert json.loads(fa_allow_record_path().read_text()) == expected
+    local = root / ".claude/settings.local.json"
+    # Remembering consent still matters if the person later removes the settings file.
+    if answer == "yes":
+        local.unlink()
+
+    # The default adapter resolves its root; injected adapters can return an alias.
+    monkeypatch.setattr(GitRepo, "worktree_root", lambda self: alias)
+    report = init_repo(alias, git=GitRepo(alias, setup.run_git), gh_run=setup.run_gh,
+                       tracker=setup.tracker, no_push=True, no_launchd=True, no_board=True)
+    assert "FA commands permission: not yet decided" not in report.summary()
+    assert not local.exists(), "re-init must not reinstall a removed grant"
+    assert offer_fa_allow(alias, never) == offer_fa_allow(root, never) == "kept"
+    assert json.loads(fa_allow_record_path().read_text()) == expected

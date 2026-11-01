@@ -465,7 +465,7 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
-    if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root)):
+    if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root.resolve())):
         notes.append("FA commands permission: not yet decided — /fa setup asks, or run `fa init --fa-allow yes|no`.")
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
