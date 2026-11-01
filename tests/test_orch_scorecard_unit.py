@@ -211,12 +211,15 @@ def test_flow_idle_without_label_events_uses_records_not_current_labels(tmp_path
                              merged=True, merged_at=clock[0].isoformat())
     clock[0] = NOW
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(30)
-    # A hold counts from its flag time, not from the approval.
+    # A hold counts from its GitHub marker time, not from approval or a stale local flag.
     store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready", "blocked"], state="open",
                              blocked_by=[])
     store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
                         approved_by="human", approved_at=(NOW - timedelta(minutes=20)).isoformat())
-    store.save_flag(2, "stalled", flagged_at=(NOW - timedelta(minutes=10)).isoformat())
+    store.save_flag(2, "stalled", flagged_at=(NOW - timedelta(minutes=15)).isoformat())
+    store.record_comments(2, [{"id": 1, "author": "bot",
+                              "body": "<!-- foragent:blocked reason=stalled -->\nNo progress",
+                              "created_at": (NOW - timedelta(minutes=10)).isoformat()}])
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(40)
 
 

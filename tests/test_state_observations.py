@@ -565,3 +565,34 @@ def test_missing_issue_still_retires_evidence(case):
     case.store.queue_github_write(7, "comment", body="Advice", evidence=True)
     case.store.ingest_absence(7, at(1))
     assert case.store.github_outbox() == []
+
+
+ORDINARY_WRITES = {"add_labels": {"labels": ["mine"]}, "remove_labels": {"labels": ["base"]}, "close_issue": {},
+                   "update_issue": {"title": "Mine", "body": "Mine body"}}
+
+
+@pytest.mark.parametrize("action", sorted(ORDINARY_WRITES))
+def test_an_ordinary_write_given_no_premise_is_still_judged_against_the_visible_issue(case, action):
+    case.store.queue_github_write(7, action, premise=None, **ORDINARY_WRITES[action])
+    assert raw_intents(case)[0]["premise"]["labels"] == ["base"]
+    case.clock[0] = at(1)
+    case.remote.issues[7] = Issue(7, "Title", "Body", frozenset({"base", "needs-human"}), "open")
+    case.reader.get_issue(7)
+    assert case.store.github_outbox() == []
+    assert case.events == [(7, "remote change")]
+    case.reader.flush_outbox()
+    assert case.remote.issues[7].labels == frozenset({"base", "needs-human"})
+    assert case.remote.issues[7].state == "open" and case.remote.issues[7].title == "Title"
+
+
+def test_a_stored_write_without_a_premise_is_judged_by_its_recorded_base(case):
+    case.store.queue_github_write(7, "add_labels", labels=["mine"])
+    snapshot = case.store._issue_snapshot()
+    snapshot["outbox_base"] = {"7": snapshot["issues"]["7"]}
+    snapshot["outbox"][0]["premise"] = None
+    (case.store.root / "issues.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    case.clock[0] = at(1)
+    case.remote.issues[7] = Issue(7, "Title", "Body", frozenset({"base", "needs-human"}), "open")
+    case.reader.get_issue(7)
+    assert case.store.github_outbox() == []
+    assert case.events == [(7, "remote change")]
