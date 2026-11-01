@@ -387,3 +387,12 @@ def test_detached_builder_keeps_the_repo_slug(capture_case, monkeypatch, tmp_pat
     monkeypatch.setattr(run_baseline, "_build_baseline", lambda context, *args: built.append(context))
     run_baseline_process.main(["x", json.dumps({**request, "repo_root": str(tmp_path)}), str(os.open(os.devnull, os.O_RDONLY))])
     assert built[0].config.repo == "owner/repo"
+
+
+def test_baseline_duration_follows_fresh_capture_and_cache_hit(capture_case):
+    c = capture_case
+    fresh = c.capture("runner")
+    c.duration = 99
+    cached = c.capture("runner")
+    assert fresh.duration_seconds == cached.duration_seconds == 736
+    assert c.calls == [900]
