@@ -1074,7 +1074,7 @@ def test_a_named_test_weakened_in_the_checkout_after_review_is_not_published(req
     """Publication also writes tests its Done when names from the checkout: they must be the reviewed bytes."""
     cases = _cases
     case = request.getfixturevalue("lane_case")
-    strong = "if __name__ == '__main__':\n    raise SystemExit(1)\n"  # red as a script, collectable as a test
+    strong = "import sys\nsys.exit(1)\n"
     git_history.update({EXISTING: strong})
     git_command(case.root, "fetch", "origin", "main")
     git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")

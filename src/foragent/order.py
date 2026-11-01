@@ -751,7 +751,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
-            git: GitRepo | None = None, refreshed: bool = False, landed: bool = False) -> "_Publication":
+            git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
+            collected: order_collect.Collected | None = None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -797,7 +798,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "approved": approve or issue.number in selected_numbers})
     # A commit that already landed has no write left to protect. Everything else, dry runs and
     # deferred orders included, must collect on the base it would land on.
-    collected = None if landed else order_collect.check(plan, files, root, config, git, refreshed=refreshed)
+    collected = None if landed else order_collect.check(plan, files, root, config, git, refreshed=refreshed,
+                                                         earlier=collected)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {}, collected)
@@ -871,7 +873,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     owner = publication.owner
     with order_reviewed.publication_gate(repo):
         with git.publish_lock():
-            git.update_base(config.base_branch)
+            # The base is collected before the checkout moves onto it, so a refusal leaves it alone.
+            collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected)
+            order_collect.land(git, config.base_branch, [collected], lambda: order_collect.check(
+                plan, publication.files, root, config, git, refreshed=True, earlier=collected))
             # A preparation that started or finished since the first checks is visible now, and none
             # can start until this publication's issues are written: it claims them under the gate.
             listed = tracker.list_issues()
@@ -889,9 +894,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             if affected:
                 raise PlanError(text("order_locks_refused", config.language,
                                      owners="\n".join(_owner_lines(affected))))
-            # HEAD is what the commit lands on now; a later remote move is refused by the push.
-            order_collect.check(plan, publication.files, root, config, git, refreshed=True,
-                                earlier=publication.collected)
             tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
             published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
         return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,

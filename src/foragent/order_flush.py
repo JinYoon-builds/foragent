@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_notes, order_references, order_reviewed
+from foragent import order_collect, order_notes, order_references, order_reviewed
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_files import check_destinations, check_write
@@ -50,7 +50,27 @@ def _note_files(root, notes, language):
     return files
 
 
-def _preflight(rows, notes, root, config, tracker, repo, git):
+def _collect(rows, root, config, git, earlier=None):
+    """Each order's collection, alone with its retained files; ``earlier`` means on the refreshed HEAD.
+
+    A plan that no longer validates is left for the preflight to report.
+    """
+    results = {}
+    for row in rows:
+        try:
+            files = order.validate_plan(row["plan"], root, config, retained_files=row.get("files"))
+        except (ValueError, OSError):
+            continue
+        try:
+            results[row["entry_id"]] = order_collect.check(
+                row["plan"], files, root, config, git, refreshed=earlier is not None,
+                earlier=(earlier or {}).get(row["entry_id"]))
+        except order.PlanError as exc:
+            raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
+    return results
+
+
+def _preflight(rows, notes, root, config, tracker, repo, git, collected=None):
     prepared, files, roots = [], {}, {}
     for row in rows:
         try:
@@ -58,7 +78,8 @@ def _preflight(rows, notes, root, config, tracker, repo, git):
             publication = order._publication_checks(
                 plan, root, config, tracker, repo=repo, approve=row["approve"],
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-                retained_files=row.get("files"), git=git, refreshed=True)
+                retained_files=row.get("files"), git=git, refreshed=True,
+                collected=(collected or {}).get(row["entry_id"]))
             _merge(files, publication.files, config.language)
         except order.DoneWhenExecutableError:
             raise
@@ -189,9 +210,15 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         latest = {row["id"]: row for row in orders}
         effective = [row for row in orders if row is latest[row["id"]]]
         with git.publish_lock():
-            git.update_base(config.base_branch)
+            # Every order is collected before the checkout moves, so a refusal leaves it alone.
+            collected = _collect(effective, root, config, git)
+
+            def recheck():
+                collected.update(_collect(effective, root, config, git, earlier=collected))
+
+            order_collect.land(git, config.base_branch, list(collected.values()), recheck)
             # Validate against the refreshed base before starting a durable batch.
-            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git)
+            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collected)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}

@@ -98,14 +98,153 @@ def test_only_listed_files_join_the_base_and_no_caller_import_path_counts(case, 
     assert check(case, {GOOD: IMPORTS, HELPER: "VALUE = 2\n"}) is not None
 
 
-def test_a_script_or_unimported_helper_is_published_but_never_run(case, monkeypatch):
+def test_a_script_done_when_runs_itself_is_published_but_never_run(case):
     root, config, git, *_ = case
     witness = root.parent / "ran"
     body = f"open({str(witness)!r}, 'w').close()\nraise SystemExit(1)\n"
-    plan = plan_with({"tests/acceptance/check_script.py": body, HELPER: body})
-    plan["issues"][0]["done_when"] = ["python tests/acceptance/check_script.py"]
-    order_collect.check(plan, order.validate_plan(plan, root, config), root, config, git)
+    # Explicit or resolved from Done when, a script's top level is its body.
+    for files in ({"tests/acceptance/check_script.py": body}, {}):
+        (root / "tests/acceptance/check_script.py").write_text(body)
+        plan = plan_with(files)
+        plan["issues"][0]["done_when"] = ["python tests/acceptance/check_script.py && true"]
+        published = order.validate_plan(plan, root, config)
+        assert "tests/acceptance/check_script.py" in published
+        order_collect.check(plan, published, root, config, git)
     assert not witness.exists()
+
+
+def test_every_other_python_acceptance_file_is_collected_whatever_its_name(case):
+    """A custom helper breaks refusal even when no test imports it and no Done when names it."""
+    root, config, git, *_ = case
+    custom = "tests/acceptance/custom_helper.py"
+    plan = plan_with({GOOD: "VALUE = 1\n", custom: "import no_such_module_anywhere\n"})
+    with pytest.raises(order.PlanError) as refusal:
+        order_collect.check(plan, order.validate_plan(plan, root, config), root, config, git)
+    assert custom in str(refusal.value) and "no_such_module_anywhere" in str(refusal.value)
+    # The same file in a pytest segment of a compound command stays a test.
+    plan = plan_with({custom: "import no_such_module_anywhere\n"})
+    plan["issues"][0]["done_when"] = [f"python -m pytest -q {custom} && python {custom}"]
+    with pytest.raises(order.PlanError, match="no_such_module_anywhere"):
+        order_collect.check(plan, order.validate_plan(plan, root, config), root, config, git)
+
+
+@pytest.mark.parametrize("other", ["cat {f}", "ls {f}", "grep x {f}", "sh -c true {f}", "time python {f}"])
+def test_a_file_only_mentioned_by_another_command_is_still_collected(case, other):
+    root, config, git, *_ = case
+    custom = "tests/acceptance/custom_helper.py"
+    plan = plan_with({GOOD: "VALUE = 1\n", custom: "import no_such_module_anywhere\n"})
+    plan["issues"][0]["done_when"] = [f"{other.format(f=custom)} && python -m pytest {GOOD}"]
+    with pytest.raises(order.PlanError, match="no_such_module_anywhere"):
+        order_collect.check(plan, order.validate_plan(plan, root, config), root, config, git)
+
+
+@pytest.mark.parametrize("run", ["python {f}", "python3.12 -u {f}", "uv run python {f}", "X=1 {f}", "./{f}"])
+def test_each_program_shape_counts_as_a_script(case, run):
+    root, config, git, *_ = case
+    custom = "tests/acceptance/custom_script.py"
+    witness = root.parent / "ran"
+    plan = plan_with({custom: f"open({str(witness)!r}, 'w').close()\n"})
+    plan["issues"][0]["done_when"] = [run.format(f=custom)]
+    published = order.validate_plan(plan, root, config)
+    order_collect.check(plan, published, root, config, git)
+    assert not witness.exists()
+
+
+def test_a_broken_published_conftest_is_refused_with_its_path_and_error(case):
+    with pytest.raises(order.PlanError) as refusal:
+        check(case, {GOOD: "VALUE = 1\n", "tests/acceptance/conftest.py": "import no_such_module_anywhere\n"})
+    message = str(refusal.value)
+    assert "tests/acceptance/conftest.py" in message and "no_such_module_anywhere" in message
+
+
+@pytest.mark.parametrize("words", [
+    "PYTHONPATH={outside} {python} -m pytest",
+    "PYTHONPATH=src:{outside} {python} -m pytest",
+    "PYTHONPATH=../caller {python} -m pytest",
+    "PYTHONPATH=/{outside} {python} -m pytest",
+    "PYTHONPATH=src,/{outside} {python} -m pytest",
+    "PYTHONPATH=src/../../caller {python} -m pytest",
+    "PYTHONUSERBASE={outside} {python} -m pytest",
+    "{python} -m pytest -c{outside}/pytest.ini",
+    "{python} -m pytest -c../pytest.ini",
+    "{python} -m pytest -p../plugin",
+    "uv run --with-editable=/{outside} pytest",
+    "../caller/.venv/bin/pytest",
+    "/{checkout}/.venv/bin/pytest",
+    "VIRTUAL_ENV={outside} {python} -m pytest",
+    "env PYTHONPATH={outside} {python} -m pytest",
+    "{python} -m pytest -o pythonpath={outside}",
+    "{python} -m pytest --override-ini=pythonpath={outside}",
+    "{python} -m pytest -c {outside}/pytest.ini",
+    "{python} -m pytest --rootdir {outside}",
+    "uv run --project {outside} pytest",
+    "{checkout}/.venv/bin/python -m pytest",
+])
+def test_a_command_reaching_outside_the_clean_copy_is_unavailable(case, tmp_path, monkeypatch, words):
+    """The helper exists only on that path: running this command would certify a tree main never gets."""
+    root, config, git, history, scratch = case
+    outside = tmp_path / "caller-path"
+    outside.mkdir()
+    (outside / "collect_helper.py").write_text("VALUE = 1\n")
+    command = words.format(outside=outside, python=sys.executable, checkout=root)
+    monkeypatch.setattr(processes, "run_logged", lambda *a, **k: pytest.fail("this command must not run"))
+    with pytest.raises(order.PlanError) as refusal:
+        check((root, replace(config, test_command=command), git, history, scratch), {GOOD: IMPORTS})
+    assert "unavailable" in str(refusal.value) and "outside the clean copy" in str(refusal.value)
+    assert GOOD in str(refusal.value)
+
+
+def test_a_path_inside_the_clean_copy_stays_the_projects_choice(case):
+    """A source layout's relative PYTHONPATH reads the base, so it can only see what main has."""
+    root, config, git, history, scratch = case
+    history.update({"src/collect_helper.py": "VALUE = 1\n"})
+    git.update_base("main")
+    command = f"PYTHONPATH=src {sys.executable} -m pytest"
+    assert check((root, replace(config, test_command=command), git, history, scratch), {GOOD: IMPORTS}) is not None
+    (root / "caller_only").mkdir()
+    (root / "caller_only/other_helper.py").write_text("VALUE = 1\n")
+    command = f"PYTHONPATH=caller_only {sys.executable} -m pytest"
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        check((root, replace(config, test_command=command), git, history, scratch),
+              {GOOD: "from other_helper import VALUE\n"})
+
+
+@pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONUSERBASE", "PYTEST_PLUGINS", "UV_PROJECT", "UV_WORKING_DIRECTORY"])
+def test_each_inherited_import_setting_is_gone_for_the_command(case, monkeypatch, tmp_path, name):
+    root, config, git, history, scratch = case
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    seen = tmp_path / "seen"
+    (tool / "pytest").write_text(f"#!/bin/sh\nenv > {seen}\nexit 5\n")
+    (tool / "pytest").chmod(0o755)
+    monkeypatch.setenv(name, "/caller")
+    with pytest.raises(order.PlanError, match="unavailable"):  # This launcher writes no report.
+        check((root, replace(config, test_command=str(tool / "pytest")), git, history, scratch), {GOOD: "VALUE = 1\n"})
+    assert f"{name}=" not in seen.read_text()
+
+
+def test_a_bare_launcher_does_not_start_the_callers_environment(case, monkeypatch):
+    root, config, git, history, scratch = case
+    bin_dir = root / ".venv/bin"
+    bin_dir.mkdir(parents=True)
+    witness = root.parent / "caller-pytest-ran"
+    (bin_dir / "pytest").write_text(f"#!/bin/sh\ntouch {witness}\nexit 5\n")
+    (bin_dir / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    with pytest.raises(order.PlanError, match="unavailable"):
+        check((root, replace(config, test_command="pytest"), git, history, scratch), {GOOD: "VALUE = 1\n"})
+    assert not witness.exists()
+
+
+def test_inherited_settings_add_no_import_path_or_plugin(case, monkeypatch, tmp_path):
+    elsewhere = tmp_path / "caller-path"
+    elsewhere.mkdir()
+    (elsewhere / "collect_helper.py").write_text("VALUE = 1\n")
+    (elsewhere / "caller_plugin.py").write_text("raise RuntimeError('caller plugin loaded')\n")
+    monkeypatch.setenv("PYTHONPATH", str(elsewhere))
+    monkeypatch.setenv("PYTEST_PLUGINS", "caller_plugin")
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        check(case, {GOOD: IMPORTS})
 
 
 def test_a_test_exiting_at_import_is_refused_and_named(case):
@@ -205,7 +344,7 @@ def test_detected_command_comes_from_the_base(case, monkeypatch):
     monkeypatch.setattr(processes, "run_logged", report)
     with pytest.raises(order.PlanError, match="unavailable"):
         check((root, replace(config, test_command=None), git, history, scratch), {GOOD: "VALUE = 1\n"})
-    assert seen[0].startswith("PYTEST_ADDOPTS= uv run pytest ") and "--collect-only" in seen[0]
+    assert "PYTEST_ADDOPTS= uv run pytest " in seen[0] and "--collect-only" in seen[0]
 
 
 def test_non_python_acceptance_files_have_nothing_to_collect(case, monkeypatch):
@@ -265,27 +404,142 @@ def _publish_case(offline_publication, monkeypatch):  # noqa: F811
     root, config, tracker, git, calls, origin = offline_publication
     monkeypatch.delenv("PYTHONPATH", raising=False)
     monkeypatch.setattr(order, "require_clean_preread", lambda *a, **k: None)
-    return root, replace(config, language="en"), tracker, git, calls, origin
+    return root, replace(config, language="en", test_command=f"{sys.executable} -m pytest"), tracker, git, calls, origin
 
 
-def test_base_move_during_publication_is_checked_before_any_write(  # noqa: F811
-        offline_publication, git_history, monkeypatch):
+def _checkout(root, git):
+    return git.head_sha(), git_command(root, "ls-files", "--stage"), (root / HELPER).read_text()
+
+
+def test_temporary_folder_failure_is_unavailable_not_a_raw_error(case, monkeypatch):
+    def refused(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", refused)
+    with pytest.raises(order.PlanError) as refusal:
+        check(case, {GOOD: "VALUE = 1\n"})
+    assert "unavailable" in str(refusal.value) and "No space left" in str(refusal.value) and GOOD in str(refusal.value)
+
+
+@pytest.mark.parametrize("error,caught", [
+    (OSError(28, "No space left"), order.PlanError),
+    (KeyboardInterrupt(), KeyboardInterrupt),
+], ids=["cannot-start", "interrupted"])
+def test_a_failed_recheck_after_the_move_undoes_it_in_publish(  # noqa: F811
+        offline_publication, git_history, monkeypatch, error, caught):
     root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
-    git_history.update({HELPER: "VALUE = 1\n"})
-    git.update_base("main")
+    _helper_on_main(git_history, git)
+    before = _checkout(root, git)
     update_base = git.update_base
 
-    def moved_meanwhile(branch):
-        git_history.update({HELPER: None})
+    def moved(branch):
+        git_history.update({"moved.txt": "x\n"})
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: (_ for _ in ()).throw(error))
         return update_base(branch)
 
-    monkeypatch.setattr(git, "update_base", moved_meanwhile)
+    monkeypatch.setattr(git, "update_base", moved)
+    with pytest.raises(caught):
+        order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
+    assert _checkout(root, git) == before and not (root / "moved.txt").exists()
+    assert not [args for args in calls if "commit" in args or args[:1] == ["push"]]
+
+
+def test_a_failed_recheck_after_the_move_undoes_it_in_flush(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    before = _checkout(root, git)
+    update_base = git.update_base
+
+    def moved(branch):
+        git_history.update({"moved.txt": "x\n"})
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left")))
+        return update_base(branch)
+
+    monkeypatch.setattr(git, "update_base", moved)
+    with pytest.raises(order.PlanError, match="No space left"):
+        order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), repo="owner/repo", boundary="b")
+    assert _checkout(root, git) == before and not (root / "moved.txt").exists()
+    assert not [args for args in calls if "commit" in args or args[:1] == ["push"]]
+
+
+def _helper_on_main(git_history, git):
+    git_history.update({HELPER: "VALUE = 1\n"})
+    git.update_base("main")
+
+
+def _move_helper_away(git, git_history, monkeypatch, when):
+    refreshes, update_base, real_lock = [], git.update_base, git.publish_lock
+
+    def refresh(branch):
+        refreshes.append(branch)
+        if when == "during-the-refresh":
+            git_history.update({HELPER: None})
+        return update_base(branch)
+
+    def lock():
+        if when == "before-the-lock":
+            git_history.update({HELPER: None})
+        return real_lock()
+
+    monkeypatch.setattr(git, "update_base", refresh)
+    monkeypatch.setattr(git, "publish_lock", lock)
+    return refreshes
+
+
+@pytest.mark.parametrize("when", ["before-the-lock", "during-the-refresh"])
+def test_base_move_during_publication_leaves_the_checkout_alone(  # noqa: F811
+        offline_publication, git_history, monkeypatch, when):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    before = _checkout(root, git)
+    refreshes = _move_helper_away(git, git_history, monkeypatch, when)
     labels = []
     monkeypatch.setattr(tracker, "ensure_labels", lambda specs: labels.append(specs))
     with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
         order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
     assert labels == [] and not [args for args in calls if "commit" in args or args[:1] == ["push"]]
     assert not (root / GOOD).exists() and tracker.list_issues() == []
+    assert _checkout(root, git) == before
+    # A move before the lock is refused without touching the checkout at all, not by undoing it.
+    assert refreshes == ([] if when == "before-the-lock" else ["main"])
+
+
+@pytest.mark.parametrize("when", ["before-the-lock", "during-the-refresh"])
+def test_base_move_during_flush_leaves_the_checkout_alone(  # noqa: F811
+        offline_publication, git_history, monkeypatch, when):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    before = _checkout(root, git)
+    refreshes = _move_helper_away(git, git_history, monkeypatch, when)
+    store = StateStore.for_repo("owner/repo")
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        order_flush.flush(root, config, tracker, git, store, repo="owner/repo", boundary="b")
+    assert _checkout(root, git) == before
+    # A move before the lock is refused without touching the checkout at all, not by undoing it.
+    assert refreshes == ([] if when == "before-the-lock" else ["main"])
+    assert not [args for args in calls if "commit" in args or args[:1] == ["push"]]
+
+
+def test_unchanged_base_collects_once_per_flushed_order(offline_publication, monkeypatch):  # noqa: F811
+    root, config, tracker, git, *_ = _publish_case(offline_publication, monkeypatch)
+    order.publish(plan_with({GOOD: "VALUE = 1\n"}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    runs, real = [], processes.run_logged
+    monkeypatch.setattr(processes, "run_logged", lambda *a, **k: (runs.append(a), real(*a, **k))[1])
+    result = order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"),
+                               repo="owner/repo", boundary="b")
+    assert result["status"] == "published" and len(runs) == 1
+
+
+def test_a_collected_move_still_lands_and_publishes_on_it(offline_publication, git_history, monkeypatch):  # noqa: F811
+    root, config, tracker, git, *_ = _publish_case(offline_publication, monkeypatch)
+    real_lock = git.publish_lock
+    monkeypatch.setattr(git, "publish_lock", lambda: (git_history.update({"moved.txt": "x\n"}), real_lock())[1])
+    order.publish(plan_with({GOOD: "VALUE = 1\n"}), root, config, tracker, repo="owner/repo", git=git)
+    assert (root / "moved.txt").exists()
+    assert git_command(git_history.origin, "show", f"main:{GOOD}") == "VALUE = 1"
 
 
 def test_unchanged_base_collects_once_per_publication(offline_publication, monkeypatch):  # noqa: F811
