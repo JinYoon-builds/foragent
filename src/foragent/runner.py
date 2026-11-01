@@ -180,6 +180,8 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = f"origin/{branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
+    if not _restore_approved_base(n, ctx, git, approval, target_branch, branch=branch):
+        return "hash-mismatch"
     _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
     _progress(n, ctx)
 
@@ -188,6 +190,37 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         flag(ctx, n, Reason.NO_MACHINE_CHECK, "Done when has no machine check.")
         return "no-machine-check"
     return _implement_and_publish(n, ctx, git, target_branch=target_branch)
+
+
+def _restore_approved_base(
+    n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
+    *, branch: str,
+) -> bool:
+    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    locks = approval.acceptance_blobs
+    if git.blob_shas("HEAD", locks) == locks:
+        return True
+    base = f"origin/{ctx.config.base_branch}"
+    own_edits = git._call([
+        "rev-list", "HEAD", f"^origin/{target_branch}", f"^{base}", "--", *locks,
+    ]).strip()
+    if own_edits:
+        return _acceptance_matches(n, ctx, git, approval)
+    if git.is_ancestor("HEAD", base):
+        # No own commits: recreate at the approved base without a merge commit.
+        ctx.git.remove_worktree(git.root)
+        ctx.git.add_worktree(git.root, branch, base)
+    else:
+        try:
+            git.merge_base(base)
+        except GitError:
+            conflicts = git.conflict_paths()
+            if not conflicts:
+                raise
+            # Resume's resolver can finish this merge, including a stale batch's base update.
+            pending = ctx.store.get_run(n).merge_conflicts
+            ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    return True
 
 
 def _implement_and_publish(
