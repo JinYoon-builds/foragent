@@ -396,3 +396,27 @@ def test_baseline_duration_follows_fresh_capture_and_cache_hit(capture_case):
     cached = c.capture("runner")
     assert fresh.duration_seconds == cached.duration_seconds == 736
     assert c.calls == [900]
+
+
+@pytest.mark.parametrize("api", ["runner", "prebuild"])
+@pytest.mark.parametrize("measured", [0.0, 736.0])
+def test_baseline_records_command_duration_without_queue(capture_case, monkeypatch, api, measured):
+    c = capture_case
+    c.ctx.monotonic = lambda: c.clock
+    check = runner._check
+
+    def queued_check(command, root, log, timeout_s, **kwargs):
+        assert kwargs["clock"] is c.ctx.monotonic
+        c.clock += 1600  # The wrapper's elapsed time includes the slot queue.
+        result = check(command, root, log, timeout_s, **kwargs)
+        return replace(result, seconds=measured)
+
+    monkeypatch.setattr(runner, "_check", queued_check)
+    fresh = c.capture(api)
+    saved = json.loads(next(c.cache.glob("*.json")).read_text())
+    assert saved["duration_seconds"] == measured
+    cached = c.capture("runner")
+    assert cached.duration_seconds == measured
+    if api == "runner":
+        assert fresh.duration_seconds == cached.duration_seconds
+    assert c.calls == [900]

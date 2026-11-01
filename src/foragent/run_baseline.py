@@ -88,7 +88,7 @@ def _build_baseline(ctx: RunContext, build: BaselineBuild, lock: IO[str]) -> Non
                 report=cache.root / f"{build.key}.xml",
                 check=lambda command, root: runner._check(
                     command, root, log, _baseline_capture_limit(ctx, log),
-                    slot=capacity.hold_test_slot(ctx.config.test_slots)),
+                    slot=capacity.hold_test_slot(ctx.config.test_slots), clock=ctx.monotonic),
                 prepare=lambda: None, wait=lambda acquire: acquire(), build=build, lock=lock,
                 # Locked test_baseline_prebuild (unusable "timeout") forbids caching a timed-out prebuild.
                 record_timeouts=False,
@@ -266,7 +266,7 @@ def _capture_acceptance_baseline(
             pass  # Without the base identity the capture is still measured, only not linked.
         result = runner._check(command, worktree, ctx.store.log_path(n),
                                _baseline_capture_limit(ctx, ctx.store.log_path(n), remaining),
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                                full_text_dir=cuts.issue_dir(ctx.store.root, n))
         _progress(n, ctx)
         return result
@@ -372,7 +372,8 @@ def _capture_baseline(
                 offset = log.stat().st_size if log.exists() else 0
                 started = monotonic()
                 result = check(baseline_command, worktree)
-                duration_seconds = monotonic() - started
+                # Prefer command time inside the slot; custom checks may not supply it.
+                duration_seconds = monotonic() - started if result.seconds is None else result.seconds
                 _validate_baseline_checkout(ctx.git.at(worktree), base_sha)
                 # Read this execution's collection count from the full log: a long
                 # traceback can push it out of CheckResult's bounded output tail.

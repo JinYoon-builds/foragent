@@ -26,6 +26,47 @@ from conftest import ACCEPTANCE, BASE_TIME, git_command
 from runner_support import BODY, enable_reviewer, run_case
 
 
+def test_custom_baseline_check_without_seconds_uses_elapsed_time(git_history, tmp_path, monkeypatch):
+    from foragent import run_baseline
+
+    node = "tests/acceptance/test_keep.py::test_keep"
+    git_history.update({node.split("::")[0]: "def test_keep(): pass\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    clock = [10.0]
+    monkeypatch.setattr(run_baseline, "monotonic", lambda: clock[0])
+    calls = []
+
+    def check(command, root):
+        calls.append(command)
+        clock[0] += 123.0
+        report = next(word.split("=", 1)[1] for word in shlex.split(command)
+                      if word.startswith("--junitxml="))
+        suite = ET.Element("testsuite")
+        ET.SubElement(suite, "testcase", file=node.split("::")[0], name="test_keep")
+        ET.ElementTree(suite).write(report, encoding="unicode")
+        return CheckResult(command, 0, False, "")  # Custom callers may have no clock.
+
+    def capture():
+        return run_baseline._capture_baseline(
+            ctx, "pytest", "origin/main", log=store.log_path(1),
+            report=store.root / "capture.xml", check=check,
+            prepare=lambda: None, wait=lambda acquire: acquire(),
+        )
+
+    fresh = capture()
+    cached = capture()
+    assert fresh.node_ids == cached.node_ids == (node,)
+    assert fresh.duration_seconds == cached.duration_seconds == 123.0
+    saved, = (store.root.parent / "baselines").glob("*.json")
+    assert json.loads(saved.read_text())["duration_seconds"] == 123.0
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
 def test_baseline_preserves_exact_parameterized_ids_and_excludes_nonpasses(run_case, options):
     c = run_case
