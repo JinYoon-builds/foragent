@@ -151,3 +151,21 @@ def test_retry_does_not_accept_hint_when_publication_cannot_be_persisted(run_cas
     with pytest.raises(OSError, match="disk full"):
         orch.retry(c.ctx, 1, "Must not become deliverable")
     assert not (c.store.root / "hints/1.txt").exists()
+
+
+@pytest.mark.parametrize("route", ["github-wait", "pending-write", "rate-limit"])
+def test_recording_tracker_queues_each_advice_once(tmp_path, route):
+    from datetime import timedelta
+
+    tracker = Refusing(TrackerError("HTTP 429: Too Many Requests"))
+    context = _context(tmp_path, tracker)
+    before = []
+    if route == "github-wait":
+        context.store.pause_github(NOW + timedelta(minutes=1))
+    elif route == "pending-write":
+        context.store.queue_github_write(2, "comment", body="Earlier intent")
+        before = [(2, "Earlier intent")]
+    body = orch_advice.talk_body("Keep  the receipt\n\n  timezone")
+    assert orch_advice.publish(tracker, context, 1, body) is None
+    assert _queued(context.store) == [*before, (1, body)]
+    assert tracker.comments == []
