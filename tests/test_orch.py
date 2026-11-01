@@ -90,19 +90,43 @@ def test_fast_review_merge_reuses_post_merge_reinstall(review_case, monkeypatch,
     assert calls == [(c.ctx, c.pr, "main")]
 
 
-def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
+@pytest.mark.parametrize("advance_clock", [True, False], ids=["elapsed-wait", "frozen-clock"])
+def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch, advance_clock):
+    from foragent import orch_inbox, run_merge_turn
+
     c = review_case
     calls = []
+    attempts = []
 
     def failed_merge(*args, **kwargs):
+        attempts.append(args)
+        assert len(attempts) <= 2, "A refused merge must not retry indefinitely"
         raise runner.TrackerError("merge failed")
 
     monkeypatch.setattr(c.tracker, "merge_pr", failed_merge)
     monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
     c.ctx.config = replace(c.ctx.config, max_runtime_minutes=5)
-    # A refused merge rejoins the merge queue for later turns until the time budget ends (#712).
-    assert runner.review_only(1, c.ctx) == "timeout"
-    assert_blocked(c, Reason.TIMEOUT)
+    monkeypatch.setattr(run_merge_turn, "MERGE_WAIT_SECONDS", 60)
+    measured = [0.0]
+    monkeypatch.setattr(run_merge_turn, "monotonic", lambda: measured[0])
+    if not advance_clock:
+        def sleep(seconds):
+            measured[0] += seconds
+
+        c.ctx.sleep = sleep
+    # Refused merges share the separate wait bound across later queue turns.
+    assert runner.review_only(1, c.ctx) == "merge-wait"
+    assert len(attempts) == 2
+    assert c.store.load_flag(1) is None
+    assert "blocked" in c.tracker.get_issue(1).labels
+    assert c.tracker.get_issue(c.pr).state == "open"
+    requests = orch_inbox.requests(c.store, pending=True)
+    assert len(requests) == 1
+    request = requests[0]
+    elapsed = 60
+    assert request["kind"] == "merge-wait" and request["waited_seconds"] == elapsed
+    assert c.store.get_run(1).merge_waited_seconds == elapsed
+    assert f"after {elapsed}s (2 polls)" in c.store.get_run(1).detail
     assert "merge failed" in c.store.log_path(1).read_text()
     assert calls == []
 

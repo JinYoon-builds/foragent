@@ -137,6 +137,9 @@ class Run:
     # The recorded session is not the running worker's (a fresh thread is starting, or it was
     # inherited from an earlier run and not resumed yet); nothing may be sent to it.
     session_stale: bool = False
+    # Merge queue waits and refused-merge pauses share a separate, per-run bound.
+    merge_waited_seconds: float = 0
+    merge_wait_polls: int = 0
 
     # A person's talk terminal is open (fa lanes talk): derived on every read from the talk
     # events by StateStore (D95), never stored; stall and runtime checks pause meanwhile.
