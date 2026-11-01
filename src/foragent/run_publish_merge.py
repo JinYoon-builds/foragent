@@ -31,7 +31,8 @@ def _merge_lock(n: int, ctx: RunContext):
                 started = ctx.now()
 
             try:
-                run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", resume=False)
+                # Phase only if it waits: a free lock keeps the slot and adds no phase events.
+                run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False, resume=False)
                 if not capacity.phase_holds_slot(ctx.store.get_run(n).phase):
                     continue  # A new start took the freed slot: give the lock back.
                 yield

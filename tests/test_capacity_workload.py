@@ -26,16 +26,27 @@ def now():
     return datetime.now(UTC)
 
 
-@pytest.mark.parametrize("hold", ["critical", "overload", "lock"])
-def test_returning_run_obeys_sensor_holds_and_the_machine_lock(case, monkeypatch, hold):
+@pytest.mark.parametrize("critical,load", [(True, 0.5), (False, 2.0)], ids=["critical", "overload"])
+def test_returning_run_is_admitted_by_count_during_a_sensor_hold(case, monkeypatch, critical, load):
+    case.store.start_run(7, branch="b", worktree="w", pid=capacity.os.getpid())
+    case.store.update_run(7, phase="ci")
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if critical else "normal")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", load))
+
+    def never(*args):
+        pytest.fail("A free slot must not wait for machine sensors")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=lambda: 0.0, sleep=never))
+    capacity.admit_run(case.store, 7, {"phase": "checking"}, deadline=5, now=now, waiting=never)
+    assert case.store.get_run(7).phase == "checking" and capacity.machine_runs(case.store, now()) == 1
+
+
+def test_returning_run_obeys_the_machine_lock(case, monkeypatch):
     case.store.start_run(7, branch="b", worktree="w", pid=capacity.os.getpid())
     case.store.update_run(7, phase="ci")
     clock, queued = [0.0], []
     lock = (case.root / capacity.LOCK_FILE).open("a")
-    if hold == "lock":
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if hold == "critical" and not clock[0] else "normal")
-    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 2.0 if hold == "overload" and not clock[0] else 0.5))
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def waiting():
         assert case.store.get_run(7).phase == "ci"

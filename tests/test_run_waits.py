@@ -163,28 +163,83 @@ def test_interrupted_wait_keeps_its_exception_when_the_machine_lock_is_unusable(
     assert c.store.get_run(1).phase in capacity.IDLE_RUN_PHASES
 
 
-def test_interrupted_wait_stays_idle_while_a_kernel_hold_blocks_new_work(slot_case, monkeypatch):
+def test_interrupted_wait_restores_the_work_phase_during_a_sensor_hold(slot_case, monkeypatch):
     from foragent import capacity, run_waits
 
     c = slot_case
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", capacity.OVERLOAD_LOAD))
 
     def fail():
         raise RuntimeError("original failure")
 
     with pytest.raises(RuntimeError, match="original failure"):
         run_waits._credited_wait(1, c.ctx, fail, "overlap-wait")
-    assert c.store.get_run(1).phase == "overlap-wait" and c.sleeps == []
+    assert c.store.get_run(1).phase == "reviewing" and c.sleeps == []
+
+
+@pytest.mark.parametrize("transition", ["phase", "context", "restore", "close", "merge-lock"])
+@pytest.mark.parametrize("critical,load", [(True, 0.5), (False, 2.0)], ids=["critical", "overload"])
+def test_idle_exit_with_a_free_slot_does_not_wait_for_machine_sensors(slot_case, monkeypatch, transition, critical, load):
+    from foragent import capacity, run_waits
+
+    c = slot_case
+    identity = run_waits.phase_identity(c.store.get_run(1))
+    wait = run_waits.WaitPhase(1, c.ctx, "ci")
+    wait.open()
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if critical else "normal")
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", load))
+    entered = []
+
+    def work():
+        entered.append(c.store.get_run(1).phase)
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+
+    if transition == "phase":
+        run_waits._phase(1, c.ctx, "implementing")
+        work()
+    elif transition == "context":
+        with run_waits.in_phase(1, c.ctx, "checking"):
+            work()
+    elif transition == "restore":
+        run_waits.restore_phase(1, c.ctx, identity)
+        work()
+    elif transition == "close":
+        wait.close()
+        work()
+    else:
+        with _merge_lock(1, c.ctx):
+            work()
+    assert c.sleeps == [] and len(entered) == 1 and capacity.phase_holds_slot(entered[0])
+
+
+def test_free_merge_lock_keeps_the_slot_and_adds_no_wait_phase(slot_case, monkeypatch):
+    from foragent import capacity
+
+    c = slot_case
+    phases, update = [], c.store.update_run
+
+    def recorded(number, **fields):
+        phases.extend([fields["phase"]] if "phase" in fields else [])
+        return update(number, **fields)
+
+    monkeypatch.setattr(c.store, "update_run", recorded)
+    with _merge_lock(1, c.ctx):
+        assert c.store.get_run(1).phase == "merging"
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+    assert phases == ["merging"] and c.sleeps == []
 
 
 @pytest.mark.parametrize("full", ["before-lock", "after-lock", "never"])
 def test_merge_slot_wait_releases_the_lock_and_retries_before_entering(slot_case, monkeypatch, full):
     import fcntl
 
-    from foragent import capacity, run_waits
+    from foragent import capacity, runner, run_waits
 
     c = slot_case
     run_waits._phase(1, c.ctx, "ci")
+    # The lock is contended: its first heartbeat opens the wait phase and frees the slot.
+    monkeypatch.setattr(runner, "poll_executor", lambda execute, poll: (poll(), execute())[1])
     if full == "before-lock":
         c.occupy()
     lock, attempts, effects = c.store.merge_lock, [], []
@@ -553,8 +608,7 @@ def test_idle_exit_queues_before_restoring_work_and_credits_queue_time(tmp_path,
 
 
 @pytest.mark.parametrize("transition", ["phase", "context", "restore", "close", "merge-lock"])
-@pytest.mark.parametrize("hold", ["full", "critical", "overload"])
-def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_case, monkeypatch, transition, hold):
+def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_case, monkeypatch, transition):
     from foragent import capacity, runner, run_waits
     from foragent.config import Config
 
@@ -566,22 +620,18 @@ def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_c
     c.clock[0] += timedelta(seconds=57)
     assert runner._remaining(1, c.ctx) == 3
     released = []
-    if hold == "full":
-        c.occupy()
-    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical" if hold == "critical" and not released else "normal")
-    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 2.0 if hold == "overload" and not released else 0.5))
+    c.occupy()
     monkeypatch.setattr(runner, "_timeout", lambda *args: pytest.fail("Paused queue time cannot exhaust runtime"))
 
     def sleep(seconds):
         assert c.store.get_run(1).phase == "ci"
         assert runner._remaining(1, c.ctx) == 3
-        assert capacity.machine_runs(c.store, c.ctx.now()) == (1 if hold == "full" else 0)
+        assert capacity.machine_runs(c.store, c.ctx.now()) == 1
         c.sleeps.append(seconds)
         c.clock[0] += timedelta(seconds=seconds)
         if sum(c.sleeps) >= 10:
             released.append(True)
-            if hold == "full":
-                c.other.finish_run(9, outcome="merged")
+            c.other.finish_run(9, outcome="merged")
 
     monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=sleep))
 

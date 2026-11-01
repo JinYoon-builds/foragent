@@ -789,12 +789,12 @@ def admit_run(
     Keep the idle phase while queued. The run record itself holds the admitted
     slot, so returning work needs no extra reservation or workload record.
     ``deadline=None`` waits until a slot opens; the caller credits this paused time.
+    Only the count decides: the run already started, and overload reaches it by shrinking the budget.
     """
     while True:
-        sensed = _sensor_block()
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
             holders, _ = _machine_scan(store, datetime.now(UTC), live=True)
-            if locked and sensed is None and len(holders) < workload_budget(store):
+            if locked and len(holders) < workload_budget(store):
                 store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
                 return
         remaining = None if deadline is None else deadline - time.monotonic()
