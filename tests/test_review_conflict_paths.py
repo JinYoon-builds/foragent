@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
 from conftest import ACCEPTANCE  # noqa: E402
@@ -50,7 +52,7 @@ def test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(ru
     from foragent.orch_facts_reviews import _artifacts
 
     c = run_case
-    enable_native_reviewer(c, [json.dumps({"result": f"- feature.txt:1 — bug\n  class: stale-base\n{CONFLICT}"})])
+    enable_native_reviewer(c, [json.dumps({"result": f"VERDICT: FAIL\n- feature.txt:1 — bug\n  class: stale-base\n{CONFLICT}"})])
     assert run_issue(1, c.ctx) == "spec-question"
     event, = review_events(c.store)
     assert (event["verdict"], event["review_verdict"]) == ("SPEC-CONFLICT", "FAIL")
@@ -112,3 +114,18 @@ def test_panel_member_conflict_wins_over_another_members_usage_limit(git_history
     assert panel.merges == [], "A member conflict needs no merge call"
     assert CONFLICT in questions(case.tracker)[0]
     assert [event["verdict"] for event in review_events(case.store)] == ["SPEC-CONFLICT"]
+
+
+def test_break_it_conflict_receipt_must_keep_the_reviewers_verdict(run_case, monkeypatch):
+    from foragent import run_review
+
+    journal = run_review._journal_review
+
+    def lose_reviewer_verdict(*args, **kwargs):
+        if "review_verdict" in kwargs:
+            kwargs["review_verdict"] = "UNUSABLE"
+        return journal(*args, **kwargs)
+
+    monkeypatch.setattr(run_review, "_journal_review", lose_reviewer_verdict)
+    with pytest.raises(AssertionError, match="FAIL"):
+        test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(run_case)

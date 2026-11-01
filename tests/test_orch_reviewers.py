@@ -4,6 +4,8 @@ from pathlib import Path
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
 from foragent import orch_reviewers, review_perspectives  # noqa: E402
@@ -120,12 +122,12 @@ def test_parallel_reviewers_get_distinct_log_paths(git_history, tmp_path, monkey
 
 
 def test_reviewer_without_verdict_makes_round_unusable_without_merge(git_history, tmp_path, monkeypatch):
-    case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
+    case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=0)
     panel = PanelExecutor(["VERDICT: PASS", "I could not finish the review."] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2))
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
     assert panel.merges == [], "A reviewer with no verdict must not reach the merge call"
-    assert outcome != "merged" and case.tracker.merged_prs == []
+    assert outcome == "retries-exceeded" and case.tracker.merged_prs == []
     assert "blocked" in case.tracker.get_issue(1).labels
 
 
@@ -189,3 +191,18 @@ def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path
         assert merge_round.is_file(), f"{name}: an unusable panel still counts as one review round"
         if name != "merge-raised":
             assert panel.merges == [], f"{name}: a failed reviewer must not reach the merge call"
+
+
+def test_break_it_a_missing_member_verdict_cannot_be_covered_by_the_merger(git_history, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from foragent import run_review
+
+    parse = run_review.parse_review
+
+    def ignore_missing_verdict(message):
+        review = parse(message)
+        return replace(review, verdict="PASS") if review.verdict == "UNUSABLE" else review
+
+    monkeypatch.setattr(run_review, "parse_review", ignore_missing_verdict)
+    with pytest.raises(AssertionError, match="merge call"):
+        test_reviewer_without_verdict_makes_round_unusable_without_merge(git_history, tmp_path, monkeypatch)
