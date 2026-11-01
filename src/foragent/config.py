@@ -81,6 +81,8 @@ class Config:
     # Personal push filter (#1030): all pushes every kind; decisions pushes only decision kinds.
     notify_filter: str = "all"
     run_hours: str = "always"
+    # D99: the architect, docs role and retrospective wake when an order finishes; false holds them.
+    scheduled_roles: bool = True
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
     # A live orchestrator silent this long pushes once per silence episode (#952); 0 turns the push off.

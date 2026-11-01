@@ -1,11 +1,14 @@
 """Lane memory's two writers: migration, readers and the dream's base check (D95)."""
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from foragent import lane_memory, orch_dream_publish, run_lane_skills
 from foragent.config import Config
+from foragent.tracker import Issue
 from test_init import setup  # noqa: F401
 
 OLD = ("---\nname: fa-api\ndescription: 'Lane api'\nmemory: project\nskills:\n- x\nmodel: m\n---\n"
@@ -435,6 +438,14 @@ def test_other_memory_scopes_are_not_native_lane_memory():
     assert not lane_memory.native(text) and "memory: user" in lane_memory.migrate_agent(text, "fa-api")
 
 
+def finished_order(*children):
+    """A tracker listing one published order whose children are all closed."""
+    mapping = json.dumps({f"child-{child}": child for child in children})
+    issues = [Issue(child, "Child", "", frozenset(), "closed", updated_at="2026-10-20T08:00:00+00:00") for child in children]
+    issues.append(Issue(900, "Order", f"<!-- foragent:plan id=order map={mapping} acceptance={{}} -->", frozenset(), "open"))
+    return SimpleNamespace(list_issues=lambda state="all": issues)
+
+
 def test_a_lane_that_names_a_role_agent_keeps_the_role_memory_contract(tmp_path):
     from foragent.orch_dream import dream_due
     from foragent.state import StateStore
@@ -452,11 +463,7 @@ def test_a_lane_that_names_a_role_agent_keeps_the_role_memory_contract(tmp_path)
     store.start_run(2, branch="foragent/issue-2", worktree=tmp_path / "w2", lane="api")
     store.finish_run(2, "merged", "")
 
-    class Empty:
-        def list_open_issues(self):
-            return []
-
-    assert dream_due(store, config, Empty(), None) == ["api"], "No dream curates a role's memory"
+    assert dream_due(store, config, finished_order(1, 2), None) == ["api"], "No dream curates a role's memory"
 
 
 def test_native_removal_keeps_yaml_anchors_readable():
@@ -505,11 +512,7 @@ def test_one_resolver_maps_a_role_with_a_custom_agent_to_its_agent_directory_eve
         store.start_run(number, branch=f"foragent/issue-{number}", worktree=tmp_path / f"w{number}", lane=lane)
         store.finish_run(number, "merged", "")
 
-    class Empty:
-        def list_open_issues(self):
-            return []
-
-    assert dream_due(store, config, Empty(), None) == ["qa"], "No lane's dream owns the role's memory"
+    assert dream_due(store, config, finished_order(1, 2), None) == ["qa"], "No lane's dream owns the role's memory"
     created = roles._ensure_memory(tmp_path, "qa", config.roles["qa"])
     assert created == ".claude/agent-memory/fa-reviewer/MEMORY.md" and (tmp_path / created).is_file()
     assert not (tmp_path / ".claude/agent-memory/fa-qa").exists()

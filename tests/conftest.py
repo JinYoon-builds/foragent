@@ -211,7 +211,7 @@ def isolated_test_slots(tmp_path, monkeypatch):
 # Their subject is starting a role, not admission; a loaded host must not refuse their starts.
 ROLE_START_MODULES = {
     "test_architect_project_schedule", "test_background_launch_budget", "test_orch_architect",
-    "test_role_short_reason", "test_role_source",
+    "test_role_short_reason", "test_role_source", "test_orch_role_schedule",
 }
 
 

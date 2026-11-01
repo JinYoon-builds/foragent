@@ -19,7 +19,7 @@ import shutil
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget, orch_facts_baselines, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, resource_sample
+from foragent import capacity, machine_budget, orch_facts_baselines, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -220,6 +220,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
         "binding": _binding(resources),
+        "role_schedule": orch_role_schedule.facts(store, config, now),
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
     }
 
@@ -283,7 +284,8 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
     blocks = [runs + ["  " + line for line in orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}",
-                                    orch_facts_baselines.human_line(facts, language)]]
+                                    orch_facts_baselines.human_line(facts, language),
+                                    *orch_role_schedule.human_lines(facts["role_schedule"], language)]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
 
