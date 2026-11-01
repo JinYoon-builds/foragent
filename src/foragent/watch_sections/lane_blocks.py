@@ -7,7 +7,7 @@ lane's pixel squirrel (gnawing, waving, looking out or, shared, lying asleep), i
 owned paths and today's merges, its current acorns, a waiting reason, then '다음' with
 the queue. Acorns flow over two rows at most and end in an exact …N for the rest.
 Without pixels (ASCII, a non-UTF-8 terminal, animation off) or below 40 columns the
-blocks are text only; below 40 every acorn has its own row.
+blocks are text only; every text fallback gives each acorn its own selectable row.
 """
 
 from datetime import datetime

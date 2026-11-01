@@ -327,4 +327,3 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         if warning:
             rows.append([(warning, "yellow")])
     return rows
-
