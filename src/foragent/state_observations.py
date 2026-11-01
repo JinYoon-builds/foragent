@@ -180,7 +180,7 @@ class IssueObservationsMixin:
         gone, dropped = set(), False
         row = snapshot["issues"].get(str(number))
         for intent in intents:
-            if intent.get("premise") is None and legacy is not None:
+            if "premise" not in intent and legacy is not None:
                 intent = {**intent, "premise": observed_facts(legacy)}
             reason = retirement(facts, at, intent, expected, by_person=by_person)
             if reason is None:

@@ -450,20 +450,21 @@ class RecordingTracker:
         row = next((row for row in self._context.store.local_issues() if row["number"] == n), None)
         return observed_facts(row) if row is not None else None
 
-    def _write(self, n, action, operation, started, *, queued=None, **payload):
+    def _write(self, n, action, operation, started, *, queued=None, independent=False, **payload):
         """Every write is an intent first, counted from ``started`` against the issue as it was then.
 
         It is sent now unless writes must wait (then ``queued`` replaces the
         payload, e.g. the rest of a label removal). A sent intent is visible
         to every later intent's premise while its send is in flight; the
         result is appended as an attempt. A failure nobody retries is final.
-        Comments stay direct sends: they change no labels or state.
+        Independent comments have no field premise and need not wait for field writes.
         """
         store = self._context.store
-        premise = self._premise(n)
+        premise = None if independent else self._premise(n)
         pending = store.github_outbox()
-        if (any(entry["issue"] == n for entry in pending)
-                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
+        if (self.queue_writes and store.github_wait_until(self._context.now()) is not None
+                or not independent and (any(entry["issue"] == n for entry in pending)
+                                        or self.queue_writes and pending)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
         # A direct combined close exposes only its field effect to concurrent flushes.
         # Its comment is send-only; the composite payload enters the retry queue only on failure.
@@ -593,9 +594,10 @@ class RecordingTracker:
         self._context.store.record_comments(n, [asdict(comment) for comment in comments])
         return comments
 
-    def comment(self, n, body):
+    def comment(self, n, body, *, independent=False):
+        """Record a comment; independent messages survive later label/state observations."""
         identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
-                                       body=body)
+                                       body=body, independent=independent)
         if queued:
             return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,

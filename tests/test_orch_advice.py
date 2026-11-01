@@ -1,6 +1,6 @@
 """Accepted advice keeps an issue-owned copy even when GitHub refuses the write (#1185)."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +8,7 @@ import pytest
 from foragent import orch, orch_advice
 from foragent.config import Config
 from foragent.state import StateStore
-from foragent.tracker import TrackerError
+from foragent.tracker import FakeTracker, RecordingTracker, TrackerError
 from runner_support import run_case  # noqa: F401 - the shared runner fixture
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
@@ -169,3 +169,86 @@ def test_recording_tracker_queues_each_advice_once(tmp_path, route):
     assert orch_advice.publish(tracker, context, 1, body) is None
     assert _queued(context.store) == [*before, (1, body)]
     assert tracker.comments == []
+
+
+def _message_case(tmp_path):
+    remote = FakeTracker(actor="human")
+    remote.add_issue(1, "Feature", body="Contract", labels=["blocked"])
+    context = _context(tmp_path, remote)
+    recorder = RecordingTracker(remote, context, queue_writes=True)
+    recorder.get_issue(1)
+    return remote, context, recorder
+
+
+def test_advice_reaches_the_issue_while_a_field_write_is_pending(tmp_path):
+    remote, context, _ = _message_case(tmp_path)
+    context.store.queue_github_write(1, "add_labels", labels=["ready"])
+    body = orch_advice.talk_body("Keep  the receipt\n\n  timezone")
+    assert orch_advice.publish(remote, context, 1, body) is None
+    assert [comment.body for comment in remote.list_comments(1)] == [body]
+    assert [entry["action"] for entry in context.store.github_outbox()] == ["add_labels"]
+
+
+@pytest.mark.parametrize("change", ["labels", "closed"])
+@pytest.mark.parametrize("route", ["github-wait", "rate-limit", "transport", "decode", "server"])
+def test_accepted_advice_survives_field_changes_until_delivered_once(tmp_path, monkeypatch, route, change):
+    remote, context, recorder = _message_case(tmp_path)
+    body = orch_advice.talk_body("Keep  the receipt\n\n  timezone")
+    with monkeypatch.context() as failing:
+        if route == "github-wait":
+            context.store.pause_github(NOW + timedelta(minutes=1))
+        else:
+            error = {"rate-limit": TrackerError("HTTP 429: Too Many Requests"),
+                     "transport": OSError("gh not found"), "decode": ValueError("Expecting value"),
+                     "server": TrackerError("HTTP 502: Bad Gateway")}[route]
+
+            def refuse(*args):
+                raise error
+
+            failing.setattr(remote, "comment", refuse)
+        orch_advice.publish(remote, context, 1, body)
+    assert _queued(context.store) == [(1, body)]
+    context.now = lambda: NOW + timedelta(days=1)
+    if change == "labels":
+        remote.add_labels(1, ["running"])
+    else:
+        remote.close_issue(1)
+    recorder.get_issue(1)
+    assert _queued(context.store) == [(1, body)]
+    recorder.flush_outbox()
+    assert [comment.body for comment in remote.list_comments(1)] == [body]
+    assert context.store.github_outbox() == []
+    recorder.flush_outbox()
+    assert [comment.body for comment in remote.list_comments(1)] == [body]
+
+
+@pytest.mark.parametrize("route", ["recording", "store"])
+def test_state_dependent_comments_still_retire_after_an_issue_change(tmp_path, route):
+    remote, context, recorder = _message_case(tmp_path)
+    context.store.queue_github_write(1, "add_labels", labels=["ready"])
+    if route == "recording":
+        recorder.comment(1, "Ready transition")
+    else:
+        context.store.queue_github_write(1, "comment", body="Ready transition")
+    assert _queued(context.store) == [(1, "Ready transition")]
+    assert remote.list_comments(1) == []
+    remote.close_issue(1)
+    context.now = lambda: NOW + timedelta(days=1)
+    recorder.get_issue(1)
+    assert context.store.github_outbox() == []
+    recorder.flush_outbox()
+    assert remote.list_comments(1) == []
+
+
+def test_explicit_independent_comment_does_not_inherit_a_legacy_premise(tmp_path):
+    remote, context, recorder = _message_case(tmp_path)
+    snapshot = context.store._issue_snapshot()
+    snapshot["outbox_base"] = {"1": context.store.local_issues()[0]}
+    context.store._write_json(context.store.root / "issues.json", snapshot)
+    context.store.queue_github_write(1, "comment", body="Accepted message", premise=None)
+    remote.close_issue(1)
+    context.now = lambda: NOW + timedelta(days=1)
+    recorder.get_issue(1)
+    assert _queued(context.store) == [(1, "Accepted message")]
+    recorder.flush_outbox()
+    assert [comment.body for comment in remote.list_comments(1)] == ["Accepted message"]

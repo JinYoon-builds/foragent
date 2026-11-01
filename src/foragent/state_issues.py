@@ -142,14 +142,15 @@ class IssueSnapshotMixin:
             row["state"] = "closed"
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
-                           started_at: datetime | None = None, premise: dict[str, Any] | None = None,
+                           started_at: datetime | None = None, premise: Any = _observations._UNSET,
                            dropped: list[bool] | None = None, ready_approval: Any = _observations._UNSET,
                            **payload: Any) -> dict[str, Any]:
         """Append one intent to the log.
 
         ``queued_at`` is when the write began (``started_at``, default now).
         Its premise is the visible issue then (``premise``, default the
-        visible issue now). A write queued late is judged at once, by the same
+        visible issue now; explicit None makes it independent of issue fields).
+        A write queued late is judged at once, by the same
         rule as any read, against the issue's latest observation (facts or
         absence) if that read started after it; ``dropped`` receives whether
         that dropped it unsent. An issue observed missing gets no placeholder row.
@@ -159,8 +160,8 @@ class IssueSnapshotMixin:
             identity = snapshot.get("outbox_sequence", 0) + 1
             when = self._now() if started_at is None else started_at
             row = snapshot["issues"].get(str(number))
-            if premise is None and row is not None:
-                premise = _observations.observed_facts(self._visible(snapshot, row))
+            if premise is _observations._UNSET:
+                premise = _observations.observed_facts(self._visible(snapshot, row)) if row is not None else None
             entry = {"id": identity, "issue": number, "action": action,
                      "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
             from foragent.labels import READY
