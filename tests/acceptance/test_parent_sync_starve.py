@@ -378,7 +378,10 @@ def finish_sequence(case, latency, sequence, *, closes, column=None):
             assert case.tracker.issues[10].state == "open", "Open work must keep its parent open"
             done = True
         if column is not None:
-            done = done and card_column(case.tracker, case.board_id, 10) == column
+            try:
+                done = done and card_column(case.tracker, case.board_id, 10) == column
+            except StopIteration:  # The card or its column does not exist yet: not finished.
+                done = False
         if done:
             break
     else:
