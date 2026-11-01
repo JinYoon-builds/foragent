@@ -15,7 +15,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -30,7 +30,7 @@ from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
-from foragent.run_previous import retry_marker
+from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
@@ -148,6 +148,7 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
            say: str | None = None) -> dict:
+    """Journal the verb and comment it on the issue."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
@@ -186,13 +187,15 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    path = ctx.store.root / "hints" / f"{n}.txt"
-    if hint is not None:
-        ctx.store._atomic_write(path, hint)
-    else:
-        path.unlink(missing_ok=True)
+    # Undelivered advice (an earlier hint or a talk message) is kept; only delivery removes it.
+    error = None
+    if hint:
+        # The public fact (or durable publication intent) must precede deliverable local advice.
+        error = orch_advice.publish(ctx.tracker, ctx, n,
+                                    "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
+        add_hint(ctx.store, n, hint)
     # The next implementer receives the keep-work/defect-class default before any hint.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
@@ -200,14 +203,17 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    return error
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
-    _retry(ctx, n, hint)
+    publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
+    if publication_error:
+        return f"{summary} (issue comment queued for the gate after: {publication_error})"
     return summary
 
 
