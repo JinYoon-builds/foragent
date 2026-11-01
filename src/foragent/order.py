@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
@@ -46,6 +46,10 @@ class DoneWhenExecutableError(PlanError):
     def __init__(self, lines: list[str]):
         self.lines = lines
         super().__init__("\n".join(lines))
+
+
+class DoneWhenRemovalError(DoneWhenExecutableError):
+    """One diagnostic per Done when line an edit loses or misnames, printed the same exact way."""
 
 
 def check_done_when_executables(plan: dict, root: Path, language: str = "en") -> None:
@@ -348,7 +352,9 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
                                      "references", "statements", "decisions"} if kind == "issues"
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
-                          "statements", "decisions"}, label)
+                          "statements", "decisions", "done_when_removals"}, label)
+            if "done_when_removals" in item:
+                order_done_when.validate(item["done_when_removals"], f"{label}.done_when_removals")
             if "decisions" in item:
                 try:
                     decision_links.validate(item["decisions"], f"{label}.decisions")
@@ -769,6 +775,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
     all_issues = tracker.list_issues()
     parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
+    if not landed:
+        order_done_when.check(plan, by_number, config.language)
     unknown_numbers = selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
     if unknown_numbers & by_number.keys() or (unknown_numbers and keys <= mapping.keys()):
         raise PlanError("approve numbers must refer to this plan's existing children or edits")
@@ -871,6 +879,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             # can start until this publication's issues are written: it claims them under the gate.
             listed = tracker.list_issues()
             current = {**publication.by_number, **{issue.number: issue for issue in listed}}
+            order_done_when.check(plan, current, config.language)
             _require_route(plan, config, repo, publication.mapping, current)
             items = order_reviewed.statement_items(plan, current, config)
             reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
@@ -945,7 +954,9 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         number = mapping.get(item["key"])
         existing = tracker.get_issue(number) if number is not None else None
         owned = existing is None or OWNED_MARKER in existing.body
-        body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+        body = (order_done_when.with_record(_published_body(plan, item, repo, config),
+                                            existing.body if existing else None, [])
+                + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
                 + (f"{OWNED_MARKER}\n" if owned else ""))
         # The written body itself records the wait it replaces, so the transition survives a lost comment.
         body = order_waiting.stamp(existing.body if existing else None, body)
@@ -985,7 +996,9 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         number = item["number"]
         existing = tracker.get_issue(number)
         # An edit keeps both the owner contract and omitted decision links.
-        body = decision_links.with_marker(_with_contract(_published_body(plan, item, repo, config), existing.body),
+        written = order_done_when.with_record(_published_body(plan, item, repo, config), existing.body,
+                                              item.get("done_when_removals", []))
+        body = decision_links.with_marker(_with_contract(written, existing.body),
                                           item.get("decisions"), existing.body)
         body = order_waiting.stamp(existing.body, body)
         # A revision comment identifies this write, including a changed decision marker.
@@ -1083,7 +1096,7 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Pat
         f"## Done when\n```sh\n{commands}\n```\n\n"
         f"## Checklist\n{checklist}\n\n"
         f"## Acceptance tests (locked){tests}"
-    ) + (f"\n{references}" if references else "")
+    ) + (f"\n{references}" if references else "") + order_done_when.prompt_section(item)
 
 
 def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: Path | None = None):
@@ -1319,7 +1332,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
         records = _preread_records(root)
     except PlanError:
         return None
-    text, child = _without_child_marker(decision_links.MARKER_LINE.sub("", body))
+    text, child = _without_child_marker(order_done_when.without_record(decision_links.MARKER_LINE.sub("", body)))
     content = _body_digest(text)
     actual: dict[str, str] = {}
 
@@ -1367,6 +1380,8 @@ def preread(plan: dict, root: Path, config: Config,
         current = {item["key"]: source.get_issue(mapping[item["key"]])
                    for item in plan["issues"] if item["key"] in mapping}
         current.update({f"#{item['number']}": source.get_issue(item["number"]) for item in plan.get("edits", [])})
+        order_done_when.check(plan, {item["number"]: current[f"#{item['number']}"] for item in plan.get("edits", [])},
+                              config.language)
         items += [edit_view(item, current[f"#{item['number']}"], config) for item in edits]
     elif edits:
         raise PlanError("prereading edits needs the tracker for the existing issues")
