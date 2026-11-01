@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from foragent import processes, scheduler
 from foragent.orch_tick_outcome import step
 from foragent.orch_transition import transition_state
-from foragent.reasons import ORCH_MARKER, one_line
+from foragent.reasons import ORCH_MARKER, format_comment, one_line
 from foragent.state import Run
 
 if TYPE_CHECKING:
@@ -224,13 +224,12 @@ def _stop_run_processes(
 def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport, before=None) -> None:
     """After `fa orch stop`'s kill: ready again, as a stall restart, with one stop event naming the why.
 
-    The run's WIP was already saved by the kill path. The stop event and the orch
-    audit comment come first: the event once per run, the comment only on a state
-    change. `running` still marks the issue for orphan recovery: a later step that fails (a board rate limit) is repeated by
-    the next tick and the record is never lost or written twice. `running` goes
-    last. An open PR flags the issue as _restore_stalled does; a closed, blocked or
-    needs-human issue only loses running. A stop counts toward neither the crash
-    streak nor the stall restart budget.
+    The run's WIP was already saved by the kill path. The journal bounds one stop
+    across recovery attempts; only its first attempt announces a state change.
+    Stop owns the single public line, including any open-PR flag and stop audit.
+    `running` marks incomplete ready restoration until its board update succeeds.
+    A closed, blocked or needs-human issue only loses running. A stop counts
+    toward neither the crash streak nor the stall restart budget.
     """
     from foragent.i18n import text
 
@@ -249,20 +248,23 @@ def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport
     run = ctx.store.get_run(number)
     journal = ctx.store.root / "orch-events.jsonl"
     started = scheduler.datetime.fromisoformat(run.started_at) if run is not None else None
-    if before != after:
-        ctx.tracker.comment(number, one_line(ORCH_MARKER, text(
-            "orch_stop_done", ctx.config.language, n=number, why=why)))
-    if not (journal.exists() and any(
+    first_stop = not (journal.exists() and any(
         event.get("issue") == number and event.get("kind") == "stop"
         and (started is None or scheduler.datetime.fromisoformat(event["at"]) >= started)
         for event in map(json.loads, journal.read_text(encoding="utf-8").splitlines())
-    )):
+    ))
+    audit = text("orch_stop_done", ctx.config.language, n=number, why=why)
+    if first_stop:
+        if before != after:
+            body = (format_comment(scheduler.Reason.STALLED, blocker, f"{ORCH_MARKER} {audit}", label="blocked")
+                    if pr is not None else one_line(ORCH_MARKER, audit))
+            ctx.tracker.comment(number, body)
         scheduler.append_event(ctx.store, ctx.now(), number, "stop",
                                f"Stopped by fa orch stop; unfinished work kept on foragent/issue-{number}. Why: {why}")
     if held:
         ctx.tracker.remove_labels(number, [scheduler.RUNNING])
     elif pr is not None:
-        scheduler.flag(ctx, number, scheduler.Reason.STALLED, blocker)
+        scheduler.flag(ctx, number, scheduler.Reason.STALLED, blocker, announce=False)
         report.actions.append(f"#{number} flagged stalled with open PR")
     else:
         ctx.tracker.add_labels(number, [scheduler.READY])

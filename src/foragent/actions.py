@@ -20,13 +20,14 @@ class FlagContext(board.BoardContext, Protocol):
 
 def flag(
     ctx: FlagContext, n: int, reason: Reason, summary: str, details: str | None = None,
-    *, needs_human: bool = False, remove_labels: tuple[str, ...] = (),
+    *, needs_human: bool = False, remove_labels: tuple[str, ...] = (), announce: bool = True,
 ) -> None:
     """Block an issue with a reason; needs_human also hands it to a person at once.
 
     With needs_human the issue also gets the needs-human label, and the one
     comment carries the needs-human marker, so the orchestrator timeout does
-    not escalate it again.
+    not escalate it again. A compound transition that owns its public line uses
+    announce=False while retaining the flag's label and reason effects.
     """
     before = transition_state(ctx, n)
     added = [BLOCKED, NEEDS_HUMAN] if needs_human else [BLOCKED]
@@ -41,7 +42,7 @@ def flag(
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=getattr(ctx.tracker, "queue_writes", False))
     tracker.add_labels(n, added)
     tracker.remove_labels(n, removed)
-    if before != after:
+    if announce and before != after:
         tracker.comment(n, body)
     board.sync_status(ctx, n, "Blocked")
 
