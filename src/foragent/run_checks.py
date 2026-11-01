@@ -32,6 +32,7 @@ from foragent.state import Approval
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
+    from foragent.run_baseline import AcceptanceBaseline
     from foragent.run_attempt import Implementation
 
 
@@ -458,17 +459,24 @@ def _verify_implementation(attempt: Implementation) -> str:
         raise
 
 
-def _check_protected(attempt: Implementation) -> CheckResult:
-    """Retry a timed-out protected selection once without redoing the implementation."""
+def _protected_limit(n: int, ctx: RunContext, baseline: AcceptanceBaseline) -> int:
+    """The selected baseline's adaptive allowance, bounded by the run's remaining time."""
     from foragent import runner
     from foragent.run_baseline_limits import capture_limit, repository_limit
 
-    n, ctx, baseline = attempt.n, attempt.ctx, attempt.baseline
     if baseline.duration_seconds is None:
         limit, _ = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
     else:
         limit = capture_limit(baseline.duration_seconds)
-    limit = min(limit, runner._remaining(n, ctx))
+    return min(limit, runner._remaining(n, ctx))
+
+
+def _check_protected(attempt: Implementation) -> CheckResult:
+    """Retry a timed-out protected selection once without redoing the implementation."""
+    from foragent import runner
+
+    n, ctx, baseline = attempt.n, attempt.ctx, attempt.baseline
+    limit = _protected_limit(n, ctx, baseline)
     command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
     for retry in range(2):
         result = runner._check(command, attempt.worktree, attempt.log, limit,
