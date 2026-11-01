@@ -396,3 +396,23 @@ def test_baseline_duration_follows_fresh_capture_and_cache_hit(capture_case):
     cached = c.capture("runner")
     assert fresh.duration_seconds == cached.duration_seconds == 736
     assert c.calls == [900]
+
+
+@pytest.mark.parametrize("saved,xml,expected", [
+    ({"duration_seconds": 42}, '<testsuite time="736"/>', (42, False)),
+    ({"duration_seconds": 0}, '<testsuite time="736"/>', (0, False)),
+    ({"duration_seconds": None}, '<testsuite time="736"/>', (None, False)),
+    ({"duration_seconds": -1}, '<testsuite time="736"/>', (None, False)),
+    ({}, '<testsuite time="736"/>', (736, True)),
+    ({}, '<testsuites><testsuite time="700"/><testsuite time="36"/></testsuites>', (736, True)),
+    ({}, None, (None, False)),
+    ({}, '<broken', (None, False)),
+    ({}, '<testsuite time="-1"/>', (None, False)),
+])
+def test_recorded_duration_uses_only_legacy_companion_timings(tmp_path, saved, xml, expected):
+    from foragent.run_baseline_limits import recorded_duration
+
+    report = tmp_path / "selection.xml"
+    if xml is not None:
+        report.write_text(xml)
+    assert recorded_duration(saved, report) == expected
