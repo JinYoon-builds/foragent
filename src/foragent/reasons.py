@@ -67,14 +67,21 @@ def marked_reason(comment_body: str) -> str | None:
     return match[1] if match else None
 
 
+def waiting_labels(row: dict) -> set[str]:
+    """The labels that make an observed row wait now; a closed issue or a PR never waits."""
+    if row.get("is_pull_request", False) or row.get("state") != "open":
+        return set()
+    return set(row.get("labels", ())) & {"blocked", "needs-human"}
+
+
 def current_blocker(row: dict, pending=()) -> tuple[dict, str] | None:
     """Current waiting labels own blockage; comments supply its reason and actual time.
 
     Pending comments are explicit undelivered intent, in outbox FIFO order.
     They take precedence over delivered comments until observation ingest retires them.
     """
-    labels = set(row.get("labels", ())) & {"blocked", "needs-human"}
-    if row.get("is_pull_request", False) or row.get("state") != "open" or not labels:
+    labels = waiting_labels(row)
+    if not labels:
         return None
 
     def relevant(body):
