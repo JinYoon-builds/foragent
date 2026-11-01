@@ -34,6 +34,8 @@ for good: a real publish (with or without approval) refuses the issue until its 
 tests and the configured reviewer has reviewed them; --dry-run still previews it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
+publish, --dry-run, --defer, preread and flush refuse an order whose acceptance files fail collection
+on the current base; a check that cannot run refuses too and says so. Nothing is executed.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.
 reference_files carries approved design artifacts, published in the same commit as the spec and
 tests. Keys are normalized repository paths under docs/design/ (no absolute paths, .., symlinks).
@@ -152,7 +154,8 @@ def _preread(args, root) -> int:
     except cli.GitError:
         repo = None
     results = cli.order.preread(cli.order.read_plan(args.plan), root, config,
-                                lambda: cli.GhTracker(repo or cli.GitRepo(root).remote_slug()), repo=repo)
+                                lambda: cli.GhTracker(repo or cli.GitRepo(root).remote_slug()), repo=repo,
+                                git=cli.GitRepo(root))
     if args.json:
         print(cli.json.dumps({"issues": results}, ensure_ascii=False))
     else:

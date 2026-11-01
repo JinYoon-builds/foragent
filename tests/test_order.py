@@ -5,13 +5,15 @@ from datetime import date, timedelta
 import hashlib
 import json
 import re
+import shlex
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from foragent import cli, order
+from foragent import cli, order, order_collect
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
@@ -22,7 +24,7 @@ from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
 from foragent.tracker import FakeTracker, IdentityError, TrackerError
 
-from conftest import BASE_TIME, git_command
+from conftest import BASE_TIME, REAL_COLLECTION_CHECK, git_command
 
 
 FILE = "tests/acceptance/test_login.py"
@@ -116,10 +118,12 @@ def publishing(tmp_path):
 
 
 @pytest.fixture
-def offline_publication(git_history):
-    """Exercise real Git files and trees while emulating commit/push commands."""
+def offline_publication(git_history, monkeypatch):
+    """Exercise real Git files and trees, real collection included, while emulating commit/push commands."""
+    monkeypatch.setattr(order_collect, "check", REAL_COLLECTION_CHECK)
     root, calls = git_history.clone, []
-    (root / ".foragent.yml").write_text("lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
+    (root / ".foragent.yml").write_text(f"test_command: {shlex.quote(sys.executable)} -m pytest\n"
+                                        "lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
 
     def run(args):
         calls.append(args)

@@ -315,6 +315,21 @@ LOCAL_ONLY_FILES = {
 }
 
 
+from foragent import order_collect  # noqa: E402
+
+REAL_COLLECTION_CHECK = order_collect.check
+# Locked files cannot opt in, and many publish from fake Git, a scrubbed PATH or a repository without
+# a test command. Those files test other rules; these two and offline_publication test collection.
+COLLECTION_FILES = {"tests/acceptance/test_publish_collect_check.py", "tests/test_order_collect.py"}
+
+
+@pytest.fixture(autouse=True)
+def _collection_tested_on_its_own(request, monkeypatch):
+    root = Path(__file__).resolve().parent.parent
+    if request.path.relative_to(root).as_posix() not in COLLECTION_FILES:
+        monkeypatch.setattr(order_collect, "check", lambda *args, **kwargs: None)
+
+
 def pytest_itemcollected(item):
     root = Path(__file__).resolve().parent.parent
     if item.path.relative_to(root).as_posix() in LOCAL_ONLY_FILES:

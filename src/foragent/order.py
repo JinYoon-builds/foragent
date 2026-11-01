@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_collect, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
@@ -662,6 +662,7 @@ class _Publication:
     rows: list[dict]
     owner: str | None
     reviewed_bases: dict[str, dict]
+    collected: order_collect.Collected | None = None
 
     @property
     def own(self) -> set[int]:
@@ -778,9 +779,12 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
+    # A commit that already landed has no write left to protect. Everything else, dry runs and
+    # deferred orders included, must collect on the base it would land on.
+    collected = None if landed else order_collect.check(plan, files, root, config, git, refreshed=refreshed)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None, {})
+                            by_number, edit_numbers, unconfirmed, rows, None, {}, collected)
     if landed:
         # A resumed batch commit passed the gates below before its intent was recorded, and later
         # commits (its own too) must not reopen them: only its issue effects remain.
@@ -817,7 +821,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, collected)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -830,8 +834,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
                                       check_owner=not waiting, git=git)
+    # The collection check has just fetched the base when it had files to collect.
     affected = _affected_owners(publication.by_number.values(), publication.own, publication.files,
-                                repo, config, lambda: git or GitRepo(root), fetch=True)
+                                repo, config, lambda: git or GitRepo(root), fetch=publication.collected is None)
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), True, affected=affected, language=config.language)
@@ -868,6 +873,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             if affected:
                 raise PlanError(text("order_locks_refused", config.language,
                                      owners="\n".join(_owner_lines(affected))))
+            # HEAD is what the commit lands on now; a later remote move is refused by the push.
+            order_collect.check(plan, publication.files, root, config, git, refreshed=True,
+                                earlier=publication.collected)
             tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
             published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
         return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
@@ -1331,7 +1339,8 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
 
 def preread(plan: dict, root: Path, config: Config,
-            tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
+            tracker: Callable[[], Tracker] | None = None, repo: str | None = None,
+            git: GitRepo | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
     Existing children and edits expose their current GitHub fields to the reader.
@@ -1363,6 +1372,8 @@ def preread(plan: dict, root: Path, config: Config,
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
         raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
                         f"do not exist yet; {NEW_LANE_STEPS}")
+    # An order that cannot publish gets no reader and no recorded answer.
+    order_collect.check(plan, published, root, config, git)
     # Local evidence stays in real directories; a planted symlink must not redirect writes.
     directory = order_references.real_directory(root, ".foragent")
     logs = order_references.real_directory(root, ".foragent/preread-logs")
