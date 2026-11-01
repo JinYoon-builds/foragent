@@ -69,14 +69,14 @@ def test_merge_resolves_the_pr_to_its_issue_before_comparing():
     assert orch_scope.refuse_verb(ctx, "list", None) is None
 
 
-def test_a_failed_owner_read_refuses_the_verb_instead_of_allowing_it():
+def test_a_failed_owner_read_refuses_the_team_stop_instead_of_allowing_it():
     class Failing(FakeTracker):
         def get_issue(self, n):
             raise TrackerError("HTTP 502")
 
     ctx = SimpleNamespace(tracker=Failing(login="alice"), config=Config(legacy_owner="alice"),
                           store=SimpleNamespace(local_issues=lambda: []))
-    refusal = orch_scope.refuse_verb(ctx, "retry", 1)
+    refusal = orch_scope.refuse_verb(ctx, "stop", 1)
     assert refusal is not None and "#1" in refusal and "502" in refusal
     assert orch_scope.may_write(ctx, 1) is False
 

@@ -502,7 +502,12 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
     if (number := pr_issue_number(pr.head)) is None:
         return pr.title
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
+    from foragent import orch_scope
+
+    issue = orch_scope.observe(ctx.tracker).get_issue(number)
+    if (refusal := orch_scope.merge_check(ctx, number, issue)) is not None:
+        raise OrchError(refusal)
+    title = f"{issue.title} (#{number})"
     return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
 
 
@@ -535,12 +540,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
-            if (issue := pr_issue_number(current.head)) is not None:
-                from foragent import orch_scope
-
-                # One ownership decision at the merge's remote preflight (#1004).
-                if (refusal := orch_scope.merge_check(ctx, issue)) is not None:
-                    raise OrchError(refusal)
+            # Reuse the current-title read for ownership at this remote preflight (#1004).
+            title = _merge_title(ctx, current)
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event, stale_for_redo
                 from foragent.orch_dream_publish import memory_moved
@@ -564,7 +565,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 n, f"Approved by {approved_by} in the orchestrator ({at}). "
                    f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
             subject = retitle_for_merge(
-                ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
+                ctx, n, title=title, current_title=current.title, base=current.base,
                 body=lambda: current.body, note=print,
             )
             merge_turn.record_turn(ctx, place, checked.base, "merged")

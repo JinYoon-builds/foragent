@@ -224,6 +224,10 @@ class RecordingTracker:
             if name in {"add_sub_issue", "add_blocked_by", "remove_blocked_by"}:
                 self._require(args[0] if args else kwargs.get("parent", kwargs.get("n")))
             result = value(*args, **kwargs)
+            if name == "list_issues" and getattr(self._context, "_scope", None) is None:
+                from foragent import orch_scope
+
+                self._context._scope = orch_scope.Scope(self._context, issues=result)
             if isinstance(result, Issue):
                 self._context.store.record_issue(result, self._context.config.lanes)
             return result
@@ -352,6 +356,9 @@ class RecordingTracker:
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
+        if (snapshot := getattr(self._context, "_scope", None)) is not None:
+            for pr in prs:
+                snapshot.link_pr(pr.number, pr.head)  # PRs observed with the listing share its write boundary.
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
             store.record_merged_pr_listing(listing)
@@ -543,8 +550,11 @@ class RecordingTracker:
     def create_issue(self, title, body, labels):
         labels = list(labels)
         n = self._tracker.create_issue(title, body, labels)
-        self._context.store.record_issue(Issue(n, title, body, frozenset(labels), "open"),
-                                         self._context.config.lanes)
+        from foragent import orch_scope
+
+        issue = Issue(n, title, body, frozenset(labels), "open")
+        self._context.store.record_issue(issue, self._context.config.lanes)
+        orch_scope.scope(self._context).created(issue)
         return n
 
     def update_issue(self, n, *, title, body):

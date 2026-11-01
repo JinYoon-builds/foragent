@@ -1,9 +1,7 @@
 """One ownership snapshot per tick, command or run (architect r85, #1004).
 
-Labels in the operation's existing snapshot decide ownership. Later reads and
-writes reuse that decision; a relabel is observed by the next operation. The
-RecordingTracker is the sole write gate, before both sending and queueing.
-Local process cleanup and work preservation do not require tracker permission.
+Original labels decide ownership; the next operation observes relabels.
+RecordingTracker gates sending and queueing. Local process/WIP cleanup stays outside.
 """
 
 from __future__ import annotations
@@ -90,11 +88,10 @@ def _unreadable(ctx, number: int, exc: Exception) -> str:
 
 
 class Scope:
-    """Frozen issue facts and decisions, with one lazy identity read for the operation.
+    """Operation facts and decisions, with one lazy identity read.
 
-    A tick constructs this before refreshing but captures rows only on first use,
-    after refresh. An entry read can supply the command's exact issue snapshot.
-    No ownership lookup here performs a GitHub issue read.
+    Ticks capture after refresh; commands supply their existing entry read.
+    Explicit creation adds new targets; existing issue facts stay frozen.
     """
 
     def __init__(self, ctx, issue=None, *, issues=None):
@@ -144,13 +141,18 @@ class Scope:
         self._capture()
         self._prs[number] = pr_issue_number(head)
 
+    def created(self, issue):
+        """Extend a captured snapshot; first capture reads creations from the store."""
+        if self._issues is not None and issue.number not in self._issues:
+            self._issues[issue.number] = issue
+            self._decisions.pop(issue.number, None)
+
     def refusal(self, issue) -> str | None:
         self._capture()
         self._issues.setdefault(issue.number, issue)
         return self.for_number(issue.number)
 
     def for_number(self, number) -> str | None:
-        self._capture()
         try:
             target = self._target(number)
         except Unresolved as exc:
@@ -251,10 +253,8 @@ def require(ctx, number: int, issue=None, *, read=True):
 
 def merge_check(ctx, number: int, issue=None) -> str | None:
     """The separate merge preflight uses its existing fresh issue read once."""
-    issue = issue if issue is not None else current_issue(ctx, number)
-    ctx._scope = Scope(ctx, issue)
-    ctx._scope.entry = True
-    return ctx._scope.for_number(number)
+    ctx._scope = None
+    return check(ctx, number, issue)
 
 
 def replay_refusal(context, tracker, number: int) -> str | None:
@@ -278,14 +278,10 @@ def replaying(ctx):
 def refuse_verb(ctx, action: str, number: int | None) -> str | None:
     if number is None or action not in ISSUE_VERBS | PR_VERBS:
         return None
-    try:
-        if action in PR_VERBS:
-            # Merge checks once at the remote preflight, after its checks and wait.
-            return None
-        ctx._scope = None  # A new command never inherits an earlier operation's snapshot.
-        return check(ctx, number, current_issue(ctx, number))
-    except Exception as exc:
-        return _unreadable(ctx, number, exc)
+    ctx._scope = None  # A new command never inherits an earlier operation's snapshot.
+    # Stop has local entry facts. Other verbs supply _issue's existing read;
+    # merge supplies its title read at the remote preflight, after its checks and wait.
+    return check(ctx, number) if action == "stop" else None
 
 
 def ask_orderer(ctx, number: int, summary: str) -> str:
