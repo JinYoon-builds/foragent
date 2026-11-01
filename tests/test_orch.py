@@ -268,7 +268,8 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
 @pytest.mark.parametrize("failure,reason", [
     ("checks", Reason.RETRIES_EXCEEDED), ("ci", Reason.RETRIES_EXCEEDED),
     ("ci-timeout", Reason.TIMEOUT), ("check-timeout", Reason.TIMEOUT),
-    ("base", Reason.RISK_HIGH), ("head", Reason.RISK_HIGH),
+    ("base", None), ("base-conflict", Reason.RISK_HIGH),
+    ("unexpected-base", Reason.RISK_HIGH), ("head", Reason.RISK_HIGH),
     ("body", Reason.HASH_MISMATCH), ("acceptance", Reason.HASH_MISMATCH),
     ("missing-approval", Reason.HASH_MISMATCH), ("no-check", Reason.NO_MACHINE_CHECK),
     ("error", Reason.RETRIES_EXCEEDED),
@@ -284,8 +285,19 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
         c.tracker.set_pr_checks(c.pr, "fail")
     elif failure == "ci-timeout":
         c.tracker.set_pr_checks(c.pr, "pending")
-    elif failure == "base":
-        c.history.update({"new-base.txt": "base moved"})
+    elif failure in {"base", "base-conflict"}:
+        # Advance the target independently of the reviewed PR, exercising an actual merge.
+        c.history.tip = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+        c.history.update({"feature.txt": "conflicting base work"} if failure == "base-conflict"
+                         else {"new-base.txt": "base moved"})
+        from foragent import run_review
+        verified = []
+        verify = run_review._verify_review_head
+        monkeypatch.setattr(run_review, "_verify_review_head",
+                            lambda n, ctx, git, parsed, head, link: verified.append(head)
+                            or verify(n, ctx, git, parsed, head, link))
+    elif failure == "unexpected-base":
+        c.tracker.update_pr(c.pr, base="unexpected", title="Wrong target", body="Review")
     elif failure == "head":
         monkeypatch.setattr(c.tracker, "pr_checks", lambda pr: c.tracker.set_pr_head_sha(pr, "f" * 40) or "pass")
     elif failure == "body":
@@ -306,7 +318,16 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
         orch.rerun_review(c.ctx, 1)
     else:
         orch.resolve(c.ctx, 1, "pass", "Reviewed, still require checks and CI")
-    if entry == "resolve" and failure in {"checks", "ci"}:
+    if failure == "base":
+        updated = c.tracker.pr_head_sha(c.pr)
+        assert updated != c.head
+        git_command(c.history.origin, "merge-base", "--is-ancestor", c.head, updated)
+        git_command(c.history.origin, "merge-base", "--is-ancestor", c.history.tip, updated)
+        assert verified == [updated]
+        assert len(c.review_calls) == (0 if entry == "resolve" else 1)
+        assert c.tracker.merged_prs == [c.pr]
+        assert c.store.load_flag(1) is None
+    elif entry == "resolve" and failure in {"checks", "ci"}:
         assert c.tracker.get_issue(1).labels & {"blocked", "ready", "running"} == {"ready"}
         assert c.tracker.get_issue(c.pr).state == "closed"
         hint = (c.store.root / "hints/1.txt").read_text()
@@ -316,11 +337,103 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
             assert "Broken feature" in saved_failures_section(c.store.root, 1)
     else:
         assert_blocked(c, reason)
-    assert c.tracker.merged_prs == []
+    if failure != "base":
+        assert c.tracker.merged_prs == []
+    if failure == "base-conflict":
+        assert verified == []
+        assert len(c.review_calls) == (0 if entry == "resolve" else 1)
+        assert c.tracker.pr_head_sha(c.pr) == c.head
+        assert git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1") == c.head
+        assert any(args == ["merge", "--quit"] for _, args in c.operations)
     events = [json.loads(line) for line in (c.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert events[-1]["kind"] == entry
     assert any(comment.body == "<!-- foragent:orch -->\n" + events[-1]["summary"]
                for comment in c.tracker.list_comments(1))
+
+
+@pytest.mark.parametrize("entry", ["rerun-review", "resolve"])
+def test_behind_review_refreshes_again_when_base_moves_before_merge_turn(review_case, monkeypatch, entry):
+    from foragent import run_review
+
+    c = review_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max=1)
+    c.history.tip = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.update({"src/first-base.py": "FIRST = 1\n"})
+    first_base = c.history.tip
+    checked = []
+    verify = run_review._verify_review_head
+
+    def verify_head(n, ctx, git, parsed, head, link):
+        checked.append(head)
+        return verify(n, ctx, git, parsed, head, link)
+
+    polls = []
+
+    def ci(pr):
+        polls.append(c.tracker.pr_head_sha(pr))
+        if len(polls) == 1:
+            c.history.update({"src/second-base.py": "SECOND = 2\n"})
+        return "pass"
+
+    monkeypatch.setattr(run_review, "_verify_review_head", verify_head)
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    if entry == "resolve":
+        orch.resolve(c.ctx, 1, "pass", "Reviewed this head before two base moves")
+    else:
+        orch.rerun_review(c.ctx, 1)
+
+    updated = c.tracker.pr_head_sha(c.pr)
+    assert len(checked) == 2 and len(set(checked)) == 2
+    assert c.head not in checked and checked[-1] == updated
+    assert polls == [checked[0], updated, updated]
+    assert len(c.review_calls) == (0 if entry == "resolve" else 1)
+    assert len([args for _, args in c.operations if args[:1] == ["push"]]) == 2
+    for ancestor in (c.head, first_base, c.history.tip):
+        git_command(c.history.origin, "merge-base", "--is-ancestor", ancestor, updated)
+    assert c.tracker.merged_prs == [c.pr]
+    assert c.store.load_flag(1) is None
+
+
+def test_behind_rerun_review_cannot_refresh_an_independently_changed_head(review_case):
+    c = review_case
+    c.history.tip = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.update({"new-base.txt": "base moved"})
+    c.review_calls = enable_reviewer(c, ["VERDICT: PASS"],
+                                    edit=lambda root: c.tracker.set_pr_head_sha(c.pr, "f" * 40))
+
+    orch.rerun_review(c.ctx, 1)
+
+    assert_blocked(c, Reason.RISK_HIGH)
+    assert c.store.get_run(1).outcome == "held"
+    assert len(c.review_calls) == 1
+    assert not any(args[:1] == ["push"] for _, args in c.operations)
+    assert git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1") == c.head
+
+
+@pytest.mark.parametrize("scope", ["claude-local", "pr-body"])
+def test_behind_rerun_review_uses_shared_history_for_diff_and_risk_notes(review_case, monkeypatch, scope):
+    from foragent import run_review
+
+    c = review_case
+    c.ctx.config = replace(c.ctx.config, review_scope=scope)
+    common_base = git_command(c.history.origin, "rev-parse", "refs/heads/main")
+    c.history.tip = common_base
+    c.history.update({"main-only.txt": "unrelated base work"})
+    risk_bases = []
+    notes = run_review._risk_notes
+
+    def risk_notes(git, base):
+        risk_bases.append(base)
+        return notes(git, base)
+
+    monkeypatch.setattr(run_review, "_risk_notes", risk_notes)
+    orch.rerun_review(c.ctx, 1)
+
+    assert risk_bases == [common_base] * (2 if scope == "pr-body" else 1)
+    call, = c.review_calls
+    assert "diff --git a/feature.txt b/feature.txt" in call["prompt"]
+    assert "main-only.txt" not in call["prompt"]
+    assert c.tracker.merged_prs == [c.pr]
 
 
 @pytest.mark.parametrize("change", ["base", "head", "body", "approval", "risk"])
@@ -522,6 +635,20 @@ def test_hint_keeps_native_goal_and_is_consumed_once(run_case, native):
         assert c.executor.calls[0]["goal"] == runner.goal_condition(c.ctx.config.acceptance_dir)
     assert "Use existing locale" not in second
     assert not hint.exists()
+
+
+def test_retry_adds_to_undelivered_advice_and_never_clears_it(run_case):
+    c = run_case
+    c.store.finish_run(1, outcome="blocked")
+    c.tracker.remove_labels(1, ["running"])
+    c.tracker.add_labels(1, ["blocked"])
+    path = c.store.root / "hints/1.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Preserve the receipt timezone")  # A talk message not yet delivered.
+    orch.retry(c.ctx, 1)
+    assert path.read_text() == "Preserve the receipt timezone"
+    orch.retry(c.ctx, 1, "Use the selected locale")
+    assert path.read_text() == "Preserve the receipt timezone\n\nUse the selected locale"
 
 
 @pytest.mark.parametrize("entry", ["retry", "resolve-fail"])
