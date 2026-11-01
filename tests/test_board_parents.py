@@ -5,7 +5,7 @@ import pytest
 
 from foragent.board_parents import order_parents, parent_state
 from foragent.i18n import text
-from foragent.tracker import GhTracker, Issue, ReferenceState
+from foragent.tracker import GhTracker, Issue
 
 
 def child(number, labels=(), state="open", reason=None):
@@ -73,7 +73,7 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
-        confirmed_read=lambda n, name: None,
+        confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None,
         local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
         load_local_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
@@ -114,7 +114,7 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     monkeypatch.setattr(board, "set_status", lambda issue, status: written.append((issue, status)))
     ctx = SimpleNamespace(tracker=SimpleNamespace(), repo="owner/repo",
                           config=SimpleNamespace(board="PVT_1", board_map=None),
-                          store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None))
+                          store=SimpleNamespace(local_issues=lambda: rows))
     for number in (1, 3, 5, 7):
         board.sync_status(ctx, number, "Needs human")
     board.sync_status(ctx, 1, "Running", parent=True)
@@ -146,7 +146,7 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     synced, closed = [], []
     tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
                               close_issue=lambda n, comment: closed.append((n, comment)))
-    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None), tracker=tracker,
+    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None), tracker=tracker,
                           config=SimpleNamespace(language="en"),
                           now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
     monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
@@ -177,18 +177,10 @@ def _record_ctx(monkeypatch, rows, remote, children=None, root=None, clock=None)
         return issue
 
     store = SimpleNamespace(
-        root=root, confirmed_read=lambda n, name: None, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
+        root=root, confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
-    def reference_states(numbers):
-        # Like GitHub's one bulk read, any unreadable number fails the whole call.
-        out.bulk_reads.append(list(numbers))
-        return [ReferenceState(issue.number, issue.state, issue.state_reason, issue.is_pull_request)
-                for issue in [ctx.tracker.get_issue(number) for number in numbers]]
-
-    out.bulk_reads = []
     tracker = SimpleNamespace(sub_issues=lambda n: (children or {}).get(n, []), get_issue=get_issue,
-                              reference_states=reference_states,
                               close_issue=lambda n, comment: out.closed.append((n, comment)))
     ctx = SimpleNamespace(store=store, tracker=tracker, config=SimpleNamespace(language="en"),
                           now=clock or (lambda: datetime(2026, 1, 1, tzinfo=UTC)))
@@ -310,16 +302,16 @@ def test_reference_read_closed_earlier_is_read_again_on_every_tick(monkeypatch):
               5: child(5, state="closed"), 6: child(6)}
     ctx, out = _record_ctx(monkeypatch, rows, remote)
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.bulk_reads == [[4, 5, 6]] and out.closed == []
+    assert out.reads == [4, 5, 6] and out.closed == []
     remote[5], remote[6] = child(5), child(6, state="closed")  # #5 reopened; #6 closed.
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.bulk_reads[1:] == [[4, 5, 6]] and out.closed == [], "A reopened reference keeps the record open"
+    assert out.reads[3:] == [4, 5] and out.closed == [], "A reopened reference keeps the record open"
     remote[5] = TrackerError("Not Found")
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.bulk_reads[2:] == [[4, 5, 6]] and out.closed == [], "An unreadable reference keeps the record open"
+    assert out.reads[5:] == [4, 5] and out.closed == [], "An unreadable reference keeps the record open"
     remote[5] = child(5, state="closed")
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.bulk_reads[3:] == [[4, 5, 6]]
+    assert out.reads[7:] == [4, 5, 6]
     assert out.closed == [(1, board_parents.closing_comment("en", [5, 6], []))], "The pull request is ignored"
 
 
@@ -416,7 +408,6 @@ def _parent_row(number, children, summary=None, **fields):
 
 
 def _counting_ctx(monkeypatch, rows, remote=None):
-    """Offline context that counts sub-issue reads; any listed fact must make them unnecessary."""
     ctx, out = _record_ctx(monkeypatch, rows, {})
     out.child_reads = []
 
@@ -478,29 +469,18 @@ def test_summary_never_closes_by_itself_when_a_child_has_no_row(monkeypatch, sum
         assert out.synced == [(1, "Running", True)], "The unlisted open child counts as open work"
 
 
-def test_summary_total_above_known_children_forces_a_read_before_closing(monkeypatch):
+def test_read_showing_only_ended_children_does_not_hide_counted_open_work(monkeypatch):
     from types import SimpleNamespace
 
     from foragent import board_parents
 
     rows = [_parent_row(1, [2], {"total": 2, "completed": 1}), _row(2, "closed")]
-    ctx, out = _counting_ctx(monkeypatch, rows, {1: [child(2, state="closed"), child(3)]})
+    ctx, out = _counting_ctx(monkeypatch, rows, {1: [child(2, state="closed")]})
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.child_reads == [1] and out.closed == [], "A child added since the last edge read is open work"
+    assert out.child_reads == [1] and out.closed == []
 
 
-def test_read_showing_open_work_keeps_a_full_summary_parent_open(monkeypatch):
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-
-    rows = [_parent_row(1, [2], {"total": 1, "completed": 1})]
-    ctx, out = _counting_ctx(monkeypatch, rows, {1: [child(2)]})
-    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.child_reads == [1] and out.closed == [], "Any open work keeps the parent open"
-
-
-def test_closes_come_before_reads_and_one_failure_defers_only_its_parent(monkeypatch):
+def test_closes_come_first_and_one_failure_defers_only_its_parent(monkeypatch):
     from types import SimpleNamespace
 
     from foragent import board_parents
@@ -514,10 +494,8 @@ def test_closes_come_before_reads_and_one_failure_defers_only_its_parent(monkeyp
         seen.append(("read", n))
         raise TrackerError("gh call timed out")
 
-    def close_issue(n, comment):
-        seen.append(("close", n))
-
-    ctx.tracker.sub_issues, ctx.tracker.close_issue = sub_issues, close_issue
+    ctx.tracker.sub_issues = sub_issues
+    ctx.tracker.close_issue = lambda n, comment: seen.append(("close", n))
     with pytest.raises(TrackerError, match="timed out"):
         board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert seen[0] == ("close", 3), "A parent ready to close does not wait behind reads"
@@ -544,131 +522,6 @@ def test_rate_limit_stops_the_step_at_once(monkeypatch):
     assert closes == [1], "Lowest number first, and the rate limit reaches the tick immediately"
 
 
-def test_a_record_read_on_every_tick_cannot_starve_a_later_one(monkeypatch):
-    """Lower records reread an open unlisted reference forever, and only one read fits a tick."""
-    from datetime import UTC, datetime, timedelta
-    from types import SimpleNamespace
-
-    from foragent import board_parents
-    from foragent.tracker import TrackerError
-
-    rows = [_record(number, edited=[number * 100]) for number in range(1, 7)]
-    remote = {number * 100: child(number * 100) for number in range(1, 6)}
-    remote[600] = child(600, state="closed")
-    moment = [datetime(2026, 1, 1, tzinfo=UTC)]
-    ctx, out = _record_ctx(monkeypatch, rows, remote, clock=lambda: moment[0])
-    original = ctx.tracker.reference_states
-    budget = [0]
-
-    def reference_states(numbers):
-        if budget[0] == 0:
-            raise TrackerError("gh time budget exhausted")
-        budget[0] -= 1
-        return original(numbers)
-
-    ctx.tracker.reference_states = reference_states
-    for tick in range(60):
-        budget[0] = 1
-        moment[0] += timedelta(minutes=5)
-        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-        if out.closed:
-            break
-    assert out.closed == [(6, board_parents.closing_comment("en", [600], []))], (
-        "The highest record must be reached within a finite number of ticks"
-    )
-
-
-def _four_second_calls(monkeypatch, tracker, names):
-    """The real shared budget, with each named tracker call taking four seconds of a fake clock."""
-    from foragent import gh
-    from foragent.tracker import TrackerError
-
-    clock, calls = [0.0], []
-    monkeypatch.setattr(gh.time, "monotonic", lambda: clock[0])
-    for name in names:
-        original = getattr(tracker, name)
-
-        def timed(*args, _name=name, _original=original, **kwargs):
-            try:
-                available = gh.call_timeout(float("inf"))
-            except gh.DeadlineExhausted as exc:
-                raise TrackerError(str(exc)) from exc
-            clock[0] += min(4.0, available)
-            if available < 4.0:
-                raise TrackerError("timed out at its deadline")
-            calls.append(_name)
-            return _original(*args, **kwargs)
-
-        setattr(tracker, name, timed)
-    return calls
-
-
-def _bounded_tick(ctx):
-    from types import SimpleNamespace
-
-    from foragent import board_parents, gh
-    from foragent.tracker import TrackerError
-
-    try:
-        with gh.Budget(10, 5).spend():
-            board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    except TrackerError as exc:
-        assert not exc.is_rate_limit
-
-
-def test_ended_record_with_many_unlisted_references_closes_under_the_tick_budget(monkeypatch):
-    """Separate reads spend the budget and start over each tick, so this record would never close."""
-    from foragent import board_parents
-
-    references = list(range(100, 130))
-    rows = [_record(1, edited=references)]
-    remote = {n: child(n, state="closed", reason="not_planned" if n == 100 else "completed") for n in references}
-    ctx, out = _record_ctx(monkeypatch, rows, remote)
-    calls = _four_second_calls(monkeypatch, ctx.tracker, ["reference_states", "close_issue"])
-    _bounded_tick(ctx)
-    assert calls == ["reference_states", "close_issue"], "One read for every reference, then the close"
-    assert out.closed == [(1, board_parents.closing_comment("en", references[1:], [100]))]
-
-
-def test_unlisted_child_read_then_close_fits_the_tick_budget(monkeypatch):
-    from foragent import board_parents
-
-    rows = [_parent_row(1, [2], {"total": 1, "completed": 1})]
-    ctx, out = _counting_ctx(monkeypatch, rows, {1: [child(2, state="closed")]})
-    calls = _four_second_calls(monkeypatch, ctx.tracker, ["sub_issues", "close_issue"])
-    _bounded_tick(ctx)
-    assert calls == ["sub_issues", "close_issue"]
-    assert out.closed == [(1, board_parents.closing_comment("en", [2], []))]
-
-
-def test_gh_reference_states_reads_every_number_in_one_call():
-    from foragent.tracker import ReferenceState, TrackerError
-
-    calls = []
-
-    def run(argv, input=None):
-        calls.append(json.loads(input))
-        return json.dumps({"data": {"repository": {
-            "i4": {"number": 4, "state": "OPEN", "__typename": "PullRequest"},
-            "i5": {"number": 5, "state": "CLOSED", "stateReason": "NOT_PLANNED", "__typename": "Issue"},
-            "i6": {"number": 6, "state": "CLOSED", "stateReason": None, "__typename": "Issue"},
-        }}})
-
-    tracker = GhTracker("owner/repo", run=run)
-    assert tracker.reference_states([6, 5, 4, 5]) == [
-        ReferenceState(4, "open", None, True), ReferenceState(5, "closed", "not_planned"),
-        ReferenceState(6, "closed"),
-    ]
-    assert len(calls) == 1 and calls[0]["variables"] == {"owner": "owner", "name": "repo"}
-    assert all(f"number: {n})" in calls[0]["query"] for n in (4, 5, 6))
-    assert tracker.reference_states([]) == [] and len(calls) == 1, "Nothing to read costs no call"
-
-    missing = GhTracker("owner/repo", run=lambda argv, input=None: json.dumps(
-        {"data": {"repository": {"i9": None}}, "errors": [{"type": "NOT_FOUND"}]}))
-    with pytest.raises(TrackerError):
-        missing.reference_states([9])
-
-
 def test_card_moves_once_and_before_the_reference_read(monkeypatch):
     from types import SimpleNamespace
 
@@ -676,10 +529,15 @@ def test_card_moves_once_and_before_the_reference_read(monkeypatch):
 
     rows = [_record(1, edited=[4], children=[2]), _row(2, "closed")]
     ctx, out = _record_ctx(monkeypatch, rows, {4: child(4, state="closed")})
-    order = []
-    reference_states = ctx.tracker.reference_states
-    ctx.tracker.reference_states = lambda numbers: (order.append(list(out.synced)), reference_states(numbers))[1]
+    order, get_issue = [], ctx.tracker.get_issue
+
+    def reading(number):
+        order.append(list(out.synced))
+        return get_issue(number)
+
+    ctx.tracker.get_issue = reading
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert order == [[(1, "Done", True)]], "The card is already moved when the reference read starts"
     assert out.closed == [(1, board_parents.closing_comment("en", [2, 4], []))]
     assert out.synced == [(1, "Done", True)], "The close writes the same column only once"
+

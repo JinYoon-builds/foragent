@@ -3,7 +3,6 @@
 A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
 each tick that read the issue listing, and closes it once no child is open.
-The listing is the fact source: per-issue reads are only for what it cannot show.
 A child closed as not planned (for example replaced by a newer order) has
 ended too; the one closing comment names completed and cancelled children in
 separate groups. An approved issue with sub-issues stays ordinary work.
@@ -22,13 +21,13 @@ import json
 import logging
 import re
 from collections.abc import Iterable
+from types import SimpleNamespace
 from typing import Any
 
 from foragent import board
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
 from foragent.orch_events import append_event
-from foragent.state_refresh import CHILD_READ
 from foragent.tracker import Issue, TrackerError
 
 log = logging.getLogger(__name__)
@@ -124,10 +123,9 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
 
     A closed reference counts as ended whatever its close reason; it is
     cancelled only when its reason is known to be not_planned. Listed issues
-    answer from the listing, and only when all of them are closed are the
-    unlisted references read fresh, in one call of this tick: separate reads
-    could outgrow the tick's budget and start over every time, since nothing
-    is kept between ticks. A number that reads as a pull request is ignored.
+    answer from the listing, and only when all of them are closed is each
+    unlisted reference read fresh, in this tick; nothing is kept between
+    ticks. A number that reads as a pull request is ignored.
     """
     closed, unlisted = {}, []
     for number in sorted(references - listed_prs):
@@ -138,22 +136,19 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
             return None  # Open work keeps the record open without spending reads.
         else:
             closed[number] = row.get("state_reason") == "not_planned"
-    if not unlisted:
-        return closed
-    try:
-        states = ctx.tracker.reference_states(unlisted)
-    except TrackerError as exc:
-        if exc.is_rate_limit:
-            raise
-        log.warning("Could not read %s, which an order record references: %s",
-                    ", ".join(f"#{number}" for number in unlisted), exc)
-        return None
-    for reference in states:
-        if reference.is_pull_request:
-            continue
-        if reference.state != "closed":
+    for number in unlisted:
+        try:
+            issue = ctx.tracker.get_issue(number)
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
+            log.warning("Could not read #%s, which an order record references: %s", number, exc)
             return None
-        closed[reference.number] = reference.state_reason == "not_planned"
+        if issue.is_pull_request:
+            continue
+        if issue.state != "closed":
+            return None
+        closed[number] = getattr(issue, "state_reason", None) == "not_planned"
     return closed
 
 
@@ -166,42 +161,17 @@ def closing_comment(language: str, completed: list[int], cancelled: list[int]) -
     return " ".join(parts)
 
 
-def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]],
-                     remembered: list[dict[str, Any]] | None = None) -> list[Issue] | None:
-    """A parent's children as this tick's listing shows them; None when only a read can tell.
-
-    Child rows carry state, close reason and labels, so a child-only change is
-    seen even if the parent's own row did not change. The native summary only
-    checks the edges and, for a child with no row, shows open work; it never
-    closes anything by itself. GitHub's completed count includes cancelled
-    children, so completed < total means some child is open.
-
-    ``remembered`` is the sub-issue read a later listing confirmed: the parent
-    and its summary have not changed since. It answers for a child with no row,
-    so a sequence that ran out of budget continues after that read.
-    """
-    numbers = row.get("children") or []
-    memory = {child["number"]: child for child in remembered or ()}
-    known = [_listed_issue(rows.get(number) or memory[number]) for number in numbers
-             if number in rows or number in memory]
-    total = _summary(row).get("total")
-    if total is None:
-        return known if len(known) == len(numbers) else None
-    # A confirmed read that still disagrees with the total will not change by reading again.
-    if total != len(numbers) and (remembered is None or memory.keys() != set(numbers)):
-        return None
-    if len(known) == len(numbers) and total == len(numbers):
-        return known
-    counted = _with_counted_open_work(row, known)
-    return counted if counted != known or len(known) == len(numbers) else None
-
-
 def _summary(row: dict[str, Any]) -> dict[str, int]:
     return (row.get("observed") or {}).get("sub_issues") or {}
 
 
 def _with_counted_open_work(row: dict[str, Any], children: list[Issue]) -> list[Issue]:
-    """Children read or remembered, plus the open work the summary counts and they do not show."""
+    """The children shown, plus the open work the native summary counts and they do not show.
+
+    GitHub's completed count includes cancelled children, so completed < total
+    means some child is open. The summary only ever adds open work; it never
+    closes anything by itself.
+    """
     summary = _summary(row)
     total = summary.get("total")
     if (total is None or summary.get("completed", total) >= total
@@ -215,17 +185,101 @@ def _listed_issue(row: dict[str, Any]) -> Issue:
                  row.get("state", "open"), state_reason=row.get("state_reason"))
 
 
+def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]]) -> list[Issue] | None:
+    """A parent's children as this tick's listing shows them; None when only a read can tell.
+
+    Child rows carry state, close reason and labels, so a child-only change is
+    seen even if the parent's own row did not change.
+    """
+    numbers = row.get("children") or []
+    known = [_listed_issue(rows[number]) for number in numbers if number in rows]
+    total = _summary(row).get("total")
+    if total is not None and total != len(numbers):
+        return None
+    if len(known) == len(numbers):
+        return known
+    counted = _with_counted_open_work(row, known)
+    return counted if counted is not known else None
+
+
+def _issue_facts(issue: Issue) -> dict[str, Any]:
+    return {"number": issue.number, "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
+            "labels": sorted(issue.labels), "is_pull_request": issue.is_pull_request}
+
+
+def _issue_from(facts: dict[str, Any]) -> Issue:
+    return Issue(facts["number"], "", "", frozenset(facts["labels"]), facts["state"],
+                 facts["is_pull_request"], state_reason=facts["state_reason"])
+
+
+class _ActionCalls:
+    """The tracker as one parent's action sees it: a completed call is not repeated.
+
+    The one rule for every parent action, however many calls it needs: each
+    completed GitHub call is remembered with the listing facts it depended on
+    (the existing per-issue read memory), so a tick that runs out of budget
+    continues after the last completed call. A listing that shows different
+    facts ends the memory, and the action works from new reads.
+
+    An action that ran to its end forgets its issue reads. What it waits on
+    outside the listing can change without the listing showing it, so the next
+    tick reads it fresh (#837).
+    """
+
+    def __init__(self, ctx, number: int, links: list[int]):
+        self._tracker, self._store, self._number, self._links = ctx.tracker, ctx.store, number, links
+        self._issue_reads: set[str] = set()
+        self.interrupted = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tracker, name)
+
+    def _once(self, name: str, arguments: Any, call, encode, decode) -> Any:
+        key = f"parent-action:{name}:" + hashlib.sha256(
+            json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()
+        if name == "get_issue":
+            self._issue_reads.add(key)
+        remembered = self._store.confirmed_read(self._number, key)
+        if remembered is not None and remembered[0] is not None:
+            return decode(remembered[0])
+        baseline = self._store.read_baseline()
+        try:
+            result = call()
+        except TrackerError:
+            self.interrupted = True
+            raise
+        self._store.record_read(self._number, key, encode(result), baseline=baseline, links=self._links)
+        return result
+
+    def get_issue(self, number: int) -> Issue:
+        return self._once("get_issue", number, lambda: self._tracker.get_issue(number), _issue_facts, _issue_from)
+
+    def sub_issues(self, number: int) -> list[Issue]:
+        return self._once("sub_issues", number, lambda: self._tracker.sub_issues(number),
+                          lambda issues: [_issue_facts(issue) for issue in issues],
+                          lambda facts: [_issue_from(item) for item in facts])
+
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        return self._once("graphql", [query, variables], lambda: self._tracker.graphql(query, variables),
+                          lambda result: result, lambda result: result)
+
+    def finish(self) -> None:
+        if self.interrupted or not self._issue_reads:
+            return
+        baseline = self._store.read_baseline()
+        for key in self._issue_reads:
+            self._store.record_read(self._number, key, None, baseline=baseline)
+
+
 def follow_children(ctx, report) -> None:
     """Move each order parent's card to its children's column; close it when all its work is done.
 
-    Everything the listing establishes costs no GitHub call, so an unchanged
-    parent spends none of the shared budget. Parents ready to close go first,
-    lowest number first: a close succeeds once and leaves the list. The others
-    follow in an order drawn from the tick's time, with nothing stored, so a
-    parent that spends the budget on every tick (an unlisted reference is read
-    fresh each time) cannot keep starving a later one.
-    One parent's failure defers only that parent, and the step still reports
-    it; a rate limit stops the step at once.
+    The listing is the fact source, so an unchanged parent spends none of the
+    shared budget. Parents ready to close go first, lowest number first: a close
+    happens once and leaves the list. The others follow in an order drawn from
+    the tick's time, with nothing stored, so a parent that spends the budget on
+    every tick cannot keep starving a later one. One parent's failure defers
+    only that parent, and the step still reports it; a rate limit stops the step.
     """
     rows = ctx.store.local_issues()
     by_number = {row["number"]: row for row in rows}
@@ -244,7 +298,7 @@ def follow_children(ctx, report) -> None:
         return (all(by_number[n].get("state") == "closed" for n in references if n in by_number)
                 and any(n not in by_number for n in references))
 
-    def decide(number: int, children: list[Issue]) -> tuple[str | None, bool, dict[int, bool]]:
+    def decide(view, number: int, children: list[Issue]) -> tuple[str | None, bool, dict[int, bool]]:
         # Until a record closes, only an order parent's sub-issues move its card (today's handling).
         state = parent_state(children, open_prs) if number in parents else None
         work = {child.number for child in children}
@@ -253,7 +307,7 @@ def follow_children(ctx, report) -> None:
             done = None
             if all(child.state == "closed" for child in children):
                 # Sub-issues already carry their state; read only the other references.
-                done = _closed_references(ctx, records[number] - work, by_number, listed_prs)
+                done = _closed_references(view, records[number] - work, by_number, listed_prs)
             closes = done is not None and bool(work | done.keys())
             ended.update(done or {})
         elif number in unparseable:
@@ -262,18 +316,18 @@ def follow_children(ctx, report) -> None:
             closes = state == "Done"
         return state, closes, ended
 
-    def visit(number: int) -> None:
+    def act(number: int, calls: _ActionCalls) -> None:
+        view = SimpleNamespace(tracker=calls, store=ctx.store, config=ctx.config, repo=getattr(ctx, "repo", None))
         children = listed[number]
         if children is None:
-            children = _with_counted_open_work(by_number[number], ctx.tracker.sub_issues(number))
+            children = _with_counted_open_work(by_number[number], calls.sub_issues(number))
         moved = None
         if number in parents and needs_read(number, children):
-            # The card first: its column depends only on the children, and a reference read
-            # repeats every tick. Each step then fits a tick and leaves its result behind.
+            # The card's column depends only on the children, so it need not wait for reference reads.
             moved = parent_state(children, open_prs)
             if moved is not None:
-                board.sync_status(ctx, number, moved, parent=True)
-        state, closes, ended = decide(number, children)
+                board.sync_status(view, number, moved, parent=True)
+        state, closes, ended = decide(view, number, children)
         cancelled = [child.number for child in children
                      if child.state == "closed" and not _completed(child)]
         if cancelled and number in parents and not closes:  # A decision only while work remains.
@@ -293,18 +347,25 @@ def follow_children(ctx, report) -> None:
                                        completed=len(completed), cancelled=len(cancelled)))
             state = "Done"
         if state is not None and state != moved:
-            board.sync_status(ctx, number, state, parent=True)
+            board.sync_status(view, number, state, parent=True)
 
-    def remembered(number: int) -> list[dict[str, Any]] | None:
-        read = ctx.store.confirmed_read(number, CHILD_READ)
-        return read[0] if read else None
+    def visit(number: int) -> None:
+        linked = [*(by_number[number].get("children") or []), *records.get(number, ())]
+        # Only a row the listing showed can confirm a read; a row from another read has no listed facts.
+        calls = _ActionCalls(ctx, number, [n for n in dict.fromkeys(linked)
+                                           if n != number and (by_number.get(n) or {}).get("observed")])
+        try:
+            act(number, calls)
+        except TrackerError:
+            calls.interrupted = True
+            raise
+        calls.finish()
 
-    listed = {number: _listed_children(by_number[number], by_number, remembered(number))
-              for number in parents | records.keys()}
+    listed = {number: _listed_children(by_number[number], by_number) for number in parents | records.keys()}
     seed = ctx.now().isoformat()
     closing, others = [], []
     for number, children in listed.items():
-        ready = not needs_read(number, children) and decide(number, children)[1]
+        ready = not needs_read(number, children) and decide(ctx, number, children)[1]
         (closing if ready else others).append(number)
 
     def drawn(number: int) -> bytes:

@@ -80,10 +80,8 @@ class FakeProjects:
                     items.append({"id": item["id"], "project": {"id": project["id"]},
                                   "fieldValueByName": {"name": option["name"], "optionId": option["id"]}
                                   if option else None})
-            project = self.projects.get(variables.get("id"))
             result = {"repository": {"issue": {"id": content_id, "projectItems": self._connection(
-                items, variables.get("cursor"))}},
-                "node": {"fields": self._connection(list(project["fields"].values()))} if project else None}
+                items, variables.get("cursor"))}}}
         elif operation == "ForagentBoardCards":
             project = self.projects.get(variables["id"])
             node = None

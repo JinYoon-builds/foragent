@@ -59,16 +59,6 @@ class Comment:
 
 
 @dataclass(frozen=True)
-class ReferenceState:
-    """What one bulk read of a plan reference shows; too little to be an issue observation."""
-
-    number: int
-    state: str
-    state_reason: str | None = None
-    is_pull_request: bool = False
-
-
-@dataclass(frozen=True)
 class Dependency:
     number: int
     state: IssueState
@@ -105,7 +95,6 @@ class Tracker(Protocol):
     def add_blocked_by(self, n: int, blocker: int) -> None: ...
     def remove_blocked_by(self, n: int, blocker: int) -> None: ...
     def get_issue(self, n: int) -> Issue: ...
-    def reference_states(self, numbers: Iterable[int]) -> list[ReferenceState]: ...
     def body_last_edited_at(self, n: int) -> str | None: ...
     def label_events(self, n: int) -> list[LabelEvent]: ...
     def blocked_by(self, n: int) -> list[Dependency]: ...
@@ -296,13 +285,8 @@ class RecordingTracker:
 
     def sub_issues(self, n):
         started = self._started()
-        store = self._context.store
-        baseline = store.read_baseline()
         children = self._tracker.sub_issues(n)
         self._ingest(children, started)
-        store.record_child_read(n, [{"number": child.number, "state": child.state,
-                                     "state_reason": child.state_reason, "labels": sorted(child.labels)}
-                                    for child in children], started=started, baseline=baseline)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
 
@@ -774,12 +758,6 @@ class FakeTracker:
     def list_open_issues(self) -> list[Issue]:
         return [issue for issue in self.issues.values() if issue.state == "open" and not issue.is_pull_request]
 
-    def reference_states(self, numbers: Iterable[int]) -> list[ReferenceState]:
-        """Like GitHub's single GraphQL read: one missing number fails the whole call."""
-        issues = [self.get_issue(number) for number in numbers]
-        return [ReferenceState(issue.number, issue.state, issue.state_reason, issue.is_pull_request)
-                for issue in issues]
-
     def list_issues(self, state: str = "all") -> list[Issue]:
         return [issue for issue in self.issues.values()
                 if not issue.is_pull_request and (state == "all" or issue.state == state)]
@@ -1114,24 +1092,6 @@ class GhTracker:
             return result
         except json.JSONDecodeError as exc:
             raise TrackerError(f"invalid GraphQL JSON: {exc}") from exc
-
-    def reference_states(self, numbers: Iterable[int]) -> list[ReferenceState]:
-        """Read every number's state in one call; GraphQL errors, such as a missing number, fail it all."""
-        numbers = sorted(set(numbers))
-        if not numbers:
-            return []
-        owner, name = self.repo.split("/", 1)
-        reads = " ".join(f"""i{int(number)}: issueOrPullRequest(number: {int(number)}) {{
-          ... on Issue {{ number state stateReason }} ... on PullRequest {{ number state }} __typename
-        }}""" for number in numbers)
-        repository = self.graphql(
-            "query ForagentReferenceStates($owner: String!, $name: String!) { "
-            f"repository(owner: $owner, name: $name) {{ {reads} }} }}",
-            {"owner": owner, "name": name},
-        )["data"]["repository"]
-        return [ReferenceState(item["number"], item["state"].lower(), (item.get("stateReason") or "").lower() or None,
-                               item["__typename"] == "PullRequest")
-                for item in (repository[f"i{number}"] for number in numbers)]
 
     def list_open_issues(self) -> list[Issue]:
         return self.list_issues("open")
