@@ -133,8 +133,8 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
     the event) then runs under ``worktree_lock(n)``, the lock the tick's stall and runtime
     stop also take, with the opener lock inside it.
 
-    ``accepted(message)`` persists the issue-owned copy or publication intent before any
-    delivery effect. If persistence fails, the message is neither saved nor sent.
+    ``accepted(message)`` persists the issue-owned copy before delivery or a manual-command
+    handoff. If persistence fails, no advice is saved, sent or exposed as a command.
     """
     language = config.language
     root = (repo_root or Path.cwd()).resolve()
@@ -216,12 +216,12 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
                     target.get("window_id") or target.get("handle"), now)
         return sent or text("talk_reshown", language, n=number, screen="tmux" if "socket" in current else "orca")
     opener = _opener(store, root)
+    if prompt and not running:
+        accept()  # A printed resume command hands off advice just like a launched terminal.
     if opener is None:
         return " ".join(filter(None, [sent, text("talk_manual", language, command=f"cd {shlex.quote(str(cwd))} && "
                                                   + shlex.join(command))]))
     trackable = opener["kind"] in {"orca", "tmux"}
-    if prompt and not running:
-        accept()
     try:
         handle = _launch(opener, cwd, title, command)
     except subprocess.SubprocessError as exc:

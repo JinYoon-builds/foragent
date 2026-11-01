@@ -1475,3 +1475,65 @@ def test_talk_publication_failure_prevents_local_acceptance_or_delivery(
     assert not (store.root / "hints/1.txt").exists()
     assert not terminals.opened()
     assert not any(Path(argv[0]).name == "codex" for argv in terminals.calls)
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("outcome", ["blocked", "merged"])
+@pytest.mark.parametrize("queued", [False, True])
+def test_manual_resume_advice_is_public_before_the_command_is_printed(
+    store, tmp_path, monkeypatch, capsys, executor, outcome, queued,
+):
+    import shlex
+
+    from foragent import cli, orch_advice
+    from foragent.commands import lanes as lane_command
+    from foragent.tracker import FakeTracker, TrackerError
+
+    session(store, executor)
+    store.finish_run(1, outcome=outcome)
+    terminals = Terminals(monkeypatch, opener="none")
+    tracker = FakeTracker()
+    tracker.add_issue(1, "Keep the selected locale")
+    monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
+    if queued:
+        def refuse(number, body):
+            raise TrackerError("HTTP 502: Bad Gateway")
+        monkeypatch.setattr(tracker, "comment", refuse)
+    message = "Keep  labels\n\n  '한국어' and --help"
+    printed = []
+    original_print = print
+
+    def print_after_publication(value, *args, **kwargs):
+        if kwargs.get("file") is None:
+            bodies = [comment.body for comment in tracker.list_comments(1)]
+            bodies += [entry["body"] for entry in store.github_outbox() if entry["action"] == "comment"]
+            assert bodies == [orch_advice.talk_body(message)]
+            printed.append(value)
+        original_print(value, *args, **kwargs)
+
+    monkeypatch.setattr(lane_command, "print", print_after_publication, raising=False)
+    assert _cli(store, monkeypatch, tmp_path, "--message", message, executor=executor) == 0
+    assert len(printed) == 1
+    words = shlex.split(printed[0].split("run: ", 1)[1])
+    assert words[-2:] == ["--", message]
+    assert words[4:6] == ["resume" if executor == "codex" else "--resume", "thread-1"]
+    assert printed[0] in capsys.readouterr().out
+    assert not terminals.opened() and not (store.root / "hints/1.txt").exists()
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+@pytest.mark.parametrize("outcome", ["blocked", "merged"])
+def test_manual_resume_does_not_expose_advice_when_publication_cannot_be_saved(
+    store, tmp_path, monkeypatch, executor, outcome,
+):
+    session(store, executor)
+    store.finish_run(1, outcome=outcome)
+    terminals = Terminals(monkeypatch, opener="none")
+
+    def refuse(message):
+        raise OSError("cannot persist publication")
+
+    with pytest.raises(OSError, match="cannot persist publication"):
+        lanes.talk(1, message="Keep this on the issue", store=store, config=config(executor=executor),
+                   repo_root=tmp_path, accepted=refuse)
+    assert not terminals.opened() and not (store.root / "hints/1.txt").exists()
