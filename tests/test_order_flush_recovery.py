@@ -147,3 +147,102 @@ def test_empty_path_list_never_stages_all_unrelated_changes(waiting, monkeypatch
     assert result["status"] == "published"
     assert git_command(root, "ls-files", "--stage") == before
     assert not (root / "docs/decisions.md").read_text().count("One retained decision")
+
+
+def test_landed_batch_is_not_rechecked_against_the_commit_it_made(waiting, monkeypatch):
+    """A statement order's evidence names the base it lands on; its own commit moves HEAD."""
+    from foragent import order
+
+    root, config, tracker, git, store = waiting
+    plan = {"id": "2026-11-01-reviewed", "title": "Reviewed", "summary": "Reviewed", "spec_markdown": "# Reviewed\n",
+            "new_lanes": [], "edits": [], "issues": [
+                {"key": "api", "title": "API", "goal": "Do it.", "out_of_scope": "Other.", "done_when": ["true"],
+                 "checklist": [], "lane": "main", "size": "s", "blocked_by": [], "acceptance_files": {},
+                 "statements": ["It works."]}]}
+    from foragent import order_submissions
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args, **kwargs: None)
+    order_submissions.retain(plan, "owner/repo", "chosen", approve=True, approve_keys=[], approve_numbers=[],
+                             language=config.language, files={"docs/specs/2026-11-01-reviewed.md": "# Reviewed\n"})
+    base = git.head_sha()
+    monkeypatch.setattr(order, "require_reviewed_tests",
+                        lambda *args, **kwargs: {"api": {"base_revision": base}})
+    monkeypatch.setattr(order.order_reviewed, "require_reviewed_bytes", lambda *args, **kwargs: None)
+    monkeypatch.setattr(order.order_reviewed, "require_route_kept", lambda *args, **kwargs: None)
+    fail_push(waiting, monkeypatch)
+    assert git.head_sha() != base
+    assert flush(waiting)["status"] == "published"
+    assert [issue.title for issue in tracker.list_issues() if issue.title == "API"] == ["API"]
+    assert git_command(root, "log", "--format=%s", "--grep=Foragent batch").count("Foragent batch") == 1
+
+
+def approve_owner(case):
+    """An approved issue outside the batch comes to lock the file the batch rewrites."""
+    tracker = case[2]
+    number = tracker.create_issue("Owner", "No locks yet.", ["approved"])
+    tracker.update_issue(number, title="Owner", body=('<!-- foragent:plan id=other map={} acceptance={"%d": '
+                                       '{"docs/decisions.md": "locked"}} -->' % number))
+    return number
+
+
+def test_retried_push_refuses_an_owner_approved_since_the_commit(waiting, monkeypatch):
+    _root, _config, tracker, git, store = waiting
+    fail_push(waiting, monkeypatch)
+    sha = git.head_sha()
+    owner = approve_owner(waiting)
+    pushed = []
+    with monkeypatch.context() as patch:
+        patch.setattr(git, "push_base", pushed.append)
+        with pytest.raises(PlanError, match=f"#{owner}"):
+            flush(waiting)
+    assert not pushed
+    assert git.head_sha() == sha
+    assert order_notes.pending(store)["notes"][0]["status"] == "waiting"
+    tracker.remove_labels(owner, ["approved"])
+    assert flush(waiting)["status"] == "published"
+    intact(waiting)
+
+
+def test_uncommitted_resume_refuses_an_owner_approved_since_the_intent(waiting, monkeypatch):
+    _root, _config, tracker, git, _store = waiting
+    head = git.head_sha()
+
+    def stop(paths, title):
+        raise Interrupted()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(git, "commit_paths", stop)
+        with pytest.raises(Interrupted):
+            flush(waiting)
+    owner = approve_owner(waiting)
+    with pytest.raises(PlanError, match=f"#{owner}"):
+        flush(waiting)
+    assert git.head_sha() == head
+    tracker.remove_labels(owner, ["approved"])
+    assert flush(waiting)["status"] == "published"
+    intact(waiting)
+
+
+def test_resume_holds_the_shared_publication_gate(waiting, monkeypatch):
+    from contextlib import contextmanager
+
+    from foragent import order_reviewed
+
+    git = waiting[3]
+    fail_push(waiting, monkeypatch)
+    held, gate, push = [], order_reviewed.publication_gate, git.push_base
+
+    @contextmanager
+    def spy(repo):
+        with gate(repo):
+            held.append(True)
+            yield
+            held.pop()
+
+    def pushed(branch):
+        assert held
+        return push(branch)
+
+    monkeypatch.setattr(order_reviewed, "publication_gate", spy)
+    monkeypatch.setattr(git, "push_base", pushed)
+    assert flush(waiting)["status"] == "published"
+    assert not held

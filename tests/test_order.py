@@ -53,8 +53,14 @@ class PublishingGit:
     def head_sha(self):
         return "published"
 
+    def fetch(self, *args):
+        pass
+
+    def committed_paths(self, base_ref):
+        return set()
+
     def blob_shas(self, ref, paths):
-        assert ref == "published"
+        assert ref in {"published", "HEAD", "origin/main"}
         return {path: self._blob(self.saved[path]) if path in self.saved else "missing" for path in paths}
 
     @staticmethod
@@ -71,11 +77,9 @@ class PublishingGit:
         self.saved.update(contents)
         self.pushed = False
 
-    def fetch(self, remote="origin", ref=None):
-        pass
-
     def is_ancestor(self, ancestor, head):
-        return self.pushed if head.startswith("origin/") else ancestor == "published"
+        # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
+        return self.pushed if head.startswith("origin/") else ancestor in {"published", "origin/main"}
 
     def push_base(self, branch):
         self.pushed = True
@@ -165,6 +169,8 @@ def test_deferred_order_retains_exact_plan_and_approval_selection(publishing, pl
 
     original = deepcopy(plan)
     report = publish(publishing, plan, defer="next-code-merge", **selection)
+    assert report.waiting_for == "next-code-merge"
+    assert report.affected == {}
     store = StateStore.for_repo("owner/repo")
     row, = order_notes.pending(StateStore(store.root))["orders"]
     assert row["plan"] == original
@@ -1344,6 +1350,23 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_proposal_survives_the_decision_marker_publish_appends(publishing, plan, monkeypatch, newline):
+    """Decision links are bookkeeping like the plan-child marker; they are not what preread read (#1025)."""
+    from foragent import decisions
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    item = plan["issues"][0]
+    child = decisions.with_marker(_child_body(plan, item, config), ["D79"], None)
+    assert child.rstrip().endswith(decisions.marker(["D79"]))
+    assert _handover(root, 7, child.replace("\n", newline), API_FILES)["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, decisions.with_marker(child, [], None).replace("\n", newline), API_FILES) is not None
+    changed = decisions.with_marker(_child_body(plan, {**item, "goal": item["goal"] + " More."}, config), ["D79"], None)
+    assert _handover(root, 7, changed, API_FILES) is None, "the marker never hides a changed WHAT"
+
+
 @pytest.mark.parametrize("section", ["goal", "out_of_scope"])
 def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
     """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
@@ -2387,7 +2410,7 @@ def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
 
 def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT]
     with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
         publish(publishing, plan, approve=True)
@@ -2401,7 +2424,7 @@ def test_invalid_statements_name_the_field(publishing, plan, value):
 
 
 def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
     publish(publishing, plan)
     body = publishing[2].get_issue(2).body
@@ -2527,6 +2550,314 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "Waiting for machine capacity" in err
     order.preread(plan, root, config)  # A free slot: no notice.
     assert "own turn" not in capsys.readouterr().err
+
+
+@pytest.fixture
+def shared_order(offline_publication, plan, monkeypatch):
+    """Order A's two children approved and snapshotted, both locking FILE; order B changes FILE."""
+    root, config, tracker, git, _, origin = offline_publication
+    config = replace(config, approvers=["human"])
+    clock = [BASE_TIME + timedelta(hours=1)]
+    tracker._now = lambda: clock[0]
+    store = StateStore(root / ".foragent/state", now=lambda: clock[0])
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kwargs: store))
+    plan["issues"][1]["done_when"] = [f"uv run pytest -q {FILE}"]
+    plan["issues"][1]["blocked_by"] = []
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
+    ctx = TickContext(repo="owner/repo", repo_root=root, tracker=tracker, store=store, config=config, git=git,
+                      now=lambda: clock[0], launcher=lambda number: None, start_runs=False,
+                      runner_process_exists=lambda number: False)
+    tick(ctx)
+    assert store.load_approval(2) is not None and store.load_approval(3) is not None
+    clock[0] += timedelta(hours=1)
+    change = deepcopy(plan)
+    item = deepcopy(plan["issues"][0])
+    item.update(key="change", title="Shared test amendment", blocked_by=[])
+    item["acceptance_files"][FILE] = "assert 1 == 1\n"
+    change.update(id="2026-10-21-shared-change", title="Change a shared test", issues=[item], edits=[])
+    return SimpleNamespace(root=root, config=config, tracker=tracker, git=git, store=store, ctx=ctx,
+                           plan=change, clock=clock, origin=origin,
+                           original=plan["issues"][0]["acceptance_files"][FILE])
+
+
+def _publish_shared(case, **kwargs):
+    return order.publish(case.plan, case.root, case.config, case.tracker, repo="owner/repo", git=case.git, **kwargs)
+
+
+def _push_elsewhere(case, content: str) -> None:
+    """Another clone's publication: a commit on origin's main replacing FILE."""
+    parent = git_command(case.origin, "rev-parse", "refs/heads/main")
+    data = content.encode()
+    stream = ("commit refs/heads/main\ncommitter Other Clone <other@example.com> 1792483200 +0000\n"
+              f"data 5\nOther\nfrom {parent}\nM 100644 inline {FILE}\ndata {len(data)}\n{content}\ndone\n")
+    git_command(case.origin, "fast-import", "--quiet", input=stream)
+
+
+def test_shared_lock_dry_run_lists_owners_outside_the_order(shared_order):
+    report = _publish_shared(shared_order, dry_run=True)
+    assert report.affected == {2: [FILE], 3: [FILE]}
+    assert f"#2: {FILE}" in report.summary() and f"#3: {FILE}" in report.summary()
+
+
+def test_shared_lock_refusal_writes_nothing(shared_order, monkeypatch):
+    case = shared_order
+    entered, ensured = [], []
+    monkeypatch.setattr(case.git, "publish_lock", lambda: entered.append(1) or pytest.fail("publish lock taken"))
+    ensure_labels = case.tracker.ensure_labels
+    monkeypatch.setattr(case.tracker, "ensure_labels", lambda specs: ensured.append(specs) or ensure_labels(specs))
+    old, old_blob = (case.root / FILE).read_bytes(), case.git.blob_sha("origin/main", FILE)
+    issues, labels = dict(case.tracker.issues), dict(case.tracker.labels)
+    events = {n: case.tracker.label_events(n) for n in (2, 3)}
+    snapshots = {n: case.store.load_approval(n) for n in (2, 3)}
+    with pytest.raises(order.PlanError) as refused:
+        _publish_shared(case, approve=True)
+    assert f"#2: {FILE}" in str(refused.value) and f"#3: {FILE}" in str(refused.value)
+    assert "withdraw" in str(refused.value)
+    assert (case.root / FILE).read_bytes() == old and case.git.blob_sha("origin/main", FILE) == old_blob
+    assert case.tracker.issues == issues and case.tracker.labels == labels
+    assert {n: case.tracker.label_events(n) for n in (2, 3)} == events
+    assert {n: case.store.load_approval(n) for n in (2, 3)} == snapshots
+    assert entered == [] and ensured == []  # Refused before the publish lock and any label.
+
+
+def test_shared_lock_identical_bytes_publish_without_touching_approvals(shared_order):
+    case = shared_order
+    case.plan["issues"][0]["acceptance_files"][FILE] = case.original
+    events = {n: case.tracker.label_events(n) for n in (2, 3)}
+    report = _publish_shared(case, approve=True)
+    assert report.affected == {}
+    assert {n: case.tracker.label_events(n) for n in (2, 3)} == events
+
+
+@pytest.mark.parametrize("source", ["parent-map", "snapshot"])
+def test_shared_lock_owner_is_found_from_either_lock_record(shared_order, source):
+    """The parent's acceptance map and this machine's snapshot each name the locked path on their own."""
+    case = shared_order
+    if source == "parent-map":
+        for number in (2, 3):
+            (case.store.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
+            assert case.store.load_approval(number) is None
+    else:
+        parent = case.tracker.get_issue(1)
+        case.tracker.update_issue(1, title=parent.title, body=re.sub(r" acceptance=\{[^\n]*\}(?= -->)", "", parent.body))
+    assert _publish_shared(case, dry_run=True).affected == {2: [FILE], 3: [FILE]}
+
+
+def test_shared_lock_dry_run_reads_the_remote_base(shared_order):
+    """Another clone already published B; this clone still has A locally and proposes A."""
+    case = shared_order
+    _push_elsewhere(case, "assert 2 == 2\n")
+    case.plan["issues"][0]["acceptance_files"][FILE] = case.original
+    assert case.git.blob_sha("origin/main", FILE) == order._blob(case.original.encode())  # Stale locally.
+    assert _publish_shared(case, dry_run=True).affected == {2: [FILE], 3: [FILE]}
+
+
+@pytest.mark.parametrize("change", ["approval", "remote-base", "local-commit"])
+def test_shared_lock_is_checked_again_after_the_base_update(shared_order, monkeypatch, change):
+    """A new owner or new remote bytes must cause refusal before even label setup."""
+    case = shared_order
+    if change == "approval":
+        for number in (2, 3):
+            case.tracker.remove_labels(number, ["approved", "ready"])
+    elif change == "remote-base":
+        case.plan["issues"][0]["acceptance_files"][FILE] = case.original
+    else:
+        _writes(case, {"tests/acceptance/test_other.py": "assert True\n"})
+    update_base = case.git.update_base
+    writes = []
+    labels = dict(case.tracker.labels)
+    snapshots = {n: case.store.load_approval(n) for n in (2, 3)}
+    for method in ("ensure_labels", "create_issue", "update_issue", "remove_labels", "comment", "close_issue"):
+        monkeypatch.setattr(case.tracker, method, lambda *a, _method=method, **kw: writes.append(_method))
+    monkeypatch.setattr(order, "_publish_files", lambda *a: writes.append("publish-files"))
+
+    def change_meanwhile(branch):
+        if change == "approval":
+            case.tracker.add_labels(2, ["approved"])
+        elif change == "remote-base":
+            _push_elsewhere(case, "assert 2 == 2\n")
+        else:
+            _local_commit(case, {FILE: "assert 2 == 2\n"})
+        return update_base(branch)
+
+    monkeypatch.setattr(case.git, "update_base", change_meanwhile)
+    with pytest.raises(order.PlanError, match=f"#2: {FILE}"):
+        _publish_shared(case)
+    assert writes == []
+    assert case.tracker.labels == labels
+    assert {n: case.store.load_approval(n) for n in (2, 3)} == snapshots
+
+
+def test_shared_lock_fetches_before_discovering_unpushed_overlap(shared_order, monkeypatch):
+    case = shared_order
+    case.plan["issues"][0]["acceptance_files"] = {"tests/acceptance/test_other.py": "assert True\n"}
+    case.plan["issues"][0]["done_when"] = ["uv run pytest -q tests/acceptance/test_other.py"]
+    fetches = []
+    monkeypatch.setattr(case.git, "fetch", lambda *args: fetches.append(args))
+    assert _publish_shared(case, dry_run=True).affected == {}
+    assert fetches == [("origin", "main")]
+
+
+@pytest.mark.parametrize("marker", ["<!-- foragent:v1 -->\n", ""], ids=["external", "legacy"])
+def test_shared_lock_owner_without_any_record_is_found_from_its_done_when(shared_order, marker):
+    """An approved issue no order recorded (or a legacy one): its Done when locks the file on every gate."""
+    case = shared_order
+    body = f"{marker}## Goal\nOther work.\n\n## Done when\n```sh\nuv run pytest -q {FILE}\n```\n"
+    number = case.tracker.create_issue("Approved elsewhere", body, [])
+    case.tracker.add_labels(number, ["approved"])
+    assert case.store.load_approval(number) is None
+    assert _publish_shared(case, dry_run=True).affected == {2: [FILE], 3: [FILE], number: [FILE]}
+    with pytest.raises(order.PlanError, match=f"#{number}: {FILE}"):
+        _publish_shared(case, approve=True)
+
+
+def test_shared_lock_owner_snapshotted_only_on_another_clone_is_found(shared_order):
+    """No parent map entry and no snapshot on this machine; another clone's gate still locks Done when."""
+    case = shared_order
+    parent = case.tracker.get_issue(1)
+    case.tracker.update_issue(1, title=parent.title, body=re.sub(r" acceptance=\{[^\n]*\}(?= -->)", "", parent.body))
+    for number in (2, 3):
+        (case.store.root / "approvals" / f"{number}.json").unlink()
+    assert _publish_shared(case, dry_run=True).affected == {2: [FILE], 3: [FILE]}
+
+
+def test_shared_lock_child_dropped_from_its_own_plan_is_listed(shared_order, plan):
+    """Republishing order A without "client" leaves #3 approved and locking FILE; it is not own any more."""
+    case = shared_order
+    plan["issues"][1]["done_when"] = [f"uv run pytest -q {FILE}"]
+    plan["issues"][1]["blocked_by"] = []
+    plan["issues"].pop(1)
+    plan["issues"][0]["acceptance_files"][FILE] = "assert 1 == 1\n"
+    report = order.publish(plan, case.root, case.config, case.tracker, repo="owner/repo", git=case.git,
+                           approve=True, dry_run=True)
+    assert report.affected == {3: [FILE]}
+
+
+def _approved_elsewhere(case, done_when: str) -> int:
+    body = f"<!-- foragent:v1 -->\n## Goal\nOther work.\n\n## Done when\n```sh\n{done_when}\n```\n"
+    number = case.tracker.create_issue("Approved elsewhere", body, [])
+    case.tracker.add_labels(number, ["approved"])
+    return number
+
+
+def _writes(case, files: dict[str, str]) -> None:
+    item = case.plan["issues"][0]
+    item["acceptance_files"] = files
+    item["done_when"] = [f"uv run pytest -q {name}" for name in files]
+
+
+@pytest.mark.parametrize("write", [FILE, "tests/acceptance/test_brand_new.py"], ids=["changed", "new"])
+def test_shared_lock_directory_lock_in_done_when_covers_files_beneath(shared_order, write):
+    case = shared_order
+    number = _approved_elsewhere(case, "uv run pytest -q tests/acceptance")
+    _writes(case, {write: "assert 1 == 1\n"})
+    assert _publish_shared(case, dry_run=True).affected[number] == [write]
+
+
+def test_shared_lock_subdirectory_lock_covers_only_its_own_tree(shared_order):
+    case = shared_order
+    number = _approved_elsewhere(case, "uv run pytest -q tests/acceptance/sub")
+    _writes(case, {"tests/acceptance/sub/test_inside.py": "assert True\n",
+                   "tests/acceptance/subway/test_neighbour.py": "assert True\n",
+                   "tests/acceptance/test_sibling.py": "assert True\n"})
+    assert _publish_shared(case, dry_run=True).affected[number] == ["tests/acceptance/sub/test_inside.py"]
+
+
+@pytest.mark.parametrize("source", ["snapshot", "parent-map"])
+def test_shared_lock_directory_lock_from_a_record_covers_files_beneath(shared_order, source):
+    """A snapshot or a parent's acceptance map can name a directory too."""
+    case = shared_order
+    number = _approved_elsewhere(case, "true")  # Its body names no path; only the record does.
+    if source == "snapshot":
+        case.store.save_approval(number, body="x", body_sha="x", acceptance_blobs={"tests/acceptance": "f" * 40},
+                                 approved_by="human", approved_at="2026-10-20T09:00:00+00:00")
+    else:
+        parent = case.tracker.get_issue(1)
+        case.tracker.update_issue(1, title=parent.title, body=parent.body.replace(
+            ' acceptance={', f' acceptance={{"{number}": {{"tests/acceptance": "{"f" * 40}"}}, ', 1))
+    _writes(case, {"tests/acceptance/test_brand_new.py": "assert True\n"})
+    assert _publish_shared(case, dry_run=True).affected.get(number) == ["tests/acceptance/test_brand_new.py"]
+
+
+def test_shared_lock_directory_lock_ignores_identical_bytes_beneath(shared_order):
+    case = shared_order
+    number = _approved_elsewhere(case, "uv run pytest -q tests/acceptance")
+    _writes(case, {FILE: case.original})
+    assert number not in _publish_shared(case, dry_run=True).affected
+
+
+def _local_commit(case, changes):
+    """Make unpushed commits without invoking Git hooks or the publication shim."""
+    from conftest import GitHistory
+
+    history = GitHistory(case.root, case.root, git_command(case.root, "rev-parse", "HEAD"))
+    history.update(changes)
+    git_command(case.root, "read-tree", "HEAD")
+    for name, content in changes.items():
+        path = case.root / name
+        if content is None:
+            path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+
+@pytest.mark.parametrize("kind", ["modified", "deleted", "added", "renamed"])
+def test_shared_lock_in_unpushed_commits_is_disclosed_and_refused(shared_order, monkeypatch, kind):
+    case = shared_order
+    # This order writes a different test: FILE travels only in earlier commits.
+    _writes(case, {"tests/acceptance/test_other.py": "assert True\n"})
+    target = "tests/acceptance/test_pending.py" if kind == "added" else FILE
+    owners = [2, 3]
+    if kind == "added":
+        owners = [_approved_elsewhere(case, "uv run pytest -q tests/acceptance")]
+    changes = {target: None if kind in {"deleted", "renamed"} else "assert 2 == 2\n"}
+    if kind == "renamed":
+        changes["tests/acceptance/test_renamed.py"] = case.original
+    _local_commit(case, changes)
+    _local_commit(case, {"unrelated.txt": "Another unpushed commit\n"})
+    expected = {n: sorted([target, "tests/acceptance/test_other.py"]) if kind == "added" else [FILE]
+                for n in owners}
+    assert _publish_shared(case, dry_run=True).affected == expected
+    before = (case.git.ref_sha("origin/main"), dict(case.tracker.issues), dict(case.tracker.labels),
+              {n: case.store.load_approval(n) for n in (2, 3)})
+    writes = []
+    monkeypatch.setattr(case.tracker, "ensure_labels", lambda *a: writes.append("labels"))
+    monkeypatch.setattr(case.git, "push_base", lambda *a: writes.append("push"))
+    with pytest.raises(order.PlanError) as refused:
+        _publish_shared(case)
+    assert all(f"#{n}: {', '.join(paths)}" in str(refused.value) for n, paths in expected.items())
+    assert writes == []
+    assert before == (case.git.ref_sha("origin/main"), dict(case.tracker.issues), dict(case.tracker.labels),
+                      {n: case.store.load_approval(n) for n in (2, 3)})
+    tick(case.ctx)
+    assert all(case.store.load_flag(n) is None and "approved" in case.tracker.get_issue(n).labels for n in (2, 3))
+
+
+@pytest.mark.parametrize("restore", ["commit", "plan"])
+def test_shared_lock_compares_final_bytes_of_the_whole_push(shared_order, restore):
+    case = shared_order
+    _local_commit(case, {FILE: "assert 2 == 2\n"})
+    if restore == "commit":
+        _local_commit(case, {FILE: case.original})
+        _writes(case, {"tests/acceptance/test_other.py": "assert True\n"})
+    else:
+        _writes(case, {FILE: case.original})
+    assert _publish_shared(case, dry_run=True).affected == {}
+    snapshots = {n: case.store.load_approval(n) for n in (2, 3)}
+    _publish_shared(case)
+    assert git_command(case.origin, "rev-parse", "refs/heads/main") == case.git.head_sha()
+    assert git_command(case.origin, "show", f"refs/heads/main:{FILE}") == case.original.rstrip("\n")
+    tick(case.ctx)
+    assert {n: case.store.load_approval(n) for n in (2, 3)} == snapshots
+    assert all(case.store.load_flag(n) is None for n in (2, 3))
+
+
+def test_shared_lock_remote_only_changes_are_not_proposed_deletions(shared_order):
+    case = shared_order
+    _push_elsewhere(case, "assert 2 == 2\n")
+    _writes(case, {"tests/acceptance/test_other.py": "assert True\n"})
+    assert _publish_shared(case, dry_run=True).affected == {}
 
 
 class _WaitIssue:
@@ -3202,3 +3533,48 @@ def test_flush_pushes_before_reading_only_required_issue_blob_metadata(publishin
     else:
         assert reads == [] and tracker.list_issues() == []
         assert [event[0] for event in events] == ["commit", "push"]
+
+
+@pytest.mark.parametrize("kind", ["plan", "unpushed", "notes-only"])
+def test_shared_lock_flush_refuses_before_checkpoint_or_publication(shared_order, monkeypatch, kind):
+    from foragent import order_flush, order_flush_journal, order_notes
+
+    case = shared_order
+    for number in (2, 3):
+        case.tracker.remove_labels(number, ["approved", "ready"])
+    if kind == "notes-only":
+        order_notes.append(case.store, kind="decision", boundary="chosen", content="Keep the decision")
+    else:
+        if kind == "unpushed":
+            _writes(case, {"tests/acceptance/test_other.py": "assert True\n"})
+        _publish_shared(case, defer="chosen")
+    for number in (2, 3):
+        case.tracker.add_labels(number, ["approved"])
+    if kind != "plan":
+        _local_commit(case, {FILE: "assert 2 == 2\n"})
+    before = (git_command(case.origin, "rev-parse", "refs/heads/main"),
+              (case.root / FILE).read_bytes(), dict(case.tracker.issues), dict(case.tracker.labels),
+              {n: case.store.load_approval(n) for n in (2, 3)})
+    labels = []
+    ensure = case.tracker.ensure_labels
+    monkeypatch.setattr(case.tracker, "ensure_labels", lambda specs: labels.append(specs) or ensure(specs))
+    with pytest.raises(order.PlanError) as refused:
+        order_flush.flush(case.root, case.config, case.tracker, case.git, case.store,
+                          repo="owner/repo", boundary="chosen")
+    assert f"#2: {FILE}" in str(refused.value) and f"#3: {FILE}" in str(refused.value)
+    assert order_flush_journal.entries(case.store) == []
+    assert labels == []
+    assert before == (git_command(case.origin, "rev-parse", "refs/heads/main"),
+                      (case.root / FILE).read_bytes(), dict(case.tracker.issues), dict(case.tracker.labels),
+                      {n: case.store.load_approval(n) for n in (2, 3)})
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_binding_ignores_decision_marker_line_endings(publishing, plan, newline):
+    from foragent import decisions
+
+    config = publishing[1]
+    item = plan["issues"][0]
+    plain = {**item, "goal": "Observable behaviour" + newline + "Remaining behaviour"}
+    marked = {**item, "goal": "Observable behaviour" + newline + decisions.marker([]) + newline + "Remaining behaviour"}
+    assert order._binding(plan, marked, config, REPO, {}) == order._binding(plan, plain, config, REPO, {})

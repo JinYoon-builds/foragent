@@ -9,31 +9,30 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
-from foragent.records import load_record
+from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
-from foragent.run_previous import retry_marker
+from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
-from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
+from foragent.tracker import Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -148,6 +147,7 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
            say: str | None = None) -> dict:
+    """Journal the verb and comment it on the issue."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
@@ -161,14 +161,10 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
     for row in ctx.store.local_issues():
-        if row["state"] != "open" or BLOCKED not in row["labels"]:
+        if row.get("is_pull_request", False) or row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
-        comments = [load_record(Comment, item) for item in row["comments"]]
-        flags = [(comment, match[1]) for comment in comments
-                 if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
-                                           comment.body.splitlines()[0] if comment.body else ""))]
-        latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
+        latest = current_blocker(row, ctx.store.github_outbox())
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
             reviews.append({"path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})
@@ -179,20 +175,22 @@ def list_blocked(ctx: RunContext) -> list[dict]:
                 tail = "".join(deque(stream, maxlen=60))
         items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
-                      "blocked_at": latest[0].created_at if latest else None,
-                      "details": latest[0].body if latest else "",
+                      "blocked_at": latest[0]["created_at"] if latest else None,
+                      "details": latest[0]["body"] if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
     append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    path = ctx.store.root / "hints" / f"{n}.txt"
-    if hint is not None:
-        ctx.store._atomic_write(path, hint)
-    else:
-        path.unlink(missing_ok=True)
+    # Undelivered advice (an earlier hint or a talk message) is kept; only delivery removes it.
+    error = None
+    if hint:
+        # The public fact (or durable publication intent) must precede deliverable local advice.
+        error = orch_advice.publish(ctx.tracker, ctx, n,
+                                    "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
+        add_hint(ctx.store, n, hint)
     # The next implementer receives the keep-work/defect-class default before any hint.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
@@ -200,14 +198,17 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    return error
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
-    _retry(ctx, n, hint)
+    publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
+    if publication_error:
+        return f"{summary} (issue comment queued for the gate after: {publication_error})"
     return summary
 
 
@@ -511,21 +512,22 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         datetime.fromisoformat(at)
     except ValueError as exc:
         raise OrchError("at must be an ISO8601 timestamp") from exc
-    checked = _premerge(ctx, n)
-    report = checked.report
-    if not report["ready"]:
-        broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
-        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
-                        f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
-    # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the
-    # turn claim to the merge, so every freshness check below runs after any lock wait.
+    # Refuse a live holder before waiting on its merge lock or doing premerge work.
+    # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
+    head = ctx.tracker.pr_head_sha(n)
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
-    with ctx.store.merge_lock():
-        if (holder := merge_turn.claim(ctx, place, checked.head)) is not None:
-            raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
-                            "run again after it finishes")
-        try:
+    if (holder := merge_turn.claim(ctx, place, head)) is not None:
+        raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
+                        "run again after it finishes")
+    try:
+        with ctx.store.merge_lock():
+            checked = _premerge(ctx, n)
+            report = checked.report
+            if not report["ready"]:
+                broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+                raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
+                                f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
             current = _open_pr(ctx, n)
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head
@@ -564,9 +566,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise
-        except BaseException:
-            merge_turn.withdraw(ctx, place)
-            raise
+    except BaseException:
+        merge_turn.withdraw(ctx, place)
+        raise
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)

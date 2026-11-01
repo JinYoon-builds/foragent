@@ -22,6 +22,7 @@ class Flag:
     number: int
     reason: str
     flagged_at: str
+    local_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,17 @@ class Run:
     kind: str = "issue"
     # The last head the test-harness guard passed: {"merge_base": sha, "guarded": commit or tree sha}.
     harness_guard: dict = field(default_factory=dict)
+    # The parent text this build first read (#1184) and the approval generation (body sha and
+    # approval time) it was read for: written only by run_parent when the build takes its snapshot,
+    # carried only across a gate continuation (stall, crash, limit-wait) of that generation.
+    # continued marks such a start, contract_published its public copy and build_id the build
+    # its contract comment names.
+    parent_context: str | None = None
+    contract_sha: str | None = None
+    contract_approved_at: str | None = None
+    contract_published: bool = False
+    continued: bool = False
+    build_id: str | None = None
 
     @property
     def key(self) -> int | str:
@@ -125,6 +137,9 @@ class Run:
     # The recorded session is not the running worker's (a fresh thread is starting, or it was
     # inherited from an earlier run and not resumed yet); nothing may be sent to it.
     session_stale: bool = False
+    # Merge queue waits and refused-merge pauses share a separate, per-run bound.
+    merge_waited_seconds: float = 0
+    merge_wait_polls: int = 0
 
     # A person's talk terminal is open (fa lanes talk): derived on every read from the talk
     # events by StateStore (D95), never stored; stall and runtime checks pause meanwhile.
@@ -173,3 +188,20 @@ def _at(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value) if value else None
     except (TypeError, ValueError):
         return None
+
+
+def carried_contract(previous: Run | None, restarted: bool, started_at: str) -> dict:
+    """The build fields a new run record takes (#1184).
+
+    A gate continuation is the same build: it carries the build id and the snapshot as saved,
+    with the approval generation the snapshot names. Whether that snapshot still applies is
+    decided in one place, run_parent.parent_context, against the approval the build uses.
+    Any other start (manual retry, lost record) is a new build named by its start time.
+    """
+    if not (restarted and previous is not None and previous.build_id is not None):
+        return {"continued": restarted, "build_id": started_at}
+    return {
+        "continued": True, "build_id": previous.build_id, "parent_context": previous.parent_context,
+        "contract_sha": previous.contract_sha, "contract_approved_at": previous.contract_approved_at,
+        "contract_published": previous.contract_published,
+    }

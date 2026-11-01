@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_notes, order_references
+from foragent import order_notes, order_references, order_reviewed
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_files import check_destinations, check_write
@@ -50,7 +50,7 @@ def _note_files(root, notes, language):
     return files
 
 
-def _preflight(rows, notes, root, config, tracker, repo):
+def _preflight(rows, notes, root, config, tracker, repo, git):
     prepared, files, roots = [], {}, {}
     for row in rows:
         try:
@@ -58,7 +58,7 @@ def _preflight(rows, notes, root, config, tracker, repo):
             publication = order._publication_checks(
                 plan, root, config, tracker, repo=repo, approve=row["approve"],
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-                retained_files=row.get("files"))
+                retained_files=row.get("files"), git=git, refreshed=True)
             _merge(files, publication.files, config.language)
         except (ValueError, OSError, TrackerError) as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
@@ -73,7 +73,17 @@ def _preflight(rows, notes, root, config, tracker, repo):
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
+    _refuse_affected(prepared, files, config, tracker, repo, git)
     return prepared, files, roots
+
+
+def _refuse_affected(prepared, files, config, tracker, repo, git):
+    # Compares with the tracking ref, which every caller has just fetched.
+    own = set().union(*(publication.own for _row, publication in prepared))
+    affected = order._affected_owners(tracker.list_issues(), own, files, repo, config, lambda: git, fetch=False)
+    if affected:
+        raise order.PlanError(text("order_locks_refused", config.language,
+                                   owners="\n".join(order._owner_lines(affected))))
 
 
 def _write(root, git, files, roots, title):
@@ -121,12 +131,11 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         sha = recovery.committed(root, config, git, store, batch, records)
         if sha is None:
             rows, notes = _members(store, batch)
-            prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo)
+            prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git)
             if set(files) != set(batch["paths"]):
                 raise order.PlanError(text("order_flush_paths_changed", config.language))
             sha = _write(root, git, files, roots, recovery.title(batch))
             journal.append(store, "committed", batch["batch"], sha=sha)
-    sha = recovery.push(config, git, store, batch, sha, recovering=resuming)
     completed = {row.get("entry", row.get("order")) for row in records
                  if row["batch"] == batch["batch"] and row["kind"] == "issues"}
     if prepared is None:
@@ -134,8 +143,12 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         prepared = [(row, order._publication_checks(
             row["plan"], root, config, tracker, repo=repo, approve=row["approve"],
             approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-            retained_files=row.get("files"))) for row in rows
+            retained_files=row.get("files"), landed=True)) for row in rows
             if row["entry_id"] not in completed and row["id"] not in completed]
+        # An owner approved since the commit may lock bytes this retried push would move.
+        if not git.is_ancestor(sha, f"origin/{config.base_branch}"):
+            _refuse_affected(prepared, {}, config, tracker, repo, git)
+    sha = recovery.push(config, git, store, batch, sha, recovering=resuming)
     for row, publication in prepared:
         if row["entry_id"] in completed or row["id"] in completed:
             continue
@@ -153,7 +166,8 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
 def flush(root, config, tracker, git, store, *, repo, boundary):
     # Before lock creation or checkpoint reads: a wrong-branch invocation has no effects.
     _require_base(git, config)
-    with journal.locked(store):
+    # The gate spans the checks below and every write, as in order.publish.
+    with journal.locked(store), order_reviewed.publication_gate(repo):
         records = journal.entries(store)
         done = {row["batch"] for row in records if row["kind"] == "done"}
         pending = [row for row in records if row["kind"] == "selected" and row["batch"] not in done]
@@ -174,7 +188,8 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         effective = [row for row in orders if row is latest[row["id"]]]
         with git.publish_lock():
             git.update_base(config.base_branch)
-            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo)
+            # Validate against the refreshed base before starting a durable batch.
+            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
