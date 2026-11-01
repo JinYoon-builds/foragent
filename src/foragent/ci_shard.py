@@ -91,9 +91,13 @@ def main():
                "excluded": excluded, "scope": scope, "duration_seconds": monotonic() - started,
                "base": base_result, "head": head_result}
     output = json.dumps(payload, separators=(",", ":"))
-    Path(os.environ["FA_REPORT_FILE"]).write_text(output, encoding="utf-8")
+    report = Path(os.environ["FA_REPORT_FILE"])
+    report.write_text(output, encoding="utf-8")
+    lost = sorted(set(base_result["passing_ids"]) - set(head_result["passing_ids"]))
+    # Beside the report, not in it: the verdict step prints these and the artifact stays one file.
+    report.with_suffix(".lost").write_text("".join(f"{node}\n" for node in lost), encoding="utf-8")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
-        stream.write("comparison=true\n")
+        stream.write(f"comparison=true\nlost={len(lost)}\n")
     print(output)
 
 

@@ -231,7 +231,6 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
             run_id = need("run.id", _positive, "a positive integer")
             equal("run.head_sha", head_sha)
             equal("run.status", "completed")
-            equal("run.conclusion", "success")
             equal("run.event", "pull_request")
             need("run.path", lambda value: isinstance(value, str) and value.split("@", 1)[0] == WORKFLOW,
                  _shown(WORKFLOW))
