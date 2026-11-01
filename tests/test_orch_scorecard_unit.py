@@ -599,6 +599,39 @@ def test_an_unreadable_commit_time_is_unknown(repo, monkeypatch, stamp):
     assert orch_scorecard_reverts.times(repo, "main") is None
 
 
+def test_no_repository_is_unknown_without_starting_a_process(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("A folder outside any repository must not start Git")
+
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    (tmp_path / "plain" / "deep").mkdir(parents=True)
+    assert orch_scorecard_reverts.times(tmp_path / "plain" / "deep", "main") is None
+
+
+@pytest.mark.parametrize("place", ["root", "subfolder", "worktree-file", "git-dir-env"])
+def test_a_repository_is_still_read_from_every_place_git_finds_it(repo, tmp_path, monkeypatch, place):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    at = NOW - timedelta(hours=1)
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _publish(repo, _committed(repo, tree, tip, at=at, message=message, monkeypatch=monkeypatch))
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    root = repo
+    if place == "subfolder":
+        root = repo / "deep" / "er"
+        root.mkdir(parents=True)
+    elif place == "worktree-file":
+        root = tmp_path / "linked"
+        git_command(repo, "worktree", "add", "--detach", str(root), tip)
+        assert (root / ".git").is_file()
+    elif place == "git-dir-env":
+        root = tmp_path / "elsewhere"
+        root.mkdir()
+        monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    assert orch_scorecard_reverts.times(root, "main") == [at]
+
+
 def test_reverts_land_in_time_buckets_and_ignore_journal_events(store):
     store.root.mkdir(parents=True, exist_ok=True)
     (store.root / "orch-events.jsonl").write_text(json.dumps(

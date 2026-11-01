@@ -9,6 +9,7 @@ never proves that there were no reverts.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 
 from foragent.git import GitError, GitRepo
@@ -25,8 +26,18 @@ def _commit_time(record: str) -> datetime | None:
     return datetime.fromtimestamp(int(stamp), UTC)
 
 
+def _in_repository(root: Path) -> bool:
+    """Whether Git has anything to read here; without it the read starts no process at all."""
+    if "GIT_DIR" in os.environ:  # Git reads that directory and ignores the path.
+        return True
+    start = Path(root).absolute()
+    return any((folder / ".git").exists() for folder in (start, *start.parents))
+
+
 def times(root: Path, base_branch: str) -> list[datetime] | None:
     """Committer times of every canonical revert reachable from ``origin/<base_branch>``."""
+    if not _in_repository(root):
+        return None
     git = GitRepo(root)
     try:
         # A shallow history is incomplete, so finding nothing in it proves nothing.
