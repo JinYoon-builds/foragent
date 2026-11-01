@@ -143,6 +143,15 @@ def _case(git_history, tmp_path, monkeypatch):
     # make_case normally substitutes "Test"; retain requested WIP messages so
     # the regression cannot disappear inside the fixture's Git transport.
     monkeypatch.setattr(case.git, "_run", preserve_messages)
+    # The scripted producer supplies the new summary value on every turn, including rebuilds.
+    execute = case.implementer.run
+    def with_summary(**kwargs):
+        result = execute(**kwargs)
+        producer = kwargs["worktree"] / ".foragent/PR.json"
+        producer.parent.mkdir(exist_ok=True)
+        producer.write_text(json.dumps({"summary": "The selected event wording is now applied."}))
+        return result
+    monkeypatch.setattr(case.implementer, "run", with_summary)
     case.prs = RecordedPRs(case, monkeypatch)
     return case
 
@@ -233,6 +242,12 @@ def test_existing_wip_pr_is_retitled_before_merge_without_changing_checkpoint(
     case.store.finish_run(1, outcome="pr-open")
     case.tracker.remove_labels(1, ["running"])
 
+    # This fixture represents an already published gate PR: preserve its composition values,
+    # not the old rendered body, so the title test still requires zero implementer turns.
+    case.store._write_json(case.store.root / "pr-content/1.json", {
+        "summary": "The selected event wording is now applied.", "checks": [], "reviews": [],
+        "attempt": 1, "try_text": "Existing instructions.",
+    })
     if entrypoint == "review-only":
         assert runner.review_only(1, case.ctx, verdict_head=head, repair_ci=False) == "merged"
     else:

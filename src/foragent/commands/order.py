@@ -21,6 +21,9 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
       "base64": "<encoded image bytes>"}}
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+An edit keeps every existing Done when command and checklist text, on open and closed issues, unless
+edits[].done_when_removals names each removed line: [{"line": "exact text", "reason": "why"}]. The
+line and reason stay readable on the issue. `fa order edit NUMBER --json` prints an edit to start from.
 edits[].blocked_by names this plan's issue keys and replaces the edited issue's native
 dependencies ([] clears them); omit it to keep them.
 A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
@@ -119,6 +122,10 @@ def add(commands) -> None:
     for command in (note, pending, flush):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
+    edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
+    edit.add_argument("number", type=int)
+    edit.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    edit.add_argument("--json", action="store_true")
     prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
     prepare.add_argument("plan", type=cli.Path)
     prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -254,6 +261,11 @@ def run(args) -> int:
     tracker = cli.GhTracker(repo)
     if args.action == "context":
         print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
+        return 0
+    if args.action == "edit":
+        from foragent import order_done_when
+        # A read like context: it records nothing and leaves the issue as it is.
+        print(cli.json.dumps(order_done_when.seed(tracker.get_issue(args.number)), ensure_ascii=False))
         return 0
     tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
                              store=cli.StateStore.for_repo(repo), config=config, git=git,

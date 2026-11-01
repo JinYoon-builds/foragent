@@ -26,6 +26,7 @@ from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
+from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
 from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
 from foragent.state import Approval
@@ -391,8 +392,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
 def _acceptance_matches(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, ref: str = "HEAD",
 ) -> bool:
-    blobs = git.blob_shas(ref, approval.acceptance_blobs)
-    mismatches = [path for path, sha in approval.acceptance_blobs.items() if blobs.get(path) != sha]
+    mismatches = acceptance_mismatches(git, approval, ref)
     if mismatches:
         invalidate_approval(
             ctx, n, "Approval invalidated: worktree acceptance files changed. Re-approve to run it.",
@@ -530,8 +530,8 @@ def _verify_contents(attempt: Implementation) -> str:
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             harness_guard.guard_staged(attempt)  # a Done when command can commit
-            attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
+            attempt.checks.append(run_done_when(n, ctx, command, worktree, log, DONE_WHEN_SECONDS,
+                                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
             harness_guard.guard_staged(attempt)
@@ -622,9 +622,8 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
-            check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
-                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            check = run_done_when(n, ctx, command, worktree, log, min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
+                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             if stopped := harness_guard.before_measurement(worktree):
                 return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)
