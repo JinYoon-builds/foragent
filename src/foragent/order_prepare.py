@@ -30,9 +30,8 @@ import os
 from pathlib import Path
 import re
 
-from foragent import capacity, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
 from foragent.config import Config
-from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.order_prepare_prompt import writer_prompt
@@ -220,7 +219,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             # The writer is one agent workload: it waits for the shared machine slot like preread.
             with capacity.hold_workload(store, config, kind="prepare", role=f"{item['key']} writer"):
                 admitted = True
-                result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
+                result = executors.executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
                                                           timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
         except TimeoutError as exc:
             if admitted:

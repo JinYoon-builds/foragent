@@ -79,7 +79,7 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
         "status": "written", "phase": "writing_tests", "questions": [], "holds": 0, "reason": "r",
         "updated_at": "2026-10-31T00:00:00+00:00", "base_revision": "abc",
         "written": {"tests/acceptance/test_a.py": "x"}, "attempts": [{"attempt": 1}]}}}))
-    monkeypatch.setattr(order_prepare, "executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr("foragent.executors.executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
     rows = order_prepare.prepare(plan, tmp_path, Config(), None, store, status=True)
     assert rows[0] == {"key": "a", "status": "written", "phase": "writing_tests", "questions": [],
@@ -447,7 +447,7 @@ def test_refused_lane_context_asks_before_any_writer_starts(tmp_path, monkeypatc
     monkeypatch.setattr(order_scratch, "protected", lambda git, root, state: ())
     monkeypatch.setattr(order_scratch, "build", lambda git, base, tree, context: {})
     monkeypatch.setattr(order_prepare_setup, "lane_context", lambda plan, item, config, root: (config, context))
-    monkeypatch.setattr(order_prepare, "executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr("foragent.executors.executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
     row = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store)[0]
     assert row["status"] == "question" and ".claude/agents/fa-api.md" in row["questions"][0]
 
@@ -1537,3 +1537,29 @@ def test_bytes_read_for_publication_are_the_bytes_checked_even_if_the_checkout_c
     assert code != 0 and EXISTING in out + err, out + err
     cases.assert_no_publication(case)
     assert git_command(case.root, "show", f"HEAD:{EXISTING}") + "\n" == strong
+
+
+def test_preparation_uses_the_current_executor_factory_after_import(request, capsys, monkeypatch):
+    """Importing during another caller's temporary setup must not retain its executor."""
+    import importlib
+    from foragent import executors, order_prepare_review
+
+    case = request.getfixturevalue("lane_case")
+
+    def previous_factory(name):
+        pytest.fail(f"Preparation retained another caller's executor: {name}")
+
+    try:
+        with monkeypatch.context() as importing:
+            importing.setattr(executors, "executor_for", previous_factory)
+            importlib.reload(order_prepare)
+            importlib.reload(order_prepare_review)
+        row = _cases.prepare(case, capsys)
+        assert row["status"] == "reviewed", row
+        assert [(call["role"], call["executor"]) for call in case.calls] == [
+            ("writer", "codex"), ("reviewer", "claude")]
+        assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+        _cases.assert_no_publication(case)
+    finally:
+        importlib.reload(order_prepare)
+        importlib.reload(order_prepare_review)
