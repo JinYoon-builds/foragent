@@ -570,3 +570,72 @@ def test_related_check_timeout_keeps_earlier_done_when_failures(run_case, monkey
     assert "done-when output" in saved and "unit output" in saved
     run = c.store.get_run(1)
     assert "done-when output" in run.resume_reason and run.resume_whole
+
+
+@pytest.mark.parametrize("measured,remaining,expected", [
+    (736, 5000, 1472), (100, 5000, 900), (2000, 5000, 3600), (736, 1000, 1000),
+    (None, 5000, 1600),
+])
+def test_protected_allowance_uses_selection_measurement_and_remaining_time(
+    tmp_path, monkeypatch, measured, remaining, expected,
+):
+    from types import SimpleNamespace
+    from foragent import run_checks, runner, run_baseline_limits
+    from foragent.run_baseline import AcceptanceBaseline
+
+    nodes = ("tests/acceptance/test_keep.py::test_a", "tests/acceptance/test_keep.py::test_b")
+    ctx = SimpleNamespace(store=SimpleNamespace(root=tmp_path / "state"), repo_root=tmp_path,
+                          config=Config(), now=lambda: None, monotonic=lambda: 0)
+    attempt = SimpleNamespace(n=1, ctx=ctx, baseline=AcceptanceBaseline("pytest", nodes,
+                              duration_seconds=measured), worktree=tmp_path, log=tmp_path / "check.log")
+    calls = []
+    def check(command, worktree, log, limit, **kwargs):
+        calls.append((shlex.split(command), limit, kwargs["clock"]))
+        return CheckResult(command, 0, False, "", 1)
+    monkeypatch.setattr(runner, "_check", check)
+    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
+
+    assert run_checks._check_protected(attempt).exit_code == 0
+    assert calls == [(["pytest", *nodes], expected, ctx.monotonic)]
+
+
+@pytest.mark.parametrize("timeout_exit", [-9, 0])
+@pytest.mark.parametrize("remaining,recovered", [(5000, True), (1000, False)])
+def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch, timeout_exit, remaining, recovered):
+    from types import SimpleNamespace
+    from foragent import run_checks, runner
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_baseline import AcceptanceBaseline
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    store.start_run(1, branch="foragent/issue-1", worktree=tmp_path)
+    ctx = SimpleNamespace(store=store, monotonic=lambda: 0)
+    attempt = SimpleNamespace(n=1, ctx=ctx, baseline=AcceptanceBaseline("pytest", ("test_keep.py::test_a",),
+                              duration_seconds=736), worktree=tmp_path, log=tmp_path / "check.log", checks=[])
+    calls, flags = [], []
+    def check(command, worktree, log, limit, **kwargs):
+        calls.append(limit)
+        return (CheckResult(command, timeout_exit, True, "", limit + 7) if len(calls) == 1
+                else CheckResult(command, 0, False, "", 10))
+    monkeypatch.setattr(runner, "_check", check)
+    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
+    monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
+    monkeypatch.setattr(run_checks, "flag", lambda *args: flags.append(args))
+
+    if recovered:
+        assert run_checks._check_protected(attempt).exit_code == 0
+        assert calls == [1472, 2944]
+        assert flags == [] and attempt.checks == []
+    else:
+        with pytest.raises(ExecutorStopped):
+            run_checks._check_protected(attempt)
+        assert calls == [1000]
+        assert flags[0][2] == Reason.TIMEOUT
+        assert "elapsed 1007s, allowed 1000s" in flags[0][3]
+        assert store.get_run(1).resume_whole
+    assert f"elapsed {calls[0] + 7}s, allowed {calls[0]}s" in attempt.log.read_text()
