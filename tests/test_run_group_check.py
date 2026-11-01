@@ -152,34 +152,64 @@ def test_members_use_the_current_auto_limit(tmp_path):
     (None, 5000, 1600),
 ])
 @pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("blocked", [False, True])
 def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
-    tmp_path, monkeypatch, measured, remaining, expected, timed_out,
+    tmp_path, monkeypatch, measured, remaining, expected, timed_out, blocked,
 ):
     from contextlib import nullcontext
 
     from foragent import (
-        ci_mode, orch_events, run_baseline, run_baseline_limits, run_checks, run_implementation, runner,
+        capacity, ci_mode, orch_events, run_baseline, run_baseline_limits, run_checks, run_implementation, runner,
     )
+    import os
+    from datetime import timedelta
     from foragent.run_baseline import AcceptanceBaseline
     from foragent.run_checks import CheckResult
 
     ctx = make_ctx(tmp_path, (5, 1))
     ctx.config = replace(ctx.config, test_command="pytest -q")
     ctx.repo_root = tmp_path
-    ctx.monotonic = lambda: 0
+    clock = [NOW]
+    ctx.now = lambda: clock[0]
+    ctx.monotonic = lambda: (clock[0] - NOW).total_seconds()
+    for n in (5, 1):
+        ctx.store.update_run(n, phase="ci", phase_started_at=NOW.isoformat())
+    ctx.store.update_run(5, pid=os.getpid())
+    capacity.write_state(ctx.store, 1, NOW)
     monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
     captured, ran = [], []
+    sleeps = []
+    other = StateStore(tmp_path / "other", now=ctx.now)
+    if blocked:
+        other.start_run(90, branch="other", worktree="other", pid=os.getpid())
+
+    def sleep(seconds):
+        assert ctx.store.get_run(5).phase == "ci"
+        assert captured == ran == []
+        assert capacity.machine_runs(ctx.store, ctx.now()) == 1
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+        other.finish_run(90, outcome="merged")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
     monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
     monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *args, **kwargs: ["tests/test_related.py"])
     monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: (
         captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
-    monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
+    def combine(git, base, members):
+        assert ctx.store.get_run(5).phase == "checking"
+        assert capacity.machine_runs(ctx.store, NOW) == 1
+        return "combined"
+
+    monkeypatch.setattr(group, "_combine", combine)
     monkeypatch.setattr(group, "_trees", lambda *args: ["tree-5", "tree-1"])
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
 
     def check(command, worktree, log, limit, **kwargs):
+        assert ctx.store.get_run(5).phase == "checking", "Every joint command needs the leader's slot"
+        assert capacity.machine_runs(ctx.store, NOW) == 1
         ran.append((command, limit, kwargs.get("clock")))
         return CheckResult(command, 0, timed_out and "tests/acceptance/" in command, "")
 
@@ -200,6 +230,9 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     ]
     assert orch_events.has_event(ctx.store, 5, "group-check", passed=not timed_out,
                                  verdict="void" if timed_out else "passed")
+    assert ctx.store.get_run(5).phase == "ci"
+    assert capacity.machine_runs(ctx.store, NOW) == 0
+    assert sleeps == ([capacity.WORKLOAD_POLL_SECONDS] if blocked else [])
 
 
 @pytest.mark.parametrize("conflict_index", [0, 1, 2])
