@@ -1341,6 +1341,23 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_proposal_survives_the_decision_marker_publish_appends(publishing, plan, monkeypatch, newline):
+    """Decision links are bookkeeping like the plan-child marker; they are not what preread read (#1025)."""
+    from foragent import decisions
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    item = plan["issues"][0]
+    child = decisions.with_marker(_child_body(plan, item, config), ["D79"], None)
+    assert child.rstrip().endswith(decisions.marker(["D79"]))
+    assert _handover(root, 7, child.replace("\n", newline), API_FILES)["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, decisions.with_marker(child, [], None).replace("\n", newline), API_FILES) is not None
+    changed = decisions.with_marker(_child_body(plan, {**item, "goal": item["goal"] + " More."}, config), ["D79"], None)
+    assert _handover(root, 7, changed, API_FILES) is None, "the marker never hides a changed WHAT"
+
+
 @pytest.mark.parametrize("section", ["goal", "out_of_scope"])
 def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
     """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
@@ -3786,3 +3803,44 @@ def test_observed_diagnostic_labels_cover_every_real_parser_field(tmp_path, lang
         order_observed.check(tmp_path, "plan", [issue], language)
     assert MESSAGES[language]["observed_field_body"] in str(fallback.value)
     assert issue.body in str(fallback.value)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_binding_ignores_decision_marker_line_endings(publishing, plan, newline):
+    from foragent import decisions
+
+    config = publishing[1]
+    item = plan["issues"][0]
+    plain = {**item, "goal": "Observable behaviour" + newline + "Remaining behaviour"}
+    marked = {**item, "goal": "Observable behaviour" + newline + decisions.marker([]) + newline + "Remaining behaviour"}
+    assert order._binding(plan, marked, config, REPO, {}) == order._binding(plan, plain, config, REPO, {})
+
+
+@pytest.mark.parametrize("route", ["child", "edit"])
+def test_observed_base_holds_the_decision_marker_publish_wrote(publishing, plan, route):
+    """Publish compares against what it wrote: its own marker is no conflict, a changed one is."""
+    from foragent import decisions
+
+    tracker = publishing[2]
+    if route == "edit":
+        tracker.add_issue(9, "Existing", "old", [])
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                          "decisions": ["D79"]}]
+    else:
+        plan["issues"][0]["decisions"] = ["D79"]
+    publish(publishing, plan)
+    item = plan["edits"][0] if route == "edit" else plan["issues"][0]
+    number = 9 if route == "edit" else next(i.number for i in tracker.list_issues() if i.title == item["title"])
+    assert decisions.explicit(tracker.get_issue(number).body) == ["D79"]
+    item["goal"] += " Republished."
+    publish(publishing, plan)
+    written = tracker.get_issue(number)
+    assert "Republished." in written.body and decisions.explicit(written.body) == ["D79"]
+    item["goal"] += " Again."
+    tracker.update_issue(number, title=written.title, body=decisions.with_marker(written.body, ["D80"], None))
+    changed = tracker.get_issue(number).body
+    with pytest.raises(order.PlanError) as refusal:
+        publish(publishing, plan)
+    assert f"#{number}" in str(refusal.value) and "D79" in str(refusal.value) and "D80" in str(refusal.value)
+    assert tracker.get_issue(number).body == changed
