@@ -66,7 +66,8 @@ class FakeProjects:
             result = {"updateProjectV2Field": {"projectV2Field": field}}
         elif operation == "ForagentBoardIssue":
             number = variables["number"]
-            tracker.get_issue(number)
+            if number not in tracker.issues:
+                tracker.get_issue(number)  # A board read of a missing issue fails, without counting as an issue read.
             content_id = f"I_{variables['owner']}/{variables['name']}#{number}"
             items = []
             for project in self.projects.values():
@@ -111,6 +112,8 @@ class FakeProjects:
             result = {"addProjectV2ItemById": {"item": {"id": item["id"]}}}
         elif operation == "ForagentSetBoardValue":
             project = self.projects[data["projectId"]]
+            if data["itemId"] not in project["items"]:  # GitHub rejects a write to a removed card.
+                raise TrackerError(f"Could not resolve to a node with the global id of {data['itemId']}", returncode=1)
             item = project["items"][data["itemId"]]
             field = project["fields"][data["fieldId"]]
             if field.get("dataType") == "TEXT":
@@ -118,7 +121,7 @@ class FakeProjects:
             else:
                 option_id = data["value"]["singleSelectOptionId"]
                 if not any(option["id"] == option_id for option in field["options"]):
-                    raise TrackerError(f"unknown board option: {option_id}")
+                    raise TrackerError(f"unknown board option: {option_id}", returncode=1)
                 item["values"][field["id"]] = option_id
             result = {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}
         elif operation == "ForagentClearBoardValue":
