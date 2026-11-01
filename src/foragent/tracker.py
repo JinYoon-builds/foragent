@@ -195,10 +195,11 @@ def local_issue_models(store) -> list[Issue]:
 class RecordingTracker:
     """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
 
-    def __init__(self, tracker, context, *, queue_writes=False):
+    def __init__(self, tracker, context, *, queue_writes=False, accepted_advice=False):
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
+        self.accepted_advice = accepted_advice
         # GitHub calls made for this context count in its own store and clock.
         store, now = getattr(context, "store", None), getattr(context, "now", None)
         if store is not None and now is not None:
@@ -467,6 +468,8 @@ class RecordingTracker:
         store = self._context.store
         premise = self._premise(n)
         pending = store.github_outbox()
+        if action == "comment" and payload.get("accepted_advice"):
+            pending = [entry for entry in pending if entry["action"] == "comment"]
         if (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
@@ -602,7 +605,7 @@ class RecordingTracker:
 
     def comment(self, n, body):
         identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
-                                       body=body)
+                                       body=body, **({"accepted_advice": True} if self.accepted_advice else {}))
         if queued:
             return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,
@@ -853,6 +856,9 @@ class FakeTracker:
         self.labels.update((spec.name, spec) for spec in specs)
 
     def close_issue(self, n: int, comment: str | None = None) -> None:
+        self._close(n, comment)
+
+    def _close(self, n: int, comment: str | None) -> None:
         if comment is not None:
             self.comment(n, comment)
         self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
@@ -878,7 +884,7 @@ class FakeTracker:
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
 
     def close_pr(self, pr: int, comment: str | None = None) -> None:
-        self.close_issue(pr, comment)
+        self._close(pr, comment)
         self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:

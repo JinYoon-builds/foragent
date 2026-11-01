@@ -19,20 +19,27 @@ from foragent.tracker import FakeTracker, Issue  # noqa: E402
 NOW = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
 
 
-def test_repeating_a_retry_while_writes_wait_for_github_queues_one_comment(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize("action", ["add_labels", "comment"])
+def test_repeating_a_retry_while_writes_wait_for_github_queues_one_comment(git_history, tmp_path, monkeypatch, action):
     """GitHub still shows blocked; the pending local intent already says ready."""
     from foragent import orch
 
-    case = github_outbox_case(git_history, tmp_path, monkeypatch, action="add_labels")
+    case = github_outbox_case(git_history, tmp_path, monkeypatch, action=action)
+    before = len(case.tracker.list_comments(1))
+
+    def public_or_pending():
+        return [c.body for c in case.tracker.list_comments(1)[before:]] + [
+            row["body"] for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
+
     orch.retry(case.ctx, 1, "Use the selected locale")
-    first = [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
-    assert len(first) == 1, "The first retry is a change and queues its comment"
+    first = public_or_pending()
+    assert len(first) == 1, "Accepted advice is either published or durably queued before its hint is saved"
     orch.retry(case.ctx, 1, "Use the selected locale")
-    rows = [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
+    rows = public_or_pending()
     assert rows == first, "The same retry again changes nothing that waits for GitHub"
     orch.retry(case.ctx, 1, "Use the English locale")
-    rows = [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
-    assert len(rows) == 2 and "English" in rows[-1]["body"], "A new hint is a change"
+    rows = public_or_pending()
+    assert len(rows) == 2 and "English" in rows[-1], "A new hint is a change"
 
 
 def test_queued_comments_with_one_time_order_by_queue_id_after_delivered_ones():

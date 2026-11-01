@@ -18,7 +18,10 @@ def scope_run(git_history, tmp_path, monkeypatch, *, mode=None, failing_review=F
         observations.append({"argv": argv, "prs": list(case.tracker.created_prs),
                              "scope": (kwargs["cwd"] / "CLAUDE.local.md").read_text()
                              if (kwargs["cwd"] / "CLAUDE.local.md").is_file() else ""})
-        kwargs["stdout_path"].write_text(json.dumps({"result": results.pop(0)}))
+        result = results.pop(0)
+        native = argv[argv.index("-p") + 1].startswith("/code-review")  # A confirmation round uses the prompt path.
+        kwargs["stdout_path"].write_text(json.dumps(
+            {"result": result} if native else {"type": "result", "result": "VERDICT: PASS"}))
         return 0, False, ""
 
     monkeypatch.setattr(executors, "run_logged", transport)

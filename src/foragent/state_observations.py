@@ -92,6 +92,8 @@ def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any
         return "absent"
     if intent["action"] == "comment":
         # Send-only entries end with an acknowledgement or an outbox drop.
+        if intent.get("accepted_advice"):
+            return None  # Accepted messages remain owed across label/state changes; absence still drops them above.
         premise = intent.get("premise")
         return "dropped" if by_person and premise is not None and person_fields(premise) != person_fields(expected) else None
     if abandoned(intent):

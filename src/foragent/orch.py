@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -31,7 +31,7 @@ from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
-from foragent.run_previous import retry_marker
+from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
 from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
@@ -150,10 +150,7 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
            say: str | None = None, changed: bool = True) -> dict:
-    """Journal every verb; comment only when it changed public state (one line).
-
-    The comment carries the exact summary (the journal's copy has its spacing collapsed).
-    """
+    """Journal every verb; announce changes on one line with the exact original summary."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if not changed:
         return event
@@ -196,14 +193,12 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
-    """Queue a retry, preserving the branch; replace the hint, or clear it when omitted."""
+def _retry(ctx: RunContext, n: int, hint: str | None, *, record: str | None = None) -> str | None:
+    """Publish advice before adding it; preserve earlier undelivered hints and branch work."""
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    path = ctx.store.root / "hints" / f"{n}.txt"
-    if hint is not None:
-        ctx.store._atomic_write(path, hint)
-    else:
-        path.unlink(missing_ok=True)
+    error = orch_advice.publish_retry(ctx.tracker, ctx, n, hint, record)
+    if hint:
+        add_hint(ctx.store, n, hint)
     # The next implementer receives the keep-work/defect-class default before any hint.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
@@ -211,16 +206,21 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    return error
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     before = transition_state(ctx, n, _issue(ctx, n))
-    after = before.after(add=[READY], remove=[BLOCKED, NEEDS_HUMAN], hint=hint)
-    _retry(ctx, n, hint)
+    pending = orch_advice.after_retry_hint(before.hint, hint)
+    after = before.after(add=[READY], remove=[BLOCKED, NEEDS_HUMAN], hint=pending)
     changed = before != after
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
-    _event(ctx, n, "retry", summary, say=say, changed=changed)
+    publication_error = _retry(ctx, n, hint if pending != before.hint else None,
+                               record=orch_record(summary) if pending != before.hint else None)
+    _event(ctx, n, "retry", summary, say=say, changed=changed and pending == before.hint)
     kick_tick(ctx.repo_root)
+    if publication_error:
+        return f"{summary} (issue comment queued for the gate after: {publication_error})"
     return summary
 
 

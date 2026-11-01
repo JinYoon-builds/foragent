@@ -1,7 +1,7 @@
 """Deterministic context gathering and publication for the fa-order skill."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import fcntl
 import hashlib
@@ -15,6 +15,7 @@ import sys
 from urllib.parse import quote
 
 from foragent import board, capacity, design, order_references, order_waiting, ownership
+from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -331,9 +332,14 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references", "statements"} if kind == "issues"
+                                     "references", "statements", "decisions"} if kind == "issues"
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
-                          "statements"}, label)
+                          "statements", "decisions"}, label)
+            if "decisions" in item:
+                try:
+                    decision_links.validate(item["decisions"], f"{label}.decisions")
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
             if "statements" in item:
                 _strings(item["statements"], f"{label}.statements", nonempty=True)
                 if any("\n" in line or "\r" in line for line in item["statements"]):
@@ -454,8 +460,10 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
-    waiting_for: str | None = None
+    # Approved issues outside this order whose locked acceptance bytes it would change (#1107).
+    affected: dict[int, list[str]] = field(default_factory=dict)
     language: str = "en"
+    waiting_for: str | None = None
 
     def summary(self) -> str:
         if self.waiting_for is not None:
@@ -464,6 +472,8 @@ class PublishReport:
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
         lines.append("Files: " + ", ".join(self.paths))
+        if self.affected:
+            lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
             lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
@@ -649,6 +659,11 @@ class _Publication:
     rows: list[dict]
     owner: str | None
 
+    @property
+    def own(self) -> set[int]:
+        # Dropped children keep map entries, but this publication does not update them.
+        return {number for key, number in self.mapping.items() if key in self.keys} | self.edit_numbers
+
 
 def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             manager: SkillManager | None = None,
@@ -777,23 +792,32 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
                                       check_owner=not waiting)
+    affected = _affected_owners(publication.by_number.values(), publication.own, publication.files,
+                                repo, config, lambda: git or GitRepo(root), fetch=True)
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
-                             sorted(publication.files), True)
+                             sorted(publication.files), True, affected=affected, language=config.language)
+    if affected:
+        raise PlanError(text("order_locks_refused", config.language, owners="\n".join(_owner_lines(affected))))
     if waiting:
         from foragent import order_submissions
         order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
                                  approve_numbers=approve_numbers, language=config.language,
                                  files=publication.files)
         return PublishReport(plan["title"], publication.parent, publication.rows,
-                             sorted(publication.files), False, defer, config.language)
+                             sorted(publication.files), False, waiting_for=defer, language=config.language)
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     owner = publication.owner
-    tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
+        affected = _affected_owners(tracker.list_issues(), publication.own, publication.files,
+                                    repo, config, lambda: git, fetch=False)
+        if affected:
+            raise PlanError(text("order_locks_refused", config.language,
+                                 owners="\n".join(_owner_lines(affected))))
+        tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
         published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
     return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
                            published_blobs=published_blobs, approve=approve)
@@ -855,6 +879,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         if item.get("interactive", False):
             labels.append("interactive")
         blobs = acceptance_blobs(item)
+        body = decision_links.with_marker(body, item.get("decisions"), existing.body if existing else None)
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
@@ -884,10 +909,11 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        # An edit rewrites the whole body; the issue's owner-label contract survives it.
-        body = order_waiting.stamp(existing.body, _with_contract(_published_body(plan, item, repo, config), existing.body))
-        # A rewrite gets its own id, so the revision comment below names this write: a body
-        # written back over a hand edit is a new change that comments, not an old one repeated.
+        # An edit keeps both the owner contract and omitted decision links.
+        body = decision_links.with_marker(_with_contract(_published_body(plan, item, repo, config), existing.body),
+                                          item.get("decisions"), existing.body)
+        body = order_waiting.stamp(existing.body, body)
+        # A revision comment identifies this write, including a changed decision marker.
         body = order_waiting.mark_write(existing.body, body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
@@ -1109,6 +1135,73 @@ def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
     return (head if marker else text), marker
 
 
+_ANY_PLAN_ACCEPTANCE = re.compile(r"<!-- foragent:plan id=\S+ map=\{[^\n]*?\} acceptance=(\{[^\n]*\}) -->")
+
+
+def _under_lock(name: str, locks: set[str]) -> bool:
+    """Whether the gate's lock on one of ``locks`` (a file or a directory) covers ``name``."""
+    return any(name == lock or name.startswith(lock + "/") for lock in locks)
+
+
+def _owner_lines(affected: dict[int, list[str]]) -> list[str]:
+    return [f"#{number}: {', '.join(paths)}" for number, paths in affected.items()]
+
+
+def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo: str, config: Config,
+                     base_git: Callable[[], GitRepo], *, fetch: bool) -> dict[int, list[str]]:
+    """Approved owners outside ``own`` affected by the complete prospective push.
+
+    Locks come from Done when (on every clone), parent maps and local snapshots.
+    Compare the fetched base with all unpushed changes plus the plan's final bytes;
+    publication pushes existing commits too. Fetch before discovering overlap, since
+    a stale tracking ref cannot tell us which commits remain unpublished.
+    """
+    # Every gate, on any clone, locks the Done-when acceptance paths of the issue body
+    # (``scheduler_approval._snapshot``), whether or not an order recorded them.
+    locked: dict[int, set[str]] = {
+        issue.number: set(acceptance_paths(parse_body(issue.body).done_when_commands, config.acceptance_dir))
+        for issue in issues if issue.state == "open" and "approved" in issue.labels and issue.number not in own}
+    if not locked:
+        return {}
+    for issue in issues:
+        for match in _ANY_PLAN_ACCEPTANCE.finditer(issue.body):
+            try:
+                acceptance = json.loads(match[1])
+            except ValueError:
+                continue
+            for number, blobs in (acceptance.items() if isinstance(acceptance, dict) else ()):
+                if number.isdecimal() and int(number) in locked and isinstance(blobs, dict):
+                    locked[int(number)].update(path for path in blobs if isinstance(path, str))
+    store = StateStore.for_repo(repo)
+    for number, paths in locked.items():
+        if (approval := store.load_approval(number)) is not None:
+            paths.update(approval.acceptance_blobs)
+    if not any(locked.values()):
+        return {}
+    git = base_git()
+    if fetch:
+        git.fetch("origin", config.base_branch)
+    base = f"origin/{config.base_branch}"
+    # committed_paths excludes remote-only history when this clone is behind, and
+    # includes deletions. Inspect final HEAD bytes, so restored files are unchanged.
+    pending = git.committed_paths(base)
+    overlap = {number: covered for number, paths in sorted(locked.items())
+               if (covered := sorted(name for name in pending | files.keys() if _under_lock(name, paths)))}
+    candidates = sorted({path for paths in overlap.values() for path in paths})
+    if not candidates:
+        return {}
+    current = git.blob_shas(base, candidates)
+    proposed = git.blob_shas("HEAD", [path for path in candidates if path not in files])
+    for path in candidates:
+        if path in files:
+            data = files[path].encode("utf-8") if isinstance(files[path], str) else files[path]
+            digest = hashlib.sha256 if len(current[path]) == 64 else hashlib.sha1
+            proposed[path] = digest(b"blob %d\0" % len(data) + data).hexdigest()
+    changed = {path for path in candidates if proposed[path] != current[path]}
+    return {number: [path for path in paths if path in changed]
+            for number, paths in overlap.items() if changed & set(paths)}
+
+
 def _blob(data: bytes) -> str:
     """Git's blob hash of a file's content, as stored in approval snapshots."""
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
@@ -1123,7 +1216,9 @@ def _binding(plan: dict, item: dict, config: Config, repo: str | None,
     the repository's). The body names the repository in links publish generates; without the
     repository the body cannot be reproduced, so the record is not bound and never handed over.
     """
-    content = None if repo is None else _body_digest(_published_body(plan, item, repo, config))
+    # Decision links are bookkeeping like the plan-child marker; neither side counts them (#1025).
+    content = None if repo is None else _body_digest(
+        decision_links.MARKER_LINE.sub("", _published_body(plan, item, repo, config)))
     names = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
              | set(order_references.selected(plan, item)))
     files = {}
@@ -1149,7 +1244,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
         records = _preread_records(root)
     except PlanError:
         return None
-    text, child = _without_child_marker(body)
+    text, child = _without_child_marker(decision_links.MARKER_LINE.sub("", body))
     content = _body_digest(text)
     actual: dict[str, str] = {}
 

@@ -124,19 +124,27 @@ def test_paused_event_retains_changed_comment_even_when_outbox_started_empty(tmp
 
 
 def test_retry_without_hint_clears_pending_hint_once(git_history, tmp_path, monkeypatch):
+    """Historical name retained: main now keeps undelivered advice until delivery."""
     from test_orch_verbs import blocked_case
 
     case, _ = blocked_case(git_history, tmp_path, monkeypatch)
     orch.retry(case.ctx, 1, "Use English")
     path = case.store.root / "hints/1.txt"
+    assert path.is_file(), "Accepted retry advice must remain deliverable"
     assert path.read_text() == "Use English"
     before = len(case.tracker.list_comments(1))
     orch.retry(case.ctx, 1)
-    assert not path.exists(), "Omitting a hint explicitly clears it; it does not preserve the old one"
+    assert path.read_text() == "Use English", "Omitting a hint preserves the pending advice"
     added = case.tracker.list_comments(1)[before:]
-    assert len(added) == 1 and len(added[0].body.splitlines()) == 1
+    assert added == []
     orch.retry(case.ctx, 1)
     assert case.tracker.list_comments(1)[before:] == added
+    predicted = orch.orch_advice.after_retry_hint(path.read_text(), "Use Korean")
+    orch.retry(case.ctx, 1, "Use Korean")
+    assert path.read_text() == "Use English\n\nUse Korean"
+    assert path.read_text() == predicted
+    added = case.tracker.list_comments(1)[before:]
+    assert len(added) == 1 and len(added[0].body.splitlines()) == 1
 
 
 @pytest.mark.parametrize("history", [None, "parked", "unparked"])
