@@ -178,8 +178,8 @@ def no_real_usage_source(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def no_live_cpu_times(monkeypatch):
-    """Tests opt into fake CPU counters instead of depending on the shared machine."""
+def no_live_cpu_sensors(monkeypatch):
+    """Tests opt into fake CPU counters and load averages, independent of host activity."""
     import psutil
 
     popen = subprocess.Popen
@@ -195,6 +195,8 @@ def no_live_cpu_times(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", isolated_cpu)
     monkeypatch.setattr(psutil, "cpu_times", unavailable)
+    # Admission falls back to the load average when CPU counters are unavailable.
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
 
 
 @pytest.fixture(autouse=True)
