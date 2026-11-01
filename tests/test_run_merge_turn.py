@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import run_merge_turn as turn
+from foragent import orch_queue, run_merge_turn as turn
 from foragent.config import Config
 from foragent.runner import run_issue
 from foragent.state import StateStore
@@ -26,6 +26,63 @@ def make_ctx(tmp_path, *numbers):
 
 def rows(ctx):
     return [json.loads(line) for line in (ctx.store.root / turn.QUEUE).read_text().splitlines()]
+
+
+def test_ready_turn_follows_current_global_priority_without_rejoining(tmp_path):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    seats = [turn.seat(ctx, n, "main") for n in (3, 1, 2)]
+    for place in seats:
+        turn.join(ctx, place, f"head-{place.n}")
+    before = (ctx.store.root / turn.QUEUE).read_bytes()
+
+    for priority, expected in [([2, 1], 2), ([1, 2], 1), ([3], 3)]:
+        orch_queue.set_global(ctx.store, priority)
+        assert [place.n for place in seats if turn.holds_turn(ctx.store, place)] == [expected]
+        assert (ctx.store.root / turn.QUEUE).read_bytes() == before
+
+
+def test_empty_global_priority_preserves_join_order(tmp_path):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    seats = [turn.seat(ctx, n, "main") for n in (3, 1, 2)]
+    for place in seats:
+        turn.join(ctx, place, f"head-{place.n}")
+    orch_queue.set_global(ctx.store, [2])
+    orch_queue.set_global(ctx.store, [])
+
+    for expected in seats:
+        assert [place.n for place in seats if turn.holds_turn(ctx.store, place)] == [expected.n]
+        turn.withdraw(ctx, expected)
+    assert not any(turn.holds_turn(ctx.store, place) for place in seats)
+
+
+@pytest.mark.parametrize(("priority", "expected"), [([], 3), ([2, 1], 2)])
+def test_claim_reports_priority_holder_without_joining(tmp_path, priority, expected):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    for n in (3, 1, 2):
+        turn.join(ctx, turn.seat(ctx, n, "main"), f"head-{n}")
+    orch_queue.set_global(ctx.store, priority)
+    before = (ctx.store.root / turn.QUEUE).read_bytes()
+
+    assert turn.claim(ctx, turn.Seat(4, "manual-merge", "main"), "head-4") == expected
+    assert (ctx.store.root / turn.QUEUE).read_bytes() == before
+
+
+@pytest.mark.parametrize(("priority", "expected"), [([], 2), ([1], 1), ([2], 2)])
+def test_failed_merge_rejoins_with_fresh_position_within_priority(tmp_path, priority, expected):
+    ctx = make_ctx(tmp_path, 1, 2)
+    first, second = turn.seat(ctx, 1, "main"), turn.seat(ctx, 2, "main")
+    orch_queue.set_global(ctx.store, priority)
+    turn.join(ctx, first, "a")
+    turn.join(ctx, second, "b")
+    ctx.sleep = lambda seconds: ctx.clock.__setitem__(0, ctx.clock[0] + timedelta(seconds=seconds))
+
+    turn.rejoin_after_failed_merge(1, ctx, first, RuntimeError("merge refused"))
+    assert not turn.holds_turn(ctx.store, first)
+    assert turn.holds_turn(ctx.store, second)
+    turn.join(ctx, first, "a")
+
+    assert [place.n for place in (first, second) if turn.holds_turn(ctx.store, place)] == [expected]
+    assert [row["event"] for row in rows(ctx)] == ["ready", "ready", "withdrawn", "ready"]
 
 
 def test_head_keeps_the_turn_through_its_merge_until_its_run_stops(tmp_path):

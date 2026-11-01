@@ -52,6 +52,9 @@ Every proposal and every review checks the state-ownership rules:
 - Flag duplicated state (for example GitHub labels versus the local record) and name the reader
   that tolerates the lag.
 
+GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
+`fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.
+
 ## Refactoring
 
 Source: adapted from `pstack/playbooks/refactoring.md` (pstack by Lauren Tan, MIT License).

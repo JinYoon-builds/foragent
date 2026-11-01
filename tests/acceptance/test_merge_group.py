@@ -499,7 +499,7 @@ def test_default_group_checks_union_once_and_finishes_borrowed_members(group_cas
     contend(case)
     assert_group(case, case.members)
     assert_suite(group_rows(case, case.members), case.members)
-    assert_config(case, 4)
+    assert_config(case, "auto")  # absent key: auto, which starts at 4
     assert merge_order(case) == list(case.members), "Members merge themselves in durable FIFO order"
     assert_members_merged(case, case.members)
     for n in case.members:
