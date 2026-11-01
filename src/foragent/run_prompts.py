@@ -10,12 +10,16 @@ from foragent import cuts
 from foragent.issue import ParsedIssue
 
 
+REVIEW_VERDICT_CONTRACT = (
+    "Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
+    "followed by every finding, each one line with file:line and the concrete failure."
+)
+
 REVIEW_PROMPT = (
     "Review this change for defects that break the stated goal, violate Out of scope, "
     "or would make the Done when commands pass without the goal being met "
     "(weakened checks, special-casing test inputs). Ignore style and nice-to-haves. "
-    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
-    "followed by every finding, each one line with file:line and the concrete failure."
+    "Do not edit files. " + REVIEW_VERDICT_CONTRACT
 )
 REVIEW_FEEDBACK_INSTRUCTIONS = (
     "For each review finding, name the defect class it belongs to, "
@@ -64,6 +68,7 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     from foragent.i18n import text
 
     return (
+        REVIEW_VERDICT_CONTRACT + "\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"

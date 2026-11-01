@@ -258,6 +258,8 @@ def review_context(git_history, tmp_path):
 
 def expected_review_rules(acceptance_dir):
     return (
+        "Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
+        "followed by every finding, each one line with file:line and the concrete failure.\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"

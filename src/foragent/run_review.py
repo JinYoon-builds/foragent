@@ -45,6 +45,8 @@ class ReviewResult:
     timed_out: bool = False
     conflicts: tuple[str, ...] = ()
     review_notes: tuple[str, ...] = ()  # reviewer NOTE lines: recorded, never findings
+    no_findings: bool = False  # successful transport with an empty findings result
+    execution_failed: bool = False  # transport failure, separate from a missing verdict
 
 
 SPEC_CONFLICT = "SPEC-CONFLICT:"
@@ -66,15 +68,30 @@ def _stop_on_spec_conflict(n: int, ctx: RunContext, review: ReviewResult) -> Non
 
 def parse_review(message: str) -> ReviewResult:
     lines = message.splitlines()
-    for index, line in enumerate(lines):
-        if match := re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line):
-            rest = [line for line in lines[index + 1:] if line.strip()]
-            findings = [line for line in rest if review_notes.note_text(line) is None]
-            notes = review_notes.extract(message)
-            # A FAIL whose findings are all NOTE lines rejects nothing.
-            verdict = "PASS" if match[1] == "FAIL" and notes and not findings else match[1]
-            return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
-    return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
+    verdict_lines = [(index, re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line))
+                     for index, line in enumerate(lines) if line.startswith("VERDICT:")]
+    if len(verdict_lines) != 1 or verdict_lines[0][1] is None:
+        return ReviewResult("UNUSABLE", "", ("reviewer must give exactly one verdict",),
+                            no_findings=not verdict_lines and _empty_findings(message))
+    index, match = verdict_lines[0]
+    rest = [line for line in lines[index + 1:] if line.strip()]
+    findings = [line for line in rest if review_notes.note_text(line) is None]
+    notes = review_notes.extract(message)
+    # A FAIL whose findings are all NOTE lines rejects nothing.
+    verdict = "PASS" if match[1] == "FAIL" and notes and not findings else match[1]
+    return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
+
+
+def _empty_findings(message: str) -> bool:
+    """Convert the tool's empty findings marker, without judging any review prose."""
+    text = review_notes.strip(message).strip()
+    if not text:
+        return True
+    lines = text.splitlines()
+    return (lines[-1].strip() == "(none)"
+            and not any(FINDING_LINE.match(line) for line in lines[:-1])
+            and "```" not in text
+            and not code_review_findings("\n".join(lines[:-1]))[1])
 
 
 FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
@@ -123,10 +140,15 @@ def parse_code_review(message: str) -> ReviewResult:
         event = None
     if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
-    verdict, findings, note = code_review_findings(event["result"])
+    text = event["result"]
+    review = parse_review(text)
+    if review.verdict == "UNUSABLE":
+        return review
+    verdict, findings, _ = code_review_findings(review.findings)
+    # The explicit verdict decides; the native findings payload is only a transport format.
     if verdict == "UNUSABLE":
-        return ReviewResult("UNUSABLE", "", (note,))
-    return ReviewResult(verdict, "\n".join(
+        return review
+    return replace(review, findings="\n".join(
         item if isinstance(item, str) else f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}"
         for item in findings
     ))
@@ -327,8 +349,11 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     problems: list[str] = []
     raws = []
     timed_out = False
+    no_findings = True
+    execution_failed = bool(raised)
     for k, (future, error) in enumerate(zip(futures, errors), start=1):
         if error is not None:
+            no_findings = False
             problems.append(failure(f"Reviewer {k} of {count}", error))
             raws.append(problems[-1])
         else:
@@ -336,9 +361,13 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
             message = result.full_message if result.full_message is not None else result.last_message
             raws.append(_raw_text(reviewer, message))
             timed_out |= result.timed_out
+            member = parse_review(raws[-1])
+            no_findings &= member.verdict == "PASS" or member.no_findings
             if result.timed_out or result.exit_code != 0:
+                no_findings = False
+                execution_failed = True
                 problems.append(f"Reviewer {k} of {count} exit_code={result.exit_code}, timed_out={result.timed_out}")
-            elif parse_review(raws[-1]).verdict == "UNUSABLE":
+            elif member.verdict == "UNUSABLE":
                 # A reviewer without a VERDICT line gave no usable review; never let the merge cover for it.
                 problems.append(f"Reviewer {k} of {count} gave no verdict")
         _save_review(n, ctx, f"review-{round_number}-{k}.txt", raws[-1])
@@ -346,7 +375,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     findings = "\n\n".join(f"Reviewer {k}:\n{raw}" for k, raw in enumerate(raws, start=1))
     if problems or member_conflicts:
         raw = findings
-        review = ReviewResult("UNUSABLE", "", tuple(problems) or ("Findings merge skipped: a reviewer reported a spec conflict",))
+        review = ReviewResult("UNUSABLE", "", tuple(problems) or ("Findings merge skipped: a reviewer reported a spec conflict",),
+                              no_findings=no_findings, execution_failed=execution_failed)
     else:
         try:
             result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
@@ -359,21 +389,21 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         finally:
             edited = restore(before) or edited
         if result is None:
-            review = ReviewResult("UNUSABLE", "", (raw,))
+            review = ReviewResult("UNUSABLE", "", (raw,), execution_failed=True)
         else:
             message = result.full_message if result.full_message is not None else result.last_message
             raw = _raw_text(reviewer, message)
             timed_out = result.timed_out
             review = (ReviewResult("UNUSABLE", "", (
                 f"Findings merge exit_code={result.exit_code}, timed_out={result.timed_out}",
-            )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
+            ), execution_failed=True) if result.timed_out or result.exit_code != 0 else parse_review(raw))
     _save_review(n, ctx, f"review-{round_number}.txt", raw)
-    review = ReviewResult(review.verdict, review.findings, (
+    review = replace(review, notes=(
         f"reviewers: {count}, up to {at_once} at once in {-(-count // at_once)} batches, one findings merge",
         *review.notes,
     ))
     if edited:
-        review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
+        review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
                                           conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw))
@@ -442,13 +472,17 @@ def _read_rebuttals(worktree: Path) -> str:
 
 
 def _normalized_findings(review: ReviewResult) -> set[str]:
-    # Unstructured prose is one finding: repeated preambles alone are not a dispute.
-    points = [review.raw] if review.verdict == "UNUSABLE" else review.findings.splitlines()
+    points = review.findings.splitlines()
     return {" ".join(re.sub(r"^\s*[-*]\s+", "", point).split()).casefold()
             for point in points if point.strip()}
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    """Set feedback; runner._implement_and_publish bounds all rework by max_retries + 1.
+
+    Missing verdicts still set attempt.failure, so they spend that shared attempt budget
+    even though they never spend the explicit-FAIL defect budget here.
+    """
     from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 
@@ -461,11 +495,12 @@ def _review_implementation(attempt: Implementation) -> None:
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
-    review = _review(n, ctx, git, attempt.parsed, attempt.base_ref, round_number=_next_review_round(n, ctx), pr=pr)
+    review = _review(n, ctx, git, attempt.parsed, attempt.base_ref,
+                     round_number=_next_review_round(n, ctx), pr=pr)
     if pr is not None and review.conflicts:
         ctx.tracker.comment(pr, "\n".join([f"Round {len(attempt.reviews) + 1}: SPEC-CONFLICT", *review.conflicts]))
     _stop_on_spec_conflict(n, ctx, review)
-    if review.verdict == "UNUSABLE":
+    if review.verdict == "UNUSABLE" and not review.no_findings:
         review = replace(review, findings=review_notes.strip(review.raw))
     attempt.reviews.append(review)
     if pr is not None:
@@ -473,15 +508,25 @@ def _review_implementation(attempt: Implementation) -> None:
             f"Round {len(attempt.reviews)}: VERDICT: {review.verdict}", review.findings,
             *(f"NOTE: {note}" for note in review.review_notes), *review.notes,
         ]))
+    if review.verdict == "UNUSABLE" and review.no_findings:
+        return  # Empty tool result: ordinary merge policy, without manufacturing a PASS.
     if review.verdict != "PASS":
-        attempt.review_failures += 1
+        if review.verdict == "FAIL":
+            attempt.review_failures += 1
         attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
             attempt.reviewer_text = review.findings
             attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.findings)
         else:
             attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
-        findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
+        # Keep the existing execution-error retry ceiling, without counting protocol errors as defects.
+        execution_failures = sum(item.execution_failed for item in attempt.reviews)
+        if review.execution_failed and execution_failures + attempt.review_failures > ctx.config.review_max:
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Reviewer execution failed after all review attempts.",
+                 review.raw or "\n".join(review.notes))
+            raise ExecutorStopped("review-failed")
+        findings = (_normalized_findings(review)
+                    if review.verdict == "FAIL" and _read_rebuttals(worktree).strip() else set())
         if findings & attempt.previous_rebutted_findings:
             attempt.review_hold = True
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
@@ -577,7 +622,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         _stop_on_spec_conflict(n, ctx, review)
         if review.timed_out or runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        if review.verdict != "PASS":
+        if review.verdict != "PASS" and not review.no_findings:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
 
