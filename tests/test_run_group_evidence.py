@@ -257,3 +257,77 @@ def test_a_commit_built_on_an_older_tip_is_not_this_merge(history):
     git(history.root, "update-ref", "refs/remotes/origin/main", stale)
     evidence.record_merge(1, history.ctx, "main", read_tip, history.head_1)
     assert merge_events(history.ctx)[-1]["commit"] is None
+
+
+# group-reuse: a commit that is no member's merge counts only through run_base_move.
+
+def deep_commit(root: Path, files: dict[str, str], *parents: str, message: str = "x") -> str:
+    """Like ``commit`` but for nested paths: builds the tree in a throwaway index."""
+    import os
+    env = {**os.environ, "GIT_INDEX_FILE": str(root / ".git" / "deep-index")}
+
+    def run(*args, stdin=None):
+        return subprocess.run(["git", "-C", str(root), *IDENTITY, *args], input=stdin, text=True,
+                              capture_output=True, check=True, env=env).stdout.strip()
+
+    run("read-tree", "--empty")
+    for name, text in files.items():
+        run("update-index", "--add", "--cacheinfo", f"100644,{git(root, 'hash-object', '-w', '--stdin', stdin=text)},{name}")
+    return git(root, "commit-tree", run("write-tree"), *[arg for p in parents for arg in ("-p", p)], "-m", message)
+
+def reviewed_view(history):
+    """A reviewed-path view: the follower's worktree at its head, no baseline of its own."""
+    git(history.root, "update-ref", "HEAD", history.head_1)
+    git(history.root, "read-tree", "HEAD")
+    history.ctx.tracker.list_issues = lambda state: []  # no open issue owns a locked file
+    return SimpleNamespace(n=4, ctx=history.ctx, git=history.ctx.git,
+                           approval=SimpleNamespace(acceptance_blobs={}), baseline=None)
+
+
+def test_docs_commit_after_the_members_merge_is_neutral_only_through_the_rule(history):
+    squash = history.merge_1()
+    main = deep_commit(history.root, {**history.after_1, "docs/n.md": "N\n"}, squash, message="docs")
+    rule = evidence.neutral_rule(reviewed_view(history))
+    assert "not a result-neutral move" in evidence.void_reason(history.ctx, 4, "h4", main)
+    assert evidence.void_reason(history.ctx, 4, "h4", main, neutral=rule) is None
+
+
+def test_docs_commit_before_the_members_merge_keeps_the_checked_result(history):
+    docs = deep_commit(history.root, {"a.py": "A\n", "docs/n.md": "N\n"}, history.base, message="docs")
+    squash = deep_commit(history.root, {**history.after_1, "docs/n.md": "N\n"}, docs, message="Member 1 (#1)")
+    git(history.root, "update-ref", "refs/remotes/origin/main", squash)
+    evidence.record_merge(1, history.ctx, "main", docs, history.head_1)
+    rule = evidence.neutral_rule(reviewed_view(history))
+    assert evidence.void_reason(history.ctx, 4, "h4", squash, neutral=rule) is None
+
+
+@pytest.mark.parametrize("files", [{"src/o.py": "O\n"}, {"a.py": "changed\n"}], ids=["new-source", "edit"])
+def test_source_commit_is_never_neutral(history, files):
+    squash = history.merge_1()
+    main = deep_commit(history.root, {**history.after_1, **files}, squash, message="outsider")
+    rule = evidence.neutral_rule(reviewed_view(history))
+    assert "not a result-neutral move" in evidence.void_reason(history.ctx, 4, "h4", main, neutral=rule)
+
+
+def test_members_merge_with_a_different_tree_is_void_even_beside_a_neutral_commit(history):
+    docs = deep_commit(history.root, {"a.py": "A\n", "docs/n.md": "N\n"}, history.base, message="docs")
+    wrong = {**history.after_1, "docs/n.md": "N\n", "extra.py": "E\n"}
+    squash = deep_commit(history.root, wrong, docs, message="Member 1 (#1)")
+    git(history.root, "update-ref", "refs/remotes/origin/main", squash)
+    orch_events.append_event(history.ctx.store, NOW, 1, "group-merge", "merge", head_sha=history.head_1,
+                             commit={"sha": squash, "parent": docs, "tree": git(history.root, "rev-parse", f"{squash}^{{tree}}")})
+    rule = evidence.neutral_rule(reviewed_view(history))
+    assert "is not #1's checked merge" in evidence.void_reason(history.ctx, 4, "h4", squash, neutral=rule)
+
+
+def test_leader_spends_its_own_pass_only_across_neutral_commits(history):
+    # #1 led the group; before its merge, main moves by one commit only.
+    docs = deep_commit(history.root, {"a.py": "A\n", "docs/n.md": "N\n"}, history.base, message="docs")
+    source = deep_commit(history.root, {"a.py": "A\n", "src/o.py": "O\n"}, history.base, message="outsider")
+    rule = evidence.neutral_rule(reviewed_view(history))
+    assert evidence.latest(history.ctx, 1)[1] == 0, "The leader is named by its own joint result"
+    assert evidence.void_reason(history.ctx, 1, history.head_1, docs, neutral=rule) is None
+    assert evidence.note(1, history.ctx, history.head_1, docs, rule) is None
+    assert "not a result-neutral move" in evidence.void_reason(history.ctx, 1, history.head_1, docs)
+    assert "not a result-neutral move" in evidence.void_reason(history.ctx, 1, history.head_1, source, neutral=rule)
+    assert evidence.void_reason(history.ctx, 1, "other", docs, neutral=rule)

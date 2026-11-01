@@ -178,14 +178,38 @@ def _pull_requests(tracker: Tracker) -> list[dict]:
 
 
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
-    issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
-    feedback, decisions = [], []
+    issues = sorted((issue for issue in tracker.list_open_issues()
+                     if issue.state == "open" and not issue.is_pull_request), key=lambda issue: issue.number)
+    login, identity = None, {}
+    try:
+        login = ownership.normalize_login(tracker.authenticated_login(), config.language)
+    except IdentityError as exc:
+        identity = {"identity": {"login": None, "error": text(
+            "identity_not_a_person", config.language, login=exc.login, kind=exc.kind)}}
+    except (TrackerError, OwnershipError) as exc:
+        identity = {"identity": {"login": None, "error": text(
+            "init_identity_failed", config.language, error=exc)}}
+    feedback, decisions, other_orders, owner_errors = [], [], [], {}
     for issue in issues:
+        owner, ours = None, False
+        try:
+            # Keep legacy questions visible on identity failure without inventing an owner.
+            # An unconfirmed owner-label publication is not legacy work.
+            legacy = (login is None and ownership.parse_orderer(issue.labels, config.language) is None
+                      and OWNED_MARKER not in issue.body)
+            if not (legacy and config.legacy_owner is None):
+                owner = ownership.effective_orderer(issue, config, login)
+            ours = legacy or (login is not None and owner == login)
+        except OwnershipError as exc:
+            owner_errors[issue.number] = {"owner_error": str(exc)}
+        if owner is not None and not ours:
+            other_orders.append({"number": issue.number, "title": issue.title, "orderer": owner,
+                                 "files": parse_body(issue.body).files})
         if "feedback" in issue.labels:
             about = re.search(r"(?:^|\n)About #(\d+)\.", issue.body)
             feedback.append({"number": issue.number, "title": issue.title, "body": issue.body,
                              "about": int(about[1]) if about else None})
-        if "needs-human" in issue.labels:
+        if ours and "needs-human" in issue.labels:
             comments = tracker.list_comments(issue.number)
             flag = latest_flag(comments)
             if flag and flag[1] in {"spec-question", "no-machine-check"}:
@@ -227,16 +251,18 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     lanes = {name: {"paths": lane.get("paths", []), "agent": lane.get("agent"),
                     "skills": lane.get("skills", [])} for name, lane in config.lanes.items()}
     return {
+        **identity,
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
         "profile": config.profile,
         "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
-        "feedback": feedback, "decisions": decisions,
+        "feedback": feedback, "decisions": decisions, "other_orders": other_orders,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
                          "state_group": state_group(issue, tracker),
-                         "waiting": order_waiting.section(issue.body)} for issue in issues],
+                         "waiting": order_waiting.section(issue.body),
+                         **owner_errors.get(issue.number, {})} for issue in issues],
         "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
