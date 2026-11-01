@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from foragent import cuts
 from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
-from foragent.run_baseline_limits import _duration, load_reusable, record_timeout, repository_limit
+from foragent.run_baseline_limits import _duration, load_reusable, recorded_duration, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
 from foragent.state import StateStore
@@ -227,16 +227,20 @@ def _premerge_baseline(ctx: RunContext, test_command: str, base_sha: str,
             continue
         if any(node.split("::", 1)[0] in saved["excluded"] for node in required_ids):
             continue
-        return saved
+        # The compatible selection may live under another key: keep its own timing.
+        duration, _ = recorded_duration(saved, candidate.with_suffix(".xml"))
+        return {**saved, "duration_seconds": duration}
     return None
 
 
-def _saved_baseline(command: str, saved: dict) -> AcceptanceBaseline:
+def _saved_baseline(command: str, saved: dict, report_path: Path | None = None) -> AcceptanceBaseline:
+    duration = (_duration(saved.get("duration_seconds")) if report_path is None
+                else recorded_duration(saved, report_path)[0])
     return AcceptanceBaseline(command, tuple(saved["node_ids"]),
                               tuple(saved["collected_ids"]) if "collected_ids" in saved else None,
                               tuple(saved["failing_ids"]) if "failing_ids" in saved else None,
                               tuple(saved.get("excluded", ())),
-                              duration_seconds=_duration(saved.get("duration_seconds")))
+                              duration_seconds=duration)
 
 
 def _baseline_capture_limit(ctx: RunContext, log: Path, remaining: int | None = None) -> int:
@@ -337,7 +341,8 @@ def _capture_baseline(
         if saved is not None and (required_ids is None or
                                   {"collected_ids", "failing_ids", "excluded"} <= saved.keys()):
             _append(log, f"Acceptance baseline count={len(saved['node_ids'])}, cache=hit")
-            return replace(_saved_baseline(command, saved), excluded=tuple(excluded), base_sha=base_sha)
+            return replace(_saved_baseline(command, saved, cached_ids.with_suffix(".xml")),
+                           excluded=tuple(excluded), base_sha=base_sha)
         report.parent.mkdir(parents=True, exist_ok=True)
         # Use a fresh base checkout; tests can write files without touching the implementation.
         with tempfile.TemporaryDirectory(prefix="foragent-baseline-") as directory:
