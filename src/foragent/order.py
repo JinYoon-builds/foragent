@@ -830,29 +830,30 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     owner = publication.owner
-    with git.publish_lock():
-        git.update_base(config.base_branch)
-        # A preparation that started or finished since the first checks is visible now, and none can
-        # start before this publication is pushed: it claims its issues under this lock.
-        listed = tracker.list_issues()
-        current = {**publication.by_number, **{issue.number: issue for issue in listed}}
-        _require_route(plan, config, repo, publication.mapping, current)
-        items = order_reviewed.statement_items(plan, current, config)
-        reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
-        if reviewed:
-            order_reviewed.require_reviewed_bytes(git, config, items, reviewed, publication.files)
-            # Refreshed HEAD is the actual landing commit, including local commits.
-            order_reviewed.require_tested_base(git, config, reviewed,
-                                               order_reviewed.landing(git, config.base_branch, refreshed=True))
-        affected = _affected_owners(listed, publication.own, publication.files,
-                                    repo, config, lambda: git, fetch=False)
-        if affected:
-            raise PlanError(text("order_locks_refused", config.language,
-                                 owners="\n".join(_owner_lines(affected))))
-        tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
-        published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
-    return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
-                           published_blobs=published_blobs, approve=approve)
+    with order_reviewed.publication_gate(repo):
+        with git.publish_lock():
+            git.update_base(config.base_branch)
+            # A preparation that started or finished since the first checks is visible now, and none
+            # can start until this publication's issues are written: it claims them under the gate.
+            listed = tracker.list_issues()
+            current = {**publication.by_number, **{issue.number: issue for issue in listed}}
+            _require_route(plan, config, repo, publication.mapping, current)
+            items = order_reviewed.statement_items(plan, current, config)
+            reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
+            if reviewed:
+                order_reviewed.require_reviewed_bytes(git, config, items, reviewed, publication.files)
+                # Refreshed HEAD is the actual landing commit, including local commits.
+                order_reviewed.require_tested_base(git, config, reviewed,
+                                                   order_reviewed.landing(git, config.base_branch, refreshed=True))
+            affected = _affected_owners(listed, publication.own, publication.files,
+                                        repo, config, lambda: git, fetch=False)
+            if affected:
+                raise PlanError(text("order_locks_refused", config.language,
+                                     owners="\n".join(_owner_lines(affected))))
+            tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
+            published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
+        return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
+                               published_blobs=published_blobs, approve=approve)
 
 
 def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,

@@ -24,6 +24,7 @@ MESSAGES = {
                                     "entry, a socket or a device), so the writer would not see what preread sees. "
                                     "Should it become a regular file or a link inside the copied context?"),
         "prepare_busy": "Another fa order prepare for this order is running; nothing was started.",
+        "prepare_publishing": "A publication for this repository is running; nothing was started. Run fa order prepare again.",
         "prepare_none": "Not prepared yet.",
         "prepare_admission": "No machine slot became free, so the agent did not start; run fa order prepare again later: {error}",
         "prepare_main_moved": "Main moved while the tests were prepared; run fa order prepare again to prepare them on the new main.",
@@ -68,6 +69,7 @@ MESSAGES = {
                                     "가리키는 링크, 순환 링크, 읽을 수 없는 항목, 소켓, 장치). 작성자가 preread와 같은 "
                                     "내용을 볼 수 없어요. 일반 파일이나 복사되는 맥락 안의 링크로 바꿀까요?"),
         "prepare_busy": "이 주문의 다른 fa order prepare가 실행 중이에요. 아무것도 시작하지 않았어요.",
+        "prepare_publishing": "이 저장소의 발행이 실행 중이에요. 아무것도 시작하지 않았어요. fa order prepare를 다시 실행하세요.",
         "prepare_none": "아직 준비하지 않았어요.",
         "prepare_admission": "기계 칸이 비지 않아 에이전트를 시작하지 않았어요. 나중에 fa order prepare를 다시 실행하세요: {error}",
         "prepare_main_moved": "시험을 준비하는 동안 main이 바뀌었어요. 새 main에서 준비하려면 fa order prepare를 다시 실행하세요.",

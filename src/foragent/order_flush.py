@@ -7,7 +7,7 @@ Interrupted batches deliberately refuse here; their recovery is a separate issue
 from pathlib import PurePosixPath
 from uuid import uuid4
 
-from foragent import order, order_flush_journal as journal, order_notes, order_references
+from foragent import order, order_flush_journal as journal, order_notes, order_references, order_reviewed
 from foragent.i18n import text
 from foragent.order_files import check_destinations, check_write
 from foragent.ownership import LABEL_COLOR, label_description, owner_label
@@ -98,7 +98,8 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
     # Before lock creation or checkpoint reads: a wrong-branch invocation has no effects.
     if git.current_branch() != config.base_branch:
         raise order.PlanError(text("order_flush_branch", language, branch=config.base_branch))
-    with journal.locked(store):
+    # The gate spans the checks below and every write, as in order.publish.
+    with journal.locked(store), order_reviewed.publication_gate(repo):
         records = journal.entries(store)
         done = {row["batch"] for row in records if row["kind"] == "done"}
         if any(row["kind"] == "selected" and row["batch"] not in done for row in records):

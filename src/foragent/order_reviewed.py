@@ -75,6 +75,32 @@ def _prepared_numbers(repo: str | None, listed) -> set[int]:
     return numbers
 
 
+def _child_prepared(repo: str | None, body: str) -> bool:
+    """Whether the order and key this issue's own marker names took the statement route.
+
+    The publisher writes the marker into the child's body when it creates it, so this link stands
+    even when that order's parent map was never written or cannot be read. The publisher's marker
+    comes after the text, so an earlier one is quoted text.
+    """
+    from foragent.order import _CHILD_LINE
+    from foragent.order_prepare import _read, _record_path
+    from foragent.state import StateStore
+
+    if not repo:
+        return False
+    for identity, key in _CHILD_LINE.findall(body)[-1:]:
+        return key in _taken(_read(_record_path(StateStore.for_repo(repo), {"id": identity}), {"id": identity}))
+    return False
+
+
+def publication_gate(repo: str):
+    """Every publication path holds this from its last check through its file and issue writes."""
+    from foragent.order_prepare_owner import publication_gate as gate
+    from foragent.state import StateStore
+
+    return gate(StateStore.for_repo(repo).root / "prepare")
+
+
 def _taken_here(plan: dict, repo: str | None) -> set[str]:
     from foragent.order_prepare import _read, _record_path
     from foragent.state import StateStore
@@ -87,14 +113,14 @@ def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dic
     """Refuse an issue or edit that left the statement route after taking it.
 
     The ``statements`` field selects the route and the route is kept once taken: an issue this order
-    prepared (any outcome, a question too), an existing issue any order prepared, or an existing issue
-    published with a Behaviour section cannot drop its statements to fall back to a clean legacy
+    prepared (any outcome, a question too), an existing issue any order prepared (found by number, by
+    its order's parent map or by its own child marker), or an existing issue published with a Behaviour section cannot drop its statements to fall back to a clean legacy
     preread. ``bodies`` maps issue keys (``#N`` for edits) to the current body of the issue they
     publish onto, ``numbers`` the same keys to issue numbers, and ``listed`` holds the issues whose
     parent maps name each order's children. A key new to a new order is a new issue, not a return.
 
-    Preparation claims its keys under the publication lock before any agent starts, so a check made
-    under that lock cannot miss a preparation already under way; publication checks again there.
+    Preparation claims its keys under ``publication_gate`` before any agent starts, so a check made
+    inside the gate cannot miss a preparation under way and none starts until the writes are done.
     """
     from foragent.order import PlanError
 
@@ -105,7 +131,7 @@ def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dic
     record, numbers = _taken_here(plan, repo), numbers or {}
     prepared = _prepared_numbers(repo, listed) if any(key in numbers for key in keys) else set()
     kept = [key for key in keys if key in record or numbers.get(key) in prepared
-            or has_behaviour(bodies.get(key) or "")]
+            or has_behaviour(bodies.get(key) or "") or _child_prepared(repo, bodies.get(key) or "")]
     if kept:
         raise PlanError(text("reviewed_route_kept", _language(config), action=action, keys=", ".join(kept)))
 

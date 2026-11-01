@@ -1,6 +1,5 @@
 """Unit checks for `fa order prepare`'s scratch tree comparison and status projection."""
 
-import contextlib
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -15,8 +14,6 @@ from foragent import order_prepare, order_prepare_setup, order_scratch, order_sc
 from foragent.config import Config
 from foragent.git import GitRepo
 
-
-_LOCKED_GIT = SimpleNamespace(publish_lock=contextlib.nullcontext)
 
 def scratch(git_history, tmp_path, files):
     git_history.update(files)
@@ -451,7 +448,7 @@ def test_refused_lane_context_asks_before_any_writer_starts(tmp_path, monkeypatc
     monkeypatch.setattr(order_scratch, "build", lambda git, base, tree, context: {})
     monkeypatch.setattr(order_prepare_setup, "lane_context", lambda plan, item, config, root: (config, context))
     monkeypatch.setattr("foragent.executors.executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
-    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), _LOCKED_GIT, store)[0]
+    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store)[0]
     assert row["status"] == "question" and ".claude/agents/fa-api.md" in row["questions"][0]
 
 
@@ -477,7 +474,7 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
         raise OSError("stop before the writer")
 
     monkeypatch.setattr(order_scratch, "build", build)
-    rows = order_prepare.prepare(plan, tmp_path, Config(language="en"), _LOCKED_GIT, store,
+    rows = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store,
                                  lambda: SimpleNamespace(get_issue=lambda n: None))
     assert [row["key"] for row in rows] == ["7", "#7"] and len(set(trees)) == 2
     assert order_prepare._record_path(store, {"id": "a/b"}) != order_prepare._record_path(store, {"id": "a-b"})
@@ -1775,25 +1772,12 @@ def test_preparation_claims_its_issues_under_the_lock_before_any_agent_starts(re
 
     cases = _cases
     case = request.getfixturevalue("lane_case")
-    lock = case.git.publish_lock
-    held, claims = [], []
-
-    class Held:
-        def __enter__(self):
-            held.append(True)
-            self.inner = lock()
-            self.inner.__enter__()
-
-        def __exit__(self, *details):
-            held.pop()
-            return self.inner.__exit__(*details)
-
-    case.git.publish_lock = Held
+    claims = []
     write = order_prepare._write
 
     def recording(path, record):
         if record.get("claimed") and not claims:
-            claims.append((bool(held), len(case.calls)))
+            claims.append(len(case.calls))
         write(path, record)
 
     monkeypatch.setattr(order_prepare, "_write", recording)
@@ -1816,5 +1800,209 @@ def test_preparation_claims_its_issues_under_the_lock_before_any_agent_starts(re
     case.writer_hook = during_the_first_writer
     code, out, err = cases.invoke(case, capsys, "prepare", str(case.path), "--json")
     assert code == 0, out + err
-    assert claims == [(True, 0)], "Claimed under the lock, before any agent ran"
+    assert claims == [0], "Claimed before any agent ran"
     assert seen, "The writer ran while the claim was already visible"
+
+
+def _other_clone(case, tmp_path):
+    """A second checkout of the same repository: its own publication lock, the same state folder."""
+    origin = subprocess.run(["git", "-C", str(case.root), "remote", "get-url", "origin"], check=True,
+                            capture_output=True, text=True).stdout.strip()
+    clone = tmp_path / "other-clone"
+    subprocess.run(["git", "clone", "-q", origin, str(clone)], check=True, capture_output=True)
+    return clone, GitRepo(clone)
+
+
+_STATEMENT_EDIT = {"number": 7, "goal": "Sending stays quiet.", "out_of_scope": "Flags.",
+                   "statements": ["Sending prints nothing."], "done_when": ["true"]}
+_PATHS = {"approve": (["--approve"], "#7"), "approve-numbers": (["--approve-numbers", "7"], "#7"),
+          "no-approval": ([], "#7"), "approve-keys": (["--approve-keys", "notice"], "notice"),
+          "flush": (["--approve-numbers", "7", "--defer", "next-merge"], "#7")}
+
+
+def _publish_path(case, capsys, name):
+    options, _key = _PATHS[name]
+    code, out, err = _cases.publish(case, capsys, *options)
+    if name == "flush":
+        assert code == 0, out + err
+        code, out, err = _cases.invoke(case, capsys, "flush", "--boundary", "next-merge")
+    return code, out, err
+
+
+def _legacy_for(case, name):
+    if name == "approve-keys":
+        item = case.plan["issues"][0]
+        case.plan = {**case.plan, "issues": [{**{k: v for k, v in item.items() if k != "statements"},
+                                              "acceptance_files": {}, "done_when": ["true"]}]}
+        case.save()
+    else:
+        _legacy_order(case)
+
+
+@pytest.mark.parametrize("name", sorted(_PATHS))
+def test_another_clones_preparation_cannot_start_inside_a_publication(request, capsys, monkeypatch, tmp_path, name):
+    """A preparation asked to start at any write of a legacy publication starts nothing."""
+    from foragent import order, order_prepare
+
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    statement = {**case.plan, "id": "from-the-other-clone", "issues": [], "edits": [dict(_STATEMENT_EDIT)]}
+    _legacy_for(case, name)
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    clone, clone_git = _other_clone(case, tmp_path)
+    tried = []
+
+    def try_preparing():
+        rows = order_prepare.prepare(statement, clone, case.config, clone_git, case.store, lambda: case.tracker)
+        tried.append(rows[0]["status"])
+
+    for method in ("push_base", "update_base"):
+        original = getattr(case.git, method)
+
+        def wrapped(*args, _original=original, **kwargs):
+            try_preparing()
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(case.git, method, wrapped)
+    add_issue_writes = case.tracker.ensure_labels
+
+    def before_issue_writes(*args, **kwargs):
+        try_preparing()
+        return add_issue_writes(*args, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "ensure_labels", before_issue_writes)
+    calls = len(case.calls)
+    code, out, err = _publish_path(case, capsys, name)
+    assert code == 0, out + err
+    assert tried and set(tried) == {"waiting"}, tried
+    assert len(case.calls) == calls, "No agent started during the publication"
+    path = order_prepare._record_path(case.store, statement)
+    assert not path.exists() or not json.loads(path.read_text()).get("claimed")
+
+
+@pytest.mark.parametrize("name", sorted(_PATHS))
+def test_a_publication_during_another_clones_preparation_is_refused(request, capsys, monkeypatch, tmp_path, name):
+    """The other interleaving: the other clone's preparation is running; it later ends in a question."""
+    from foragent import order, order_prepare
+
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    item = case.plan["issues"][0]
+    statement = ({**case.plan, "issues": [item]} if name == "approve-keys" else
+                 {**case.plan, "id": "from-the-other-clone", "issues": [], "edits": [dict(_STATEMENT_EDIT)]})
+    if name == "flush":
+        _legacy_order(case)
+        monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+        assert _cases.publish(case, capsys, *_PATHS[name][0])[0] == 0
+    clone, clone_git = _other_clone(case, tmp_path)
+    case.verdicts = ["question"]
+    outcome = []
+
+    def during_the_writer(*args, **kwargs):
+        if outcome:
+            return
+        if name != "flush":
+            _legacy_for(case, name)
+            monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+            outcome.append(_cases.publish(case, capsys, *_PATHS[name][0]))
+        else:
+            outcome.append(_cases.invoke(case, capsys, "flush", "--boundary", "next-merge"))
+
+    case.writer_hook = during_the_writer
+    rows = order_prepare.prepare(statement, clone, case.config, clone_git, case.store, lambda: case.tracker)
+    assert rows[0]["status"] == "question", rows
+    code, out, err = outcome[0]
+    assert code != 0 and "reviewed-tests route" in out + err, out + err
+    assert not any("commit" in call or "push" in call for call in case.git_calls)
+    assert case.tracker.issues[7].body == "Goal only.\n"
+
+
+def _order_whose_parent_map_failed(case, capsys, monkeypatch):
+    """A legacy child is created but its parent map never written; planning then adds statements."""
+    from foragent import order
+    from foragent.tracker import TrackerError
+
+    cases = _cases
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    statement = case.plan
+    item = statement["issues"][0]
+    case.plan = {**statement, "issues": [{**{k: v for k, v in item.items() if k != "statements"},
+                                          "acceptance_files": {}, "done_when": ["true"]}]}
+    case.save()
+    write = case.tracker.update_issue
+
+    def fails_on_the_map(number, *, title, body):
+        if '"' + item["key"] + '":' in body and "foragent:plan id=" in body:
+            raise TrackerError("the parent map could not be written")
+        return write(number, title=title, body=body)
+
+    with monkeypatch.context() as failing:
+        failing.setattr(case.tracker, "update_issue", fails_on_the_map)
+        code, out, err = cases.publish(case, capsys)
+    assert code != 0, out + err
+    child = next(n for n, issue in case.tracker.issues.items() if "foragent:plan-child" in issue.body)
+    assert not any(f'"{item["key"]}": {child}' in issue.body for issue in case.tracker.issues.values())
+    case.plan = statement
+    case.verdicts = ["question"]
+    case.save()
+    assert cases.prepare(case, capsys)["status"] == "question"
+    return child, item
+
+
+@pytest.mark.parametrize("name", ["approve", "approve-numbers", "no-approval", "flush"])
+def test_an_edit_of_a_child_whose_parent_map_failed_keeps_the_route(request, capsys, monkeypatch, name):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    child, _item = _order_whose_parent_map_failed(case, capsys, monkeypatch)
+    body = case.tracker.issues[child].body
+    case.plan = {**case.plan, "id": "another-order", "issues": [], "edits": [{**LEGACY_EDIT, "number": child}]}
+    case.save()
+    before = len(case.calls)
+    code, out, err = cases.invoke(case, capsys, "preread", str(case.path), "--json")
+    assert code != 0 and "reviewed-tests route" in out + err, out + err
+    assert len(case.calls) == before
+    options = {"approve": ["--approve"], "approve-numbers": ["--approve-numbers", str(child)], "no-approval": [],
+               "flush": ["--approve-numbers", str(child), "--defer", "next-merge"]}[name]
+    code, out, err = cases.publish(case, capsys, *options)
+    assert code != 0 and "reviewed-tests route" in out + err and f"#{child}" in out + err, out + err
+    assert case.tracker.issues[child].body == body
+
+
+def test_a_retained_edit_is_refused_when_the_child_is_prepared_before_the_flush(request, capsys, monkeypatch):
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    marker = "<!-- foragent:plan-child id=earlier key=notice -->"
+    _existing_issue(case, f"Goal only.\n\n{marker}\n")
+    _legacy_order(case)
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert cases.publish(case, capsys, "--approve-numbers", "7", "--defer", "next-merge")[0] == 0
+    _record_for(case, "earlier", "notice")
+    code, out, err = cases.invoke(case, capsys, "flush", "--boundary", "next-merge")
+    assert code != 0 and "reviewed-tests route" in out + err, out + err
+    assert not any("commit" in call or "push" in call for call in case.git_calls)
+
+
+@pytest.mark.parametrize("body, kept", [
+    ("<!-- foragent:plan-child id=earlier key=notice -->\n", True),
+    ("Goal\r\n\r\n<!-- foragent:plan-child id=earlier key=notice -->\r\n", True),
+    ("<!-- foragent:plan-child id=earlier key=other -->\n", False),
+    ("<!-- foragent:plan-child id=unprepared key=notice -->\n", False),
+    ("Quoted <!-- foragent:plan-child id=earlier key=notice -->\n<!-- foragent:plan-child id=earlier key=other -->\n",
+     False),
+    ("Goal only.\n", False),
+], ids=["own-marker", "crlf", "another-key", "another-order", "quoted-then-own", "no-marker"])
+def test_the_childs_own_marker_links_it_to_the_preparation(request, body, kept):
+    from foragent import order, order_reviewed
+
+    case = request.getfixturevalue("lane_case")
+    _record_for(case, "earlier", "notice")
+    plan = {"id": "another-order", "issues": [], "edits": [{"number": 9}]}
+    check = lambda: order_reviewed.require_route_kept(  # noqa: E731
+        plan, case.config, case.config.repo, {"#9": body}, "publish", numbers={"#9": 9})
+    if kept:
+        with pytest.raises(order.PlanError, match="reviewed-tests route"):
+            check()
+    else:
+        check()

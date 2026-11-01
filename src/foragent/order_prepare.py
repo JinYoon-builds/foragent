@@ -282,11 +282,9 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         statement = batch = [item for item in items if "statements" in item]
-        # The route is taken before any agent starts. Under the publication lock, so no legacy
-        # publication of these issues passes its last check without seeing this.
-        with git.publish_lock():
-            record["claimed"] = sorted({*record.get("claimed", []), *(item["key"] for item in statement)})
-            _write(path, record)
+        if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record)):
+            busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_publishing", config.language)}
+            return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
         for _ in range(2):
             for item in batch:
                 # Main is read again for each issue: an earlier issue's agents may have run for long.
