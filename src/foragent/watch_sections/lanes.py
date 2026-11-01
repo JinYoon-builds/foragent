@@ -218,6 +218,14 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
 
     status, language = snapshot.status, config.language
     clones = _clones(status)
+    # A task can change lanes after a merge. Current rows anywhere in the view
+    # take precedence over that task's historical row in its previous lane.
+    current = {run["number"] for runs in clones.values() for run in runs}
+    current.update(number for number, fact in snapshot.waiting_facts.items() if fact.get("authored"))
+    for lane in status["lanes"].values():
+        current.update(item["number"] for group in ("running", "held", "queued") for item in lane.get(group) or [])
+        if lane.get("issue") is not None and lane["state"] in {"working", "waiting-human", "blocked"}:
+            current.add(lane["issue"])
     found: list[dict[str, Any]] = []
     for row in status["lanes"].values():
         slug, name = row["slug"], row["lane_display"]
@@ -253,7 +261,14 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                                      item.get("title") or snapshot.titles.get(number) or "", glyphs, now))
         shown = {item["issue"] for item in active}
         queued = [item for item in row.get("queued", []) if item["number"] not in shown]
-        finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in shown]
+        authored = {number: fact for number, fact in snapshot.waiting_facts.items()
+                    if fact.get("authored") and fact.get("lane") == slug}
+        listed = shown | {item["number"] for item in queued}
+        queued += [{"number": number, "title": fact.get("title", "")}
+                   for number, fact in authored.items() if number not in listed]
+        # A reopened issue can have a past merge and a current wait. Its current row
+        # carries the explanation; the historical row must not repeat it as done.
+        finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in current]
         rows: list[dict[str, Any]] = []
         if not active and not queued:
             # Today's merges in this lane; a snapshot built without them keeps the order's done list.
@@ -265,15 +280,19 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
         else:
-            hideable = max(0, len(finished) - 1) + max(0, len(queued) - 1)
+            folded_queue = [item for index, item in enumerate(queued) if index == 0 or item["number"] in authored]
+            visible_queue = queued if is_open else folded_queue
+            hideable = max(0, len(finished) - 1) + len(queued) - len(folded_queue)
             last = last_finished(snapshot, finished)
             for issue in finished if is_open else [last] if last is not None and not tight else []:
                 rows.append(_finished_row(snapshot, config, issue, name, glyphs))
             rows += active
-            for item in queued if is_open else queued[:1]:
+            for item in visible_queue:
                 # A queued issue has no run: neither the lane's phase nor its acorns are its own.
                 waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued", None,
                                      item.get("title") or snapshot.titles.get(item["number"]) or "", glyphs, now)
+                if item["number"] in authored:
+                    waiting["words"] = watch.text("waiting_view_state", language)
                 rows.append({**waiting, "style": "dim"})
         found += [{**item, "slug": slug} for item in rows]
         if hideable and (is_open or not tight):
@@ -340,4 +359,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             continue
         if hits is not None:
             hits.append(target)
+        if "issue" in row:
+            authored = snapshot.waiting_facts.get(row["issue"], {}).get("authored")
+            if authored:
+                from foragent.watch_waiting import explanation
+
+                lines += explanation(authored, config.language, width)
     return lines
