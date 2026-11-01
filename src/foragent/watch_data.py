@@ -190,7 +190,10 @@ def collect(
 
     repo_root = repo_root if repo_root is not None else COLLECTION_ROOT.get()
 
-    rows = {row["number"]: row for row in store.local_issues()}
+    try:
+        rows = {row["number"]: row for row in store.local_issues()}
+    except (OSError, ValueError):
+        rows = {}  # An unreadable issue snapshot provides no authored waits or other issue facts.
     issues = {number: Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
               for number, row in rows.items()}
 
