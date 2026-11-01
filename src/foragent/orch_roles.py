@@ -229,19 +229,24 @@ def human(payload: dict[str, Any]) -> str:
     return "\n".join(lines) or "No roles."
 
 
-def decide(store: StateStore, request_id: str, decision: str, role: str | None) -> dict[str, Any]:
-    """Record the orchestrator's decision on one role proposal and close its request."""
-    record = next((row for row in orch_inbox.requests(store) if row.get("id") == request_id), None)
-    if record is None:
-        raise orch_inbox.InboxError(f"no request with id {request_id!r}")
-    name = record.get("role") or role
-    if not name:
-        raise orch_inbox.InboxError(f"request {request_id} names no role; pass --role")
-    event = orch_events.append_event(store, store._now(), None, "role-proposal",
-                                     f"{name}: {request_id} {decision}", role=name, request_id=request_id,
-                                     accepted=decision == "accepted")
-    orch_inbox.set_request_status(store, request_id, "done", f"role {name} proposal {decision}")
-    return event
+def decide(store: StateStore, request_id: str, decision: str, role: str | None,
+           answer: str | None = None) -> dict[str, Any]:
+    """Record answer and explicit decision with the done mark under the inbox lock."""
+    if decision not in ("accepted", "rejected"):
+        raise orch_inbox.InboxError("decision must be accepted or rejected")
+
+    def proposal(record: dict[str, Any]) -> None:
+        name = record.get("role") or role
+        if not name:
+            raise orch_inbox.InboxError(f"request {request_id} names no role; pass --role")
+        record.update(role=name, accepted=decision == "accepted")
+
+    record = orch_inbox.set_request_status(store, request_id, "done", f"role proposal {decision}",
+                                           check=proposal, answer=answer, require_answer=True)
+    name = record["role"]
+    return orch_events.append_event(store, store._now(), None, "role-proposal",
+                                    f"{name}: {request_id} {decision}", role=name, request_id=request_id,
+                                    accepted=record["accepted"])
 
 
 def add_parser(orch_actions) -> None:
@@ -251,13 +256,14 @@ def add_parser(orch_actions) -> None:
     decision = orch_actions.add_parser("role-decision", help="Record a role proposal as accepted or rejected")
     decision.add_argument("id", help="Request id of the proposal")
     decision.add_argument("decision", choices=("accepted", "rejected"))
+    decision.add_argument("--answer", help="What was done or why the proposal was rejected")
     decision.add_argument("--role", help="Role name when the request names none")
     decision.add_argument("--repo-root", type=Path, default=Path.cwd())
 
 
 def command(args, store: StateStore, config: Config) -> None:
     if args.action == "role-decision":
-        event = decide(store, args.id, args.decision, args.role)
+        event = decide(store, args.id, args.decision, args.role, args.answer)
         print(f"Role {event['role']}: proposal {args.id} {args.decision}.")
         return
     payload = collect(store, config, args.repo_root.resolve())

@@ -24,7 +24,7 @@ When the planning heartbeat is stale, `fa orch ask` already pushes the question 
 not hide the plan. Keep that existing route; no new notification mechanism is needed.
 
 After the planning session successfully publishes the orchestrator-drafted plan, it marks
-the originating request done with `fa orch request-status ID done --note "<issues>"`, using
+the originating request done with `fa orch request-status ID done --answer "<issues>"`, using
 the originating request ID (not the question ID) and the published issue numbers.
 A failed publication leaves the request processing.
 

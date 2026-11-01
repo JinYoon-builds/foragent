@@ -17,6 +17,7 @@ def _add_inbox(orch_actions) -> None:
     request_status.add_argument("id")
     request_status.add_argument("status", choices=cli.orch_inbox.REQUEST_STATUSES)
     request_status.add_argument("--note")
+    request_status.add_argument("--answer", help="What was done to complete the request")
     ask = orch_actions.add_parser("ask", help="Record a D71 human question in the box")
     ask.add_argument("--question", required=True)
     ask.add_argument("--option", action="append", default=[])
@@ -167,7 +168,10 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         record = box.add_request(store, args.source, args.text)
         print(f"Request {record['id']} saved ({record['status']}).")
     elif args.action == "request-status":
-        record = box.set_request_status(store, args.id, args.status, args.note)
+        record = box.set_request_status(store, args.id, args.status, args.note,
+                                        answer=args.answer, require_answer=True,
+                                        empty_answer_reason=("Legacy request-status completion: --answer was omitted."
+                                                             if args.answer is None else None))
         print(f"Request {record['id']}: {record['status']}.")
     elif args.action == "note":
         if args.person_found is not None:

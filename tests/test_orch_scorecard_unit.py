@@ -360,3 +360,26 @@ def test_flow_removed_approval_rule_spares_running_and_closed_issues():
     assert _labels_at({**issue, "running": True}, NOW) == {"ready"}
     assert _labels_at({**issue, "closed": True}, before) == {"approved", "ready"}
     assert _labels_at({**issue, "labels": {"approved"}}, NOW) == {"approved", "ready"}
+
+
+def test_proposal_retry_and_correction_count_only_the_latest_explicit_acceptance(store):
+    from types import SimpleNamespace
+    from foragent import orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    ordinary = orch_inbox.add_request(store, "planning", "ordinary")
+    orch_inbox.set_request_status(store, ordinary["id"], "done", answer="Completed", require_answer=True)
+    proposal = orch_inbox.add_request(store, "architect", "proposal")
+
+    def count():
+        reopened = StateStore(store.root, now=lambda: store.clock[0])
+        card = orch_roles.scorecard(reopened, config, orch_scorecard.collect(reopened, days=2))
+        return card["window"]["today"]["roles"]["architect"]["accepted_proposals"]
+
+    assert count() == 0
+    for _ in range(2):
+        orch_roles.decide(store, proposal["id"], "accepted", "architect", answer="Applied")
+        assert count() == 1
+    orch_roles.decide(store, proposal["id"], "rejected", None, answer="Reconsidered")
+    assert count() == 0
+    assert orch_inbox.requests(store)[1]["accepted"] is False
