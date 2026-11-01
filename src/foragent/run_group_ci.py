@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 
-from foragent import ci_mode, run_group_evidence
+from foragent import ci_mode, run_group_check, run_group_evidence
 from foragent.ci_workflow import measurement_scope
 from foragent.git import GitError
 from foragent.run_baseline import _baseline_exclusions
@@ -113,7 +113,7 @@ class GroupComparisonEvidence:
 def evidence(view, head, base_sha):
     """Use a CI group result only through #1141's single member reuse predicate."""
     n, ctx = view.n, view.ctx
-    if ctx.config.merge_group_max <= 1:
+    if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
         return None
     found = run_group_evidence.latest(ctx, n)
     if found is None or found[0].get("mode") != "ci":
