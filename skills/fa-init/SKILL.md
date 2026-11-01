@@ -12,7 +12,7 @@ description: Set up a project folder for Foragent.
    `gh repo create <owner>/<folder> --private|--public --source . --push` using
    the selected owner, folder name, and visibility flag.
 
-2. At first use, ask only two questions: merge (review) mode, then Claude quota
+2. At first use, ask only these configuration questions: merge (review) mode, then Claude quota
    mode. Use AskUserQuestion (or the available question tool), recommendation first:
    - batch (recommended): group completed work for human review.
    - fast: merge passing work automatically unless a human review rule applies.
@@ -40,6 +40,26 @@ description: Set up a project folder for Foragent.
    command cannot prompt (no terminal), ask this once with AskUserQuestion (or the
    available question tool): Yes (recommended) or No, then rerun with
    `--statusline yes|no`. Either answer is remembered and never asked again; skip the question if the summary already reports a decision.
+   `fa init` also offers one optional project step: adding the single rule
+   `Bash(fa:*)` to this project's `.claude/settings.local.json`, so Claude can
+   run fa commands here without a prompt each time. It covers this project
+   only, never the account, and adds nothing else. fa commands do not expose
+   permanent deletion, money transactions, sending to others, or widening
+   permissions. Add it only after the person explicitly accepts; never answer
+   for them. The CLI asks directly only when the project already has
+   `.claude/settings.json` or `.claude/settings.local.json`. In a new project,
+   the summary says `FA commands permission: not yet decided`. Every time that
+   note appears, or the command says it could not ask because there is no
+   terminal, ask the person with AskUserQuestion (or the available question tool):
+   - Yes: add only `Bash(fa:*)`, for this project only.
+   - No: keep approving commands individually.
+   Use no recommended default. Then run `fa init --fa-allow yes` or
+   `fa init --fa-allow no` with their explicit answer. If they have not answered,
+   leave it undecided and ask again on the next setup run. Either answer is
+   remembered for this project, so skip a decided offer. If the person revises
+   their answer, run the same flag with that explicit answer; No leaves existing
+   Claude settings and rules unchanged. A dry run neither asks
+   nor grants, and must never be followed by an automatic grant.
 
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
    public repositories (hosted Actions minutes are free), or `local` for private
