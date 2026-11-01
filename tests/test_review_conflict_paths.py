@@ -106,13 +106,33 @@ class ConflictThenLimitPanel(PanelExecutor):
         return result
 
 
-def test_panel_member_conflict_wins_over_another_members_usage_limit(git_history, tmp_path, monkeypatch):
+@pytest.mark.parametrize("deferred_comments", [False, True], ids=["ordinary", "queued-comment"])
+def test_panel_member_conflict_wins_over_another_members_usage_limit(
+    git_history, tmp_path, monkeypatch, deferred_comments,
+):
+    if deferred_comments:
+        from foragent.tracker import RecordingTracker
+
+        def queue_comment(self, number, body):
+            entry = self._queue(number, "comment", self._started(), self._premise(number), {"body": body})
+            return -entry["id"]
+
+        monkeypatch.setattr(RecordingTracker, "comment", queue_comment)
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
     panel = ConflictThenLimitPanel([f"VERDICT: FAIL\n{CONFLICT}"] + ["VERDICT: PASS"] * (len(CHECKLIST) - 1))
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "spec-question"
     assert panel.merges == [], "A member conflict needs no merge call"
-    assert CONFLICT in questions(case.tracker)[0]
+    assert case.store.load_flag(1).reason == "spec-question"
+    # Sibling limit-wait label writes may queue this comment behind an in-flight write.
+    pending = case.store.github_outbox()
+    if deferred_comments:
+        assert not questions(case.tracker)
+        assert any(entry["action"] == "comment" and CONFLICT in entry.get("body", "") for entry in pending), pending
+    case.ctx.tracker.flush_outbox()
+    comments = questions(case.tracker)
+    assert comments, f"Spec-conflict question comment was not delivered; queued writes: {pending}"
+    assert CONFLICT in comments[0]
     assert [event["verdict"] for event in review_events(case.store)] == ["SPEC-CONFLICT"]
 
 
@@ -129,3 +149,16 @@ def test_break_it_conflict_receipt_must_keep_the_reviewers_verdict(run_case, mon
     monkeypatch.setattr(run_review, "_journal_review", lose_reviewer_verdict)
     with pytest.raises(AssertionError, match="FAIL"):
         test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(run_case)
+
+
+@pytest.mark.parametrize("skip", ["flush", "send"])
+def test_break_it_conflict_priority_requires_delivery_of_the_question(git_history, tmp_path, monkeypatch, skip):
+    from foragent.tracker import FakeTracker, RecordingTracker
+
+    # Keep the local flag and outcome, but skip either the flush or the external send.
+    if skip == "flush":
+        monkeypatch.setattr(RecordingTracker, "flush_outbox", lambda self: None)
+    else:
+        monkeypatch.setattr(FakeTracker, "comment", lambda *args, **kwargs: 1)
+    with pytest.raises(AssertionError, match="question comment was not delivered"):
+        test_panel_member_conflict_wins_over_another_members_usage_limit(git_history, tmp_path, monkeypatch, True)

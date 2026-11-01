@@ -528,6 +528,11 @@ def _normalized_findings(review: ReviewResult) -> set[str]:
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    """Set feedback; runner._implement_and_publish bounds all rework by max_retries + 1.
+
+    Missing verdicts still set attempt.failure, so they spend that shared attempt budget
+    even though they never spend the explicit-FAIL defect budget here.
+    """
     from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 

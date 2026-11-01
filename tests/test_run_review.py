@@ -231,6 +231,7 @@ def test_disabled_review_does_not_create_a_reviewer(run_case):
 
 @pytest.mark.parametrize("invalid", [
     ExecResult(0, False, "No defects found.", Path("unused")),
+    ExecResult(0, False, "feature.txt:1 — the retry loses the selected locale", Path("unused")),
     ExecResult(1, False, "VERDICT: PASS", Path("unused")),
     ExecResult(None, False, "VERDICT: PASS", Path("unused")),
     ExecResult(0, True, "VERDICT: PASS", Path("unused")),
@@ -1074,3 +1075,30 @@ def test_break_it_rejects_native_none_becoming_a_pass(run_case, monkeypatch):
     monkeypatch.setattr(run_review, "parse_code_review", none_passes)
     with pytest.raises(AssertionError, match="UNUSABLE"):
         test_empty_review_merges_without_rework_or_a_recorded_pass(run_case, True, "(none)")
+
+
+def test_break_it_shared_retry_budget_rejects_an_extra_unusable_rework(run_case, monkeypatch):
+    import inspect
+
+    from foragent import runner
+
+    source = inspect.getsource(runner._implement_and_publish)
+    boundary = "if run.attempts < ctx.config.max_retries + 1:"
+    assert source.count(boundary) == 1
+    broken = source.replace(boundary, boundary.replace(" < ", " <= "), 1)
+    namespace = vars(runner).copy()
+    exec(compile("from __future__ import annotations\n" + broken, "<extra-unusable-rework>", "exec"), namespace)
+    monkeypatch.setattr(runner, "_implement_and_publish", namespace["_implement_and_publish"])
+    # Let the extra attempt complete, so the regression fails on the count, not fixture exhaustion.
+    run_case.executor.steps.append({})
+    enable = enable_reviewer
+
+    def extra_reply(case, messages, edit=None):
+        return enable(case, [*messages, messages[-1]], edit)
+
+    monkeypatch.setattr(sys.modules[__name__], "enable_reviewer", extra_reply)
+    finding = ExecResult(0, False, "feature.txt:1 — the retry loses the selected locale", Path("unused"))
+    with pytest.raises(AssertionError):
+        test_unusable_review_retries_implementation_using_the_shared_budget(run_case, finding, "invalid")
+    assert len(run_case.executor.calls) == run_case.store.get_run(1).attempts == 3
+    assert run_case.store.get_run(1).outcome == "retries-exceeded"
