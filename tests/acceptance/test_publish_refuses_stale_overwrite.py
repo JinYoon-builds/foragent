@@ -80,7 +80,7 @@ def test_publish_refuses_stale_issue_atomically_then_allows_explicit_reread(
         case.plan = {
             **case.plan, 'id': case.plan['id'] + '-followup', 'issues': [],
             'edits': [{'number': number, **{key: item[key] for key in
-                       ('goal', 'out_of_scope', 'done_when', 'acceptance_files')}}],
+                       ('goal', 'out_of_scope', 'done_when', 'checklist', 'acceptance_files')}}],
         }
         case.path.write_text(json.dumps(case.plan))
         reread(case, capsys)
@@ -113,6 +113,12 @@ def test_publish_refuses_stale_issue_atomically_then_allows_explicit_reread(
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(case.tracker, name, mutation)
+
+    if route == 'edit':
+        # Keep the current check without refreshing the observed base: only the
+        # stale guard should refuse this otherwise valid edit until a re-read.
+        case.plan['edits'][0]['done_when'][0] = new_command
+        case.path.write_text(json.dumps(case.plan))
 
     code, diagnostic = publish(case, capsys, approve=False)
     assert code != 0, f'Stale publish must stop before overwriting GitHub issue #{number}'
