@@ -184,7 +184,8 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
         "- paths: [feature.txt]\n  why: Preserve the feature output.\n"
         "  guidance: Check the resulting file.\n"
     )})
-    enable_reviewer(c, ["VERDICT: PASS"] * 4)
+    # #1372 (2026-11-01, test owner): four perspective reviews plus one findings merge.
+    enable_reviewer(c, ["VERDICT: PASS"] * 5)
     c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
     payload = "evidence-BEGIN\n" + "e" * 70000 + "\nevidence-END"
     if entry == "run":
