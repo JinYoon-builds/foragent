@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import harness_guard, run_group_check, run_group_evidence, runner
+    from foragent import harness_guard, run_group_check, run_group_ci, run_group_evidence, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -157,6 +157,11 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     def reuse(target: str) -> bool:
         """Every base-move point asks this: does the joint pass verify this exact head on ``target``?"""
         nonlocal verified_base_sha, reused_base
+        if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
+            return False
+        if (run_publish.enabled(ctx, attempt.target_branch)
+                and run_group_ci.evidence(attempt, verified_head_sha, target) is None):
+            return False
         if run_group_evidence.note(n, ctx, verified_head_sha, target, run_group_evidence.neutral_rule(attempt)):
             return False
         verified_base_sha = reused_base = target  # group-reuse: no refresh, recheck or push
@@ -196,6 +201,14 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
         comparison = None
         if run_publish.enabled(ctx, attempt.target_branch):
+            comparison = run_group_ci.evidence(attempt, verified_head_sha, verified_base_sha)
+            if comparison is None and reused_base == verified_base_sha:
+                target_sha = refresh_base(run_publish.capture_move(git, verified_base_sha))
+                reused_base = None
+                if stopped := publish_refresh(target_sha):
+                    return stopped
+                continue
+        if comparison is None and run_publish.enabled(ctx, attempt.target_branch):
             comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
                                                         base_sha=verified_base_sha, status=ci_wait.status,
                                                         deadline=ci_wait.deadline)

@@ -7,6 +7,23 @@ from typing import Any
 from foragent.state import StateStore
 
 
+def events(store: StateStore, kind: str) -> list[dict]:
+    """Retained events of one kind in journal order, skipping unreadable records."""
+    try:
+        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    result = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("kind") == kind:
+            result.append(event)
+    return result
+
+
 def append_event(store: StateStore, at: datetime, issue: int | None, kind: str, summary: str,
                  say: str | None = None, *, locked: bool = False, **fields: Any) -> dict:
     """Append one event; ``say`` is an optional line for a person, kept beside the raw summary.

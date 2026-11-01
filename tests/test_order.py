@@ -20,7 +20,7 @@ from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
-from foragent.tracker import FakeTracker, TrackerError
+from foragent.tracker import FakeTracker, IdentityError, TrackerError
 
 from conftest import BASE_TIME, git_command
 
@@ -909,7 +909,8 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -928,6 +929,95 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert not any(path.startswith((".git/", ".venv/", "node_modules/")) for path in result["repo"]["tree"])
     (tmp_path / "package.json").write_text('{"scripts":{"test":"test"}}')
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
+
+
+@pytest.mark.parametrize("legacy_owner,foreign", [(None, False), ("alice", False), ("bob", True)])
+def test_context_legacy_orderer_and_foreign_scope(tmp_path, monkeypatch, legacy_owner, foreign):
+    tracker = FakeTracker(login="Alice")
+    # Deliberately return an unfiltered, unsorted listing to exercise the context boundary.
+    tracker.add_issue(8, "Foreign PR", "## Files\n- pr.py", ["by:bob"], is_pull_request=True)
+    tracker.add_issue(7, "Closed", "## Files\n- closed.py", ["by:bob"], state="closed")
+    tracker.add_issue(6, "Unknown scope", "## Goal\nNot scoped yet", ["by:bob"])
+    tracker.add_issue(5, "Empty scope", "## Files\n## Out of scope\nRest", ["by:bob"])
+    tracker.add_issue(4, "Declared scope", "## Files\n- src/shared.py\n- ui/**\n", ["by:BOB"])
+    tracker.add_issue(2, "Legacy question", "## Files\n- legacy/**\n", ["needs-human"])
+    tracker.add_issue(1, "Own question", "body", ["by:alice", "needs-human"])
+    for n in (1, 2, 4):
+        tracker.comment(n, format_comment(Reason.SPEC_QUESTION, "Choose", "A or B?"))
+    tracker.add_labels(4, ["needs-human"])
+    monkeypatch.setattr(tracker, "list_open_issues", lambda: list(tracker.issues.values()))
+    reads, logins = [], []
+    comments = tracker.list_comments
+    monkeypatch.setattr(tracker, "list_comments", lambda n: reads.append(n) or comments(n))
+    monkeypatch.setattr(tracker, "authenticated_login", lambda: logins.append(True) or "Alice")
+    result = order.context(tmp_path, Config(legacy_owner=legacy_owner), tracker)
+    expected = [{"number": 4, "title": "Declared scope", "orderer": "bob",
+                 "files": ["src/shared.py", "ui/**"]},
+                {"number": 5, "title": "Empty scope", "orderer": "bob", "files": []},
+                {"number": 6, "title": "Unknown scope", "orderer": "bob", "files": []}]
+    if foreign:
+        expected.insert(0, {"number": 2, "title": "Legacy question", "orderer": "bob",
+                            "files": ["legacy/**"]})
+    assert result["other_orders"] == expected
+    assert [row["number"] for row in result["decisions"]] == ([1] if foreign else [1, 2])
+    assert reads == ([1] if foreign else [1, 2])
+    assert logins == [True]
+    assert [row["number"] for row in result["open_issues"]] == [1, 2, 4, 5, 6]
+
+
+@pytest.mark.parametrize("labels,body,error", [
+    (["by:alice", "by:bob"], "", "ownership_ambiguous"),
+    ([], order.OWNED_MARKER, "ownership_unconfirmed"),
+    (["by:???"], "", "ownership_invalid_login"),
+])
+@pytest.mark.parametrize("factory_login", ["alice", None])
+def test_context_unresolved_owner_stays_visible(tmp_path, monkeypatch, labels, body, error, factory_login):
+    from foragent.i18n import text
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Unresolved", body, [*labels, "needs-human"])
+    tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Choose"))
+    monkeypatch.setattr(tracker, "authenticated_login", lambda: factory_login)
+    result = order.context(tmp_path, Config(language="ko"), tracker)
+    assert result["decisions"] == result["other_orders"] == []
+    assert result["open_issues"][0]["owner_error"] == text(
+        error, "ko", owners="alice, bob", number=1, value="???")
+
+
+@pytest.mark.parametrize("failure", [TrackerError("offline"), IdentityError("robot", "Bot"),
+                                     OwnershipError("unavailable"), None])
+@pytest.mark.parametrize("legacy_owner", [None, "alice"])
+def test_context_identity_failure_preserves_legacy_questions(tmp_path, monkeypatch, failure, legacy_owner):
+    from foragent.i18n import text
+    tracker = FakeTracker()
+    tracker.add_issue(1, "Known owner", "## Files\n- ui/**", ["by:alice", "needs-human"])
+    tracker.add_issue(2, "Legacy", "", ["needs-human"])
+    tracker.add_issue(3, "Legacy without check", "", ["needs-human", "approved"])
+    tracker.add_issue(4, "Other owner", "## Files\n- src/**", ["by:bob", "needs-human"])
+    for n in (1, 2, 3, 4):
+        reason = Reason.NO_MACHINE_CHECK if n == 3 else Reason.SPEC_QUESTION
+        tracker.comment(n, format_comment(reason, "Choose", f"Question #{n}"))
+    tracker.comment(2, "<!-- foragent:decision -->\nExisting answer")
+    def unavailable():
+        if failure is not None:
+            raise failure
+        return None
+    monkeypatch.setattr(tracker, "authenticated_login", unavailable)
+    reads, comments = [], tracker.list_comments
+    monkeypatch.setattr(tracker, "list_comments", lambda n: reads.append(n) or comments(n))
+    result = order.context(tmp_path, Config(language="ko", legacy_owner=legacy_owner), tracker)
+    cause = failure or text("ownership_invalid_login", "ko", value=None)
+    error = (text("identity_not_a_person", "ko", login="robot", kind="Bot")
+             if isinstance(failure, IdentityError) else text("init_identity_failed", "ko", error=cause))
+    assert result["identity"] == {"login": None, "error": error}
+    assert [row["number"] for row in result["decisions"]] == [2, 3]
+    assert [row["reason"] for row in result["decisions"]] == ["spec-question", "no-machine-check"]
+    assert [row["question"] for row in result["decisions"]] == ["Question #2", "Question #3"]
+    assert [row["answer"] for row in result["decisions"]] == ["Existing answer", None]
+    assert reads == [2, 3]
+    assert all("owner_error" not in row for row in result["open_issues"])
+    assert result["other_orders"] == [
+        {"number": 1, "title": "Known owner", "orderer": "alice", "files": ["ui/**"]},
+        {"number": 4, "title": "Other owner", "orderer": "bob", "files": ["src/**"]}]
 
 
 def test_context_lane_skills_come_only_from_configuration(tmp_path):
