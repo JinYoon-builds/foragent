@@ -60,6 +60,8 @@ def _preflight(rows, notes, root, config, tracker, repo, git):
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
                 retained_files=row.get("files"), git=git, refreshed=True)
             _merge(files, publication.files, config.language)
+        except order.DoneWhenExecutableError:
+            raise
         except (ValueError, OSError, TrackerError) as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
         references = set(plan.get("reference_files", {}))
@@ -211,6 +213,8 @@ def run(args, root):
                              config=config, git=git, now=lambda: cli.datetime.now(cli.UTC)).tracker
     try:
         result = flush(root, config, tracker, git, store, repo=repo, boundary=args.boundary)
+    except order.DoneWhenExecutableError:
+        raise
     except (OSError, cli.GitError, cli.TrackerError, order.PlanError) as exc:
         raise order.PlanError(text("order_flush_failed", config.language,
                                    error=" ".join(str(exc).split()))) from exc
