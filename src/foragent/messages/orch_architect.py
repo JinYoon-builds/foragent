@@ -20,6 +20,13 @@ MESSAGES = {
         "role_started": "{role} session started (pid {pid}); proposals arrive in fa orch inbox. Log: {log}",
         "role_short_help": "A one-line reason for people, written by the caller in the config language; stored beside --why",
         "role_short_one_line": "--short must be one line.",
+        "settings_desc_scheduled_roles": "Whether the architect, docs role and retrospective wake when an order finishes.",
+        "settings_window_label_scheduled_roles": "Scheduled roles",
+        "schedule_why_architect": ("Scheduled project review: order {orders} finished, with new merge or run records "
+                                   "since {since}. Follow the Project review section of your skill."),
+        "schedule_why_role": "Scheduled {role} check: order {orders} finished. Check what that order changed in your area.",
+        "schedule_retrospective": ("Retrospective due: order {orders} finished. Review it, append chosen lessons to "
+                                   "your memory and record a marked retrospective note."),
     },
     "ko": {
         "architect_help": "측정하고 제안하는 아키텍트 세션 하나를 시작해요 (--why 필요)",
@@ -40,5 +47,12 @@ MESSAGES = {
         "role_started": "{role} 세션을 시작했어요 (pid {pid}). 제안은 fa orch inbox에 들어와요. 로그: {log}",
         "role_short_help": "사람이 읽을 한 줄 이유. 부르는 쪽이 설정 언어로 써요. --why와 함께 저장돼요",
         "role_short_one_line": "--short는 한 줄이어야 해요.",
+        "settings_desc_scheduled_roles": "주문이 끝날 때 아키텍트, 문서 역할, 회고를 깨울지 정해요.",
+        "settings_window_label_scheduled_roles": "예약된 역할",
+        "schedule_why_architect": ("예약된 프로젝트 검토: 주문 {orders}이(가) 끝났고 {since} 뒤로 새 머지나 실행 기록이 있어요. "
+                                   "스킬의 Project review 절을 따르세요."),
+        "schedule_why_role": "예약된 {role} 점검: 주문 {orders}이(가) 끝났어요. 그 주문이 내 영역에서 바꾼 것을 점검하세요.",
+        "schedule_retrospective": ("회고 차례: 주문 {orders}이(가) 끝났어요. 돌아보고, 고른 교훈을 메모리에 덧붙이고, "
+                                   "회고 표시가 있는 노트를 남기세요."),
     },
 }

@@ -6,8 +6,8 @@ description: Measure where a Foragent project hurts and propose structural chang
 
 This is skills/fa-architect/SKILL.md; skills/fa-orchestrator/references/refactor.md points here.
 
-The orchestrator starts you with `fa orch architect --why "<evidence>"`. You only propose; the
-orchestrator decides. You never publish, edit or approve orders, and you do not change code, labels
+The orchestrator starts you with `fa orch architect --why "<evidence>"`, and the gate starts you the
+same way when an order finishes (see Project review). You only propose; the orchestrator decides. You never publish, edit or approve orders, and you do not change code, labels
 or the board.
 
 ## Measure first
@@ -54,6 +54,23 @@ Every proposal and every review checks the state-ownership rules:
 
 GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
 `fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.
+
+## Project review
+
+The gate starts this review when every child issue of a published order is merged or closed and there
+are new merge or run records. Your `--why` names the order and the input cutoff: review what landed
+since that cutoff, across the whole project, not only that order. Records that arrive during your
+session wait for the next review.
+
+Look for what this input changed structurally, with these facts when `fa orch facts` shows them:
+
+- Structure: hot files, co-changed files, line counts and slow tests, measured as above.
+- Spend versus size: the time and review rounds a run used against what its declared size usually takes.
+- Scope drift: the files a run changed against its declared Files.
+
+Facts are evidence, not triggers: judge them yourself and keep every Proposals rule above. Send proposals
+with `fa orch request --from architect`. "Nothing to change" stays a valid result, and no order is
+required to follow from this review.
 
 ## Refactoring
 
