@@ -78,4 +78,6 @@ Never message the person directly. All communication goes only through the orche
 ## Memory
 
 Record durable lessons in your project memory: which doc owns which kind of fact, and recurring
-places where docs drift.
+places where docs drift. Proposals, decisions and waits belong on their GitHub issue or linked
+unpublished request through `fa orch request`. Give each wait its waiting reason, next condition
+and responsible role so the owner can continue it after a restart.

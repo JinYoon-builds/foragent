@@ -12,3 +12,6 @@
 - [id:wait-resume-2026-10-31-1181-public-reader] #1181: 대기 원문은 order_waiting.section()이 공개 reader다. orch_waits는 이를 그대로 요청에 싣고 역할·이유·조건을 다시 파싱하지 않는다. 성공한 최신 listing 뒤에만 scheduler._blockers(confirmed=True)를 읽어, blocker 변경의 기존 링크 무효화와 변경 없는 refresh의 조회 재사용을 함께 따른다.
 - [id:wait-resume-2026-10-31-1181-receipt] #1181: wait_resume_key(이슈 번호·대기 원문 SHA256·저장소를 포함한 닫힌 blocker 집합)는 inbox 요청 자체가 유일한 전송 영수증이다. tick lock 안에서 모든 상태(done 포함)의 요청을 읽어 재시작·완료 뒤에도 중복을 막고, 별도 claim 파일 없이 쓰기 실패는 재시도한다. 한 이슈의 일반 오류는 다음 이슈를 막지 않으며 한도 오류는 기존 tick pause로 전파한다.
 - [id:wait-resume-2026-10-31-1181-break-it] #1181: tests/test_orch_waits_unit.py의 14개 사례 모두가 임시 src 사본의 변형을 하나 이상 잡았고, 전달 생략·중복·옛 listing·임의 승인 등 18개 변형을 모두 거절했다. PYTHONPATH 사본 검증은 실제 import된 orch_waits.__file__을 먼저 확인해야 한다. 인수 시험이나 작업 트리 소스를 변형하지 않는다.
+
+- [id:1188-2026-11-01-role-memory-ssot] 역할 시작 안내의 원본은 orch_role_prompt.PROMPT(architect)·ROLE_PROMPT(다른 역할)이며 Codex는 _procedure()가 붙인 프로젝트 스킬 본문도 읽는다. 기억 규칙을 고칠 때 skills/fa-architect·fa-docs와 함께 맞추고, measured: pending 등 작업 측정은 연결 요청/이슈에 두고 교훈만 memory에 남긴다.
+- [id:1188-2026-11-01-waiting-edit-contract] 기존 order plan 스키마에는 waiting 키가 없다. 기존 goal 뒤에 ## Waiting을 붙인 edits를 order_files.issue_body로 렌더링한 뒤 parse_body(새 본문)==parse_body(옛 본문), order_waiting.section(새 본문)==의도한 대기를 확인하면 기존 실행 계약 보존을 직접 검사할 수 있다. 전체 본문 편집안의 조회 전제 해시는 별도 근거에 두고 게시 담당이 최신 본문과 재대조한다.
