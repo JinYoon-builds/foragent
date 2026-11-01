@@ -42,6 +42,7 @@ class PublishingGit:
         self.root, self.events = root, events
         self.saved = {}
         self.branch = "main"
+        self.pushed = False
 
     def current_branch(self):
         return self.branch
@@ -74,8 +75,19 @@ class PublishingGit:
         contents = {path: (self.root / path).read_text() for path in paths}
         self.events.append(("commit", title, contents))
         self.saved.update(contents)
+        self.pushed = False
+
+    def _call(self, args):
+        # Recovery's history search: this fake keeps no history, so it finds no batch commit.
+        assert args[0] == "log"
+        return ""
+
+    def is_ancestor(self, ancestor, head):
+        # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
+        return self.pushed if head.startswith("origin/") else ancestor in {"published", "origin/main"}
 
     def push_base(self, branch):
+        self.pushed = True
         self.events.append(("push", branch))
 
     @contextmanager
@@ -113,8 +125,10 @@ def offline_publication(git_history):
         calls.append(args)
         if "commit" in args:
             parent = git_command(root, "rev-parse", "HEAD")
+            title = args[args.index("-m") + 1]
             stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-                      "data 7\nPublish\n", f"from {parent}\n"]
+                      f"data {len(title.encode())}\n{title}\n",
+                      f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
                 if name == ":!CLAUDE.local.md":
                     continue
