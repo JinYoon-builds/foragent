@@ -24,21 +24,43 @@ STEPS = {"baseline": "baseline", "implementing": "implementing", "resolving": "i
 CATEGORIES = ("working", "question", "waiting", "idle")
 
 
-def fit_marked(line: Line, width: int, mark: str) -> Line:
+def fit_marked(line: Line, width: int, mark: str, *, omitted: bool = False) -> Line:
     """``line`` within ``width`` cells; when anything is cut away it ends in ``mark``.
 
     watch._fit clips silently, which hides that a name, path or count was shortened.
+    ``omitted`` also marks a fitting row when later rows were left out.
     """
     from foragent import watch
 
-    if sum(watch._cells(value) for value, _ in line) <= width:
+    if not omitted and sum(watch._cells(value) for value, _ in line) <= width:
         return list(line)
     room = width - watch._cells(mark)
     if room < 0:
         return watch._fit([(mark, "")], width)
     kept = watch._fit(line, room)
+    while kept:
+        value, style = kept[-1]
+        if value.rstrip():
+            kept[-1] = (value.rstrip(), style)
+            break
+        kept.pop()
     style = next((style for value, style in reversed(kept) if value.strip()), "")
     return [*kept, (mark, style)]
+
+
+def text(key: str, language: str, *, ascii: bool = False, **values) -> str:
+    """Choose a template before formatting, preserving literal names and paths."""
+    from foragent import i18n, watch
+
+    catalog = i18n.MESSAGES.get(language.lower().split("-")[0], i18n.MESSAGES["en"])
+    if ascii and key + "_ascii" in catalog:
+        key += "_ascii"
+    return watch.text(key, language, **values)
+
+
+def generated_ascii(value: str) -> str:
+    """ASCII decorations for generated status copy; never apply to authored data."""
+    return value.translate(str.maketrans({"·": "|", "⚠": "!", "○": "o", "—": "-", "…": "..."}))
 
 
 def questions(status: dict[str, Any]) -> set[int]:
@@ -50,11 +72,12 @@ def questions(status: dict[str, Any]) -> set[int]:
 
 def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str, phase: str | None,
                 needs: set[int]) -> str:
-    """question, parked, wait, working or next: the one rule for an issue's acorn.
+    """question, parked, wait, working, authored or next: the one rule for an acorn.
 
     Recorded question evidence wins (the item's own state, the needs-human group, or the
     lane's representative row in waiting-human, for that issue only), then the latest park
-    fact, then a recorded wait phase or an orchestrator block, then work. Queued work is next.
+    fact, then a recorded wait phase or an orchestrator block, then work. Queued
+    authored waits keep their own context; ordinary queued work is next.
     """
     if (state == "waiting-human" or number in needs
             or (number == row.get("issue") and row.get("state") == "waiting-human")):
@@ -62,7 +85,7 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     if (snapshot.park_facts.get(number) or {}).get("parked"):
         return "parked"
     if state == "queued":
-        return "next"
+        return "authored" if (snapshot.waiting_facts.get(number) or {}).get("authored") else "next"
     if phase in WAIT_PHASES or state == "blocked":
         return "wait"
     return "working"
@@ -80,8 +103,11 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     status = snapshot.status
     needs = questions(status) if needs is None else needs
     runs = {run["number"]: run for run in _clones(status).get(row.get("slug"), [])}
+    # Only a lane in this snapshot can redirect a status entry. Unresolved optional
+    # references leave the status's own placement intact.
+    slugs = {lane["slug"] for lane in status["lanes"].values()}
     authored = {number: fact for number, fact in snapshot.waiting_facts.items()
-                if fact.get("authored") and fact.get("lane") == row.get("slug")}
+                if fact.get("authored") and fact.get("lane") in slugs}
     titles = {item["number"]: item.get("title") for key in ("running", "queued", "held")
               for item in row.get(key) or () if isinstance(item, dict) and "number" in item}
     current: list[dict[str, Any]] = []
@@ -90,7 +116,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     def add(target: list[dict[str, Any]], number: int, state: str, phase: str | None,
             run: dict[str, Any] | None) -> None:
         fact = snapshot.waiting_facts.get(number) or {}
-        if fact.get("authored") and fact.get("lane") != row.get("slug"):
+        if number in authored and authored[number]["lane"] != row.get("slug"):
             return  # The recorded active lane wins over a subsequently edited label.
         if number in seen:
             # One acorn per issue, but question evidence from any listing still counts.
@@ -102,7 +128,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         title = titles.get(number) or snapshot.titles.get(number) or fact.get("title") or (
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
-                 "class": acorn_class(snapshot, row, number, state, phase, needs)}
+                 "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored")}
         seen[number] = entry
         target.append(entry)
 
@@ -138,8 +164,9 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
             None, None)
     # An authored wait is visible even without approval or a scheduler queue entry.
     # add() keeps a listed worker/held/queued acorn and its class instead of duplicating it.
-    for number in authored:
-        add(upcoming, number, "queued", None, None)
+    for number, fact in authored.items():
+        if fact["lane"] == row.get("slug"):
+            add(upcoming, number, "queued", None, None)
     return current, upcoming
 
 
@@ -163,6 +190,7 @@ def representative_wait(row: dict[str, Any], current: list[dict[str, Any]],
     or queued acorns) shows the reason of its first waiting acorn, else of its first queued
     acorn classed next (its own issue first); parked and question acorns wait for no turn.
     """
+    # Current wait states keep their sentence even when they also have authored context.
     waiting = [item["number"] for item in current if item["class"] == "wait"]
     if row.get("issue") in waiting:
         return row["issue"]
@@ -178,20 +206,18 @@ def representative_wait(row: dict[str, Any], current: list[dict[str, Any]],
     return chosen["number"]
 
 
-def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, language: str) -> str:
+def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, language: str, *, ascii: bool = False) -> str:
     """The waiting sentence, with a cause only when facts record one.
 
     Recorded waiting facts come first; a snapshot without them still names the status's
     recorded blockers of the row's own issue.
     """
-    from foragent import watch
-
     facts = snapshot.waiting_facts.get(number)
     if facts is None:
         facts = {"kind": None, "blocking_issues": list(row.get("waiting_for") or [])
                  if number == row.get("issue") else [], "overlapping_files": []}
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
-    t = lambda key, **values: watch.text(key, language, **values)
+    t = lambda key, **values: text(key, language, ascii=ascii, **values)
     if blockers:
         return t("lane_blocks_wait_after", issues=", ".join(f"#{n}" for n in blockers))
     if kind == "capacity":
@@ -239,4 +265,8 @@ def activity_warning(snapshot: Snapshot, config: Config, row: dict[str, Any], it
         shown, config.language, age, config.stall_minutes, run.get("pid"), snapshot.log_ages.get(number),
         _runner_progress(run, snapshot.captured_at), _age(run.get("phase_started_at"), snapshot.captured_at))
     # The acorn already says what is normal; only warnings add words.
-    return found if found.startswith(("○", "?")) else ""
+    if not found.startswith(("○", "?")):
+        return ""
+    from foragent.watch_sections.lanes import glyph_mode
+
+    return generated_ascii(found) if glyph_mode(config) == "ascii" else found

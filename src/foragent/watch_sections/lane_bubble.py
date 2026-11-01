@@ -45,17 +45,6 @@ def _ellipsis(config: Config) -> str:
     return "..." if glyph_mode(config) == "ascii" else "…"
 
 
-def _cut(value: str, width: int, mark: str) -> str:
-    """One row of at most ``width`` cells, ending in ``mark`` when anything was cut."""
-    from foragent import watch
-
-    value = watch._clean(value)
-    if watch._cells(value) <= width:
-        return value
-    room = max(0, width - watch._cells(mark))
-    return "".join(part for part, _ in watch._fit([(value, "")], room)).rstrip() + mark
-
-
 def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
@@ -83,20 +72,21 @@ def bar_counts(snapshot: Snapshot) -> tuple[int, int]:
     return done, done + len(left)
 
 
-def _bar(snapshot: Snapshot, language: str, width: int, mark: str = "…") -> list[Line]:
+def _bar(snapshot: Snapshot, language: str, width: int, mark: str = "…", *, ascii: bool = False) -> list[Line]:
     from foragent import watch, watch_scene
 
     done, total = bar_counts(snapshot)
     if not total:
         return []
     percent = round(100 * done / total)
-    label = (watch.text("lane_bubble_bar_one", language, percent=percent, done=done) if total == 1
-             else watch.text("lane_bubble_bar", language, percent=percent, done=done, total=total))
+    label = (watch_scene.text("lane_bubble_bar_one", language, ascii=ascii, percent=percent, done=done) if total == 1
+             else watch_scene.text("lane_bubble_bar", language, ascii=ascii, percent=percent, done=done, total=total))
     cells = max(0, min(BAR_CELLS, width - watch._cells(label) - 2))
     filled = round(cells * done / total)
     if not cells:
         return [watch_scene.fit_marked([(label, "")], width, mark)]
-    return [[("█" * filled, "green"), ("░" * (cells - filled), "dim"), ("  ", ""), (label, "")]]
+    ink, empty = ("#", "-") if ascii else ("█", "░")
+    return [[(ink * filled, "green"), (empty * (cells - filled), "dim"), ("  ", ""), (label, "")]]
 
 
 def _clock(at: datetime, now: datetime, language: str) -> str:
@@ -186,15 +176,9 @@ def _clip(rows: list[Line], width: int, mark: str, limit: int = BODY_ROWS) -> li
         return rows
     if limit <= 0:
         return []
-    from foragent import watch
+    from foragent.watch_scene import fit_marked
 
-    last = rows[limit - 1]
-    text = watch._clean("".join(value for value, _ in last))
-    style = last[0][1] if last else ""
-    # The last row always ends in the mark: something was left out, even when it was full.
-    room = max(0, width - watch._cells(mark))
-    kept = "".join(part for part, _ in watch._fit([(text, "")], room)).rstrip()
-    return rows[:limit - 1] + [[(kept + mark, style)]]
+    return rows[:limit - 1] + [fit_marked(rows[limit - 1], width, mark, omitted=True)]
 
 
 def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
@@ -208,9 +192,11 @@ def _explanation_rows(found: list[Line], width: int, mark: str) -> list[Line]:
 
     rows: list[Line] = []
     for index, line in enumerate(found):
+        line = [(watch._clean(value) if any(watch.unicodedata.category(char).startswith("C") for char in value)
+                 else value, style) for value, style in line]
         text = "".join(value for value, _ in line)
         style = next((style for value, style in line if value.strip()), "")
-        wrapped = watch._wrap(text, width, style) if text.strip() else [[]]
+        wrapped = (watch._wrap(text, width, style) if watch._cells(text) > width else [line]) if text.strip() else [[]]
         later = len(found) - index - 1
         rows += _clip(wrapped, width, mark, max(1, BODY_ROWS - len(rows) - later))
     return _clip(rows, width, mark)
@@ -242,6 +228,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     state = context.get("state")
     hits = context.get("hits", [])
     mark = _ellipsis(config)
+    from foragent.watch_sections.lanes import glyph_mode
+
+    ascii = glyph_mode(config) == "ascii"
     sprite = _pixels(config) and width >= SPRITE_FROM
     box_width = width - SPRITE_CELLS - SPRITE_GAP if sprite else width
     inside = max(1, box_width - 4)
@@ -255,8 +244,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         from foragent import watch_scene
 
         return ([watch_scene.fit_marked(line, width, mark) for line in body if line]
-                + _bar(snapshot, config.language, width, mark))
-    from foragent.watch_sections.lanes import glyph_mode
+                + _bar(snapshot, config.language, width, mark, ascii=ascii))
 
     box = _box(body, box_width, sprite, glyph_mode(config))
     if sprite:
@@ -264,13 +252,15 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         box = [[*art[index], (" " * (SPRITE_CELLS - len(art[index]) + SPRITE_GAP), ""), *row]
                for index, row in enumerate(box)]
         hits.append((0, top, SPRITE_CELLS, top + len(box), ("orchestrator", None)))
-    return box + _bar(snapshot, config.language, width, mark)
+    return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
             now: datetime, width: int, state: dict | None) -> list[Line] | None:
     """An acorn's rows: #N and title (one row), its lane, what it is doing and for how long,
-    and a worker warning when there is one. Other targets are not this section's."""
+    and a worker warning when there is one. Queued authored waits show their recorded
+    context; other classes keep their state explanation, with that context in the block.
+    Other targets are not this section's."""
     from foragent import watch, watch_scene
     from foragent.status import _age
     from foragent.watch_sections.lanes import elapsed_text
@@ -278,7 +268,10 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     if not (isinstance(target, tuple) and len(target) == 2 and target[0] == "acorn" and type(target[1]) is int):
         return None
     number, language = target[1], config.language
-    t = lambda key, **values: watch.text(key, language, **values)
+    from foragent.watch_sections.lanes import glyph_mode
+
+    ascii = glyph_mode(config) == "ascii"
+    t = lambda key, **values: watch_scene.text(key, language, ascii=ascii, **values)
     needs = watch_scene.questions(snapshot.status)
     for row in snapshot.status.get("lanes", {}).values():
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)
@@ -291,17 +284,22 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     facts = snapshot.lane_facts.get(slug)
     paths = facts.get("owned_paths") if isinstance(facts, dict) else (config.lanes.get(slug) or {}).get("paths")
     paths = [str(path) for path in paths or ()]
-    rows: list[Line] = [[(_cut(f"#{number} {item['title']}".rstrip(), width, _ellipsis(config)), "bold")]]
+    rows = [watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
+                                   width, _ellipsis(config))]
     rows.append([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
                   else t("lane_bubble_lane", lane=name), "")])
     kind, run, phase = item["class"], item["run"], item["phase"]
+    if kind == "authored":
+        from foragent.watch_waiting import explanation
+
+        return rows + explanation(item["authored"], language, width, mark=_ellipsis(config))
     if kind == "question":
         return rows + [[(t("lane_bubble_question_click"), "question")]]
     if kind == "parked":
         return rows + [[(t("lane_bubble_parked_click", lane=name), "")]]
     if kind == "next":
         rows.append([(t("lane_bubble_queued_click", lane=name), "")])
-        reason = watch_scene.waiting_reason(snapshot, row, number, language)
+        reason = watch_scene.waiting_reason(snapshot, row, number, language, ascii=ascii)
         if reason != t("lane_blocks_wait"):
             rows.append([(reason, "")])
         return rows

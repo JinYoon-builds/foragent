@@ -266,7 +266,7 @@ def test_idle_rows_count_todays_merges_in_the_lane_only(tmp_path):
     frame = watch.render_frame(result, config, tmp_path).splitlines()
     # The shared idle block lists each lane once; only today's merges in that lane count.
     names = next(line for line in frame if "Docs" in line and "Server" in line)
-    entries = dict(entry.split(" ", 1) if " " in entry else (entry, "") for entry in names.split(" · "))
+    entries = dict(entry.split(" ", 1) if " " in entry else (entry, "") for entry in names.split(" | "))
     assert (entries["Docs"], entries["Server"]) == ("v2", ""), frame
 
 

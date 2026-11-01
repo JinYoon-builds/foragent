@@ -47,15 +47,6 @@ def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
     return config.animation and not ascii_glyphs and not narrow, ascii_glyphs, narrow
 
 
-def _cut(value: str, width: int, mark: str) -> str:
-    from foragent import watch
-
-    if watch._cells(value) <= width:
-        return value
-    room = max(0, width - watch._cells(mark))
-    return "".join(part for part, _ in watch._fit([(value, "")], room)).rstrip() + mark
-
-
 def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *, word: bool = True) -> Line:
     """The item's sideways acorn; ``word=False`` gives the ID-only acorn kept when the step word
     does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
@@ -130,7 +121,7 @@ def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefi
                 elif count:
                     break  # The whole unit moves to the next row, where it is first.
                 elif spare > watch._cells(mark) + 1:
-                    extra = [(_cut(text, spare, mark), "yellow")]
+                    extra = watch_scene.fit_marked([(text, "yellow")], spare, mark)
             if gap:
                 line.append(("  ", ""))
             placed.append((len(lines), indent + used + gap, indent + used + gap + size, number))
@@ -151,7 +142,7 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
     The paths are cut first; the count goes before the name is cut. Returns the row and
     the name's cells.
     """
-    from foragent import watch
+    from foragent import watch, watch_scene
 
     slug, language = row.get("slug"), config.language
     name = watch._clean(row.get("lane_display") or slug or "")
@@ -164,13 +155,10 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
     name_cells = watch._cells(name)
     if right and name_cells + 2 + watch._cells(right) > width:
         right = ""
-    if name_cells > width:
-        # The name goes last, and visibly: cut with the mark, never silently by the frame.
-        name = _cut(name, width, mark)
     room = width - name_cells - (2 + watch._cells(right) if right else 0) - 2
-    line: Line = [(name, "bold")]
+    line = watch_scene.fit_marked([(name, "bold")], width, mark)
     if joined and room > watch._cells(mark):
-        line += [("  ", ""), (_cut(joined, room, mark), "dim")]
+        line += [("  ", ""), *watch_scene.fit_marked([(joined, "dim")], room, mark)]
     if right:
         used = sum(watch._cells(value) for value, _ in line)
         line += [(" " * max(2, width - used - watch._cells(right)), ""), (right, "green")]
@@ -229,13 +217,14 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
             if not (context := authored[item["number"]]):
                 continue
             place(_flow(units([item], warnings), width, 1, prefix, mark, 1))
-            lines.extend(explanation(context, language, width))
+            lines.extend(explanation(context, language, width, mark=mark))
 
     if current:
         group(current, True, [])
     waiting = watch_scene.representative_wait(row, current, upcoming)
     if waiting is not None:
-        lines.append([(_cut(watch_scene.waiting_reason(snapshot, row, waiting, language), width, mark), "dim")])
+        lines.append(watch_scene.fit_marked([(watch_scene.waiting_reason(snapshot, row, waiting, language,
+                                                                        ascii=ascii_glyphs), "dim")], width, mark))
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
@@ -272,7 +261,7 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
             lines.append(line)
             line, used = [], 0
         if line:
-            line.append((" · ", "dim"))
+            line.append((" | " if ascii_glyphs else " · ", "dim"))
             used += 3
         hits.append((used, len(lines), min(width, used + cells), len(lines) + 1, ("squirrel", slug)))
         line += spans
@@ -284,8 +273,9 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
 
 def _evidence(snapshot: Snapshot, config: Config, now: datetime) -> Line:
     """The orchestrator's missing watch, the planning requests (D76) and the inbox count, on one row."""
-    from foragent import watch
+    from foragent import watch, watch_scene
     from foragent.watch_sections import orch_panel
+    from foragent.watch_sections.lanes import glyph_mode
 
     status, language = snapshot.status, config.language
     t = lambda key, **values: watch.text(key, language, **values)
@@ -302,8 +292,10 @@ def _evidence(snapshot: Snapshot, config: Config, now: datetime) -> Line:
     if snapshot.panel.get("inbox") is not None:
         parts.append((t("orch_panel_for_you", count=snapshot.panel["inbox"]), ""))
     line: Line = []
+    ascii = glyph_mode(config) == "ascii"
     for index, (value, style) in enumerate(parts):
-        line += ([(" · ", "dim")] if index else []) + [(value, style)]
+        line += ([(" | " if ascii else " · ", "dim")] if index else []) + [(
+            watch_scene.generated_ascii(value) if ascii else value, style)]
     return line
 
 

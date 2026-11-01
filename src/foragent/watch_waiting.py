@@ -5,8 +5,9 @@ import unicodedata
 from foragent.watch_cells import Line
 
 
-def explanation(authored: dict[str, str], language: str, width: int) -> list[Line]:
+def explanation(authored: dict[str, str], language: str, width: int, *, mark: str = "…") -> list[Line]:
     from foragent import watch
+    from foragent.watch_scene import fit_marked
 
     def printable(value: str) -> str:
         # Tabs have visible spacing; other terminal controls must not steer the screen.
@@ -19,7 +20,5 @@ def explanation(authored: dict[str, str], language: str, width: int) -> list[Lin
     lines = []
     for value in values:
         value = "  " + value
-        if watch._cells(value) > width:
-            value = "".join(part for part, _ in watch._fit([(value, "dim")], max(0, width - 1))).rstrip() + "…"
-        lines.append(watch._fit([(value, "dim")], width))
+        lines.append(fit_marked([(value, "dim")], width, mark))
     return lines

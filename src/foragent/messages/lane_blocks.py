@@ -21,6 +21,11 @@ MESSAGES = {
         "lane_blocks_wait_overlap_unknown": "waiting its turn · file overlap",
         "lane_blocks_wait_machine": "waiting: the computer is busy",
         "lane_blocks_wait_and_slots": "{reason} · slots full",
+        "lane_blocks_wait_after_ascii": "waiting its turn | after {issues}",
+        "lane_blocks_wait_slots_ascii": "waiting its turn | slots full",
+        "lane_blocks_wait_overlap_ascii": "waiting its turn | file overlap: {paths}",
+        "lane_blocks_wait_overlap_unknown_ascii": "waiting its turn | file overlap",
+        "lane_blocks_wait_and_slots_ascii": "{reason} | slots full",
     },
     "ko": {
         "lane_blocks_today_one": "오늘 1개 머지",
@@ -42,5 +47,10 @@ MESSAGES = {
         "lane_blocks_wait_overlap_unknown": "순서를 기다려요 · 파일이 겹쳐요",
         "lane_blocks_wait_machine": "컴퓨터가 바빠서 기다려요",
         "lane_blocks_wait_and_slots": "{reason} · 자리도 다 찼어요",
+        "lane_blocks_wait_after_ascii": "순서를 기다려요 | {issues} 뒤에 해요",
+        "lane_blocks_wait_slots_ascii": "순서를 기다려요 | 자리가 다 찼어요",
+        "lane_blocks_wait_overlap_ascii": "순서를 기다려요 | 파일이 겹쳐요: {paths}",
+        "lane_blocks_wait_overlap_unknown_ascii": "순서를 기다려요 | 파일이 겹쳐요",
+        "lane_blocks_wait_and_slots_ascii": "{reason} | 자리도 다 찼어요",
     },
 }

@@ -62,7 +62,7 @@ def test_ascii_glyphs_draw_the_bubble_as_brackets(tmp_path):
     first = list(config.lanes)[0]
     frame = plain_frame(render_frame(dreaming(snapshot, first), config, tmp_path, width=80))
     # A hand-built snapshot has no today counts, so only the ASCII dream mark follows the name.
-    assert lane_line(frame, config, first)[0].startswith("🧩 담당0 [~] · 🧩 담당1")
+    assert lane_line(frame, config, first)[0].startswith("🧩 담당0 [~] | 🧩 담당1")
     assert "💭" not in frame and "꿈꾸는 중" not in frame
 
 

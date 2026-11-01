@@ -179,5 +179,5 @@ def test_long_waits_clip_in_cells_without_wrapping(tmp_path, monkeypatch, width)
     snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
     frame = watch.render_frame(snapshot, config, tmp_path, width=width)
     waits = [line for line in frame.splitlines() if "기다리는 이유:" in line]
-    assert len(waits) == 3 and any("…" in line for line in waits)
+    assert len(waits) == 3 and any(line.rstrip().endswith("...") for line in waits)
     assert all(watch._cells(line) <= width for line in frame.splitlines())
