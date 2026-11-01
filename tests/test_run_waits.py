@@ -45,11 +45,11 @@ def slot_case(tmp_path, monkeypatch):
     return SimpleNamespace(ctx=ctx, store=store, other=other, clock=clock, sleeps=sleeps, occupy=occupy)
 
 
-@pytest.mark.parametrize("kind", ["credited", "lazy-credited", "merge-lock", "executor", "test-slot",
+@pytest.mark.parametrize("kind", ["credited", "lazy-credited", "merge-lock", "merge-turn", "executor", "test-slot",
                                    "context", "baseline", "local-baseline"])
 @pytest.mark.parametrize("exception", [RuntimeError, KeyboardInterrupt, SystemExit])
 def test_failed_phase_restoration_does_not_reenter_or_replace_the_exception(slot_case, monkeypatch, kind, exception):
-    from foragent import capacity, ci_local, run_baseline, run_waits
+    from foragent import capacity, run_waits
 
     c, error = slot_case, exception("original failure")
 
@@ -58,6 +58,23 @@ def test_failed_phase_restoration_does_not_reenter_or_replace_the_exception(slot
         c.occupy()
         c.clock[0] += timedelta(seconds=3)
         raise error
+
+    with pytest.raises(exception) as caught:
+        _interrupt_wait(c, monkeypatch, kind, fail)
+    assert caught.value is error and c.sleeps == []
+    assert c.store.get_run(1).phase in capacity.IDLE_RUN_PHASES
+    assert c.store.get_run(1).waiting_until is None
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+    if kind in {"credited", "lazy-credited", "merge-lock", "merge-turn", "executor", "test-slot"}:
+        assert c.store.get_run(1).waited_seconds == 3
+
+
+INTERRUPTED_WAITS = ["credited", "lazy-credited", "merge-lock", "merge-turn", "executor", "test-slot",
+                     "context", "baseline", "local-baseline", "group-ci"]
+
+
+def _interrupt_wait(c, monkeypatch, kind, fail):
+    from foragent import capacity, ci_local, run_baseline, run_merge_turn, run_waits
 
     @contextmanager
     def failed_lock():
@@ -70,35 +87,94 @@ def test_failed_phase_restoration_does_not_reenter_or_replace_the_exception(slot
         fail()
         yield
 
+    if kind in {"credited", "lazy-credited"}:
+        run_waits._credited_wait(1, c.ctx, fail, "overlap-wait", eager=kind == "credited")
+    elif kind == "merge-lock":
+        monkeypatch.setattr(c.store, "merge_lock", failed_lock)
+        with _merge_lock(1, c.ctx):
+            pytest.fail("A failed acquisition cannot enter the merge body")
+    elif kind == "merge-turn":
+        with run_merge_turn._merge_wait(1, c.ctx):
+            fail()
+    elif kind == "executor":
+        c.ctx.sleep = fail
+        run_waits._executor_wait(1, c.ctx, 5)
+    elif kind == "test-slot":
+        monkeypatch.setattr(capacity, "hold_test_slot", failed_test_slot)
+        with run_waits._test_slot(1, c.ctx):
+            pytest.fail("A failed acquisition cannot enter the test body")
+    elif kind == "context":
+        with run_waits.in_phase(1, c.ctx, "checking"):
+            fail()
+    elif kind == "baseline":
+        monkeypatch.setattr(run_baseline, "_capture_baseline", fail)
+        run_baseline._capture_acceptance_baseline(1, c.ctx, "pytest", "base")
+    elif kind == "local-baseline":
+        monkeypatch.setattr(ci_local, "_capture_local_only", fail)
+        ci_local.capture_local_only(1, c.ctx, None, "pytest", "base", [])
+    else:
+        with run_waits.in_phase(1, c.ctx, "ci"):
+            fail()
+
+
+@pytest.mark.parametrize("kind", INTERRUPTED_WAITS)
+@pytest.mark.parametrize("exception", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_interrupted_wait_restores_the_work_phase_into_a_free_slot(slot_case, monkeypatch, kind, exception):
+    from foragent import capacity, run_waits
+
+    c, error = slot_case, exception("original failure")
+    before = c.store.get_run(1).phase
+    assert capacity.phase_holds_slot(before)
+
+    def fail(*args, **kwargs):
+        run_waits._phase(1, c.ctx, "overlap-wait")
+        c.clock[0] += timedelta(seconds=3)
+        raise error
+
     with pytest.raises(exception) as caught:
-        if kind in {"credited", "lazy-credited"}:
-            run_waits._credited_wait(1, c.ctx, fail, "overlap-wait", eager=kind == "credited")
-        elif kind == "merge-lock":
-            monkeypatch.setattr(c.store, "merge_lock", failed_lock)
-            with _merge_lock(1, c.ctx):
-                pytest.fail("A failed acquisition cannot enter the merge body")
-        elif kind == "executor":
-            c.ctx.sleep = fail
-            run_waits._executor_wait(1, c.ctx, 5)
-        elif kind == "test-slot":
-            monkeypatch.setattr(capacity, "hold_test_slot", failed_test_slot)
-            with run_waits._test_slot(1, c.ctx):
-                pytest.fail("A failed acquisition cannot enter the test body")
-        elif kind == "context":
-            with run_waits.in_phase(1, c.ctx, "checking"):
-                fail()
-        elif kind == "baseline":
-            monkeypatch.setattr(run_baseline, "_capture_baseline", fail)
-            run_baseline._capture_acceptance_baseline(1, c.ctx, "pytest", "base")
-        else:
-            monkeypatch.setattr(ci_local, "_capture_local_only", fail)
-            ci_local.capture_local_only(1, c.ctx, None, "pytest", "base", [])
+        _interrupt_wait(c, monkeypatch, kind, fail)
+    run = c.store.get_run(1)
     assert caught.value is error and c.sleeps == []
+    assert run.phase == ("merging" if kind == "merge-lock" else before)
+    assert run.waiting_until is None and capacity.machine_runs(c.store, c.ctx.now()) == 1
+
+
+@pytest.mark.parametrize("source,failure", [("_try_flock", PermissionError("lock")),
+                                            ("workload_budget", ValueError("budget"))], ids=["lock", "budget"])
+@pytest.mark.parametrize("kind", INTERRUPTED_WAITS)
+def test_interrupted_wait_keeps_its_exception_when_the_machine_lock_is_unusable(
+    slot_case, monkeypatch, kind, source, failure,
+):
+    from foragent import capacity, run_waits
+
+    c, error = slot_case, RuntimeError("original failure")
+
+    def unusable(*args, **kwargs):
+        raise failure
+
+    def fail(*args, **kwargs):
+        run_waits._phase(1, c.ctx, "overlap-wait")
+        monkeypatch.setattr(capacity, source, unusable)
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        _interrupt_wait(c, monkeypatch, kind, fail)
+    assert caught.value is error
     assert c.store.get_run(1).phase in capacity.IDLE_RUN_PHASES
-    assert c.store.get_run(1).waiting_until is None
-    assert capacity.machine_runs(c.store, c.ctx.now()) == 1
-    if kind in {"credited", "lazy-credited", "merge-lock", "executor", "test-slot"}:
-        assert c.store.get_run(1).waited_seconds == 3
+
+
+def test_interrupted_wait_stays_idle_while_a_kernel_hold_blocks_new_work(slot_case, monkeypatch):
+    from foragent import capacity, run_waits
+
+    c = slot_case
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical")
+
+    def fail():
+        raise RuntimeError("original failure")
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        run_waits._credited_wait(1, c.ctx, fail, "overlap-wait")
+    assert c.store.get_run(1).phase == "overlap-wait" and c.sleeps == []
 
 
 @pytest.mark.parametrize("full", ["before-lock", "after-lock", "never"])

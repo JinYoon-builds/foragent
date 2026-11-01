@@ -113,7 +113,7 @@ def phase_identity(run) -> dict:
 
 
 def restore_phase(n: int, ctx: RunContext, identity: dict, *, resume: bool = True) -> None:
-    """Restore interrupted work; an exceptional exit must not reenter work from an idle phase."""
+    """Restore interrupted work; ``resume=False`` takes a free slot but never queues for one."""
     run = ctx.store.get_run(n)
     if phase_identity(run) != identity:
         _set_phase(n, ctx, identity, resume=resume)
@@ -122,14 +122,23 @@ def restore_phase(n: int, ctx: RunContext, identity: dict, *, resume: bool = Tru
 def _set_phase(
     n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None, resume: bool = True,
 ) -> bool:
-    """Every exit from an idle phase must acquire capacity before doing work."""
+    """Every exit from an idle phase must acquire capacity before doing work.
+
+    ``resume=False`` tries once, for an exit that must not block, and reports whether it took the phase.
+    """
     run = ctx.store.get_run(n)
     if capacity.phase_holds_slot(run.phase) or not capacity.phase_holds_slot(identity["phase"]):
         ctx.store.update_run(n, **identity, phase_started_at=(started or ctx.now()).astimezone(UTC).isoformat())
         return True
     if not resume:
-        # Work is abandoned or deferred; keep it idle until its caller actually resumes it.
-        return False
+        try:
+            capacity.admit_run(
+                ctx.store, n, identity, deadline=capacity.time.monotonic(),
+                now=lambda: started or ctx.now(), waiting=lambda: None,
+            )
+        except Exception:  # Full or unreadable: another exception may be unwinding, so never replace it.
+            return False
+        return True
     began, mono = ctx.now(), ctx.monotonic()
     key = f"run-slot-{uuid4().hex}"
     queued = False
@@ -175,7 +184,7 @@ class WaitPhase:
             self.opened = _set_phase(self.n, self.ctx, {"phase": self.phase}, started=self.started, resume=resume)
 
     def close(self, now: datetime | None = None, *, resume: bool = True) -> None:
-        """Close the wait; ``resume=False`` leaves idle work deferred without admission."""
+        """Close the wait; ``resume=False`` restores the phase only into a free slot, without queueing."""
         now = now or self.ctx.now()
         if not self.opened and now > self.started:
             self.open(resume=resume)
@@ -200,9 +209,9 @@ def in_phase(n: int, ctx: RunContext, phase: str):
         restore_phase(n, ctx, previous, resume=completed)
 
 
-def _phase(n: int, ctx: RunContext, phase: str) -> None:
+def _phase(n: int, ctx: RunContext, phase: str, *, resume: bool = True) -> None:
     if ctx.store.get_run(n).phase != phase:
-        _set_phase(n, ctx, {"phase": phase})
+        _set_phase(n, ctx, {"phase": phase}, resume=resume)
 
 
 def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:
@@ -250,7 +259,7 @@ def _credited_wait(
 
     ``eager=False`` opens the wait phase only once the wait lasts (a lock that is usually
     free adds no phase events when it is acquired at once).
-    ``resume=False`` leaves admission to the resource owner, which must release it before queueing.
+    ``resume=False`` never queues while holding the resource; its owner checks the phase and releases it.
     """
     from foragent import runner
 

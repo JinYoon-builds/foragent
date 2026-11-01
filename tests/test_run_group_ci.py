@@ -97,6 +97,46 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
     assert len([call for call in c.calls if call[0] == "push"]) == 2
 
 
+@pytest.mark.parametrize("damage", ["full", "lock", "free"])
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit, RuntimeError])
+def test_interrupted_group_ci_cleans_up_without_queueing_or_replacing_the_interruption(
+    ci_case, tmp_path, monkeypatch, exception, damage,
+):
+    import os
+
+    from foragent import capacity
+
+    c, error, closed = ci_case, exception("cancelled"), []
+    for n in (5, 1, 4):
+        c.ctx.store.update_run(n, phase="ci", phase_started_at=NOW.isoformat())
+    c.ctx.store.update_run(5, pid=os.getpid())
+    capacity.write_state(c.ctx.store, 1, NOW)
+    other = StateStore(tmp_path / "other", now=c.ctx.now)
+
+    def unusable(path):
+        raise PermissionError(path)
+
+    def reports(head):
+        assert c.ctx.store.get_run(5).phase == "ci"
+        if damage == "full":
+            other.start_run(90, branch="other", worktree="other", pid=os.getpid())
+        elif damage == "lock":
+            monkeypatch.setattr(capacity, "_try_flock", unusable)
+        raise error
+
+    def slot_sleep(seconds):
+        pytest.fail("A cancellation must not queue for a machine slot")
+
+    monkeypatch.setattr(c.ctx.tracker, "pr_acceptance_reports", reports)
+    monkeypatch.setattr(c.ctx.tracker, "close_pr", lambda pr: closed.append(c.ctx.store.get_run(5).phase))
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=slot_sleep))
+    with pytest.raises(exception) as caught:
+        group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    assert caught.value is error
+    assert closed == ["checking" if damage == "free" else "ci"]
+    assert len([call for call in c.calls if call[0] == "push"]) == 2
+
+
 @pytest.mark.parametrize("result", ["passed", "failed", "void", "timeout", "transport", "create"])
 def test_leader_publishes_once_judges_exact_reports_and_cleans_up(ci_case, result):
     c = ci_case

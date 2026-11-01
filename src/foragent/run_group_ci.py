@@ -27,6 +27,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     published = False
     metadata = {"combined_sha": combined}
     verdict, reason = "void", None
+    interrupted = False
     try:
         if ci_mode.changed_workflows(ctx.git, ci_mode._trusted_sha(ctx.git, ctx.tracker), combined):
             raise ci_mode.UnusableComparison("group acceptance workflow differs from the default branch")
@@ -59,9 +60,13 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError,
             GitError, TrackerError, OSError, AttributeError) as exc:
         reason = str(exc).strip() or type(exc).__name__
+    except BaseException:
+        interrupted = True
+        raise
     finally:
         if published:
-            _phase(n, ctx, "checking")  # Cleanup publishes Git changes too; CI waiting has ended.
+            # Cleanup publishes Git changes too; CI waiting has ended. A cancellation cleans up without queueing.
+            _phase(n, ctx, "checking", resume=not interrupted)
             # A PR creation failure can still leave a published ref (or an open PR
             # when the response was lost). Only this leader owns these resources.
             try:

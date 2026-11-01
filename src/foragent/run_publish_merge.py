@@ -33,14 +33,7 @@ def _merge_lock(n: int, ctx: RunContext):
             try:
                 run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", resume=False)
                 if not capacity.phase_holds_slot(ctx.store.get_run(n).phase):
-                    try:
-                        # One try while locked; if a new start took the freed slot, give the lock back.
-                        capacity.admit_run(
-                            ctx.store, n, {"phase": "merging"}, deadline=capacity.time.monotonic(),
-                            now=ctx.now, waiting=lambda: None,
-                        )
-                    except TimeoutError:
-                        continue
+                    continue  # A new start took the freed slot: give the lock back.
                 yield
                 return
             finally:
