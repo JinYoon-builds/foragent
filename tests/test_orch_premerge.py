@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
 import shlex
 import sys
 from types import SimpleNamespace
@@ -628,3 +629,242 @@ def test_human_withdraw_is_atomic_against_another_claim(merge_case, monkeypatch)
     rows = queue_events(c)
     assert [(row["n"], row["event"]) for row in rows] == [
         (own.n, "ready"), (own.n, "withdrawn"), (other.n, "ready")]
+
+
+def linked_pr(c, *, head="foragent/issue-1", base="main", done_when=("test -f suite-ok",), sha=None, locks=None):
+    """An issue's PR with its approval snapshot; ``locks`` defaults to the bytes both refs already have."""
+    from foragent.issue import body_hash
+
+    sha = sha or c.head
+    git_command(c.history.origin, "update-ref", f"refs/heads/{head}", sha)
+    body = "## Done when\n" + "\n".join(f"```sh\n{command}\n```" for command in done_when)
+    c.tracker.add_issue(1, "Feature", body, labels=["approved"])
+    pr = c.tracker.create_pr(head=head, base=base, title="Feature", body="Review")
+    c.tracker.set_pr_head_sha(pr, sha)
+    c.tracker.set_pr_checks(pr, "pass")
+    if locks is None:
+        locks = {"feature.txt": git_command(c.history.origin, "rev-parse", f"{sha}:feature.txt")}
+    c.ctx.store.save_approval(1, body=body, body_sha=body_hash(body), acceptance_blobs=locks,
+                              approved_by="human", approved_at=BASE_TIME.isoformat())
+    return pr
+
+
+def premerge_log(c, pr):
+    return (c.ctx.store.root / "runs" / f"premerge-pr-{pr}.log").read_text()
+
+
+def test_linked_pr_on_a_batch_branch_answers_to_the_configured_base(merge_case):
+    c = merge_case
+    pr = linked_pr(c, base="foragent/batch-1")
+    c.history.update({"feature.txt": "changed on the configured base only"})
+    main = c.history.tip
+    report = orch.premerge(c.ctx, pr)
+    assert report["ready"] is False
+    assert report["approved_inputs"] == f"approved acceptance file changed or missing: feature.txt on base {main}"
+    with pytest.raises(orch.OrchError) as refused:
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert report["approved_inputs"] in str(refused.value)
+    assert c.tracker.merged_prs == []
+    assert c.tracker.list_comments(pr) == []
+
+
+def test_refused_approved_input_names_every_changed_path_and_skips_the_suite(merge_case):
+    c = merge_case
+    locks = {"feature.txt": "0" * 40, "absent.txt": "1" * 40}
+    pr = linked_pr(c, locks=locks, done_when=("false",))
+    report = orch.premerge(c.ctx, pr)
+    assert report["tests"] == "not run" and report["ready"] is False
+    for path in locks:
+        for name, ref in (("head", c.head), ("base", c.history.tip)):
+            assert f"{path} on {name} {ref}" in report["approved_inputs"]
+    log = premerge_log(c, pr)
+    assert "Done when command:" not in log, "A changed lock decides before its own commands run"
+    assert "Pre-merge PR" not in log, "A refused PR must not hold the merge lock for the full suite"
+
+
+def test_done_when_runs_on_the_merged_tree_inside_a_test_slot(merge_case, monkeypatch):
+    from foragent import capacity
+
+    c = merge_case
+    merged_tree = "test -f base.txt && test -f feature.txt"
+    pr = linked_pr(c, done_when=(merged_tree, 'test "$FORAGENT_TEST_SLOT" = held'))
+    held = []
+    hold = capacity.hold_test_slot
+
+    def counted(*args, **kwargs):
+        held.append(args)
+        return hold(*args, **kwargs)
+
+    monkeypatch.setattr(capacity, "hold_test_slot", counted)
+    report = orch.premerge(c.ctx, pr)
+    assert report["approved_inputs"] is None and report["ready"] is True, report
+    assert report["tests"] == "pass"
+    assert premerge_log(c, pr).count("Done when command:") == 2
+    assert len(held) == 3, "Each Done when command and the suite hold their own test slot"
+    orch.merge(c.ctx, pr, approved_by="jin")
+    assert c.tracker.merged_prs == [pr]
+
+
+def test_done_when_stops_at_the_first_failure_and_quotes_it_on_one_line(merge_case):
+    c = merge_case
+    pr = linked_pr(c, done_when=("test -f suite-ok", "test -f missing &&\n  true", "true"))
+    with pytest.raises(orch.OrchError) as refused:
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert str(refused.value) == f"PR #{pr} is not ready: Done when failed (exit 1): test -f missing && true"
+    log = premerge_log(c, pr)
+    assert log.count("Done when command:") == 2
+    assert "Pre-merge PR" not in log
+
+
+def test_done_when_timeout_refuses_the_merge(merge_case, monkeypatch):
+    from foragent import runner
+
+    c = merge_case
+    pr = linked_pr(c, done_when=("sleep forever",))
+    limits = []
+
+    def timed_out(argv, *, cwd, timeout_s, log_path, env):
+        limits.append(timeout_s)
+        return 0, True, ""  # A zero code does not excuse the timeout.
+
+    monkeypatch.setattr(runner, "run_logged", timed_out)
+    with pytest.raises(orch.OrchError) as refused:
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert str(refused.value) == f"PR #{pr} is not ready: Done when timed out after 900 s: sleep forever"
+    assert limits == [900]
+    assert c.tracker.merged_prs == []
+
+
+def test_conflicted_pr_keeps_the_conflict_refusal_without_running_done_when(merge_case):
+    c = merge_case
+    main = c.history.tip
+    c.history.tip = c.head
+    git_command(c.history.origin, "update-ref", "refs/heads/main", c.head)
+    c.history.update({"feature.txt": "PR side"})
+    side = c.history.tip
+    git_command(c.history.origin, "update-ref", "refs/heads/main", main)
+    c.history.tip = main
+    c.history.update({"feature.txt": "base side"})
+    pr = linked_pr(c, sha=side, locks={}, done_when=("false",))
+    report = orch.premerge(c.ctx, pr)
+    assert report["conflicts"] == ["feature.txt"] and report["approved_inputs"] is None
+    assert report["ready"] is False
+    assert "Done when command:" not in premerge_log(c, pr)
+
+
+@pytest.mark.parametrize("head", ["foragent/batch-1", "foragent/dream-orch", "feature/person"])
+def test_batch_dream_and_unlinked_prs_keep_their_handling(merge_case, head):
+    c = merge_case
+    # Issue #1's snapshot exists and would refuse if any of these heads were read as linked to it.
+    pr = linked_pr(c, head=head, locks={"feature.txt": "0" * 40}, done_when=("false",))
+    report = orch.premerge(c.ctx, pr)
+    assert report["approved_inputs"] is None and report["ready"] is True, report
+    assert "Done when command:" not in premerge_log(c, pr)
+
+
+def test_issue_pr_without_a_snapshot_runs_no_approved_checks(merge_case):
+    c = merge_case
+    pr = linked_pr(c, locks={"feature.txt": "0" * 40}, done_when=("false",))
+    c.ctx.store.clear_approval(1)
+    report = orch.premerge(c.ctx, pr)
+    assert report["approved_inputs"] is None and report["ready"] is True
+
+
+@pytest.mark.parametrize("moved", ["approval", "configured-base"])
+def test_merge_refuses_approved_inputs_that_moved_after_premerge(merge_case, monkeypatch, moved):
+    c = merge_case
+    pr = linked_pr(c, base="foragent/batch-1")
+    checked = orch._premerge
+
+    def then_move(ctx, number):
+        result = checked(ctx, number)
+        if moved == "approval":
+            saved = ctx.store.load_approval(1)
+            ctx.store.save_approval(**{**saved.__dict__, "approved_at": "2026-01-01T00:00:00+00:00"})
+        else:
+            c.history.update({"other.txt": "the configured base advanced"})
+        return result
+
+    monkeypatch.setattr(orch, "_premerge", then_move)
+    with pytest.raises(orch.OrchError, match="changed during pre-merge; run again"):
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+    assert c.tracker.list_comments(pr) == []
+
+
+def test_premerge_command_says_why_on_its_one_line(merge_case, monkeypatch, capsys):
+    c = merge_case
+    pr = linked_pr(c, done_when=("false",))
+    main = bound_main(c, monkeypatch)
+    assert main(["orch", "premerge", str(pr)]) == 1
+    assert capsys.readouterr().out.strip().splitlines()[-1] == (
+        f"PR #{pr}: tests not run; conflicts: none; CI pass; ready: false; Done when failed (exit 1): false")
+    (c.history.clone / ".foragent.yml").unlink()  # bind_cli's config, not a premerge effect.
+
+
+def bound_main(c, monkeypatch):
+    """The public CLI on this case; remove the config it writes before merge_case's status check."""
+    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+    from foragent.cli import main
+    from test_orch_review_handoff import bind_cli
+
+    bind_cli(SimpleNamespace(root=c.history.clone, ctx=c.ctx, tracker=c.tracker, git=c.ctx.git, store=c.ctx.store,
+                             clock=[BASE_TIME]), monkeypatch)
+    return main
+
+
+def test_path_approved_as_absent_and_still_absent_is_refused_on_head_and_base(merge_case, monkeypatch, capsys):
+    # A snapshot stores an absent path as a marker; the marker equal to itself is not a match.
+    from foragent.git import ABSENT_BLOB
+
+    c = merge_case
+    main = bound_main(c, monkeypatch)
+    from test_skills_autosync import cli_exit
+
+    pr = linked_pr(c, locks={"never-written.txt": ABSENT_BLOB})
+    capsys.readouterr()
+    code = cli_exit(main, ["orch", "merge", str(pr), "--approved-by", "jin"])
+    (c.history.clone / ".foragent.yml").unlink()
+    assert code != 0
+    assert capsys.readouterr().err.strip().splitlines() == [
+        f"foragent: PR #{pr} is not ready: approved acceptance file changed or missing: "
+        f"never-written.txt on head {c.head}, never-written.txt on base {c.history.tip}"]
+    assert c.tracker.merged_prs == []
+    assert c.tracker.list_comments(pr) == []
+
+
+@pytest.mark.parametrize("present_on", ["head", "base"])
+def test_path_approved_as_absent_is_named_once_on_each_ref_when_one_ref_has_it(merge_case, present_on):
+    from foragent.git import ABSENT_BLOB
+
+    c = merge_case
+    main = c.history.tip
+    if present_on == "base":
+        c.history.update({"late.txt": "only on the base"})
+        main = c.history.tip
+        sha = c.head
+    else:
+        c.history.tip = main
+        c.history.update({"late.txt": "only on the PR"})
+        sha = c.history.tip
+        git_command(c.history.origin, "update-ref", "refs/heads/main", main)
+        c.history.tip = main
+    pr = linked_pr(c, sha=sha, locks={"late.txt": ABSENT_BLOB})
+    report = orch.premerge(c.ctx, pr)
+    assert report["ready"] is False
+    assert report["approved_inputs"] == ("approved acceptance file changed or missing: "
+                                         f"late.txt on head {sha}, late.txt on base {main}")
+
+
+def test_ordinary_path_keeps_its_answer_for_a_path_approved_as_absent(merge_case):
+    # The ordinary eligibility is out of this change: only the person path refuses the marker.
+    from foragent.git import ABSENT_BLOB
+    from foragent.run_checks import _acceptance_matches
+    from foragent.run_checks_approved import acceptance_mismatches
+
+    c = merge_case
+    approval = SimpleNamespace(acceptance_blobs={"never-written.txt": ABSENT_BLOB})
+    git = c.ctx.git
+    assert _acceptance_matches(1, c.ctx, git, approval, "origin/main") is True
+    assert acceptance_mismatches(git, approval, "origin/main") == []
+    assert acceptance_mismatches(git, approval, "origin/main", absent_ok=False) == ["never-written.txt"]

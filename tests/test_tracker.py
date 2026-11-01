@@ -755,16 +755,17 @@ def test_gh_runs_unreadable_is_a_notice_that_proves_nothing():
 
 
 def test_gh_unreadable_changed_files_keep_measurement_runs_out_of_the_evidence():
+    # Failed logs no longer read changed files: measurement runs are ordinary CI evidence.
     from foragent.ci_workflow import WORKFLOW
 
     runs = [{"id": 6, "path": WORKFLOW, "conclusion": "failure"},
             {"id": 7, "path": ".github/workflows/ci.yml", "conclusion": "failure"}]
-    run = ScriptedRun('{"head":{"sha":"abc"}}', json.dumps(runs), gh_error("HTTP 502 files"),
+    run = ScriptedRun('{"head":{"sha":"abc"}}', json.dumps(runs), failed_job(60, "acceptance (0)"), "[]", "lost ids",
                       failed_job(70), "[]", "ordinary tail")
     logs = GhTracker(REPO, run).pr_failed_logs(42)
-    assert "CI evidence unavailable: changed files of the pull request: HTTP 502 files" in logs
-    assert "ordinary tail" in logs and "Actions run 6" not in logs and not logs.not_started
-    assert all("/runs/6/" not in call[0][-1] for call in run.calls)
+    assert "unavailable" not in logs and "Actions run 6" in logs and not logs.not_started
+    assert logs.index("lost ids") < logs.index("ordinary tail")
+    assert all("/files" not in call[0][-1] for call in run.calls)
 
 
 def test_gh_unreadable_jobs_of_a_completed_run_keep_its_run_wide_log():
@@ -1283,52 +1284,23 @@ def test_gh_checks_expected_nonzero_exit(response, expected):
     '.github/workflows/foragent-acceptance.yml@refs/heads/main',
     '.github/workflows/foragent-acceptance-publish.yml'])
 def test_renamed_unit_workflow_cannot_hide_failed_checks(changed, unit_bucket, path):
-    fixtures = Path(__file__).parent / 'fixtures/github_ci'
-    measurement = json.loads((fixtures / 'measurement_run.json').read_text())
-    measurement['path'] = path
-    measurement['name'] = 'foragent-acceptance'
-    measurement['repository'] = {'full_name': REPO}
-    unit = {**measurement, 'id': measurement['id'] + 1, 'name': 'foragent-acceptance',
-            'check_suite_id': measurement['check_suite_id'] + 1,
-            'path': '.github/workflows/ci.yml',
-            'html_url': f"https://github.com/{REPO}/actions/runs/{measurement['id'] + 1}"}
+    # A failed acceptance job is red whichever workflow or path it claims.
     checks = [
-        {'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': measurement['name'],
-         'link': measurement['html_url'] + '/job/100'},
-        {'bucket': unit_bucket, 'name': 'foragent-acceptance/0', 'workflow': unit['name'],
-         'link': unit['html_url'] + '/job/101'},
+        {'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': 'foragent-acceptance',
+         'link': f'https://github.com/{REPO}/actions/runs/1/job/100'},
+        {'bucket': unit_bucket, 'name': 'foragent-acceptance/0', 'workflow': 'foragent-acceptance',
+         'link': f'https://github.com/{REPO}/actions/runs/2/job/101'},
     ]
-
-    def github(args, input=None):
-        if args[:2] == ['pr', 'checks']:
-            raise gh_error('', json.dumps(checks), 1)
-        endpoint = args[-1]
-        if endpoint.endswith('/pulls/42'):
-            return json.dumps({'head': {'sha': measurement['head_sha']}})
-        if '/commits/' in endpoint and '/check-runs?' in endpoint:
-            return json.dumps([
-                {'id': index, 'name': check['name'], 'details_url': check['link'],
-                 'app': {'slug': 'github-actions'}, 'check_suite': {'id': run['check_suite_id']}}
-                for index, (check, run) in enumerate(zip(checks, [measurement, unit]), 1)
-            ])
-        if '/actions/runs?check_suite_id=' in endpoint:
-            return json.dumps([run for run in [measurement, unit]
-                               if f"check_suite_id={run['check_suite_id']}&" in endpoint])
-        if '/pulls/42/files?' in endpoint:
-            return json.dumps(changed)
-        raise AssertionError(args)
-
-    excluded = not changed and path == '.github/workflows/foragent-acceptance.yml'
-    expected = unit_bucket if excluded else 'fail'
-    assert GhTracker(REPO, github).pr_checks(42) == expected
+    github = ScriptedRun(gh_error('', json.dumps(checks), 1))
+    assert GhTracker(REPO, github).pr_checks(42) == 'fail'
+    assert len(github.calls) == 1, 'Status comes from the checks alone, not workflow provenance'
 
 
 @pytest.mark.parametrize('external_status', [False, True])
 @pytest.mark.parametrize('damage', [None, 'missing-suite', 'foreign-repo', 'wrong-path',
                                   'wrong-suite', 'non-actions', 'api-failure', 'workflow-change', 'colliding-check'])
 def test_commit_status_cannot_impersonate_acceptance_job(external_status, damage):
-    from foragent.ci_workflow import WORKFLOW
-
+    # Every failed row counts, with or without verifiable provenance.
     link = f'https://github.com/{REPO}/actions/runs/42/job/100'
     checks = [{'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': 'foragent-acceptance', 'link': link}]
     if external_status:
@@ -1337,43 +1309,17 @@ def test_commit_status_cannot_impersonate_acceptance_job(external_status, damage
         checks.append({'bucket': 'fail', 'name': 'acceptance (0)', 'workflow': '', 'link': link})
     if damage == 'colliding-check':
         checks.append(dict(checks[0]))
-    check = {'id': 100, 'name': checks[0]['name'], 'details_url': link,
-             'app': {'slug': 'github-actions'}, 'check_suite': {'id': 99}}
-    run = {'id': 42, 'check_suite_id': 99, 'path': WORKFLOW, 'repository': {'full_name': REPO}}
-    if damage == 'missing-suite':
-        check.pop('check_suite')
-    elif damage == 'foreign-repo':
-        run['repository']['full_name'] = 'someone/else'
-    elif damage == 'wrong-path':
-        run['path'] += '@refs/heads/main'
-    elif damage == 'wrong-suite':
-        run['check_suite_id'] = 98
-    elif damage == 'non-actions':
-        check['app']['slug'] = 'external-ci'
-    responses = [gh_error('', json.dumps(checks), 1),
-                 json.dumps([{'filename': '.github/workflows/ci.yml'}] if damage == 'workflow-change' else [])]
-    if damage != 'workflow-change':
-        raw_checks = [check]
-        if damage == 'colliding-check':
-            raw_checks.append({**check, 'id': 101, 'check_suite': {'id': 98}})
-        responses.extend(['{"head":{"sha":"head"}}', json.dumps(raw_checks)])
-        if damage not in {'missing-suite', 'non-actions'}:
-            responses.append(gh_error('HTTP 403') if damage == 'api-failure' else json.dumps([run]))
-        if damage == 'colliding-check':
-            responses.append(json.dumps([{**run, 'id': 43, 'check_suite_id': 98,
-                                          'path': '.github/workflows/ci.yml'}]))
-    github = ScriptedRun(*responses)
+    github = ScriptedRun(gh_error('', json.dumps(checks), 1))
 
-    assert GhTracker(REPO, github).pr_checks(42) == ('fail' if external_status or damage else 'none')
-    assert not github.responses
-    if not damage:
-        assert github.calls[-1][0][-1] == f'repos/{REPO}/actions/runs?check_suite_id=99&per_page=100'
+    assert GhTracker(REPO, github).pr_checks(42) == 'fail'
+    assert len(github.calls) == 1
 
 
 @pytest.mark.parametrize('ordinary,expected', [(None, 'none'), ('pass', 'pass'), ('pending', 'pending'),
                                               ('fail', 'fail'), ('cancel', 'fail')])
 @pytest.mark.parametrize('acceptance', ['fail', 'pending'])
 def test_ordinary_ci_excludes_acceptance_jobs_reports_and_failed_logs(ordinary, expected, acceptance):
+    # Acceptance jobs join ordinary CI: their state and failed logs count like any other job's.
     from foragent.ci_workflow import WORKFLOW
 
     checks = [
@@ -1382,28 +1328,28 @@ def test_ordinary_ci_excludes_acceptance_jobs_reports_and_failed_logs(ordinary, 
     ]
     if ordinary is not None:
         checks.append({'name': 'unit', 'workflow': 'ci', 'bucket': ordinary})
-    response = gh_error('', json.dumps(checks), 1 if acceptance == 'fail' or expected == 'fail' else 8)
-    runs = [{'id': 1, 'check_suite_id': 9, 'repository': {'full_name': REPO},
-             'name': 'custom measurement name', 'path': WORKFLOW, 'conclusion': 'failure',
+    ordinary_failed = expected == 'fail'
+    combined = 'fail' if acceptance == 'fail' or ordinary_failed else 'pending'
+    response = gh_error('', json.dumps(checks), 1 if combined == 'fail' else 8)
+    runs = [{'id': 1, 'name': 'custom measurement name', 'path': WORKFLOW,
+             'conclusion': 'failure' if acceptance == 'fail' else None,
              'html_url': 'https://github.com/owner/repo/actions/runs/1'}]
-    failed = expected == 'fail'
-    if failed:
+    if ordinary_failed:
         runs.append({'id': 3, 'name': 'ci', 'path': '.github/workflows/ci.yml', 'conclusion': 'failure'})
-    responses = [response, '[]', '{"head":{"sha":"head"}}',
-                 json.dumps([{'id': 10, 'name': checks[0]['name'], 'details_url': checks[0]['link'],
-                              'app': {'slug': 'github-actions'}, 'check_suite': {'id': 9}}]),
-                 json.dumps(runs[:1]),
-                 '{"head":{"sha":"head"}}', json.dumps(runs), '[]']
-    if failed:
+    responses = [response, '{"head":{"sha":"head"}}', json.dumps(runs)]
+    if acceptance == 'fail':
+        responses.extend([failed_job(10, 'acceptance (0)'), '[]', 'lost test ids'])
+    else:
+        responses.append(json.dumps([pending_job(10)]))
+    if ordinary_failed:
         responses.extend([failed_job(30), '[]', 'ordinary CI failure'])
     run = ScriptedRun(*responses)
     tracker = GhTracker(REPO, run)
-    assert tracker.pr_checks(42) == expected
+    assert tracker.pr_checks(42) == combined
     logs = tracker.pr_failed_logs(42)
-    assert 'custom measurement name' not in logs and not logs.not_started
-    assert ('ordinary CI failure' in logs) is failed
+    assert ('lost test ids' in logs) is (acceptance == 'fail') and not logs.not_started
+    assert ('ordinary CI failure' in logs) is ordinary_failed
     assert not run.responses
-    assert all('/actions/runs/1/jobs' not in args[-1] for args, _ in run.calls)
 
 
 @pytest.mark.parametrize("response", [
