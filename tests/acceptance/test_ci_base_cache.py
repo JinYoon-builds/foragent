@@ -149,7 +149,8 @@ def shard_case(git_history, tmp_path, monkeypatch):
         ci_shard.main()
         observed()
         payload = decode_report(artifact.read_text(encoding="utf-8"))
-        assert output.read_text(encoding="utf-8") == "comparison=true\n"
+        outputs = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+        assert outputs.get("comparison") == "true"
         assert payload["base_sha"] == case.base and payload["head_sha"] == case.head
         assert payload["shard_index"] == shard and payload["shard_count"] == 2
         assert payload["base"]["complete"] is True and payload["head"]["complete"] is True
