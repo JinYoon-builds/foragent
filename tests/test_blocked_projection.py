@@ -107,6 +107,21 @@ def test_human_marker_is_current_only_while_human_label_is_present(case):
     assert case.store.load_flag(1) is None
 
 
+@pytest.mark.parametrize("label", ["blocked", "needs-human"])
+@pytest.mark.parametrize("pending", [False, True], ids=["delivered", "pending"])
+def test_pull_request_cache_row_cannot_be_a_shared_blocker(case, label, pending):
+    case.store.update_local_issue(1, labels=[label], is_pull_request=True)
+    marked = comment(1, "spec-question", label=label)
+    if pending:
+        case.store.queue_github_write(1, "comment", body=marked["body"])
+    else:
+        case.store.record_comments(1, [marked])
+    assert case.store.local_issues()[0]["is_pull_request"] is True
+
+    assert StateStore(case.store.root).load_flag(1) is None
+    assert orch.list_blocked(case) == []
+
+
 def test_machine_only_flag_keeps_its_local_contract(case):
     case.store.save_flag(1, "parent-child-not-planned", local_only=True)
     assert StateStore(case.store.root).load_local_flag(1).reason == "parent-child-not-planned"

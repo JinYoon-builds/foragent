@@ -160,7 +160,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
     for row in ctx.store.local_issues():
-        if row["state"] != "open" or BLOCKED not in row["labels"]:
+        if row.get("is_pull_request", False) or row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
         latest = current_blocker(row, ctx.store.github_outbox())

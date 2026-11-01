@@ -76,6 +76,27 @@ def test_first_tick_sends_one_combined_push_with_lowest_issue_link(case):
     assert len(case.pushes) == 1
 
 
+@pytest.mark.parametrize("labels", [["blocked"], ["needs-human"], ["blocked", "needs-human"]],
+                         ids=["blocked", "needs-human", "both"])
+def test_pull_request_cache_rows_never_receive_a_blocker_push(case, labels):
+    label(case, 4, *labels)
+    case.store.update_local_issue(4, is_pull_request=True)
+    marker(case, 4, "spec-question", label=labels[0])
+    label(case, 7, "blocked")
+    marker(case, 7, "stalled")
+    assert next(row for row in case.store.local_issues() if row["number"] == 4)["is_pull_request"] is True
+
+    assert orch_push.after_tick(case.ctx, spawned=False) == ([7], False)
+    assert len(case.pushes) == 1
+    assert "#7" in case.pushes[0]["line"] and "#4" not in case.pushes[0]["line"]
+    assert case.pushes[0]["link"] == "https://github.com/owner/repo/issues/7"
+    assert kinds(case.store) == [("push-blocked", 7)]
+    saved = json.loads((case.store.root / "notify-blocked.json").read_text())
+    assert saved["blocked"] == {"7": "stalled"}
+    assert orch_push.after_tick(case.ctx, spawned=False) == ([], False)
+    assert len(case.pushes) == 1
+
+
 def test_no_link_without_repo(case):
     case.ctx.config = replace(case.ctx.config, repo="")
     label(case, 2, "blocked")

@@ -68,7 +68,7 @@ def current_blocker(row: dict, pending=()) -> tuple[dict, str] | None:
     They take precedence over delivered comments until observation ingest retires them.
     """
     labels = set(row.get("labels", ())) & {"blocked", "needs-human"}
-    if row.get("state") != "open" or not labels:
+    if row.get("is_pull_request", False) or row.get("state") != "open" or not labels:
         return None
 
     def relevant(body):

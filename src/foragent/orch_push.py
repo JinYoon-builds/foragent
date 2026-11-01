@@ -88,7 +88,7 @@ def blocked_now(store: StateStore) -> dict[int, tuple[str, str]]:
     pending = store.github_outbox()
     for row in store.local_issues():
         waiting = set(row["labels"]) & {BLOCKED, NEEDS_HUMAN}
-        if row["state"] != "open" or not waiting:
+        if row.get("is_pull_request", False) or row["state"] != "open" or not waiting:
             continue
         marker = current_blocker(row, pending)
         if BLOCKED in waiting:
