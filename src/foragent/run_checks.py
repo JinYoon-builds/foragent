@@ -458,6 +458,43 @@ def _verify_implementation(attempt: Implementation) -> str:
         raise
 
 
+def _check_protected(attempt: Implementation) -> CheckResult:
+    """Retry a timed-out protected selection once without redoing the implementation."""
+    from foragent import runner
+    from foragent.run_baseline_limits import capture_limit, repository_limit
+
+    n, ctx, baseline = attempt.n, attempt.ctx, attempt.baseline
+    if baseline.duration_seconds is None:
+        limit, _ = repository_limit(ctx.store.root.parent / "baselines", ctx.repo_root, ctx.config.repo, ctx.now())
+    else:
+        limit = capture_limit(baseline.duration_seconds)
+    limit = min(limit, runner._remaining(n, ctx))
+    command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+    for retry in range(2):
+        result = runner._check(command, attempt.worktree, attempt.log, limit,
+                              progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                              clock=ctx.monotonic, full_text_dir=cuts.issue_dir(ctx.store.root, n))
+        _progress(n, ctx)
+        if not result.timed_out:
+            return result
+        detail = (f"Protected acceptance check timed out: elapsed {result.seconds:g}s, allowed {limit:g}s "
+                  f"({len(baseline.node_ids)} nodes)")
+        _append(attempt.log, detail)
+        larger = min(2 * limit, runner._remaining(n, ctx))
+        if retry == 0 and larger > limit:
+            limit = larger
+            continue
+        detail += (", after one retry with a larger allowance." if retry
+                   else "; insufficient run time for a larger allowance.")
+        attempt.checks.append(result)
+        save_failures(ctx.store.root, n, attempt.checks, complete=False)
+        bundle = WholeFailure(cuts.failures_path(ctx.store.root, n).read_text(encoding="utf-8"))
+        ctx.store.update_run(n, resume_reason=bundle, resume_whole=True)
+        flag(ctx, n, Reason.TIMEOUT, detail, bundle)
+        raise ExecutorStopped("timeout", detail)
+    raise AssertionError("unreachable protected check state")
+
+
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
     from foragent.run_conflicts import _prepare_target
@@ -490,9 +527,7 @@ def _verify_contents(attempt: Implementation) -> str:
         if attempt.baseline and attempt.baseline.node_ids:
             harness_guard.guard_staged(attempt)
             started = ctx.monotonic()
-            command = f"{attempt.baseline.command} {shlex.join(attempt.baseline.node_ids)}"
-            result = runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                            slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            result = _check_protected(attempt)
             attempt.checks.append(result)
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
