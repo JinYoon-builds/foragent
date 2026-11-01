@@ -31,6 +31,28 @@ def section(body: str | None) -> str | None:
     return (rest[:end.start()] if end else rest).strip()
 
 
+def read_waiting(body: str | None) -> dict[str, str] | None:
+    """The current wait for projections, read through the canonical section reader.
+
+    Keep the complete authored text. The ordinary three-field form additionally
+    exposes its values for localized labels; other forms stay opaque. Publication's
+    raw ``section`` contract (including an explicit ``None.``) remains unchanged.
+    """
+    raw = section(body)
+    if raw is None or raw.strip() in {"", "None."}:
+        return None
+    fields = {"Reason": "reason", "Next condition": "next_condition", "Responsible role": "responsible_role"}
+    values = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        label, separator, value = line.partition(":")
+        if not separator or label not in fields or not value.strip() or fields[label] in values:
+            return {"text": raw}
+        values[fields[label]] = value.strip()
+    return {"text": raw, **values} if len(values) == len(fields) else {"text": raw}
+
+
 def replace_section(body: str, text: str | None) -> str:
     """Replace or clear this issue's wait, preserving everything outside its section."""
     replacement = f"## Waiting\n{text.strip()}\n\n" if text is not None else ""
