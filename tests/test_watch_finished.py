@@ -39,6 +39,13 @@ def frame(snapshot, config, tick, **kwargs):
     return watch.render_frame(snapshot, config, ".", tick=tick, width=100, **kwargs)
 
 
+def band_of(snapshot, config, tick, state=None):
+    """The band through the retained finished section; the lane scene replaces it in frames."""
+    lines = finished.render(snapshot, config, ".", tick=tick, width=100, selected=None, now=BASE_TIME,
+                            top=0, hits=[], marks=[], height=None, state=state)
+    return "\n".join("".join(value for value, _ in line) for line in lines)
+
+
 def test_fireworks_seconds_is_reexported():
     assert watch.FIREWORKS_SECONDS == finished.FIREWORKS_SECONDS == 3
 
@@ -46,39 +53,44 @@ def test_fireworks_seconds_is_reexported():
 def test_live_state_counts_from_the_first_finished_tick_once_per_order():
     snapshot, config = snapshot_for()
     state = {}
-    assert fireworks(frame(snapshot, config, 50, state=state)), "a view opened later still plays them"
-    assert fireworks(frame(snapshot, config, 59, state=state))
-    assert not fireworks(frame(snapshot, config, 60, state=state)), "3 seconds is 10 ticks"
-    assert not fireworks(frame(snapshot, config, 200, state=state))
+    assert fireworks(band_of(snapshot, config, 50, state=state)), "a view opened later still plays them"
+    assert fireworks(band_of(snapshot, config, 59, state=state))
+    assert not fireworks(band_of(snapshot, config, 60, state=state)), "3 seconds is 10 ticks"
+    assert not fireworks(band_of(snapshot, config, 200, state=state))
     other, _ = snapshot_for(order=100)
-    assert fireworks(frame(other, config, 300, state=state)), "a different order plays them again"
-    assert not fireworks(frame(snapshot, config, 300, state=state))
+    assert fireworks(band_of(other, config, 300, state=state)), "a different order plays them again"
+    assert not fireworks(band_of(snapshot, config, 300, state=state))
+    # The lane scene replaces the band in frames: a finished order sleeps instead (squirrel_done).
+    assert not fireworks(frame(other, config, 0, state={}))
 
 
 def test_unfinished_order_does_not_start_the_timer():
     running, config = snapshot_for(done=False)
     state = {}
-    assert not fireworks(frame(running, config, 5, state=state))
+    assert not fireworks(band_of(running, config, 5, state=state))
     assert state.get("fireworks", {}) == {}
     done, _ = snapshot_for()
-    assert fireworks(frame(done, config, 40, state=state))
+    assert fireworks(band_of(done, config, 40, state=state))
 
 
 def test_calm_state_and_animation_off_never_play_them():
     snapshot, config = snapshot_for()
-    assert fireworks(frame(snapshot, config, 0))
+    assert fireworks(band_of(snapshot, config, 0))
     with finished.calm():
-        assert not fireworks(frame(snapshot, config, 0, state={}))
-    assert fireworks(frame(snapshot, config, 0)), "calm ends with its block"
-    assert not fireworks(frame(snapshot, replace(config, animation=False), 0))
+        assert not fireworks(band_of(snapshot, config, 0, state={}))
+    assert fireworks(band_of(snapshot, config, 0)), "calm ends with its block"
+    assert not fireworks(band_of(snapshot, replace(config, animation=False), 0))
 
 
 def test_band_sits_directly_above_the_completion_sentence():
     snapshot, config = snapshot_for()
     lines = frame(snapshot, config, 0).splitlines()
-    heading = next(index for index, line in enumerate(lines) if "이번 주문을 모두 끝냈어요" in line)
-    assert all(fireworks(line) for line in lines[heading - 3:heading])
-    assert not fireworks(lines[heading - 4])
+    # The lane scene (lane_blocks replaces done and finished): no band and no done list, the
+    # bubble says there is nothing to do and the lane sleeps in the shared idle block.
+    assert not fireworks("\n".join(lines)) and "이번 주문을 모두 끝냈어요" not in "\n".join(lines)
+    assert any("지금은 할 일이 없어요." in line for line in lines)
+    heading = next(index for index, line in enumerate(lines) if index and line[14:] == "쉬고 있어요")
+    assert lines[heading + 1][14:] == "담당"
 
 
 @pytest.mark.parametrize("width, height", [(39, 24), (100, 15)])
@@ -98,14 +110,11 @@ def text_of(lines):
 def test_short_screen_keeps_the_playing_band_and_drops_other_sections_first():
     snapshot, config = snapshot_for()
     full = watch._frame(snapshot, config, ".", tick=0, width=100, selected=None, now=BASE_TIME, height=None)
-    dropped_list = False
     for height in range(len(full), finished.MIN_HEIGHT - 1, -1):
         text = text_of(watch._frame(snapshot, config, ".", tick=0, width=100, selected=None,
                                     now=BASE_TIME, height=height))
-        assert fireworks(text), f"the playing band gave way at {height} rows"
-        dropped_list |= "이번 주문을 모두 끝냈어요" not in text
-    # Shell: an explicit height no longer drops sections; the viewport scrolls instead.
-    assert not dropped_list, "no short screen drops the done list; every row stays reachable"
+        # Shell: an explicit height drops no section; the scene has no band to keep.
+        assert text == text_of(full) and not fireworks(text), height
 
 
 def test_band_colours_are_the_existing_style_keys_and_change_every_tick():
@@ -132,7 +141,7 @@ def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
     watch.run(lambda: {}, FakeTracker(), None, config, tmp_path, once=True)
     out = capsys.readouterr().out
-    assert "이번 주문을 모두 끝냈어요" in out and not fireworks(out)
+    assert "지금은 할 일이 없어요." in out and not fireworks(out)
 
 
 def test_animation_off_hides_the_big_squirrel_but_keeps_the_header_line():
@@ -171,13 +180,12 @@ def test_animation_false_loads_from_settings(tmp_path, monkeypatch):
 def test_band_moves_into_the_first_screen_when_lane_rows_push_it_below():
     snapshot, config = snapshot_for(lanes=8)
     lines = watch._frame(snapshot, config, ".", tick=0, width=100, selected=None, now=BASE_TIME, height=16)
-    rows = ["".join(value for value, _ in line) for line in lines]
-    assert len(rows) > 16, "the KEEP rows alone overflow this screen"
-    assert fireworks("\n".join(rows[:15])), "the band is inside the rows the live view shows first"
-    assert sum(fireworks(row) for row in rows) == 3, "the band moved, it was not copied"
+    rows = ["".join(value for value, _ in line).rstrip() for line in lines]
+    assert not fireworks("\n".join(rows)), "the lane scene has no band"
     names = ["담당", *(f"담당{index}" for index in range(1, 8))]
-    lane_rows = [row.split()[1] for row in rows if row.startswith("💤 ")]
-    assert lane_rows == names, "every lane row stays, in order"
+    # Every idle lane stays, in order, in the one shared sleeping block.
+    listed = [name for row in rows for name in row[14:].split(" · ") if name in names]
+    assert listed == names
 
 
 def test_moved_band_shifts_the_click_areas_of_the_rows_it_passes(monkeypatch):
@@ -217,7 +225,6 @@ def test_live_terminal_paints_the_band_on_a_short_screen_with_many_lanes(tmp_pat
 
     snapshot, config = snapshot_for(lanes=8)
     screen = Mock()
-    # F keeps the band within its fixed 24 rows (#170); a 24-row terminal shows it at once.
     screen.getmaxyx.return_value = (24, 100)
     screen.getch.return_value = ord("q")
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
@@ -229,4 +236,6 @@ def test_live_terminal_paints_the_band_on_a_short_screen_with_many_lanes(tmp_pat
                              StateStore(tmp_path))
     painted = [call.args for call in screen.addstr.call_args_list]
     assert all(y < 24 for y, *_ in painted)
-    assert {value for y, x, value, *_ in painted} & {"*", "+"}, "fireworks are painted on the screen"
+    text = "".join(value for y, x, value, *_ in painted)
+    # The lane scene paints the bubble and the sleeping lanes; no fireworks band.
+    assert "지금은 할 일이 없어요." in text and not {value for y, x, value, *_ in painted} & {"*", "+"}

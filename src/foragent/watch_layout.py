@@ -23,8 +23,8 @@ PICK = ("  ⛏ ", " ⛏  ", "⛏✦  ", " ⛏  ")
 
 
 def _has_work(row: dict[str, Any]) -> bool:
-    return (row["issue"] is not None or bool(row["queued"])
-            or row["state"] in {"working", "blocked", "waiting-human"})
+    return (row.get("issue") is not None or bool(row.get("queued"))
+            or row.get("state") in {"working", "blocked", "waiting-human"})
 
 
 # Run phases in which the runner waits on checks, CI, a merge or a review.
@@ -86,7 +86,9 @@ def _activity(
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Running runs by lane in start order; ties in start time break by issue number."""
     clones: dict[str, list[dict[str, Any]]] = {}
-    running = [run for run in status["active_runs"] if run.get("status", "running") == "running"]
+    # A record without its issue or lane belongs to no lane; the rest are still drawn.
+    running = [run for run in status.get("active_runs") or () if isinstance(run, dict)
+               and run.get("status", "running") == "running" and type(run.get("number")) is int and run.get("lane")]
     for run in sorted(running, key=lambda run: (run.get("started_at") or "", run["number"])):
         clones.setdefault(run["lane"], []).append(run)
     return clones
@@ -146,9 +148,16 @@ def _frame(
         # A section draws from row 0; its click areas and issue rows move with it below.
         own: list[Hit] = []
         marks: list[Mark] = []
-        lines = section.render(snapshot, drawn or config, repo_root, tick=tick, width=width, selected=selected,
-                               now=now, layout=layout, top=0, hits=own, marks=marks, rows=True,
-                               height=height, state=state, **extra)
+        try:
+            lines = section.render(snapshot, drawn or config, repo_root, tick=tick, width=width, selected=selected,
+                                   now=now, layout=layout, top=0, hits=own, marks=marks, rows=True,
+                                   height=height, state=state, **extra)
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+            # A replaced section's rows are dropped below, and it may need facts its
+            # replacement does not: a snapshot without them must not stop the view.
+            if section.__name__ not in replaced:
+                raise
+            return section, [], [], []
         return section, list(lines), own, marks
 
     for section in discovered:
@@ -243,7 +252,7 @@ def _frame(
         # Lanes belong to rows, not issue numbers: the same issue can show as a lane row
         # (foldable) and again as a completion row (not foldable).
         state["row_lanes"] = {y: lane for y, _, lane in marks if lane is not None}
-        state["lanes"] = list(snapshot.status.get("lanes", {}))
+        state["lanes"] = list(snapshot.status.get("lanes") or ())
         state["pinned_rows"] = {name: sorted(rows) for name, rows in pins.items()}
     return [watch._fit(list(line), width) for line in frame]
 

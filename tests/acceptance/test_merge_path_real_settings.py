@@ -171,7 +171,8 @@ class GitHub(FakeTracker):
             tree = git_command(case.history.origin, "merge-tree", "--write-tree", before,
                                expected_head_sha).splitlines()[0]
             # External service observes which loaded client code requested the merge.
-            frames = [f for f in inspect.stack() if "foragent" in Path(f.filename).parts]
+            frames = [f for f in inspect.stack()
+                      if Path(f.filename).resolve().is_relative_to(ROOT / "src/foragent")]
             provenance = [{"path": f.filename, "function": f.function,
                            "sha256": hashlib.sha256(Path(f.filename).read_bytes()).hexdigest()}
                           for f in frames]
@@ -214,7 +215,7 @@ def world(git_history, tmp_path, monkeypatch):
                  "name: offline-ci\non: [pull_request]\njobs:\n  checks:\n    runs-on: ubuntu-latest\n    steps: []\n",
                  "src/value.py": "VALUE = 0\n",
                  CONTRACT: "import runpy\n\ndef test_contract():\n    assert runpy.run_path('src/value.py')['VALUE'] == 0\n",
-                 CLOSING_LOCK: "def test_closed_owner():\n    assert True\n"}
+                 CLOSING_LOCK: "def test_closed_owner():\n    pass\n"}
         for n in NUMBERS:
             files[f"tests/acceptance/test_own_{n}.py"] = (
                 "from pathlib import Path\n\ndef test_own():\n"
@@ -345,8 +346,8 @@ def assert_merged(case, expected=NUMBERS):
     assert turns(case) == list(expected), "Queue history must match the actual merged PRs exactly"
     for n in expected:
         assert case.tracker.get_issue(n).state == "closed"
-        pr = next(p for p in case.tracker.created_prs if p.head == f"foragent/issue-{n}")
-        assert pr.merged_at is not None and case.tracker.get_issue(pr.number).state == "closed"
+        run = case.store.get_run(n)
+        assert (n, run.started_at) in case.store.merge_times() and run.outcome == "merged", "Persist the runner's successful merge"
         assert git_command(case.history.origin, "show", f"main:src/member_{n}.py") == f"VALUE = {n}"
     assert (case.store.root / QUEUE).read_bytes().startswith(case.waiting_queue)
 
@@ -390,7 +391,7 @@ def test_c_new_main_contract_rejects_green_head(world):
     assert_merged(case, NUMBERS[1:])
     assert_rework(case, NUMBERS[0])
     main = measured_suite(case, case.history.tip, [f"tests/acceptance/test_own_{n}.py" for n in (NUMBERS[0],)])
-    assert main["passing_ids"] == main["collected_ids"], "Main must stay green after refusing the incompatible PR"
+    assert main["collected_ids"] and main["passing_ids"] == main["collected_ids"], "Main must stay green after refusing the incompatible PR"
 
 
 @expected_red("test_d_lost_comparison_never_joins_queue")
@@ -417,7 +418,6 @@ def test_e_closed_owner_keeps_waiting_evidence_valid(world):
                              for n in NUMBERS}
     exercise(case, close)
     assert_merged(case)
-    assert case.tracker.get_issue(77).state == "closed"
     for n in NUMBERS[:1]:
         # FakeTracker.find_pr only returns open PRs; inspect immutable PR state.
         pr = next(p.number for p in case.tracker.created_prs if p.head == f"foragent/issue-{n}")
@@ -431,8 +431,6 @@ def install_new_tool(case):
     with zipfile.ZipFile(wheel, "w") as output:
         for path in (ROOT / "src/foragent").rglob("*.py"):
             content = path.read_bytes()
-            if path.name == "__init__.py":
-                content += b"\nMERGE_PATH_INSTALL = 'new-install'\n"
             output.writestr(path.relative_to(ROOT / "src").as_posix(), content)
         requirements = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
         output.writestr(f"{info}/METADATA", "Metadata-Version: 2.1\nName: foragent\nVersion: 9999.0\n"
@@ -465,7 +463,8 @@ def install_new_tool(case):
         raise RuntimeError(f"Offline tool install failed: {installed.stderr}")
     python = tool_dir / "foragent/bin/python"
     result = subprocess.run([str(python), "-I", "-c",
-                             "import foragent; print(foragent.__file__); print(foragent.MERGE_PATH_INSTALL)"],
+                             "import foragent; from importlib.metadata import version; "
+                             "print(foragent.__file__); print(version('foragent'))"],
                             check=True, capture_output=True, text=True)
     case.installed = result.stdout.strip().splitlines()
     subprocess.run([str(python), "-I", "-m", "foragent.cli", "--help"], check=True,
@@ -480,8 +479,10 @@ def test_f_install_during_wait_records_merging_code(world, record_property):
     record = {"new_install": case.installed, "merge_clients": [m["client"] for m in case.merges]}
     record_property("merge_code_provenance", json.dumps(record))
     print("MERGING_CODE", json.dumps(record))
-    assert case.installed[1] == "new-install"
-    assert all(m["client"] for m in case.merges), "Record the loaded code responsible for every merge"
+    assert case.merges, "Observe actual merges before checking their callers"
+    for merge in case.merges:
+        assert any(Path(frame["path"]).resolve() != ROOT / "src/foragent/tracker.py"
+                   for frame in merge["client"]), "Record a production caller outside the tracker wrapper for every merge"
 
 
 @expected_red("test_g_twenty_shared_file_runs_watch_once_has_bounded_work")

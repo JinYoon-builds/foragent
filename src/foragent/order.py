@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_references, order_waiting, ownership
+from foragent import board, capacity, design, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
@@ -609,7 +609,8 @@ def _unconfirmed(issue, mapped: set[int]) -> bool:
     return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
 
 
-def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
+def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str],
+                  on_created: Callable[[int], None] | None = None) -> int:
     """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
 
     GitHub silently drops labels a creator may not apply, so the label is read back.
@@ -624,6 +625,8 @@ def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body
     """
     label = owner_label(owner)
     number = tracker.create_issue(title, body, [label, *labels])
+    if on_created is not None:
+        on_created(number)
     confirmed = label in tracker.get_issue(number).labels
     if not confirmed:
         _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
@@ -658,6 +661,7 @@ class _Publication:
     unconfirmed: list[Issue]
     rows: list[dict]
     owner: str | None
+    reviewed_bases: dict[str, dict]
 
     @property
     def own(self) -> set[int]:
@@ -665,26 +669,15 @@ class _Publication:
         return {number for key, number in self.mapping.items() if key in self.keys} | self.edit_numbers
 
 
-def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
-            manager: SkillManager | None = None,
-            approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False,
-            check_owner: bool = True, retained_files: dict[str, str] | None = None) -> "_Publication":
-    try:
-        files = (validate_plan(plan, root, config) if retained_files is None else
-                 validate_plan(plan, root, config, retained_files=retained_files))
-    except ValueError as exc:
-        raise PlanError(str(exc)) from exc
-    if dry_run:
-        # A dry run only previews: read GitHub without recording any observation locally.
-        from foragent.tracker import RecordingTracker
+def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int], by_number: dict) -> None:
+    targets = {**mapping, **{f"#{item['number']}": item["number"] for item in plan.get("edits", [])}}
+    order_reviewed.require_route_kept(
+        plan, config, repo, {key: by_number[number].body for key, number in targets.items() if number in by_number},
+        "publish", numbers=targets, listed=by_number.values())
 
-        tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
-    keys = {item["key"] for item in plan["issues"]}
-    selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
-    if selected_keys - keys:
-        raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
-    all_issues = tracker.list_issues()
+
+def _publication_targets(plan: dict, all_issues: list):
+    """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
@@ -735,6 +728,31 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     for number in edit_numbers | set(mapping.values()):
         if number not in by_number or number == parent:
             raise PlanError(f"issue #{number} does not exist or is the plan parent")
+    return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
+
+
+def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            manager: SkillManager | None = None,
+            approve: bool = False, approve_keys: list[str] | None = None,
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            check_owner: bool = True, retained_files: dict[str, str] | None = None,
+            git: GitRepo | None = None, refreshed: bool = False) -> "_Publication":
+    try:
+        files = (validate_plan(plan, root, config) if retained_files is None else
+                 validate_plan(plan, root, config, retained_files=retained_files))
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    if dry_run:
+        # A dry run only previews: read GitHub without recording any observation locally.
+        from foragent.tracker import RecordingTracker
+
+        tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
+    keys = {item["key"] for item in plan["issues"]}
+    selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
+    if selected_keys - keys:
+        raise PlanError(f"unknown approve keys: {', '.join(sorted(selected_keys - keys))}")
+    all_issues = tracker.list_issues()
+    parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
     unknown_numbers = selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
     if unknown_numbers & by_number.keys() or (unknown_numbers and keys <= mapping.keys()):
         raise PlanError("approve numbers must refer to this plan's existing children or edits")
@@ -762,8 +780,13 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None)
-    require_reviewed_tests(plan)
+                            by_number, edit_numbers, unconfirmed, rows, None, {})
+    # Statement issues need the reviewed evidence preparation recorded, approved or not; the
+    # tested base is checked again under the publication lock, before anything is written.
+    _require_route(plan, config, repo, mapping, by_number)
+    # The evidence is checked against ``files``, the bytes read once above and written below.
+    reviewed_bases = require_reviewed_tests(
+        plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config), files=files) or {}
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
     # Statement issues take the reviewed-tests route instead of preread.
@@ -776,10 +799,18 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    targets = {mapping[item["key"]] for item in plan["issues"] if item["key"] in mapping} | edit_numbers
+    order_observed.check(root, plan["id"], [tracker.get_issue(n) for n in sorted(targets)], config.language)
+    if reviewed_bases:
+        git = git or GitRepo(root)
+        order_reviewed.require_reviewed_bytes(git, config, order_reviewed.statement_items(plan, by_number, config),
+                                              reviewed_bases, files)
+        order_reviewed.require_tested_base(git, config, reviewed_bases,
+                                           order_reviewed.landing(git, config.base_branch, refreshed=refreshed))
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -791,7 +822,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
-                                      check_owner=not waiting)
+                                      check_owner=not waiting, git=git)
     affected = _affected_owners(publication.by_number.values(), publication.own, publication.files,
                                 repo, config, lambda: git or GitRepo(root), fetch=True)
     if dry_run:
@@ -810,17 +841,30 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
     owner = publication.owner
-    with git.publish_lock():
-        git.update_base(config.base_branch)
-        affected = _affected_owners(tracker.list_issues(), publication.own, publication.files,
-                                    repo, config, lambda: git, fetch=False)
-        if affected:
-            raise PlanError(text("order_locks_refused", config.language,
-                                 owners="\n".join(_owner_lines(affected))))
-        tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
-        published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
-    return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
-                           published_blobs=published_blobs, approve=approve)
+    with order_reviewed.publication_gate(repo):
+        with git.publish_lock():
+            git.update_base(config.base_branch)
+            # A preparation that started or finished since the first checks is visible now, and none
+            # can start until this publication's issues are written: it claims them under the gate.
+            listed = tracker.list_issues()
+            current = {**publication.by_number, **{issue.number: issue for issue in listed}}
+            _require_route(plan, config, repo, publication.mapping, current)
+            items = order_reviewed.statement_items(plan, current, config)
+            reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
+            if reviewed:
+                order_reviewed.require_reviewed_bytes(git, config, items, reviewed, publication.files)
+                # Refreshed HEAD is the actual landing commit, including local commits.
+                order_reviewed.require_tested_base(git, config, reviewed,
+                                                   order_reviewed.landing(git, config.base_branch, refreshed=True))
+            affected = _affected_owners(listed, publication.own, publication.files,
+                                        repo, config, lambda: git, fetch=False)
+            if affected:
+                raise PlanError(text("order_locks_refused", config.language,
+                                     owners="\n".join(_owner_lines(affected))))
+            tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
+            published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
+        return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
+                               published_blobs=published_blobs, approve=approve)
 
 
 def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -841,6 +885,13 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         tracker.ensure_labels([LabelSpec("interactive", "d4c5f9", "Work that needs substantial back-and-forth with the user.")])
 
     recorded_blobs = saved_blobs.copy()
+
+    def remember(number: int, title: str, body: str) -> None:
+        order_observed.save(root, plan["id"], {str(number): {"title": title, "body": body}}, config.language)
+
+    def update_target(number: int, *, title: str, body: str) -> None:
+        tracker.update_issue(number, title=title, body=body)
+        remember(number, title, body)
 
     def acceptance_blobs(item: dict) -> dict[str, str]:
         # Reference files an issue relies on revoke its approval when they change, like its tests.
@@ -881,7 +932,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         blobs = acceptance_blobs(item)
         body = decision_links.with_marker(body, item.get("decisions"), existing.body if existing else None)
         if number is None:
-            number = _create_owned(tracker, config, owner, item["title"], body, labels)
+            number = _create_owned(tracker, config, owner, item["title"], body, labels,
+                                   on_created=lambda n: remember(n, item["title"], body))
             mapping[item["key"]] = number
             order_waiting.announce(tracker, number, body, config.language)
             recorded_blobs[str(number)] = blobs
@@ -891,7 +943,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
             if (existing.body != body or saved_blobs.get(str(number), {}) != blobs
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
-            tracker.update_issue(number, title=item["title"], body=body)
+            update_target(number, title=item["title"], body=body)
             # A record follows the fact it describes: announce the wait the body now holds.
             order_waiting.announce(tracker, number, body, config.language)
             tracker.remove_labels(number, [label for label in existing.labels
@@ -932,7 +984,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
                    or saved_blobs.get(str(number), {}) != blobs)
         if changed:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
-            tracker.update_issue(number, title=existing.title, body=body)
+            update_target(number, title=existing.title, body=body)
         # Records follow the facts they describe: the revision comment covers the body and
         # the dependencies, and the waiting line the body's wait, so each comes after them.
         if "blocked_by" in item:
@@ -1275,18 +1327,30 @@ def preread(plan: dict, root: Path, config: Config,
             tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
-    Edits need the tracker for each existing issue's title and lane; it is opened only then.
+    Existing children and edits expose their current GitHub fields to the reader.
     """
     try:
         published = validate_plan(plan, root, config)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
-    items = list(plan["issues"])
-    if plan.get("edits"):
-        if tracker is None:
-            raise PlanError("prereading edits needs the tracker for the existing issues")
+    # Statement issues are prepared and reviewed instead; preread reads only the legacy issues.
+    items = [item for item in plan["issues"] if "statements" not in item]
+    edits = [item for item in plan.get("edits", []) if "statements" not in item]
+    current, listed = {}, []
+    if tracker is not None:
         source = tracker()
-        items += [edit_view(item, source.get_issue(item["number"]), config) for item in plan["edits"]]
+        listed = source.list_issues()
+        _, mapping, _, _, _, _ = _publication_targets(plan, listed)
+        current = {item["key"]: source.get_issue(mapping[item["key"]])
+                   for item in plan["issues"] if item["key"] in mapping}
+        current.update({f"#{item['number']}": source.get_issue(item["number"]) for item in plan.get("edits", [])})
+        items += [edit_view(item, current[f"#{item['number']}"], config) for item in edits]
+    elif edits:
+        raise PlanError("prereading edits needs the tracker for the existing issues")
+    # An issue that took the statement route keeps it: no legacy evidence is made for it.
+    order_reviewed.require_route_kept(plan, config, repo or config.repo,
+                                      {key: issue.body for key, issue in current.items()}, "preread",
+                                      numbers={key: issue.number for key, issue in current.items()}, listed=listed)
     waiting, lanes = _uncreated_lanes(plan, config, items)
     if waiting:
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
@@ -1310,6 +1374,9 @@ def preread(plan: dict, root: Path, config: Config,
         snapshot = order_references.materialize(plan, item, root)
         try:
             setup, prompt, digest = preread_target(plan, item, config, root, snapshot)
+            observed = current.get(item["key"])
+            if observed is not None:
+                prompt += order_observed.context(observed, config.language)
             log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
             if log.is_symlink():
                 log.unlink()
@@ -1336,9 +1403,18 @@ def preread(plan: dict, root: Path, config: Config,
             "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
             "unknowns": unknowns, "decisions": decisions, "approach": approach,
             "at": datetime.now(UTC).isoformat(timespec="seconds")})
+        if observed is not None:
+            order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
+    # A statement issue has no reader turn, yet a refused publication must have this way back:
+    # the agent that ran this re-read sees the current fields it now stands on.
+    read = {item["key"] for item in items}
+    for key, issue in current.items():
+        if key not in read:
+            order_observed.save(root, plan["id"], {str(issue.number): order_observed.fields(issue)}, config.language)
+            results.append({"key": key, "unknowns": [], "current": order_observed.context(issue, config.language).strip()})
     return results
 
 
@@ -1367,20 +1443,7 @@ NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent
                   "then run fa order preread PLAN.json and publish again with --approve")
 
 
-def require_reviewed_tests(plan: dict) -> None:
-    """A statement issue is published only with tests its lane wrote and an independent reviewer passed.
-
-    The ``statements`` field selects this route for good, even once acceptance_files exist.
-    No reviewed-tests record is read or written here yet, so every statement issue is refused.
-    """
-    keys = [item["key"] for item in plan["issues"] if "statements" in item]
-    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" in item]
-    if keys:
-        raise PlanError(
-            f"cannot publish: statement issue(s) {', '.join(keys)} have no reviewed tests; "
-            "prepare them with fa order prepare PLAN.json so the lane writes the tests and the "
-            "configured reviewer reviews them, then publish again (fa order publish PLAN.json "
-            "--dry-run still previews the plan)")
+require_reviewed_tests = order_reviewed.require_reviewed_tests
 
 
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:

@@ -12,7 +12,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, quota_reviewer, usage_events, usage_recheck
+from foragent import board, cuts, quota_reviewer, run_check_slot, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -50,7 +50,7 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
             "Bash(git merge:*)",
         ]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
-                                      "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
+                                      "timeout": run_check_slot.hook_seconds(ctx.config)}]}]},
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
