@@ -101,9 +101,21 @@ class ComparisonEvidence:
             return False
 
 
-def enabled(ctx, target_branch):
-    return (ctx.config.checks == "ci" and target_branch == ctx.config.base_branch
+def ci_protection(ctx):
+    """CI owns portable protection even when a target cannot produce evidence."""
+    return (ctx.config.checks == "ci" and ctx.config.checks_fallback != "local"
             and acceptance_command(ctx.config, ctx.repo_root) is not None)
+
+
+def ci_evidence_target(ctx, target_branch):
+    """The generated acceptance workflow runs only against the configured base."""
+    return target_branch == ctx.config.base_branch
+
+
+def enabled(ctx, target_branch):
+    return (ci_protection(ctx)
+            or (ctx.config.checks == "ci" and ci_evidence_target(ctx, target_branch)
+                and acceptance_command(ctx.config, ctx.repo_root) is not None))
 
 
 def commit_exclusions(attempt, title):
@@ -314,6 +326,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
+    if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
+        detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
+                  "(checks: ci, no local fallback)")
+        flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
+        raise ExecutorStopped("held", detail)
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
