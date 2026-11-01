@@ -11,11 +11,27 @@ from pathlib import Path
 import shlex
 import sys
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from test_merge_group import (  # noqa: E402,F401
     contend, group_case, isolated_home, offline_acceptance, prepare, publish_case,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_runner_process_pause(monkeypatch):
+    # Real runners each own a process; group_case simulates them with threads.
+    # Their overlapping deadline scopes can exit out of stack order. Keep that
+    # process-wide fallback inside this simulation, including on test failure.
+    from foragent import processes
+
+    previous = processes.current_pause()
+    with monkeypatch.context() as patch:
+        patch.setattr(processes, "_process_paused", None)
+        yield
+    assert processes.current_pause() is previous, "Simulated runners leaked their process pause"
 
 
 def _probe_counts(case):

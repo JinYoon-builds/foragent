@@ -22,3 +22,5 @@
 - [id:wait-resume-2026-10-31-1181-break-it] #1181: tests/test_orch_waits_unit.py의 14개 사례 모두가 임시 src 사본의 변형을 하나 이상 잡았고, 전달 생략·중복·옛 listing·임의 승인 등 18개 변형을 모두 거절했다. PYTHONPATH 사본 검증은 실제 import된 orch_waits.__file__을 먼저 확인해야 한다. 인수 시험이나 작업 트리 소스를 변형하지 않는다.
 
 - [id:1141-2026-11-01-resume-validation] #1141 재개: HEAD가 origin/main 전체와 #1295·#1347을 이미 포함하면 재베이스 대신 기존 구현을 보존한다. 이번 fa test는 공용 test-slots.lock EPERM으로 시작 전 종료됐다. 저장된 check-done.log의 지정 3/4 통과와 logs/issue-1141.log의 관련 39 통과는 이전 실행 근거이며, git diff fb1ead5d HEAD로 해당 소스·시험 6파일 동일성을 확인해도 새 base 재실행 통과와 구분한다. 재생성 때 사라진 TRY·SEARCHED·REBUTTAL을 복원한다.
+
+- [id:1141-2026-11-01-ci-pause-isolation] #1141 빈 CI failed는 workflow가 진행 중이면 pr_failed_logs가 실패한 job을 아직 안 읽어서 나올 수 있다. GitHub 연결 도구로 commit workflow→jobs→실패 job log를 읽으니 test_lane_talk의 current_pause() is None만 실패했다(job 124731594790). 새 test_group_reuse_timing 네 시험이 같은 프로세스에서 runner들을 스레드로 흉내 내어 processes._process_paused를 비 LIFO로 복원했다. 모듈 fixture가 monkeypatch.context로 프로세스 fallback을 격리·복원하고 공개 current_pause로 복원을 확인하게 했다. 정상·효과 생략 mutant 모두 fa test 슬롯 EPERM이라 아직 수정 후 검증·break-it 검출은 미확인이다.
