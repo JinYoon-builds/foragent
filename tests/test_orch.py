@@ -464,6 +464,8 @@ def test_behind_rerun_review_uses_shared_history_for_diff_and_risk_notes(review_
         return notes(git, base)
 
     monkeypatch.setattr(run_review, "_risk_notes", risk_notes)
+    from foragent.run_pr_body import save_values
+    save_values(1, c.ctx, {"summary": "Summary.", "checks": [], "attempt": 1, "reviews": []})
     orch.rerun_review(c.ctx, 1)
 
     assert risk_bases == [common_base] * (2 if scope == "pr-body" else 1)

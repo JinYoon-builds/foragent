@@ -666,60 +666,13 @@ class RecordingTracker:
         return prs
 
     def create_pr(self, *, head, base, title, body):
-        from foragent.pr_body_limit import record_quoted
-
-        sent, full = self._fit_pr_body(body, head.removeprefix("foragent/"))
-        pr = self._tracker.create_pr(head=head, base=base, title=title, body=sent)
+        pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
         self._record_pr(pr, head, base)
-        record_quoted(self._context.store.root, pr, sent)
-        self._post_full_text(pr, full)
         return pr
 
     def update_pr(self, pr, *, base, title, body):
-        from foragent.pr_body_limit import record_quoted
-
-        key = next((row["pr_head"].removeprefix("foragent/") for row in self._context.store.local_issues()
-                    if row["pr_number"] == pr and row.get("pr_head")), f"pr-{pr}")
-        sent, full = self._fit_pr_body(body, key)
-        self._tracker.update_pr(pr, base=base, title=title, body=sent)
+        self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
-        record_quoted(self._context.store.root, pr, sent)
-        self._post_full_text(pr, full)
-
-    def _fit_pr_body(self, body, key):
-        """The text to send, and the complete text a shortened one still has to publish."""
-        from foragent.i18n import text
-        from foragent.pr_body_limit import PR_BODY_LIMIT, digest, fit_pr_body
-
-        root, language = self._context.store.root, self._context.config.language
-        if len(body) <= PR_BODY_LIMIT:
-            return body, None
-        name = digest(body)
-        relative = f"pr-bodies/{re.sub(r'[^\w-]', '-', key)}-{name}.md"
-        header = text("pr_body_full_text", language, digest=name)
-        fitted = fit_pr_body(body, lambda label: text(
-            "pr_body_block_removed", language, label=label, header=header, path=relative))
-        # Retained only once a send is certain; a refused body has nothing to point at.
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        return fitted, (header, str(body))
-
-    def _post_full_text(self, pr, full):
-        """Publish the removed text where the note says; the local copy holds if this fails."""
-        from foragent.pr_body_limit import comment_parts
-
-        if full is None:
-            return
-        header, body = full
-        try:
-            if any(comment.body.startswith(header) for comment in self._tracker.list_comments(pr)):
-                return
-            for part in comment_parts(body, header):
-                self.comment(pr, part)
-        except TrackerError as exc:
-            if exc.is_rate_limit:
-                raise
 
     def _record_pr_state(self, pr, **fields):
         for row in self._context.store.local_issues():

@@ -20,14 +20,14 @@ from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
 from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
-from foragent.pr_body_limit import PrBody, change_outside_quoted, load_quoted
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
 from foragent.run_execution import _available_executor, _requeue_limit
+from foragent.run_pr_body import load_values, publish_comments, read_values, render_values, review_values, save_values
 from foragent.run_prompts import (
-    build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
+    build_review_prompt, lane_decisions_section, review_scope_rules,
 )
 from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
 from foragent.run_waits import _phase, _progress, _timeout
@@ -451,32 +451,6 @@ def _risk_notes(git: GitRepo, base_ref: str) -> str:
     return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
 
 
-def refreshed_native_body(root: Path, pr: int, body: str, acceptance_dir: str, language: str,
-                          notes: str, decisions: str) -> PrBody:
-    """Bring an open PR's body up to this head without touching any quoted text in it."""
-    def refresh(text: str) -> str:
-        text = with_review_scope(text, acceptance_dir, language)
-        return refresh_lane_decisions(risks.refresh_notes(text, notes), decisions)
-
-    return change_outside_quoted(load_quoted(root, pr, body), refresh)
-
-
-def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
-    """Add the review scope, or every rule line an older PR's existing scope section lacks."""
-    rules = review_scope_rules(acceptance_dir, language)
-    if "## Review scope" not in body:
-        return body + "\n\n## Review scope\n\n" + rules
-    missing = [line for line in rules.splitlines() if line not in body]
-    if not missing:
-        return body
-    # An older section holding the remaining rules in order is replaced whole; otherwise
-    # the missing lines (the spec-conflict rule, the defect-class question) lead the section.
-    earlier = "\n".join(line for line in rules.splitlines() if line not in missing)
-    if earlier and earlier in body:
-        return body.replace(earlier, rules, 1)
-    return body.replace("## Review scope\n\n", "## Review scope\n\n" + "\n".join(missing) + "\n", 1)
-
-
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
@@ -620,20 +594,30 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
-            # Native PR review reads only the PR body: refresh the risk notes for this head and base.
-            body = refreshed_native_body(
-                ctx.store.root, pr.number, pr.body, ctx.config.acceptance_dir, ctx.config.language,
-                review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config),
-                _lane_decisions(n, ctx, git.root))
-            if body != pr.body:
-                pr = replace(pr, body=body)
-                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
+            # Native PR review reads only the PR body: compose it again with this head's facts.
+            values = load_values(n, ctx)
+            values.update(review_scope="pr-body", acceptance_dir=ctx.config.acceptance_dir,
+                          language=ctx.config.language,
+                          risk_notes=review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config),
+                          lane_decisions=_lane_decisions(n, ctx, git.root))
+            save_values(n, ctx, values)
+            body = render_values(n, ctx, values)
+            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
+            publish_comments(ctx, pr.number, body)
         review = _review(n, ctx, git, parsed, review_base, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
         if review.timed_out or runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
+        if (values := read_values(n, ctx)) is not None:
+            # A later retitle composes from the record, so it has to hold this verdict in either scope.
+            values["reviews"] = [*values.get("reviews", []), *review_values([review])]
+            save_values(n, ctx, values)
+            if ctx.config.review_scope == "pr-body":
+                body = render_values(n, ctx, values)
+                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
+                publish_comments(ctx, pr.number, body)
         if review.verdict != "PASS" and not review.no_findings:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
