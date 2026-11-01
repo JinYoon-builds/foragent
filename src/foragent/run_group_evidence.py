@@ -1,18 +1,22 @@
-"""Whether a follower may count an earlier joint group check as its own evidence (group-evidence).
+"""Whether a group member may count an earlier joint group check as its own evidence (group-evidence).
 
 A joint result is spendable only when everything it assumed still holds:
 
 - the group verdict is exactly ``passed`` (a ``failed`` or ``void`` group never is);
-- the follower's PR head at this final read is the head that was checked;
+- the member's PR head at this final read is the head that was checked;
 - current main descends from the captured group base through exactly the earlier
   members' merges, first parent by first parent: one commit per earlier member,
-  each with the expected previous tip as parent and that member's checked tree.
-  Any other commit (an outsider, including one that reverts itself, or one that
-  lands inside a member's merge call) makes the interval unproven.
+  each with the expected previous tip as parent and that member's checked tree,
+  apart from paths of result-neutral commits in between. A commit that is no
+  member's recorded merge counts only when the caller's run_base_move rules call
+  it neutral by itself; any other (an outsider, including one that reverts itself,
+  or one that lands inside a member's merge call) makes the interval unproven.
 
-``void_reason`` is the single predicate; ``None`` means usable. Until group reuse
-exists, ``note`` only records the decision in the follower's own log and one
-journal event, and the follower keeps its ordinary one-PR verification.
+``void_reason`` is the single predicate; ``None`` means usable. ``note`` records
+the decision in the member's own log and one journal event; the leader is judged
+the same way, with no earlier member. A usable result lets the member merge its
+exact checked head without rechecking (group-reuse); otherwise it keeps its
+ordinary one-PR verification.
 
 Provenance is recorded by each member itself: right after its own ``merge_pr``
 succeeds, ``record_merge`` observes the new main and appends one ``group-merge``
@@ -28,7 +32,7 @@ each runner writes only its own log and its own ``group-evidence`` /
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from foragent.git import GitError
 from foragent.tracker import TrackerError
@@ -36,22 +40,34 @@ from foragent.tracker import TrackerError
 if TYPE_CHECKING:
     from foragent.runner import RunContext
 
+# (parent, commit) -> whether that one main commit is a result-neutral move.
+Neutral = Callable[[str, str], bool]
+
 
 def latest(ctx: RunContext, n: int) -> tuple[dict, int] | None:
-    """The newest ``group-check`` event naming ``n`` as a follower, and ``n``'s position in it."""
+    """The newest ``group-check`` event naming ``n`` at any position, and that position.
+
+    The leader spends the pass it ran exactly like a follower: with no earlier
+    member, only result-neutral commits may lie between the group base and main.
+    """
     for event in reversed(_events(ctx, "group-check")):
         members = event.get("members")
         if not isinstance(members, list):
             continue
         numbers = [member.get("n") if isinstance(member, dict) else None for member in members]
-        if n in numbers[1:]:
+        if n in numbers:
             return event, numbers.index(n)
     return None
 
 
 def void_reason(ctx: RunContext, n: int, head_sha: str, base_sha: str,
-                found: tuple[dict, int] | None = None) -> str | None:
-    """Why ``n`` may not spend the joint result on main ``base_sha``; ``None`` when it may."""
+                found: tuple[dict, int] | None = None, neutral: Neutral | None = None) -> str | None:
+    """Why ``n`` may not spend the joint result on main ``base_sha``; ``None`` when it may.
+
+    ``neutral(parent, commit)`` classifies one main commit that is no member's
+    recorded merge (the caller's run_base_move rules); without it, only the
+    earlier members' own merges may lie between the group base and main.
+    """
     found = found if found is not None else latest(ctx, n)
     if found is None:
         return "no joint result names this run"
@@ -80,39 +96,63 @@ def void_reason(ctx: RunContext, n: int, head_sha: str, base_sha: str,
     except (GitError, OSError) as exc:
         return f"main history unreadable: {exc}"
     commits = [line.split() for line in lines if line.strip()]
-    if len(commits) != len(trees):
-        return (f"main moved by {len(commits)} commits since the group base; "
-                f"expected exactly the {len(trees)} earlier member merges")
     merges = _recorded_merges(ctx)
     tip = group_base
-    for (sha, tree, *parents), expected, member in zip(commits, trees, members):
-        if not parents or parents[0] != tip or tree != expected:
-            return f"commit {sha} is not #{member.get('n')}'s checked merge"
+    pending = list(zip(trees, members))
+    neutral_paths: set[str] = set()
+    for sha, tree, *parents in commits:
+        if not parents or parents[0] != tip:
+            return f"commit {sha} does not follow {tip} on main's first-parent line"
+        expected, member = pending[0] if pending else (None, {})
         # Matching content is not provenance: the commit must be the one that member
         # itself observed as its own merge of the exact checked head.
-        if merges.get((member.get("n"), member.get("head_sha"))) != (sha, tip, tree):
-            return f"commit {sha} has no recorded merge by #{member.get('n')} of its checked head"
+        if pending and merges.get((member.get("n"), member.get("head_sha"))) == (sha, tip, tree):
+            if not _same_result(ctx, expected, tree, neutral_paths):
+                return f"commit {sha} is not #{member.get('n')}'s checked merge"
+            pending.pop(0)
+        elif neutral is not None and (moved := _neutral(ctx, neutral, tip, sha)) is not None:
+            neutral_paths |= moved
+        else:
+            who = f"#{member.get('n')} of its checked head" if pending else "any earlier member"
+            return f"commit {sha} has no recorded merge by {who} and is not a result-neutral move"
         tip = sha
+    if pending:
+        return (f"main moved by {len(commits)} commits since the group base; "
+                f"expected the {len(trees)} earlier member merges")
     if tip != base_sha:
         return "main does not end at the earlier members' merges"
     return None
 
 
-def note(n: int, ctx: RunContext, head_sha: str, base_sha: str) -> str | None:
-    """Record whether ``n`` could spend an earlier joint result; return the void reason, if any."""
+def note(n: int, ctx: RunContext, head_sha: str, base_sha: str, neutral: Neutral | None = None) -> str | None:
+    """Record whether ``n`` may spend an earlier joint result; ``None`` when it may.
+
+    A usable result is the member's verification on ``base_sha``: it merges its
+    exact checked head without re-running checks. Any reason means the ordinary
+    one-PR path; without a joint result naming ``n`` nothing is recorded.
+    """
     from foragent import orch_events
     from foragent.run_checks import _append
 
     found = latest(ctx, n)
     if found is None:
-        return None
-    reason = void_reason(ctx, n, head_sha, base_sha, found)
-    decision = "usable" if reason is None else f"void ({reason})"
-    _append(ctx.store.log_path(n), f"\nGroup evidence on {base_sha}: {decision}; running the ordinary check")
+        return "no joint result names this run"
+    reason = void_reason(ctx, n, head_sha, base_sha, found, neutral)
+    decision = "usable; reusing the joint pass" if reason is None else f"void ({reason}); running the ordinary check"
+    _append(ctx.store.log_path(n), f"\nGroup evidence on {base_sha}: {decision}")
     orch_events.append_event(ctx.store, ctx.now(), n, "group-evidence", f"group evidence {decision}",
                              base_sha=base_sha, head_sha=head_sha, usable=reason is None, reason=reason,
                              group_base=found[0].get("base_sha"))
     return reason
+
+
+def neutral_rule(view) -> Neutral:
+    """The run_base_move rule for one commit, for any run view (``n``, ``ctx``, ``git``,
+    ``approval``, ``baseline``): every publish path judges neutral moves alike."""
+    from foragent import run_publish
+    from foragent.run_base_move import BaseMove
+
+    return lambda parent, sha: run_publish.base_move_is_neutral(view, BaseMove(parent, sha))
 
 
 def record_merge(n: int, ctx: RunContext, target: str, pre_tip: str, head_sha: str) -> None:
@@ -149,6 +189,29 @@ def record_merge(n: int, ctx: RunContext, target: str, pre_tip: str, head_sha: s
     orch_events.append_event(ctx.store, ctx.now(), n, "group-merge",
                              f"merge of {head_sha} " + (f"is {commit['sha']}" if commit else f"unattributed ({reason})"),
                              head_sha=head_sha, commit=commit, reason=reason)
+
+
+def _neutral(ctx: RunContext, neutral: Neutral, parent: str, sha: str) -> set[str] | None:
+    """The paths of one result-neutral commit; ``None`` when it is not (or is unreadable)."""
+    try:
+        return _paths(ctx, parent, sha) if neutral(parent, sha) else None
+    except (GitError, OSError):
+        return None
+
+
+def _paths(ctx: RunContext, parent: str, sha: str) -> set[str]:
+    return {path for path in ctx.git._call(
+        ["diff", "--name-only", "--no-renames", "-z", parent, sha]).split("\0") if path}
+
+
+def _same_result(ctx: RunContext, expected: str, tree: str, neutral_paths: set[str]) -> bool:
+    """``tree`` holds the checked ``expected`` tree, apart from earlier neutral paths."""
+    if tree == expected:
+        return True
+    try:
+        return bool(neutral_paths) and _paths(ctx, expected, tree) <= neutral_paths
+    except (GitError, OSError):
+        return False
 
 
 def _events(ctx: RunContext, kind: str) -> list[dict]:

@@ -639,3 +639,45 @@ def test_with_python_path_joins_inline_and_env_assignments():
         "A='' env PYTHONPATH='/p d:my src' python -m pytest -o addopts=")
     assert _with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
     assert shlex.split(_with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
+
+
+@pytest.mark.parametrize("compatible", [False, True], ids=["exact-key", "compatible-key"])
+def test_legacy_cache_hit_retains_its_own_duration_without_capture(git_history, tmp_path, compatible):
+    from foragent import run_baseline
+
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    command = "pytest -q"
+    keep = "tests/acceptance/test_keep.py"
+    git_history.update({keep: "def test_keep(): pass\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    build = run_baseline._baseline_build(ctx, command, git_history.tip, store.log_path(1))
+    cache = store.root.parent / "baselines"
+    cache.mkdir(exist_ok=True)
+    node = f"{keep}::test_keep"
+    saved = {"created_at": ctx.now().isoformat(), "node_ids": [node], "collected_ids": [node],
+             "failing_ids": [], "excluded": build.excluded, "scope": build.scope}
+    key = "compatible-selection" if compatible else build.key
+    record = cache / f"{key}.json"
+    record.write_text(json.dumps(saved))
+    record.with_suffix(".xml").write_text('<testsuite time="736"/>')
+    # The requested key's report must never supply a compatible selection's timing.
+    if compatible:
+        (cache / f"{build.key}.xml").write_text('<testsuite time="99"/>')
+    (cache / "newer-selection.json").write_text(json.dumps({**saved, "duration_seconds": 2000}))
+
+    def unexpected_capture(*args, **kwargs):
+        pytest.fail("A reusable legacy baseline must not be captured again")
+
+    result = run_baseline._capture_baseline(
+        ctx, command, git_history.tip, log=store.log_path(1), report=store.root / "unused.xml",
+        check=unexpected_capture, prepare=lambda: None, wait=lambda acquire: acquire(),
+        required_ids=frozenset({node}) if compatible else None,
+    )
+    assert result.node_ids == (node,)
+    assert result.duration_seconds == 736
+    assert "duration_seconds" not in json.loads(record.read_text())
+    assert "cache=hit" in store.log_path(1).read_text()
