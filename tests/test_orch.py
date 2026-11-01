@@ -106,8 +106,13 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch, advanc
     monkeypatch.setattr(runner, "after_merge", lambda *args: calls.append(args))
     c.ctx.config = replace(c.ctx.config, max_runtime_minutes=5)
     monkeypatch.setattr(run_merge_turn, "MERGE_WAIT_SECONDS", 60)
+    measured = [0.0]
+    monkeypatch.setattr(run_merge_turn, "monotonic", lambda: measured[0])
     if not advance_clock:
-        c.ctx.sleep = lambda seconds: None
+        def sleep(seconds):
+            measured[0] += seconds
+
+        c.ctx.sleep = sleep
     # Refused merges share the separate wait bound across later queue turns.
     assert runner.review_only(1, c.ctx) == "merge-wait"
     assert len(attempts) == 2
@@ -117,7 +122,7 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch, advanc
     requests = orch_inbox.requests(c.store, pending=True)
     assert len(requests) == 1
     request = requests[0]
-    elapsed = 60 if advance_clock else 0
+    elapsed = 60
     assert request["kind"] == "merge-wait" and request["waited_seconds"] == elapsed
     assert c.store.get_run(1).merge_waited_seconds == elapsed
     assert f"after {elapsed}s (2 polls)" in c.store.get_run(1).detail

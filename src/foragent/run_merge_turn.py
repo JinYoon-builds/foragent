@@ -1,19 +1,20 @@
-"""FIFO merge turn over the append-only ``<state>/merge-queue.jsonl`` (#712).
+"""Merge turn in join order within priority over append-only ``<state>/merge-queue.jsonl``.
 
 State ownership: each run appends only its own ``ready``/``withdrawn`` entries,
 only the turn holder appends ``turn`` records, and the file only grows. The
-turn itself is derived on every read, never stored. There is one FIFO per
-target branch.
+turn itself is derived on every read, never stored. Each target branch uses
+the current cross-lane priority list, with join order within equal priority.
+Listed issues precede all unlisted issues, which share one priority.
 
 Reading the queue: a run's entry is keyed by issue and the run's started_at.
 Its first ``ready`` entry fixes its position (a later head change keeps it). A
 ``withdrawn`` entry ends that position; a later ``ready`` joins at the tail. A
-``turn`` record is history only: the holder keeps the turn until its run stops
-running, so a successor never takes the turn while the merge is in flight. A
-run that merged leaves no withdrawn entry. The head, which holds the turn, is
-the first remaining entry whose run is still running. Entries of runs that
-are not running are skipped, never deleted; the scheduler's crash recovery
-decides that an owner is dead.
+``turn`` record is history only. A run that merged leaves no withdrawn entry.
+The head, which holds the turn, is the first live entry in priority order.
+Priority changes can change the next turn, while the merge lock serializes
+actual merges already in flight. Entries of runs that are not running are
+skipped, never deleted; the scheduler's crash recovery decides that an owner
+is dead.
 """
 
 from __future__ import annotations
@@ -22,9 +23,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, timedelta
 import json
+from time import monotonic
 from typing import TYPE_CHECKING, NoReturn
 from uuid import uuid4
 
+from foragent import orch_queue
 from foragent.run_waits import WaitPhase
 
 if TYPE_CHECKING:
@@ -38,7 +41,7 @@ POLL_SECONDS = 30
 
 @dataclass(frozen=True)
 class Seat:
-    """One run's identity in one target branch's FIFO."""
+    """One run's identity in one target branch's merge queue."""
 
     n: int
     started_at: str | None
@@ -90,6 +93,12 @@ def _live(store: StateStore, key: tuple[int, str | None]) -> bool:
     return run is not None and run.status == "running" and key[1] in {None, run.started_at}
 
 
+def _turn_order(entries: dict[tuple[int, str | None], dict], priority: list[int]) -> list[tuple[int, str | None]]:
+    """Stable priority order over entries already in join order."""
+    ranks = {n: index for index, n in enumerate(priority)}
+    return sorted(entries, key=lambda key: ranks.get(key[0], len(priority)))
+
+
 def _append(store: StateStore, row: dict) -> None:
     store.root.mkdir(parents=True, exist_ok=True)
     with (store.root / QUEUE).open("a", encoding="utf-8") as stream:
@@ -116,12 +125,11 @@ def withdraw(ctx: RunContext, place: Seat) -> None:
 
 
 def holds_turn(store: StateStore, place: Seat) -> bool:
-    for key in _waiting(_rows(store), place.target):
-        if key == place.key:
-            return True
+    entries = _waiting(_rows(store), place.target)
+    for key in _turn_order(entries, orch_queue.get_global(store)):
         if _live(store, key):
-            return False
-    return True
+            return key == place.key
+    return False
 
 
 def record_turn(ctx: RunContext, place: Seat, base_sha: str, result: str) -> None:
@@ -135,6 +143,7 @@ def _merge_wait(n: int, ctx: RunContext):
     """Credit one merge queue wait and keep its liveness visible to tick."""
     started = ctx.now()
     started_mono = ctx.monotonic()
+    started_real = monotonic()
     previous_wait = ctx.store.get_run(n).merge_waited_seconds
     key = f"merge-wait-{uuid4().hex}"
     wait = WaitPhase(n, ctx, "merge-lock-wait", started)
@@ -148,6 +157,7 @@ def _merge_wait(n: int, ctx: RunContext):
             last_progress_at=now.astimezone(UTC).isoformat(),
             merge_waited_seconds=previous_wait + max(
                 0, (now - started).total_seconds(), ctx.monotonic() - started_mono,
+                monotonic() - started_real,
             ),
         )
         return now
@@ -160,9 +170,7 @@ def _merge_wait(n: int, ctx: RunContext):
 
 def _wait_limit_reached(n: int, ctx: RunContext) -> bool:
     run = ctx.store.get_run(n)
-    # The poll bound also ends retries when an injected clock/sleep makes no progress.
-    return (run.merge_waited_seconds >= MERGE_WAIT_SECONDS
-            or run.merge_wait_polls * POLL_SECONDS >= MERGE_WAIT_SECONDS)
+    return run.merge_waited_seconds >= MERGE_WAIT_SECONDS
 
 
 def _pause(n: int, ctx: RunContext) -> None:
@@ -243,7 +251,8 @@ def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:
     holds the merge lock for the whole merge, which keeps every later entry waiting.
     """
     with ctx.store._state_lock():
-        for key in _waiting(_rows(ctx.store), place.target):
+        entries = _waiting(_rows(ctx.store), place.target)
+        for key in _turn_order(entries, orch_queue.get_global(ctx.store)):
             if _live(ctx.store, key):
                 return key[0]
         _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import run_merge_turn as turn
+from foragent import orch_queue, run_merge_turn as turn
 from foragent.config import Config
 from foragent.runner import run_issue
 from foragent.state import StateStore
@@ -27,6 +27,63 @@ def make_ctx(tmp_path, *numbers):
 
 def rows(ctx):
     return [json.loads(line) for line in (ctx.store.root / turn.QUEUE).read_text().splitlines()]
+
+
+def test_ready_turn_follows_current_global_priority_without_rejoining(tmp_path):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    seats = [turn.seat(ctx, n, "main") for n in (3, 1, 2)]
+    for place in seats:
+        turn.join(ctx, place, f"head-{place.n}")
+    before = (ctx.store.root / turn.QUEUE).read_bytes()
+
+    for priority, expected in [([2, 1], 2), ([1, 2], 1), ([3], 3)]:
+        orch_queue.set_global(ctx.store, priority)
+        assert [place.n for place in seats if turn.holds_turn(ctx.store, place)] == [expected]
+        assert (ctx.store.root / turn.QUEUE).read_bytes() == before
+
+
+def test_empty_global_priority_preserves_join_order(tmp_path):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    seats = [turn.seat(ctx, n, "main") for n in (3, 1, 2)]
+    for place in seats:
+        turn.join(ctx, place, f"head-{place.n}")
+    orch_queue.set_global(ctx.store, [2])
+    orch_queue.set_global(ctx.store, [])
+
+    for expected in seats:
+        assert [place.n for place in seats if turn.holds_turn(ctx.store, place)] == [expected.n]
+        turn.withdraw(ctx, expected)
+    assert not any(turn.holds_turn(ctx.store, place) for place in seats)
+
+
+@pytest.mark.parametrize(("priority", "expected"), [([], 3), ([2, 1], 2)])
+def test_claim_reports_priority_holder_without_joining(tmp_path, priority, expected):
+    ctx = make_ctx(tmp_path, 1, 2, 3)
+    for n in (3, 1, 2):
+        turn.join(ctx, turn.seat(ctx, n, "main"), f"head-{n}")
+    orch_queue.set_global(ctx.store, priority)
+    before = (ctx.store.root / turn.QUEUE).read_bytes()
+
+    assert turn.claim(ctx, turn.Seat(4, "manual-merge", "main"), "head-4") == expected
+    assert (ctx.store.root / turn.QUEUE).read_bytes() == before
+
+
+@pytest.mark.parametrize(("priority", "expected"), [([], 2), ([1], 1), ([2], 2)])
+def test_failed_merge_rejoins_with_fresh_position_within_priority(tmp_path, priority, expected):
+    ctx = make_ctx(tmp_path, 1, 2)
+    first, second = turn.seat(ctx, 1, "main"), turn.seat(ctx, 2, "main")
+    orch_queue.set_global(ctx.store, priority)
+    turn.join(ctx, first, "a")
+    turn.join(ctx, second, "b")
+    ctx.sleep = lambda seconds: ctx.clock.__setitem__(0, ctx.clock[0] + timedelta(seconds=seconds))
+
+    turn.rejoin_after_failed_merge(1, ctx, first, RuntimeError("merge refused"))
+    assert not turn.holds_turn(ctx.store, first)
+    assert turn.holds_turn(ctx.store, second)
+    turn.join(ctx, first, "a")
+
+    assert [place.n for place in (first, second) if turn.holds_turn(ctx.store, place)] == [expected]
+    assert [row["event"] for row in rows(ctx)] == ["ready", "ready", "withdrawn", "ready"]
 
 
 def test_head_keeps_the_turn_through_its_merge_until_its_run_stops(tmp_path):
@@ -140,6 +197,7 @@ def test_wait_limit_releases_live_seat_before_reporting(tmp_path, monkeypatch, p
     ctx = make_ctx(tmp_path, 1, 2, 3)
     first, own, following = (turn.seat(ctx, n, "main") for n in (1, 2, 3))
     ctx.tracker = SimpleNamespace(add_labels=lambda *_: None, remove_labels=lambda *_: None)
+    monkeypatch.setattr(turn, "monotonic", lambda: 0.0)
     monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 30)
     if path == "queue":
         turn.join(ctx, first, "a")
@@ -178,6 +236,38 @@ def test_wait_limit_releases_live_seat_before_reporting(tmp_path, monkeypatch, p
     assert [row["event"] for row in rows(ctx) if row["n"] == 2] == ["ready", "withdrawn"]
     run = ctx.store.get_run(2)
     assert run.status == "running" and run.waited_seconds == 30
+    assert run.waiting_until is None and run.pause_regions == {}
+
+
+@pytest.mark.parametrize("path", ["queue", "retry"])
+def test_fast_polls_do_not_spend_merge_wait_limit(tmp_path, monkeypatch, path):
+    ctx = make_ctx(tmp_path, 1, 2)
+    own = turn.seat(ctx, 2, "main")
+    measured = [0.0]
+    sleeps = []
+    monkeypatch.setattr(turn, "monotonic", lambda: measured[0])
+    monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 60)
+    ctx.tracker = SimpleNamespace(add_labels=lambda *_: None, remove_labels=lambda *_: None)
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        assert len(sleeps) <= 150
+        measured[0] += 0.01
+        if len(sleeps) == 150:
+            ctx.store.finish_run(1, outcome="merged")
+
+    ctx.sleep = sleep
+    if path == "queue":
+        turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+        assert turn.await_turn(2, ctx, own, "b") == (True, None)
+    else:
+        for _ in range(150):
+            turn.join(ctx, own, "b")
+            turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"))
+    run = ctx.store.get_run(2)
+    assert len(sleeps) == run.merge_wait_polls == 150
+    assert run.merge_waited_seconds == pytest.approx(1.5)
+    assert run.status == "running" and run.waited_seconds == 0
     assert run.waiting_until is None and run.pause_regions == {}
 
 
@@ -270,12 +360,15 @@ def test_merge_wait_limit_preserves_pr_and_reports_elapsed_wait(run_case, monkey
         c.ctx.config = replace(c.ctx.config, review="fast")
     queue_behind_live_run(c, monkeypatch)
     monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 90)
+    measured = [0.0]
+    monkeypatch.setattr(turn, "monotonic", lambda: measured[0])
     sleeps, remaining = [], []
 
     def sleep(seconds):
         sleeps.append(seconds)
-        assert len(sleeps) <= 3, "The wait must end even when clock and sleep are frozen"
+        assert len(sleeps) <= 3, "The wait must end even when the run clock is frozen"
         remaining.append(runner._remaining(1, c.ctx))
+        measured[0] += seconds
         if advance_clock:
             c.now[0] += timedelta(seconds=seconds)
 
@@ -286,8 +379,9 @@ def test_merge_wait_limit_preserves_pr_and_reports_elapsed_wait(run_case, monkey
     assert sleeps == [30, 30, 30] and remaining == [60, 60, 60]
     run = StateStore(c.store.root).get_run(1)
     assert run.outcome == "merge-wait" and run.merge_wait_polls == 3
-    elapsed = 90 if advance_clock else 0
-    assert run.merge_waited_seconds == run.waited_seconds == elapsed
+    elapsed = 90
+    assert run.merge_waited_seconds == elapsed
+    assert run.waited_seconds == (elapsed if advance_clock else 0)
     assert run.waiting_until is None and run.pause_regions == {}
     assert f"after {elapsed}s (3 polls)" in run.detail
     requests = orch_inbox.requests(c.store, pending=True)

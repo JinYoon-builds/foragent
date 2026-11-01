@@ -189,3 +189,18 @@ def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path
         assert merge_round.is_file(), f"{name}: an unusable panel still counts as one review round"
         if name != "merge-raised":
             assert panel.merges == [], f"{name}: a failed reviewer must not reach the merge call"
+
+
+def test_merge_fail_blocks_once_with_merged_classes_and_no_raw_reviewer_text(git_history, tmp_path, monkeypatch):
+    merged = "src/app.py:1 — stale writer drops the receipt\n  class: stale-owner"
+    raw = [f"VERDICT: FAIL\nsrc/app.py:{k} — RAW-PANEL-{k} a delayed writer wins" for k in range(len(CHECKLIST))]
+    case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
+    panel = PanelExecutor(raw, merged="VERDICT: FAIL\n" + merged)
+    install_panel(case, panel)
+    outcome = run_issue(1, case.ctx)
+    assert len(panel.merges) == 1 and all(message in panel.merges[0]["prompt"] for message in raw)
+    assert outcome != "merged" and case.tracker.merged_prs == []
+    returns = [comment.body for comment in case.tracker.list_comments(1)
+               if comment.body.startswith("<!-- foragent:blocked")]
+    assert len(returns) == 1 and returns[0].count(merged) == 1
+    assert "RAW-PANEL-" not in returns[0], "The blocked return carries the merger's classes, not raw verdicts"
