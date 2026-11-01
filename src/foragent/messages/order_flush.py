@@ -1,0 +1,38 @@
+"""Explicit batch publication controls."""
+
+MESSAGES = {
+    "en": {
+        "order_flush_help": "Publish waiting orders and notes at the chosen boundary",
+        "order_flush_boundary_help": "Explicit boundary to publish",
+        "order_flush_replace_help": "Exact current-rule line to replace",
+        "order_flush_rule_invalid": "A rule note needs one replacement line and one new line; other notes cannot use --replace.",
+        "order_flush_rule_missing": "Rule note {id}: the supplied replacement must match exactly one current-rule line.",
+        "order_flush_conflict": "Selected entries supply conflicting contents for {path}.",
+        "order_flush_refused": "Order {id} refused: {error}",
+        "order_flush_branch": "Order flush must run on the base branch {branch}.",
+        "order_flush_incomplete": "An incomplete batch needs recovery before another batch can publish.",
+        "order_flush_failed": "Could not flush waiting work: {error}",
+        "order_flush_result": "Boundary {boundary}: {status}.",
+        "order_flush_order_row": "Order {id}: {status} for {boundary}.",
+        "order_flush_status_empty": "no waiting work",
+        "order_flush_status_published": "published",
+        "order_flush_status_waiting": "waiting",
+    },
+    "ko": {
+        "order_flush_help": "고른 경계에서 대기 주문과 노트를 함께 발행해요",
+        "order_flush_boundary_help": "발행할 경계를 명시해요",
+        "order_flush_replace_help": "대체할 현재 규칙 한 줄을 그대로 적어요",
+        "order_flush_rule_invalid": "규칙 노트는 대체할 한 줄과 새 한 줄이 필요해요. 다른 노트에는 --replace를 쓸 수 없어요.",
+        "order_flush_rule_missing": "규칙 노트 {id}: 대체할 내용이 현재 규칙 한 줄과 정확히 일치해야 해요.",
+        "order_flush_conflict": "선택한 항목들의 {path} 내용이 서로 달라요.",
+        "order_flush_refused": "주문 {id}를 발행할 수 없어요: {error}",
+        "order_flush_branch": "주문 묶음은 기본 브랜치 {branch}에서 발행해야 해요.",
+        "order_flush_incomplete": "끝나지 않은 묶음을 복구한 뒤 다음 묶음을 발행해야 해요.",
+        "order_flush_failed": "대기 작업을 발행하지 못했어요: {error}",
+        "order_flush_result": "경계 {boundary}: {status}.",
+        "order_flush_order_row": "주문 {id}: {boundary} 경계에서 {status}.",
+        "order_flush_status_empty": "대기 작업이 없어요",
+        "order_flush_status_published": "발행했어요",
+        "order_flush_status_waiting": "기다려요",
+    },
+}
