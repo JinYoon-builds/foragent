@@ -634,6 +634,11 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                  validate_plan(plan, root, config, retained_files=retained_files))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    if dry_run:
+        # A dry run only previews: read GitHub without recording any observation locally.
+        from foragent.tracker import RecordingTracker
+
+        tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
     keys = {item["key"] for item in plan["issues"]}
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
