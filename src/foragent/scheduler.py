@@ -90,6 +90,7 @@ def tick(ctx: TickContext) -> TickReport:
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            ctx._scope = None  # A new tick: cleanup never reuses an earlier tick's ownership decisions.
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
             with tick_processes(ctx.store) as snapshot:
                 cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
@@ -122,7 +123,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
 def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
-    ctx._scope = orch_scope.Scope(ctx)  # #1004: one identity read per tick, shared by recovery and admission.
+    orch_scope.renew(ctx)  # #1004: one identity read per tick, shared by recovery and admission.
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"

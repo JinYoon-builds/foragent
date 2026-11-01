@@ -82,6 +82,33 @@ def current_issue(ctx, number: int, tracker=None):
     return None if linked is None else tracker.get_issue(linked)
 
 
+def _target_issue(store, tracker, number: int):
+    """The issue a number outside the snapshot works, or None when it exists nowhere or works no issue."""
+    tracker = observe(tracker)
+    try:
+        issue = tracker.get_issue(number)
+    except TrackerError as exc:
+        if not exc.is_not_found:
+            raise
+        issue = None
+    if issue is not None and not getattr(issue, "is_pull_request", False):
+        return issue
+    try:
+        linked = _linked_issue(store, tracker, number)
+    except Unresolved:
+        if issue is None:
+            return None
+        raise
+    return None if linked is None else tracker.get_issue(linked)
+
+
+def _waiting(ctx) -> bool:
+    try:
+        return ctx.store.github_wait_until(ctx.now()) is not None
+    except AttributeError:
+        return False
+
+
 def _unreadable(ctx, number: int, exc: Exception) -> str:
     return text("ownership_unreadable", getattr(ctx.config, "language", "en"),
                 number=number, error=" ".join(str(exc).split())[:200])
@@ -96,6 +123,7 @@ class Scope:
 
     def __init__(self, ctx, issue=None, *, issues=None):
         self._ctx, self._login, self._read = ctx, None, False
+        self.reader = getattr(ctx, "tracker", None)
         self.entry = False
         self._issues, self._prs, self._decisions = None, {}, {}
         if issues is not None or issue is not None:
@@ -168,19 +196,46 @@ class Scope:
         if number not in self._decisions:
             issue = self._issues.get(number)
             if issue is None:
-                # No team setting preserves the existing singleton's unknown-target path.
-                self._decisions[number] = (None if getattr(self._ctx.config, "legacy_owner", None) is None else
-                                          _unreadable(self._ctx, number, Unresolved("issue absent from snapshot")))
-            elif singleton(issue, self._ctx.config):
-                self._decisions[number] = None
+                if _waiting(self._ctx):
+                    return None  # Only a queue entry can result; its replay judges it after the wait.
+                self._decisions[number] = self._outside_snapshot(number)
             else:
-                try:
-                    require_owned(issue, self._ctx.config, self.login())
-                except OwnershipError as exc:
-                    self._decisions[number] = str(exc)
-                else:
-                    self._decisions[number] = None
+                self._decisions[number] = self._judge(issue)
         return self._decisions[number]
+
+    def _outside_snapshot(self, number) -> str | None:
+        """A target no read has shown: nothing says it is ours, so read it once; absent is nobody's."""
+        if getattr(self._ctx.config, "legacy_owner", None) is not None:
+            return _unreadable(self._ctx, number, Unresolved("issue absent from snapshot"))
+        try:
+            issue = _target_issue(getattr(self._ctx, "store", None), self.reader, number)
+        except Unresolved as exc:
+            return _unreadable(self._ctx, number, exc)
+        except TrackerError:
+            raise  # No decision: the caller's effect fails like a failed send.
+        except Exception as exc:
+            return _unreadable(self._ctx, number, exc)
+        if issue is None:
+            return None
+        self._issues[issue.number] = issue
+        if issue.number != number:
+            self._prs[number] = issue.number
+        return self.for_number(issue.number) if issue.number != number else self._judge(issue)
+
+    def _judge(self, issue) -> str | None:
+        if singleton(issue, self._ctx.config):
+            return None
+        try:
+            require_owned(issue, self._ctx.config, self.login())
+        except OwnershipError as exc:
+            return str(exc)
+        return None
+
+    def unseen(self, number) -> bool:
+        """No team setting and no read has shown this number: entry has nothing to judge yet."""
+        self._capture()
+        return (getattr(self._ctx.config, "legacy_owner", None) is None
+                and number not in self._issues and number not in self._prs)
 
     def owns(self, issue) -> bool:
         return self.refusal(issue) is None
@@ -207,26 +262,21 @@ def stored_singleton(store, config, number: int) -> bool:
 
 def check(ctx, number: int, issue=None, *, read=True) -> str | None:
     """Check once at entry, before any shared effect, and retain that snapshot."""
-    if getattr(ctx, "_scope", None) is not None and ctx._scope.entry:
-        return ctx._scope.for_number(number)
     try:
-        if read and issue is None and not stored_singleton(ctx.store, ctx.config, number):
-            issue = current_issue(ctx, number)
-        ctx._scope = Scope(ctx, issue)
-        ctx._scope.entry = True
-        if issue is not None and issue.number != number:
-            ctx._scope._prs[number] = issue.number
+        if getattr(ctx, "_scope", None) is None or not ctx._scope.entry:
+            if read and issue is None and not stored_singleton(ctx.store, ctx.config, number):
+                issue = current_issue(ctx, number)
+            ctx._scope = Scope(ctx, issue)
+            ctx._scope.entry = True
+            if issue is not None and issue.number != number:
+                ctx._scope._prs[number] = issue.number
+        if issue is None and ctx._scope.unseen(number):
+            return None  # Entry adds no read here; the first shared effect needs the evidence.
         return ctx._scope.for_number(number)
     except Exception as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         return _unreadable(ctx, number, exc)
-
-
-def end_entry(ctx) -> None:
-    """An entry's read ends with its run or review; decisions stay, a later entry reads again."""
-    if getattr(ctx, "_scope", None) is not None:
-        ctx._scope.entry = False
 
 
 # Compatibility names for cleanup/publication callers: all use the same decision,
@@ -235,8 +285,41 @@ def current_refusal(ctx, number: int) -> str | None:
     return scope(ctx).for_number(number)
 
 
+def entry_issue(ctx, number: int):
+    """A run's entry read. An issue GitHub cannot find is no entry fact: the run's own reads report it."""
+    try:
+        return observe(ctx.tracker).get_issue(number)
+    except TrackerError as exc:
+        if exc.is_not_found and stored_singleton(ctx.store, ctx.config, number):
+            return None
+        raise
+
+
+def begin_entry(ctx, number: int) -> None:
+    """Until the entry read answers, a stored team row authorizes no shared effect."""
+    ctx._scope = Scope(ctx)
+    if not stored_singleton(ctx.store, ctx.config, number):
+        ctx._scope._decisions[number] = _unreadable(ctx, number, Unresolved("entry read did not finish"))
+
+
+def renew(ctx) -> None:
+    """A new snapshot within one tick, keeping the tick's one identity read."""
+    previous = getattr(ctx, "_scope", None)
+    ctx._scope = Scope(ctx)
+    if previous is not None and previous._read:
+        ctx._scope._login, ctx._scope._read = previous._login, True
+
+
+def end_entry(ctx) -> None:
+    """An entry's read ends with its run or review; decisions stay, a later entry reads again."""
+    if getattr(ctx, "_scope", None) is not None:
+        ctx._scope.entry = False
+
+
 def write_refusal(context, tracker, number: int) -> str | None:
-    return scope(context).for_number(number)
+    snapshot = scope(context)
+    snapshot.reader = tracker  # The tracker this write goes to shows the evidence it needs.
+    return snapshot.for_number(number)
 
 
 def may_write(ctx, number) -> bool:

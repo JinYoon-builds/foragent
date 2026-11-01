@@ -95,8 +95,8 @@ def _preserve_locked_implementation(
         return
     # An unverified WIP must not replace the head seen by an open PR's CI/review.
     if pr is None:
-        if not run_publish.orch_scope.may_write(ctx, n):  # Another person's issue now: no push (#1004).
-            run_publish._append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; the issue's owner changed")
+        if not run_publish.orch_scope.may_write(ctx, n):  # Another person's or an unconfirmed issue: no push (#1004).
+            run_publish._append(ctx.store.log_path(n), f"WIP kept on local branch {branch}; its owner is not this person")
             return
         if push_branch is not None:
             push_branch()
