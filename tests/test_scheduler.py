@@ -2196,7 +2196,8 @@ def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
     tick(ctx)
     mark_running(ctx)
     stale = ctx.tracker.get_issue(1)
-    store = StateStore(ctx.store.root)
+    # Local updates are observations at their call time, so they share the gate's clock.
+    store = StateStore(ctx.store.root, now=ctx.now)
     if change == "closed":
         store.update_local_issue(1, state="closed")
     else:
