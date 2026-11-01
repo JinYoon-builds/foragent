@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import shlex
+import subprocess
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -110,20 +111,28 @@ def _waiting_member(ctx: RunContext, n: int, head_sha: object) -> Member | None:
 
 
 def _combine(git: GitRepo, base_sha: str, group: list[Member], *, excluded=None) -> str:
-    """Apply each member's head over ``base_sha`` in order; a conflict raises GitError."""
+    """Apply the clean FIFO prefix; only merge-tree exit 1 ends it normally."""
     commit = base_sha
-    for index, member in enumerate(group):
+    for member in group:
         try:
             git._call(["cat-file", "-e", f"{member.head_sha}^{{commit}}"])
         except GitError:
             git.fetch("origin")
-        tree = git._call(["merge-tree", "--write-tree", commit, member.head_sha]).splitlines()[0].strip()
+        try:
+            tree = git._call(["merge-tree", "--write-tree", commit, member.head_sha]).splitlines()[0].strip()
+        except GitError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1:
+                break
+            raise
         title = f"Foragent group check: #{member.n} at {member.head_sha}"
-        if excluded is not None and index == len(group) - 1:
-            from foragent.ci_workflow import EXCLUSIONS_TRAILER
+        parent = commit
+        commit = git._call([*IDENTITY, "commit-tree", tree, "-p", parent, "-m", title]).strip()
+    if excluded is not None and commit != base_sha:
+        from foragent.ci_workflow import EXCLUSIONS_TRAILER
 
-            title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(sorted(set(excluded)), separators=(',', ':'))}"
-        commit = git._call([*IDENTITY, "commit-tree", tree, "-p", commit, "-m", title]).strip()
+        title += f"\n\n{EXCLUSIONS_TRAILER}: {json.dumps(sorted(set(excluded)), separators=(',', ':'))}"
+        commit = git._call([*IDENTITY, "commit-tree", tree, "-p", parent, "-m", title]).strip()
     return commit
 
 
@@ -161,7 +170,6 @@ def check(
     done.add(key)
     log = ctx.store.log_path(n)
     numbers = [member.n for member in group]
-    _append(log, f"\nGroup check of {numbers} on {base_sha}")
     results = []
     error = None
     baseline = None
@@ -176,6 +184,13 @@ def check(
         else:
             combined = _combine(ctx.git, base_sha, group)
         trees = _trees(ctx.git, base_sha, combined)
+        cut = (f" (cut at #{group[len(trees)].n}: merge-tree conflict)"
+               if len(trees) < len(group) else "")
+        group = group[:len(trees)]
+        numbers = [member.n for member in group]
+        _append(log, f"\nGroup check of {numbers} on {base_sha}{cut}")
+        if len(group) < 2:
+            return
         if ci:
             from foragent import run_group_ci
 
