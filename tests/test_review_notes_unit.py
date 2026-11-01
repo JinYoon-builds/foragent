@@ -49,7 +49,7 @@ def test_parse_review_keeps_notes_out_of_findings_and_an_all_note_fail_passes():
     (f"[]\nNOTE: {NOTE}", "PASS", ""),
 ])
 def test_code_review_notes_are_plain_lines_beside_findings(text, verdict, findings):
-    review = parse_code_review(json.dumps({"result": text}))
+    review = parse_code_review(json.dumps({"result": f"VERDICT: {verdict}\n{text}"}))
     assert (review.verdict, review.findings) == (verdict, findings)
 
 
@@ -88,7 +88,7 @@ def test_unusable_review_still_records_its_notes_and_hands_off_without_them(run_
 def test_native_code_review_notes_are_recorded(run_case):
     c = run_case
     enable_native_reviewer(c, [ExecResult(0, False, "", Path("unused"),
-                                          full_message=json.dumps({"result": f"(none)\nNOTE: {NOTE}"}))])
+                                          full_message=json.dumps({"result": f"VERDICT: PASS\n(none)\nNOTE: {NOTE}"}))])
     assert run_issue(1, c.ctx) == "merged"
     assert notes(c.store) == [NOTE]
 
