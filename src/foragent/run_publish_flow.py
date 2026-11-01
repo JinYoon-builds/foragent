@@ -157,7 +157,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     def reuse(target: str) -> bool:
         """Every base-move point asks this: does the joint pass verify this exact head on ``target``?"""
         nonlocal verified_base_sha, reused_base
-        if ctx.config.merge_group_max <= 1:
+        if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
             return False
         if (run_publish.enabled(ctx, attempt.target_branch)
                 and run_group_ci.evidence(attempt, verified_head_sha, target) is None):
