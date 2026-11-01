@@ -30,12 +30,11 @@ import os
 from pathlib import Path
 import re
 
-from foragent import capacity, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_owner as owners, order_prepare_setup as setup, order_scratch
 from foragent.config import Config
-from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
-from foragent.order_prepare_prompt import _references, writer_prompt
+from foragent.order_prepare_prompt import writer_prompt
 from foragent.state import StateStore
 from foragent.tracker import Tracker
 
@@ -169,7 +168,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
                  path: Path, record: dict, base: str, cycle: str, asked: str | None = None,
                  store: StateStore | None = None) -> None:
     """One writer attempt in a new scratch tree; the record is saved before and after the agent."""
-    from foragent.order_prepare_cycle import revision_notes, same_requirement
+    from foragent.order_prepare_cycle import behaviour, revision_notes, same_requirement
 
     entries = record["issues"]
     entry = entries.setdefault(item["key"], {"key": item["key"], "attempts": []})
@@ -185,8 +184,8 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     for stale in ("coverage", "red"):
         entry.pop(stale, None)
     entry.update(status="writing_tests", phase="writing_tests", questions=[], reason=None, cycle=cycle,
-                 requirement=asked,
-                 updated_at=facts["started_at"], base_revision=base, scratch=str(tree))
+                 requirement=asked, updated_at=facts["started_at"], base_revision=base, scratch=str(tree),
+                 behaviour=behaviour(item), published=setup.published_digest(plan, root, config))
     _write(path, record)
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
     failure = {"status": "interrupted", "reason": say("prepare_stopped")}
@@ -194,7 +193,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     try:
         # One resolution feeds the tree, the setup, the prompt and the permissions.
         lane_config, context = setup.lane_context(plan, item, config, root)
-        context.files.update(_references(plan, item))
+        context.files.update(setup.scratch_files(plan, item, root, config, record))
         # Writes must never reach the checkout, its Git directory or this command's state.
         protected = order_scratch.protected(git, root, path.parent.parent)
         manifest = order_scratch.build(git, base, tree, context)
@@ -220,7 +219,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             # The writer is one agent workload: it waits for the shared machine slot like preread.
             with capacity.hold_workload(store, config, kind="prepare", role=f"{item['key']} writer"):
                 admitted = True
-                result = executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
+                result = executors.executor_for(start.executor).run(worktree=tree, prompt=prompt, model=start.model,
                                                           timeout_s=WRITER_TIMEOUT_S, log_path=log, **options)
         except TimeoutError as exc:
             if admitted:
@@ -282,11 +281,17 @@ def prepare(plan: dict, root: Path, config: Config, git: GitRepo, store: StateSt
         if not owned or not owners.take(record, config):
             busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_busy", config.language)}
             return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
-        _write(path, record)
-        for item in items:
-            if "statements" in item:
+        statement = batch = [item for item in items if "statements" in item]
+        if not owners.claim(path.parent, record, [item["key"] for item in statement], lambda: _write(path, record)):
+            busy = {"status": "waiting", "phase": "writing_tests", "reason": text("prepare_publishing", config.language)}
+            return [owners.row(item["key"], busy if "statements" in item else legacy, config) for item in items]
+        for _ in range(2):
+            for item in batch:
                 # Main is read again for each issue: an earlier issue's agents may have run for long.
                 base = order_scratch.base_revision(git, config.base_branch)
                 prepare_issue(plan, item, root, config, git, path, record, base, plan_path, store)
+            # Issues reviewed before a later one's tests were written are reviewed again beside them.
+            batch = [item for item in statement if (record["issues"].get(item["key"]) or {}).get("status") == "reviewed"
+                     and record["issues"][item["key"]].get("others") != setup.others_digest(plan, record, item)]
         return [owners.row(item["key"], record["issues"].get(item["key"]) if "statements" in item else legacy,
                            config) for item in items]
