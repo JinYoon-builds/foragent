@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from collections import Counter
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
-from foragent import capacity, resource_sample
+from foragent import capacity, capacity_sessions, resource_sample
 from foragent.config import Config, lane_executors
 from foragent.i18n import text
 from foragent.state import Run, StateStore
@@ -16,6 +18,7 @@ from foragent.state import Run, StateStore
 
 SLOT_STORES = "slot-stores"
 SAMPLES = "resource-samples"
+MERGE_STORES = "merge-stores"
 
 
 def freeze_slot_store(store: StateStore, source: Path, into: Path, copy: Callable[[Path, Path], None]) -> None:
@@ -23,6 +26,71 @@ def freeze_slot_store(store: StateStore, source: Path, into: Path, copy: Callabl
     if source != store.root and source.parent == capacity.machine_root():
         for path in (source / "runs").glob("*.json"):
             copy(path, into / SLOT_STORES / source.name / "runs" / path.name)
+
+
+def merge_store_roots(store: StateStore) -> set[Path]:
+    """The other stores the ETA's machine-wide merge samples read (progress.machine_stores)."""
+    try:
+        return {path for path in capacity.machine_root().iterdir() if path != store.root and path.is_dir()
+                and ((path / "runs.jsonl").exists() or (path / "issues.json").exists())}
+    except OSError:
+        return set()
+
+
+def copy_reviews(source: Path, target: Path) -> None:
+    """Review artifacts keep their modification time: it places each in its execution."""
+    for path in (source / "runs").glob("issue-*/review-*.txt"):
+        (target / "runs" / path.parent.name).mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(path, target / "runs" / path.parent.name / path.name)
+        except FileNotFoundError:
+            pass
+
+
+def freeze_merge_store(store: StateStore, source: Path, into: Path, copy: Callable[[Path, Path], None]) -> None:
+    """Copy what another store's merge samples and their review rounds read."""
+    if source not in merge_store_roots(store):
+        return
+    target = into / MERGE_STORES / source.name
+    for name in ("issues.json", "runs.jsonl", "orch-events.jsonl"):
+        copy(source / name, target / name)
+    for path in (source / "runs").glob("*.json"):
+        copy(path, target / "runs" / path.name)
+    copy_reviews(source, target)
+
+
+def merge_stores(machine: dict[str, Any], now: datetime) -> list[StateStore]:
+    """The frozen copies freeze_merge_store made."""
+    try:
+        roots = sorted(path for path in (machine["merge_stores"]).iterdir() if path.is_dir())
+    except (KeyError, OSError):
+        return []
+    return [StateStore(root, now=lambda: now) for root in roots]
+
+
+def probe_workloads(frozen: Path, probe: Callable[[int], bool]) -> dict[int, bool]:
+    """Whether each frozen workload's process lives, read while its record cannot change."""
+    return {workload.pid: probe(workload.pid) for root in frozen.iterdir() if root.is_dir()
+            for workload in capacity_sessions.read(root)}
+
+
+def workload_slots(root: Path, counted: list[Run], starts: list[int], alive: dict[int, bool]) -> int:
+    """Slots a store's workloads hold beyond its runs and reservations: capacity._store_scan's rule, unsignalled."""
+    by_pid = Counter(run.pid for run in counted if run.pid is not None)
+    by_issue = {run.number for run in counted if run.pid is None} | set(starts)
+    live = [workload for workload in capacity_sessions.read(root) if alive.get(workload.pid, True)]
+    slots = 0
+    # A run or reservation already holds one slot for its agent's first workload.
+    for workload in sorted(live, key=lambda item: item.kind != capacity.RUN_KIND):
+        if by_pid[workload.pid] > 0:
+            by_pid[workload.pid] -= 1
+        elif workload.issue is not None and workload.issue in by_issue:
+            by_issue.discard(workload.issue)
+        else:
+            slots += 1
+            if workload.kind == capacity.RUN_KIND:
+                by_pid[workload.pid] += 1
+    return slots
 
 
 def freeze_sample(into: Path, copy: Callable[[Path, Path], None]) -> tuple[dict[str, Any] | None, tuple[str, float]]:
