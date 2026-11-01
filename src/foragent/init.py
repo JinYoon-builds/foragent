@@ -497,6 +497,16 @@ def _read_json_object(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _read_fa_allow_settings(path: Path) -> dict | None:
+    settings = _read_json_object(path)
+    if settings is None:
+        return None
+    permissions = settings.get("permissions", {})
+    if not isinstance(permissions, dict) or not isinstance(permissions.get("allow", []), list):
+        return None
+    return settings
+
+
 def _write_json_atomic(path: Path, value: dict) -> None:
     import tempfile
 
@@ -555,14 +565,17 @@ def _has_claude_settings(root: Path) -> bool:
     return any((root / ".claude" / name).exists() for name in ("settings.json", "settings.local.json"))
 
 
-def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_settings: bool = True) -> str:
+def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_settings: bool = True,
+                   answer: str | None = None) -> str:
     """Ask once whether Claude may run fa commands in this project; remember either answer.
 
     Returns "added", "declined", "present" (the rule was already there), "kept" (already
     decided), "busy" (another init is deciding for this project now), "skipped" (the project
     has no Claude settings file yet, so the fa-init skill asks using the summary note;
-    pass ``require_settings=False`` when the person already gave an answer),
-    "unanswered" (no terminal) or "unreadable" (settings are not a JSON object). Raises OSError when a file
+    pass ``require_settings=False`` to bypass that settings-file condition),
+    "unanswered" (no terminal) or "unreadable" (invalid local settings). An explicit
+    ``answer`` revises the remembered decision without asking; declining preserves existing settings.
+    Raises OSError when a file
     cannot be written; then nothing is remembered.
 
     One per-project lock covers the whole check, prompt and write, so two inits of the same
@@ -573,7 +586,7 @@ def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_set
 
     key = str(root.resolve())
     # New projects defer the question to the skill without creating state or lock files.
-    if require_settings and not _has_claude_settings(root):
+    if answer is None and require_settings and not _has_claude_settings(root):
         return "kept" if _fa_allow_decided(key) else "skipped"
     claude = root / ".claude"
     local_file = claude / "settings.local.json"
@@ -587,31 +600,29 @@ def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_set
     with _flock(project_lock, wait=False) as held:
         if not held:
             return "busy"
-        if _fa_allow_decided(key):
-            return "kept"
-        if rule_present():
-            _remember_fa_allow(key, "accepted")
-            return "present"
-        if _read_json_object(local_file) is None:
-            return "unreadable"
-        try:
-            answer = ask(FA_ALLOW_PROMPT)
-        except (EOFError, OSError):
-            return "unanswered"
+        if answer is None:
+            if _fa_allow_decided(key):
+                return "kept"
+            if rule_present():
+                _remember_fa_allow(key, "accepted")
+                return "present"
+            if _read_fa_allow_settings(local_file) is None:
+                return "unreadable"
+            try:
+                answer = ask(FA_ALLOW_PROMPT)
+            except (EOFError, OSError):
+                return "unanswered"
         if answer.strip().lower() not in {"y", "yes"}:
             _remember_fa_allow(key, "declined")
             return "declined"
         if rule_present():  # Added by hand while the prompt waited: do not add it twice.
             _remember_fa_allow(key, "accepted")
             return "present"
-        local = _read_json_object(local_file)
+        local = _read_fa_allow_settings(local_file)
         if local is None:
             return "unreadable"
-        permissions = local.get("permissions")
-        if not isinstance(permissions, dict):
-            permissions = {}
-        allow = permissions.get("allow")
-        allow = list(allow) if isinstance(allow, list) else []
+        permissions = local.get("permissions", {})
+        allow = permissions.get("allow", [])
         local["permissions"] = {**permissions, "allow": [*allow, FA_ALLOW_RULE]}
         # Settings first: a recorded acceptance without the rule would never be offered again.
         _write_json_atomic(local_file, local)

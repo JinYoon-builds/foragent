@@ -57,21 +57,22 @@ def _offer_fa_allow(root, answer: str | None) -> None:
     from foragent.init import FA_ALLOW_RULE, offer_fa_allow
 
     try:
-        outcome = offer_fa_allow(root, input if answer is None else lambda _prompt: answer,
-                                 require_settings=answer is None)
+        outcome = offer_fa_allow(root, input, answer=answer)
     except OSError as exc:
         print(f"FA commands: not allowed ({exc}); fa init will ask again next time.")
         return
     if outcome == "added":
         print(f"FA commands: allowed in this project ({FA_ALLOW_RULE} in .claude/settings.local.json).")
+    elif outcome == "present" and answer is not None:
+        print(f"FA commands: already allowed in this project ({FA_ALLOW_RULE}).")
     elif outcome == "declined":
-        print("FA commands: not allowed; Claude keeps asking per command and fa init will not ask again.")
+        print("FA commands: permission offer declined; existing Claude settings are unchanged; fa init will not ask again.")
     elif outcome == "unanswered":
         print("FA commands: not asked (no terminal); rerun with --fa-allow yes|no.")
     elif outcome == "busy":
         print("FA commands: not asked; another fa init is asking about this project now.")
     elif outcome == "unreadable":
-        print("FA commands: not asked (.claude/settings.local.json is not a JSON object).")
+        print("FA commands: not added (.claude/settings.local.json is unreadable or has invalid permissions).")
 
 
 def _offer_upstream_reports(root) -> None:

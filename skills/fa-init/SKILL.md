@@ -56,7 +56,9 @@ description: Set up a project folder for Foragent.
    Use no recommended default. Then run `fa init --fa-allow yes` or
    `fa init --fa-allow no` with their explicit answer. If they have not answered,
    leave it undecided and ask again on the next setup run. Either answer is
-   remembered for this project, so skip a decided offer. A dry run neither asks
+   remembered for this project, so skip a decided offer. If the person revises
+   their answer, run the same flag with that explicit answer; No leaves existing
+   Claude settings and rules unchanged. A dry run neither asks
    nor grants, and must never be followed by an automatic grant.
 
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for

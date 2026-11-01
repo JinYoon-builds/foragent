@@ -1608,3 +1608,75 @@ def test_fa_allow_summary_reuses_decision_for_git_root_alias(setup, tmp_path, mo
     assert not local.exists(), "re-init must not reinstall a removed grant"
     assert offer_fa_allow(alias, never) == offer_fa_allow(root, never) == "kept"
     assert json.loads(fa_allow_record_path().read_text()) == expected
+
+
+@pytest.mark.parametrize("previous", ["yes", "no"])
+@pytest.mark.parametrize("answer", ["yes", "no"])
+@pytest.mark.parametrize("settings_exist", [True, False])
+def test_fa_allow_explicit_answer_overrides_remembered_answer(tmp_path, monkeypatch, capsys,
+                                                            previous, answer, settings_exist):
+    from foragent import init
+    from foragent.commands import init as command
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    local = root / ".claude/settings.local.json"
+    assert init.offer_fa_allow(root, lambda prompt: previous) == ("added" if previous == "yes" else "declined")
+    if settings_exist:
+        settings = json.loads(local.read_text())
+        settings["env"] = {"KEEP": "unchanged"}
+        local.write_text(json.dumps(settings))
+    else:
+        local.unlink()
+    before = local.read_bytes() if local.exists() else None
+    writes = []
+    write_json = init._write_json_atomic
+
+    def record_write(path, value):
+        writes.append(path)
+        write_json(path, value)
+
+    monkeypatch.setattr(init, "_write_json_atomic", record_write)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("explicit answer must not prompt"))
+    for _ in range(2):
+        command._offer_fa_allow(root, answer)
+        output = capsys.readouterr().out
+        assert ("allowed in this project" if answer == "yes" else "declined") in output
+        assert json.loads(init.fa_allow_record_path().read_text()) == {
+            str(root.resolve()): "accepted" if answer == "yes" else "declined"}
+    if answer == "yes":
+        expected = json.loads(before) if before is not None else {}
+        permissions = expected.setdefault("permissions", {})
+        permissions["allow"] = ["Bash(fa:*)"]
+        assert json.loads(local.read_text()) == expected
+        assert writes.count(local) == (0 if previous == "yes" and settings_exist else 1)
+    else:
+        assert (local.read_bytes() if local.exists() else None) == before
+        assert writes.count(local) == 0
+    assert init.offer_fa_allow(root, lambda prompt: pytest.fail("asked again")) == "kept"
+
+
+@pytest.mark.parametrize("settings", [
+    {"permissions": value} for value in (None, "keep", [], 1, False)
+] + [
+    {"permissions": {"allow": value, "deny": ["Read(.env)"]}}
+    for value in (None, "Read(keep/**)", {}, 1, False)
+])
+@pytest.mark.parametrize("edited_during_prompt", [False, True])
+def test_fa_allow_preserves_invalid_nested_settings(tmp_path, monkeypatch, settings, edited_during_prompt):
+    from foragent.init import fa_allow_record_path, offer_fa_allow
+
+    root = _fa_allow_env(tmp_path, monkeypatch)
+    local = root / ".claude/settings.local.json"
+    original = json.dumps({**settings, "env": {"KEEP": "unchanged"}}, indent=4) + "\n"
+    if not edited_during_prompt:
+        local.write_text(original)
+
+    def answer(prompt):
+        if not edited_during_prompt:
+            pytest.fail("invalid settings must be reported before asking")
+        local.write_text(original)
+        return "yes"
+
+    assert offer_fa_allow(root, answer) == "unreadable"
+    assert local.read_text() == original
+    assert not fa_allow_record_path().exists()
