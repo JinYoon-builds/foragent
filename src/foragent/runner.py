@@ -351,7 +351,7 @@ def review_only(
         # The shared machine budget admits this review before any label or run-record change; a
         # start the tick reserved reuses its slot. Once the run records this pid, the run holds it.
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
-                                                       kind="review", issue=n))
+                                                       kind="review", issue=n, now=ctx.now))
         issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
@@ -437,7 +437,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
     """
     with ExitStack() as admission:
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
-                                                       kind=capacity.RUN_KIND, issue=n))
+                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         return _run_issue(n, ctx, admission)
 
 

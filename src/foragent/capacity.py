@@ -785,7 +785,7 @@ _ADMISSION = threading.Lock()
 
 def _acquire_workload(
     store: StateStore, record: Path, language: str, wait_s: float, deadline: float, *,
-    kind: str, issue: int | None, role: str | None,
+    kind: str, issue: int | None, role: str | None, now: Callable[[], datetime],
 ) -> None:
     """Write this process's workload ``record`` once a slot is free, by the monotonic ``deadline``.
 
@@ -803,8 +803,7 @@ def _acquire_workload(
         # flock as another process's.
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
             # One scan decides admission: reuse is matched by identity, never by comparing counts.
-            # The store's clock wrote its run and start timestamps, so it alone judges their grace.
-            holders, reused = _machine_scan(store, store._now(), live=True, candidate=candidate)
+            holders, reused = _machine_scan(store, now(), live=True, candidate=candidate)
             budget = workload_budget(store)
             reason = None if reused else sensed or ("full" if len(holders) >= budget else None)
             if locked and reason is None:
@@ -854,7 +853,7 @@ def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: f
             reason = "tests"
         else:
             reason = "busy"  # A slot is free; another process held the slot guard lock.
-        return reason, machine_holders(store, store._now(), live=True), budget, used
+        return reason, machine_holders(store, datetime.now(UTC), live=True), budget, used
 
     def waiting() -> None:
         nonlocal shown
@@ -879,8 +878,12 @@ def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: f
 def hold_workload(
     store: StateStore, config: Any, *, tests: bool = False, wait_s: float = 600,
     kind: str = "workload", issue: int | None = None, role: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Iterator[None]:
     """Hold one machine slot for one agent workload; ``tests`` also holds a test slot.
+
+    ``now`` is the caller's clock for judging reservation grace: a runner's own context
+    wrote its reservation, so it passes that context's clock.
 
     The slot is the shared gate budget: the same AIMD value, machine.yml ceiling,
     load and critical-memory holds, and the same count of live runs across
@@ -901,7 +904,7 @@ def hold_workload(
     record = capacity_sessions.new_path(store, holder[0]) if held is None or not _held_here(held[0]) else None
     try:
         if record is not None:
-            _acquire_workload(store, record, language, wait_s, deadline, kind=kind, issue=issue, role=role)
+            _acquire_workload(store, record, language, wait_s, deadline, kind=kind, issue=issue, role=role, now=now)
             token = _WORKLOAD.set((holder, record))
         if tests and not _held_here(_WORKLOAD_TESTS.get()):
             tests_token = None

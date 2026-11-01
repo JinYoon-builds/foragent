@@ -205,7 +205,8 @@ def test_direct_admission_judges_a_reservation_by_the_clock_that_wrote_it(
     entered = []
 
     def admit():
-        with capacity.hold_workload(case.store, case.config, wait_s=0, kind=capacity.RUN_KIND, issue=1):
+        with capacity.hold_workload(case.store, case.config, wait_s=0, kind=capacity.RUN_KIND, issue=1,
+                                    now=case.ctx.now):
             entered.append(capacity.machine_runs(case.store, case.clock[0]))
 
     if waits:
@@ -216,3 +217,46 @@ def test_direct_admission_judges_a_reservation_by_the_clock_that_wrote_it(
         admit()
         assert entered == [1]  # The reservation and its runner are one slot.
     assert list(capacity_sessions.read(case.store.root)) == []
+
+
+def test_other_workloads_judge_a_reservation_by_their_own_clock(git_history, tmp_path, monkeypatch):
+    """Only the caller that passes a clock uses it; the store's clock does not decide for everyone."""
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.0))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    (case.store.root.parent / "machine.yml").write_text("max_parallel: 1\n")
+    entered = []
+    # Days past the fixture clock on the wall clock, so the reservation is a leftover here.
+    with capacity.hold_workload(case.store, case.config, wait_s=0, kind="perspective", role="skeptic"):
+        entered.append("wall")
+    with pytest.raises(TimeoutError):
+        with capacity.hold_workload(case.store, case.config, wait_s=0, kind="perspective", role="skeptic",
+                                    now=case.ctx.now):
+            entered.append("store")
+    assert entered == ["wall"]
+
+
+@pytest.mark.parametrize("entry", ["run", "review"])
+def test_runner_entries_admit_their_reservation_by_the_context_clock(git_history, tmp_path, monkeypatch, entry):
+    """Overload holds new work, not a start this runner's own context reserved moments ago."""
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", capacity.OVERLOAD_LOAD))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+
+    def no_wait(key, language, reason, *args, **values):
+        raise AssertionError(f"admission waited: {key} {reason}")
+
+    monkeypatch.setattr(capacity, "_workload_text", no_wait)
+    if entry == "review":
+        case.store.finish_run(1, "error")
+        case.tracker.remove_labels(1, ["running"])
+        case.store.prepare_run_start(1)
+        seen = []
+        monkeypatch.setattr(runner, "_review_only", lambda n, ctx, worktree, head: seen.append(n) or "review-failed")
+        assert runner.review_only(1, case.ctx) == "review-failed"
+        assert seen == [1]
+    else:
+        assert runner.run_issue(1, case.ctx) == "merged", case.store.log_path(1).read_text()
+
