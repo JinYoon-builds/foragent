@@ -52,8 +52,14 @@ def set_global(store: StateStore, numbers: list[int]) -> list[int]:
     """Replace the cross-lane priority list; an empty list removes it."""
     order = list(dict.fromkeys(int(n) for n in numbers))
     with store._state_lock():
+        try:
+            changed = get_global(store) != order
+        except (OSError, TypeError, ValueError):
+            changed = True  # An unreadable list is replaced; what it held is unknown.
         if order:
             store._write_json(_global_path(store), order)
         else:
             _global_path(store).unlink(missing_ok=True)
+        if changed:
+            store.record_flow("priority", issues=order)
     return order
