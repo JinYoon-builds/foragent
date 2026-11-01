@@ -140,16 +140,15 @@ def stall_store(tmp_path, monkeypatch):
     root.mkdir()
     (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
     now = datetime(2026, 10, 30, 12, tzinfo=UTC)
-
-    class FixedClock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return now
-
     from foragent import statusline
 
-    # The prompt hook reads the wall clock; pin it to the store's clock so time windows
-    # such as the 24-hour notice window do not expire as real days pass.
+    class FixedClock(datetime):
+        """The prompt hook reads the wall clock; pin it so a fixed-date store stays inside its windows."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+
     monkeypatch.setattr(statusline, "datetime", FixedClock)
     return root, StateStore.for_repo("offline/stall", now=lambda: now), now
 

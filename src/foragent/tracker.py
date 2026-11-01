@@ -851,6 +851,9 @@ class FakeTracker:
         self.labels.update((spec.name, spec) for spec in specs)
 
     def close_issue(self, n: int, comment: str | None = None) -> None:
+        self._close(n, comment)
+
+    def _close(self, n: int, comment: str | None) -> None:
         if comment is not None:
             self.comment(n, comment)
         self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
@@ -876,7 +879,7 @@ class FakeTracker:
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
 
     def close_pr(self, pr: int, comment: str | None = None) -> None:
-        self.close_issue(pr, comment)
+        self._close(pr, comment)
         self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:

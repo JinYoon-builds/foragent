@@ -243,17 +243,23 @@ def test_ci_preparation_fault_records_mode_and_never_regroups_its_members(ci_cas
 
 
 @pytest.mark.parametrize("excluded", [None, [], ["pending-b.py", "pending-a.py", "pending-b.py"]])
-def test_combined_ci_commit_carries_the_exclusions_protocol_without_changing_trees(git_history, excluded):
+@pytest.mark.parametrize("cut", [False, True])
+def test_combined_ci_commit_carries_the_exclusions_protocol_without_changing_trees(git_history, excluded, cut):
     history = git_history
     base = history.tip
     history.update({"member-5.py": "VALUE = 5\n"})
     head5 = history.tip
     history.update({"member-1.py": "VALUE = 1\n"})
     head1 = history.tip
+    members = [run_group_check.Member(5, head5, ()), run_group_check.Member(1, head1, ())]
+    if cut:
+        history.tip = base
+        git_command(history.origin, "update-ref", "refs/heads/main", base)
+        history.update({"member-5.py": "CONFLICT = True\n"})
+        members.extend([run_group_check.Member(4, history.tip, ()),
+                        run_group_check.Member(7, "must-not-be-read", ())])
     git = GitRepo(history.origin)
-    combined = run_group_check._combine(git, base, [
-        run_group_check.Member(5, head5, ()), run_group_check.Member(1, head1, ()),
-    ], excluded=excluded)
+    combined = run_group_check._combine(git, base, members, excluded=excluded)
     trees = run_group_check._trees(git, base, combined)
     assert len(trees) == 2
     assert trees[-1] == git_command(history.origin, "rev-parse", f"{head1}^{{tree}}")

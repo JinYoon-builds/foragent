@@ -53,6 +53,7 @@ def joint_ctx(tmp_path, monkeypatch, check, baseline=BASELINE):
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: baseline)
     monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
+    monkeypatch.setattr(group, "_trees", lambda *args: ["tree-5", "tree-1"])
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
     monkeypatch.setattr(runner, "_check", check)
     ctx.git = SimpleNamespace(add_detached_worktree=lambda path, ref: None, remove_worktree=lambda path: None,
