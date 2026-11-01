@@ -11,12 +11,15 @@ the published bytes; this is only the approval lock's input check.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 
 from foragent.config import Config
+from foragent.decisions import PARENT
 from foragent.git import GitRepo
 from foragent.i18n import text
+from foragent.issue import has_behaviour
 
 
 def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
@@ -29,9 +32,6 @@ def statement_items(plan: dict, by_number: dict, config: Config) -> list[dict]:
     return items
 
 
-_BEHAVIOUR = re.compile(r"^## Behaviour$", re.MULTILINE)
-
-
 def _record(plan: dict, repo: str | None) -> dict:
     """This order's preparation record (issue key -> entry), read only; empty when none exists."""
     from foragent.order_prepare import _read, _record_path
@@ -42,21 +42,70 @@ def _record(plan: dict, repo: str | None) -> dict:
     return _read(_record_path(StateStore.for_repo(repo), plan), plan)["issues"]
 
 
+def _taken(record: dict) -> set[str]:
+    """The keys a preparation record holds: those it has started on and those it claimed at its start."""
+    claimed = record.get("claimed")
+    return set(record["issues"]) | (set(claimed) if isinstance(claimed, list) else set())
+
+
+def _prepared_numbers(repo: str | None, listed) -> set[int]:
+    """Existing issues any order's preparation took on the statement route, whatever its outcome.
+
+    Every order's record counts because a new plan id must not leave an issue's history behind: an
+    edit is recorded as ``#N``, and a child under its key, which its order's parent maps to a number.
+    """
+    from foragent.order_prepare import _read, _record_path
+    from foragent.state import StateStore
+
+    if not repo:
+        return set()
+    store = StateStore.for_repo(repo)
+    numbers = set()
+    for path in (store.root / "prepare").glob("*.json"):
+        numbers |= {int(key[1:]) for key in _taken(_read(path, {"id": path.stem}))
+                    if re.fullmatch(r"#[1-9][0-9]*", key)}
+    for issue in listed:
+        for identity, mapping, _acceptance in PARENT.findall(issue.body)[-1:]:
+            record = _taken(_read(_record_path(store, {"id": identity}), {"id": identity}))
+            try:
+                numbers |= {number for key, number in json.loads(mapping).items()
+                            if key in record and type(number) is int}
+            except (ValueError, AttributeError):
+                continue  # A malformed map names no issue; publication refuses its own order's.
+    return numbers
+
+
+def _taken_here(plan: dict, repo: str | None) -> set[str]:
+    from foragent.order_prepare import _read, _record_path
+    from foragent.state import StateStore
+
+    return _taken(_read(_record_path(StateStore.for_repo(repo), plan), plan)) if repo else set()
+
+
 def require_route_kept(plan: dict, config: Config, repo: str | None, bodies: dict[str, str],
-                       action: str) -> None:
+                       action: str, *, numbers: dict[str, int] | None = None, listed=()) -> None:
     """Refuse an issue or edit that left the statement route after taking it.
 
     The ``statements`` field selects the route and the route is kept once taken: an issue this order
-    prepared (any outcome, a question too) or an existing issue published with a Behaviour section
-    cannot drop its statements to fall back to a clean legacy preread. ``bodies`` maps issue keys
-    (``#N`` for edits) to the current body of the issue they publish onto.
+    prepared (any outcome, a question too), an existing issue any order prepared, or an existing issue
+    published with a Behaviour section cannot drop its statements to fall back to a clean legacy
+    preread. ``bodies`` maps issue keys (``#N`` for edits) to the current body of the issue they
+    publish onto, ``numbers`` the same keys to issue numbers, and ``listed`` holds the issues whose
+    parent maps name each order's children. A key new to a new order is a new issue, not a return.
+
+    Preparation claims its keys under the publication lock before any agent starts, so a check made
+    under that lock cannot miss a preparation already under way; publication checks again there.
     """
     from foragent.order import PlanError
 
-    record = _record(plan, repo)
     keys = [item["key"] for item in plan["issues"] if "statements" not in item]
     keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" not in item]
-    kept = [key for key in keys if key in record or _BEHAVIOUR.search(bodies.get(key) or "")]
+    if not keys:
+        return
+    record, numbers = _taken_here(plan, repo), numbers or {}
+    prepared = _prepared_numbers(repo, listed) if any(key in numbers for key in keys) else set()
+    kept = [key for key in keys if key in record or numbers.get(key) in prepared
+            or has_behaviour(bodies.get(key) or "")]
     if kept:
         raise PlanError(text("reviewed_route_kept", _language(config), action=action, keys=", ".join(kept)))
 

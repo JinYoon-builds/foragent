@@ -666,6 +666,13 @@ class _Publication:
         return {number for key, number in self.mapping.items() if key in self.keys} | self.edit_numbers
 
 
+def _require_route(plan: dict, config: Config, repo: str, mapping: dict[str, int], by_number: dict) -> None:
+    targets = {**mapping, **{f"#{item['number']}": item["number"] for item in plan.get("edits", [])}}
+    order_reviewed.require_route_kept(
+        plan, config, repo, {key: by_number[number].body for key, number in targets.items() if number in by_number},
+        "publish", numbers=targets, listed=by_number.values())
+
+
 def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -767,10 +774,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                             by_number, edit_numbers, unconfirmed, rows, None, {})
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
-    order_reviewed.require_route_kept(plan, config, repo, {
-        **{key: by_number[number].body for key, number in mapping.items() if number in by_number},
-        **{f"#{item['number']}": by_number[item["number"]].body for item in plan.get("edits", [])},
-    }, "publish")
+    _require_route(plan, config, repo, mapping, by_number)
     # The evidence is checked against ``files``, the bytes read once above and written below.
     reviewed_bases = require_reviewed_tests(
         plan, root, config, repo, order_reviewed.statement_items(plan, by_number, config), files=files) or {}
@@ -828,11 +832,19 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     owner = publication.owner
     with git.publish_lock():
         git.update_base(config.base_branch)
-        if publication.reviewed_bases:
+        # A preparation that started or finished since the first checks is visible now, and none can
+        # start before this publication is pushed: it claims its issues under this lock.
+        listed = tracker.list_issues()
+        current = {**publication.by_number, **{issue.number: issue for issue in listed}}
+        _require_route(plan, config, repo, publication.mapping, current)
+        items = order_reviewed.statement_items(plan, current, config)
+        reviewed = require_reviewed_tests(plan, root, config, repo, items, files=publication.files) or {}
+        if reviewed:
+            order_reviewed.require_reviewed_bytes(git, config, items, reviewed, publication.files)
             # Refreshed HEAD is the actual landing commit, including local commits.
-            order_reviewed.require_tested_base(git, config, publication.reviewed_bases,
+            order_reviewed.require_tested_base(git, config, reviewed,
                                                order_reviewed.landing(git, config.base_branch, refreshed=True))
-        affected = _affected_owners(tracker.list_issues(), publication.own, publication.files,
+        affected = _affected_owners(listed, publication.own, publication.files,
                                     repo, config, lambda: git, fetch=False)
         if affected:
             raise PlanError(text("order_locks_refused", config.language,
@@ -1304,16 +1316,18 @@ def preread(plan: dict, root: Path, config: Config,
     # Statement issues are prepared and reviewed instead; preread reads only the legacy issues.
     items = [item for item in plan["issues"] if "statements" not in item]
     edits = [item for item in plan.get("edits", []) if "statements" not in item]
-    existing = {}
+    existing, listed = {}, []
     if edits:
         if tracker is None:
             raise PlanError("prereading edits needs the tracker for the existing issues")
         source = tracker()
         existing = {item["number"]: source.get_issue(item["number"]) for item in edits}
+        listed = source.list_issues()
         items += [edit_view(item, existing[item["number"]], config) for item in edits]
     # An issue that took the statement route keeps it: no legacy evidence is made for it.
     order_reviewed.require_route_kept(plan, config, repo or config.repo,
-                                      {f"#{n}": issue.body for n, issue in existing.items()}, "preread")
+                                      {f"#{n}": issue.body for n, issue in existing.items()}, "preread",
+                                      numbers={f"#{n}": n for n in existing}, listed=listed)
     waiting, lanes = _uncreated_lanes(plan, config, items)
     if waiting:
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.

@@ -1,5 +1,6 @@
 """Unit checks for `fa order prepare`'s scratch tree comparison and status projection."""
 
+import contextlib
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -14,6 +15,8 @@ from foragent import order_prepare, order_prepare_setup, order_scratch, order_sc
 from foragent.config import Config
 from foragent.git import GitRepo
 
+
+_LOCKED_GIT = SimpleNamespace(publish_lock=contextlib.nullcontext)
 
 def scratch(git_history, tmp_path, files):
     git_history.update(files)
@@ -448,7 +451,7 @@ def test_refused_lane_context_asks_before_any_writer_starts(tmp_path, monkeypatc
     monkeypatch.setattr(order_scratch, "build", lambda git, base, tree, context: {})
     monkeypatch.setattr(order_prepare_setup, "lane_context", lambda plan, item, config, root: (config, context))
     monkeypatch.setattr("foragent.executors.executor_for", lambda name: (_ for _ in ()).throw(AssertionError))
-    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store)[0]
+    row = order_prepare.prepare(plan, tmp_path, Config(language="en"), _LOCKED_GIT, store)[0]
     assert row["status"] == "question" and ".claude/agents/fa-api.md" in row["questions"][0]
 
 
@@ -474,7 +477,7 @@ def test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees(tmp_pa
         raise OSError("stop before the writer")
 
     monkeypatch.setattr(order_scratch, "build", build)
-    rows = order_prepare.prepare(plan, tmp_path, Config(language="en"), None, store,
+    rows = order_prepare.prepare(plan, tmp_path, Config(language="en"), _LOCKED_GIT, store,
                                  lambda: SimpleNamespace(get_issue=lambda n: None))
     assert [row["key"] for row in rows] == ["7", "#7"] and len(set(trees)) == 2
     assert order_prepare._record_path(store, {"id": "a/b"}) != order_prepare._record_path(store, {"id": "a-b"})
@@ -1563,3 +1566,255 @@ def test_preparation_uses_the_current_executor_factory_after_import(request, cap
     finally:
         importlib.reload(order_prepare)
         importlib.reload(order_prepare_review)
+
+
+LEGACY_EDIT = {"number": 7, "goal": "Sending stays quiet.", "out_of_scope": "Flags.",
+               "acceptance_files": {}, "done_when": ["true"]}
+
+
+def _existing_issue(case, body="Goal only.\n"):
+    lane = case.plan["issues"][0]["lane"]
+    case.tracker.add_issue(7, "Existing", body=body, labels=[f"lane:{lane}"])
+
+
+def _legacy_order(case, identity="another-order"):
+    """A new plan id over issue 7, with no statements, no tests and a placeholder command."""
+    case.plan = {**case.plan, "id": identity, "issues": [], "edits": [dict(LEGACY_EDIT)]}
+    case.save()
+
+
+def _assert_route_refused(code, out, err, case, body):
+    assert code != 0 and "reviewed-tests route" in out + err and "#7" in out + err, out + err
+    assert case.tracker.issues[7].body == body, "Nothing was published onto the issue"
+
+
+@pytest.mark.parametrize("verdict", ["pass", "question"])
+def test_a_new_plan_id_does_not_free_an_edit_from_its_statement_route(request, capsys, verdict):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    case.verdicts = [verdict]
+    case.plan = {**case.plan, "issues": [], "edits": [
+        {"number": 7, "goal": "Sending stays quiet.", "out_of_scope": "Flags.",
+         "statements": ["Sending prints nothing."], "done_when": ["true"]}]}
+    case.save()
+    code, out, err = cases.invoke(case, capsys, "prepare", str(case.path), "--json")
+    assert code == 0 and json.loads(out)["issues"][0]["key"] == "#7", out + err
+    _legacy_order(case)
+    before = len(case.calls)
+    code, out, err = cases.invoke(case, capsys, "preread", str(case.path), "--json")
+    _assert_route_refused(code, out, err, case, "Goal only.\n")
+    assert len(case.calls) == before, "No legacy evidence is made for a statement issue"
+    for options in (["--approve-numbers", "7"], ["--approve"], []):
+        _assert_route_refused(*cases.publish(case, capsys, *options), case, "Goal only.\n")
+
+
+@pytest.mark.parametrize("body", ["Goal\r\n\r\n## Behaviour\r\n- Sending prints nothing.\r\n",
+                                  "Goal\n\n## Behaviour \t\n- Sending prints nothing.\n"],
+                         ids=["crlf", "trailing-space"])
+def test_a_published_behaviour_heading_keeps_the_route_however_the_line_ends(request, capsys, body):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case, body)
+    _legacy_order(case)
+    code, out, err = cases.invoke(case, capsys, "preread", str(case.path), "--json")
+    _assert_route_refused(code, out, err, case, body)
+    _assert_route_refused(*cases.publish(case, capsys, "--approve-numbers", "7"), case, body)
+
+
+def test_text_quoting_a_behaviour_heading_is_not_the_statement_route():
+    from foragent import order_reviewed
+
+    plan = {"id": "p", "issues": [], "edits": [{"number": 9}]}
+    fenced = "Goal\n\n```\n## Behaviour\n```\n\nAlso ## Behaviour inline.\n"
+    order_reviewed.require_route_kept(plan, Config(language="en"), None, {"#9": fenced}, "publish")
+
+
+def _record_for(case, identity, *keys):
+    from foragent import order_prepare
+
+    path = order_prepare._record_path(case.store, {"id": identity})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"plan": identity, "issues": {key: {"status": "question"} for key in keys}}))
+
+
+def test_an_edit_of_a_child_its_own_order_prepared_keeps_the_route(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    case.tracker.add_issue(6, "Earlier order", body='<!-- foragent:plan id=earlier map={"notice": 7} -->\n')
+    _record_for(case, "earlier", "notice")
+    _legacy_order(case)
+    _assert_route_refused(*cases.publish(case, capsys, "--approve-numbers", "7"), case, "Goal only.\n")
+
+
+def test_another_orders_child_with_the_same_key_stays_legacy(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    case.tracker.add_issue(6, "Earlier order", body='<!-- foragent:plan id=earlier map={"notice": 8, "other": 7} -->\n')
+    _record_for(case, "earlier", "notice")
+    _legacy_order(case)
+    code, out, err = cases.publish(case, capsys, "--approve-numbers", "7")
+    assert "reviewed-tests route" not in out + err and "preread" in out + err, out + err
+
+
+def test_a_mapped_child_edited_as_prepared_by_another_order_keeps_the_route(request, capsys):
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    item = case.plan["issues"][0]
+    case.tracker.add_issue(6, "This order", body=f'<!-- foragent:plan id={case.plan["id"]} map={{"notice": 7}} -->\n')
+    case.tracker.add_issue(7, "Child", body="Goal only.\n", labels=[f"lane:{item['lane']}"])
+    _record_for(case, "elsewhere", "#7")
+    legacy = {key: value for key, value in item.items() if key != "statements"}
+    case.plan = {**case.plan, "issues": [{**legacy, "acceptance_files": {}, "done_when": ["true"]}]}
+    case.save()
+    code, out, err = cases.publish(case, capsys, "--approve-numbers", "7")
+    assert code != 0 and "reviewed-tests route" in out + err and "notice" in out + err, out + err
+    assert case.tracker.issues[7].body == "Goal only.\n"
+
+
+def test_a_flush_refuses_a_retained_edit_whose_issue_took_the_route_since(request, capsys, monkeypatch):
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    _legacy_order(case)
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    code, out, err = cases.publish(case, capsys, "--approve-numbers", "7", "--defer", "next-merge")
+    assert code == 0, out + err
+    _record_for(case, "later", "#7")
+    code, out, err = cases.invoke(case, capsys, "flush", "--boundary", "next-merge")
+    _assert_route_refused(code, out, err, case, "Goal only.\n")
+
+
+def _prepared_meanwhile(case, identity, key):
+    """Preparation records the issue after the first checks, while publication refreshes its base."""
+    refresh = case.git.update_base
+
+    def moved(branch):
+        _record_for(case, identity, key)
+        refresh(branch)
+
+    case.git.update_base = moved
+
+
+def _assert_nothing_pushed(case):
+    assert not any("commit" in call or "push" in call for call in case.git_calls)
+
+
+@pytest.mark.parametrize("options", [["--approve"], ["--approve-numbers", "7"], []],
+                         ids=["approve", "approve-numbers", "no-approval"])
+def test_preparation_that_arrives_during_publication_stops_a_legacy_edit(request, capsys, monkeypatch, options):
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    _legacy_order(case)
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    _prepared_meanwhile(case, "later", "#7")
+    _assert_route_refused(*cases.publish(case, capsys, *options), case, "Goal only.\n")
+    _assert_nothing_pushed(case)
+
+
+def test_preparation_that_arrives_during_publication_stops_a_legacy_child(request, capsys, monkeypatch):
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    item = case.plan["issues"][0]
+    legacy = {key: value for key, value in item.items() if key != "statements"}
+    case.plan = {**case.plan, "issues": [{**legacy, "acceptance_files": {}, "done_when": ["true"]}]}
+    case.save()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    _prepared_meanwhile(case, case.plan["id"], item["key"])
+    code, out, err = cases.publish(case, capsys, "--approve-keys", item["key"])
+    assert code != 0 and "reviewed-tests route" in out + err, out + err
+    cases.assert_no_publication(case)
+
+
+def test_preparation_that_arrives_during_a_flush_stops_a_legacy_edit(request, capsys, monkeypatch):
+    from foragent import order
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    _existing_issue(case)
+    _legacy_order(case)
+    monkeypatch.setattr(order, "require_clean_preread", lambda *args: None)
+    assert cases.publish(case, capsys, "--approve-numbers", "7", "--defer", "next-merge")[0] == 0
+    _prepared_meanwhile(case, "later", "#7")
+    _assert_route_refused(*cases.invoke(case, capsys, "flush", "--boundary", "next-merge"), case, "Goal only.\n")
+    _assert_nothing_pushed(case)
+
+
+def test_evidence_that_went_stale_during_publication_stops_the_statement_issue(request, capsys):
+    from foragent import order_prepare
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    cases.prepare(case, capsys)
+    refresh = case.git.update_base
+
+    def asked_meanwhile(branch):
+        path = order_prepare._record_path(case.store, case.plan)
+        record = json.loads(path.read_text())
+        record["issues"][case.plan["issues"][0]["key"]]["status"] = "question"
+        path.write_text(json.dumps(record))
+        refresh(branch)
+
+    case.git.update_base = asked_meanwhile
+    code, out, err = cases.publish(case, capsys, "--approve")
+    assert code != 0 and "prepare" in (out + err).lower(), out + err
+    cases.assert_no_publication(case)
+
+
+def test_preparation_claims_its_issues_under_the_lock_before_any_agent_starts(request, capsys, monkeypatch):
+    from foragent import order, order_prepare, order_reviewed
+
+    cases = _cases
+    case = request.getfixturevalue("lane_case")
+    lock = case.git.publish_lock
+    held, claims = [], []
+
+    class Held:
+        def __enter__(self):
+            held.append(True)
+            self.inner = lock()
+            self.inner.__enter__()
+
+        def __exit__(self, *details):
+            held.pop()
+            return self.inner.__exit__(*details)
+
+    case.git.publish_lock = Held
+    write = order_prepare._write
+
+    def recording(path, record):
+        if record.get("claimed") and not claims:
+            claims.append((bool(held), len(case.calls)))
+        write(path, record)
+
+    monkeypatch.setattr(order_prepare, "_write", recording)
+    _existing_issue(case)
+    # The issue goes first, so the edit has no entry of its own while the first writer runs.
+    case.plan = {**case.plan, "edits": [{"number": 7, "goal": "Sending stays quiet.", "out_of_scope": "Flags.",
+                                         "statements": ["Sending prints nothing."], "done_when": ["true"]}]}
+    case.save()
+    seen = []
+
+    def during_the_first_writer(*args, **kwargs):
+        if seen:
+            return
+        other = {"id": "another-order", "issues": [], "edits": [dict(LEGACY_EDIT)]}
+        with pytest.raises(order.PlanError, match="reviewed-tests route"):
+            order_reviewed.require_route_kept(other, case.config, case.config.repo, {"#7": "Goal only.\n"},
+                                              "publish", numbers={"#7": 7})
+        seen.append(True)
+
+    case.writer_hook = during_the_first_writer
+    code, out, err = cases.invoke(case, capsys, "prepare", str(case.path), "--json")
+    assert code == 0, out + err
+    assert claims == [(True, 0)], "Claimed under the lock, before any agent ran"
+    assert seen, "The writer ran while the claim was already visible"
