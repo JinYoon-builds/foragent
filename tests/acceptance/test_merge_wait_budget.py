@@ -6,6 +6,7 @@ timeout, queue-wait or merge-policy code.
 
 Break-it: returning "merged" without merging, merging before the predecessor
 leaves, skipping the merge, or merging twice fails observable-effect checks.
+The waits cover 65 minutes and the measured 826-minute incident maximum.
 Removing the run budget globally fails the implementation-timeout control.
 Crediting too much wait, resetting the budget, or freezing it after waiting
 fails the post-wait active-work control. Poll frequency is not prescribed.
@@ -97,7 +98,7 @@ def queued_run(case, monkeypatch, wait_seconds, *, active_seconds_after_wait=0):
     def sleep(seconds):
         nonlocal elapsed_wait
         assert seconds > 0, "Merge waiting must make progress on the fake clock"
-        assert len(case.wait_samples) < 100, "Merge wait did not finish after its turn became available"
+        assert len(case.wait_samples) < wait_seconds + 100, "Merge wait did not finish after its turn became available"
         assert case.store.get_run(1).phase == "merge-lock-wait"
         assert len(case.executor.calls) == len(case.review_calls) == 1
         assert "Check exit_code=0" in case.store.log_path(1).read_text()
@@ -129,7 +130,7 @@ def queued_run(case, monkeypatch, wait_seconds, *, active_seconds_after_wait=0):
     return outcome, elapsed_wait, post_wait_work
 
 
-@pytest.mark.parametrize("wait_seconds", [90, 185], ids=["long-wait", "longer-wait"])
+@pytest.mark.parametrize("wait_seconds", [3_900, 49_560], ids=["long-wait", "longer-wait"])
 def test_completed_run_merges_once_after_wait_exceeds_implementation_budget(
     budget_case, monkeypatch, wait_seconds,
 ):

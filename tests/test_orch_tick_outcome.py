@@ -50,6 +50,16 @@ def test_success_tolerates_a_removed_alert_request(store, pushes):
     assert orch_inbox.requests(store) == []
 
 
+def test_success_closes_its_alert_with_a_recorded_answer(store, pushes):
+    config = Config(tick_failure_alert=1)
+    record = orch_tick_outcome.record_failure(store, config, "owner/repo", RuntimeError("boom"))
+    recovered = orch_tick_outcome.record_success(store)
+    [request] = orch_inbox.requests(StateStore(store.root))
+    assert request["id"] == record["alert_request"]
+    assert request["status"] == "done"
+    assert request["answer"] == f"gate tick recovered at {recovered['at']}"
+
+
 @pytest.mark.parametrize("value", [0, -1, "3", True])
 def test_threshold_must_be_a_positive_integer(tmp_path, value):
     (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"tick_failure_alert": value}))
