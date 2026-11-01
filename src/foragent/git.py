@@ -22,6 +22,7 @@ REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 SPLIT_MIN_LINES = 5
 SPLIT_MIN_LINE = 4
 ARTIFACT_PATHS = (".foragent",)
+ABSENT_BLOB = "missing"  # blob_shas value of a path the ref does not have.
 
 
 def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
@@ -703,7 +704,7 @@ class GitRepo:
             return None
 
     def blob_shas(self, ref: str, paths: Iterable[str]) -> dict[str, str]:
-        return {path: self.blob_sha(ref, path) or "missing" for path in paths}
+        return {path: self.blob_sha(ref, path) or ABSENT_BLOB for path in paths}
 
     def remote_slug(self, remote: str = "origin") -> str:
         slug = slug_from_url(self._call(["remote", "get-url", remote]))
