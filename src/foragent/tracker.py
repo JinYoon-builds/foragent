@@ -285,8 +285,13 @@ class RecordingTracker:
 
     def sub_issues(self, n):
         started = self._started()
+        store = self._context.store
+        baseline = store.read_baseline()
         children = self._tracker.sub_issues(n)
         self._ingest(children, started)
+        store.record_child_read(n, [{"number": child.number, "state": child.state,
+                                     "state_reason": child.state_reason, "labels": sorted(child.labels)}
+                                    for child in children], started=started, baseline=baseline)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
 

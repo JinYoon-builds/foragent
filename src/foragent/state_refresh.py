@@ -5,6 +5,9 @@ from datetime import datetime
 from typing import Any
 
 
+CHILD_READ = "sub_issues"
+
+
 class IssueRefreshMixin:
     def refresh_local_issues(
         self, issues: list, prs: list, lanes: dict, now: datetime,
@@ -188,6 +191,32 @@ class IssueRefreshMixin:
                 "observed": {key: baseline["observed"].get(key) for key in keys},
             }
             # A remembered read is not an issue change; keep revisions for real writes.
+            self._write_json(self.root / "issues.json", snapshot)
+
+
+    def record_child_read(self, number: int, children: list[dict[str, Any]], *,
+                          started: datetime, baseline: dict[str, Any]) -> None:
+        """Keep what one sub-issue read showed, so a later tick need not read it again.
+
+        The numbers repair the parent's stored edges, unless a newer observation
+        of the parent has arrived since. The facts stay as a remembered read for
+        children that no listing shows; a changed parent, including its summary,
+        ends that memory.
+        """
+        from foragent.state_observations import stamp
+
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            row = snapshot["issues"].get(str(number))
+            if row is None:
+                return
+            if (seen := stamp(row.get("observed_at"))) is not None and seen > started:
+                return
+            row["children"] = [child["number"] for child in children]
+            row.setdefault("reads", {})[CHILD_READ] = {
+                "value": children, "refresh": baseline["refresh"],
+                "observed": {str(number): baseline["observed"].get(str(number))},
+            }
             self._write_json(self.root / "issues.json", snapshot)
 
 

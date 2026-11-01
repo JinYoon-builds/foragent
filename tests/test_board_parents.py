@@ -73,6 +73,7 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
+        confirmed_read=lambda n, name: None,
         local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
         load_local_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
@@ -113,7 +114,7 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     monkeypatch.setattr(board, "set_status", lambda issue, status: written.append((issue, status)))
     ctx = SimpleNamespace(tracker=SimpleNamespace(), repo="owner/repo",
                           config=SimpleNamespace(board="PVT_1", board_map=None),
-                          store=SimpleNamespace(local_issues=lambda: rows))
+                          store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None))
     for number in (1, 3, 5, 7):
         board.sync_status(ctx, number, "Needs human")
     board.sync_status(ctx, 1, "Running", parent=True)
@@ -145,7 +146,7 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     synced, closed = [], []
     tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
                               close_issue=lambda n, comment: closed.append((n, comment)))
-    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows), tracker=tracker,
+    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None), tracker=tracker,
                           config=SimpleNamespace(language="en"),
                           now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
     monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
@@ -176,7 +177,7 @@ def _record_ctx(monkeypatch, rows, remote, children=None, root=None, clock=None)
         return issue
 
     store = SimpleNamespace(
-        root=root, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
+        root=root, confirmed_read=lambda n, name: None, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     def reference_states(numbers):
@@ -666,3 +667,19 @@ def test_gh_reference_states_reads_every_number_in_one_call():
         {"data": {"repository": {"i9": None}}, "errors": [{"type": "NOT_FOUND"}]}))
     with pytest.raises(TrackerError):
         missing.reference_states([9])
+
+
+def test_card_moves_once_and_before_the_reference_read(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, edited=[4], children=[2]), _row(2, "closed")]
+    ctx, out = _record_ctx(monkeypatch, rows, {4: child(4, state="closed")})
+    order = []
+    reference_states = ctx.tracker.reference_states
+    ctx.tracker.reference_states = lambda numbers: (order.append(list(out.synced)), reference_states(numbers))[1]
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert order == [[(1, "Done", True)]], "The card is already moved when the reference read starts"
+    assert out.closed == [(1, board_parents.closing_comment("en", [2, 4], []))]
+    assert out.synced == [(1, "Done", True)], "The close writes the same column only once"

@@ -45,6 +45,9 @@ FIELD_SELECTION = """... on ProjectV2SingleSelectField {
 } ... on ProjectV2Field { id name dataType } ... on ProjectV2IterationField { id name }"""
 
 
+# Local board values for a card beyond the first page: its id once found, and how far the search got.
+CARD_ITEM = "Card item"
+CARD_CURSOR = "Card search"
 BOARD_ISSUE_QUERY = """query ForagentBoardIssue(
   $owner: String!, $name: String!, $number: Int!, $cursor: String, $id: ID!
 ) {
@@ -161,11 +164,13 @@ class Project:
             return  # The last board read found no card for this issue.
         owner, name = self.repo.split("/", 1)
         fields = None
-        cursor = None
         item = None
+        known_card = recorded(number, self.id, CARD_ITEM) if recorded is not None else None
+        # A search that ran out of budget continues from the page it reached.
+        cursor = recorded(number, self.id, CARD_CURSOR) if recorded is not None else None
+        searching = cursor is not None
         while True:
-            # One read names both the card and the fields, so moving a card takes
-            # two calls and fits one bounded tick; a failed try keeps no partial work.
+            # One read names both the card and the fields, so moving a card takes two calls.
             data = _data(self.tracker, BOARD_ISSUE_QUERY, {
                 "owner": owner, "name": name, "number": number, "cursor": cursor, "id": self.id,
             })
@@ -174,11 +179,28 @@ class Project:
             content = data["repository"]["issue"]
             connection = content["projectItems"]
             item = next((node for node in connection["nodes"] if node["project"]["id"] == self.id), None)
-            if item or not connection["pageInfo"]["hasNextPage"]:
+            if item or known_card or not connection["pageInfo"]["hasNextPage"]:
                 break
             cursor = connection["pageInfo"]["endCursor"]
+            if record is not None:
+                record(number, self.id, CARD_CURSOR, cursor)
+                searching = True
+
+        def search_over(found: str | None = None) -> None:
+            if record is None:
+                return
+            if found is not None:  # It took extra reads: keep it, so a retry fits one bounded tick.
+                record(number, self.id, CARD_ITEM, found)
+            if searching:
+                record(number, self.id, CARD_CURSOR, None)
+
+        if item is None and known_card:
+            item = {"id": known_card}  # Found on a later page before; refresh_cards corrects it.
+        elif item is not None:
+            search_over(item["id"] if cursor is not None else None)
         if item is None and not add:
             # Only move an existing card; never add one here. Remember the check.
+            search_over()
             if record is not None:
                 record(number, self.id, "Status", NO_CARD)
             return
@@ -196,7 +218,9 @@ class Project:
                 if "Content already exists in this project" not in str(exc):
                     raise
                 # Concurrent addition confirmed membership without an item ID.
+                search_over()
                 return
+            search_over(item["id"] if cursor is not None else None)
         other_fields = {key: [value] for key, value in values.items() if key != "Status"}
         if other_fields:
             fields = self.ensure_fields(other_fields)
@@ -417,6 +441,13 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
         value = ((item.get("fieldValueByName") or {}).get("name") or "") if item else NO_CARD
         if recorded(row["number"], ctx.config.board, "Status") != value:
             record(row["number"], ctx.config.board, "Status", value)
+        # This read shows every card, so it settles a kept card and ends a search in progress.
+        searching = recorded(row["number"], ctx.config.board, CARD_CURSOR) is not None
+        if searching:
+            record(row["number"], ctx.config.board, CARD_CURSOR, None)
+        known_card = recorded(row["number"], ctx.config.board, CARD_ITEM)
+        if (known_card is not None or (searching and item)) and known_card != (item or {}).get("id"):
+            record(row["number"], ctx.config.board, CARD_ITEM, (item or {}).get("id"))
     _refresh_waiting(ctx, tracker, rows, cards)
 
 

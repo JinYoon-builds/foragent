@@ -28,6 +28,7 @@ from foragent import board
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
 from foragent.orch_events import append_event
+from foragent.state_refresh import CHILD_READ
 from foragent.tracker import Issue, TrackerError
 
 log = logging.getLogger(__name__)
@@ -165,7 +166,8 @@ def closing_comment(language: str, completed: list[int], cancelled: list[int]) -
     return " ".join(parts)
 
 
-def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]]) -> list[Issue] | None:
+def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]],
+                     remembered: list[dict[str, Any]] | None = None) -> list[Issue] | None:
     """A parent's children as this tick's listing shows them; None when only a read can tell.
 
     Child rows carry state, close reason and labels, so a child-only change is
@@ -173,18 +175,39 @@ def _listed_children(row: dict[str, Any], rows: dict[int, dict[str, Any]]) -> li
     checks the edges and, for a child with no row, shows open work; it never
     closes anything by itself. GitHub's completed count includes cancelled
     children, so completed < total means some child is open.
+
+    ``remembered`` is the sub-issue read a later listing confirmed: the parent
+    and its summary have not changed since. It answers for a child with no row,
+    so a sequence that ran out of budget continues after that read.
     """
     numbers = row.get("children") or []
-    known = [_listed_issue(rows[number]) for number in numbers if number in rows]
-    summary = (row.get("observed") or {}).get("sub_issues") or {}
-    total = summary.get("total")
-    if total is not None and total != len(numbers):
+    memory = {child["number"]: child for child in remembered or ()}
+    known = [_listed_issue(rows.get(number) or memory[number]) for number in numbers
+             if number in rows or number in memory]
+    total = _summary(row).get("total")
+    if total is None:
+        return known if len(known) == len(numbers) else None
+    # A confirmed read that still disagrees with the total will not change by reading again.
+    if total != len(numbers) and (remembered is None or memory.keys() != set(numbers)):
         return None
-    if len(known) == len(numbers):
+    if len(known) == len(numbers) and total == len(numbers):
         return known
-    if total is not None and summary.get("completed", total) < total:
-        return [*known, Issue(0, "", "", frozenset(), "open")]  # Stands for the unlisted open work.
-    return None
+    counted = _with_counted_open_work(row, known)
+    return counted if counted != known or len(known) == len(numbers) else None
+
+
+def _summary(row: dict[str, Any]) -> dict[str, int]:
+    return (row.get("observed") or {}).get("sub_issues") or {}
+
+
+def _with_counted_open_work(row: dict[str, Any], children: list[Issue]) -> list[Issue]:
+    """Children read or remembered, plus the open work the summary counts and they do not show."""
+    summary = _summary(row)
+    total = summary.get("total")
+    if (total is None or summary.get("completed", total) >= total
+            or any(child.state == "open" for child in children)):
+        return children
+    return [*children, Issue(0, "", "", frozenset(), "open")]  # Stands for the unseen open work.
 
 
 def _listed_issue(row: dict[str, Any]) -> Issue:
@@ -242,7 +265,14 @@ def follow_children(ctx, report) -> None:
     def visit(number: int) -> None:
         children = listed[number]
         if children is None:
-            children = ctx.tracker.sub_issues(number)
+            children = _with_counted_open_work(by_number[number], ctx.tracker.sub_issues(number))
+        moved = None
+        if number in parents and needs_read(number, children):
+            # The card first: its column depends only on the children, and a reference read
+            # repeats every tick. Each step then fits a tick and leaves its result behind.
+            moved = parent_state(children, open_prs)
+            if moved is not None:
+                board.sync_status(ctx, number, moved, parent=True)
         state, closes, ended = decide(number, children)
         cancelled = [child.number for child in children
                      if child.state == "closed" and not _completed(child)]
@@ -262,10 +292,15 @@ def follow_children(ctx, report) -> None:
             report.actions.append(text("parent_closed_report", language, number=number,
                                        completed=len(completed), cancelled=len(cancelled)))
             state = "Done"
-        if state is not None:
+        if state is not None and state != moved:
             board.sync_status(ctx, number, state, parent=True)
 
-    listed = {number: _listed_children(by_number[number], by_number) for number in parents | records.keys()}
+    def remembered(number: int) -> list[dict[str, Any]] | None:
+        read = ctx.store.confirmed_read(number, CHILD_READ)
+        return read[0] if read else None
+
+    listed = {number: _listed_children(by_number[number], by_number, remembered(number))
+              for number in parents | records.keys()}
     seed = ctx.now().isoformat()
     closing, others = [], []
     for number, children in listed.items():
