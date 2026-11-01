@@ -1,5 +1,5 @@
 repo: JinYoon-builds/foragent  # 2026-10-30: pushes failed 255x with 'claude-push requires a repository' since >=10-28
-review: batch
+review: fast
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
 approvers:
@@ -97,7 +97,7 @@ lanes:
     skills: [skill-creator, principle-prove-it-works, principle-fix-root-causes, fa-state-design]
     title: 역할
 board: PVT_kwHODvdhm84BoMtn  # restored 2026-10-24 after #221: ticks write only changed board cards
-test_slots: 5  # 2026-10-26: CPU 47% idle and memory 76% free while 3 slots were held and more than four runs waited to check; the gate's CPU-busy AIMD climbs within this ceiling
+test_slots: 4  # 2026-11-01: 3 check timeouts (#1322 #1206 #1004) with 5 slots at load 1.15 per CPU, CPU 90%; baselines 1100-1500 s vs limit 1538 s
 checks: ci  # 2026-10-26 Jin: CI mode on after #493/#506 (evidence = the measurement run's own artifacts). Revert to local in one commit if evidence is missing or rejected
 max_runtime_minutes: 360  # 2026-10-25 Jin (D89): interim until the #435 watchdog; progressing runs were cut at 90 min. stall_minutes (30, no progress) still ends silent runs
 # Raised from 2 on 2026-10-26: 1 conflict (598 s, no redo) in 107 overlap records; earlier 33 conflict events took 189 s median, while cap waits held 5 ready issues for hours.

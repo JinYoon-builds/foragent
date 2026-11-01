@@ -12,6 +12,32 @@ def store(tmp_path):
     return StateStore(tmp_path / "state")
 
 
+def test_note_journals_each_named_issue_once_and_keeps_earlier_responses(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    from foragent.orch_events import acknowledged_at
+
+    clock = [datetime(2026, 10, 31, 9, tzinfo=UTC)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    assert acknowledged_at(store, 1) is None
+    orch_inbox.write_note(store, "Diagnosed #1", "#2 reproduces on main; #1 waits", "Wait for #3", {})
+    events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [(event["issue"], event["kind"]) for event in events] == [
+        (1, "acknowledged"), (2, "acknowledged"), (3, "acknowledged"),
+    ]
+    assert all(event["summary"] == "Diagnosed #1 #2 reproduces on main; #1 waits Wait for #3"
+               for event in events)
+    first = clock[0]
+    clock[0] += timedelta(hours=1)
+    orch_inbox.write_note(store, "Other work #2", None, None, {})
+    assert acknowledged_at(store, 1) == first
+    assert acknowledged_at(store, 2) == clock[0]
+    assert acknowledged_at(store, 3) == first
+    assert acknowledged_at(store, 4) is None
+    latest = orch_inbox.write_note(store, "General monitoring", None, None, {})
+    assert orch_inbox.read_note(store) == latest
+    assert len((store.root / "orch-events.jsonl").read_text().splitlines()) == 4
+
+
 def test_requests_keep_order_and_pending_hides_done(store):
     first = orch_inbox.add_request(store, "planning", "one")
     second = orch_inbox.add_request(store, "planning", "two")

@@ -328,6 +328,38 @@ def test_premerge_ci_accepts_and_caches_an_entirely_excluded_acceptance_suite(me
     assert log.count("cache=hit") == 1
 
 
+@pytest.mark.parametrize("mode", ["ci", "local"])
+@pytest.mark.parametrize("owned", [True, False])
+def test_premerge_head_only_pending_lock_exclusion_keeps_unowned_failures(merge_case, mode, owned):
+    c = merge_case
+    base = c.history.tip
+    locked = "tests/acceptance/test_new_lock.py"
+    c.history.update({locked: '"""Locked by Foragent; do not edit."""\n'
+                      'def test_pending():\n    assert False, "not implemented yet"\n'})
+    head = c.history.tip
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.history.tip = base
+    c.tracker.set_pr_head_sha(c.pr, head)
+    c.ctx.config = replace(c.ctx.config, runner_unit_tests=mode,
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    if owned:
+        c.tracker.add_issue(99, "Pending feature", labels=["approved"])
+        c.ctx.store.save_approval(
+            99, body="pending", body_sha="body", acceptance_blobs={locked: "blob"},
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+    assert c.ctx.git.blob_sha(base, locked) is None
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["broken"] == ([] if owned else [f"{locked}::test_pending"])
+    assert report["failing_on_base"] == []
+    assert report["tests"] == ("pass" if owned else "fail")
+    assert report["ready"] is owned
+    if owned:
+        log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
+        assert "Acceptance baseline skipped 1 files owned by open issues: #99" in log
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_premerge_suite_releases_slot_and_propagates_it_to_nested_tests(merge_case, monkeypatch, failure):
     from contextlib import contextmanager
