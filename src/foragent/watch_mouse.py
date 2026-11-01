@@ -1,10 +1,11 @@
 """Mouse targets, keys and scrolling in the lane view.
 
 render_frame fills a caller-owned layout with hit boxes; coordinates are
-zero-based screen cells. Handlers change a caller-owned state: ``issue`` is the
-legacy box's number (or None; no input opens it since the lane scene), ``explanation_target``
-the selected ('acorn', number), ('role', name) or ('squirrel', slug) to explain (or None), ``scroll`` the zero-based first visible frame row,
-``unfolded`` the lanes showing all their rows. Each frame records ``length``,
+zero-based screen cells. Handlers change a caller-owned state: ``explanation_target``
+is the selected ('acorn', number), ('role', name) or ('squirrel', slug), ``scroll``
+the zero-based first visible frame row, ``unfolded`` the lanes showing all their rows.
+Legacy callers may supply ``issue`` and ``rows_scroll`` for closing an existing issue
+box; inputs only select explanations. Each frame records ``length``,
 ``rows`` (issue rows as (y, number)) and, on a screen, ``height``. Runtime
 dependencies resolve through foragent.watch to preserve its patch points.
 """
@@ -75,25 +76,6 @@ def highlighted(state: dict[str, Any]) -> int | None:
     return None if y is None else dict(state.get("rows", ()))[y]
 
 
-def _open(state: dict[str, Any], number: int | None, store: StateStore | None, row: int | None = None) -> None:
-    """Open, switch or (with None) close the issue box; the box reads the records through store.
-
-    The box starts at its top; closing it brings the rows back where they were scrolled.
-    ``row`` is the F row it was opened from: the box names that row's lane, if any.
-    """
-    was_open = state.get("issue") is not None
-    if number is not None:
-        if not was_open:
-            state["rows_scroll"] = state.get("scroll", 0)
-            state["scroll"] = 0
-        # The box names the lane of the row it was opened from (none for a completion row).
-        state["issue"], state["store"] = number, store
-        state["issue_lane"] = state.get("row_lanes", {}).get(row)
-    elif was_open:
-        state["issue"] = None
-        state["scroll"] = state.pop("rows_scroll", 0)
-
-
 def handle_mouse(
     button: str, x: int, y: int, layout: dict[str, Any], store: StateStore, config: Config,
     *, state: dict[str, Any] | None = None,
@@ -126,7 +108,7 @@ def handle_mouse(
 
 
 # Click targets that select an explanation instead of acting. An acorn explains its issue
-# in the orchestrator's bubble while every lane stays visible (no box, no scroll change).
+# in the orchestrator's bubble while every lane stays visible at its current scroll.
 EXPLAINED = frozenset({"acorn", "role", "squirrel"})
 
 
@@ -146,20 +128,20 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
                repo_root: Path | None = None, confirm: Callable[[str], bool] | None = None) -> bool:
     """Act on one key name; True asks the view to quit.
 
-    j/k (and the arrows) move one row, Enter explains (or, again, stops explaining) the
-    highlighted row's acorn, f folds
-    its lane, a unfolds every lane when any is folded (else folds all), o switches to
-    the orchestrator, m flips the Claude quota mode (keep/burn), x or Esc closes the selected
-    explanation, else the box (Esc quits when neither is open). While a
-    box is open, Enter, f, a, m and s do nothing. s opens the settings window (#173); while it is
-    open it takes every key but q and m. ``confirm(message)`` approves a team change; without it the
-    window asks y/n itself. ``repo_root`` is where the window saves.
+    j/k and the arrows scroll, Enter toggles the highlighted acorn's explanation,
+    f folds its lane, a toggles all folds, o switches to the orchestrator and m flips
+    the Claude quota mode. x clears the explanation; Esc clears it or quits.
+    s opens settings, which takes every key but q and m. ``confirm(message)`` approves
+    a team change; otherwise settings asks y/n. ``repo_root`` is where it saves.
+
+    For a caller-supplied legacy issue box, x/Esc restore its saved scroll and the
+    modal Enter/f/a/m/s guards still apply. The live lane scene never opens a box.
     """
     from foragent import watch
     from foragent.watch_sections import settings as settings_window
 
     state = {} if state is None else state
-    is_open = state.get("issue") is not None
+    legacy_box_open = state.get("issue") is not None
     if key in ("q", "Q"):
         return True
     if settings_window.is_open(state) and not (key == "m" and state.get("settings_prompt") is None):
@@ -167,12 +149,12 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         return False
     if key in ("esc", "x") and state.get("explanation_target") is not None:
         del state["explanation_target"]
-    elif key == "esc":
-        if not is_open:
+    elif key in ("esc", "x"):
+        if legacy_box_open:
+            state["issue"] = None
+            state["scroll"] = state.pop("rows_scroll", 0)
+        elif key == "esc":
             return True
-        _open(state, None, store)
-    elif key == "x":
-        _open(state, None, store)
     elif key in ("j", "down"):
         watch.scroll(state, 1)
     elif key in ("k", "up"):
@@ -182,7 +164,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         watch.scroll(state, step if key == "pagedown" else -step)
     elif key == "o":
         watch.switch_to_orchestrator(store)
-    elif is_open:
+    elif legacy_box_open:
         pass
     elif key == "s":
         state.pop("explanation_target", None)

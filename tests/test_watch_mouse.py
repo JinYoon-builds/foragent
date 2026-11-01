@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 import subprocess
 
+import pytest
+
 from foragent import orch_inbox, watch
 from foragent.config import Config
 from foragent.state import StateStore
@@ -55,6 +57,13 @@ def test_failed_switch_does_not_raise(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fail)
     assert watch.switch_to_orchestrator(store) is False
+
+
+@pytest.mark.parametrize("key", ["x", "esc"])
+def test_keys_close_a_caller_supplied_legacy_box_and_restore_its_scroll(key):
+    state = {"issue": 7, "scroll": 1, "rows_scroll": 4}
+    assert watch.handle_key(key, None, Config(), state=state) is False
+    assert state == {"issue": None, "scroll": 4}
 
 
 def test_note_location_prefers_orca_then_tmux_then_terminal():

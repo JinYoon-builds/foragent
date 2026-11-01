@@ -80,6 +80,8 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     status = snapshot.status
     needs = questions(status) if needs is None else needs
     runs = {run["number"]: run for run in _clones(status).get(row.get("slug"), [])}
+    authored = {number: fact for number, fact in snapshot.waiting_facts.items()
+                if fact.get("authored") and fact.get("lane") == row.get("slug")}
     titles = {item["number"]: item.get("title") for key in ("running", "queued", "held")
               for item in row.get(key) or () if isinstance(item, dict) and "number" in item}
     current: list[dict[str, Any]] = []
@@ -87,6 +89,9 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
 
     def add(target: list[dict[str, Any]], number: int, state: str, phase: str | None,
             run: dict[str, Any] | None) -> None:
+        fact = snapshot.waiting_facts.get(number) or {}
+        if fact.get("authored") and fact.get("lane") != row.get("slug"):
+            return  # The recorded active lane wins over a subsequently edited label.
         if number in seen:
             # One acorn per issue, but question evidence from any listing still counts.
             entry = seen[number]
@@ -94,7 +99,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
                 entry["state"] = state
                 entry["class"] = acorn_class(snapshot, row, number, state, entry["phase"], needs)
             return
-        title = titles.get(number) or snapshot.titles.get(number) or (
+        title = titles.get(number) or snapshot.titles.get(number) or fact.get("title") or (
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
                  "class": acorn_class(snapshot, row, number, state, phase, needs)}
@@ -131,6 +136,10 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         # A queued item keeps a recorded question; any other state of the queue is next.
         add(upcoming, item["number"], "waiting-human" if item.get("state") == "waiting-human" else "queued",
             None, None)
+    # An authored wait is visible even without approval or a scheduler queue entry.
+    # add() keeps a listed worker/held/queued acorn and its class instead of duplicating it.
+    for number in authored:
+        add(upcoming, number, "queued", None, None)
     return current, upcoming
 
 

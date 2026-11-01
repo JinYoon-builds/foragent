@@ -214,16 +214,32 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
                 firsts.add(offset)
                 marks.append((start + offset, number))
 
+    def group(items: list[dict[str, Any]], warnings: bool, prefix: Line) -> None:
+        from foragent.watch_waiting import explanation
+
+        authored = {item["number"]: snapshot.waiting_facts.get(item["number"], {}).get("authored")
+                    for item in items}
+        ordinary = [item for item in items if not authored[item["number"]]]
+        if ordinary:
+            place(_flow(units(ordinary, warnings), width, ACORN_ROWS if pixels else len(ordinary),
+                        prefix, mark, per_row))
+        # Each recorded wait keeps its acorn and canonical explanation together, outside
+        # the ordinary flow's overflow budget. Never hide a reason, condition or owner.
+        for item in items:
+            if not (context := authored[item["number"]]):
+                continue
+            place(_flow(units([item], warnings), width, 1, prefix, mark, 1))
+            lines.extend(explanation(context, language, width))
+
     if current:
-        place(_flow(units(current, True), width, ACORN_ROWS if pixels else len(current), [], mark, per_row))
+        group(current, True, [])
     waiting = watch_scene.representative_wait(row, current, upcoming)
     if waiting is not None:
         lines.append([(_cut(watch_scene.waiting_reason(snapshot, row, waiting, language), width, mark), "dim")])
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
-        place(_flow(units(upcoming, False), width, ACORN_ROWS if pixels else len(upcoming), prefix, mark,
-                    per_row))
+        group(upcoming, False, prefix)
     return lines, hits, marks, name_cells
 
 

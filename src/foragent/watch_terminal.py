@@ -223,7 +223,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     except curses.error:
         pass
     try:
-        curses.set_escdelay(25)  # Esc closes a box at once instead of waiting for a sequence.
+        curses.set_escdelay(25)  # Esc clears the explanation at once.
     except (curses.error, AttributeError):
         pass
     screen.keypad(True)
@@ -248,7 +248,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     painted = False  # The screen is erased once; later frames paint over it in place.
     pending = None
     started_build = watch._installed_build()
-    # Memory across frames: fireworks start times, folds, scroll and the open issue box.
+    # Memory across frames: fireworks start times, folds, scroll and the explanation.
     view_state: dict = {}
     if store is not None:
         view_state["store"] = store
@@ -322,7 +322,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 bottom = max(0, height - 1)
                 visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
             # One highlighted row, by its position: the first issue row on screen.
-            mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
+            mark = watch.highlighted_row(view_state)
             if mark is None:
                 marked = set()
             elif row_map is not None:
@@ -416,7 +416,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 if keys[key] in ("q", "Q") or (keys[key] == "esc" and store is None):
                     return
                 if store is not None or keys[key] == "s":
-                    # Esc goes through handle_key: it closes a selection or box before it quits.
+                    # Esc goes through handle_key: it clears an explanation before it quits.
                     if watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root):
                         return
                 elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):

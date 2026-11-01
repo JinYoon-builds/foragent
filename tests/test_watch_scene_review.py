@@ -201,3 +201,45 @@ def test_an_id_that_fits_beside_the_count_is_drawn_not_counted():
     texts = ["".join(value for value, _ in line) for line in lines]
     assert [entry[3] for entry in placed] == [1062, 1063]
     assert "[#1063]" in texts[1] and texts[1].endswith("...1") and watch._cells(texts[1]) <= 14
+
+
+@pytest.mark.parametrize("listing", ["running", "held", "queued", "facts-only"])
+@pytest.mark.parametrize("pixels", [False, True])
+def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_overflow(listing, pixels):
+    from foragent.config import Config
+    from foragent.watch_scene import lane_items
+    from foragent.watch_sections.lane_blocks import _block
+
+    row = {"slug": "work", "lane_display": "work", "state": "idle", "issue": None,
+           "running": [], "held": [], "queued": [{"number": n, "title": "Next"} for n in range(40)]}
+    if listing != "facts-only":
+        row[listing].append({"number": 999, "title": "Authored wait", "state": "blocked"})
+    snapshot = _snapshot(row, waiting_facts={999: {"lane": "work", "title": "Authored wait", "authored": {
+        "text": "Canonical wait", "reason": "Choice  pending", "next_condition": "Record choice",
+        "responsible_role": "orchestrator"}}})
+    config = Config(language="en", lanes={"work": {}})
+    current, upcoming = lane_items(snapshot, row)
+    lines, hits, marks, _ = _block(snapshot, config, row, current, upcoming, 60, 0, NOW,
+                                  (pixels, not pixels, False))
+    text = "\n".join("".join(value for value, _ in line) for line in lines)
+    own = [hit for hit in hits if hit[-1] == ("acorn", 999)]
+    assert len(own) == 1 and [number for _, number in marks].count(999) == 1
+    y = own[0][1]
+    assert "#999" in "".join(value for value, _ in lines[y])
+    assert ["".join(value for value, _ in line).strip() for line in lines[y + 1:y + 4]] == [
+        "Waiting: Choice  pending", "Next: Record choice", "Owner: orchestrator"]
+    for phrase in ("Choice  pending", "Record choice", "orchestrator"):
+        assert text.count(phrase) == 1
+    assert all(sum(watch._cells(value) for value, _ in line) <= 60 for line in lines)
+
+
+def test_authored_wait_uses_its_recorded_lane_when_a_listing_still_names_another_lane():
+    from foragent.watch_scene import lane_items
+
+    old = {"slug": "old", "state": "idle", "issue": None, "running": [], "queued": [], "held": []}
+    new = {**old, "slug": "new", "queued": [{"number": 999, "title": "Moved"}]}
+    snapshot = _snapshot(old, waiting_facts={999: {"lane": "old", "title": "Recorded title",
+                                                   "authored": {"text": "Still waiting"}}})
+    old_items = sum(lane_items(snapshot, old), [])
+    assert [(item["number"], item["title"]) for item in old_items] == [(999, "Recorded title")]
+    assert sum(lane_items(snapshot, new), []) == []
