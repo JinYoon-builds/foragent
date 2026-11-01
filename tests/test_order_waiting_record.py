@@ -36,3 +36,20 @@ def test_record_reads_the_public_section_once_and_uses_its_return_value(monkeypa
     monkeypatch.setattr(order_waiting, "section", canonical)
     assert order_waiting.read_waiting("Other body") == {"text": "From the canonical reader."}
     assert calls == ["Other body"]
+
+
+def test_projection_reads_owner_replacements_and_their_notification():
+    original = "## Goal\nKeep the goal.\n\n## Waiting\nOld wait.\n\n## Done when\nKeep the checks.\n"
+    raw = "Reason: Locale choice\nNext condition: Record the locale\nResponsible role: planning"
+    changed = order_waiting.replace_section(original, raw)
+    changed = order_waiting.stamp(original, changed)
+    assert order_waiting.read_waiting(changed) == {
+        "text": raw, "reason": "Locale choice", "next_condition": "Record the locale",
+        "responsible_role": "planning",
+    }
+    line = order_waiting.notification(changed)
+    assert line.count("Reason: Locale choice") == 1
+    assert "Next condition: Record the locale" in line and "Responsible role: planning" in line
+    cleared = order_waiting.replace_section(changed, None)
+    assert order_waiting.read_waiting(cleared) is None
+    assert cleared.startswith("## Goal\nKeep the goal.\n\n## Done when\nKeep the checks.\n")

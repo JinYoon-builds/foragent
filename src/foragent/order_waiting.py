@@ -53,6 +53,22 @@ def read_waiting(body: str | None) -> dict[str, str] | None:
     return {"text": raw, **values} if len(values) == len(fields) else {"text": raw}
 
 
+def replace_section(body: str, text: str | None) -> str:
+    """Replace or clear this issue's wait, preserving everything outside its section."""
+    replacement = f"## Waiting\n{text.strip()}\n\n" if text is not None else ""
+    match = HEADING.search(body)
+    if match is None:
+        return body + ("\n\n" if body else "") + replacement if replacement else body
+    end = _END.search(body, match.end())
+    return body[:match.start()] + replacement + (body[end.start():] if end else "")
+
+
+def notification(body: str, language: str = "en") -> str:
+    """The line owed by this body's stamped transition, for a caller's existing comment."""
+    recorded = _prior(body)
+    return comment_line(*recorded, section(body), language) if recorded is not None else ""
+
+
 def _digest(text: str | None) -> str:
     return hashlib.sha256(("" if text is None else "w:" + text).encode("utf-8")).hexdigest()
 

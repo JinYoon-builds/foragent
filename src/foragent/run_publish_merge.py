@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
     from foragent.ci_mode import ComparisonEvidence
+    from foragent.run_group_ci import GroupComparisonEvidence
     from foragent.git import GitRepo
     from foragent.runner import RunContext
     from foragent.state import Approval
@@ -55,7 +56,7 @@ def _final_merge_inputs(
     n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
     head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
     approved_body_sha: str | None = None,
-    comparison: ComparisonEvidence | None = None,
+    comparison: ComparisonEvidence | GroupComparisonEvidence | None = None,
 ) -> _MergeInputs:
     """Read every mutable prerequisite after acquiring the final merge lock.
 

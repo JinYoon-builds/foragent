@@ -26,6 +26,47 @@ from conftest import ACCEPTANCE, BASE_TIME, git_command
 from runner_support import BODY, enable_reviewer, run_case
 
 
+def test_custom_baseline_check_without_seconds_uses_elapsed_time(git_history, tmp_path, monkeypatch):
+    from foragent import run_baseline
+
+    node = "tests/acceptance/test_keep.py::test_keep"
+    git_history.update({node.split("::")[0]: "def test_keep(): pass\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    clock = [10.0]
+    monkeypatch.setattr(run_baseline, "monotonic", lambda: clock[0])
+    calls = []
+
+    def check(command, root):
+        calls.append(command)
+        clock[0] += 123.0
+        report = next(word.split("=", 1)[1] for word in shlex.split(command)
+                      if word.startswith("--junitxml="))
+        suite = ET.Element("testsuite")
+        ET.SubElement(suite, "testcase", file=node.split("::")[0], name="test_keep")
+        ET.ElementTree(suite).write(report, encoding="unicode")
+        return CheckResult(command, 0, False, "")  # Custom callers may have no clock.
+
+    def capture():
+        return run_baseline._capture_baseline(
+            ctx, "pytest", "origin/main", log=store.log_path(1),
+            report=store.root / "capture.xml", check=check,
+            prepare=lambda: None, wait=lambda acquire: acquire(),
+        )
+
+    fresh = capture()
+    cached = capture()
+    assert fresh.node_ids == cached.node_ids == (node,)
+    assert fresh.duration_seconds == cached.duration_seconds == 123.0
+    saved, = (store.root.parent / "baselines").glob("*.json")
+    assert json.loads(saved.read_text())["duration_seconds"] == 123.0
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("options", ["", "--rootdir=tests --junit-prefix=project"])
 def test_baseline_preserves_exact_parameterized_ids_and_excludes_nonpasses(run_case, options):
     c = run_case
@@ -598,3 +639,45 @@ def test_with_python_path_joins_inline_and_env_assignments():
         "A='' env PYTHONPATH='/p d:my src' python -m pytest -o addopts=")
     assert _with_python_path("PYTHONPATH=src python -m pytest", "/p").startswith("PYTHONPATH=/p:src ")
     assert shlex.split(_with_python_path("python -m pytest", "/p d"))[0].startswith("PYTHONPATH=/p d")
+
+
+@pytest.mark.parametrize("compatible", [False, True], ids=["exact-key", "compatible-key"])
+def test_legacy_cache_hit_retains_its_own_duration_without_capture(git_history, tmp_path, compatible):
+    from foragent import run_baseline
+
+    store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
+    ctx = RunContext(
+        repo="owner/repo", repo_root=git_history.clone, tracker=FakeTracker(), store=store,
+        config=Config(), git=GitRepo(git_history.clone), now=lambda: BASE_TIME,
+    )
+    command = "pytest -q"
+    keep = "tests/acceptance/test_keep.py"
+    git_history.update({keep: "def test_keep(): pass\n"})
+    git_command(git_history.clone, "fetch", "-q", "origin")
+    build = run_baseline._baseline_build(ctx, command, git_history.tip, store.log_path(1))
+    cache = store.root.parent / "baselines"
+    cache.mkdir(exist_ok=True)
+    node = f"{keep}::test_keep"
+    saved = {"created_at": ctx.now().isoformat(), "node_ids": [node], "collected_ids": [node],
+             "failing_ids": [], "excluded": build.excluded, "scope": build.scope}
+    key = "compatible-selection" if compatible else build.key
+    record = cache / f"{key}.json"
+    record.write_text(json.dumps(saved))
+    record.with_suffix(".xml").write_text('<testsuite time="736"/>')
+    # The requested key's report must never supply a compatible selection's timing.
+    if compatible:
+        (cache / f"{build.key}.xml").write_text('<testsuite time="99"/>')
+    (cache / "newer-selection.json").write_text(json.dumps({**saved, "duration_seconds": 2000}))
+
+    def unexpected_capture(*args, **kwargs):
+        pytest.fail("A reusable legacy baseline must not be captured again")
+
+    result = run_baseline._capture_baseline(
+        ctx, command, git_history.tip, log=store.log_path(1), report=store.root / "unused.xml",
+        check=unexpected_capture, prepare=lambda: None, wait=lambda acquire: acquire(),
+        required_ids=frozenset({node}) if compatible else None,
+    )
+    assert result.node_ids == (node,)
+    assert result.duration_seconds == 736
+    assert "duration_seconds" not in json.loads(record.read_text())
+    assert "cache=hit" in store.log_path(1).read_text()
