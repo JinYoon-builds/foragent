@@ -24,8 +24,18 @@ Both issues use the existing `roles` lane: `.foragent.yml` assigns `orch_inbox.p
 ## Scope assumptions
 This order covers future completion records and evidence-based signal re-raising. It does not infer or manufacture historical answers or proposal decisions. Signal tests cover hot_overlap_files and idle_lanes_with_backlog as requested, plus files_over_limit and repeated_design_holds from the same reported incident. The idle-lane binding constraint stays unchanged in the count-drift tests; a genuinely changed constraint is still relevant evidence. There is no shared interface dependency between the issues.
 
-## Earlier checks superseded by the current request
-`tests/acceptance/test_role_signal_not_now.py::test_changed_facts_raise_exactly_one_new_request[ready-work-changes]` expects a ready-count change alone to re-raise. `tests/acceptance/test_role_signal_raise.py::test_an_answered_signal_waits_for_the_cooldown_while_it_stays_met` expects a called signal to re-raise after 12 hours without new evidence. Those expectations conflict with Jin's 2026-11-01 request. The new contract supersedes them; this planning run does not alter either locked file. No historical/full-suite pass is claimed; the Done when checks below are targeted at the new contract.
+## QA reconciliation of the older locked contracts (#1337)
+Classification: this conflict is a planning judgment problem, not a tool defect. The first draft documented contradictory locked expectations without delivering corrected checks. The missing context was explicit ownership and authority to reconcile those locked tests; the QA instruction now confirms the orchestrator owns them and supplies that authority. The correction is a complete, executable acceptance contract in this same issue. No runtime script gains a judgment rule, classifier, or new agent step order.
+
+| Existing case | Judgment about its facts | Contract in this order |
+| --- | --- | --- |
+| `test_changed_facts_raise_exactly_one_new_request[binding-changes]` | Meaningful: the binding changes from cap to quota. | Keep re-raising exactly once on the next tick. |
+| `test_changed_facts_raise_exactly_one_new_request[idle-lanes-change]` | Meaningful: skills becomes a newly idle lane. | Keep re-raising exactly once on the next tick. |
+| `test_changed_facts_raise_exactly_one_new_request[ready-work-changes]` | Count drift: orch has 4 then 5 ready issues; the idle and backlog lane sets and binding are unchanged. | Rewrite to zero re-raises, including beyond the old cooldown. Keep the function name and parameter id. |
+| `test_an_answered_signal_waits_for_the_cooldown_while_it_stays_met` | No new evidence: a called path signal is still about the same file; only time passes. | Rewrite to stay quiet after 12 hours; a subsequently merged, newly matching file must still re-raise once. Keep the historical function name. |
+| `test_a_signal_that_clears_can_be_raised_again_inside_the_cooldown` | Meaningful: the condition becomes unmet, then met again. | Keep the existing re-raise expectation unchanged. |
+
+The two corrected full files are carried only by signal-meaningful-change.acceptance_files, with their repository paths added to that issue's files. Its Done when now runs the new file and both corrected older files. The request-answer-record issue and its acceptance file are unchanged. No implementation or source-tree test file is edited in this preparation run.
 
 ## Break-it review
 Request checks fail if completion drops an answer, drops/reverses a decision, counts rejections or ordinary requests, affects a neighboring request, counts the same close twice, or silently completes without an answer. Signal checks fail for raw-count comparison, timer-only suppression, permanent muting, missing a newly affected entity, duplicate raises, or suppression lost when the store is reopened. Tests write no answer/decision/suppression records directly and fake only infrastructure or measured facts. No implementation or mutation-testing patch was applied.
@@ -87,4 +97,61 @@ The corresponding Done when commands use the eventual published tests/acceptance
 ## Publish dry-run verification
 Ran the public CLI equivalent of `fa order publish --dry-run order-out/plan.json` through `foragent.cli.main` with the real local configuration, schema validator, and preview renderer. Only the GitHub boundary used `FakeTracker` with an empty issue list. Subprocess and socket access were blocked. Result: exit 0; exactly the two size-s roles issues, neither blocked, neither approved nor interactive. No issues, acceptance files under tests/, or spec under docs/ were written. This verifies offline publication shape, not live GitHub state.
 
-Final repository audit: HEAD remains cc7ffb9e9bac2cdd7c111f2cd17e802f5a0b8117. The shared main reference advanced externally to 3c15510a56cb6ef68830d0918bad2a9a54b0ec30 after the baseline tests. A read-only git diff showed only docs/specs/2026-11-01-1125-cache-test.md and tests/acceptance/test_issue_record_cache.py differ; src/ and all fixtures used here are identical. No checkout or retest on the advanced reference is claimed.
+
+## QA baseline verification on main
+Pinned main at `a1d5fedccbbac2380efac23e233dab0c6f9e180b` and exported its complete tracked tree using `git archive` into `order-out/.verification/main`. No checkout command was used. Ran the corrected test copies from that snapshot's order-out/tests/acceptance with the snapshot's src/, tests/, tests/acceptance and conftest. This tests the actual main snapshot, rather than relying on the older detached working-tree source. The snapshot and all other verification temporary files remain inside the supplied working directory and are removed after verification.
+
+Environment: UV_PROJECT_ENVIRONMENT=/Users/apple/Dev/foragent/.venv, UV_NO_SYNC=1, UV_OFFLINE=1, UV_CACHE_DIR=$PWD/../uv-cache, TMPDIR=$PWD/../tmp, PYTHONDONTWRITEBYTECODE=1, PYTEST_DISABLE_PLUGIN_AUTOLOAD=1, PYTHONPATH=$PWD/src:$PWD/tests:$PWD/tests/acceptance. Here $PWD is the archived main root. Each file ran separately; no xdist.
+
+```sh
+uv run pytest -q order-out/tests/acceptance/test_role_signal_not_now.py -p conftest --basetemp="$PWD/../not-now" -p no:cacheprovider
+```
+
+Actual result: pytest exit 1 (expected baseline failures).
+```text
+E       AssertionError: Changed binding or a new idle lane must re-raise once; count drift in the same backlog lane must stay quiet
+E       assert 1 == 0
+FAILED order-out/tests/acceptance/test_role_signal_not_now.py::test_changed_facts_raise_exactly_one_new_request[ready-work-changes]
+1 failed, 5 passed in 5.78s
+```
+
+```sh
+uv run pytest -q order-out/tests/acceptance/test_role_signal_raise.py -p conftest --basetemp="$PWD/../raise" -p no:cacheprovider
+```
+
+Actual result: pytest exit 1 (expected baseline failures).
+```text
+E       AssertionError: A called signal must stay quiet after the old cooldown when no new evidence appears
+FAILED order-out/tests/acceptance/test_role_signal_raise.py::test_an_answered_signal_waits_for_the_cooldown_while_it_stays_met
+1 failed, 4 passed in 1.47s
+```
+
+```sh
+uv run pytest -q order-out/tests/acceptance/test_role_signal_meaningful_change.py -p conftest --basetemp="$PWD/../new-signal" -p no:cacheprovider
+```
+
+Actual result: pytest exit 1 (expected baseline failures).
+```text
+E           AssertionError: hot_overlap_files: not-now must stay quiet when only counts/order within the same affected set change
+E           assert ['r1', 'r2'] == ['r1']
+E           AssertionError: idle_lanes_with_backlog: not-now must stay quiet when only counts/order within the same affected set change
+E           AssertionError: files_over_limit: not-now must stay quiet when only counts/order within the same affected set change
+E           AssertionError: repeated_design_holds: not-now must stay quiet when only counts/order within the same affected set change
+E           AssertionError: hot_overlap_files: called must stay quiet when only counts/order within the same affected set change
+E           AssertionError: idle_lanes_with_backlog: called must stay quiet when only counts/order within the same affected set change
+E           AssertionError: files_over_limit: called must stay quiet when only counts/order within the same affected set change
+E           AssertionError: repeated_design_holds: called must stay quiet when only counts/order within the same affected set change
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[not-now-hot-files]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[not-now-idle-lanes]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[not-now-oversized-files]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[not-now-repeated-holds]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[called-hot-files]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[called-idle-lanes]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[called-oversized-files]
+FAILED order-out/tests/acceptance/test_role_signal_meaningful_change.py::test_count_drift_stays_quiet_and_a_new_affected_entity_raises_once[called-repeated-holds]
+8 failed in 4.94s
+```
+
+The corrected ready-work-changes case fails only because main raises one request for same-lane count drift (expected zero). The corrected called-signal case fails only because main re-raises after time alone (expected none). The five and four passing older cases retain meaningful re-raises and existing non-conflicting behavior; no import/setup/infrastructure failure occurred. The eight new cases fail for count/order drift or the old called timer, as in the original baseline. No implementation pass is claimed.
+
+QA dry-run result: `fa order publish --dry-run order-out/plan.json` ran through the public CLI on the archived main with the real local configuration, schema validator and renderer, and only the GitHub boundary replaced by the repository's empty FakeTracker. Exit 0. The preview contains the original two independent roles/s issues and all four acceptance paths, including both corrected older files only under signal-meaningful-change. Subprocess/socket access was blocked; no issues or test files were published. This is an offline shape check, not a check of live GitHub issue state.
