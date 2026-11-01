@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -66,6 +67,83 @@ def test_dead_entries_are_skipped_and_an_ineligible_live_entry_ends_the_group(tm
 def test_a_lone_holder_is_no_group(tmp_path):
     ctx = make_ctx(tmp_path, (5,))
     assert numbers(ctx, 5) == []
+
+
+def record_result(store, verdict, count, **fields):
+    from foragent import orch_events
+
+    return orch_events.append_event(store, NOW, 99, "group-check", "result",
+                                    verdict=verdict, members=[{}] * count, **fields)
+
+
+def test_auto_replays_in_journal_order_and_only_uses_verdict_and_member_count(tmp_path):
+    store = StateStore(tmp_path / "state")
+    config = Config()
+    assert group.group_limit(store, config) == (4, "auto")
+    # Deliberately reverse timestamps: file order, not timestamps, defines the replay.
+    for verdict, count, expected in [
+        ("passed", 4, 5), ("passed", 3, 5), ("failed", 1, 4),
+        ("passed", 4, 5), ("void", 8, 5), ("unknown", 8, 5),
+        ("passed", 5, 6), ("passed", 6, 7), ("passed", 7, 8), ("passed", 8, 8),
+        *[("failed", 1, max(2, 7 - i)) for i in range(8)],
+    ]:
+        event = record_result(store, verdict, count, passed=verdict != "passed")
+        path = store.root / "orch-events.jsonl"
+        lines = path.read_text().splitlines()
+        event["at"] = str(100 - len(lines))
+        lines[-1] = json.dumps(event)
+        path.write_text("\n".join(lines) + "\n")
+        before = path.read_bytes()
+        assert group.group_limit(store, config) == (expected, "auto")
+        assert group.group_limit(store, config) == (expected, "auto")
+        assert path.read_bytes() == before
+    # Only retained history is replayed, with no persisted limit.
+    path.write_text("")
+    assert group.group_limit(store, config) == (4, "auto")
+
+
+def test_auto_ignores_unreadable_and_unusable_events(tmp_path):
+    store = StateStore(tmp_path / "state")
+    store.root.mkdir(parents=True)
+    path = store.root / "orch-events.jsonl"
+    path.write_text("\n".join([
+        "not json", "null", "[]", "1",
+        json.dumps({"kind": "other", "verdict": "failed", "members": []}),
+        json.dumps({"kind": "group-check", "verdict": "failed"}),
+        json.dumps({"kind": "group-check", "verdict": "passed", "members": 4}),
+        json.dumps({"kind": "group-check", "passed": True, "members": [{}] * 4}),
+    ]) + "\n")
+    assert group.group_limit(store, Config()) == (4, "auto")
+    record_result(store, "passed", 4)
+    assert group.group_limit(store, Config()) == (5, "auto")
+    path.unlink()
+    path.mkdir()  # An unreadable journal also leaves the starting limit alone.
+    assert group.group_limit(store, Config()) == (4, "auto")
+
+
+@pytest.mark.parametrize("maximum", [1, 3, 12])
+def test_fixed_limit_ignores_history_without_reading_it(tmp_path, monkeypatch, maximum):
+    from foragent import orch_events
+
+    store = StateStore(tmp_path / "state")
+    record_result(store, "passed", 20)
+    record_result(store, "failed", 1)
+
+    def unexpected_read(*args):
+        pytest.fail("a fixed limit must not read the journal")
+
+    monkeypatch.setattr(orch_events, "events", unexpected_read)
+    assert group.group_limit(store, Config(merge_group_max=maximum)) == (maximum, "fixed")
+
+
+def test_members_use_the_current_auto_limit(tmp_path):
+    ctx = make_ctx(tmp_path, (5, 1, 4, 7, 8, 9), maximum="auto")
+    assert numbers(ctx, 5) == [5, 1, 4, 7]
+    record_result(ctx.store, "passed", 4)
+    assert numbers(ctx, 5) == [5, 1, 4, 7, 8]
+    record_result(ctx.store, "failed", 1)
+    record_result(ctx.store, "failed", 1)
+    assert numbers(ctx, 5) == [5, 1, 4]
 
 
 @pytest.mark.parametrize("measured,remaining,expected", [
