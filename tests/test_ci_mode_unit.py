@@ -1076,17 +1076,18 @@ def test_review_checks_unit_selection_honors_runner_unit_tests(git_history, tmp_
     ('foragent/group-5-abcdef', 'owner/repo', 'main', False),
     ('foragent/batch-1', 'owner/repo', 'release', False),
 ])
-def test_workflow_only_measures_issue_and_group_prs_to_the_primary_base(branch, repo, base, allowed):
+@pytest.mark.parametrize('event', ['pull_request', 'push'])
+def test_workflow_only_measures_issue_and_group_prs_to_the_primary_base(branch, repo, base, allowed, event):
     document = yaml.safe_load(workflow_text(Config(base_branch='release')))
     condition = document['jobs']['acceptance']['if']
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
     assert "startsWith(github.event.pull_request.head.ref, 'foragent/issue-')" in condition
     assert "github.event.pull_request.base.ref == 'release'" in condition
-    github = SimpleNamespace(repository='owner/repo', event=SimpleNamespace(pull_request=SimpleNamespace(
+    github = SimpleNamespace(repository='owner/repo', event_name=event, event=SimpleNamespace(pull_request=SimpleNamespace(
         head=SimpleNamespace(repo=SimpleNamespace(full_name=repo), ref=branch),
         base=SimpleNamespace(ref=base))))
     expression = condition.replace('&&', 'and').replace('||', 'or')
-    assert eval(expression, {'github': github, 'startsWith': str.startswith}) is allowed
+    assert eval(expression, {'github': github, 'startsWith': str.startswith}) is (allowed and event == 'pull_request')
 
 
 @pytest.mark.parametrize('damage', ['foreign-run', 'missing-run', 'wrong-workflow', 'wrong-repository',
@@ -1126,10 +1127,11 @@ def test_measurement_cannot_read_publication_credentials(tmp_path, monkeypatch):
     acceptance.mkdir(parents=True)
     secret_names = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
                     'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']
-    for name in secret_names:
+    hidden_names = [*secret_names, 'FA_BASE_CACHE_FILE', 'FA_BASE_CACHE_MODE', 'FA_CACHED_RESULTS']
+    for name in hidden_names:
         monkeypatch.setenv(name, 'sentinel-checks-write-token')
     (acceptance / 'test_credentials.py').write_text(
-        f'import os\ndef test_credentials():\n    assert not set({secret_names!r}) & os.environ.keys()\n')
+        f'import os\ndef test_credentials():\n    assert not set({hidden_names!r}) & os.environ.keys()\n')
     (tmp_path / 'fa_measurement.py').write_bytes(
         (Path(__file__).parents[1] / 'src/foragent/ci_pytest.py').read_bytes())
     monkeypatch.setenv('FA_SHARDS', '1')
@@ -1140,9 +1142,9 @@ def test_measurement_cannot_read_publication_credentials(tmp_path, monkeypatch):
     assert value['complete'] and value['passing_ids'] == ['tests/acceptance/test_credentials.py::test_credentials']
     workflow = yaml.safe_load(workflow_text(Config()))
     measurement = workflow['jobs']['acceptance']
-    assert measurement['permissions'] == {'contents': 'read'}
+    assert measurement['permissions'] == {'contents': 'read', 'actions': 'read'}
     assert measurement['steps'][0]['with']['persist-credentials'] is False
-    step = measurement['steps'][2]
+    step = next(step for step in measurement['steps'] if step.get('id') == 'compare')
     assert step['working-directory'] == '${{ runner.temp }}'
     assert not set(secret_names) & step['env'].keys()
     assert 'PYTHONPATH' not in step['env']
