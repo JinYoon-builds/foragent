@@ -121,7 +121,7 @@ def test_parking_again_for_the_same_reason_adds_no_record(git_history, tmp_path,
     added = _new_comments(case, before)
     assert len(added) == 1 and "wait for  the design" in added[0]
     orch_park.park(case.ctx, 1, "wait for the design")
-    assert len(_new_comments(case, before)) == 1, "A new park explanation alone is no issue-state change"
+    assert len(_new_comments(case, before)) == 1, "The normalized public waiting reason is unchanged"
 
 
 @pytest.mark.parametrize("text", ["echo a ↵ echo b", "a ↵\nb", "a\n↵b", "x↵ y", " ↵ ", "↵↵\n↵"])
@@ -167,7 +167,10 @@ def test_escalation_and_park_texts_with_a_literal_separator_are_distinct_facts(g
     assert "step one ↵ step two" in decode_line(added[2].partition("--> ")[2])
     orch_park.park(case.ctx, 1, "wait\nfor design")
     orch_park.park(case.ctx, 1, "wait ↵ for design")
-    assert len(_new_comments(case, before)) == 5, "Only the first park changes labels; explanations do not define state"
+    added = _new_comments(case, before)
+    assert len(added) == 6, "Main now publishes the waiting reason: changing it is a shared-state change"
+    assert all(len(body.splitlines()) == 1 for body in added)
+    assert "wait ↵ for design" in decode_line(added[-1].partition("--> ")[2])
 
 
 @pytest.mark.parametrize("label", ["blocked", "needs-human", "approved"])
@@ -310,6 +313,7 @@ def test_reason_code_and_summary_survive_reopening_and_each_counts_as_a_change(t
 
 
 def test_unpark_without_a_label_change_journals_but_does_not_comment(git_history, tmp_path, monkeypatch):
+    """Historical name retained; main now requires the public unpark transition too."""
     import json
 
     from foragent import orch_park
@@ -319,12 +323,14 @@ def test_unpark_without_a_label_change_journals_but_does_not_comment(git_history
     orch_park.park(case.ctx, 1, "wait")
     before = len(case.tracker.list_comments(1))
     orch_park.unpark(case.ctx, 1)
-    assert _new_comments(case, before) == []
+    added = _new_comments(case, before)
+    assert len(added) == 1 and "kind=unparked" in added[0], "Clearing GitHub park intent is a change without a label change"
+    assert not orch_park.is_parked(case.store, 1)
     events = [json.loads(line) for line in (case.store.root / "orch-events.jsonl").read_text().splitlines()]
     assert events[-1]["kind"] == "unparked"
     orch_park.park(case.ctx, 1, "wait", for_person=True)
     orch_park.unpark(case.ctx, 1)
-    assert len(_new_comments(case, before)) == 2
+    assert len(_new_comments(case, before)) == 3
 
 
 def test_queued_repark_observes_restored_blocked_without_reading_old_comments(
@@ -335,13 +341,15 @@ def test_queued_repark_observes_restored_blocked_without_reading_old_comments(
 
     case = github_outbox_case(git_history, tmp_path, monkeypatch, action="remove_labels")
     orch_park.park(case.ctx, 1, "wait")
-    first = [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
+    pending = persisted_store(case).github_outbox()
+    assert any(row["action"] == "update_issue" and "Reason: wait" in row["body"] for row in pending)
+    first = [row for row in pending if row["action"] == "comment"]
     assert len(first) == 1
     orch_park.park(case.ctx, 1, "wait")
-    assert [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"] == first
+    assert [row for row in persisted_store(case).github_outbox() if row["action"] == "comment"] == first
     RecordingTracker(case.ctx.tracker, case.ctx, queue_writes=True).add_labels(1, ["blocked"])
     orch_park.park(case.ctx, 1, "wait")
-    comments = [row for row in outbox_rows(persisted_store(case)) if row["action"] == "comment"]
+    comments = [row for row in persisted_store(case).github_outbox() if row["action"] == "comment"]
     assert len(comments) == 2, "A queued blocked removal is still a state change"
 
 

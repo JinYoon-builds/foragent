@@ -7,7 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -95,7 +95,7 @@ class Config:
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
-    merge_group_max: int = 4
+    merge_group_max: int | Literal["auto"] = "auto"
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None

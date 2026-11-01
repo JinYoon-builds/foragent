@@ -347,7 +347,10 @@ def test_a_failing_open_pr_flag_still_leaves_the_stop_event_and_comment(case, mo
     assert len(_stops(case)) == len(first) == 1 and ORCH_MARKER in first[0].body
     _restore_stopped(case.ctx, 1, "reprioritize", scheduler.TickReport())
     assert len(_stops(case)) == 1 and tracker.list_comments(1) == first
+    assert case.ctx.tracker.current_issue(1).labels == {"approved", "blocked"}
+    case.ctx.tracker.flush_outbox()
     assert tracker.get_issue(1).labels == {"approved", "blocked"}
+    assert len(_stops(case)) == 1 and tracker.list_comments(1) == first
 
 
 @pytest.mark.parametrize("state,labels", [

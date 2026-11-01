@@ -131,8 +131,8 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
         return issue
     # A response remains effective until a later blocker/run starts a new clock.
-    responses = [at for at in (orch_park.parked_at(ctx.store, issue.number),
-                               acknowledged_at(ctx.store, issue.number)) if at is not None]
+    parked = orch_park.parked_at(ctx.store, issue.number, comments=row.get("comments", []))
+    responses = [at for at in (parked, acknowledged_at(ctx.store, issue.number)) if at is not None]
     if responses and max(responses) > since:
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])

@@ -39,9 +39,13 @@ IMPLEMENTER_TEST_RULE = "When you write or fix a test, check it by the break-it 
 
 PANEL_MERGE_PROMPT = (
     "Independent reviewers checked this change, each from its own share of the review perspectives. "
-    "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
-    "and reproducible against the diff above. Your reply is the final review: give the verdict and the "
-    "kept findings in the format above. Reviewer verdicts do not count; only yours does."
+    "Their raw findings follow, unedited; several may describe the same defect in different words. "
+    "Group the findings by defect class, not by identical text: findings with one root cause are one class, "
+    "even when their wording, lines or files differ. Keep only the classes you judge real and reproducible "
+    "against the diff above, and leave out every claim you dismiss. For each kept class give one finding "
+    "line `path:line — summary`, then indented lines `class: <name>`, the evidence, and every affected "
+    "instance (path:line). Your reply is the final review: give the verdict and the kept classes in the "
+    "format above. Reviewer verdicts do not count; only yours does."
 )
 
 
