@@ -27,7 +27,7 @@ def run(args) -> int:
     except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
         print("foragent: " + cli.text("decisions_ledger_missing", config.language, path=ledger), file=cli.sys.stderr)
         return 1
-    rows = decisions.view(root, store.confirmed_local_issues(), text)
+    rows = decisions.view(root, decisions.observed_rows(store._issue_view()), text)
     if args.json:
         print(cli.json.dumps(rows, ensure_ascii=False))
         return 0

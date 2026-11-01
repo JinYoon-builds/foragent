@@ -110,34 +110,6 @@ class IssueRefreshMixin:
             self._write_json(self.root / "issues.json", snapshot)
             return sorted(dropped)
 
-    def confirmed_local_issues(self) -> list[dict[str, Any]]:
-        """Observed facts plus accepted sends; unsent intent never proves decision completion."""
-        from foragent.state_observations import FACTS, abandoned, latest, sent_at, sent_labels
-
-        record = self._issue_view()
-        accepted = []
-        for intent in record.get("outbox", []):
-            if abandoned(intent) or intent["action"] == "comment":
-                continue
-            if intent["action"] == "remove_labels":
-                labels = sorted(sent_labels(intent))
-                if labels:
-                    accepted.append({**intent, "labels": labels})
-            elif sent_at(intent) is not None:
-                accepted.append(intent)
-        record["outbox"] = accepted
-        # Older snapshots stored queued effects on the row and its observed facts in this base.
-        for key, base in record.get("outbox_base", {}).items():
-            row = record["issues"].get(key)
-            if row is not None and row.get("observed_at") is None:
-                row.update({name: base[name] for name in (*FACTS, "observed_at") if name in base})
-        for row in record["issues"].values():
-            facts, seen = latest(record, row["number"])
-            if facts is None and seen is not None:
-                # A later intent can keep a row after an absence; its old close/merge proves nothing.
-                row.update(state="unknown", state_reason=None, merged=False, observed_at=seen.isoformat())
-        return [self._visible(record, row) for row in sorted(record["issues"].values(), key=lambda row: row["number"])]
-
     def merged_pr_listing(self) -> dict[str, Any] | None:
         """The stored merged-PR listing and the refresh start it covers, if any."""
         try:

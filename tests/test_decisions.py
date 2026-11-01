@@ -55,7 +55,8 @@ def test_parent_map_and_spec_reference_link_legacy_children_exactly(tmp_path):
         {"number": 1, "body": '<!-- foragent:plan id=old map={"a": 2} -->', "state": "open"},
         {"number": 2, "body": "no marker", "state": "closed", "state_reason": "completed",
          "observed_at": NOW.isoformat()},
-        {"number": 3, "body": "See docs/specs/ref.md", "state": "closed", "state_reason": "completed",
+        {"number": 3, "body": "See docs/specs/ref.md\n<!-- foragent:plan id=ref-order map={} -->",
+         "state": "closed", "state_reason": "completed",
          "merged": True},
         {"number": 4, "body": "D7 mentioned in prose only", "state": "open"},
     ]
@@ -128,7 +129,7 @@ def test_citations_match_whole_identifiers_only(tmp_path, text, linked):
 def test_spec_references_match_whole_paths_only(tmp_path, body, linked):
     (tmp_path / "docs/specs").mkdir(parents=True)
     (tmp_path / "docs/specs/old.md").write_text("D74\n")
-    result = {row["id"]: row["issues"] for row in decisions.view(tmp_path, [{"number": 2, "body": body}], LEDGER)}
+    result = {row["id"]: row["issues"] for row in decisions.view(tmp_path, [{"number": 2, "body": body + "\n<!-- foragent:plan id=order map={} -->"}], LEDGER)}
     assert result["D74"] == ([2] if linked else [])
 
 
@@ -206,11 +207,11 @@ def issue(state="open", reason=None, body=None, labels=()):
 
 
 def d79(tmp_path, state):
-    return next(row for row in decisions.view(tmp_path, state.confirmed_local_issues(), LEDGER)
+    return next(row for row in decisions.view(tmp_path, decisions.observed_rows(state._issue_view()), LEDGER)
                 if row["id"] == "D79")
 
 
-def test_undelivered_close_is_local_intent_until_delivery(tmp_path):
+def test_sent_close_is_not_completion_until_observation(tmp_path):
     clock = Clock()
     state = clock.store(tmp_path)
     state.refresh_local_issues([issue()], [], {}, NOW)
@@ -221,10 +222,11 @@ def test_undelivered_close_is_local_intent_until_delivery(tmp_path):
     assert d79(tmp_path, state)["state"] == "in progress", "GitHub has not closed it yet"
     clock.at = minutes(2)
     state.record_github_attempt(entry["id"], clock.at, True)
-    assert d79(tmp_path, state)["state"] == "done", "Delivery means GitHub accepted the close"
+    assert d79(tmp_path, state)["state"] == "in progress", "A send does not replace the recorded observation"
     state.refresh_local_issues([issue("closed", "completed")], [], {}, minutes(3))
     row = state.local_issues()[0]
     assert row["state_reason"] == "completed" and state.github_outbox() == []
+    assert d79(tmp_path, state)["state"] == "done"
 
 
 def test_pending_comment_does_not_hide_a_newer_completion_reason(tmp_path):
@@ -258,7 +260,7 @@ def test_a_newer_contradicting_observation_drops_the_pending_write(tmp_path, act
     assert state.refresh_local_issues([seen], [], {}, minutes(2)) == ([] if action == "close_issue" else [9])
     assert state.github_outbox() == []
     row = state.local_issues()[0]
-    assert row[field] == value and state.confirmed_local_issues()[0][field] == value
+    assert row[field] == value and decisions.observed_rows(state._issue_view())[0][field] == value
 
 
 @pytest.mark.parametrize("action, payload, field, local", [
@@ -277,7 +279,7 @@ def test_a_pending_write_stays_over_observations_that_predate_it_or_show_no_chan
     assert state.refresh_local_issues([issue(body="edited")], [], {}, minutes(3)) == []
     row = state.local_issues()[0]
     assert row[field] == local and len(state.github_outbox()) == 1
-    assert state.confirmed_local_issues()[0]["body"] == "edited"
+    assert decisions.observed_rows(state._issue_view())[0]["body"] == "edited"
     # A later listing that shows GitHub unchanged means the write is still undelivered.
     assert state.refresh_local_issues([issue(body="edited")], [], {}, minutes(6)) == []
     assert state.local_issues()[0][field] == local and len(state.github_outbox()) == 1
@@ -290,12 +292,12 @@ def test_a_late_older_refresh_after_a_newer_one_applies_nothing(tmp_path):
     clock.at = minutes(1)
     state.queue_github_write(9, "add_labels", labels=["x"])
     state.refresh_local_issues([issue(body=decisions.marker(["D74"]))], [], {}, minutes(3))
-    before = (state.local_issues(), state.github_outbox(), state.confirmed_local_issues())
+    before = (state.local_issues(), state.github_outbox(), decisions.observed_rows(state._issue_view()))
     clock.at = minutes(10)
     assert state.refresh_local_issues([issue(body=decisions.marker(["D79"]), labels=["z"])], [], {},
                                       minutes(2)) == []
-    assert (state.local_issues(), state.github_outbox(), state.confirmed_local_issues()) == before
-    assert decisions.explicit(state.confirmed_local_issues()[0]["body"]) == ["D74"]
+    assert (state.local_issues(), state.github_outbox(), decisions.observed_rows(state._issue_view())) == before
+    assert decisions.explicit(decisions.observed_rows(state._issue_view())[0]["body"]) == ["D74"]
     assert d79(tmp_path, state)["issues"] == [] and state.issues_observation()["as_of"] == minutes(3).isoformat()
 
 
@@ -308,7 +310,7 @@ def test_a_late_older_refresh_after_a_newer_one_keeps_a_dropped_write_dropped(tm
     state.refresh_local_issues([issue(body=decisions.marker(["D74"]), labels=["person"])], [], {}, minutes(3))
     assert state.github_outbox() == []
     state.refresh_local_issues([issue()], [], {}, minutes(2))
-    row = state.confirmed_local_issues()[0]
+    row = decisions.observed_rows(state._issue_view())[0]
     assert decisions.explicit(row["body"]) == ["D74"] and row["observed_at"] == minutes(3).isoformat()
 
 
@@ -395,7 +397,7 @@ def test_single_read_under_a_queued_close_confirms_what_github_shows(tmp_path, g
     state.record_issue(issue(github_state, reason), {})
     assert state.local_issues()[0]["state"] == "closed"
     assert len(state.github_outbox()) == (1 if github_state == "open" else 0)
-    confirmed = state.confirmed_local_issues()[0]
+    confirmed = decisions.observed_rows(state._issue_view())[0]
     assert (confirmed["state"], confirmed["state_reason"]) == (github_state, reason)
     assert d79(tmp_path, state)["state"] == "in progress"
 
@@ -407,7 +409,7 @@ def test_confirmed_view_keeps_facts_recorded_after_a_write_was_queued(tmp_path):
     clock.at = minutes(1)
     state.queue_github_write(9, "comment", body="note")
     state.update_local_issue(9, merged=True)
-    assert state.confirmed_local_issues()[0]["merged"] is True
+    assert decisions.observed_rows(state._issue_view())[0]["merged"] is True
     assert d79(tmp_path, state)["state"] == "done"
 
 
@@ -476,14 +478,14 @@ def _legacy_snapshot(state, row, outbox, base):
         "outbox_base": {"9": base}, "outbox_sequence": len(outbox)}))
 
 
-def test_a_legacy_row_with_an_undelivered_close_reads_its_baseline(tmp_path):
+def test_a_legacy_row_without_observation_provenance_cannot_prove_completion(tmp_path):
     state = store(tmp_path)
     open_row = {"number": 9, "title": "T", "body": decisions.marker(["D79"]), "labels": [], "lane": "main",
                 "state": "open", "pr_number": 3, "merged": True, "comments": []}
     _legacy_snapshot(state, {**open_row, "state": "closed"},
                      [{"id": 1, "issue": 9, "action": "close_issue", "body": None,
                        "queued_at": NOW.isoformat()}], open_row)
-    assert state.confirmed_local_issues()[0]["state"] == "open"
+    assert decisions.observed_rows(state._issue_view())[0]["state"] == "unknown"
     assert d79(tmp_path, state)["state"] == "in progress"
 
 
@@ -496,7 +498,7 @@ def test_writes_queued_before_the_first_observation_are_not_observed_facts(tmp_p
     state = store(tmp_path)
     state.queue_github_write(9, action, **payload)
     assert state.local_issues()[0][field] != observed, "Local intent shows the write"
-    assert state.confirmed_local_issues()[0][field] == observed
+    assert decisions.observed_rows(state._issue_view())[0][field] == observed
     assert d79(tmp_path, state)["issues"] == []
 
 
@@ -510,7 +512,7 @@ def test_an_observed_close_reason_outweighs_an_unsent_close(tmp_path, reason):
     seen = issue("open", "reopened") if reason == "reopened" else issue("closed", "not_planned")
     state.refresh_local_issues([seen], [], {}, minutes(2))
     assert len(state.github_outbox()) == (1 if reason == "reopened" else 0)
-    assert state.confirmed_local_issues()[0]["state_reason"] == reason
+    assert decisions.observed_rows(state._issue_view())[0]["state_reason"] == reason
     assert d79(tmp_path, state)["state"] == "in progress"
 
 
@@ -701,7 +703,7 @@ def test_writes_github_does_not_yet_show_stay_queued(tmp_path, seen, writes):
     assert [entry["action"] for entry in state.github_outbox()] == [action for action, _ in writes]
 
 
-def test_a_flushed_write_answer_and_a_missing_check_are_observations(tmp_path):
+def test_decision_completion_uses_ingest_observations_after_a_send(tmp_path):
     clock = Clock()
     state = clock.store(tmp_path)
     state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
@@ -718,7 +720,7 @@ def test_a_flushed_write_answer_and_a_missing_check_are_observations(tmp_path):
     clock.at = minutes(2)
     tracker = _recording(state, clock, Writer())
     tracker.flush_outbox()
-    assert state.local_issues()[0]["state_reason"] == "not_planned"
+    assert d79(tmp_path, state)["state"] == "done", "Sending changes no recorded completion facts"
     clock.at = minutes(3)
     assert tracker._missing(9) is False
     assert state.local_issues()[0]["state_reason"] == "reopened"
@@ -865,47 +867,13 @@ def test_delayed_write_ack_cannot_restore_an_older_decision_link(tmp_path, path)
             state.update_local_issue(9, body=decisions.marker(["D79"]), observed_at=minutes(1))
         else:
             state.record_labels(9, ["approved"], remove=False, lanes={}, observed_at=minutes(1))
-    result = {row["id"]: row for row in decisions.view(tmp_path, state.confirmed_local_issues(), LEDGER)}
+    result = {row["id"]: row for row in decisions.view(tmp_path, decisions.observed_rows(state._issue_view()), LEDGER)}
     assert result["D7"]["issues"] == [9] and result["D7"]["observed_at"] == minutes(2).isoformat()
     assert result["D79"]["issues"] == [] and result["D74"]["issues"] == []
     assert state.github_outbox() == []
 
 
-@pytest.mark.parametrize("action, payload", [
-    ("add_labels", {"labels": ["x"]}), ("remove_labels", {"labels": ["x"]}),
-    ("update_issue", {"title": "T", "body": decisions.marker(["D79"])}),
-    ("close_issue", {"body": None}),
-])
-@pytest.mark.parametrize("route", ["direct", "flush"])
-def test_each_write_issue_echo_is_an_observation(tmp_path, action, payload, route):
-    clock = Clock()
-    state = clock.store(tmp_path)
-    state.record_issue(issue("closed", "completed"), {})
-    clock.at = minutes(1)
-    if route == "flush":
-        state.queue_github_write(9, action, **payload)
-
-    class Echo:
-        def __getattr__(self, name):
-            def response(*args, **kwargs):
-                return issue("open", "reopened")
-            return response
-
-    clock.at = minutes(2)
-    reader = _recording(state, clock, Echo())
-    if route == "flush":
-        reader.flush_outbox()
-    elif action == "update_issue":
-        reader.update_issue(9, **payload)
-    elif action == "close_issue":
-        reader.close_issue(9)
-    else:
-        getattr(reader, action)(9, payload["labels"])
-    assert d79(tmp_path, state) == {"id": "D79", "issues": [9], "state": "in progress",
-                                    "observed_at": minutes(2).isoformat()}
-
-
-def test_confirmed_view_shows_only_successful_parts_of_a_label_removal(tmp_path):
+def test_sent_label_removals_do_not_change_the_decision_observation(tmp_path):
     clock = Clock()
     state = clock.store(tmp_path)
     state.record_issue(issue(labels=["a", "b", "c"]), {})
@@ -914,7 +882,7 @@ def test_confirmed_view_shows_only_successful_parts_of_a_label_removal(tmp_path)
     state.record_github_attempt(entry["id"], minutes(1), True, labels=["a"])
     before = (state.root / "issues.json").read_bytes()
     assert state.local_issues()[0]["labels"] == ["c"]
-    assert state.confirmed_local_issues()[0]["labels"] == ["b", "c"]
+    assert decisions.observed_rows(state._issue_view())[0]["labels"] == ["a", "b", "c"]
     assert (state.root / "issues.json").read_bytes() == before
 
 
@@ -928,3 +896,80 @@ def test_a_newer_absence_held_by_later_intent_never_proves_completion(tmp_path):
     assert len(state.local_issues()) == 1 and len(state.github_outbox()) == 1
     assert d79(tmp_path, state)["state"] == "in progress"
     assert d79(tmp_path, state)["observed_at"] == minutes(2).isoformat()
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("ids", [[], ["D79"]], ids=["unlinked", "linked"])
+def test_marker_line_endings_preserve_explicit_links_and_strip_one_line(newline, ids):
+    old = "Old body" + newline + decisions.marker(ids) + newline
+    assert decisions.explicit(old) == ids
+    assert decisions.MARKER_LINE.sub("", old) == "Old body" + newline
+    new = decisions.with_marker("New body" + newline + decisions.marker(["D7"]) + newline, None, old)
+    assert decisions.explicit(new) == ids
+    assert [line for line in new.splitlines() if "foragent:decisions" in line] == [decisions.marker(ids)]
+
+
+def test_crlf_explicit_empty_links_do_not_fall_back_to_a_legacy_spec(tmp_path):
+    (tmp_path / "docs/specs").mkdir(parents=True)
+    (tmp_path / "docs/specs/legacy.md").write_text("D79\n")
+    body = '<!-- foragent:plan-child id=legacy key=a -->\r\n<!-- foragent:decisions [] -->\r\n'
+    result = {row["id"]: row for row in decisions.view(tmp_path, [{"number": 9, "body": body}], LEDGER)}
+    assert result["D79"]["issues"] == []
+    assert result["D79"]["state"] == "decided, nothing ordered"
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "child", "mapped-child", "parent"])
+def test_spec_reference_links_only_a_published_parent(tmp_path, kind):
+    (tmp_path / "docs/specs").mkdir(parents=True)
+    (tmp_path / "docs/specs/ref.md").write_text("D79\n")
+    (tmp_path / "docs/specs/own.md").write_text("D74\n")
+    body = "Reference: docs/specs/ref.md\n"
+    if kind == "child":
+        body += "<!-- foragent:plan-child id=own key=a -->\n"
+    elif kind == "parent":
+        body += "<!-- foragent:plan id=parent map={} -->\n"
+    rows = [{"number": 9, "body": body, "state": "open"},
+            {"number": 10, "body": decisions.marker(["D79"]), "state": "closed", "state_reason": "completed"}]
+    if kind == "mapped-child":
+        rows.append({"number": 1, "body": '<!-- foragent:plan id=own map={"a": 9} -->'})
+    result = {row["id"]: row for row in decisions.view(tmp_path, rows, LEDGER)}
+    assert result["D79"]["issues"] == ([9, 10] if kind == "parent" else [10])
+    assert result["D79"]["state"] == ("in progress" if kind == "parent" else "done")
+    assert result["D74"]["issues"] == ([9] if kind in ("child", "mapped-child") else [])
+
+
+def test_decisions_cli_waits_for_observation_after_an_accepted_close(tmp_path, monkeypatch, capsys):
+    import json
+
+    from foragent import cli
+
+    root = tmp_path / "repo"
+    (root / "docs").mkdir(parents=True)
+    (root / ".foragent.yml").write_text("repo: offline/decisions\nskill_libraries: []\n")
+    (root / "docs/decisions.md").write_text("### D79. Decision\n")
+    state = store(tmp_path)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: state))
+
+    def no_github(*args, **kwargs):
+        pytest.fail("Decision facts must be read locally")
+
+    monkeypatch.setattr(cli, "GhTracker", no_github)
+    state.record_issue(issue(), {}, observed_at=NOW)
+    state.update_local_issue(9, merged=True)
+    entry = state.queue_github_write(9, "close_issue", body=None)
+    state.record_github_attempt(entry["id"], NOW, True)
+    assert state.local_issues()[0]["state"] == "closed"
+
+    def read():
+        before = {p: p.read_bytes() for p in state.root.rglob("*") if p.is_file()}
+        capsys.readouterr()
+        assert cli.main(["decisions", "--json", "--repo-root", str(root)]) == 0
+        output = capsys.readouterr()
+        assert {p: p.read_bytes() for p in state.root.rglob("*") if p.is_file()} == before
+        return json.loads(output.out)[0]
+
+    assert read() == {"id": "D79", "issues": [9], "state": "in progress", "observed_at": NOW.isoformat()}
+    completed = NOW + timedelta(hours=1)
+    state.record_issue(issue("closed", "completed"), {}, observed_at=completed)
+    assert read() == {"id": "D79", "issues": [9], "state": "done", "observed_at": completed.isoformat()}

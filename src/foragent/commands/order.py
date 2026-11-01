@@ -253,11 +253,9 @@ def run(args) -> int:
     if args.action == "context":
         print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
         return 0
-    if not args.dry_run:
-        # A preview reads GitHub only; a real publication records what it reads and writes.
-        tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
-                                 store=cli.StateStore.for_repo(repo), config=config, git=git,
-                                 now=lambda: cli.datetime.now(cli.UTC)).tracker
+    tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
+                             store=cli.StateStore.for_repo(repo), config=config, git=git,
+                             now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
     report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,

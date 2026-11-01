@@ -523,17 +523,15 @@ class RecordingTracker:
                 if action == "remove_labels":
                     while (entry := current(queued["id"])) is not None and entry["labels"]:
                         label, started = entry["labels"][0], self._started()
-                        result = self._tracker.remove_labels(number, [label])
+                        self._tracker.remove_labels(number, [label])
                         store.record_github_attempt(entry["id"], started, True, labels=[label])
-                        self._acknowledge(number, started, result)
                     continue
                 if (entry := current(queued["id"])) is None:
                     continue
                 started = self._started()
                 if action == "update_issue":
-                    result = self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
+                    self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
                     store.record_github_attempt(entry["id"], started, True)
-                    self._acknowledge(number, started, result)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
                     result = getattr(self._tracker, action)(number, payload)
@@ -541,7 +539,6 @@ class RecordingTracker:
                         store.acknowledge_github_comment(entry, result)
                     else:
                         store.record_github_attempt(entry["id"], started, True)
-                        self._acknowledge(number, started, result)
             except TrackerError as exc:
                 if started is not None and action != "comment":
                     # Every field-send attempt is recorded, whatever its failure.
@@ -614,17 +611,15 @@ class RecordingTracker:
 
     def update_issue(self, n, *, title, body):
         started = self._started()
-        result, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
-                                     started, title=title, body=body)
-        if not queued:
-            self._acknowledge(n, started, result)
+        _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
+                                started, title=title, body=body)
+        del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
     def close_issue(self, n, comment=None):
         started = self._started()
-        result, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                                    else self._tracker.close_issue(n, comment), started, body=comment)
-        if not queued:
-            self._acknowledge(n, started, result)
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                               else self._tracker.close_issue(n, comment), started, body=comment)
+        del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)

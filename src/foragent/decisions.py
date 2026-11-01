@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 ID = re.compile(r"D[1-9][0-9]*")
-MARKER = re.compile(r"^<!-- foragent:decisions (\[[^\n]*\]) -->$", re.MULTILINE)
-MARKER_LINE = re.compile(r"^<!-- foragent:decisions \[[^\n]*\] -->$\n?", re.MULTILINE)
+MARKER = re.compile(r"^<!-- foragent:decisions (\[[^\r\n]*\]) -->\r?$", re.MULTILINE)
+MARKER_LINE = re.compile(MARKER.pattern + r"\n?", re.MULTILINE)
 HEADING = re.compile(r"^### (D[1-9][0-9]*)\.", re.MULTILINE)
 # An exact citation: D74 or the subclause D74-2, but never D740, D74x, D74_1 or XD74.
 CITATION = re.compile(r"(?<![A-Za-z0-9_])(D[1-9][0-9]*)(?![A-Za-z0-9_])")
@@ -79,7 +79,8 @@ def _citations(text: str) -> set[str]:
 def _spec_names(row: dict[str, Any], parents: dict[int, set[str]]) -> set[str]:
     # The publisher writes its own marker after the text, so an earlier one is quoted text.
     body = row.get("body") or ""
-    return set(CHILD.findall(body)[-1:]) | set(SPEC_LINK.findall(body)) | parents.get(row["number"], set())
+    references = set(SPEC_LINK.findall(body)) if PARENT.search(body) else set()
+    return set(CHILD.findall(body)[-1:]) | references | parents.get(row["number"], set())
 
 
 def _parent_map(rows: list[dict[str, Any]]) -> dict[int, set[str]]:
@@ -106,6 +107,20 @@ def _finished(row: dict[str, Any] | None) -> bool:
         return False
     reason = row.get("state_reason")
     return reason == "completed" or (reason is None and row.get("merged") is True)
+
+
+def observed_rows(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read observation-ingest's facts and absence view; write intents are not observations."""
+    from foragent.state_observations import latest
+
+    rows = []
+    for row in sorted(snapshot["issues"].values(), key=lambda row: row["number"]):
+        facts, seen = latest(snapshot, row["number"])
+        if facts is None:
+            # Keep known links, but an absent or unobserved row cannot prove completion.
+            facts = {"state": "unknown", "state_reason": None, "merged": False}
+        rows.append({**row, **facts, "observed_at": seen.isoformat() if seen is not None else None})
+    return rows
 
 
 def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, Any]]:
