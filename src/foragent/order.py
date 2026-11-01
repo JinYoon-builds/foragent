@@ -955,7 +955,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         existing = tracker.get_issue(number) if number is not None else None
         owned = existing is None or OWNED_MARKER in existing.body
         body = (order_done_when.with_record(_published_body(plan, item, repo, config),
-                                            existing.body if existing else None, [])
+                                            existing.body if existing else None)
                 + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
                 + (f"{OWNED_MARKER}\n" if owned else ""))
         # The written body itself records the wait it replaces, so the transition survives a lost comment.
@@ -997,7 +997,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         existing = tracker.get_issue(number)
         # An edit keeps both the owner contract and omitted decision links.
         written = order_done_when.with_record(_published_body(plan, item, repo, config), existing.body,
-                                              item.get("done_when_removals", []))
+                                              item.get("done_when_removals", []), plan["id"])
         body = decision_links.with_marker(_with_contract(written, existing.body),
                                           item.get("decisions"), existing.body)
         body = order_waiting.stamp(existing.body, body)

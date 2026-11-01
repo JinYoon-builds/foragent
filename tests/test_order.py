@@ -4065,12 +4065,14 @@ def test_removal_record_survives_later_edits_and_never_reads_as_done_when(publis
     _publish_edit(case, _edit_plan(**_drop_command("Line one.\n  Line two.")))
     body = tracker.get_issue(40).body
     assert parse_body(body).done_when_commands == ["true"]
-    assert order.order_done_when.records(body) == [{"line": "test  -s kept.txt", "reason": "Line one. Line two."}]
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
     # A later order that names nothing keeps the history, and adds its own after it.
     _publish_edit(case, _edit_plan("keep-lines-2", goal="Keep it better.", done_when=["true"]))
     body = tracker.get_issue(40).body
     assert parse_body(body).goal == "Keep it better."
-    assert order.order_done_when.records(body) == [{"line": "test  -s kept.txt", "reason": "Line one. Line two."}]
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
     _publish_edit(case, _edit_plan("keep-lines-3", done_when=["true"], checklist=["Stay open."], done_when_removals=[
         {"line": "Stay checked.", "reason": "Done elsewhere."}]))
     assert [entry["line"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
@@ -4081,8 +4083,8 @@ def test_removal_record_survives_later_edits_and_never_reads_as_done_when(publis
     "printf '## Goal\\n'\n\n```\nsecond  line", "```", "<!-- foragent:done-when-removed -->",
 ])
 def test_removal_record_round_trips_lines_that_look_like_structure(line):
-    written = order.order_done_when.with_record(DONE_WHEN_BODY, None, [{"line": line, "reason": "## Goal"}])
-    assert order.order_done_when.records(written) == [{"line": line, "reason": "## Goal"}]
+    written = order.order_done_when.with_record(DONE_WHEN_BODY, None, [{"line": line, "reason": "## Goal"}], "an-order")
+    assert order.order_done_when.records(written) == [{"line": line, "order": "an-order", "reason": "## Goal"}]
     assert order.order_done_when.without_record(written).strip() == DONE_WHEN_BODY.strip()
     assert parse_body(written) == parse_body(DONE_WHEN_BODY)
 
@@ -4105,6 +4107,36 @@ def test_republishing_an_applied_removal_keeps_the_body_and_its_approval(publish
     issue = tracker.get_issue(40)
     assert issue.body == body and "approved" in issue.labels
     assert len(order.order_done_when.records(body)) == 1
+
+
+@pytest.mark.parametrize("route", ["publish", "dry-run", "preread"])
+def test_a_new_order_cannot_reuse_a_removal_another_order_recorded(publishing, route):
+    """History authorizes nothing: the line is absent from the current Done when, so it is refused."""
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    before = tracker.get_issue(40).body
+    plan = _edit_plan("another-order", **_drop_command())
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        if route == "preread":
+            order.preread(plan, root, config, lambda: tracker, repo="owner/repo")
+        else:
+            _publish_edit(case, plan, dry_run=route == "dry-run")
+    assert "absent from the current Done when" in refused.value.lines[0]
+    assert refused.value.lines[0].endswith("test  -s kept.txt") and "#40" in refused.value.lines[0]
+    assert tracker.get_issue(40).body == before
+
+
+def test_a_later_order_records_its_own_removal_of_a_line_put_back(publishing):
+    """The same line and reason from another order is a new removal, so its record is not merged away."""
+    case = _edit_case(publishing)
+    tracker = case[2]
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    restored = "keep-lines-back"
+    _publish_edit(case, _edit_plan(restored))
+    _publish_edit(case, _edit_plan("keep-lines-again", **_drop_command()))
+    assert [entry["order"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
+        "keep-lines", "keep-lines-again"]
 
 
 def test_a_recorded_line_with_a_different_reason_is_still_absent(publishing):
@@ -4216,11 +4248,12 @@ def test_a_republished_child_keeps_the_removal_record_written_on_it(publishing, 
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     report_number = next(issue.number for issue in tracker.list_issues() if issue.title == plan["issues"][0]["title"])
     child = tracker.get_issue(report_number)
-    marked = order.order_done_when.with_record(child.body, child.body, [{"line": "old", "reason": "Why."}])
+    marked = order.order_done_when.with_record(child.body, child.body, [{"line": "old", "reason": "Why."}], "earlier")
     tracker.update_issue(report_number, title=child.title, body=marked)
     order.order_observed.save(root, plan["id"], {str(report_number): order.order_observed.fields(tracker.get_issue(report_number))}, "en")
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert order.order_done_when.records(tracker.get_issue(report_number).body) == [{"line": "old", "reason": "Why."}]
+    assert order.order_done_when.records(tracker.get_issue(report_number).body) == [
+        {"line": "old", "order": "earlier", "reason": "Why."}]
 
 
 def test_seed_carries_the_sections_an_edit_would_otherwise_lose(publishing):

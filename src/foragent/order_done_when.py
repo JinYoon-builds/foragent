@@ -19,6 +19,7 @@ _START = f"{_MARKER}\n{_HEADING}\n"
 _INTRO = "- Removed line:"
 # An indented code block keeps a command's exact spacing, and no record line can open a section.
 _INDENT = " " * 6
+_ORDER = "  Order: "
 _REASON = "  Reason: "
 _NEXT_MARKER = re.compile(r"^<!-- foragent:", re.MULTILINE)
 
@@ -54,13 +55,15 @@ def records(body: str | None) -> list[dict[str, str]]:
     span = _span(text_)
     if span is None:
         return []
-    entries, lines = [], []
+    entries, lines, order = [], [], ""
     for line in text_[span[0] + len(_START):span[1]].splitlines():
         if line.startswith(_INDENT):
             lines.append(line[len(_INDENT):])
+        elif line.startswith(_ORDER):
+            order = line[len(_ORDER):]
         elif line.startswith(_REASON):
-            entries.append({"line": "\n".join(lines), "reason": line[len(_REASON):]})
-            lines = []
+            entries.append({"line": "\n".join(lines), "order": order, "reason": line[len(_REASON):]})
+            lines, order = [], ""
     return entries
 
 
@@ -73,15 +76,15 @@ def _render(entries: list[dict[str, str]]) -> str:
     parts = [_START]
     for entry in entries:
         code = "".join(f"{_INDENT}{line}\n" for line in entry["line"].split("\n"))
-        parts.append(f"{_INTRO}\n\n{code}\n{_REASON}{entry['reason']}\n")
+        parts.append(f"{_INTRO}\n\n{code}\n{_ORDER}{entry['order']}\n{_REASON}{entry['reason']}\n")
     return "".join(parts)
 
 
-def with_record(body: str, existing: str | None, removals: list[dict[str, str]]) -> str:
-    """``body`` plus the issue's earlier removals and these; unchanged when there are none."""
+def with_record(body: str, existing: str | None, removals: list[dict[str, str]] = (), order: str = "") -> str:
+    """``body`` plus the issue's earlier removals and ``order``'s; unchanged when there are none."""
     entries = records(existing)
     for removal in removals:
-        entry = {"line": removal["line"], "reason": _flat(removal["reason"])}
+        entry = {"line": removal["line"], "order": order, "reason": _flat(removal["reason"])}
         if entry not in entries:
             entries.append(entry)
     return f"{body}\n{_render(entries)}" if entries else body
@@ -94,7 +97,7 @@ def without_record(body: str) -> str:
     return body if span is None else normalized[:span[0]] + normalized[span[1]:]
 
 
-def _problems(item: dict, body: str, language: str) -> list[str]:
+def _problems(item: dict, order: str, body: str, language: str) -> list[str]:
     number = item["number"]
     current, proposed = parse_body(body), parse_body(issue_body(item, "owner/repo", "main"))
     commands = current.done_when_commands
@@ -113,8 +116,9 @@ def _problems(item: dict, body: str, language: str) -> list[str]:
             continue
         elif line in new_commands or line in new_checklist:
             problems.append(text("order_done_when_kept", language, number=number, line=line))
-        elif {"line": line, "reason": _flat(reason)} not in recorded:
-            # Only this same explanation may repeat, when a plan is published again after it applied.
+        elif {"line": line, "order": order, "reason": _flat(reason)} not in recorded:
+            # History authorizes nothing: only the order that applied this removal may repeat it,
+            # when it is prereaded and published again (publish, preread, then --approve).
             problems.append(text("order_done_when_unknown", language, number=number, line=line))
     for line in dict.fromkeys(removed):
         if line not in declared:
@@ -127,7 +131,7 @@ def check(plan: dict, issues: dict, language: str) -> None:
     from foragent.order import DoneWhenRemovalError
 
     problems = [problem for item in plan.get("edits", [])
-                for problem in _problems(item, issues[item["number"]].body, language)]
+                for problem in _problems(item, plan["id"], issues[item["number"]].body, language)]
     if problems:
         raise DoneWhenRemovalError([*problems, text("order_done_when_hint", language)])
 
