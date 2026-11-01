@@ -2,7 +2,7 @@
 
 Today is the 24 hours back from now; each earlier day is the next 24-hour bucket before
 it. A bucket holds a time when ``older end < time <= newer end`` (UTC). The command only
-reads the state directory and writes nothing.
+reads the state directory and the local Git history, and writes nothing.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from statistics import median
 from typing import Any
 
 from foragent import orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
+from foragent import orch_scorecard_reverts as reverts
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
@@ -82,8 +83,9 @@ def _events(store: StateStore, now: datetime, days: int) -> list[tuple[int, dict
             if (bucket := _bucket(_time(event.get("at")), now, days)) is not None]
 
 
-def _day(runs: list[dict[str, Any]], events: list[dict[str, Any]], calls: int) -> dict[str, Any]:
-    """One window's per-day metrics, before phases and load."""
+def _day(runs: list[dict[str, Any]], events: list[dict[str, Any]], calls: int,
+         revert_count: int | None = None) -> dict[str, Any]:
+    """One window's per-day metrics, before phases and load; a revert count of None is unknown."""
     merged = [run for run in runs if run["merged"]]
     return {
         "runs": len(runs),
@@ -92,7 +94,7 @@ def _day(runs: list[dict[str, Any]], events: list[dict[str, Any]], calls: int) -
         "github_calls_per_hour": calls / 24,
         "review_returns": sum(1 for event in events if event.get("kind") == "review"
                               and event.get("verdict") != "PASS"),
-        "reverts_after_merge": sum(1 for event in events if event.get("kind") == "revert"),
+        "reverts_after_merge": revert_count,
         "spec_questions": sum(1 for run in runs if run["outcome"] == "spec-question"),
     }
 
@@ -137,8 +139,23 @@ def _worse(today: dict[str, Any], previous: dict[str, Any]) -> list[str]:
             if now is not None and before is not None and (now - before) * direction > 0]
 
 
-def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict[str, Any]:
-    """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses."""
+def _revert_counts(moments: list[datetime] | None, now: datetime, days: int) -> list[int | None]:
+    """Reverts per bucket; every bucket is unknown when the history could not be read."""
+    if moments is None:
+        return [None] * days
+    counts = [0] * days
+    for moment in moments:
+        if (bucket := _bucket(moment, now, days)) is not None:
+            counts[bucket] += 1
+    return counts
+
+
+def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
+            revert_times: list[datetime] | None = None) -> dict[str, Any]:
+    """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses.
+
+    ``revert_times`` are the default branch's revert commit times; None leaves reverts unknown.
+    """
     now = store._now()
     runs, events = _runs(store, now, days), _events(store, now, days)
     calls = [0] * days
@@ -146,8 +163,9 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None) -> dict
         # An hour counts in the window that holds its start.
         if (bucket := _bucket(_time(row["hour"]), now, days)) is not None:
             calls[bucket] += row["calls"]
+    revert_counts = _revert_counts(revert_times, now, days)
     daily = [_day([run for index, run in runs if index == bucket],
-                  [event for index, event in events if index == bucket], calls[bucket])
+                  [event for index, event in events if index == bucket], calls[bucket], revert_counts[bucket])
              for bucket in range(days)]
     today = daily[0]
     today["phase_minutes"], today["load"] = _phases([event for index, event in events if index == 0])
@@ -184,13 +202,18 @@ def _shown(name: str, value: Any) -> str:
     return _number(None if value is None else value * 100, "%") if name == "merge_rate" else _number(value)
 
 
+def _reverts_text(value: int | None, language: str) -> str:
+    return text("scorecard_reverts_unknown", language) if value is None else text(
+        "scorecard_reverts", language, count=_number(value))
+
+
 def _window_line(key: str, metrics: dict[str, Any], language: str, days: int) -> str:
     phases = ", ".join(f"{phase} {_number(minutes)}" for phase, minutes in sorted(metrics["phase_minutes"].items()))
     return text(key, language, days=days - 1, runs=_number(metrics["runs"]),
                 merge_rate=_shown("merge_rate", metrics["merge_rate"]),
                 merge_minutes=_number(metrics["median_minutes_to_merge"]),
                 calls=_number(metrics["github_calls_per_hour"]),
-                returns=_number(metrics["review_returns"]), reverts=_number(metrics["reverts_after_merge"]),
+                returns=_number(metrics["review_returns"]), reverts=_reverts_text(metrics["reverts_after_merge"], language),
                 questions=_number(metrics["spec_questions"]), load=_number(metrics["load"]),
                 phases=phases or "-")
 
@@ -324,6 +347,7 @@ def command(args, store: StateStore, config: Config) -> None:
             raise SystemExit(f"fa orch scorecard: {error}") from error
         print(text("scorecard_main_recorded", config.language, count=fresh))
         return
-    card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes))
+    revert_times = reverts.times(args.repo_root, config.base_branch)
+    card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes, revert_times))
     card["binding"] = binding(store, config, args.repo_root, card)
     print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))
