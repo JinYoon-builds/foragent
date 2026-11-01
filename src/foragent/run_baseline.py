@@ -182,11 +182,17 @@ def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
 
 def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]:
     """Locked files owned by approved issues that have not merged (#327)."""
+    return pending_acceptance_exclusions(ctx, (base_sha,), log)
+
+
+def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path) -> list[str]:
+    """Pending locks present in any input tree of a proposed merge."""
     owners = unmerged_acceptance_owners(ctx)
-    excluded = sorted(name for name in owners if ctx.git.blob_sha(base_sha, name) is not None)
-    open_issues = sorted({number for name in excluded for number in owners[name]})
+    excluded = sorted(name for name in owners
+                      if any(ctx.git.blob_sha(ref, name) is not None for ref in refs))
+    issues = sorted({number for name in excluded for number in owners[name]})
     _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "
-                 + " ".join(f"#{number}" for number in open_issues))
+                 + " ".join(f"#{number}" for number in issues))
     return excluded
 
 
