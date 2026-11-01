@@ -223,3 +223,33 @@ def test_parent_reads_foreign_children_but_writes_only_owned_parents(tmp_path, m
     assert tracker.get_issue(1).state == 'closed' and tracker.get_issue(3).state == 'open'
     assert moved == [(1, 'Done')]
     assert '#2' in tracker.list_comments(1)[0].body
+
+
+@pytest.mark.parametrize('owner', ['alice', 'bob'])
+def test_chained_pr_targets_use_the_original_issue_snapshot(tmp_path, monkeypatch, owner):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, [f'by:{owner}']), legacy='alice')
+    first = tracker.create_pr(head='foragent/issue-1', base='main', title='First', body='')
+    second = tracker.create_pr(head=f'foragent/issue-{first}', base='main', title='Second', body='')
+    store.update_local_issue(1, pr_number=first)
+    store.update_local_issue(first, pr_number=second)
+    monkeypatch.setattr(orch_scope, 'current_issue', lambda *a, **k: pytest.fail('Resolve from the snapshot'))
+    recorder.comment(second, 'Chain target')
+    snapshot = orch_scope.scope(recorder._context)
+    canonical = snapshot.issue(second)
+    assert canonical is not None and canonical.number == 1
+    assert [c.body for c in tracker.list_comments(second)] == (['Chain target'] if owner == 'alice' else [])
+    if owner == 'bob':
+        assert 'bob' in snapshot.for_number(second)
+
+
+def test_cyclic_pr_links_refuse_without_writes_or_looping(tmp_path):
+    store, tracker, recorder, _ = flush_case(tmp_path, (1, ['by:alice']), (2, ['by:alice']), legacy='alice')
+    store.update_local_issue(1, pr_number=2)
+    store.update_local_issue(2, pr_number=1)
+    before = {p.relative_to(store.root): p.read_bytes() for p in store.root.rglob('*') if p.is_file()}
+    recorder.comment(1, 'No canonical issue')
+    snapshot = orch_scope.scope(recorder._context)
+    refusal = snapshot.for_number(1)
+    assert refusal is not None and 'cyclic' in refusal and snapshot.issue(1) is None
+    assert tracker.list_comments(1) == []
+    assert {p.relative_to(store.root): p.read_bytes() for p in store.root.rglob('*') if p.is_file()} == before

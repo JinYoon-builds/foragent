@@ -120,9 +120,25 @@ class Scope:
             self._login, self._read = factory_login(self._ctx.tracker), True
         return self._login
 
-    def issue(self, number):
+    def _target(self, number):
         self._capture()
-        return self._issues.get(self._prs.get(number, number))
+        seen = set()
+        while number in self._prs:
+            target = self._prs[number]
+            if target == number and number in self._issues:
+                return number  # An observed issue can be its own canonical target.
+            if number in seen:
+                raise Unresolved("cyclic PR links in snapshot")
+            seen.add(number)
+            number = target
+        return number
+
+    def issue(self, number):
+        try:
+            target = self._target(number)
+            return self._issues.get(target)
+        except Unresolved:
+            return None
 
     def link_pr(self, number, head):
         self._capture()
@@ -135,7 +151,10 @@ class Scope:
 
     def for_number(self, number) -> str | None:
         self._capture()
-        target = self._prs.get(number, number)
+        try:
+            target = self._target(number)
+        except Unresolved as exc:
+            return _unreadable(self._ctx, number, exc)
         if (target != number and target is not None and target not in self._issues
                 and target not in self._decisions):
             return _unreadable(self._ctx, target, Unresolved("linked issue absent from snapshot"))
