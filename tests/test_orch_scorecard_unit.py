@@ -3,10 +3,17 @@
 import argparse
 from datetime import UTC, datetime, timedelta
 import json
+import os
+import shutil
+import subprocess
+import threading
+import time
 
 import pytest
 
-from foragent import orch_scorecard
+from conftest import git_command
+from foragent import orch_scorecard, orch_scorecard_reverts
+from foragent.git import GitRepo
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 23, 12, tzinfo=UTC)
@@ -485,3 +492,252 @@ def test_scorecard_keeps_the_decision_day_after_a_later_status_note(store):
     card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=2))
     assert card["window"]["today"]["roles"]["architect"]["accepted_proposals"] == 0
     assert card["window"]["previous"]["roles"]["architect"]["accepted_proposals"] == 1
+
+
+def _committed(root, tree, *parents, at, message, monkeypatch):
+    """A commit at an exact committer time, built with plumbing (the test guard blocks git commit)."""
+    stamp = f"{int(at.timestamp())} +0000"
+    for key in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{key}_NAME", "Offline Tests")
+        monkeypatch.setenv(f"{key}_EMAIL", "tests@example.com")
+        monkeypatch.setenv(f"{key}_DATE", stamp)
+    options = [item for parent in parents for item in ("-p", parent)]
+    return git_command(root, "commit-tree", tree, *options, "-m", message)
+
+
+@pytest.fixture
+def repo(git_history):
+    git_command(git_history.clone, "fetch", "origin")
+    return git_history.clone
+
+
+def _publish(root, sha, branch="main"):
+    git_command(root, "update-ref", f"refs/remotes/origin/{branch}", sha)
+
+
+SHA = "abc1234def"
+
+
+@pytest.mark.parametrize("message", [
+    f'Revert "Add x"\n\nThis reverts commit {SHA}.',
+    f'Revert "Add x" (#12)\n\nWhy it went back.\n\nThis reverts commit {SHA}.',
+    f'Reapply "Add x"\n\nThis reverts commit {SHA}.',
+    f'Revert "Merge x"\n\nThis reverts commit {SHA}, reversing\nchanges made to {SHA}.',
+])
+def test_canonical_revert_messages_are_found_at_their_committer_time(repo, monkeypatch, message):
+    at = NOW - timedelta(hours=3)
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    _publish(repo, _committed(repo, tree, tip, at=at, message=message, monkeypatch=monkeypatch))
+    assert orch_scorecard_reverts.times(repo, "main") == [at]
+
+
+@pytest.mark.parametrize("message", [
+    f"Squash of the feature\n\nRevert \"Inner\"\n\nThis reverts commit {SHA}.",
+    f"Fix the thing\n\nThis reverts commit {SHA}.",
+    'Revert "Add x"\n\nNo commit named here.',
+    f'Revert "Add x"\n\nMentions: This reverts commit {SHA}.',
+    f'Revert "Add x"\n\nThis reverts commit nothex.',
+    'Revert "Add x"\n\nThis reverts commit abc123.',
+    f'Revert "Add x"\n\nThis reverts commit {SHA}xyz.',
+    "Revert the idea of doing x",
+])
+def test_other_commits_are_not_reverts(repo, monkeypatch, message):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    _publish(repo, _committed(repo, tree, tip, at=NOW, message=message, monkeypatch=monkeypatch))
+    assert orch_scorecard_reverts.times(repo, "main") == []
+
+
+def test_a_revert_merged_from_a_side_branch_counts_even_behind_a_newer_merge_time(repo, monkeypatch):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    # The side parent is older than an unrelated main commit: no first-parent or date walk finds it.
+    reverted = NOW - timedelta(days=9)
+    side = _committed(repo, tree, tip, at=reverted, message=message, monkeypatch=monkeypatch)
+    main_commit = _committed(repo, tree, tip, at=NOW - timedelta(days=1), message="Other", monkeypatch=monkeypatch)
+    merge = _committed(repo, tree, main_commit, side, at=NOW, message="Merge side", monkeypatch=monkeypatch)
+    _publish(repo, merge)
+    assert orch_scorecard_reverts.times(repo, "main") == [reverted]
+
+
+def test_only_the_configured_default_branch_is_read(repo, monkeypatch):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    other = _committed(repo, tree, tip, at=NOW, message=message, monkeypatch=monkeypatch)
+    _publish(repo, other, "other")
+    git_command(repo, "update-ref", "refs/heads/main", other)  # A local main never stands in for origin's.
+    git_command(repo, "update-ref", "refs/heads/trunk", other)
+    assert orch_scorecard_reverts.times(repo, "main") == []
+    assert orch_scorecard_reverts.times(repo, "other") == [NOW]
+    assert orch_scorecard_reverts.times(repo, "trunk") is None  # Only a local branch: no origin ref.
+
+
+def test_shallow_history_is_unknown_not_zero(repo):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    assert orch_scorecard_reverts.times(repo, "main") == []
+    (repo / ".git" / "shallow").write_text(f"{tip}\n")
+    assert orch_scorecard_reverts.times(repo, "main") is None
+
+
+@pytest.mark.parametrize("error", ["timeout", "command", "os"])
+def test_git_failures_are_unknown(repo, monkeypatch, error):
+    def fail(args):
+        if args[0] == "rev-parse":
+            return "false\n"
+        raise {"timeout": subprocess.TimeoutExpired("git", 120),
+               "command": subprocess.CalledProcessError(128, "git", stderr="bad object"),
+               "os": OSError("gone")}[error]
+
+    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root, run: GitRepo(root, fail))
+    assert orch_scorecard_reverts.times(repo, "main") is None
+
+
+@pytest.mark.parametrize("stamp", ["not-a-time", "9" * 40, ""])
+def test_an_unreadable_commit_time_is_unknown(repo, monkeypatch, stamp):
+    output = f'{stamp}\nRevert "Add x"\n\nThis reverts commit {SHA}.\n\0'
+    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root, run: GitRepo(
+        root, lambda args: "false\n" if args[0] == "rev-parse" else output))
+    assert orch_scorecard_reverts.times(repo, "main") is None
+
+
+def _git_shim(tmp_path, monkeypatch, body):
+    """A `git` first on PATH; ``$REAL_GIT`` is the real one."""
+    folder = tmp_path / "shim"
+    folder.mkdir()
+    shim = folder / "git"
+    shim.write_text(f"#!/bin/sh\n{body}\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("REAL_GIT", shutil.which("git"))
+    monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_a_git_that_is_slow_to_exit_is_read_without_polling(repo, tmp_path, monkeypatch):
+    # The output is complete and the pipes are closed while the process still runs:
+    # waiting with a timeout here is what calls time.sleep, which local fixtures forbid.
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    at = NOW - timedelta(hours=1)
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _publish(repo, _committed(repo, tree, tip, at=at, message=message, monkeypatch=monkeypatch))
+    _git_shim(tmp_path, monkeypatch, '"$REAL_GIT" "$@"\ncode=$?\nexec >&- 2>&-\nsleep 0.3\nexit $code')
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("The read must not poll"))
+    assert orch_scorecard_reverts.times(repo, "main") == [at]
+
+
+def test_a_git_past_its_deadline_is_killed_and_unknown(tmp_path, monkeypatch):
+    # A stand-in process: the test guard makes real kills no-ops, so a real child would not end.
+    (tmp_path / ".git").mkdir()
+    killed = threading.Event()
+
+    class Process:
+        returncode = None
+
+        def __init__(self, command, **options):
+            self.command = command
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *details):
+            return False
+
+        def kill(self):
+            killed.set()
+
+        def communicate(self):
+            if self.command[1] == "rev-parse":
+                self.returncode = 0
+                return "false\n", ""
+            self.returncode = -9 if killed.wait(5) else 0
+            return "", ""
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    monkeypatch.setattr(orch_scorecard_reverts, "TIMEOUT_SECONDS", 0.05)
+    assert orch_scorecard_reverts.times(tmp_path, "main") is None
+    assert killed.is_set()
+
+
+def test_a_failing_git_is_unknown_even_with_output(repo, tmp_path, monkeypatch):
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _git_shim(tmp_path, monkeypatch, 'case "$1" in rev-parse) exec "$REAL_GIT" "$@";; esac\n'
+              f"printf '1700000000\\n{message}\\0'\nexit 128".replace('"Add x"', '\\"Add x\\"'))
+    assert orch_scorecard_reverts.times(repo, "main") is None
+
+
+def test_no_repository_is_unknown_without_starting_a_process(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("A folder outside any repository must not start Git")
+
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    (tmp_path / "plain" / "deep").mkdir(parents=True)
+    assert orch_scorecard_reverts.times(tmp_path / "plain" / "deep", "main") is None
+
+
+@pytest.mark.parametrize("place", ["root", "subfolder", "worktree-file", "git-dir-env"])
+def test_a_repository_is_still_read_from_every_place_git_finds_it(repo, tmp_path, monkeypatch, place):
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    at = NOW - timedelta(hours=1)
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _publish(repo, _committed(repo, tree, tip, at=at, message=message, monkeypatch=monkeypatch))
+    monkeypatch.delenv("GIT_DIR", raising=False)
+    root = repo
+    if place == "subfolder":
+        root = repo / "deep" / "er"
+        root.mkdir(parents=True)
+    elif place == "worktree-file":
+        root = tmp_path / "linked"
+        git_command(repo, "worktree", "add", "--detach", str(root), tip)
+        assert (root / ".git").is_file()
+    elif place == "git-dir-env":
+        root = tmp_path / "elsewhere"
+        root.mkdir()
+        monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    assert orch_scorecard_reverts.times(root, "main") == [at]
+
+
+def test_reverts_land_in_time_buckets_and_ignore_journal_events(store):
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "orch-events.jsonl").write_text(json.dumps(
+        {"at": (NOW - timedelta(hours=1)).isoformat(), "kind": "revert", "summary": "x"}) + "\n")
+    moments = [NOW, NOW - timedelta(hours=1),  # Today, the newer end included.
+               NOW - timedelta(hours=24),  # Exactly 24 h back is the day before.
+               NOW - timedelta(days=2, hours=1), NOW - timedelta(days=2, hours=2),
+               NOW - timedelta(days=3, hours=1),  # Outside --days 3.
+               NOW + timedelta(seconds=1)]  # The future is in no bucket.
+    card = orch_scorecard.collect(store, 3, revert_times=moments)
+    assert card["window"]["today"]["reverts_after_merge"] == 2
+    # Previous days hold 1 and 2: the median 1.5 rounds half up to 2, so today is not worse.
+    assert card["window"]["previous"]["reverts_after_merge"] == 2
+    assert "reverts_after_merge" not in card["worse"]
+    card = orch_scorecard.collect(store, 3, revert_times=moments[:2])
+    assert card["window"]["previous"]["reverts_after_merge"] == 0
+    assert "reverts_after_merge" in card["worse"]
+    zero = orch_scorecard.collect(store, 3, revert_times=[])
+    assert zero["window"]["today"]["reverts_after_merge"] == 0
+
+
+def test_unknown_reverts_are_null_never_worse_and_keep_other_metrics(store):
+    finish(store, 1, at=NOW - timedelta(hours=1))
+    card = orch_scorecard.collect(store, 3, revert_times=None)
+    for metrics in card["window"].values():
+        assert metrics["reverts_after_merge"] is None
+    assert "reverts_after_merge" not in card["worse"]
+    assert orch_scorecard.worst(card) != "reverts_after_merge"
+    assert card["window"]["today"]["runs"] == 1
+    assert card["window"]["today"]["merge_rate"] == 1
+
+
+@pytest.mark.parametrize(("language", "unknown", "known"), [
+    ("en", "unknown reverts", "1 reverts"), ("ko", "되돌림 알 수 없음", "되돌림 1건"),
+])
+def test_human_output_says_unknown_on_both_window_lines(store, language, unknown, known):
+    lines = orch_scorecard.human(orch_scorecard.collect(store, 2), language).splitlines()
+    assert unknown in lines[0] and unknown in lines[2]
+    moments = [NOW - timedelta(hours=1), NOW - timedelta(days=1, hours=1)]
+    lines = orch_scorecard.human(orch_scorecard.collect(store, 2, revert_times=moments), language).splitlines()
+    assert known in lines[0] and known in lines[2] and unknown not in "\n".join(lines)
