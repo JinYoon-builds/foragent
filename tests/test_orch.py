@@ -12,7 +12,7 @@ from test_runner import enable_reviewer, run_case
 from foragent import cli, orch, runner
 from foragent.executors import ExecResult
 from foragent.issue import body_hash
-from foragent.reasons import Reason
+from foragent.reasons import Reason, marked_reason
 from foragent.state import Flag
 
 
@@ -95,6 +95,10 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch, advanc
     from foragent import orch_inbox, run_merge_turn
 
     c = review_case
+    original_blocker = Flag(1, "review-dispute", c.now[0].isoformat())
+    original_local_flag = c.store.load_local_flag(1)
+    original_markers = [comment for comment in c.tracker.list_comments(1)
+                        if marked_reason(comment.body) is not None]
     calls = []
     attempts = []
 
@@ -117,7 +121,12 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch, advanc
     # Refused merges share the separate wait bound across later queue turns.
     assert runner.review_only(1, c.ctx) == "merge-wait"
     assert len(attempts) == 2
-    assert c.store.load_flag(1) is None
+    # The wait restores blocked, so its existing GitHub marker is visible again.
+    # It must not manufacture another failure record or marked blocker comment.
+    assert c.store.load_flag(1) == original_blocker
+    assert c.store.load_local_flag(1) == original_local_flag
+    assert [comment for comment in c.tracker.list_comments(1)
+            if marked_reason(comment.body) is not None] == original_markers
     assert "blocked" in c.tracker.get_issue(1).labels
     assert c.tracker.get_issue(c.pr).state == "open"
     requests = orch_inbox.requests(c.store, pending=True)
