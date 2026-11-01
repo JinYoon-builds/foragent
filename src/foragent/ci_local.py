@@ -65,10 +65,13 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
     previous = phase_identity(ctx.store.get_run(n))
     _phase(n, ctx, "baseline")
     ctx.store.update_run(n, phase_work_id=f"baseline-local:{base_sha}")
+    completed = False
     try:
-        return _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        result = _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        completed = True
+        return result
     finally:
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
 def _capture_local_only(n, ctx, git, command, base_sha, excluded):
