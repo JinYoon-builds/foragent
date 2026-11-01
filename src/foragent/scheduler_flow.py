@@ -34,6 +34,7 @@ class _Tick:
     ready: list[int] | None = None  # Set once this tick has judged its candidates.
     hold: tuple[str, dict[str, Any]] | None = None
     current: int | None = None  # The issue the tick is judging, so an exit during it has a known cause.
+    out: set[int] = field(default_factory=set)  # Judged this tick and found to be no candidate.
     failure: Exception | None = None
 
 
@@ -41,9 +42,16 @@ def _current(ctx: TickContext) -> _Tick | None:
     return getattr(ctx, "_ready_flow", None)
 
 
-def considering(ctx: TickContext, number: int | None) -> None:
+def considering(ctx: TickContext, number: int) -> None:
     if (tick := _current(ctx)) is not None:
         tick.current = number
+
+
+def considered(ctx: TickContext, number: int, ready: dict[str, list[int]]) -> None:
+    """Its judgment finished: without a reason or a place among the candidates, it is no candidate."""
+    tick = _current(ctx)
+    if tick is not None and number not in tick.decided and not any(number in numbers for numbers in ready.values()):
+        tick.out.add(number)
 
 
 def waits(ctx: TickContext, number: int, reason: str, **facts: Any) -> None:
@@ -161,32 +169,32 @@ def _flush(ctx: TickContext, tick: _Tick) -> None:
 
     store = ctx.store
     rows = {row["number"]: row for row in store.local_issues()}
-    held = tick.ready if tick.ready is not None else [
-        number for number, row in rows.items()
-        if row["state"] == "open" and READY in row["labels"]
-        and not set(row["labels"]) & {RUNNING, BLOCKED, NEEDS_HUMAN}]
+    hold = tick.hold
+    if hold is None and tick.failure is not None:  # A tick that failed held every candidate it had not decided.
+        kind = "read-failed" if isinstance(tick.failure, TrackerError) else "tick-failed"
+        hold = (kind, {"error": type(tick.failure).__name__})
     decided = dict(tick.decided)
-    judged = rows.get(tick.current)
-    if judged is not None and tick.current not in decided and judged["state"] == "open" and (
-            set(judged["labels"]) & {APPROVED, READY}):
-        # The tick ended while judging this issue: that exit is its cause, not its last one.
-        if tick.failure is not None:
-            kind = "read-failed" if isinstance(tick.failure, TrackerError) else "tick-failed"
-            decided[tick.current] = (kind, {"error": type(tick.failure).__name__})
-        elif tick.hold is not None:
-            decided[tick.current] = tick.hold
-    if tick.hold is not None:
+    if hold is not None:
+        held = tick.ready if tick.ready is not None else [
+            number for number, row in rows.items()
+            if row["state"] == "open" and READY in row["labels"]
+            and not set(row["labels"]) & {RUNNING, BLOCKED, NEEDS_HUMAN}]
+        judging = rows.get(tick.current)
+        if judging is not None and judging["state"] == "open" and set(judging["labels"]) & {APPROVED, READY}:
+            held = [*held, tick.current]  # The tick ended while judging it, ready or not.
         for number in held:
-            decided.setdefault(number, tick.hold)
-    changes = []
+            if number not in tick.out:
+                decided.setdefault(number, hold)
+    started = {number for number, (reason, _) in decided.items() if reason is None}
+    waited = {number for number, last in store._flow_last("ready").items() if last["data"].get("outcome") == "waiting"}
+    # A candidate left when its row is gone (a 404 removes it during the tick) or its judgment passed it by.
+    left = {number for number in waited - started
+            if number not in rows or (number in tick.out and number not in decided)}
+    changes = [(number, None, {"reason": "released", "outcome": "waiting"}) for number in sorted(left)]
     for number, (reason, facts) in sorted(decided.items()):
-        outcome = "waiting" if reason is not None else "started"
+        if reason is not None and number not in rows:
+            continue  # Nothing waits for an issue that is gone. A start already happened, whatever came after it.
         run = store.get_run(number) if reason is None else None
         changes.append((number, run.started_at if run is not None else None,
-                        {"reason": reason, "outcome": outcome, **facts}))
-    if tick.ready is not None:
-        # Every issue was judged this tick: one that waited and the tick neither held nor kept has left the candidates.
-        for number, last in store._flow_last("ready").items():
-            if number not in decided and number not in tick.ready and last["data"].get("outcome") == "waiting":
-                changes.append((number, None, {"reason": "released", "outcome": "waiting"}))
+                        {"reason": reason, "outcome": "waiting" if reason is not None else "started", **facts}))
     store._record_flow_changes("ready", changes)

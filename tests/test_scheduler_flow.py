@@ -293,7 +293,7 @@ def test_a_deferred_issue_read_keeps_it_a_candidate_with_that_cause(ctx, monkeyp
     assert reasons(ctx, 2) == ["slots-full", "read-deferred"], "A deferral is not a release"
 
 
-def test_a_tick_that_failed_before_judging_releases_nothing(ctx, monkeypatch):
+def test_a_tick_that_failed_before_judging_releases_nothing_and_names_the_failure(ctx, monkeypatch):
     prepare(ctx, 1)
     ready_issue(ctx, 1, running=True)
     ready_issue(ctx, 2)
@@ -301,7 +301,7 @@ def test_a_tick_that_failed_before_judging_releases_nothing(ctx, monkeypatch):
     monkeypatch.setattr(scheduler.board_parents, "order_parents", lambda rows: 1 / 0)
     with pytest.raises(ZeroDivisionError):
         scheduler.tick(ctx)
-    assert reasons(ctx, 2) == ["slots-full"]
+    assert reasons(ctx, 2) == ["slots-full", "tick-failed"]
 
 
 def test_a_tick_that_failed_after_judging_does_not_release_its_ready_candidates(ctx, monkeypatch):
@@ -312,7 +312,7 @@ def test_a_tick_that_failed_after_judging_does_not_release_its_ready_candidates(
     monkeypatch.setattr(scheduler, "_start_ready", lambda *args: 1 / 0)
     with pytest.raises(ZeroDivisionError):
         scheduler.tick(ctx)
-    assert reasons(ctx, 2) == ["slots-full"], "It is still a candidate; only its cause this tick is unknown"
+    assert reasons(ctx, 2) == ["slots-full", "tick-failed"], "Still a candidate, not released; this tick's failure held it"
 
 
 def moving_clock(context):
@@ -466,15 +466,71 @@ def test_a_failure_during_a_read_in_the_start_loop_replaces_the_reason(ctx, monk
     assert reasons(ctx, 2) == ["slots-full", "read-failed"]
 
 
-def test_a_failure_after_the_judging_loop_blames_no_issue(ctx, monkeypatch):
-    prepare(ctx, 1)
-    ready_issue(ctx, 1, running=True)
-    ready_issue(ctx, 2)
-    assert scheduler.tick(ctx).skipped is None
-    monkeypatch.setattr(scheduler, "_github_wait", lambda *args: 1 / 0)
+@pytest.mark.parametrize("name", ["fetch_base", "_recover_runs", "_reconcile_batches", "_github_wait", "_apply_budgets"])
+def test_a_failure_outside_any_issues_judgment_holds_the_known_candidates(ctx, monkeypatch, name):
+    _waiting_candidate(ctx)
+    ctx.store.finish_run(1, outcome="merged")  # The old cause is gone, so slots-full would now be a false claim.
+    ctx.tracker.close_issue(1)
+    ctx.process_table.exit(7001)
+    monkeypatch.setattr(scheduler, name, lambda *args, **kwargs: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        scheduler.tick(ctx)
+    rows = ready_rows(ctx, 2)
+    assert [row["data"]["reason"] for row in rows] == ["slots-full", "tick-failed"]
+    assert rows[-1]["data"]["error"] == "ZeroDivisionError"
+    assert ready_rows(ctx, 1) == [], "The failure holds candidates only"
+
+
+def test_a_decisive_hold_is_not_replaced_by_a_failure_after_it(ctx, monkeypatch):
+    _waiting_candidate(ctx)
+    monkeypatch.setattr(scheduler.orch_dream, "start", lambda *args: 1 / 0)
     with pytest.raises(ZeroDivisionError):
         scheduler.tick(ctx)
     assert reasons(ctx, 2) == ["slots-full"]
+
+
+@pytest.mark.parametrize("exit_path", ["closed", "parent", "revoked"])
+def test_a_candidate_judged_out_stays_released_when_a_later_issue_fails(ctx, monkeypatch, exit_path):
+    _waiting_candidate(ctx)
+    ready_issue(ctx, 3)
+    assert scheduler.tick(ctx).skipped is None
+    if exit_path == "closed":
+        ctx.tracker.close_issue(2)
+    elif exit_path == "parent":
+        monkeypatch.setattr(scheduler.board_parents, "order_parents", lambda rows: {2})
+    else:
+        ctx.tracker.remove_labels(2, ["approved", "ready"])
+    original = scheduler._check_prerequisites
+
+    def failing(context, issue, *args, **kwargs):
+        if issue.number == 3:
+            raise ValueError("later issue")
+        return original(context, issue, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_check_prerequisites", failing)
+    with pytest.raises(ValueError):
+        scheduler.tick(ctx)
+    assert reasons(ctx, 2) == ["slots-full", "released"]
+    assert reasons(ctx, 3) == ["slots-full", "tick-failed"]
+
+
+def test_a_start_is_kept_when_the_issue_goes_missing_right_after_it(ctx):
+    starts = prepare(ctx, 3)
+    ready_issue(ctx, 1)
+    ctx.store.record_flow("ready", issue=1, reason="slots-full", outcome="waiting")
+    launch = ctx.launcher
+
+    def vanish(number=None, **kwargs):
+        pid = launch(number, **kwargs)
+        ctx.store.ingest_absence(1, ctx.now() + timedelta(seconds=1))
+        return pid
+
+    ctx.launcher = vanish
+    assert scheduler.tick(ctx).skipped is None
+    assert starts == [1] and 1 not in {row["number"] for row in ctx.store.local_issues()}
+    rows = ready_rows(ctx, 1)
+    assert [(row["data"]["reason"], row["data"]["outcome"]) for row in rows] == [("slots-full", "waiting"), (None, "started")]
+    assert rows[-1]["run_started_at"] == ctx.store.get_run(1).started_at
 
 
 def test_an_exception_on_an_issue_that_is_no_candidate_records_no_wait(ctx, monkeypatch):
@@ -484,3 +540,66 @@ def test_an_exception_on_an_issue_that_is_no_candidate_records_no_wait(ctx, monk
     with pytest.raises(ZeroDivisionError):
         scheduler.tick(ctx)
     assert ready_rows(ctx, 1) == []
+
+
+def _waiting_candidate(ctx):
+    prepare(ctx, 1)
+    ready_issue(ctx, 1, running=True)
+    ready_issue(ctx, 2)
+    assert scheduler.tick(ctx).skipped is None
+    assert reasons(ctx, 2) == ["slots-full"]
+
+
+def _not_found(context, monkeypatch, number):
+    from foragent.tracker import TrackerError
+
+    original = context.tracker._tracker.get_issue
+
+    def missing(n):
+        if n == number:
+            raise TrackerError("gh: issue not found (HTTP 404)")
+        return original(n)
+
+    monkeypatch.setattr(context.tracker._tracker, "get_issue", missing)
+
+
+def test_a_404_at_the_start_check_removes_the_row_and_releases_the_candidate(ctx, monkeypatch):
+    _waiting_candidate(ctx)
+    ctx.store.finish_run(1, outcome="merged")
+    ctx.tracker.close_issue(1)
+    ctx.process_table.exit(7001)
+    _not_found(ctx, monkeypatch, 2)
+    with pytest.raises(Exception, match="HTTP 404"):
+        scheduler.tick(ctx)
+    assert 2 not in {row["number"] for row in ctx.store.local_issues()}
+    assert reasons(ctx, 2) == ["slots-full", "released"]
+
+
+def test_a_404_while_judging_before_the_candidates_are_known_releases_too(ctx, monkeypatch):
+    _waiting_candidate(ctx)
+    ctx.store.clear_approval(2)
+    _not_found(ctx, monkeypatch, 2)
+    with pytest.raises(Exception, match="HTTP 404"):
+        scheduler.tick(ctx)
+    assert reasons(ctx, 2) == ["slots-full", "released"]
+
+
+def test_a_deferred_404_during_a_failed_refresh_releases_instead_of_naming_the_deferral(ctx, monkeypatch):
+    _waiting_candidate(ctx)
+    ctx.store.finish_run(1, outcome="merged")
+    ctx.tracker.close_issue(1)
+    ctx.process_table.exit(7001)
+    fail_listing(ctx, monkeypatch)
+    _not_found(ctx, monkeypatch, 2)
+    assert scheduler.tick(ctx).skipped is None, "The deferral keeps the tick going"
+    assert reasons(ctx, 2) == ["slots-full", "released"]
+
+
+def test_a_row_gone_with_no_wait_before_it_records_nothing(ctx, monkeypatch):
+    prepare(ctx, 3)
+    ready_issue(ctx, 2)
+    ctx.tracker.list_issues()
+    _not_found(ctx, monkeypatch, 2)
+    with pytest.raises(Exception, match="HTTP 404"):
+        scheduler.tick(ctx)
+    assert ready_rows(ctx, 2) == []

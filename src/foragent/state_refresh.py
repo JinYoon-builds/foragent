@@ -114,9 +114,13 @@ class IssueRefreshMixin:
             snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
             self._write_json(self.root / "issues.json", snapshot)
             # Only a read establishes edges: an unread issue's [] and a repeated list prove nothing.
-            self._flow_issue_states(snapshot, {int(number) for number in fresh} | gone, {
-                int(number): (blocked_by[int(number)], (edge_reads or {}).get(int(number), at)) for number in fresh
-                if int(number) in (blocked_by or {}) and (edge_reads is None or int(number) in edge_reads)})
+            # A read has its own time, so it counts even when this listing of the issue lost to a newer one.
+            from foragent.state_flow import edge_read
+
+            reads = {int(number): at for number in fresh} if edge_reads is None else edge_reads
+            edges = {number: edge_read(blocked_by[number], started) for number, started in reads.items()
+                     if number in (blocked_by or {})}
+            self._flow_issue_states(snapshot, {int(number) for number in fresh} | gone | set(edges), edges)
             return sorted(dropped)
 
     def merged_pr_listing(self) -> dict[str, Any] | None:

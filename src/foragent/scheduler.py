@@ -282,6 +282,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             scheduler_flow.considering(ctx, issue.number)
             try:
                 consider(issue)
+                scheduler_flow.considered(ctx, issue.number, ready)
             except TrackerError as exc:
                 # After a failed refresh GitHub is known to be failing: one issue's read does not stop the others.
                 if exc.is_rate_limit or not ctx._refresh_failed:
@@ -289,7 +290,6 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
                 scheduler_flow.waits(ctx, issue.number, "read-deferred")
-        scheduler_flow.considering(ctx, None)
         if listing_current:  # Children change only through observed facts and this tick's writes.
             _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     scheduler_flow.candidates(ctx, ready)

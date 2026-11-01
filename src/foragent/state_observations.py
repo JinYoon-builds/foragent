@@ -157,7 +157,7 @@ def latest(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any] | None
 
 
 def accepted_facts(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any] | None, datetime | None]:
-    """What GitHub accepted: the latest observation plus sends it does not yet show, and the time of the newest.
+    """What GitHub accepted: the latest observation plus sends it does not yet show, and that observation's time.
 
     A send that succeeded is a fact even when no read followed it, and a read that
     started before the send cannot undo it (such a read leaves the intent unretired).
@@ -174,7 +174,6 @@ def accepted_facts(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any
             facts = {**facts, "labels": sorted(set(facts["labels"]) - sent)}
         elif sent_at(intent) is not None:
             facts = effect(facts, intent)
-        at = max([at, *(start for start in ok_starts(intent) if start is not None)])
     return facts, at
 
 

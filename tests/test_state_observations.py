@@ -641,7 +641,6 @@ def test_torn_and_malformed_lines_are_unknown_and_never_merge_with_the_next_reco
     path = store.root / "flow" / "other.jsonl"
     with path.open("a", encoding="utf-8") as stream:
         stream.write('[1]\n{"at":"not-a-time","kind":"x","issue":null,"run_started_at":null,"data":{}}\n'
-                     '{"at":"2026-10-31T09:00:00","kind":"naive","issue":null,"run_started_at":null,"data":{}}\n'
                      '{"at":"2026-10-31T09:00:00+00:00","kind":"to')
     store.record_flow("spawn", decision="after")
     assert [row["data"]["decision"] for row in flow(store)] == ["kept", "after"]
@@ -719,70 +718,74 @@ OPEN_EDGE = {"number": 3, "state": "open", "repository": None}
 CLOSED_EDGE = {"number": 3, "state": "closed", "repository": None}
 
 
-def test_edge_only_change_from_a_live_read_is_a_transition(tmp_path):
+OTHER_EDGE = {"number": 4, "state": None, "repository": None}
+NEW_EDGE = {"number": 3, "state": None, "repository": None}
+
+
+def read_step(edges, second):
+    return lambda store: store.record_edges_read(7, edges, at(second))
+
+
+def write_step(blocker, second, remove=False, accepted=None):
+    return lambda store: store.record_edge_write(7, blocker, at(second), at(accepted or second), remove=remove)
+
+
+def listing_step(edges, second, read_at):
+    return lambda store: store.refresh_local_issues([plain_issue()], [], {}, at(second), blocked_by={7: edges},
+                                                    edge_reads={7: at(read_at)} if read_at else {})
+
+
+@pytest.mark.parametrize("steps,history", [
+    # Whatever order they arrive in, facts add up by the time each one started.
+    ([read_step([CLOSED_EDGE], 3), read_step([OPEN_EDGE], 2)], [[], [CLOSED_EDGE]]),
+    ([read_step([], 3), read_step([CLOSED_EDGE], 2)], [[]]),
+    ([write_step(4, 3), write_step(3, 2)], [[], [OTHER_EDGE], [NEW_EDGE, OTHER_EDGE]]),
+    ([write_step(3, 2), write_step(3, 3, remove=True)], [[], [NEW_EDGE], []]),
+    ([write_step(3, 3, remove=True), write_step(3, 2)], [[]]),
+    ([write_step(3, 5), read_step([], 2)], [[], [NEW_EDGE]]),
+    ([read_step([OPEN_EDGE], 5), write_step(3, 2, remove=True)], [[], [OPEN_EDGE]]),
+    ([write_step(4, 2), read_step([OPEN_EDGE], 3), write_step(3, 4, remove=True)], [[], [OTHER_EDGE], [OPEN_EDGE], []]),
+    # A listing's read counts by its own time; a repeated list is no fact at all.
+    ([listing_step([CLOSED_EDGE], 3, 5), read_step([OPEN_EDGE], 4)], [[], [CLOSED_EDGE]]),
+    ([listing_step([], 3, 5), read_step([CLOSED_EDGE], 4)], [[]]),
+    ([read_step([CLOSED_EDGE], 2), listing_step([OPEN_EDGE], 3, None)], [[], [CLOSED_EDGE]]),
+    # A write is an interval. A read decides an edge unless the edge's latest earlier write was still in flight.
+    ([write_step(3, 3, remove=True, accepted=4), read_step([], 5), write_step(3, 2, accepted=9)], [[]]),
+    ([write_step(3, 3, accepted=4), read_step([NEW_EDGE], 5), write_step(3, 2, remove=True, accepted=9)],
+     [[], [NEW_EDGE]]),
+    ([write_step(3, 3, remove=True, accepted=4), listing_step([], 3, 5), write_step(3, 2, accepted=9)], [[]]),
+    ([read_step([], 3), write_step(3, 2, accepted=4)], [[], [NEW_EDGE]]),
+    ([read_step([NEW_EDGE], 3), write_step(3, 2, remove=True, accepted=4)], [[], [NEW_EDGE], []]),
+    ([write_step(3, 2, accepted=3), read_step([], 3)], [[], [NEW_EDGE], []]),
+    ([write_step(4, 2, accepted=9), read_step([NEW_EDGE], 3), write_step(3, 4, remove=True)],
+     [[], [OTHER_EDGE], [NEW_EDGE, OTHER_EDGE], [OTHER_EDGE]]),
+], ids=["reads-reversed", "equal-read-outranks", "adds-reversed", "add-remove", "add-remove-reversed", "read-before-write",
+        "write-before-read", "whole-list-resets", "listing-outranks", "equal-listing-outranks", "repeated-list",
+        "delayed-add-after-remove-and-read", "delayed-remove-after-add-and-read", "delayed-add-after-listing",
+        "add-in-flight-at-read", "remove-in-flight-at-read", "read-at-the-response-instant", "other-edge-in-flight"])
+def test_edge_facts_add_up_by_their_own_time(tmp_path, steps, history):
     store = flow_store(tmp_path)
     store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: []})
-    read = {"number": 3, "state": "open", "state_reason": None, "repository": None}
-    store.record_edges_read(7, [read], at(2))
-    assert edge_rows(store) == [[], [OPEN_EDGE]]
+    for step in steps:
+        step(store)
+    assert edge_rows(store) == history
 
 
-def test_blocked_by_reads_finishing_in_reverse_order_keep_the_newer_edges(tmp_path):
+def test_a_read_during_an_older_listing_of_the_issue_still_counts(tmp_path):
     store = flow_store(tmp_path)
     store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
-    store.record_edges_read(7, [CLOSED_EDGE], at(3))
-    store.record_edges_read(7, [OPEN_EDGE], at(2))  # Started first, finished last.
+    store.ingest([plain_issue()], at(5), {})  # A single-issue read that outranks the listing's issue facts.
+    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: [CLOSED_EDGE]}, edge_reads={7: at(6)})
     assert edge_rows(store) == [[OPEN_EDGE], [CLOSED_EDGE]]
 
 
-def test_equal_edges_still_advance_the_read_time(tmp_path):
-    store = flow_store(tmp_path)
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
-    store.record_edges_read(7, [OPEN_EDGE], at(3))
-    store.record_edges_read(7, [CLOSED_EDGE], at(2))
-    assert edge_rows(store) == [[OPEN_EDGE]], "The newer read changed nothing visible but still outranks the older"
-
-
-@pytest.mark.parametrize("empty", [False, True], ids=["equal", "initially-empty"])
-def test_a_listing_that_read_edges_equal_to_the_row_advances_the_read_time(tmp_path, empty):
-    store = flow_store(tmp_path)
-    listed = [] if empty else [OPEN_EDGE]
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: listed}, edge_reads={7: at(1)})
-    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: listed}, edge_reads={7: at(5)})
-    store.record_edges_read(7, [CLOSED_EDGE], at(4))  # After the listing began, before its own edge read.
-    assert edge_rows(store) == [listed]
-
-
-def test_a_listing_that_read_edges_outranks_a_read_started_before_it(tmp_path):
-    store = flow_store(tmp_path)
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
-    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: [CLOSED_EDGE]})
-    store.record_edges_read(7, [OPEN_EDGE], at(2))
-    assert edge_rows(store) == [[OPEN_EDGE], [CLOSED_EDGE]]
-
-
-def test_a_listing_repeating_its_old_list_does_not_undo_a_newer_live_read(tmp_path):
-    store = flow_store(tmp_path)
-    remote = {"number": 3, "state": "open", "repository": "other/repo"}
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [remote]})
-    closed = {**remote, "state": "closed"}
-    store.record_edges_read(7, [closed], at(2))
-    # The other repository's issue shows no change here, so the tracker repeats the row's list.
-    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: [remote]}, edge_reads={})
-    assert edge_rows(store) == [[remote], [closed]]
-
-
-def test_a_repeated_list_alone_never_establishes_edges(tmp_path):
+def test_edges_stay_unknown_until_a_read_or_write_establishes_them(tmp_path):
     store = flow_store(tmp_path)
     store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]}, edge_reads={})
-    assert edge_rows(store) == [None], "No read in this history established them"
-
-
-def test_edges_first_read_equal_to_a_rows_unread_default_become_known(tmp_path):
-    store = flow_store(tmp_path)
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={})  # The row now holds an unread [].
-    store.refresh_local_issues([plain_issue()], [], {}, at(2), blocked_by={7: []})  # A real read of no edges.
-    assert edge_rows(store) == [None, []]
+    store.record_edge_write(7, 3, at(2), at(2), remove=True)
+    assert edge_rows(store) == [None], "Neither a repeated list nor removing from nothing says what the edges are"
+    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: []})
+    assert edge_rows(store) == [None, []], "A real read of none is a fact, unlike the row's unread default"
 
 
 def test_tracker_marks_only_the_edges_it_read_during_a_listing(case):
@@ -808,25 +811,64 @@ def test_delegated_dependency_read_is_an_observation_and_keeps_its_result(case):
     assert edge_rows(case.store)[-1] == [OPEN_EDGE]
 
 
-def test_dependency_writes_enter_history_before_any_read_and_without_one(case):
-    case.remote.add_issue(3, "Blocker", "", labels=[])
-    case.reader.get_issue(3)
+def test_concurrent_dependency_writes_acknowledged_in_reverse_all_enter_history_without_a_read(case):
+    for number in (3, 4):
+        case.remote.add_issue(number, "Blocker", "", labels=[])
+        case.reader.get_issue(number)
     case.store.record_edges_read(7, [], T0)
     calls = []
-    for name in ("add_blocked_by", "remove_blocked_by"):
-        setattr(case.remote, name, lambda *args, _name=name: calls.append((_name, *args)))
+
+    def send(n, blocker):
+        calls.append(blocker)
+        if blocker == 3:  # Blocker 4's write starts and finishes while this send waits.
+            case.clock[0] = at(2)
+            case.reader.add_blocked_by(7, 4)
+
+    case.remote.add_blocked_by = send
+    case.remote.remove_blocked_by = lambda n, blocker: calls.append(-blocker)
     case.remote.blocked_by = lambda n: pytest.fail("Recording a write must not read GitHub")
     case.clock[0] = at(1)
     case.reader.add_blocked_by(7, 3)
-    case.clock[0] = at(2)
+    assert [[edge["number"] for edge in edges] for edges in edge_rows(case.store)[-3:]] == [[], [4], [3, 4]]
+    assert calls == [3, 4]
+    case.clock[0] = at(3)
     case.reader.remove_blocked_by(7, 3)
-    assert calls == [("add_blocked_by", 7, 3), ("remove_blocked_by", 7, 3)]
-    assert edge_rows(case.store)[-3:] == [[], [OPEN_EDGE], []], "Adding then removing keeps both transitions"
+    assert [edge["number"] for edge in edge_rows(case.store)[-1]] == [4] and calls == [3, 4, -3]
 
 
-def test_removing_an_edge_of_unknown_edges_does_not_claim_there_are_none(case):
-    case.reader.remove_blocked_by(7, 3)
-    assert edge_rows(case.store)[-1] is None
+def test_a_delayed_dependency_response_cannot_resurrect_a_removed_edge_through_the_tracker(case):
+    case.remote.add_issue(3, "Blocker", "", labels=[])
+    case.reader.get_issue(3)
+    case.store.record_edges_read(7, [], T0)
+    case.remote.remove_blocked_by = lambda n, blocker: None
+    case.remote.blocked_by = lambda n: []
+
+    def add(n, blocker):  # GitHub applied it, but the response waits while newer work finishes.
+        case.clock[0] = at(2)
+        case.reader.remove_blocked_by(7, 3)
+        case.clock[0] = at(3)
+        case.reader.blocked_by(7)
+        case.clock[0] = at(4)
+
+    case.remote.add_blocked_by = add
+    case.clock[0] = at(1)
+    case.reader.add_blocked_by(7, 3)
+    assert edge_rows(case.store)[-1] == []
+
+
+def test_a_read_started_during_a_dependency_write_cannot_lose_the_accepted_edge(case):
+    case.remote.add_issue(3, "Blocker", "", labels=[])
+    case.reader.get_issue(3)
+    case.store.record_edges_read(7, [], T0)
+
+    def send(n, blocker):
+        case.store.record_edges_read(7, [], at(2))  # Started before GitHub applied this write.
+        case.clock[0] = at(3)
+
+    case.remote.add_blocked_by = send
+    case.clock[0] = at(1)
+    case.reader.add_blocked_by(7, 3)
+    assert [edge["number"] for edge in edge_rows(case.store)[-1]] == [3]
 
 
 def test_a_failed_dependency_write_records_nothing(case):
@@ -840,22 +882,14 @@ def test_a_failed_dependency_write_records_nothing(case):
     assert edge_rows(case.store)[-1] == []
 
 
-def test_a_read_started_before_a_dependency_write_cannot_undo_it(case):
-    case.remote.add_issue(3, "Blocker", "", labels=[])
-    case.store.record_edges_read(7, [], T0)
-    case.clock[0] = at(5)
-    case.reader.add_blocked_by(7, 3)
-    case.store.record_edges_read(7, [], at(1))
-    assert edge_rows(case.store)[-1][0]["number"] == 3
-
-
-@pytest.mark.parametrize("facts", [True, False], ids=["with-facts", "edge-only"])
-def test_a_stale_local_update_cannot_enter_edge_history(tmp_path, facts):
+@pytest.mark.parametrize("extra", [{"state": "open"}, {}], ids=["with-facts", "edge-only"])
+def test_a_stale_local_update_cannot_enter_edge_history(tmp_path, extra):
     store = flow_store(tmp_path)
     store.refresh_local_issues([plain_issue()], [], {}, at(5), blocked_by={7: [CLOSED_EDGE]})
-    extra = {"state": "open"} if facts else {}
     store.update_local_issue(7, blocked_by=[OPEN_EDGE], observed_at=at(1), **extra)
     assert edge_rows(store) == [[CLOSED_EDGE]]
+    store.update_local_issue(7, blocked_by=[OPEN_EDGE], observed_at=at(6))
+    assert edge_rows(store) == [[CLOSED_EDGE], [OPEN_EDGE]]
 
 
 def test_edges_a_stale_update_left_on_the_row_never_enter_history_later(tmp_path):
@@ -863,25 +897,9 @@ def test_edges_a_stale_update_left_on_the_row_never_enter_history_later(tmp_path
     store.ingest([plain_issue()], at(5), {})  # Edges still unknown.
     store.update_local_issue(7, state="open", blocked_by=[OPEN_EDGE], observed_at=at(1))
     assert [row["blocked_by"] for row in store.local_issues()] == [[OPEN_EDGE]], "The row keeps today's behavior"
-    store.ingest([plain_issue(labels=("approved", "ready"))], at(6), {})
-    store.refresh_local_issues([plain_issue(labels=("approved",))], [], {}, at(7),
+    store.refresh_local_issues([plain_issue(labels=("approved", "ready"))], [], {}, at(7),
                                blocked_by={7: [OPEN_EDGE]}, edge_reads={})
-    assert edge_rows(store) == [None, None, None], "Neither the row nor a list repeating it is evidence"
-
-
-def test_a_stale_observation_cannot_carry_edges_newer_than_the_stored_edges(tmp_path):
-    store = flow_store(tmp_path)
-    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [CLOSED_EDGE]})
-    store.ingest([plain_issue()], at(5), {})  # A newer observation that read no edges.
-    store.update_local_issue(7, state="open", blocked_by=[OPEN_EDGE], observed_at=at(3))
-    assert edge_rows(store) == [[CLOSED_EDGE]], "The update lost to the observation; its edges go with it"
-
-
-def test_a_local_edge_update_newer_than_the_stored_read_is_accepted(tmp_path):
-    store = flow_store(tmp_path)
-    store.refresh_local_issues([plain_issue()], [], {}, at(5), blocked_by={7: [CLOSED_EDGE]})
-    store.update_local_issue(7, blocked_by=[OPEN_EDGE], observed_at=at(6))
-    assert edge_rows(store) == [[CLOSED_EDGE], [OPEN_EDGE]]
+    assert edge_rows(store) == [None, None], "Neither the row nor a list repeating it is evidence"
 
 
 def test_a_read_cannot_add_edges_to_an_issue_observed_missing(tmp_path):
@@ -889,7 +907,7 @@ def test_a_read_cannot_add_edges_to_an_issue_observed_missing(tmp_path):
     store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
     store.queue_github_write(7, "add_labels", labels=["pending"], started_at=at(9))  # Keeps the row.
     store.ingest_absence(7, at(5))
-    store.record_edges_read(7, [CLOSED_EDGE], at(2))  # Newer than the stored edges, so only the absence refuses it.
+    store.record_edges_read(7, [CLOSED_EDGE], at(2))
     assert edge_rows(store)[-1] == [OPEN_EDGE]
 
 
@@ -979,3 +997,15 @@ def test_an_evicted_unchanged_issue_is_not_recorded_again_by_each_listing(tmp_pa
     assert flow(store, "issue-state", 7) == [], "The fixture evicted the record"
     store.ingest([closed], at(2), {})
     assert flow(store, "issue-state", 7) == []
+
+
+def test_kept_edge_facts_cannot_grow_past_the_newest_whole_read(tmp_path):
+    store = flow_store(tmp_path)
+    store.ingest([plain_issue()], at(1), {})
+    store.record_edges_read(7, [], at(2))
+    store.record_edge_write(7, 3, at(3), at(3), remove=False)
+    store.record_edge_write(7, 3, at(4), at(4), remove=True)
+    store.record_edges_read(7, [], at(5))
+    store.record_edges_read(7, [], at(6))
+    kept = json.loads((store.root / "flow" / "issue-facts.json").read_text(encoding="utf-8"))["7"]["edge_facts"]
+    assert [fact["at"] for fact in kept] == [at(4).isoformat(), at(6).isoformat()], "One edit per edge and one list"

@@ -252,8 +252,8 @@ class IssueSnapshotMixin:
             row.update(fields)
             self._save_local_issue(snapshot, row)
             if outcome != "stale" and (facts or "blocked_by" in fields):
-                self._flow_issue_states(
-                    snapshot, [number], {number: (fields["blocked_by"], observed_at)} if "blocked_by" in fields else None)
+                self._flow_issue_states(snapshot, [number], {
+                    number: _flow.edge_read(fields["blocked_by"], observed_at or self._now())} if "blocked_by" in fields else None)
 
     def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
         """Record an issue as an observation at its time (default now)."""
@@ -315,3 +315,4 @@ class IssueSnapshotMixin:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+import foragent.state_flow as _flow

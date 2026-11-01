@@ -13,7 +13,7 @@ Lock order is state lock, then flow lock; nothing takes the state lock under the
 
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 import fcntl
 from hashlib import sha256
 import json
@@ -43,16 +43,53 @@ def normalized_edges(edges: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(known, key=lambda edge: (edge["repository"] or "", edge["number"]))
 
 
-def _aware(moment: datetime | None) -> datetime | None:
-    return moment.replace(tzinfo=UTC) if moment is not None and moment.tzinfo is None else moment
+def edge_read(edges: Iterable[dict[str, Any]], started_at: datetime) -> dict[str, Any]:
+    """One observation of an issue's whole edge list, at the time its read started."""
+    return {"at": started_at.isoformat(), "edges": normalized_edges(edges)}
+
+
+def _with_fact(kept: list[dict[str, Any]], fact: dict[str, Any]) -> list[dict[str, Any]]:
+    """Add a fact in time order, whenever it arrives.
+
+    Before the newest whole list, only each edge's latest edit can still matter (see ``current_edges``).
+    """
+    facts = sorted([*kept, fact], key=lambda item: stamp(item["at"]))
+    whole = [position for position, item in enumerate(facts) if "edges" in item]
+    if not whole:
+        return facts
+    latest = {item["edge"]["number"]: item for item in facts[:whole[-1]] if "edge" in item}
+    return [*sorted(latest.values(), key=lambda item: stamp(item["at"])), *facts[whole[-1]:]]
+
+
+def current_edges(kept: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """The edges the facts add up to, in time order. Removing from unknown edges leaves them unknown.
+
+    A write happened somewhere between its start (``at``) and its response (``accepted_at``).
+    So a whole list decides an edge unless the edge's latest earlier write was still in flight
+    when the list's read started: that read may not show it, and the write stands.
+    """
+    known = None
+    for position, fact in enumerate(kept):
+        if "edges" not in fact:
+            known = _edit(known, fact)
+            continue
+        known = fact["edges"]
+        for edit in kept[:position]:
+            if stamp(edit["accepted_at"]) > stamp(fact["at"]):
+                known = _edit(known, edit)
+    return known
+
+
+def _edit(known: list[dict[str, Any]] | None, fact: dict[str, Any]) -> list[dict[str, Any]] | None:
+    edge = fact["edge"]
+    rest = [item for item in known or [] if item["number"] != edge["number"] or item["repository"]]
+    return (rest if known is not None else None) if fact["remove"] else normalized_edges([*rest, edge])
 
 
 def _valid(row: Any) -> bool:
     if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or not isinstance(row.get("data"), dict):
         return False
-    if not {"issue", "run_started_at"} <= row.keys() or stamp(row.get("at")) is None:
-        return False
-    return datetime.fromisoformat(row["at"]).utcoffset() == timedelta(0)
+    return {"issue", "run_started_at"} <= row.keys() and stamp(row.get("at")) is not None
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -139,7 +176,6 @@ class FlowRecordsMixin:
         """Retained observations in ``[since, until)``, oldest first. Reading changes nothing."""
         with self._flow_reading():
             rows = [row for group in GENERATIONS for row in self._flow_group_rows(group)]
-        since, until = _aware(since), _aware(until)
         moments = [(stamp(row["at"]), index) for index, row in enumerate(rows)]
         return [rows[index] for at, index in sorted(moments)
                 if (since is None or at >= since) and (until is None or at < until)]
@@ -197,9 +233,9 @@ class FlowRecordsMixin:
         return index if isinstance(index, dict) else {}
 
     def flow_known_edges(self, number: int) -> list[dict[str, Any]] | None:
-        """The issue's last accepted blocked_by edges; None when no read ever established them."""
+        """The issue's blocked_by edges as its kept facts give them; None when nothing ever established them."""
         entry = self._flow_index().get(str(number))
-        return entry.get("edges") if isinstance(entry, dict) else None
+        return current_edges(entry.get("edge_facts", [])) if isinstance(entry, dict) else None
 
     def _flow_write_index(self, index: dict[str, Any]) -> None:
         text = json.dumps(index, ensure_ascii=False, separators=(",", ":"))
@@ -212,34 +248,30 @@ class FlowRecordsMixin:
 
     def record_edges_read(self, number: int, edges: list[dict[str, Any]], started_at: datetime) -> None:
         """A read that started at ``started_at`` showed these blocked_by edges."""
-        self._flow_edges(number, edges, started_at)
+        self._flow_edge_fact(number, lambda snapshot: edge_read(edges, started_at))
 
-    def record_edge_write(self, number: int, blocker: int, started_at: datetime, *, remove: bool) -> None:
+    def record_edge_write(self, number: int, blocker: int, started_at: datetime, accepted_at: datetime,
+                          *, remove: bool) -> None:
         """A blocked_by write GitHub accepted. Recording it reads nothing, so the new edge's state is the local one."""
-        def edit(known: list[dict[str, Any]] | None, snapshot: dict[str, Any]) -> list[dict[str, Any]] | None:
-            rest = [edge for edge in known or [] if edge["number"] != blocker or edge["repository"]]
-            if remove:
-                return rest if known is not None else None
-            return normalized_edges([*rest, {"number": blocker, "state": (accepted_facts(snapshot, blocker)[0] or {}).get("state")}])
+        self._flow_edge_fact(number, lambda snapshot: {
+            "at": started_at.isoformat(), "accepted_at": accepted_at.isoformat(), "remove": remove,
+            "edge": {"number": blocker, "state": (accepted_facts(snapshot, blocker)[0] or {}).get("state")}})
 
-        self._flow_edges(number, edit, started_at)
-
-    def _flow_edges(self, number: int, value: Any, at: datetime) -> None:
+    def _flow_edge_fact(self, number: int, fact: Any) -> None:
         try:
             with self._state_lock():
-                self._flow_issue_states(self._issue_snapshot(), [number], {number: (value, at)})
+                snapshot = self._issue_snapshot()
+                self._flow_issue_states(snapshot, [number], {number: fact(snapshot)})
         except Exception:  # noqa: BLE001
             return
 
     def _flow_issue_states(self, snapshot: dict[str, Any], numbers: Iterable[int],
-                           edges: dict[int, tuple[Any, datetime | None]] | None = None) -> None:
+                           edges: dict[int, dict[str, Any]] | None = None) -> None:
         """Record the accepted facts of these issues where they changed; ``snapshot`` is already committed.
 
-        ``edges`` maps an issue to the blocked_by facts one read or write established
-        and when it started (default now): a list, or an edit of the known list. One
-        that started before the stored edges' is stale, whichever finished first. Only
-        these establish edges, never a row's field: other issues keep their last known
-        edges, and None means they were never known.
+        ``edges`` holds the blocked_by fact one read or write established per issue.
+        Only these establish edges, never a row's field. Other issues keep their edges,
+        and None means they were never known.
         """
         if not numbers:
             return
@@ -252,21 +284,17 @@ class FlowRecordsMixin:
                     facts, seen = accepted_facts(snapshot, number)
                     if seen is None:
                         continue  # A local placeholder row: nothing about the issue was observed yet.
-                    known, known_at = entry.get("edges"), entry.get("edges_at")
+                    kept = entry.get("edge_facts", [])
                     if facts is not None and number in (edges or {}):
-                        value, started = edges[number]
-                        started = _aware(started) or self._now()
-                        if known_at is None or started >= stamp(known_at):
-                            known = value(known, snapshot) if callable(value) else normalized_edges(value)
-                            known_at = started.isoformat()
+                        kept = _with_fact(kept, edges[number])
                     state = "absent" if facts is None else facts["state"]
-                    data = {"labels": sorted(facts["labels"]) if facts else [], "blocked_by": known, "state": state}
+                    data = {"labels": sorted(facts["labels"]) if facts else [],
+                            "blocked_by": current_edges(kept), "state": state}
                     digest = sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-                    fresh = {"digest": digest, "edges": known, "edges_at": known_at}
+                    fresh = {"digest": digest, "edge_facts": kept}
                     if fresh != entry:
                         index[str(number)], dirty = fresh, True
                     if entry.get("digest") != digest:
-                        data["observed_at"] = seen.isoformat()
                         lines.append(_encoded(self._flow_row("issue-state", number, None, data)))
                 self._flow_append("other", lines)  # The index follows: a crash repeats, never loses, a record.
                 if dirty:

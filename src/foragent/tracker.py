@@ -246,12 +246,12 @@ class RecordingTracker:
     def add_blocked_by(self, n, blocker):
         started = self._started()
         self._tracker.add_blocked_by(n, blocker)
-        self._context.store.record_edge_write(n, blocker, started, remove=False)
+        self._context.store.record_edge_write(n, blocker, started, self._started(), remove=False)
 
     def remove_blocked_by(self, n, blocker):
         started = self._started()
         self._tracker.remove_blocked_by(n, blocker)
-        self._context.store.record_edge_write(n, blocker, started, remove=True)
+        self._context.store.record_edge_write(n, blocker, started, self._started(), remove=True)
 
     def _started(self):
         """When a read or write begins: observations and intents are ordered by it, not by completion."""
