@@ -1283,7 +1283,9 @@ def test_a_refused_stop_does_not_stop_the_tick_from_closing_a_talk(git_history, 
     tick(ctx)
     sched.mark_running(ctx)
     talk_event(ctx.store, sched.NOW)
-    ctx.store.save_flag(1, Reason.STOP_REFUSED, flagged_at=(sched.NOW + timedelta(minutes=1)).isoformat())
+    ctx.now = lambda: sched.NOW + timedelta(minutes=1)
+    sched.flag(ctx, 1, Reason.STOP_REFUSED, "Stop refused: prior attempt")
+    assert ctx.store.load_flag(1).reason == Reason.STOP_REFUSED
     monkeypatch.setattr(probe, "liveness", lambda event, cwd: probe.CLOSED)  # The terminal is gone.
     ctx.now = lambda: sched.NOW + timedelta(minutes=5)
     tick(ctx)
