@@ -28,7 +28,7 @@ class ParsedIssue:
     exclusive: list[str] = field(default_factory=list)
 
 
-def _sections(body: str, names: set[str]) -> dict[str, list[str]]:
+def parse_body(body: str) -> ParsedIssue:
     body = body.replace("\r\n", "\n")
     sections: dict[str, list[str]] = {}
     current: list[str] | None = None
@@ -43,43 +43,13 @@ def _sections(body: str, names: set[str]) -> dict[str, list[str]]:
             if opening:
                 fence = opening[1]
             elif line.startswith("## "):
-                heading = re.fullmatch(r"## (.+?)[ \t]*", line)
+                heading = re.fullmatch(r"## (Goal|Out of scope|Files|Done when)[ \t]*", line)
                 current = None
-                if heading and heading[1] in names and heading[1] not in sections:
+                if heading and heading[1] not in sections:
                     current = sections[heading[1]] = []
                 continue
         if current is not None:
             current.append(raw_line)
-    return sections
-
-
-def read_waiting(body: str) -> dict[str, str] | None:
-    """Read the issue-owned Waiting section; missing, cleared or incomplete waits are absent.
-
-    This is the public reader for waiting projections. Values are authored text, not
-    instructions for a reader to interpret or translate.
-    """
-    lines = _sections(body, {"Waiting"}).get("Waiting", [])
-    fields = {"Reason": "reason", "Next condition": "next_condition", "Responsible role": "responsible_role"}
-    values = {}
-    fence = None
-    for raw in lines:
-        line = raw.removesuffix("\n")
-        if fence is not None:
-            if re.fullmatch(rf"[ \t]*`{{{len(fence)},}}[ \t]*", line):
-                fence = None
-            continue
-        if opening := re.fullmatch(r"[ \t]*(`{3,4})[^`]*", line):
-            fence = opening[1]
-            continue
-        label, separator, value = line.partition(":")
-        if separator and label in fields:
-            values.setdefault(fields[label], value.strip())
-    return values if len(values) == len(fields) and all(values.values()) else None
-
-
-def parse_body(body: str) -> ParsedIssue:
-    sections = _sections(body, {"Goal", "Out of scope", "Files", "Done when"})
 
     commands: list[str] = []
     checklist: list[ChecklistItem] = []

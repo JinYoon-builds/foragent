@@ -218,6 +218,14 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
 
     status, language = snapshot.status, config.language
     clones = _clones(status)
+    # A task can change lanes after a merge. Current rows anywhere in the view
+    # take precedence over that task's historical row in its previous lane.
+    current = {run["number"] for runs in clones.values() for run in runs}
+    current.update(number for number, fact in snapshot.waiting_facts.items() if fact.get("authored"))
+    for lane in status["lanes"].values():
+        current.update(item["number"] for group in ("running", "held", "queued") for item in lane.get(group) or [])
+        if lane.get("issue") is not None and lane["state"] in {"working", "waiting-human", "blocked"}:
+            current.add(lane["issue"])
     found: list[dict[str, Any]] = []
     for row in status["lanes"].values():
         slug, name = row["slug"], row["lane_display"]
@@ -258,7 +266,6 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
         listed = shown | {item["number"] for item in queued}
         queued += [{"number": number, "title": fact.get("title", "")}
                    for number, fact in authored.items() if number not in listed]
-        current = shown | {item["number"] for item in queued}
         # A reopened issue can have a past merge and a current wait. Its current row
         # carries the explanation; the historical row must not repeat it as done.
         finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in current]

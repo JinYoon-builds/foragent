@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from foragent import cli  # noqa: F401 - load scheduler before status (the existing import order)
-from foragent import issue, status, watch, watch_data
+from foragent import order_waiting, status, watch, watch_data
 from foragent.config import Config
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
@@ -67,7 +67,7 @@ def test_every_authored_wait_is_visible_folded_and_clear_follows_snapshot(tmp_pa
 def test_wait_reader_is_the_only_authority_and_unreadable_snapshot_is_absent(tmp_path, monkeypatch):
     config, store, tracker = scenario(tmp_path, monkeypatch)
     payload = status.collect(store, config, NOW)
-    monkeypatch.setattr(issue, "read_waiting", lambda body: None)
+    monkeypatch.setattr(order_waiting, "section", lambda body: None)
     snapshot = watch.collect(payload, None, store, config, NOW)
     assert not any(fact.get("authored") for fact in snapshot.waiting_facts.values())
     assert VALUES[0] not in watch.render_frame(snapshot, config, tmp_path, width=240)
@@ -77,6 +77,35 @@ def test_wait_reader_is_the_only_authority_and_unreadable_snapshot_is_absent(tmp
 
     monkeypatch.setattr(store, "local_issues", unreadable)
     assert watch.collect(payload, None, store, config, NOW).waiting_facts == {}
+
+
+@pytest.mark.parametrize("authored", ["Reason: Choice  pending", "Wait for Jin's locale choice.\nOwner: planning",
+                                    "Reason: A\nNext condition: B\nResponsible role: C\nContext: keep this too"])
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_partial_and_free_form_waits_keep_the_canonical_authored_text(tmp_path, monkeypatch, authored, language):
+    config, store, tracker = scenario(tmp_path, monkeypatch, language)
+    tracker.update_issue(2, title="Task 2", body="## Waiting\n" + authored)
+    store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
+    snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
+    assert snapshot.waiting_facts[2]["authored"] == {"text": authored}
+    frame = watch.render_frame(snapshot, config, tmp_path, width=240)
+    assert frame.count("#2") == 1
+    for line in authored.splitlines():
+        assert frame.count(line) == 1
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_authored_tabs_keep_visible_word_spacing_in_both_record_forms(tmp_path, monkeypatch, language, structured):
+    config, store, tracker = scenario(tmp_path, monkeypatch, language)
+    value = "Await\tlocale choice."
+    body = WAIT.replace(VALUES[0], value) if structured else "## Waiting\n" + value
+    tracker.update_issue(2, title="Task 2", body=body)
+    store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
+    snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
+    assert "\t" in snapshot.waiting_facts[2]["authored"]["text"]
+    frame = watch.render_frame(snapshot, config, tmp_path, width=240)
+    assert frame.count("Await   locale choice.") == 1
 
 
 def test_reopened_issue_shows_its_current_wait_once_instead_of_a_done_row(tmp_path, monkeypatch):
@@ -91,6 +120,41 @@ def test_reopened_issue_shows_its_current_wait_once_instead_of_a_done_row(tmp_pa
         own = [line for line in frame.splitlines() if "#2" in line]
         assert len(own) == 1 and "waiting" in own[0] and "done" not in own[0]
         assert frame.count("Waiting: Reopened locale decision") == 1
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_a_wait_follows_its_current_row_after_an_issue_changes_lane(tmp_path, monkeypatch, active):
+    config, store, tracker = scenario(tmp_path, monkeypatch)
+    config.lanes["other"] = {}
+    store.start_run(2, branch="old", worktree="old", lane="work")
+    if not active:
+        store.finish_run(2, "merged")
+    tracker.remove_labels(2, ["lane:work"])
+    tracker.add_labels(2, ["lane:other", *(["approved", "running"] if active else [])])
+    tracker.update_issue(2, title="Moved task", body=WAIT.replace(VALUES[0], "Moved locale decision"))
+    store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
+    snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
+    assert snapshot.waiting_facts[2]["lane"] == ("work" if active else "other")
+    for state in (None, {"unfolded": {"work", "other"}}):
+        frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, now=NOW)
+        assert frame.count("#2") == 1
+        assert frame.count("Waiting: Moved locale decision") == 1
+
+
+@pytest.mark.parametrize("labels", [["approved", "ready"], ["needs-human"]])
+def test_other_current_rows_also_replace_a_previous_lanes_finished_row(tmp_path, monkeypatch, labels):
+    config, store, tracker = scenario(tmp_path, monkeypatch)
+    config.lanes["other"] = {}
+    store.start_run(2, branch="old", worktree="old", lane="work")
+    store.finish_run(2, "merged")
+    tracker.remove_labels(2, ["lane:work"])
+    tracker.add_labels(2, ["lane:other", *labels])
+    tracker.update_issue(2, title="Moved task", body="")
+    store.refresh_local_issues(tracker.list_issues("all"), [], config.lanes, NOW)
+    snapshot = watch.collect(status.collect(store, config, NOW), None, store, config, NOW)
+    for state in (None, {"unfolded": {"work", "other"}}):
+        frame = watch.render_frame(snapshot, config, tmp_path, width=240, state=state, now=NOW)
+        assert frame.count("#2") == 1
 
 
 @pytest.mark.parametrize("width", [20, 40, 80])

@@ -9,27 +9,10 @@ from foragent.issue import (
     body_hash,
     has_machine_check,
     parse_body,
-    read_waiting,
 )
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "docs/impl/fixtures"
-
-
-def test_public_waiting_reader_preserves_values_and_section_boundaries():
-    body = ("## Waiting  \r\nReason: Choice  pending: locale\r\n"
-            "Next condition: Jin records a choice\r\nResponsible role: orchestrator\r\n"
-            "## Notes\r\nReason: obsolete\r\n")
-    assert read_waiting(body) == {"reason": "Choice  pending: locale",
-                                  "next_condition": "Jin records a choice", "responsible_role": "orchestrator"}
-
-
-@pytest.mark.parametrize("body", ["", "## Waiting\nNone.\n", "## Waiting\nReason: incomplete",
-    "```md\n## Waiting\nReason: example\nNext condition: example\nResponsible role: example\n```",
-    "## Waiting\n```md\nReason: example\nNext condition: example\nResponsible role: example\n```",
-    "## Waiting\nReason: \nNext condition: choice\nResponsible role: orchestrator"])
-def test_public_waiting_reader_absent_cleared_incomplete_or_example(body):
-    assert read_waiting(body) is None
 
 
 @pytest.mark.parametrize(

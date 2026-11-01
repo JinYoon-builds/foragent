@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import issue
+from foragent import order_waiting
 from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN, RUNNING, WAITING_PERSON, issue_lane
 from foragent.state import StateStore
@@ -308,11 +308,12 @@ def waiting_facts(
     for number, row in sorted(rows.items()):
         if row["state"] != "open":
             continue
-        authored = issue.read_waiting(row.get("body") or "")
-        if authored is not None:
-            found[number] = {"authored": authored, "lane": issue_lane(row.get("labels") or (), config.lanes),
-                             "title": row.get("title") or ""}
         run = runs.get(number)
+        lane = (run or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
+        authored = order_waiting.read_waiting(row.get("body") or "")
+        if authored is not None:
+            found[number] = {"authored": authored, "lane": lane,
+                             "title": row.get("title") or ""}
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
         if state in HELD or (run is None and {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & labels):
@@ -341,7 +342,6 @@ def waiting_facts(
                 if approval is not None:
                     from foragent.issue import parse_body
 
-                    lane = (run or {}).get("lane") or issue_lane(labels, config.lanes)
                     held, shared = _overlap(ctx, number, lane, parse_body(approval.body))
                     paths |= shared
             except Exception:  # noqa: BLE001, S110 - optional evidence; the entry and its dependencies stay.
