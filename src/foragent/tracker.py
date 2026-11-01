@@ -145,6 +145,10 @@ class TrackerError(RuntimeError):
         return bool(re.search(r"\bHTTP(?:/\S+)?\s+404\b", f"{self}\n{self.stdout}", re.I))
 
     @property
+    def is_server_error(self) -> bool:
+        return bool(re.search(r"\bHTTP(?:/\S+)?\s+5\d\d\b", f"{self}\n{self.stdout}", re.I))
+
+    @property
     def reset_at(self) -> datetime | None:
         match = re.search(r"^x-ratelimit-reset:\s*(\d+)\s*$", f"{self.stdout}\n{self}", re.I | re.M)
         if match is not None:
@@ -457,7 +461,8 @@ class RecordingTracker:
         payload, e.g. the rest of a label removal). A sent intent is visible
         to every later intent's premise while its send is in flight; the
         result is appended as an attempt. A failure nobody retries is final.
-        Comments stay direct sends: they change no labels or state.
+        Comments stay direct sends; transient failures retain their send-only intent
+        even for a runner that does not defer field writes.
         """
         store = self._context.store
         premise = self._premise(n)
@@ -472,7 +477,8 @@ class RecordingTracker:
         try:
             result = operation()
         except TrackerError as exc:
-            retry = self.queue_writes and exc.is_rate_limit
+            retry = (self.queue_writes and exc.is_rate_limit
+                     or action == "comment" and (exc.is_rate_limit or exc.is_server_error))
             if entry is not None and retry and field_payload != payload:
                 store.record_github_attempt(entry["id"], started, False, final=True)
                 entry = None  # Retry the unsent composite close, preserving its original premise.
@@ -483,9 +489,10 @@ class RecordingTracker:
                                             labels=payload["labels"] if action == "remove_labels" else None)
             if not retry:
                 raise
-            from foragent.orch_github import pause
+            if exc.is_rate_limit:
+                from foragent.orch_github import pause
 
-            pause(self._context, exc)
+                pause(self._context, exc)
             return None, entry
         if entry is not None and action != "comment":
             store.record_github_attempt(entry["id"], started, True,

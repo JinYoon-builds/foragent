@@ -92,7 +92,6 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     before = transition_state(ctx, n, orch._issue(ctx, n))
     why = orch._text(why, "why")
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    was_parked = is_parked(ctx.store, n)
     if for_person:
         tracker.add_labels(n, [WAITING_PERSON])
     # Only a new approval (fa order publish) lets the gate start it again.
@@ -101,7 +100,7 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     after = before.after(add=[WAITING_PERSON] if for_person else [], remove=[APPROVED, BLOCKED, NEEDS_HUMAN])
     waiting, wait_changed = _waiting(ctx, tracker, n, why, for_person)
     _record(ctx, tracker, n, "parked", summary, waiting,
-            changed=before != after or wait_changed or not was_parked)
+            changed=before != after or wait_changed)
     return summary
 
 
@@ -109,19 +108,17 @@ def unpark(ctx, n: int) -> str:
     from foragent import orch
     from foragent.tracker import RecordingTracker
 
-    before = transition_state(ctx, n, orch._issue(ctx, n))
+    orch._issue(ctx, n)
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     # An explicit command reads GitHub now; gate readers use the existing cache.
     # During a GitHub pause the persisted projection and outbox are the evidence.
     comments = None if ctx.store.github_wait_until(ctx.now()) is not None else [
         asdict(comment) for comment in tracker.list_comments(n)]
-    was_parked = is_parked(ctx.store, n, comments=comments)
-    if not was_parked:
+    if not is_parked(ctx.store, n, comments=comments):
         raise orch.OrchError(f"issue #{n} is not parked")
     tracker.remove_labels(n, [WAITING_PERSON])
     summary = f"#{n}: unparked"
-    waiting, wait_changed = _waiting(ctx, tracker, n, None)
+    waiting, _ = _waiting(ctx, tracker, n, None)
     # A validated parked intent becomes unparked even when it has no waiting label.
-    _record(ctx, tracker, n, "unparked", summary, waiting,
-            changed=before != before.after(remove=[WAITING_PERSON]) or wait_changed or was_parked)
+    _record(ctx, tracker, n, "unparked", summary, waiting, changed=True)
     return summary

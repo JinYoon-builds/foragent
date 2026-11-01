@@ -155,7 +155,7 @@ def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: I
     The comment carries the exact summary (the journal's copy has its spacing collapsed).
     """
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
-    if not changed or ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
+    if not changed:
         return event
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     for number in ([n] if n is not None else issues):
@@ -197,7 +197,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
 
 
 def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
-    """Queue a retry, preserving the branch and delivering its pending hint."""
+    """Queue a retry, preserving the branch; replace the hint, or clear it when omitted."""
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     path = ctx.store.root / "hints" / f"{n}.txt"
     if hint is not None:
