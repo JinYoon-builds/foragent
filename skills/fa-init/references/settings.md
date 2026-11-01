@@ -1,7 +1,9 @@
 # First-use settings questions
 
-`/fa-init` asks two questions and nothing else about settings: merge (review) mode, then Claude
-quota mode. It says nothing about credits or spending; those are asked just in time elsewhere.
+`/fa-init` asks two configuration questions: merge (review) mode, then Claude
+quota mode. Setup also asks about the optional project FA permission rule when
+it is undecided, as described in [the setup flow](../SKILL.md). It says nothing
+about credits or spending; those are asked just in time elsewhere.
 
 Order:
 
