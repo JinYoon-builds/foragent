@@ -68,14 +68,22 @@ def test_retry_hint_comment_refused_by_github_is_queued_not_lost(run_case, monke
     c = run_case
     _blocked(c)
 
+    hint = "Use the selected locale"
+    advice = orch.orch_record(f"#1: queued implementation retry; hint: {hint}")
+    post = c.tracker.comment
+
     def refuse(n, body):
-        raise ValueError("Invalid comment response")
+        if body == advice:
+            raise ValueError("Invalid comment response")
+        return post(n, body)
 
     monkeypatch.setattr(c.tracker, "comment", refuse)
-    summary = orch.retry(c.ctx, 1, "Use the selected locale")
+    summary = orch.retry(c.ctx, 1, hint)
     assert "queued for the gate" in summary
     assert [body for _, body in _queued(c.store) if "Use the selected locale" in body]
     assert (c.store.root / "hints/1.txt").read_text() == "Use the selected locale"
+    assert _queued(c.store) == [(1, advice)]
+    assert c.store.github_blocking_outbox() == []
 
 
 def test_retry_hint_reaches_the_issue_byte_for_byte(run_case):
@@ -115,6 +123,10 @@ def test_every_retry_path_records_publication_before_hint_write(run_case, monkey
     _blocked(c)
     c.tracker.create_pr(head="foragent/issue-1", base="main", title="Old", body="Old")
     hint = "Keep  spacing\n\n  and indentation"
+    outcome = {"resolve-checks": "checks-failed", "resolve-ci": "ci-failed"}.get(entry)
+    accepted = hint if outcome is None else f"{hint}\n\nVerification: {outcome}\nSee {c.store.log_path(1)}"
+    advice = (orch.orch_record(f"#1: queued implementation retry; hint: {hint}") if entry == "retry"
+              else "<!-- foragent:orch -->\nRetry advice:\n\n" + accepted)
     append = run_previous.add_hint
     seen = []
 
@@ -130,18 +142,24 @@ def test_every_retry_path_records_publication_before_hint_write(run_case, monkey
         comment = c.tracker.comment
 
         def refuse_advice(number, body):
-            if number != 1 or body.startswith("<!-- foragent:orch-verdict "):
-                return comment(number, body)
-            raise TrackerError("HTTP 502: Bad Gateway")
+            if number == 1 and body == advice:
+                raise TrackerError("HTTP 502: Bad Gateway")
+            return comment(number, body)
 
         monkeypatch.setattr(c.tracker, "comment", refuse_advice)
     if entry == "retry":
         orch.retry(c.ctx, 1, hint)
     else:
-        outcome = "checks-failed" if entry == "resolve-checks" else "ci-failed"
         monkeypatch.setattr(orch, "review_only", lambda *a, **kw: outcome)
         orch.resolve(c.ctx, 1, "pass", hint)
     assert len(seen) == 1 and seen[0].startswith(hint)
+
+    assert seen == [accepted]
+    public = [comment.body for comment in c.tracker.list_comments(1)]
+    assert (public + [body for _, body in _queued(c.store)]).count(advice) == 1
+    if queued:
+        assert _queued(c.store) == [(1, advice)]
+        assert c.store.github_blocking_outbox() == []
 
 
 def test_retry_does_not_accept_hint_when_publication_cannot_be_persisted(run_case, monkeypatch):
@@ -222,3 +240,77 @@ def test_accepted_advice_publishes_independently_of_pending_label_writes(tmp_pat
     reader.flush_outbox()
     assert [c.body for c in remote.list_comments(1)] == [body, "State announcement"]
     assert remote.get_issue(1).labels == {"blocked", "ready"}
+
+
+def _messages(c):
+    return [comment.body for comment in c.tracker.list_comments(1)]
+
+
+def test_repeating_a_hint_that_is_not_the_last_pending_message_changes_nothing(run_case):
+    c = run_case
+    _blocked(c)
+    path = c.store.root / "hints/1.txt"
+    orch.retry(c.ctx, 1, "Use  A\n\n  with two paragraphs")
+    c.tracker.add_labels(1, ["blocked"])
+    orch.retry(c.ctx, 1, "Use B")
+    pending, comments = path.read_text(), _messages(c)
+    assert pending == "Use  A\n\n  with two paragraphs\n\nUse B"
+    for repeated in ("Use B", "Use  A\n\n  with two paragraphs", "Use B\n"):
+        orch.retry(c.ctx, 1, repeated)
+        assert path.read_text() == pending, "The next implementer reads each message once"
+        assert _messages(c) == comments, "An unchanged retry leaves no new comment"
+    assert not c.store.github_outbox()
+
+
+@pytest.mark.parametrize("new", ["Use", "B", "Use B and C"])
+def test_a_hint_that_only_resembles_pending_text_is_still_new(run_case, new):
+    c = run_case
+    _blocked(c)
+    path = c.store.root / "hints/1.txt"
+    orch.retry(c.ctx, 1, "Use B")
+    comments = _messages(c)
+    orch.retry(c.ctx, 1, new)
+    assert path.read_text() == f"Use B\n\n{new}"
+    assert len(_messages(c)) == len(comments) + 1 and new in _messages(c)[-1]
+
+
+def test_a_retry_of_a_delivered_hint_is_new_advice_again(run_case):
+    from foragent.run_previous import consume_hint
+
+    c = run_case
+    _blocked(c)
+    path = c.store.root / "hints/1.txt"
+    orch.retry(c.ctx, 1, "Use B")
+    comments = _messages(c)
+    consume_hint(c.store.root, 1, "Use B")
+    orch.retry(c.ctx, 1, "Use B")
+    assert path.read_text() == "Use B" and len(_messages(c)) == len(comments) + 1
+
+
+def test_a_repeated_resolve_note_does_not_repeat_pending_advice(run_case, monkeypatch):
+    c = run_case
+    _blocked(c)
+    path = c.store.root / "hints/1.txt"
+    orch._retry(c.ctx, 1, "Use A")
+    orch._retry(c.ctx, 1, "Use B")
+    pending, comments = path.read_text(), _messages(c)
+    assert pending == "Use A\n\nUse B" and sum("Retry advice" in body for body in comments) == 2
+    orch._retry(c.ctx, 1, "Use A")
+    orch._retry(c.ctx, 1, "Use B")
+    assert path.read_text() == pending and _messages(c) == comments
+
+
+def test_a_new_retry_queued_after_github_refuses_is_evidence_that_blocks_nothing(run_case, monkeypatch):
+    c = run_case
+    _blocked(c)
+    post = c.tracker.comment
+
+    def refuse(n, body):
+        raise ValueError("Invalid comment response")
+
+    monkeypatch.setattr(c.tracker, "comment", refuse)
+    orch.retry(c.ctx, 1, "Use A")
+    orch.retry(c.ctx, 1, "Use A")
+    monkeypatch.setattr(c.tracker, "comment", post)
+    assert [entry.get("evidence") for entry in c.store.github_outbox() if entry["action"] == "comment"] == [True]
+    assert c.store.github_blocking_outbox() == []

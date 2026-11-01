@@ -161,3 +161,15 @@ def test_rerun_review_adds_the_class_question_to_an_older_pr_scope():
     assert question in with_review_scope(custom, "tests/acceptance/", "en")
     korean = with_review_scope(older, "tests/acceptance/", "ko")
     assert text("review_class_question", "ko") in korean
+
+
+def test_add_hint_keeps_each_pending_message_once(tmp_path):
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path)
+    add_hint(store, 1, "A\n\nparagraph")
+    add_hint(store, 1, "B")
+    for repeated in ("A\n\nparagraph", "B", "B\n"):
+        add_hint(store, 1, repeated)  # Every producer's write, even if its earlier read was stale.
+    add_hint(store, 1, "paragraph two")
+    assert pending_hint(store.root, 1)[1] == "A\n\nparagraph\n\nB\n\nparagraph two"

@@ -472,7 +472,7 @@ def test_orch_merge_claims_the_turn_atomically_against_a_joining_run(merge_case,
     assert ready == [6, c.pr, 7], "The run that joined during the claim must queue behind the human merge"
 
 
-def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_case, monkeypatch):
+def test_orch_merge_checks_the_current_base_after_waiting_for_the_merge_lock(merge_case, monkeypatch):
     c = merge_case
     lock = c.ctx.store.merge_lock
     from contextlib import contextmanager
@@ -484,11 +484,38 @@ def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_cas
             yield
 
     monkeypatch.setattr(c.ctx.store, "merge_lock", base_moves_while_waiting)
-    with pytest.raises(orch.OrchError, match="head or base changed"):
+    orch.merge(c.ctx, c.pr, approved_by="jin")
+    assert c.tracker.merged_prs == [c.pr]
+    assert len(c.tracker.list_comments(c.pr)) == 1
+    rows = queue_events(c)
+    assert [row["event"] for row in rows] == ["ready", "turn"]
+    assert rows[-1]["base_sha"] == c.history.tip, "Check and merge the base read after the lock wait"
+
+
+@pytest.mark.parametrize("failure", ["not-ready", "exception", "interrupted", "lock-error"])
+def test_orch_merge_withdraws_reservation_when_premerge_cannot_finish(merge_case, monkeypatch, failure):
+    from contextlib import contextmanager
+
+    c = merge_case
+    if failure == "not-ready":
+        c.ctx.config = replace(c.ctx.config, test_command="false")
+        expected = orch.OrchError
+    elif failure == "lock-error":
+        @contextmanager
+        def failed_lock():
+            raise OSError("lock failed")
+            yield
+        monkeypatch.setattr(c.ctx.store, "merge_lock", failed_lock)
+        expected = OSError
+    else:
+        expected = KeyboardInterrupt if failure == "interrupted" else OSError
+        def fail(*args, **kwargs):
+            raise expected("premerge failed")
+        monkeypatch.setattr(orch, "run_logged", fail)
+    with pytest.raises(expected):
         orch.merge(c.ctx, c.pr, approved_by="jin")
-    assert c.tracker.merged_prs == []
-    assert c.tracker.list_comments(c.pr) == [], "Approval is recorded only for a fresh base"
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
+    assert not c.tracker.merged_prs and not c.tracker.list_comments(c.pr)
 
 
 def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
@@ -510,3 +537,94 @@ def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
     with pytest.raises(orch.OrchError, match=f"dream PR #{pr} predates a redo of lane alpha"):
         orch.merge(c.ctx, pr, approved_by="jin")
     assert c.tracker.merged_prs == []
+
+
+def test_concurrent_human_merges_serialize_premerge_through_merge(merge_case, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from foragent import run_merge_turn as turn
+
+    c = merge_case
+    second = c.tracker.create_pr(head="feature/second", base="main", title="Second", body="")
+    c.tracker.set_pr_head_sha(second, c.head)
+    c.tracker.set_pr_checks(second, "pass")
+    first_check, release_first, second_claim, second_check = (Event() for _ in range(4))
+    effects = []
+    claim = turn.claim
+    merge = c.tracker.merge_pr
+
+    def observe_claim(ctx, place, head):
+        holder = claim(ctx, place, head)
+        if place.n == second:
+            assert holder is None  # Human queue rows have no running Run record.
+            second_claim.set()
+        return holder
+
+    def premerge(ctx, number):
+        effects.append(("premerge", number))
+        if number == c.pr:
+            first_check.set()
+            assert release_first.wait(5), "First premerge was not released"
+        else:
+            second_check.set()
+        return orch._Premerge(orch._open_pr(ctx, number), c.head,
+                              git_command(c.history.origin, "rev-parse", "main"),
+                              {"ready": True, "failing_on_base": []})
+
+    def merge_pr(number, **kwargs):
+        effects.append(("merge", number))
+        merge(number, **kwargs)
+
+    monkeypatch.setattr(turn, "claim", observe_claim)
+    monkeypatch.setattr(orch, "_premerge", premerge)
+    monkeypatch.setattr(c.tracker, "merge_pr", merge_pr)
+    monkeypatch.setattr(orch, "after_merge", lambda *args: None)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(orch.merge, c.ctx, c.pr, approved_by="jin")
+        try:
+            assert first_check.wait(5)
+            following = pool.submit(orch.merge, c.ctx, second, approved_by="jin")
+            assert second_claim.wait(5), "The other human must reach the early queue check"
+            assert not second_check.wait(0.2), "The second premerge overtook the held merge lock"
+        finally:
+            release_first.set()
+        assert "merged" in first.result(timeout=5)
+        assert "merged" in following.result(timeout=5)
+    assert effects == [("premerge", c.pr), ("merge", c.pr),
+                       ("premerge", second), ("merge", second)]
+
+
+def test_human_withdraw_is_atomic_against_another_claim(merge_case, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from foragent import run_merge_turn as turn
+
+    c = merge_case
+    own = turn.Seat(c.pr, "orch-merge first", "main")
+    other = turn.Seat(c.pr + 1, "orch-merge second", "main")
+    assert turn.claim(c.ctx, own, c.head) is None
+    entered, completed = Event(), Event()
+    append = turn._append
+    futures = []
+
+    def claim():
+        entered.set()
+        try:
+            return turn.claim(c.ctx, other, c.head)
+        finally:
+            completed.set()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        def observe_withdraw(store, row):
+            if row["event"] == "withdrawn":
+                futures.append(pool.submit(claim))
+                assert entered.wait(5)
+                assert not completed.wait(0.2), "Claim bypassed the withdrawal's state lock"
+            append(store, row)
+
+        monkeypatch.setattr(turn, "_append", observe_withdraw)
+        turn.withdraw(c.ctx, own)
+        assert futures[0].result(timeout=5) is None
+    rows = queue_events(c)
+    assert [(row["n"], row["event"]) for row in rows] == [
+        (own.n, "ready"), (own.n, "withdrawn"), (other.n, "ready")]

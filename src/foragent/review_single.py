@@ -34,7 +34,7 @@ def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
 
     Failed or finding-free rounds leave the full review in charge until it produces findings.
     Those first usable findings remain the confirmation scope for every later round.
-    Native Claude reviews have no VERDICT line, so recognize their existing findings format too.
+    Legacy native Claude artifacts may lack a VERDICT line, so recognize their findings format too.
     """
     from foragent.run_review import code_review_findings, parse_review
 
@@ -107,7 +107,7 @@ def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     if result.timed_out or result.exit_code != 0:
         review = ReviewResult("UNUSABLE", "", (
             f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",
-        ))
+        ), execution_failed=True)
     else:
         parser = parse_code_review if native else parse_review
         review = parser(message)

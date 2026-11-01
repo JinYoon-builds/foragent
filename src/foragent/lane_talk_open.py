@@ -25,7 +25,7 @@ from foragent.config import Config
 from foragent.i18n import text
 from foragent.lanes import LaneError
 from foragent.orch_events import append_event
-from foragent.run_previous import add_hint
+from foragent.run_previous import add_hint, holds_hint, pending_hint
 from foragent.state import StateStore
 from foragent.state_locks import LockBusy
 from foragent.state_records import Run
@@ -147,15 +147,18 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
         raise TalkError(text("talk_no_session", language, n=number))
     published = False
 
-    def accept():
+    def accept(hint_for: str | None = None):
+        """Publish once; a message still pending for a Claude worker is already public."""
         nonlocal published
+        if hint_for == "claude" and holds_hint(pending_hint(store.root, number)[1], message):
+            return
         if message and accepted is not None and not published:
             accepted(message)
             published = True
 
     sent = ""
     if running and message:
-        accept()
+        accept(executor)
         sent = _deliver(store, run, number, executor, message, root, language)
     try:
         with store.worktree_lock(number, timeout=TALK_LOCK_WAIT), orch_spawn.watch_open._opening(store):
@@ -165,7 +168,7 @@ def talk(number: int, *, message: str | None = None, store: StateStore, config: 
 
 
 def _decide(number: int, message: str | None, store: StateStore, config: Config, root: Path,
-            now: datetime | None, sent: str, accept: Callable[[], None]) -> str:
+            now: datetime | None, sent: str, accept: Callable[..., None]) -> str:
     """Under the worktree and opener locks: re-show, report unknown, or launch and append the event."""
     language = config.language
     run = store.get_run(number)  # Read again under the lock: the run may have finished meanwhile.
@@ -176,7 +179,7 @@ def _decide(number: int, message: str | None, store: StateStore, config: Config,
         raise TalkError(text("talk_no_session", language, n=number), stdout=sent)
     if running and message and not sent:
         # The run started after talk's first read: deliver to the worker now, exactly once.
-        accept()
+        accept(executor)
         sent = _deliver(store, run, number, executor, message, root, language)
     # A message already given to the worker (Codex queue or Claude hint) is never sent again as a
     # resume terminal's first prompt, even when the run finished between delivery and this read.

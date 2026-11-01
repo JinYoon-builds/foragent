@@ -537,3 +537,31 @@ def test_queueing_a_comment_changes_neither_issue_facts_nor_provenance(case, kno
     case.store.queue_github_write(number, "comment", body="Unsent")
     assert case.store.local_issues() == before
     assert case.store.github_outbox()[0]["issue"] == number
+
+
+@pytest.mark.parametrize("change", ["labels", "state"])
+def test_evidence_survives_workflow_changes_but_ordinary_comments_do_not(case, change):
+    evidence = case.store.queue_github_write(7, "comment", body="  Exact\n\n advice  ", evidence=True)
+    case.store.queue_github_write(7, "comment", body="Superseded transition")
+    case.clock[0] = at(1)
+    issue = case.remote.get_issue(7)
+    from dataclasses import replace
+    case.remote.issues[7] = replace(issue, **({"labels": frozenset({"human"})} if change == "labels"
+                                             else {"state": "closed"}))
+    case.reader.get_issue(7)
+    assert case.store.github_outbox() == [evidence]
+    assert case.store.github_blocking_outbox() == []
+    assert case.store.github_write_issues() == set()
+    assert row(case)["comments"] == []
+    expected = case.remote.get_issue(7)
+    case.reader.flush_outbox()
+    case.reader.flush_outbox()
+    assert [comment.body for comment in case.remote.list_comments(7)] == [evidence["body"]]
+    assert case.store.github_outbox() == []
+    assert replace(case.remote.get_issue(7), updated_at=expected.updated_at) == expected
+
+
+def test_missing_issue_still_retires_evidence(case):
+    case.store.queue_github_write(7, "comment", body="Advice", evidence=True)
+    case.store.ingest_absence(7, at(1))
+    assert case.store.github_outbox() == []

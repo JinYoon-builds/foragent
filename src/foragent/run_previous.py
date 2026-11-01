@@ -33,19 +33,36 @@ def pending_hint(root: Path, n: int) -> tuple[bool, str | None]:
     return retry_marker(root, n).is_file(), hint
 
 
+def holds_hint(pending: str | None, message: str) -> bool:
+    """Whether undelivered advice already holds ``message`` as whole blank-line-separated text.
+
+    Messages are joined by one blank line and may hold blank lines themselves, so a
+    message matches at those boundaries, not by splitting (not a substring of a sentence).
+    """
+    return bool(pending and message.strip()) and f"\n\n{message.rstrip()}\n\n" in f"\n\n{pending.rstrip()}\n\n"
+
+
+def with_hint(pending: str | None, message: str | None) -> str | None:
+    """The undelivered advice after ``message``; blank or still-pending text adds nothing."""
+    if not message or not message.strip() or holds_hint(pending, message):
+        return pending
+    return f"{pending.rstrip()}\n\n{message}" if pending and pending.strip() else message
+
+
 def add_hint(store, n: int, message: str) -> None:
     """Append ``message`` to issue ``n``'s undelivered advice, one blank line apart.
 
     Every producer (``fa orch retry --hint``, ``fa lanes talk --message``) only adds
     text under the state lock, so no producer can overwrite or drop another's
-    undelivered message; only ``consume_hint`` removes text, after delivery.
+    undelivered message; only ``consume_hint`` removes text, after delivery. A message
+    still waiting is not added twice, so the next worker reads it once.
     """
-    if not message.strip():
-        return
     path = hint_path(store.root, n)
     with store._state_lock():
-        unused = path.read_text(encoding="utf-8") if path.is_file() else ""
-        store._atomic_write(path, f"{unused.rstrip()}\n\n{message}" if unused.strip() else message)
+        unused = path.read_text(encoding="utf-8") if path.is_file() else None
+        updated = with_hint(unused, message)
+        if updated != unused:
+            store._atomic_write(path, updated)
 
 
 def consume_hint(root: Path, n: int, used: str | None) -> None:

@@ -139,7 +139,7 @@ def test_retry_without_hint_clears_pending_hint_once(git_history, tmp_path, monk
     assert added == []
     orch.retry(case.ctx, 1)
     assert case.tracker.list_comments(1)[before:] == added
-    predicted = orch.orch_advice.after_retry_hint(path.read_text(), "Use Korean")
+    predicted = orch.with_hint(path.read_text(), "Use Korean")
     orch.retry(case.ctx, 1, "Use Korean")
     assert path.read_text() == "Use English\n\nUse Korean"
     assert path.read_text() == predicted
