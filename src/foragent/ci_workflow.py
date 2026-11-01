@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -85,25 +86,44 @@ def initial_checks(repo, run, *, command=None):
 
 def workflow_text(config):
     base = config.base_branch.replace("'", "''")
+    cache_file = "${{ runner.temp }}/acceptance-base.json"
+    base_key = "foragent-acceptance-base-v1-${{ github.event.pull_request.base.sha }}"
+    producer_probe = TRUSTED_RUNNER.removesuffix("-m ") + "-c " + shlex.quote(
+        'import sys; from foragent import ci_shard; sys.exit(not callable(getattr(ci_shard, "produce", None)))')
     job = {
-        "if": ("github.event.pull_request.head.repo.full_name == github.repository && "
+        "if": ("github.event_name == 'pull_request' && "
+               "github.event.pull_request.head.repo.full_name == github.repository && "
                "(startsWith(github.event.pull_request.head.ref, 'foragent/issue-') || "
                "startsWith(github.event.pull_request.head.ref, 'foragent/group-')) && "
                f"github.event.pull_request.base.ref == '{base}'"),
         "runs-on": config.ci_runs_on,
-        "permissions": {"contents": "read"},
+        "permissions": {"contents": "read", "actions": "read"},
         "strategy": {"fail-fast": False, "matrix": {"shard": list(range(config.ci_shards))}},
         "outputs": {"comparison": "${{ steps.compare.outputs.comparison }}"},
         "steps": [
             {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.event.pull_request.head.sha }}", "fetch-depth": 0,
                                                      "persist-credentials": False}},
             {"uses": "astral-sh/setup-uv@v6"},
+            {"name": "Restore trusted base node results", "id": "base-cache", "uses": "actions/cache/restore@v4",
+             "with": {"path": cache_file, "key": base_key}},
+            {"name": "Verify base cache branch origin", "working-directory": "${{ runner.temp }}",
+             "env": {"GH_TOKEN": "${{ github.token }}", "FA_BASE_CACHE_FILE": cache_file,
+                     "FA_BASE_CACHE_KEY": base_key,
+                     "FA_BASE_CACHE_MATCHED_KEY": "${{ steps.base-cache.outputs.cache-matched-key }}",
+                     "FA_BASE_CACHE_REF": f"refs/heads/{config.base_branch}"},
+             # The introducing PR still installs the trusted tool from before
+             # cache support. Never pass an unverified restore to comparison.
+             "run": (f"if ! {TRUSTED_RUNNER}foragent.ci_base_cache; then\n"
+                     '  rm -f -- "$FA_BASE_CACHE_FILE"\n'
+                     '  echo "Trusted base cache verification unavailable; measuring selected base nodes."\n'
+                     "fi\n")},
             {"name": "Compare acceptance passing sets", "id": "compare",
              "working-directory": "${{ runner.temp }}",
              "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
                      "FA_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
                      "FA_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
                      "FA_SHARD": "${{ matrix.shard }}", "FA_SHARDS": str(config.ci_shards),
+                     "FA_BASE_CACHE_FILE": cache_file,
                      "FA_REPORT_FILE": "${{ runner.temp }}/shard-${{ matrix.shard }}.json"},
              "run": TRUSTED_RUNNER + "foragent.ci_shard"},
             {"uses": "actions/upload-artifact@v4", "if": "steps.compare.outputs.comparison != ''",
@@ -111,9 +131,38 @@ def workflow_text(config):
              "path": "${{ runner.temp }}/shard-${{ matrix.shard }}.json", "if-no-files-found": "error"}},
         ],
     }
+    producer = {
+        "if": f"github.event_name == 'push' && github.ref == 'refs/heads/{base}'",
+        "runs-on": config.ci_runs_on,
+        "permissions": {"contents": "read"},
+        "steps": [
+            {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "fetch-depth": 0,
+                                                      "persist-credentials": False}},
+            {"uses": "astral-sh/setup-uv@v6"},
+            {"name": "Measure full portable base selection", "id": "produce",
+             "working-directory": "${{ runner.temp }}",
+             "env": {"FA_REPOSITORY": "${{ github.repository }}", "FA_CHECKOUT": "${{ github.workspace }}",
+                     "FA_BASE_SHA": "${{ github.sha }}", "FA_HEAD_SHA": "${{ github.sha }}",
+                     "FA_BASE_CACHE_MODE": "produce", "FA_BASE_CACHE_FILE": cache_file},
+             # Legacy ci_shard has no producer mode. Clear any old file before
+             # probing, and only publish a fresh successful production result.
+             "run": ('rm -f -- "$FA_BASE_CACHE_FILE"\n'
+                     f"if {producer_probe}; then\n"
+                     f"  {TRUSTED_RUNNER}foragent.ci_shard\n"
+                     '  if [ -s "$FA_BASE_CACHE_FILE" ]; then\n'
+                     '    echo "cache=true" >> "$GITHUB_OUTPUT"\n'
+                     "  fi\n"
+                     "else\n"
+                     '  echo "Trusted tool has no base cache producer; skipping reusable base results."\n'
+                     "fi\n")},
+            {"name": "Save trusted base node results", "uses": "actions/cache/save@v4",
+             "if": "steps.produce.outputs.cache == 'true'",
+             "with": {"path": cache_file, "key": "foragent-acceptance-base-v1-${{ github.sha }}"}},
+        ],
+    }
     return "# Generated by fa ci workflow; edit .foragent.yml, then regenerate.\n" + yaml.safe_dump({
-        "name": "foragent-acceptance", "on": ["pull_request"],
-        "permissions": {"contents": "read"}, "jobs": {"acceptance": job},
+        "name": "foragent-acceptance", "on": {"pull_request": None, "push": {"branches": [config.base_branch]}},
+        "permissions": {"contents": "read"}, "jobs": {"acceptance": job, "acceptance-base": producer},
     }, sort_keys=False)
 
 
