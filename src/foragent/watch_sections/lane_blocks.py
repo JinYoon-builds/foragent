@@ -146,10 +146,8 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
 
     slug, language = row.get("slug"), config.language
     name = watch._clean(row.get("lane_display") or slug or "")
-    facts = snapshot.lane_facts.get(slug)
-    paths = facts.get("owned_paths") if isinstance(facts, dict) else (config.lanes.get(slug) or {}).get("paths")
-    joined = ", ".join(str(path) for path in paths or ())
-    count = (snapshot.today_done or {}).get(slug, 0) if snapshot.today_done is not None else 0
+    joined = ", ".join(watch_scene.owned_paths(snapshot, config, slug))
+    count = watch_scene.today_count(snapshot, slug)
     right = ("" if not count else watch.text("lane_blocks_today_one", language) if count == 1
              else watch.text("lane_blocks_today", language, count=count))
     name_cells = watch._cells(name)
@@ -205,16 +203,14 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     def group(items: list[dict[str, Any]], warnings: bool, prefix: Line) -> None:
         from foragent.watch_waiting import explanation
 
-        authored = {item["number"]: snapshot.waiting_facts.get(item["number"], {}).get("authored")
-                    for item in items}
-        ordinary = [item for item in items if not authored[item["number"]]]
+        ordinary = [item for item in items if not item["authored"]]
         if ordinary:
             place(_flow(units(ordinary, warnings), width, ACORN_ROWS if pixels else len(ordinary),
                         prefix, mark, per_row))
         # Each recorded wait keeps its acorn and canonical explanation together, outside
         # the ordinary flow's overflow budget. Never hide a reason, condition or owner.
         for item in items:
-            if not (context := authored[item["number"]]):
+            if not (context := item["authored"]):
                 continue
             place(_flow(units([item], warnings), width, 1, prefix, mark, 1))
             lines.extend(explanation(context, language, width, mark=mark))
@@ -246,7 +242,7 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
     for row in rows:
         slug = row.get("slug")
         spans: Line = [(watch._clean(row.get("lane_display") or slug or ""), "")]
-        count = (snapshot.today_done or {}).get(slug, 0) if snapshot.today_done is not None else 0
+        count = watch_scene.today_count(snapshot, slug)
         if count:
             spans.append((f" {'v' if ascii_glyphs else '✓'}{count}", "green"))
         if row.get("dreaming"):
@@ -281,16 +277,18 @@ def _evidence(snapshot: Snapshot, config: Config, now: datetime) -> Line:
     t = lambda key, **values: watch.text(key, language, **values)
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     parts: list[tuple[str, str]] = []
-    heartbeat = snapshot.heartbeats.get("orch")
+    heartbeat = (snapshot.heartbeats or {}).get("orch")
+    requests = [row for row in snapshot.requests or () if isinstance(row, dict)]
     fresh = heartbeat is not None and heartbeat + age <= orch_panel.ORCH_FRESH_SECONDS
     if not fresh and (heartbeat is not None or status.get("active_runs")
-                      or any(watch._has_work(row) for row in status.get("lanes", {}).values())):
+                      or any(watch._has_work(row) for row in watch_scene.lane_rows(status))):
         parts.append((t("watch_orch_off"), "yellow"))
-    if snapshot.requests:
-        count = lambda name: sum(row.get("status") == name for row in snapshot.requests)
+    if requests:
+        count = lambda name: sum(row.get("status") == name for row in requests)
         parts.append((t("watch_requests", processing=count("processing"), done=count("done")), ""))
-    if snapshot.panel.get("inbox") is not None:
-        parts.append((t("orch_panel_for_you", count=snapshot.panel["inbox"]), ""))
+    inbox = (snapshot.panel or {}).get("inbox")
+    if inbox is not None:
+        parts.append((t("orch_panel_for_you", count=inbox), ""))
     line: Line = []
     ascii = glyph_mode(config) == "ascii"
     for index, (value, style) in enumerate(parts):
@@ -316,7 +314,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         out.append(watch_scene.fit_marked(evidence, width, "..." if ascii_glyphs else "…"))
     needs = watch_scene.questions(snapshot.status)
     lanes = []
-    for row in snapshot.status.get("lanes", {}).values():
+    for row in watch_scene.lane_rows(snapshot.status):
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)
         lanes.append((watch_scene.CATEGORIES.index(watch_scene.category(current, upcoming)), row, current, upcoming))
     lanes.sort(key=lambda lane: lane[0])  # Stable: lanes of one kind keep their order.

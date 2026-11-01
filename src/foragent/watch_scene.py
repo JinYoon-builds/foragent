@@ -63,11 +63,41 @@ def generated_ascii(value: str) -> str:
     return value.translate(str.maketrans({"·": "|", "⚠": "!", "○": "o", "—": "-", "…": "..."}))
 
 
+def lane_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
+    """The status's lane rows. The status keys them by slug, so a row without one is that lane."""
+    lanes = status.get("lanes")
+    return [row if row.get("slug") else {**row, "slug": key}
+            for key, row in (lanes.items() if isinstance(lanes, dict) else ()) if isinstance(row, dict)]
+
+
+def numbered(items: Any) -> list[dict[str, Any]]:
+    """The items of a lane listing that name an issue; an acorn needs its number."""
+    return [item for item in items or () if isinstance(item, dict) and type(item.get("number")) is int]
+
+
+def row_of(table: dict | None, key: Any) -> dict[str, Any]:
+    """One row of an optional facts table; an absent table or row reads as empty."""
+    found = (table or {}).get(key)
+    return found if isinstance(found, dict) else {}
+
+
+def owned_paths(snapshot: Snapshot, config: Config, slug: Any) -> list[str]:
+    """The lane's paths from its collected facts, else from the configuration."""
+    facts = (snapshot.lane_facts or {}).get(slug)
+    paths = facts.get("owned_paths") if isinstance(facts, dict) else row_of(config.lanes, slug).get("paths")
+    return [str(path) for path in paths or ()]
+
+
+def today_count(snapshot: Snapshot, slug: Any) -> int:
+    """The lane's merges today; none when they were not collected."""
+    return (snapshot.today_done or {}).get(slug) or 0
+
+
 def questions(status: dict[str, Any]) -> set[int]:
     """Distinct issue numbers in the needs-human group (the header counts the same)."""
     issues = status.get("issues")
     group = issues.get("needs-human") if isinstance(issues, dict) else None
-    return {item["number"] for item in group or () if isinstance(item, dict) and type(item.get("number")) is int}
+    return {item["number"] for item in numbered(group)}
 
 
 def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str, phase: str | None,
@@ -82,10 +112,10 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     if (state == "waiting-human" or number in needs
             or (number == row.get("issue") and row.get("state") == "waiting-human")):
         return "question"
-    if (snapshot.park_facts.get(number) or {}).get("parked"):
+    if row_of(snapshot.park_facts, number).get("parked"):
         return "parked"
     if state == "queued":
-        return "authored" if (snapshot.waiting_facts.get(number) or {}).get("authored") else "next"
+        return "authored" if row_of(snapshot.waiting_facts, number).get("authored") else "next"
     if phase in WAIT_PHASES or state == "blocked":
         return "wait"
     return "working"
@@ -105,17 +135,18 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     runs = {run["number"]: run for run in _clones(status).get(row.get("slug"), [])}
     # Only a lane in this snapshot can redirect a status entry. Unresolved optional
     # references leave the status's own placement intact.
-    slugs = {lane["slug"] for lane in status["lanes"].values()}
-    authored = {number: fact for number, fact in snapshot.waiting_facts.items()
-                if fact.get("authored") and fact.get("lane") in slugs}
+    slugs = {lane["slug"] for lane in lane_rows(status)}
+    authored = {number: fact for number, fact in (snapshot.waiting_facts or {}).items()
+                if isinstance(fact, dict) and fact.get("authored") and fact.get("lane") in slugs}
     titles = {item["number"]: item.get("title") for key in ("running", "queued", "held")
-              for item in row.get(key) or () if isinstance(item, dict) and "number" in item}
+              for item in numbered(row.get(key))}
+    worker_states, run_phases = snapshot.worker_states or {}, snapshot.run_phases or {}
     current: list[dict[str, Any]] = []
     seen: dict[int, dict[str, Any]] = {}
 
     def add(target: list[dict[str, Any]], number: int, state: str, phase: str | None,
             run: dict[str, Any] | None) -> None:
-        fact = snapshot.waiting_facts.get(number) or {}
+        fact = row_of(snapshot.waiting_facts, number)
         if number in authored and authored[number]["lane"] != row.get("slug"):
             return  # The recorded active lane wins over a subsequently edited label.
         if number in seen:
@@ -125,7 +156,7 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
                 entry["state"] = state
                 entry["class"] = acorn_class(snapshot, row, number, state, entry["phase"], needs)
             return
-        title = titles.get(number) or snapshot.titles.get(number) or fact.get("title") or (
+        title = titles.get(number) or (snapshot.titles or {}).get(number) or fact.get("title") or (
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
                  "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored")}
@@ -134,31 +165,31 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
 
     def worker(number: int, run: dict[str, Any] | None, listed: str | None = None) -> None:
         own = number == row.get("issue")
-        state = snapshot.worker_states.get(number) or (row.get("state") if own else "working") or "working"
+        state = worker_states.get(number) or (row.get("state") if own else "working") or "working"
         if listed == "waiting-human":
             state = listed  # The listing's own question wins over any other state.
         phase = (run or {}).get("phase") or (row.get("phase") if own else None)
         add(current, number, state, phase, run)
 
     # Running runs first, in start order (ties by issue number), then any other running issue.
-    listed = {item["number"]: item.get("state") for item in row.get("running") or ()
-              if isinstance(item, dict) and isinstance(item.get("state"), str)}
+    listed = {item["number"]: item.get("state") for item in numbered(row.get("running"))
+              if isinstance(item.get("state"), str)}
     for number, run in runs.items():
         worker(number, run, listed.get(number))
-    for item in row.get("running") or ():
+    for item in numbered(row.get("running")):
         worker(item["number"], runs.get(item["number"]), listed.get(item["number"]))
-    for item in row.get("held") or ():
+    for item in numbered(row.get("held")):
         number, state = item["number"], item.get("state") or "blocked"
-        phase = item.get("phase") or (snapshot.run_phases.get(number) if state == "working" else None)
+        phase = item.get("phase") or (run_phases.get(number) if state == "working" else None)
         add(current, number, state, phase, None)
     number = row.get("issue")
     if number is not None and row.get("state") in {"working", "waiting-human", "blocked"}:
         # A row whose run has stopped keeps the phase that run recorded.
         state = row["state"]
-        phase = row.get("phase") or (snapshot.run_phases.get(number) if state == "working" else None)
+        phase = row.get("phase") or (run_phases.get(number) if state == "working" else None)
         add(current, number, state, phase, None)
     upcoming: list[dict[str, Any]] = []
-    for item in row.get("queued") or ():
+    for item in numbered(row.get("queued")):
         # A queued item keeps a recorded question; any other state of the queue is next.
         add(upcoming, item["number"], "waiting-human" if item.get("state") == "waiting-human" else "queued",
             None, None)
@@ -212,8 +243,8 @@ def waiting_reason(snapshot: Snapshot, row: dict[str, Any], number: int, languag
     Recorded waiting facts come first; a snapshot without them still names the status's
     recorded blockers of the row's own issue.
     """
-    facts = snapshot.waiting_facts.get(number)
-    if facts is None:
+    facts = (snapshot.waiting_facts or {}).get(number)
+    if not isinstance(facts, dict):
         facts = {"kind": None, "blocking_issues": list(row.get("waiting_for") or [])
                  if number == row.get("issue") else [], "overlapping_files": []}
     kind, blockers = facts.get("kind"), [n for n in facts.get("blocking_issues") or () if type(n) is int]
@@ -262,7 +293,7 @@ def activity_warning(snapshot: Snapshot, config: Config, row: dict[str, Any], it
         quiet = _age(run.get("last_activity_at") or run.get("started_at"), snapshot.captured_at)
     shown = {**row, "state": item["state"], "phase": item["phase"], "last_activity_seconds": quiet}
     found = watch._activity(
-        shown, config.language, age, config.stall_minutes, run.get("pid"), snapshot.log_ages.get(number),
+        shown, config.language, age, config.stall_minutes, run.get("pid"), (snapshot.log_ages or {}).get(number),
         _runner_progress(run, snapshot.captured_at), _age(run.get("phase_started_at"), snapshot.captured_at))
     # The acorn already says what is normal; only warnings add words.
     if not found.startswith(("○", "?")):

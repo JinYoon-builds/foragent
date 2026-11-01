@@ -56,7 +56,7 @@ def latest_merges(snapshot: Snapshot) -> list[int]:
     """
     captured = _aware(snapshot.captured_at)
     midnight = captured.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-    timed = [(number, _aware(moment)) for number, moment in snapshot.merged_at.items()
+    timed = [(number, _aware(moment)) for number, moment in (snapshot.merged_at or {}).items()
              if isinstance(moment, datetime) and midnight <= _aware(moment) <= captured]
     timed.sort(key=lambda pair: pair[1], reverse=True)  # Stable: equal times keep their order.
     return [number for number, _ in timed[:MERGES_SHOWN]]
@@ -103,7 +103,7 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
 
     status, language = snapshot.status, config.language
     t = lambda key, **values: watch.text(key, language, **values)
-    rows = list(status.get("lanes", {}).values())
+    rows = watch_scene.lane_rows(status)
     sentences: list[tuple[str, str, str]] = []
     issues = sum(len(row.get("running") or ()) for row in rows)
     lanes = sum(bool(row.get("running")) for row in rows)
@@ -123,14 +123,15 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
         low, high = _clock(low, now, language), _clock(high, now, language)
         sentences.append(("eta", t("lane_bubble_eta", low=low) if low == high
                           else t("lane_bubble_eta_range", low=low, high=high), ""))
-        if snapshot.recent > 0:
-            sentences.append(("pace", t("lane_bubble_pace_one") if snapshot.recent == 1
-                              else t("lane_bubble_pace", count=snapshot.recent), ""))
+        recent = snapshot.recent or 0
+        if recent > 0:
+            sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
+                              else t("lane_bubble_pace", count=recent), ""))
     asked = len(watch_scene.questions(status))
     if asked:
         sentences.append(("questions", t("lane_bubble_questions_one") if asked == 1
                           else t("lane_bubble_questions", count=asked), "question"))
-    processing = [row for row in snapshot.requests if row.get("status") == "processing"]
+    processing = [row for row in snapshot.requests or () if isinstance(row, dict) and row.get("status") == "processing"]
     if processing:
         # The planning request being handled now (D76), its first line only.
         request = (processing[-1].get("text") or "").strip().splitlines() or [""]
@@ -273,7 +274,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     ascii = glyph_mode(config) == "ascii"
     t = lambda key, **values: watch_scene.text(key, language, ascii=ascii, **values)
     needs = watch_scene.questions(snapshot.status)
-    for row in snapshot.status.get("lanes", {}).values():
+    for row in watch_scene.lane_rows(snapshot.status):
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)
         item = next((item for item in current + upcoming if item["number"] == number), None)
         if item is not None:
@@ -281,9 +282,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     else:
         return None  # Not an acorn on screen: the summary stays.
     slug, name = row.get("slug"), row.get("lane_display") or row.get("slug") or ""
-    facts = snapshot.lane_facts.get(slug)
-    paths = facts.get("owned_paths") if isinstance(facts, dict) else (config.lanes.get(slug) or {}).get("paths")
-    paths = [str(path) for path in paths or ()]
+    paths = watch_scene.owned_paths(snapshot, config, slug)
     rows = [watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
                                    width, _ellipsis(config))]
     rows.append([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths

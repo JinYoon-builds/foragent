@@ -376,7 +376,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 watch.sys.stdout.write(SAVE_CURSOR + "".join(links) + RESTORE_CURSOR)
                 watch.sys.stdout.flush()
             key = screen.getch()
-            slugs = list(snapshot.status["lanes"])
+            slugs = list(snapshot.status.get("lanes") or ())
             if view_state.get("settings"):
                 # The window is keyboard-only and takes every key but q.
                 name = window_key(key, window_keys, view_state.get("settings_prompt") is not None,
