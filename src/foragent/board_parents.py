@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any
 
@@ -213,62 +213,91 @@ def _issue_from(facts: dict[str, Any]) -> Issue:
 
 
 class _ActionCalls:
-    """The tracker as one parent's action sees it: a completed call is not repeated.
+    """The tracker as one parent's action sees it: a completed read is not repeated.
 
     The one rule for every parent action, however many calls it needs: each
-    completed GitHub call is remembered with the listing facts it depended on
-    (the existing per-issue read memory), so a tick that runs out of budget
-    continues after the last completed call. A listing that shows different
-    facts ends the memory, and the action works from new reads.
+    completed read is remembered with the listing facts it depended on (the
+    existing per-issue read memory), so a tick that runs out of budget continues
+    after the last completed call. Three things end a memory, because each shows
+    the facts behind it changed:
 
-    An action that ran to its end forgets its issue reads. What it waits on
-    outside the listing can change without the listing showing it, so the next
-    tick reads it fresh (#837).
+    - The listing shows different facts for the parent or a linked row.
+    - GitHub rejects a board write, which the listing cannot show: the card or
+      field that the board reads named is gone. Running out of time is no rejection.
+    - The action ran to its end, for its issue reads: what it waits on outside
+      the listing can change without the listing showing it (#837).
+
+    Writes are never remembered. Each one is sent until it succeeds, and sending
+    an accepted write again is safe.
     """
 
-    def __init__(self, ctx, number: int, links: list[int]):
-        self._tracker, self._store, self._number, self._links = ctx.tracker, ctx.store, number, links
+    def __init__(self, ctx, number: int, links: list[int], listed: Callable[[int], bool]):
+        self._tracker, self._store, self._number = ctx.tracker, ctx.store, number
+        self._links, self._listed = list(links), listed
         self._issue_reads: set[str] = set()
+        self._board_reads: set[str] = set()
         self.interrupted = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._tracker, name)
 
-    def _once(self, name: str, arguments: Any, call, encode, decode) -> Any:
+    def _read(self, name: str, arguments: Any, call, encode, decode, links=lambda result: ()) -> Any:
         key = f"parent-action:{name}:" + hashlib.sha256(
             json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest()
-        if name == "get_issue":
-            self._issue_reads.add(key)
+        {"get_issue": self._issue_reads, "graphql": self._board_reads}.get(name, set()).add(key)
         remembered = self._store.confirmed_read(self._number, key)
         if remembered is not None and remembered[0] is not None:
-            return decode(remembered[0])
+            result = decode(remembered[0])
+            self._link(links(result))
+            return result
         baseline = self._store.read_baseline()
         try:
             result = call()
         except TrackerError:
             self.interrupted = True
             raise
+        self._link(links(result))
         self._store.record_read(self._number, key, encode(result), baseline=baseline, links=self._links)
         return result
 
+    def _link(self, numbers: Iterable[int]) -> None:
+        self._links.extend(n for n in numbers if n not in self._links and self._listed(n))
+
+    def _forget(self, keys: Iterable[str]) -> None:
+        baseline = self._store.read_baseline()
+        for key in keys:
+            self._store.record_read(self._number, key, None, baseline=baseline)
+
     def get_issue(self, number: int) -> Issue:
-        return self._once("get_issue", number, lambda: self._tracker.get_issue(number), _issue_facts, _issue_from)
+        return self._read("get_issue", number, lambda: self._tracker.get_issue(number), _issue_facts, _issue_from)
 
     def sub_issues(self, number: int) -> list[Issue]:
-        return self._once("sub_issues", number, lambda: self._tracker.sub_issues(number),
+        # A child only this read names depends on its listed row too.
+        return self._read("sub_issues", number, lambda: self._tracker.sub_issues(number),
                           lambda issues: [_issue_facts(issue) for issue in issues],
-                          lambda facts: [_issue_from(item) for item in facts])
+                          lambda facts: [_issue_from(item) for item in facts],
+                          lambda issues: [issue.number for issue in issues if issue.number != number])
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        return self._once("graphql", [query, variables], lambda: self._tracker.graphql(query, variables),
-                          lambda result: result, lambda result: result)
+        if query.lstrip().startswith("query"):
+            # A response that carries errors is no completed read.
+            return self._read("graphql", [query, variables], lambda: self._tracker.graphql(query, variables),
+                              lambda result: None if result.get("errors") else result, lambda result: result)
+        try:
+            result = self._tracker.graphql(query, variables)
+        except TrackerError as exc:
+            self.interrupted = True
+            if not exc.is_rate_limit and (exc.returncode is not None or "GraphQL errors" in str(exc)):
+                self._forget(self._board_reads)
+            raise
+        if result.get("errors"):
+            self.interrupted = True
+            self._forget(self._board_reads)
+        return result
 
     def finish(self) -> None:
-        if self.interrupted or not self._issue_reads:
-            return
-        baseline = self._store.read_baseline()
-        for key in self._issue_reads:
-            self._store.record_read(self._number, key, None, baseline=baseline)
+        if not self.interrupted and self._issue_reads:
+            self._forget(self._issue_reads)
 
 
 def follow_children(ctx, report) -> None:
@@ -288,6 +317,10 @@ def follow_children(ctx, report) -> None:
     parents = order_parents(rows)
     records, unparseable = order_records(rows)
     language = ctx.config.language
+
+    def is_listed(number: int) -> bool:
+        # Only a row the listing showed can confirm a read; a row from another read has no listed facts.
+        return bool((by_number.get(number) or {}).get("observed"))
 
     def needs_read(number: int, children: list[Issue] | None) -> bool:
         if children is None:
@@ -320,7 +353,10 @@ def follow_children(ctx, report) -> None:
         view = SimpleNamespace(tracker=calls, store=ctx.store, config=ctx.config, repo=getattr(ctx, "repo", None))
         children = listed[number]
         if children is None:
-            children = _with_counted_open_work(by_number[number], calls.sub_issues(number))
+            # A row this listing showed is newer than any read of the child, remembered or not.
+            children = _with_counted_open_work(by_number[number], [
+                _listed_issue(by_number[child.number]) if is_listed(child.number) else child
+                for child in calls.sub_issues(number)])
         moved = None
         if number in parents and needs_read(number, children):
             # The card's column depends only on the children, so it need not wait for reference reads.
@@ -351,9 +387,7 @@ def follow_children(ctx, report) -> None:
 
     def visit(number: int) -> None:
         linked = [*(by_number[number].get("children") or []), *records.get(number, ())]
-        # Only a row the listing showed can confirm a read; a row from another read has no listed facts.
-        calls = _ActionCalls(ctx, number, [n for n in dict.fromkeys(linked)
-                                           if n != number and (by_number.get(n) or {}).get("observed")])
+        calls = _ActionCalls(ctx, number, [n for n in dict.fromkeys(linked) if n != number and is_listed(n)], is_listed)
         try:
             act(number, calls)
         except TrackerError:
