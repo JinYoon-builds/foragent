@@ -32,6 +32,22 @@ def _write_line(store: StateStore, event: dict) -> None:
         stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
+def acknowledged_at(store: StateStore, n: int) -> datetime | None:
+    """Newest recorded response to this issue, independent of the latest note."""
+    path = store.root / "orch-events.jsonl"
+    if not path.exists():
+        return None
+    times = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("issue") == n and event.get("kind") == "acknowledged":
+            times.append(datetime.fromisoformat(event["at"]))
+    return max(times, default=None)
+
+
 def has_event(store: StateStore, issue: int | None, kind: str, **fields: Any) -> bool:
     """Whether the journal already holds an event of ``kind`` for ``issue`` with these ``fields``."""
     path = store.root / "orch-events.jsonl"

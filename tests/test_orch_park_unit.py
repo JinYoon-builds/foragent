@@ -97,6 +97,8 @@ def test_rate_limited_commands_keep_one_marker_each_and_fifo_intent(ctx):
     assert orch_park.is_parked(StateStore(ctx.store.root), 1)
     orch_park.unpark(ctx, 1)
     assert not orch_park.is_parked(StateStore(ctx.store.root), 1)
+    from foragent import order_waiting
+    assert order_waiting.section(ctx.tracker.current_issue(1).body) is None
     orch_park.park(ctx, 1, "wait again", for_person=True)
     assert orch_park.is_parked(ctx.store, 1)
     pending = ctx.store.github_outbox()
@@ -109,6 +111,44 @@ def test_rate_limited_commands_keep_one_marker_each_and_fifo_intent(ctx):
     assert [c.body for c in delivered] == [entry["body"] for entry in comments]
     assert orch_park.is_parked(ctx.store, 1)
     assert "approved" not in ctx.tracker.get_issue(1).labels
+    waiting = order_waiting.section(ctx.tracker.get_issue(1).body)
+    assert "wait again" in waiting and "Responsible role: person" in waiting
+
+
+@pytest.mark.parametrize("for_person,role", [(False, "orchestrator"), (True, "person")])
+def test_park_and_unpark_publish_the_issue_wait_without_extra_comments(ctx, for_person, role):
+    from foragent import order_waiting
+
+    before = ("<!-- foragent:v1 -->\n## Goal\nKeep the authored goal.\n"
+              "## Waiting\nOld reason.\n## Done when\n```sh\ntrue\n```\n"
+              "<!-- foragent:custom keep-this -->\n")
+    ctx.tracker.update_issue(1, title="Blocked work", body=before)
+    ctx.tracker.add_labels(1, ["approved"])
+    orch_park.park(ctx, 1, "Wait for the catalog", for_person=for_person)
+    parked = ctx.tracker.get_issue(1)
+    waiting = order_waiting.section(parked.body)
+    assert "Reason: Wait for the catalog" in waiting
+    assert f"Responsible role: {role}" in waiting
+    assert "Next condition:" in waiting and "unpark" in waiting
+    assert "Old reason." not in parked.body
+    for kept in ("## Goal\nKeep the authored goal.", "## Done when\n```sh\ntrue\n```", "<!-- foragent:custom keep-this -->"):
+        assert kept in parked.body
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 1 and "Wait for the catalog" in comments[0].body
+    order_waiting.announce(ctx.tracker, 1, parked.body, ctx.config.language)
+    assert ctx.tracker.list_comments(1) == comments
+
+    orch_park.unpark(ctx, 1)
+    unparked = ctx.tracker.get_issue(1)
+    assert order_waiting.section(unparked.body) is None
+    assert "approved" not in unparked.labels
+    assert "waiting-person" not in unparked.labels
+    for kept in ("## Goal\nKeep the authored goal.", "## Done when\n```sh\ntrue\n```", "<!-- foragent:custom keep-this -->"):
+        assert kept in unparked.body
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 2
+    order_waiting.announce(ctx.tracker, 1, unparked.body, ctx.config.language)
+    assert ctx.tracker.list_comments(1) == comments
 
 
 def test_explicit_unpark_replaces_cached_park_and_does_not_suppress_a_lingering_blocker(ctx):

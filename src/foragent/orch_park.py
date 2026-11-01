@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import datetime
 import re
 
+from foragent import order_waiting
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, WAITING_PERSON
 from foragent.state import StateStore
 
@@ -57,12 +58,28 @@ def is_parked(store: StateStore, n: int, *, comments=None) -> bool:
     return parked_at(store, n, comments=comments) is not None
 
 
-def _record(ctx, tracker, n: int, kind: str, summary: str) -> None:
+def _record(ctx, tracker, n: int, kind: str, summary: str, waiting: str) -> None:
     from foragent.orch_events import append_event
 
     summary = " ".join(summary.split())
-    tracker.comment(n, f"<!-- foragent:orch kind={kind} -->\n{summary}")
+    tracker.comment(n, f"<!-- foragent:orch kind={kind} -->\n{summary}" + (f" {waiting}" if waiting else ""))
     append_event(ctx.store, ctx.now(), n, kind, summary)
+
+
+def _waiting(ctx, tracker, n: int, why: str | None, for_person: bool = False) -> str:
+    # Pending writes are explicit intent: do not replace their body with an older remote read.
+    issue = tracker.current_issue(n)
+    role = "person" if for_person else "orchestrator"
+    condition = ("Record the person's decision, then explicitly unpark this issue." if for_person else
+                 "The orchestrator confirms the reason is resolved, then explicitly unparks this issue.")
+    text = (f"Reason: {' '.join(why.split())}\nNext condition: {condition}\nResponsible role: {role}"
+            if why is not None else None)
+    body = order_waiting.replace_section(issue.body, text)
+    body = order_waiting.mark_write(issue.body, order_waiting.stamp(issue.body, body))
+    if body != issue.body:
+        tracker.update_issue(n, title=issue.title, body=body)
+    # The park marker also announces the wait change; publication must not announce it twice.
+    return order_waiting.notification(body, ctx.config.language)
 
 
 def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
@@ -77,7 +94,7 @@ def park(ctx, n: int, why: str, *, for_person: bool = False) -> str:
     # Only a new approval (fa order publish) lets the gate start it again.
     tracker.remove_labels(n, [APPROVED, BLOCKED, NEEDS_HUMAN])
     summary = f"#{n}: parked" + (" for a person's decision" if for_person else "") + f"; why: {why}"
-    _record(ctx, tracker, n, "parked", summary)
+    _record(ctx, tracker, n, "parked", summary, _waiting(ctx, tracker, n, why, for_person))
     return summary
 
 
@@ -95,5 +112,5 @@ def unpark(ctx, n: int) -> str:
         raise orch.OrchError(f"issue #{n} is not parked")
     tracker.remove_labels(n, [WAITING_PERSON])
     summary = f"#{n}: unparked"
-    _record(ctx, tracker, n, "unparked", summary)
+    _record(ctx, tracker, n, "unparked", summary, _waiting(ctx, tracker, n, None))
     return summary
