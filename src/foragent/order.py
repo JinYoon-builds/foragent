@@ -14,7 +14,12 @@ import secrets
 import sys
 from urllib.parse import quote
 
+<<<<<<< HEAD
 from foragent import board, capacity, design, order_replaces, order_references, order_waiting, ownership
+=======
+from foragent import board, capacity, design, order_references, order_waiting, ownership
+from foragent import decisions as decision_links
+>>>>>>> 3c982a51e684419b3f0b61db079f49de9a2761a9
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -331,9 +336,18 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
+<<<<<<< HEAD
                                      "references", "statements", "replaces"} if kind == "issues"
+=======
+                                     "references", "statements", "decisions"} if kind == "issues"
+>>>>>>> 3c982a51e684419b3f0b61db079f49de9a2761a9
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
-                          "statements"}, label)
+                          "statements", "decisions"}, label)
+            if "decisions" in item:
+                try:
+                    decision_links.validate(item["decisions"], f"{label}.decisions")
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
             if "statements" in item:
                 _strings(item["statements"], f"{label}.statements", nonempty=True)
                 if any("\n" in line or "\r" in line for line in item["statements"]):
@@ -885,6 +899,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         if item.get("interactive", False):
             labels.append("interactive")
         blobs = acceptance_blobs(item)
+        body = decision_links.with_marker(body, item.get("decisions"), existing.body if existing else None)
         if number is None:
             number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
@@ -914,10 +929,11 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        # An edit rewrites the whole body; the issue's owner-label contract survives it.
-        body = order_waiting.stamp(existing.body, _with_contract(_published_body(plan, item, repo, config), existing.body))
-        # A rewrite gets its own id, so the revision comment below names this write: a body
-        # written back over a hand edit is a new change that comments, not an old one repeated.
+        # An edit keeps both the owner contract and omitted decision links.
+        body = decision_links.with_marker(_with_contract(_published_body(plan, item, repo, config), existing.body),
+                                          item.get("decisions"), existing.body)
+        body = order_waiting.stamp(existing.body, body)
+        # A revision comment identifies this write, including a changed decision marker.
         body = order_waiting.mark_write(existing.body, body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
@@ -1221,7 +1237,9 @@ def _binding(plan: dict, item: dict, config: Config, repo: str | None,
     the repository's). The body names the repository in links publish generates; without the
     repository the body cannot be reproduced, so the record is not bound and never handed over.
     """
-    content = None if repo is None else _body_digest(_published_body(plan, item, repo, config))
+    # Decision links are bookkeeping like the plan-child marker; neither side counts them (#1025).
+    content = None if repo is None else _body_digest(
+        decision_links.MARKER_LINE.sub("", _published_body(plan, item, repo, config)))
     names = (set(item.get("acceptance_files", {})) | set(acceptance_paths(item["done_when"], config.acceptance_dir))
              | set(order_references.selected(plan, item)))
     files = {}
@@ -1247,7 +1265,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
         records = _preread_records(root)
     except PlanError:
         return None
-    text, child = _without_child_marker(body)
+    text, child = _without_child_marker(decision_links.MARKER_LINE.sub("", body))
     content = _body_digest(text)
     actual: dict[str, str] = {}
 

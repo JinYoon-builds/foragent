@@ -1341,6 +1341,23 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_proposal_survives_the_decision_marker_publish_appends(publishing, plan, monkeypatch, newline):
+    """Decision links are bookkeeping like the plan-child marker; they are not what preread read (#1025)."""
+    from foragent import decisions
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    item = plan["issues"][0]
+    child = decisions.with_marker(_child_body(plan, item, config), ["D79"], None)
+    assert child.rstrip().endswith(decisions.marker(["D79"]))
+    assert _handover(root, 7, child.replace("\n", newline), API_FILES)["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, decisions.with_marker(child, [], None).replace("\n", newline), API_FILES) is not None
+    changed = decisions.with_marker(_child_body(plan, {**item, "goal": item["goal"] + " More."}, config), ["D79"], None)
+    assert _handover(root, 7, changed, API_FILES) is None, "the marker never hides a changed WHAT"
+
+
 @pytest.mark.parametrize("section", ["goal", "out_of_scope"])
 def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
     """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
@@ -3590,3 +3607,14 @@ def test_shared_lock_flush_refuses_before_checkpoint_or_publication(shared_order
     assert before == (git_command(case.origin, "rev-parse", "refs/heads/main"),
                       (case.root / FILE).read_bytes(), dict(case.tracker.issues), dict(case.tracker.labels),
                       {n: case.store.load_approval(n) for n in (2, 3)})
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_binding_ignores_decision_marker_line_endings(publishing, plan, newline):
+    from foragent import decisions
+
+    config = publishing[1]
+    item = plan["issues"][0]
+    plain = {**item, "goal": "Observable behaviour" + newline + "Remaining behaviour"}
+    marked = {**item, "goal": "Observable behaviour" + newline + decisions.marker([]) + newline + "Remaining behaviour"}
+    assert order._binding(plan, marked, config, REPO, {}) == order._binding(plan, plain, config, REPO, {})

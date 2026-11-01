@@ -19,18 +19,24 @@ is dead.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, timedelta
 import json
-from typing import TYPE_CHECKING
+from time import monotonic
+from typing import TYPE_CHECKING, NoReturn
+from uuid import uuid4
 
 from foragent import orch_queue
-from foragent.run_waits import _phase, _progress, _timeout
+from foragent.run_waits import WaitPhase
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
     from foragent.state import StateStore
 
 QUEUE = "merge-queue.jsonl"
+MERGE_WAIT_SECONDS = 60 * 60
+POLL_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -132,40 +138,108 @@ def record_turn(ctx: RunContext, place: Seat, base_sha: str, result: str) -> Non
         _append(ctx.store, _row(ctx, place, "turn", members=[place.n], base_sha=base_sha, result=result))
 
 
+@contextmanager
+def _merge_wait(n: int, ctx: RunContext):
+    """Credit one merge queue wait and keep its liveness visible to tick."""
+    started = ctx.now()
+    started_mono = ctx.monotonic()
+    started_real = monotonic()
+    previous_wait = ctx.store.get_run(n).merge_waited_seconds
+    key = f"merge-wait-{uuid4().hex}"
+    wait = WaitPhase(n, ctx, "merge-lock-wait", started)
+    wait.open()
+
+    def credit(close: bool = False):
+        now = ctx.now()
+        ctx.store.add_waited(
+            n, key=key, start=started, end=now, close=close,
+            waiting_until=None if close else (now + timedelta(seconds=60)).astimezone(UTC).isoformat(),
+            last_progress_at=now.astimezone(UTC).isoformat(),
+            merge_waited_seconds=previous_wait + max(
+                0, (now - started).total_seconds(), ctx.monotonic() - started_mono,
+                monotonic() - started_real,
+            ),
+        )
+        return now
+
+    try:
+        yield credit
+    finally:
+        wait.close(credit(close=True))
+
+
+def _wait_limit_reached(n: int, ctx: RunContext) -> bool:
+    run = ctx.store.get_run(n)
+    return run.merge_waited_seconds >= MERGE_WAIT_SECONDS
+
+
+def _pause(n: int, ctx: RunContext) -> None:
+    run = ctx.store.get_run(n)
+    ctx.store.update_run(n, merge_wait_polls=run.merge_wait_polls + 1)
+    ctx.sleep(min(POLL_SECONDS, max(0, MERGE_WAIT_SECONDS - run.merge_waited_seconds)))
+
+
+def _report_wait_limit(n: int, ctx: RunContext, place: Seat) -> NoReturn:
+    from foragent import orch_inbox
+    from foragent.labels import BLOCKED, READY, RUNNING
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_checks import _append as append_log
+
+    withdraw(ctx, place)
+    run = ctx.store.get_run(n)
+    detail = (f"Merge-turn wait limit ({MERGE_WAIT_SECONDS:g}s) reached after "
+              f"{run.merge_waited_seconds:g}s ({run.merge_wait_polls} polls). "
+              f"PR kept on {run.branch}; resume review of the existing PR when its merge turn can proceed.")
+    orch_inbox.add_request(ctx.store, "runner", f"Issue #{n}: {detail}", {
+        "kind": "merge-wait", "issue": n, "branch": run.branch,
+        "run_started_at": run.started_at, "waited_seconds": run.merge_waited_seconds,
+        "polls": run.merge_wait_polls,
+    })
+    append_log(ctx.store.log_path(n), detail)
+    ctx.tracker.add_labels(n, [BLOCKED])
+    ctx.tracker.remove_labels(n, [READY, RUNNING])
+    raise ExecutorStopped("merge-wait", detail)
+
+
 def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str) -> tuple[bool, str | None]:
     """Join and wait without re-verifying or polling CI; return (waited, stop).
 
-    Only the run's time budget bounds the wait; it is not credited as waited.
+    The whole merge-turn wait is credited as waited, preserving the work budget.
+    Queue waits and retry pauses share a separate one-hour bound per run.
     """
-    from foragent import runner
-
     join(ctx, place, head_sha)
-    waited = False
-    while not holds_turn(ctx.store, place):
-        remaining = runner._remaining(n, ctx)
-        if remaining <= 0:
-            return waited, _timeout(n, ctx)
-        if not waited:
-            _phase(n, ctx, "merge-lock-wait")
-        waited = True
-        _progress(n, ctx)
-        ctx.sleep(min(30, remaining))
-    return waited, None
+    if holds_turn(ctx.store, place):
+        return False, None
+    with _merge_wait(n, ctx) as credit:
+        while not holds_turn(ctx.store, place):
+            credit()
+            if _wait_limit_reached(n, ctx):
+                break
+            _pause(n, ctx)
+        else:
+            return True, None
+    _report_wait_limit(n, ctx, place)
 
 
 def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Exception) -> None:
     """A refused merge of an unchanged head: withdraw now and rejoin at the tail when ready again.
 
     The run is not ended; it takes a later turn (and appends another turn record).
-    Only the run's time budget bounds the retries; a short pause spaces them out.
+    A short pause spaces retries out and is credited as waited, under the same
+    separate bound as the run's merge-turn waits.
     """
-    from foragent import runner
     from foragent.run_checks import _append as append_log
 
     withdraw(ctx, place)
     append_log(ctx.store.log_path(n), f"Merge failed with the head unchanged; rejoining the merge queue: {error}")
-    _progress(n, ctx)
-    ctx.sleep(min(30, max(1, runner._remaining(n, ctx))))
+    with _merge_wait(n, ctx) as credit:
+        credit()
+        if not _wait_limit_reached(n, ctx):
+            _pause(n, ctx)
+        credit()
+        exhausted = _wait_limit_reached(n, ctx)
+    if exhausted:
+        _report_wait_limit(n, ctx, place)
 
 
 def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:

@@ -28,6 +28,8 @@ publication comments one line when it changes and nothing when it is unchanged.
 issues[].replaces optionally lists unique positive issue numbers (default []); approved replacements
 close them as not planned with a comment linking their successors. --dry-run previews closures.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
+decision marker. Omitted keeps an issue's existing marker; [] clears its links.
 issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
