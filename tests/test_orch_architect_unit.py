@@ -2,12 +2,13 @@
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from foragent import orch_architect, processes
+from foragent import capacity, capacity_sessions, executors, orch_architect, processes
 from foragent.config import Config
-from foragent.executors import codex_command
+from foragent.executors import ExecResult, codex_command
 from foragent.processes import ProcessIdentity
 from foragent.state import StateStore
 
@@ -246,3 +247,118 @@ def test_architect_session_reads_agent_skills_and_memory_from_the_roles_source(t
     else:
         assert "custom audit procedure" in prompt and "default architect procedure" not in prompt
         assert turn["add_dirs"] == (store.root, root / "mem/audit")
+
+
+@pytest.fixture
+def budget_case(tmp_path, fake_process_table, monkeypatch):
+    """One free machine slot, fake processes, and a launch that only adds a fake child."""
+    store = StateStore(tmp_path / "machine" / "owner__project")
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(orch_architect, "os", capacity.os)
+    capacity.write_state(store, 1, datetime.now(UTC))
+    launches = []
+
+    def launch(argv, **kwargs):
+        child = SimpleNamespace(pid=980001 + len(launches))
+        launches.append(child)
+        fake_process_table.add(child.pid, cwd=tmp_path, start_time=float(child.pid))
+        return child
+
+    monkeypatch.setattr(orch_architect.subprocess, "Popen", launch)
+    now = datetime(2026, 10, 27, tzinfo=UTC)
+    case = SimpleNamespace(root=tmp_path, store=store, config=Config(executor="claude", language="en"),
+                           now=now, launches=launches, table=fake_process_table)
+    case.call = lambda: orch_architect.call(tmp_path, store, case.config, "evidence", now)
+    case.finish = lambda: orch_architect.run_session(
+        tmp_path, store, case.config, "evidence", orch_architect.read_record(store)["started_at"], lambda: now)
+    case.holders = lambda: capacity.machine_holders(store, now, live=True)
+    case.files = lambda: sorted(capacity_sessions.directory(store.root).glob("*.json"))
+    return case
+
+
+def run_turn(monkeypatch, run):
+    monkeypatch.setattr(executors, "executor_for", lambda name: SimpleNamespace(run=run))
+
+
+def test_call_leaves_only_the_session_holding_one_labelled_slot(budget_case):
+    budget_case.call()
+    workloads = capacity_sessions.read(budget_case.store.root)
+    assert [(item.pid, item.label()) for item in workloads] == [(980001, "role architect")]
+    assert budget_case.holders() == ["owner__project role architect"]
+
+
+def test_call_refuses_when_another_workload_fills_the_budget(budget_case):
+    budget_case.table.add(970001, cwd=budget_case.root, start_time=1.0)
+    other = capacity_sessions.new_path(budget_case.store, 970001)
+    capacity_sessions.add(budget_case.store, other, pid=970001, kind="order")
+    with pytest.raises(orch_architect.ArchitectRefused, match="order"):
+        budget_case.call()
+    assert budget_case.launches == [] and not orch_architect.record_path(budget_case.store).exists()
+    assert budget_case.files() == [other], "A refused start must leave no record of its own"
+
+
+def test_call_refuses_while_the_sensors_hold_new_work(budget_case, monkeypatch):
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", capacity.OVERLOAD_LOAD))
+    with pytest.raises(orch_architect.ArchitectRefused, match="load"):
+        budget_case.call()
+    assert budget_case.launches == [] and budget_case.files() == []
+
+
+def test_a_failed_launch_releases_the_slot(budget_case, monkeypatch):
+    def refuse(argv, **kwargs):
+        raise OSError("cannot start")
+
+    monkeypatch.setattr(orch_architect.subprocess, "Popen", refuse)
+    with pytest.raises(OSError):
+        budget_case.call()
+    assert budget_case.files() == [] and not orch_architect.record_path(budget_case.store).exists()
+
+
+def test_a_session_counts_once_during_its_turn_and_releases_after_failure(budget_case, monkeypatch):
+    budget_case.call()
+    seen = []
+
+    def failing(**kwargs):
+        seen.append(budget_case.holders())
+        return ExecResult(1, False, "Failed.", kwargs["log_path"])
+
+    run_turn(monkeypatch, failing)
+    assert budget_case.finish() == 1
+    assert seen == [["owner__project role architect"]], "The child must not take a second slot"
+    assert budget_case.files() == []
+
+
+def test_a_session_that_raises_still_writes_done_and_releases(budget_case, monkeypatch):
+    budget_case.call()
+
+    def broken(**kwargs):
+        raise RuntimeError("executor broke")
+
+    run_turn(monkeypatch, broken)
+    with pytest.raises(RuntimeError):
+        budget_case.finish()
+    assert budget_case.files() == []
+    assert '"architect-done"' in (budget_case.store.root / "orch-events.jsonl").read_text()
+
+
+def test_a_crash_stops_counting_at_once_and_the_next_start_removes_its_leftover(budget_case):
+    budget_case.call()
+    leftover = budget_case.files()
+    budget_case.table.exit(980001)
+    assert budget_case.holders() == [] and budget_case.files() == leftover
+    budget_case.call()
+    assert [item.pid for item in capacity_sessions.read(budget_case.store.root)] == [980002]
+
+
+def test_a_late_old_session_leaves_the_new_sessions_slot(budget_case, monkeypatch):
+    budget_case.call()
+    old_started_at = orch_architect.read_record(budget_case.store)["started_at"]
+    budget_case.table.exit(980001)
+    budget_case.now += timedelta(hours=1)
+    orch_architect.call(budget_case.root, budget_case.store, budget_case.config, "evidence", budget_case.now)
+    run_turn(monkeypatch, lambda **kwargs: ExecResult(0, False, "Done.", kwargs["log_path"]))
+    orch_architect.run_session(budget_case.root, budget_case.store, budget_case.config, "evidence",
+                               old_started_at, lambda: budget_case.now)
+    assert budget_case.holders() == ["owner__project role architect"]
