@@ -70,6 +70,9 @@ Keep your edits small. Do not rewrite a doc when a few lines fix it.
 Send proposals to the orchestrator with `fa orch request --from docs --text "<proposal>"`. A
 proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
 
+GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
+`fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.
+
 Never message the person directly. All communication goes only through the orchestrator.
 
 ## Memory
