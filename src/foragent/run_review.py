@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import contextvars
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
 import os
@@ -28,6 +28,7 @@ from foragent.run_execution import _available_executor
 from foragent.run_prompts import (
     build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
 )
+from foragent.review_single import first_review_findings, single_review
 from foragent.run_waits import _phase, _progress, _timeout
 
 if TYPE_CHECKING:
@@ -177,64 +178,18 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
-    from foragent import runner
-
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
-    options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
-    if reviewer == "claude" and pr is not None:
-        options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
     decisions = _lane_decisions(n, ctx, git.root)
-    notes = _risk_notes(git, base_ref)
-    if notes:
+    first = first_review_findings(ctx.store, n, round_number)
+    if not first and (notes := _risk_notes(git, base_ref)):
         # One whole-change reviewer per perspective; the reviewer count only limits how many run at once.
         return _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes,
                              review_perspectives.shares(ctx.config), round_number, lane_decisions=decisions,
                              workers=orch_reviewers.effective(ctx.store, ctx.config, n))
-    settings = {"model": ctx.config.reviewer_model}
-    edited = False
-    with ExitStack() as scope:
-        if reviewer == "claude" and ctx.config.review_scope == "claude-local":
-            approval = ctx.store.load_approval(n)
-            if approval is None:
-                raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
-                                                      lane_decisions=decisions))
-        before = git.review_state()
-        try:
-            result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
-                prompt="" if reviewer == "claude" else build_review_prompt(
-                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
-                    full_text_dir=cuts.issue_dir(ctx.store.root, n), lane_decisions=decisions,
-                ),
-                **settings, timeout_s=runner._remaining(n, ctx),
-                log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
-            )
-            message = result.full_message if result.full_message is not None else result.last_message
-            raw = _raw_text(reviewer, message)
-            _save_review(n, ctx, f"review-{round_number}.txt", raw)
-        finally:
-            if git.review_state() != before:
-                git.restore_review_state(before)
-                edited = True
-                _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
-    if result.timed_out or result.exit_code != 0:
-        review = ReviewResult("UNUSABLE", "", (
-            f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",
-        ))
-    else:
-        parser = parse_code_review if reviewer == "claude" else parse_review
-        review = parser(message)
-    if reviewer == "claude":
-        review = ReviewResult(review.verdict, review.findings, (
-            f"reviewer: /code-review {ctx.config.review_level}", *review.notes,
-        ))
-    if edited:
-        review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
-    return _finish_review(n, ctx, replace(review, raw=raw, timed_out=result.timed_out, conflicts=spec_conflicts(raw)),
-                          round_number, (raw,))
+    return single_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, decisions,
+                         round_number=round_number, pr=pr, first_review=first)
 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
