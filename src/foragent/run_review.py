@@ -541,9 +541,9 @@ def _review_implementation(attempt: Implementation) -> None:
 
 
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
-    """Verify one immutable PR head, then apply the ordinary merge policy."""
+    """Review the exact PR head, refresh its base if needed, then apply ordinary merge policy."""
     from foragent import runner
-    from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head
+    from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head, _refresh_reviewed_head
 
     approval = ctx.store.load_approval(n)
     if approval is None:
@@ -598,15 +598,17 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
-    if not git.is_ancestor(base_sha, head):
-        flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
-        return "base-changed"
+    behind = not git.is_ancestor(base_sha, head)
+    # Review only the PR's work: a two-way diff against a newer base includes
+    # unrelated base changes as apparent reversions.
+    review_base = git._call(["merge-base", base_sha, head]).strip() if behind else base_ref
 
     guarded_head = harness_guard.review_guard(ctx, n, git, base_ref, parsed.files, link,
                                               lambda new: _verify_review_head(n, ctx, git, parsed, new, link))
-    if stopped := guarded_head(head):
-        return stopped
-    _check_publication(git, pr.base)
+    if not behind:
+        if stopped := guarded_head(head):
+            return stopped
+        _check_publication(git, pr.base)
 
     if verdict_head is None and ctx.config.reviewer != "none":
         if runner._remaining(n, ctx) <= 0:
@@ -614,12 +616,12 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if ctx.config.review_scope == "pr-body":
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
             body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
-            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
+            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config))
             body = refresh_lane_decisions(body, _lane_decisions(n, ctx, git.root))
             if body != pr.body:
                 pr = replace(pr, body=body)
                 ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
-        review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
+        review = _review(n, ctx, git, parsed, review_base, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
@@ -628,6 +630,13 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         if review.verdict != "PASS":
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
+
+    if behind:
+        # The verdict judges the original head. Only a clean Git base merge can
+        # carry it forward; check the merged head once, as on later merge turns.
+        head, stopped = _refresh_reviewed_head(n, ctx, git, pr, head, base_sha, guarded_head)
+        if stopped:
+            return stopped
 
     from foragent.ci_mode import enabled, review_checks
     comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None

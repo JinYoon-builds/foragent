@@ -1069,11 +1069,32 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
     first_in_ci = threading.Event()
     second_in_ci = threading.Event()
     first_merged = threading.Event()
+    first_finished = threading.Event()
+    second_waiting = threading.Event()
     release_first = threading.Event()
     local = threading.local()
     entries = []
     merge_lock = c.store.merge_lock
     merge = c.tracker.merge_pr
+    advance_clock = c.ctx.sleep
+    finish_run = c.store.finish_run
+
+    def finish(number, **kwargs):
+        if number == 1:
+            # Exercise the interval where main moved but the first FIFO owner is still live.
+            assert second_waiting.wait(10), "The second lane did not wait for the merge turn"
+        result = finish_run(number, **kwargs)
+        if number == 1:
+            first_finished.set()
+        return result
+
+    def sleep(seconds):
+        if local.number == 2:
+            # A merged run keeps its FIFO seat until cleanup records it as finished.
+            # Let that real work finish before advancing this test's shared fake clock.
+            second_waiting.set()
+            assert first_finished.wait(10), "The first lane did not finish after merging"
+        advance_clock(seconds)
 
     def implement(**kwargs):
         number = 1 if kwargs["worktree"].name == "issue-1" else 2
@@ -1109,8 +1130,10 @@ def test_parallel_lanes_implement_while_merge_phase_serializes_and_rechecks(run_
 
     monkeypatch.setattr(c.executor, "run", implement)
     monkeypatch.setattr(c.store, "merge_lock", observed_lock)
+    monkeypatch.setattr(c.store, "finish_run", finish)
     monkeypatch.setattr(c.tracker, "pr_checks", checks)
     monkeypatch.setattr(c.tracker, "merge_pr", merge_into_target)
+    c.ctx.sleep = sleep
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(run_issue, 1, c.ctx)
         try:
