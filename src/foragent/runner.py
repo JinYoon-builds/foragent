@@ -432,8 +432,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
     Admission reads the live slot holders, never the record's status: a record the tick
     launched this process for (its pid is this one) or a fresh reservation is reused at once;
     a finished record, or a running one whose pid has died, must fit the budget. Once the
-    running record carries this pid it holds the slot itself; a finished record cannot, so
-    the admission then holds the slot until the run ends.
+    run is started (or its running record claims this pid), that record holds the slot
+    and the temporary admission is released.
     """
     with ExitStack() as admission:
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
@@ -447,8 +447,18 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        run = ctx.store.update_run(n, pid=os.getpid(),
-                                   process_identities=observe_tree(roots=(os.getpid(),)))
+        run = ctx.store.get_run(n)
+        if run is not None and run.status == "finished":
+            # update_run deliberately leaves finished records untouched. A direct retry needs
+            # a new lifecycle, including the running identity the merge queue admits.
+            run = ctx.store.start_run(
+                n, branch=run.branch, worktree=worktree, pid=os.getpid(), lane=run.lane,
+                tier=run.tier, implementer=run.implementer, executor=run.executor,
+                reviewer=run.reviewer, executor_model=run.executor_model,
+            )
+        else:
+            run = ctx.store.update_run(n, pid=os.getpid(),
+                                       process_identities=observe_tree(roots=(os.getpid(),)))
         if run.status == "running":
             admission.close()  # The record now names this live process: it holds the slot.
         if until := ctx.store.github_wait_until(ctx.now()):

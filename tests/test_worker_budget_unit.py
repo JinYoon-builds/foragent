@@ -20,6 +20,46 @@ from test_board_status_groups import offline_github  # noqa: F401
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
+def _assert_current_run(case):
+    run = case.store.get_run(1)
+    assert run.status == "running" and run.pid == os.getpid(), run
+
+
+@pytest.mark.parametrize("entry", ["finished-issue", "running-issue", "review"])
+def test_recorded_runner_birth_is_available_before_execution(
+        git_history, tmp_path, monkeypatch, fake_process_table, entry):
+    from foragent.scheduler_stop import runner_alive
+
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    table = fake_process_table
+    root = table.add(table.self_pid, cwd=case.root, start_time=23)
+    if entry != "running-issue":
+        case.store.finish_run(1, "error")
+    if entry == "review":
+        case.tracker.remove_labels(1, ["running"])
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.0))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    observed = []
+
+    def execute(*args):
+        # Read the saved record at the worker boundary, before any executor can update it.
+        run = case.store.get_run(1)
+        observed.append(run)
+        assert run.status == "running" and run.pid == root.pid
+        assert run.process_identities == [{"pid": root.pid, "start_time": root.start_time}]
+        assert runner_alive(run) is True
+        table.add(root.pid, cwd=case.root, start_time=root.start_time + 1)
+        assert runner_alive(run) is False, "a reused PID must not stand in for the recorded runner"
+        return "merged"
+
+    monkeypatch.setattr(runner, "_execute", execute)
+    monkeypatch.setattr(runner, "_review_only", execute)
+    outcome = runner.review_only(1, case.ctx) if entry == "review" else runner.run_issue(1, case.ctx)
+    assert outcome == "merged" and len(observed) == 1
+    assert not table.signals
+
+
 @pytest.mark.parametrize("budget", [1, 2])
 def test_direct_rerun_panel_uses_n_slots_and_merges_once(git_history, tmp_path, monkeypatch, budget):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=3, review_max=0, max_retries=1)
@@ -53,6 +93,7 @@ def test_direct_rerun_panel_uses_n_slots_and_merges_once(git_history, tmp_path, 
                 active[0] -= 1
 
     def execute(**kw):
+        _assert_current_run(case)
         return case.implementer.run(**kw) if not case.implementer.calls else review(**kw)
 
     case.ctx.executor_factory = lambda _: SimpleNamespace(run=execute)
@@ -87,12 +128,17 @@ def test_admission_waits_as_long_as_the_run_may_take(git_history, tmp_path, monk
     runtime = case.config.max_runtime_minutes * 60
     assert runtime > 600
     if entry == "review":
-        monkeypatch.setattr(runner, "_review_only", lambda *args: "merged")
+        def review(*args):
+            _assert_current_run(case)
+            return "merged"
+
+        monkeypatch.setattr(runner, "_review_only", review)
         assert runner.review_only(1, case.ctx) == "merged"
         assert waits == [("review", runtime)]
         return
 
     def execute(**kw):
+        _assert_current_run(case)
         if not case.implementer.calls:
             return case.implementer.run(**kw)
         return ExecResult(0, False, "VERDICT: PASS", kw["log_path"])

@@ -962,3 +962,54 @@ def test_run_dream_is_admitted_before_it_claims_the_dream_pid(app, monkeypatch):
     monkeypatch.setattr(cli.orch_dream, "run_dream", run_dream)
     assert cli.main(["gate", "run-dream", "main", "--repo-root", str(root)]) == 0
     assert order == [("admitted", "dream", dead.pid), ("work", "main", os.getpid())]
+
+
+@pytest.mark.parametrize("record", ["admitted", "dead-pid"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_dream_workload_reuses_its_run_slot_and_releases_on_exit(app, monkeypatch, record, interrupted):
+    """The live dream record and its workload occupy one real shared slot (#993)."""
+    from foragent import capacity, capacity_sessions
+
+    root, _, _, store, _ = app
+    store.start_dream("main", worktree=store.root / "worktrees/dream-main")
+    if record == "admitted":
+        pid = os.getpid()
+    else:
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        pid = dead.pid
+    store.update_run("dream-main", pid=pid, process_identities=[])
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.0))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    capacity.write_state(store, 1, NOW)
+    hold = capacity.hold_workload
+    # A broken reuse rule must fail immediately rather than waiting for the run's timeout.
+    monkeypatch.setattr(capacity, "hold_workload", lambda *a, **kw: hold(*a, **{**kw, "wait_s": 0}))
+    calls = []
+
+    def dream(lane, ctx):
+        calls.append(lane)
+        try:
+            workloads = capacity_sessions.read(store.root)
+            assert len(workloads) == 1, "the dream must keep its admission until it exits"
+            assert (workloads[0].kind, workloads[0].role) == ("dream", "main")
+            assert ctx.store.get_dream(lane).pid == os.getpid()
+            assert capacity.machine_runs(store, NOW) == 1, "the dream was counted twice"
+            if interrupted:
+                raise KeyboardInterrupt
+            return 0
+        finally:
+            # The worker owns finishing its run, including interrupted exits.
+            store.finish_dream(lane, "killed" if interrupted else "done")
+
+    monkeypatch.setattr(cli.orch_dream, "run_dream", dream)
+    command = ["gate", "run-dream", "main", "--repo-root", str(root)]
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(command)
+    else:
+        assert cli.main(command) == 0
+    assert calls == ["main"]
+    assert capacity_sessions.read(store.root) == []
+    assert capacity.machine_runs(store, NOW) == 0
