@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import timedelta
 import re
+import json
 
 import pytest
 
@@ -52,25 +53,19 @@ def assert_writes_fit(calls):
 
 
 def assert_full_text_is_reachable(case, body, payloads):
-    """Accept a retained file/run log or linked tracker comments, without fixing a filename."""
-    assert re.search(r"\bfull\b", body, re.I), "Shortening must visibly identify the full text"
-    sources = []
-    for path in case.store.root.rglob("*"):
-        if path.is_file():
-            relative = path.relative_to(case.store.root).as_posix()
-            if str(path.resolve()) in body or ("/" in relative and relative in body):
-                sources.append(path.read_text(encoding="utf-8", errors="replace"))
-    for issue in case.tracker.issues.values():
-        for comment in case.tracker.list_comments(issue.number):
-            if f"#issuecomment-{comment.id}" in body:
-                sources.append(comment.body)
-    # Comment-based storage may split large text across several linked comments.
-    retained = "\n".join(sources)
+    """Full removed text must survive in this PR's comments, with a named notice."""
+    assert "full" in body.lower() and "PR comment" in body
+    comments = [comment.body for pr in case.tracker.created_prs
+                for comment in case.tracker.list_comments(pr.number)]
+    retained = "".join(comment.split("\n", 1)[1] for comment in comments
+                       if comment.startswith("Foragent full "))
     for payload in payloads:
-        assert payload in body or payload in retained, (
-            "The notice must resolve to retained, complete text after run cleanup: "
-            + payload[:60]
-        )
+        assert payload in body or payload in retained, payload[:60]
+    for comment in comments:
+        if comment.startswith("Foragent full "):
+            label = comment.split("\n", 1)[0].split(" [part", 1)[0]
+            assert label in body, "Each removed block needs its own named PR-comment notice"
+
 
 
 def assert_required_run_body(case, body):
@@ -79,7 +74,10 @@ def assert_required_run_body(case, body):
     assert "## Review" in body and "VERDICT: PASS" in body
     assert "Opened by Foragent gate (attempt 1)" in body
     assert f"<code>test -f {ACCEPTANCE}</code> | pass |" in body
-    assert case.store.load_approval(1).body == case.tracker.get_issue(1).body
+    assert "- [ ] Looks right to a human" in body
+    approval = case.store.load_approval(1)
+    assert f"Approval: {approval.approved_by} at {approval.approved_at}" in body
+    assert approval.body == case.tracker.get_issue(1).body
 
 
 @pytest.mark.parametrize("publication", ["create", "update"])
@@ -111,6 +109,7 @@ def test_large_run_text_still_publishes_once(run_case, monkeypatch, publication,
 
     assert outcome == "merged", f"A finished change must publish successfully, got {outcome}"
     assert_writes_fit(calls)
+    assert len(calls) == 1, "Fit on the first call; no length retry or follow-up body update"
     assert len(c.tracker.created_prs) == 1, "Do not replace or duplicate the issue PR"
     pr = c.tracker.created_prs[0]
     assert existing is None or pr.number == existing
@@ -122,6 +121,12 @@ def test_large_run_text_still_publishes_once(run_case, monkeypatch, publication,
 
 # A literal public-body baseline: never derive this expected value from the renderer.
 NORMAL_BODY = '''Closes #1
+
+## Summary
+
+{summary}
+
+{approval}
 
 | Done when command | Result |
 | --- | --- |
@@ -160,10 +165,13 @@ def test_body_that_already_fits_is_unchanged(run_case, monkeypatch, publication,
         c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="Old body")
     # Multibyte characters also catch accidentally budgeting UTF-8 bytes as characters.
     evidence = "Looked in feature.txt; found the old output."
-    empty_size = len(NORMAL_BODY.replace("{evidence}", ""))
+    approval = c.store.load_approval(1)
+    baseline = NORMAL_BODY.replace("{summary}", SUMMARY).replace(
+        "{approval}", f"Approval: {approval.approved_by} at {approval.approved_at}")
+    empty_size = len(baseline.replace("{evidence}", ""))
     if size == "exact-limit":
         evidence = "증" * (LIMIT - empty_size)
-    expected = NORMAL_BODY.replace("{evidence}", evidence)
+    expected = baseline.replace("{evidence}", evidence)
     c.executor.steps[0].update({".foragent/SEARCHED.md": evidence, ".foragent/TRY.md": CARD})
     enable_reviewer(c, ["VERDICT: PASS"])
     calls = reject_oversized_bodies(c, monkeypatch)
@@ -191,22 +199,16 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
     if entry == "run":
         c.executor.steps[0].update({".foragent/SEARCHED.md": payload, ".foragent/TRY.md": CARD})
     else:
-        # A legal, nearly full existing PR becomes oversized when re-review adds
-        # the current review scope, risk notes and review checklist.
-        c.store.finish_run(1, outcome="held")
+        # Publish once to produce the record, then remove the worktree and edit the projection.
+        # Re-review must recompose from persisted values; the old body has none of them.
+        c.executor.steps[0].update({".foragent/SEARCHED.md": payload, ".foragent/TRY.md": CARD})
+        c.ctx.config = replace(c.ctx.config, reviewer="none", review="careful")
+        assert run_issue(1, c.ctx) == "pr-open"
         c.now[0] += timedelta(seconds=1)
-        c.tracker.remove_labels(1, ["running"])
-        base = c.history.tip
-        c.history.update({"feature.txt": "done"})
-        head = c.history.tip
-        git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
-        git_command(c.history.origin, "update-ref", "refs/heads/main", base)
-        prefix = f"Closes #1\n\n## Summary\n\n{SUMMARY}\n\n"
-        payload = "evidence-BEGIN\n" + "e" * (LIMIT - len(prefix) - 40) + "\nevidence-END"
-        body = prefix + payload
-        assert len(body) <= LIMIT
-        pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body=body)
-        c.tracker.set_pr_head_sha(pr, head)
+        pr = c.tracker.created_prs[0]
+        c.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body="Person's unrelated edit")
+        enable_reviewer(c, ["VERDICT: PASS"] * 5)
+        c.ctx.config = replace(c.ctx.config, review="fast")
     calls = reject_oversized_bodies(c, monkeypatch)
 
     outcome = run_issue(1, c.ctx) if entry == "run" else review_only(1, c.ctx)
@@ -219,8 +221,12 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
     assert SUMMARY in body
     assert body.splitlines().count(RISK_START) == body.splitlines().count(RISK_END) == 1
     assert body.index(RISK_START) < body.index(RISK_END)
+    assert "VERDICT: PASS" in body and "- [ ] Looks right to a human" in body
+    approval = c.store.load_approval(1)
+    assert f"Approval: {approval.approved_by} at {approval.approved_at}" in body
     assert "Preserve the feature output." in body
     assert "## Review scope" in body
+    assert "Person's unrelated edit" not in body
     assert "Tests under tests/acceptance/ that this issue lists are locked acceptance tests." in body
     assert_full_text_is_reachable(c, body, [payload])
 
@@ -252,3 +258,155 @@ def test_batch_publication_also_fits(run_case, monkeypatch, publication):
     assert "#99" in body and "## Children" in body
     assert not re.search(r"\b(?:Closes|Fixes|Resolves)\s+#99\b", body, re.I)
     assert_full_text_is_reachable(c, body, titles)
+    batch_calls = [(op, body) for op, body in calls if "## Children" in body]
+    assert len(batch_calls) == 1
+    assert batch_calls[0][0] == ("create_pr" if publication == "create" else "update_pr")
+
+
+@pytest.fixture(autouse=True)
+def summary_value(run_case):
+    # Explicit producer protocol: summary is a value, TRY.md remains opaque optional text.
+    run_case.executor.steps[0][".foragent/PR.json"] = json.dumps({"summary": SUMMARY})
+
+
+@pytest.mark.parametrize("publication", ["create", "update"])
+@pytest.mark.parametrize("incident", [1105, 993])
+def test_incident_shape_fits_on_first_write(run_case, monkeypatch, publication, incident):
+    c = run_case
+    # Offline shapes: a repeated failure log/table and review/rebuttal blocks, not a flat pad.
+    row = f"| issue-{incident} | tests/test_worker.py::test_capacity | FAIL |\r\n"
+    log = "```text\r\n## Needs a human check ##\r\nCloses #99\r\n" + row * 1400 + "```\r\n"
+    c.executor.steps[0].update({".foragent/SEARCHED.md": log, ".foragent/TRY.md": CARD})
+    if publication == "update":
+        c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="Earlier human edit")
+    enable_reviewer(c, ["VERDICT: PASS"])
+    calls = reject_oversized_bodies(c, monkeypatch)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == 1 and calls[0][0] == publication + "_pr"
+    assert_writes_fit(calls)
+    assert_required_run_body(c, calls[0][1])
+    assert_full_text_is_reachable(c, calls[0][1], [log])
+
+
+@pytest.mark.parametrize("shape", ["crlf-summary", "human-heading", "fenced-heading"])
+def test_rendered_markdown_cannot_choose_required_content(run_case, monkeypatch, shape):
+    c = run_case
+    summary = "A complete summary.\r\nSecond complete sentence." if shape == "crlf-summary" else SUMMARY
+    c.executor.steps[0][".foragent/PR.json"] = json.dumps({"summary": summary})
+    optional = ("## What changed\r\nAn optional, obsolete summary.\r\n## Needs a human check ##\r\n"
+                "- [ ] Optional example only\r\n```md\r\n## What changed\r\nCloses #99\r\n```\r\n")
+    payload = optional + "증거" * 40000
+    c.executor.steps[0][".foragent/TRY.md"] = payload
+    enable_reviewer(c, ["VERDICT: PASS"])
+    calls = reject_oversized_bodies(c, monkeypatch)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(calls) == 1
+    body = calls[0][1]
+    assert summary in body and "Closes #1" in body and "VERDICT: PASS" in body
+    assert "- [ ] Looks right to a human" in body
+    assert_full_text_is_reachable(c, body, [payload])
+
+
+@pytest.mark.parametrize("entry", ["run", "review-only"])
+def test_required_summary_alone_over_limit_stops_before_write(run_case, monkeypatch, entry):
+    c = run_case
+    c.executor.steps[0][".foragent/PR.json"] = json.dumps({"summary": "큰 요약\r\n" * 15000})
+    if entry == "review-only":
+        # First retain a structured snapshot by a stopped publication, then retry review.
+        assert run_issue(1, c.ctx) == "pr-body-too-long"
+        c.now[0] += timedelta(seconds=1)
+        pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="Short old body")
+        head = git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1")
+        c.tracker.set_pr_head_sha(pr, head)
+        c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
+        enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    calls = reject_oversized_bodies(c, monkeypatch)
+    outcome = run_issue(1, c.ctx) if entry == "run" else review_only(1, c.ctx)
+    assert outcome == "pr-body-too-long"
+    assert calls == [], "No write, including a doomed length probe"
+    assert "required" in c.store.get_run(1).detail.lower() and "65536" in c.store.get_run(1).detail
+
+
+class UnreadableBody(str):
+    def denied(self, *args, **kwargs):
+        raise AssertionError("A rendered PR body was read to compose an update")
+    __str__ = __len__ = __contains__ = __eq__ = __add__ = denied
+    split = splitlines = strip = replace = find = index = denied
+
+
+def test_gate_update_overwrites_human_edits_without_reading_body(run_case, monkeypatch):
+    c = run_case
+    c.executor.steps[0][".foragent/TRY.md"] = CARD
+    c.ctx.config = replace(c.ctx.config, review="careful")
+    assert run_issue(1, c.ctx) == "pr-open"
+    c.now[0] += timedelta(seconds=1)
+    pr = c.tracker.created_prs[0]
+    c.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body="Human edit; do not preserve me")
+    listing = c.tracker.list_prs
+    monkeypatch.setattr(c.tracker, "list_prs", lambda *a, **kw: [
+        replace(p, body=UnreadableBody("old body")) for p in listing(*a, **kw)])
+    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_scope="pr-body")
+    calls = reject_oversized_bodies(c, monkeypatch)
+    assert review_only(1, c.ctx) == "merged"
+    assert_writes_fit(calls)
+    for _, body in calls:
+        assert SUMMARY in body and "Closes #1" in body
+        assert "Human edit; do not preserve me" not in body
+    # No requirement for an edit-overwrite notice: gate ownership is the contract.
+
+
+def test_real_closing_reference_is_structured_not_the_first_closes_line(run_case, monkeypatch):
+    c = run_case
+    # An unrelated Closes line in a person's old projection must never choose the issue.
+    c.ctx.config = replace(c.ctx.config, review="careful")
+    assert run_issue(1, c.ctx) == "pr-open"
+    c.now[0] += timedelta(seconds=1)
+    original = c.tracker.get_issue(1)
+    approval = c.store.load_approval(1)
+    c.tracker.add_issue(7, original.title, original.body, labels=["approved"])
+    c.store.save_approval(**{**approval.__dict__, "number": 7})
+    # Move the saved values, without reading or classifying a Markdown body.
+    record = c.store.root / "pr-content/1.json"
+    destination = c.store.root / "pr-content/7.json"
+    destination.write_bytes(record.read_bytes())
+    pr = c.tracker.create_pr(head="foragent/issue-7", base="main", title="Existing (#7)",
+                             body="Closes #99\n## Summary\nWrong old summary\nCloses #7")
+    head = git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1")
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-7", head)
+    c.tracker.set_pr_head_sha(pr, head)
+    c.tracker.set_pr_files(pr, ["feature.txt"])
+    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    c.ctx.config = replace(c.ctx.config, review="fast", review_scope="pr-body")
+    calls = reject_oversized_bodies(c, monkeypatch)
+    assert review_only(7, c.ctx) == "merged"
+    assert calls and all(body.splitlines().count("Closes #7") == 1 for _, body in calls)
+    assert all("Closes #99" not in body and SUMMARY in body for _, body in calls)
+
+
+@pytest.mark.parametrize("large", ["risk", "decisions", "both"])
+def test_optional_marker_blocks_have_independent_shares(run_case, monkeypatch, large):
+    from foragent import run_review, run_publish
+    c = run_case
+    risk = "risk-BEGIN\n" + ("r" * 70000 if large in ("risk", "both") else "Keep this risk whole.") + "\nrisk-END"
+    decisions = "decisions-BEGIN\n" + ("d" * 70000 if large in ("decisions", "both") else "Keep this choice whole.") + "\ndecisions-END"
+    monkeypatch.setattr(run_publish, "_risk_notes", lambda attempt: risk)
+    monkeypatch.setattr(run_review, "_lane_decisions", lambda *a: decisions)
+    c.executor.steps[0][".foragent/TRY.md"] = CARD
+    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
+    calls = reject_oversized_bodies(c, monkeypatch)
+    assert run_issue(1, c.ctx) == "merged"
+    assert_writes_fit(calls)
+    body = calls[-1][1]
+    for start, end in ((RISK_START, RISK_END),
+                       ("<!-- foragent:lane-decisions -->", "<!-- /foragent:lane-decisions -->")):
+        assert body.splitlines().count(start) == body.splitlines().count(end) == 1
+        assert body.index(start) < body.index(end)
+    assert "Closes #1" in body and SUMMARY in body and "VERDICT: PASS" in body
+    assert "- [ ] Looks right to a human" in body
+    if large == "risk":
+        assert decisions in body
+    if large == "decisions":
+        assert risk in body
+    assert_full_text_is_reachable(c, body, [risk, decisions])
