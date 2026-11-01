@@ -560,7 +560,7 @@ def test_reapproval_of_preexisting_acceptance_change_passes_gate(offline_publica
     root, config, tracker, git, _, _ = offline_publication
     config = replace(config, approvers=["human"])
     tracker._now = lambda: BASE_TIME + timedelta(hours=1)
-    plan["issues"][0]["done_when"] = [f"pytest '{FILE}::test_login[token=valid]'"]
+    plan["issues"][0]["done_when"] = [f"uv run pytest '{FILE}::test_login[token=valid]'"]
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
     ctx = TickContext(repo="owner/repo", repo_root=root, tracker=tracker, store=StateStore(root / ".foragent/state"),
                       config=config, git=git, now=lambda: tracker._now(), launcher=lambda number: None,
@@ -2565,6 +2565,87 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "own turn" not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("command", [
+    "MODE=test local-check && unavailable-later",
+    "./bin/local-check; unavailable-later",
+    "'./bin/local-check' | unavailable-later",
+    "true", "cd .", "test -f x", "[ -f x ]", ":", "if true; then unavailable; fi",
+    "for x in a; do unavailable; done", "(unavailable)", "! unavailable",
+    "MODE=test", "local-check 'unterminated",
+])
+def test_done_when_executable_resolves_first_command_only(tmp_path, monkeypatch, command):
+    from foragent import processes
+
+    binary = tmp_path / "bin" / "local-check"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\nexit 91\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, tmp_path)
+
+
+def test_done_when_executable_reports_edits_without_runner(tmp_path, monkeypatch):
+    from foragent import processes
+
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\nexit 99\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": str(tmp_path)})
+    plan = {"issues": [{"key": "one", "done_when": ["FLAG=yes missing-check --first"]}],
+            "edits": [{"number": 42, "done_when": ["missing-check --second"]}]}
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(plan, tmp_path)
+    assert caught.value.lines == [
+        "one: missing executable missing-check: FLAG=yes missing-check --first",
+        "#42: missing executable missing-check: missing-check --second",
+    ]
+
+
+def test_done_when_executable_uses_gate_environment_not_repo_venv(tmp_path, monkeypatch):
+    from foragent import processes
+
+    binary = tmp_path / ".venv/bin/check-in-venv"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary.parent))
+    seen = []
+    def environment(root):
+        seen.append(root)
+        return {"PATH": str(tmp_path / "empty")}
+    monkeypatch.setattr(processes, "_child_environment", environment)
+    with pytest.raises(order.DoneWhenExecutableError, match="check-in-venv"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["check-in-venv"]}]}, tmp_path)
+    assert seen == [tmp_path]
+
+
+@pytest.mark.parametrize("executable", ["./missing", "./not-executable", "./directory"])
+def test_done_when_executable_path_requires_executable_file(tmp_path, executable):
+    (tmp_path / "not-executable").write_text("echo no\n")
+    (tmp_path / "not-executable").chmod(0o644)
+    (tmp_path / "directory").mkdir()
+    with pytest.raises(order.DoneWhenExecutableError, match=re.escape(executable)):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": [executable]}]}, tmp_path)
+
+
+def test_done_when_executable_uv_suggestion_from_dependency_groups(tmp_path, monkeypatch):
+    from foragent import processes
+
+    binary = tmp_path / "uv"
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o755)
+    (tmp_path / "pyproject.toml").write_text('[dependency-groups]\ndev = ["pytest"]\n')
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": str(tmp_path)})
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python3 -m pytest -q test_x.py"]}]}, tmp_path, "ko")
+    assert len(caught.value.lines) == 1
+    assert "uv run pytest -q test_x.py" in caught.value.lines[0]
+    assert "찾을 수 없어요" in caught.value.lines[0]
+
+
 def test_observed_fields_preserve_raw_changes_and_keep_plans_separate(tmp_path):
     from types import SimpleNamespace
 
@@ -3442,6 +3523,26 @@ def test_planning_notes_reject_invalid_replacement_without_writing(tmp_path, kin
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_missing_done_when_is_a_plan_error_before_executable_preflight(
+        publishing, plan, monkeypatch, kind, dry_run):
+    root, config, tracker, git, events = publishing
+    if kind == "edits":
+        plan["edits"] = [{"number": 70, "goal": "Update the goal.", "out_of_scope": "Other work."}]
+    else:
+        del plan["issues"][0]["done_when"]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Malformed plans must stop before executable checks or tracker reads")
+
+    monkeypatch.setattr(order, "check_done_when_executables", forbidden)
+    monkeypatch.setattr(tracker, "list_issues", forbidden)
+    with pytest.raises(order.PlanError, match=rf"{kind}\[0\]: missing fields: done_when"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git, dry_run=dry_run)
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
+    assert not (root / "docs").exists()
+
 def flush_waiting(case, boundary="chosen"):
     from foragent import order_flush
 
@@ -3487,6 +3588,41 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert identities == {issue.title: issue.number for issue in tracker.list_issues()}
     assert all("approved" not in issue.labels for issue in tracker.list_issues())
     assert len([event for event in events if event[0] == "commit"]) == 2
+
+
+@pytest.mark.parametrize("via_cli", [False, True])
+def test_flush_missing_executables_keep_each_diagnostic_before_writes(
+        publishing, plan, monkeypatch, capsys, via_cli):
+    from foragent import processes
+
+    root, config, tracker, git, events = publishing
+    plan["issues"][0]["done_when"] = [f"uv run pytest -q {FILE}"] * 2
+    publish(publishing, plan, defer="chosen")
+    store = StateStore.for_repo("owner/repo")
+    before = (store.root / "orders.jsonl").read_bytes()
+    # Availability can change between retaining the order and flushing it.
+    monkeypatch.setattr(processes, "_child_environment", lambda cwd: {"PATH": str(root / "no-tools")})
+    if via_cli:
+        monkeypatch.setattr(cli, "load_config", lambda root: config)
+        monkeypatch.setattr(cli, "GitRepo", lambda root: git)
+        monkeypatch.setattr(git, "remote_slug", lambda: "owner/repo", raising=False)
+        monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
+        monkeypatch.setattr(cli, "RunContext", lambda **kwargs: SimpleNamespace(tracker=tracker))
+        capsys.readouterr()
+        assert cli.main(["order", "flush", "--boundary", "chosen", "--repo-root", str(root)]) == 1
+        output = capsys.readouterr()
+        assert output.out == ""
+        lines = output.err.splitlines()
+    else:
+        with pytest.raises(order.DoneWhenExecutableError) as caught:
+            flush_waiting(publishing)
+        lines = caught.value.lines
+    assert len(lines) == 2
+    assert all("uv" in line and "api" in line for line in lines)
+    assert (store.root / "orders.jsonl").read_bytes() == before
+    assert not (store.root / "flush-journal.jsonl").exists()
+    assert not (root / FILE).exists()
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
 
 
 @pytest.mark.parametrize("refusal", ["map", "approve", "owner", "preread", "rule", "conflict"])

@@ -10,6 +10,7 @@ jobs:
       'foragent/issue-') || startsWith(github.event.pull_request.head.ref, 'foragent/group-'))
       && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     strategy:
@@ -48,3 +49,9 @@ jobs:
         name: acceptance-${{ matrix.shard }}
         path: ${{ runner.temp }}/shard-${{ matrix.shard }}.json
         if-no-files-found: error
+    - name: Fail when passing tests were lost
+      env:
+        LOST: ${{ steps.compare.outputs.lost }}
+        LOST_IDS: ${{ runner.temp }}/shard-${{ matrix.shard }}.lost
+      run: "if [ \"${LOST:-0}\" -gt 0 ]; then\n  echo \"Acceptance comparison lost\
+        \ $LOST passing test(s):\"\n  cat \"$LOST_IDS\"\n  exit 1\nfi\n"

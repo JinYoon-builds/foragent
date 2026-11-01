@@ -1231,7 +1231,7 @@ def test_a_legacy_checkout_test_changed_after_review_is_named_and_refused(reques
     git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
     case.plan["issues"].append({
         "key": "legacy", "title": "Legacy receipt", "goal": "Keep receipts.", "out_of_scope": "Delivery.",
-        "done_when": [f"python {EXISTING}"], "lane": "api", "size": "s"})
+        "done_when": [f"uv run python {EXISTING}"], "lane": "api", "size": "s"})
     case.save()
     assert cases.prepare(case, capsys)["status"] == "reviewed"
     (case.root / EXISTING).write_text("pass\n")
@@ -1521,7 +1521,7 @@ def test_bytes_read_for_publication_are_the_bytes_checked_even_if_the_checkout_c
     git_command(case.root, "update-ref", "refs/heads/main", git_history.tip)
     case.plan["issues"].append({
         "key": "legacy", "title": "Legacy receipt", "goal": "Keep receipts.", "out_of_scope": "Delivery.",
-        "done_when": [f"python {EXISTING}"], "lane": "api", "size": "s"})
+        "done_when": [f"uv run python {EXISTING}"], "lane": "api", "size": "s"})
     case.save()
     assert cases.prepare(case, capsys)["status"] == "reviewed"
     (case.root / EXISTING).write_text("pass\n")  # weakened; publication reads these bytes
