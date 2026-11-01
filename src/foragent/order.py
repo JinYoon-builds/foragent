@@ -40,6 +40,20 @@ class PlanError(ValueError):
     """An order plan is malformed or cannot be applied."""
 
 
+class DoneWhenExecutableError(PlanError):
+    """One diagnostic per unavailable Done when command, in plan order."""
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        super().__init__("\n".join(lines))
+
+
+def check_done_when_executables(plan: dict, root: Path, language: str = "en") -> None:
+    from foragent.order_executables import check
+
+    check(plan, root, language)
+
+
 PROGRESS_SLOTS = ("goal", "out_of_scope", "done_when", "lane", "skills")
 PROGRESS_STEPS = ("start", "ledger", "chunk", "cell", "tests", "check", "approval", "publish", "end")
 
@@ -742,6 +756,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                  validate_plan(plan, root, config, retained_files=retained_files))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    check_done_when_executables(plan, root, config.language)
+
     if dry_run:
         # A dry run only previews: read GitHub without recording any observation locally.
         from foragent.tracker import RecordingTracker
