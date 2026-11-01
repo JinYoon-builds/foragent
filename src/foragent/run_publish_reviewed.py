@@ -126,7 +126,7 @@ def _publish_reviewed_in_turn(
     def reuse(target: str) -> bool:
         """Every base-move point asks this: does the joint pass verify this exact head on ``target``?"""
         nonlocal base_sha, reused_base
-        if ctx.config.merge_group_max <= 1:
+        if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
             return False
         if comparison_attempt is not None and run_group_ci.evidence(view, head, target) is None:
             return False
