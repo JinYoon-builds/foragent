@@ -227,6 +227,9 @@ def _implement_and_publish(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
 ) -> str:
     """Run named implementation, check, review and publication steps."""
+    from foragent.i18n import text
+    from foragent.pr_body_limit import PrBodyTooLarge
+
     attempt = _prepare_implementation(n, ctx, git, target_branch=target_branch, failure=failure)
     outcome = "error"
     try:
@@ -298,6 +301,10 @@ def _implement_and_publish(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         raise
+    except PrBodyTooLarge as exc:
+        flag(ctx, n, Reason.RETRIES_EXCEEDED, text("pr_body_too_large", ctx.config.language), str(exc), needs_human=True)
+        outcome = "held"
+        return outcome
     except TrackerError as exc:
         attempt.tracker_available = False
         outcome = "limit-wait" if exc.is_rate_limit else "error"

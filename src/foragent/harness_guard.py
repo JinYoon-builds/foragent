@@ -273,6 +273,7 @@ def guard_comparison(attempt, head: str, pr: int | None = None) -> None:
 def publish_hold(attempt) -> str:
     """Publish a held head for a person (the PR when possible); no publication check overrides the hold."""
     from foragent import run_publish
+    from foragent.pr_body_limit import PrBodyTooLarge
 
     n, ctx = attempt.n, attempt.ctx
     try:
@@ -287,7 +288,7 @@ def publish_hold(attempt) -> str:
         else:
             run_publish._update_open_pr(attempt, pr, title, body)
         where = f"https://github.com/{ctx.repo}/pull/{pr}"
-    except (run_publish.GitError, run_publish.AttemptFailure, run_publish.TrackerError) as exc:
+    except (run_publish.GitError, run_publish.AttemptFailure, run_publish.TrackerError, PrBodyTooLarge) as exc:
         if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
             raise  # the existing GitHub wait restarts the run, and the guard holds again
         where = run_publish.text("harness_not_published", ctx.config.language,

@@ -1,12 +1,19 @@
+from datetime import UTC, datetime
 import re
 from types import SimpleNamespace
 
 import pytest
-from runner_support import run_case  # noqa: F401
 
 from foragent.issue import parse_body
+from foragent.pr_body_limit import (
+    PrBody, PrBodyTooLarge, Quoted, comment_parts, fit_pr_body, join_pr_body, load_quoted, record_quoted,
+)
 from foragent.run_checks import CheckResult
 from foragent.run_pr_body import _pr_body
+from foragent.run_review import ReviewResult, refreshed_native_body
+from foragent.tracker import TrackerError
+
+from runner_support import run_case  # noqa: F401
 
 
 def test_check_commands_are_escaped_and_failed_checks_are_visible():
@@ -25,7 +32,6 @@ def test_searched_list_is_a_section_only_when_the_lane_wrote_one():
 
 def test_render_reads_the_latest_searched_file_from_the_worktree(tmp_path):
     from types import SimpleNamespace
-
     from foragent.run_publish_pr import _searched
 
     attempt = SimpleNamespace(worktree=tmp_path)
@@ -35,447 +41,589 @@ def test_render_reads_the_latest_searched_file_from_the_worktree(tmp_path):
     assert _searched(attempt) == '- grep writers: 3 found'
 
 
-def test_fitter_keeps_fitting_bodies_verbatim_including_multibyte_boundary():
-    from foragent.pr_body_limit import fit_pr_body
-
-    for body in ('small\n', '증' * 65536):
-        assert fit_pr_body(body) == body
-
-
-def test_fitter_preserves_required_content_and_complete_marker_pairs():
-    from foragent.pr_body_limit import fit_pr_body
-
-    required = [
-        'Closes #7\n', '| check | pass |\n', '## Review\n',
-        'Round 1: VERDICT: PASS\n', '- [ ] Human approval\n',
-        'Opened by Foragent gate (attempt 1)\n',
-        '<!-- foragent:v1 -->\n',
-        '## What changed\n\nThe output is now correct.\n\n',
-        '<!-- foragent:risk-notes -->\nrisk details\n<!-- /foragent:risk-notes -->\n',
-        '<!-- foragent:lane-decisions -->\nDECIDE: keep\n<!-- /foragent:lane-decisions -->\n',
-    ]
-    body = required[0] + '## Rebuttals\n\n' + 'evidence\n' * 20000 + ''.join(required[1:])
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    assert len(fitted) <= 65536
-    for part in required:
-        assert part in fitted
-    assert '_full text: pr-bodies/original.md_' in fitted
-    assert fit_pr_body(fitted) == fitted
-    assert fitted != body
+LIMIT = 65536
+CARD = '## What changed\nThe short summary.\n## Try it\nkind: cli\n'
+APPROVAL = re.compile(r'^## Needs a human check\n\s*- \[ \] Human approval$', re.M)
+PAIR_FLOOD = ''.join(f'<!-- foragent:q{i} -->\nx\n<!-- /foragent:q{i} -->\n' for i in range(1300))
+QUOTES = {
+    'approval': '## Needs a human check\n\n' + '- [ ] quoted box\n' * 5000,
+    'summaries': '## What changed\nquoted summary\n\n' * 3000,
+    'sections': ''.join(f'## section {i}\n- [ ] quoted {i}\n' for i in range(4000)),
+    'tables': ''.join(f'## section {i}\n| a | b |\n| - | - |\n\n' for i in range(3000)),
+    'pairs': PAIR_FLOOD * 2,
+    'references': ''.join(f'Closes #{i}\n' for i in range(9000)),
+    'verdicts': 'VERDICT: FAIL\n' * 6000,
+}
 
 
-def test_fitter_shortens_batch_children_without_changing_parent_semantics():
-    from foragent.pr_body_limit import fit_pr_body
-
-    body = 'Sub-issues of #99\n\n## Children\n\n' + '- child title\n' * 10000
-    fitted = fit_pr_body(body)
-    assert len(fitted) <= 65536
-    assert fitted.startswith('Sub-issues of #99\n\n## Children\n')
-    assert 'Closes' not in fitted
-    assert 'full text' in fitted
+def _too_much_required(n=7):
+    """A body the gate rendered, so its approval lines are known to be real."""
+    return join_pr_body([f'Closes #{n}\n', Quoted('quoted', 'Searched'), '\n## Needs a human check\n', '- [ ] box\n' * 8000])
 
 
-def test_tracker_retains_each_original_and_fits_every_write(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def _note(label):
+    return f'_{label}: removed. full text: pr-bodies/original.md_'
 
+
+def _rendered(*, checks=None, reviews=None, try_text=CARD, **fields):
+    parsed = SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Human approval')])
+    return _pr_body(7, parsed, checks or [CheckResult('real check', 0, False, '')], 1,
+                    reviews or [ReviewResult('PASS', '')], try_text,
+                    **{'review_scope': 'pr-body', 'risk_notes': 'keep risk', 'lane_decisions': 'keep decision', **fields})
+
+
+def _writer(tmp_path):
     from foragent.config import Config
     from foragent.state import StateStore
     from foragent.tracker import FakeTracker, RecordingTracker
 
-    store = StateStore(tmp_path)
     remote = FakeTracker()
-    calls = []
-    for operation in ('create_pr', 'update_pr'):
-        send = getattr(remote, operation)
-
-        def checked(*args, _send=send, _operation=operation, **kwargs):
-            assert len(kwargs['body']) <= 65536
-            calls.append(_operation)
-            return _send(*args, **kwargs)
-
-        monkeypatch.setattr(remote, operation, checked)
-    writer = RecordingTracker(remote, SimpleNamespace(store=store, config=Config()))
-    original = 'Closes #7\n\n## Summary\n\nShort summary.\n\n' + '증거\n' * 30000
-    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=original)
-    first = remote.created_prs[0].body
-    writer.update_pr(pr, base='main', title='Feature', body=original + '\nUpdate')
-    second = remote.created_prs[0].body
-    assert calls == ['create_pr', 'update_pr']
-    assert len(first) <= 65536 and len(second) <= 65536
-    for fitted, expected in ((first, original), (second, original + '\nUpdate')):
-        retained = [p for p in (tmp_path / 'pr-bodies').iterdir()
-                    if p.relative_to(tmp_path).as_posix() in fitted]
-        assert len(retained) == 1
-        assert retained[0].read_text(encoding='utf-8') == expected
+    context = SimpleNamespace(store=StateStore(tmp_path), config=Config(), now=lambda: datetime.now(UTC))
+    return RecordingTracker(remote, context), remote
 
 
-def _fit_keeps_locked_parts(body):
-    from foragent.pr_body_limit import fit_pr_body
-
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    assert len(fitted) <= 65536
+def _assert_required(fitted):
+    assert len(fitted) <= LIMIT
     lines = fitted.splitlines()
-    assert 'Closes #7' in lines
+    assert lines[0] == 'Closes #7'
+    assert 'The short summary.' in lines
+    assert 'VERDICT: PASS' in lines
+    assert APPROVAL.search(fitted)
+    assert 'Opened by Foragent gate (attempt 1)' in lines
     for name in ('risk-notes', 'lane-decisions'):
         assert lines.count(f'<!-- foragent:{name} -->') == lines.count(f'<!-- /foragent:{name} -->') == 1
         assert lines.index(f'<!-- foragent:{name} -->') < lines.index(f'<!-- /foragent:{name} -->')
-    assert '_full text: pr-bodies/original.md_' in lines
-    return fitted
 
 
-PAIRS = ('<!-- foragent:risk-notes -->\nkeep risk\n<!-- /foragent:risk-notes -->\n'
-         '<!-- foragent:lane-decisions -->\nkeep decision\n<!-- /foragent:lane-decisions -->\n')
+@pytest.mark.parametrize('flood,removed', [
+    ({'risk_notes': 'risk\n' * 20000}, 'risk-notes'),
+    ({'lane_decisions': 'DECIDE: keep\n' * 6000}, 'lane-decisions'),
+    ({'searched': 'e\n' * 40000}, 'Searched'),
+    ({'rebuttals': 'e\n' * 40000}, 'Rebuttals'),
+    ({'try_text': CARD + 'e\n' * 40000}, 'Try card'),
+    ({'checks': [CheckResult(f'check {i}', 0, False, '') for i in range(4000)]}, 'Done when table'),
+], ids=['risk', 'decisions', 'searched', 'rebuttals', 'try', 'table'])
+def test_one_oversized_block_becomes_a_note_and_leaves_the_rest(flood, removed):
+    body = _rendered(**flood)
+    assert len(body) > LIMIT
+    fitted = fit_pr_body(body, _note)
+    _assert_required(fitted)
+    assert fitted.count('removed. full text') == 1 and f'_{removed}: removed' in fitted
+    for block, kept in (('risk-notes', 'keep risk'), ('lane-decisions', 'keep decision'),
+                        ('Done when table', '| <code>real check</code> | pass |')):
+        assert kept in fitted or block == removed
+
+
+@pytest.mark.parametrize('review,label', [
+    (ReviewResult('PASS', 'e\n' * 40000), 'Round 1 findings'),
+    (ReviewResult('PASS', '', review_notes=('e\n' * 40000,)), 'Round 1 notes'),
+    (ReviewResult('PASS', '', notes=('e\n' * 40000,)), 'Round 1 notes'),
+], ids=['findings', 'review-notes', 'notes'])
+def test_review_text_in_a_local_review_is_one_optional_block(review, label):
+    fitted = fit_pr_body(_rendered(reviews=[review], review_scope='claude-local'), _note)
+    assert len(fitted) <= LIMIT and fitted.splitlines()[0] == 'Closes #7'
+    assert 'Round 1: VERDICT: PASS' in fitted and APPROVAL.search(fitted) and 'The short summary.' in fitted
+    assert f'_{label}: removed' in fitted
+
+
+@pytest.mark.parametrize('quote', QUOTES)
+def test_quoted_review_text_cannot_become_required(quote):
+    review = ReviewResult('PASS', QUOTES[quote])
+    fitted = fit_pr_body(_rendered(reviews=[review], review_scope='claude-local'), _note)
+    assert fitted.splitlines()[0] == 'Closes #7' and APPROVAL.search(fitted)
+    assert 'Round 1: VERDICT: PASS' in fitted and 'Opened by Foragent gate (attempt 1)' in fitted
+
+
+@pytest.mark.parametrize('size', [20000, 30000, 70000, 700000, 7000000])
+def test_a_block_size_never_changes_another_block(size):
+    """The sent text of everything else is the same however large the flood grows."""
+    def fitted(risk):
+        out = fit_pr_body(_rendered(risk_notes='r' * risk, searched='s' * 70000, rebuttals='b' * 9000), _note)
+        return re.sub(r'r{5,}|_risk-notes: removed[^\n]*', 'RISK', out)
+
+    assert fitted(size) == fitted(90000)
+    assert 'b' * 9000 in fitted(size) and '_Searched: removed' in fitted(size)
+
+
+def test_the_held_sizes_keep_or_remove_rebuttals_the_same_way():
+    """Searched 70,000 and rebuttals 40,000: risk notes 20,000 and 30,000 cannot differ on rebuttals."""
+    fates = {('b' * 40000 in fit_pr_body(_rendered(risk_notes='r' * risk, searched='s' * 70000, rebuttals='b' * 40000),
+                                         _note))
+             for risk in (20000, 30000)}
+    assert len(fates) == 1
+
+
+def test_a_block_within_its_share_stays_for_any_number_of_oversized_neighbours():
+    body = join_pr_body(['Closes #7\n', Quoted('kept', 'Small'), '\n',
+                         *(part for i in range(5) for part in (Quoted('e' * 70000, f'Big {i}'), '\n'))])
+    fitted = fit_pr_body(body, _note)
+    assert '\nkept\n' in fitted and all(f'_Big {i}: removed' in fitted for i in range(5))
+    assert len(fitted) <= LIMIT
+
+
+def test_blocks_are_whole_or_a_note_never_part_of_one():
+    table = [CheckResult(f'check {i}', 0, False, '') for i in range(4000)]
+    fitted = fit_pr_body(_rendered(checks=table), _note)
+    assert '| <code>check 0</code>' not in fitted and 'Done when table: removed' in fitted
+    evidence = 'first\n' + 'e' * 70000 + '\nlast'
+    fitted = fit_pr_body(_rendered(searched=evidence), _note)
+    assert 'first' not in fitted and 'Searched: removed' in fitted
+
+
+@pytest.mark.parametrize('name', QUOTES)
+@pytest.mark.parametrize('slot', ['searched', 'rebuttals', 'try_text'])
+def test_quoted_text_cannot_become_required(name, slot):
+    quote = (CARD + QUOTES[name]) if slot == 'try_text' else QUOTES[name]
+    fitted = fit_pr_body(_rendered(**{slot: quote}), _note)
+    _assert_required(fitted)
+    assert 'keep risk' in fitted and 'keep decision' in fitted
+
+
+@pytest.mark.parametrize('kind', ['fits', 'one-over'])
+def test_the_limit_is_exact_and_a_fitting_body_is_returned_verbatim(kind):
+    size = LIMIT if kind == 'fits' else LIMIT + 1
+    body = 'Closes #7\n' + '증' * (size - len('Closes #7\n'))
+    fitted = fit_pr_body(body, _note)
+    assert (fitted == body) == (kind == 'fits')
+    assert len(fitted) <= LIMIT and fitted.startswith('Closes #7\n')
+
+
+def test_required_content_over_the_limit_refuses_instead_of_cutting():
+    with pytest.raises(PrBodyTooLarge):
+        fit_pr_body(_too_much_required(), _note)
+
+
+def test_notes_that_do_not_fit_refuse_instead_of_passing_the_limit():
+    required = 'Closes #7\n## Needs a human check\n' + '- [ ] b\n' * 8100
+    assert len(required) <= LIMIT
+    body = join_pr_body([required, Quoted('e' * 1000, 'Searched')])
+    assert len(body) > LIMIT
+    room = LIMIT - len(required)
+    with pytest.raises(PrBodyTooLarge):
+        fit_pr_body(body, lambda label: 'n' * (room + 1))
+    assert len(fit_pr_body(body, lambda label: 'n')) <= LIMIT
+
+
+def test_a_summary_too_long_to_be_short_is_prose_and_cannot_stop_the_pr():
+    long_card = '## What changed\n' + 's' * 70000 + '\n'
+    fitted = fit_pr_body(_rendered(try_text=long_card), _note)
+    assert len(fitted) <= LIMIT and 's' * 70000 not in fitted
+
+
+def test_oversized_writes_keep_the_full_text_in_comments_and_a_file(tmp_path):
+    writer, remote = _writer(tmp_path)
+    body = _rendered(searched='증거\n' * 60000)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
+    sent = remote.created_prs[0].body
+    _assert_required(sent)
+    comments = remote.list_comments(pr)
+    assert len(comments) > 1 and all(len(comment.body) <= LIMIT for comment in comments)
+    assert ''.join(comment.body.split('\n\n', 1)[1] for comment in comments) == str(body)
+    header = comments[0].body.split(' (1/')[0]
+    assert f'"{header}"' in sent
+    retained = next(tmp_path.glob('pr-bodies/*.md'))
+    assert retained.read_text(encoding='utf-8') == str(body)
+    assert retained.relative_to(tmp_path).as_posix() in sent
+
+
+@pytest.mark.parametrize('operation', ['create', 'update'])
+def test_writes_refuse_before_sending_anything(tmp_path, operation):
+    writer, remote = _writer(tmp_path)
+    body = _too_much_required()
+    pr = None
+    if operation == 'update':
+        pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body='Closes #7')
+    with pytest.raises(PrBodyTooLarge):
+        if operation == 'update':
+            writer.update_pr(pr, base='main', title='Feature', body=body)
+        else:
+            writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
+    assert not list(tmp_path.glob('pr-bodies/*.md'))
+    if operation == 'update':
+        assert remote.created_prs[0].body == 'Closes #7' and not remote.list_comments(pr)
+    else:
+        assert not remote.created_prs
+
+
+def test_the_same_oversized_body_posts_its_comments_once_and_fits_a_later_send(tmp_path):
+    writer, remote = _writer(tmp_path)
+    body = _rendered(searched='e\n' * 40000)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
+    count = len(remote.list_comments(pr))
+    assert count
+    writer.update_pr(pr, base='main', title='Feature', body=body)
+    assert len(remote.list_comments(pr)) == count
+    writer.update_pr(pr, base='main', title='Feature', body=_rendered(searched='f\n' * 40000))
+    assert len(remote.list_comments(pr)) > count
+
+
+@pytest.mark.parametrize('message,raises', [('comment rejected', False), ('API rate limit exceeded', True)])
+def test_a_failed_full_text_comment_keeps_the_pr_and_the_file(tmp_path, monkeypatch, message, raises):
+    writer, remote = _writer(tmp_path)
+
+    def refuse(*_args, **_kwargs):
+        raise TrackerError(message)
+
+    monkeypatch.setattr(remote, 'comment', refuse)
+    body = _rendered(searched='e\n' * 40000)
+    if raises:
+        with pytest.raises(TrackerError):
+            writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
+    else:
+        writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
+    assert len(remote.created_prs) == 1
+    assert next(tmp_path.glob('pr-bodies/*.md')).read_text(encoding='utf-8') == str(body)
+
+
+def test_comment_parts_fit_and_rebuild():
+    body = '증' * 200000
+    parts = comment_parts(body, 'Full PR body abc')
+    assert all(len(part) <= 65536 for part in parts) and parts[0].startswith('Full PR body abc (1/')
+    assert ''.join(part.split('\n\n', 1)[1] for part in parts) == body
+
+
+def _refresh(root, body, notes='new risk', decisions='new decision', pr=1):
+    return refreshed_native_body(root, pr, body, 'tests/acceptance/', 'en', notes, decisions)
+
+
+@pytest.mark.parametrize('recorded', [True, False])
+@pytest.mark.parametrize('flood', [
+    {'notes': 'risk\n' * 20000}, {'decisions': 'DECIDE: keep\n' * 6000},
+], ids=['risk', 'decisions'])
+def test_refresh_with_oversized_notes_keeps_the_required_parts(tmp_path, recorded, flood):
+    """The held case: a normal PR refreshed with notes that alone pass the limit."""
+    body = _rendered()
+    if recorded:
+        record_quoted(tmp_path, 1, body)
+    fitted = fit_pr_body(_refresh(tmp_path, str(body), **flood), _note)
+    _assert_required(fitted)
+    assert 'removed. full text' in fitted
+
+
+@pytest.mark.parametrize('name', ['approval', 'summaries', 'sections', 'tables', 'references', 'verdicts'])
+@pytest.mark.parametrize('sent', ['fits', 'was-shortened'])
+def test_refresh_reads_the_recorded_quotes_of_what_was_sent(tmp_path, name, sent):
+    quote = (QUOTES[name] * 2)[:80000]
+    if sent == 'fits':
+        quote = quote[:LIMIT - len(_rendered(searched='x')) + 1]
+    writer, remote = _writer(tmp_path)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=_rendered(searched=quote))
+    plain = str(remote.created_prs[0].body)
+    assert (len(plain) == LIMIT) == (sent == 'fits')
+    writer.update_pr(pr, base='main', title='Feature', body=_refresh(tmp_path, plain, pr=pr))
+    fitted = remote.created_prs[0].body
+    _assert_required(fitted)
+    lines = fitted.splitlines()
+    assert 'new risk' in lines and 'new decision' in lines and 'keep risk' not in lines
+
+
+def test_refresh_of_an_unrecorded_marker_flood_keeps_every_marker_and_the_required_parts(tmp_path):
+    head = 'Closes #7\n\n## What changed\nThe short summary.\n\n## Review\n\nVERDICT: PASS\n\n'
+    tail = '## Needs a human check\n\n- [ ] Human approval\n\nOpened by Foragent gate (attempt 1)\n'
+    flood = ''.join(f'<!-- foragent:q{i} -->\nx\n<!-- /foragent:q{i} -->\n' for i in range(1200))
+    body = head + flood + tail
+    assert len(body) <= LIMIT
+    fitted = fit_pr_body(_refresh(tmp_path, body, notes='new risk\n' + 'z' * 20000), _note)
+    _assert_required(fitted)
+    assert re.findall(r'<!-- foragent:(q\d+) -->', fitted) == [f'q{i}' for i in range(1200)]
+    assert re.findall(r'<!-- /foragent:(q\d+) -->', fitted) == [f'q{i}' for i in range(1200)]
+
+
+def test_a_later_refresh_finds_a_pair_whose_text_became_a_note(tmp_path):
+    first = fit_pr_body(_rendered(risk_notes='r' * 70000), _note)
+    assert 'risk-notes: removed' in first
+    refreshed = _refresh(tmp_path, str(first))
+    assert 'new risk' in refreshed.splitlines() and 'risk-notes: removed' not in refreshed
+    assert fit_pr_body(refreshed, _note) == refreshed
+
+
+def test_nested_pairs_keep_both_markers_when_their_text_is_removed():
+    inner = '<!-- foragent:lane-decisions -->\n' + 'DECIDE: keep\n' * 6000 + '<!-- /foragent:lane-decisions -->\n'
+    body = f'Closes #7\n<!-- foragent:risk-notes -->\nrisk\n{inner}<!-- /foragent:risk-notes -->\n'
+    lines = fit_pr_body(body, _note).splitlines()
+    for name in ('risk-notes', 'lane-decisions'):
+        assert lines.count(f'<!-- foragent:{name} -->') == lines.count(f'<!-- /foragent:{name} -->') == 1
+    assert lines[0] == 'Closes #7'
+
+
+def test_refresh_edits_the_real_block_not_a_quoted_copy(tmp_path):
+    quote = '<!-- foragent:risk-notes -->\nquoted\n<!-- /foragent:risk-notes -->'
+    body = join_pr_body(['Closes #7\n', Quoted(quote, 'Searched'),
+                         '\n<!-- foragent:risk-notes -->\nreal\n<!-- /foragent:risk-notes -->'])
+    record_quoted(tmp_path, 1, body)
+    refreshed = _refresh(tmp_path, str(body))
+    assert quote in refreshed and '\nreal\n' not in refreshed and 'new risk' in refreshed
+    start, end, label = refreshed.quoted[0]
+    assert refreshed[start:end] == quote and label == 'Searched'
+
+
+def test_quotes_are_found_again_after_an_edit_elsewhere_on_github(tmp_path):
+    body = join_pr_body(['Closes #7\n', Quoted('quoted', 'Searched'), '\nreal\n', Quoted('second', 'Rebuttals')])
+    record_quoted(tmp_path, 7, body)
+    assert load_quoted(tmp_path, 7, str(body)).quoted == body.quoted
+    edited = load_quoted(tmp_path, 7, 'Edited above\n' + str(body) + ' ')
+    assert [(edited[start:end], label) for start, end, label in edited.quoted] == [
+        ('quoted', 'Searched'), ('second', 'Rebuttals')]
+    without = load_quoted(tmp_path, 7, str(body).replace('quoted', 'changed'))
+    assert [label for _, _, label in without.quoted] == ['Rebuttals']
+    assert load_quoted(tmp_path, 8, str(body)).quoted == ()
+    assert isinstance(load_quoted(tmp_path, 8, 'unknown'), PrBody)
+
+
+def test_a_plain_resend_keeps_the_record_of_a_rendered_body(tmp_path):
+    writer, remote = _writer(tmp_path)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=_rendered(searched='small'))
+    plain = str(remote.created_prs[0].body)
+    writer.update_pr(pr, base='main', title='Retitled', body=plain)
+    assert [label for _, _, label in load_quoted(tmp_path, pr, plain).quoted if label == 'Searched'] == ['Searched']
+
+
+def test_kept_quotes_are_still_located_after_fitting():
+    body = _rendered(searched='small evidence', risk_notes='r' * 70000)
+    fitted = fit_pr_body(body, _note)
+    spans = {label: fitted[start:end] for start, end, label in fitted.quoted}
+    assert spans['Searched'] == 'small evidence'
 
 
 @pytest.mark.parametrize('line', [
-    '| finding | detail that goes on |\n', '- [ ] check this item\n', '## A heading line\n',
-    'Round 1: VERDICT: PASS\n', 'Opened by Foragent gate (attempt 1)\n',
-    'Sub-issues of #99 and so on\n', 'Closes #7\n', '<!-- foragent:write id=abc -->\n',
+    'Closes #7', 'VERDICT: PASS', 'Round 2: VERDICT: FAIL', 'Pending review.', 'Disabled (reviewer: none).',
+    'Opened by Foragent gate (attempt 3)', 'Sub-issues of #99', '#99의 하위 이슈', '## Review', '## Children',
+    '<!-- foragent:v1 -->',
 ])
-@pytest.mark.parametrize('closing_last', [False, True])
-def test_required_looking_lines_alone_over_the_limit_keep_locked_parts(line, closing_last):
-    # The closing reference and the pairs sit after the flood, where a tail cut would hit them.
-    flood = line * (70000 // len(line) + 1)
-    assert len(flood) > 65536
-    body = (flood + PAIRS + 'Closes #7\n' if closing_last else 'Closes #7\n' + flood + PAIRS)
-    fitted = _fit_keeps_locked_parts(body)
-    assert 'keep risk' in fitted and 'keep decision' in fitted
+def test_a_required_line_inside_long_text_stays_when_that_text_goes(line):
+    fitted = fit_pr_body('e' * 70000 + f'\n{line}\n' + 'f' * 70000 + '\n', _note)
+    assert line in fitted.splitlines()
+    assert 'e' * 70000 not in fitted and 'f' * 70000 not in fitted
 
 
-def test_long_table_shortens_by_whole_rows_and_spares_small_prose():
-    table = '| Finding | Where |\n| --- | --- |\n' + ''.join(f'| finding {i} | file {i} |\n' for i in range(5000))
-    body = 'Closes #7\n\n## Review\n\n' + table + '\nA short reviewer note.\n' + PAIRS
-    fitted = _fit_keeps_locked_parts(body)
-    assert '| Finding | Where |\n| --- | --- |\n| finding 0 | file 0 |\n' in fitted
-    assert 'A short reviewer note.' in fitted
-    assert '| finding 4999 | file 4999 |' not in fitted
-    for line in fitted.splitlines():
-        if line.startswith('| finding'):
-            assert re.fullmatch(r'\| finding \d+ \| file \d+ \|', line)
+@pytest.mark.parametrize('section,kept', [
+    ('## What changed\n\nThe short summary.\n\n', 'The short summary.'),
+    ('## Summary\nThe short summary.\n\n', 'The short summary.'),
+    ('## Review scope\n\nRule one.\nRule two.\n\n', 'Rule two.'),
+    ('## Needs a human check\n\n- [ ] Human approval\n- [x] Done approval\n\n', '- [x] Done approval'),
+])
+def test_a_required_paragraph_inside_long_text_stays_when_that_text_goes(section, kept):
+    fitted = fit_pr_body('e' * 70000 + '\n' + section + 'f' * 70000 + '\n', _note)
+    assert kept in fitted.splitlines() and 'f' * 70000 not in fitted
 
 
-def test_expandable_text_goes_before_required_lines_and_marker_text():
-    body = ('Closes #7\n\n| Done when command | Result |\n| --- | --- |\n'
-            + ''.join(f'| <code>check {i}</code> | pass |\n' for i in range(20))
-            + 'VERDICT: PASS\n' + '- [ ] Human approval\n' + PAIRS + 'evidence\n' * 20000)
-    fitted = _fit_keeps_locked_parts(body)
-    for kept in ('| <code>check 19</code> | pass |', 'VERDICT: PASS', '- [ ] Human approval',
-                 'keep risk', 'keep decision'):
-        assert kept in fitted
+def test_text_inside_a_pair_is_optional_whatever_it_says():
+    body = ('Closes #7\n<!-- foragent:risk-notes -->\nVERDICT: FAIL\n- [ ] inner\n' + 'r' * 70000
+            + '\n<!-- /foragent:risk-notes -->\n')
+    fitted = fit_pr_body(body, _note)
+    assert 'VERDICT: FAIL' not in fitted and '<!-- /foragent:risk-notes -->' in fitted
 
 
-def test_oversized_marker_text_shortens_inside_its_complete_pair():
-    body = ('Closes #7\n<!-- foragent:risk-notes -->\n' + 'risk\n' * 20000
-            + '<!-- /foragent:risk-notes -->\n<!-- foragent:lane-decisions -->\nkeep decision\n'
-            '<!-- /foragent:lane-decisions -->\n')
-    fitted = _fit_keeps_locked_parts(body)
-    assert 'keep decision' in fitted and 'risk\nrisk\n' in fitted
+def test_a_quoted_reference_is_not_the_closing_reference():
+    body = join_pr_body([Quoted('Closes #99\n' + 'e' * 70000 + '\n', 'Searched'), 'Closes #7\n'])
+    fitted = fit_pr_body(body, _note)
+    assert 'Closes #7' in fitted.splitlines() and 'Closes #99' not in fitted
 
 
-def test_markers_past_the_limit_never_leave_half_a_pair_or_lose_the_first_closing():
-    from foragent.pr_body_limit import fit_pr_body
-
-    body = 'Closes #7\n' + ''.join(
-        f'<!-- foragent:p{i} -->\nx\n<!-- /foragent:p{i} -->\n' for i in range(3000))
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    assert len(fitted) <= 65536
-    assert fitted.startswith('Closes #7\n')
-    assert fitted.endswith('_full text: pr-bodies/original.md_\n')
-    assert re.findall(r'<!-- foragent:(p\d+) -->', fitted) == re.findall(r'<!-- /foragent:(p\d+) -->', fitted)
+def test_the_summary_stops_at_quoted_text():
+    body = _rendered(try_text=CARD + 'x' * 3000, searched='e' * 70000)
+    fitted = fit_pr_body(body, _note)
+    assert {label: fitted[start:end] for start, end, label in fitted.quoted}.get('Try card', '').endswith('x' * 3000)
 
 
-def test_quoted_opener_does_not_swallow_the_real_pair():
-    body = ('Closes #7\nQuoted <!-- foragent:risk-notes --> in prose\n' + 'evidence\n' * 10000
-            + '<!-- foragent:risk-notes -->\nkeep risk\n<!-- /foragent:risk-notes -->\n')
-    from foragent.pr_body_limit import fit_pr_body
-
-    assert 'keep risk' in fit_pr_body(body)
-
-
-SUMMARY_CARD = '## What changed\nThe short summary.\n## Try it\nkind: cli\n'
-FLOOD = {
-    'risk': {'risk_notes': 'risk\n' * 20000},
-    'decisions': {'lane_decisions': 'DECIDE: keep\n' * 6000},
-    'headings': {'searched': '## quoted heading\n' * 5000},
-    'checkboxes': {'searched': '- [ ] quoted box\n' * 5000},
-    'verdicts': {'searched': 'quoted VERDICT: FAIL\n' * 5000},
-    'gate-lines': {'searched': 'Opened by Foragent gate (quoted)\n' * 5000},
-    'references': {'searched': 'Closes #7\n' * 8000},
-    'lone-markers': {'searched': '<!-- foragent:write id=abc -->\n' * 3000},
-    'table-rows': {'searched': '| a | b |\n' * 9000},
-}
-
-
-def _rendered(scope, **flood):
-    from types import SimpleNamespace
-
-    from foragent.run_review import ReviewResult
-
-    parsed = SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Human approval')])
-    return _pr_body(
-        7, parsed, flood.pop('checks', [CheckResult('real check', 0, False, '')]), 1,
-        [ReviewResult('PASS', '')], SUMMARY_CARD, review_scope=scope,
-        **{'risk_notes': 'keep risk', 'lane_decisions': 'keep decision', **flood},
-    )
-
-
-def _assert_required_survive(fitted, *, checks=True):
-    assert len(fitted) <= 65536
-    lines = fitted.splitlines()
-    assert 'Closes #7' in lines
-    assert 'The short summary.' in lines
-    assert 'VERDICT: PASS' in fitted
-    assert re.search(r'^## Needs a human check\n\s*- \[ \] Human approval$', fitted, re.MULTILINE)
-    assert 'Opened by Foragent gate (attempt 1)' in lines
-    assert '_full text: pr-bodies/original.md_' in lines
-    if checks:
-        assert '| <code>real check</code> | pass |' in lines
-
-
-@pytest.mark.parametrize('name', FLOOD)
-def test_one_oversized_kind_leaves_every_other_required_part_whole(name):
-    from foragent.pr_body_limit import fit_pr_body
-
-    body = _rendered('pr-body', **FLOOD[name])
-    assert len(body) > 65536
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    _assert_required_survive(fitted)
-    if name != 'checkboxes':
-        from foragent.inspect_data import _human_checks
-
-        assert _human_checks(fitted) == '- [ ] Human approval'
-    for marker in ('risk-notes', 'lane-decisions'):
-        assert fitted.splitlines().count(f'<!-- foragent:{marker} -->') == 1
-        assert fitted.splitlines().count(f'<!-- /foragent:{marker} -->') == 1
-    if name != 'risk':
-        assert 'keep risk' in fitted
-    if name != 'decisions':
-        assert 'keep decision' in fitted
-
-
-def test_oversized_checks_table_and_checklist_leave_the_rest_whole():
-    from types import SimpleNamespace
-
-    from foragent.pr_body_limit import fit_pr_body
-
-    checks = [CheckResult(f'check {i}', 0, False, '') for i in range(4000)]
-    fitted = fit_pr_body(_rendered('pr-body', checks=checks), notice='_full text: pr-bodies/original.md_')
-    _assert_required_survive(fitted, checks=False)
-    assert '| <code>check 0</code> | pass |' in fitted
-
-    items = [SimpleNamespace(text=f'box {i}') for i in range(8000)]
-    body = _pr_body(7, SimpleNamespace(done_when_checklist=items), [CheckResult('real check', 0, False, '')],
-                    1, [], SUMMARY_CARD, review_scope='pr-body', risk_notes='keep risk')
-    assert len(body) > 65536
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    assert 'box 0' in fitted and 'The short summary.' in fitted and 'keep risk' in fitted
-    assert 'Opened by Foragent gate (attempt 1)' in fitted
-
-
-@pytest.mark.parametrize('inner_first', [True, False])
-def test_nested_and_crossing_pairs_keep_both_delimiters(inner_first):
-    from foragent.pr_body_limit import fit_pr_body
-
-    inner = ('<!-- foragent:lane-decisions -->\n' + 'DECIDE: keep\n' * 6000
-             + '<!-- /foragent:lane-decisions -->\n')
-    if inner_first:
-        body = f'Closes #7\n<!-- foragent:risk-notes -->\nrisk\n{inner}<!-- /foragent:risk-notes -->\n'
-    else:  # The pairs cross instead of nesting.
-        body = ('Closes #7\n<!-- foragent:risk-notes -->\n<!-- foragent:lane-decisions -->\n'
-                + 'DECIDE: keep\n' * 6000
-                + '<!-- /foragent:risk-notes -->\n<!-- /foragent:lane-decisions -->\n')
-    fitted = _fit_keeps_locked_parts(body)
-    assert 'DECIDE: keep\n' in fitted
-    assert fit_pr_body(fitted) == fitted
-
-
-@pytest.mark.parametrize('operation', ['create', 'update'])
-def test_tracker_writes_keep_required_parts_of_oversized_risk_notes(tmp_path, operation):
-    from types import SimpleNamespace
-
-    from foragent.config import Config
-    from foragent.state import StateStore
-    from foragent.tracker import FakeTracker, RecordingTracker
-
-    remote = FakeTracker()
-    writer = RecordingTracker(remote, SimpleNamespace(store=StateStore(tmp_path), config=Config()))
-    body = _rendered('pr-body', **FLOOD['risk'])
-    if operation == 'create':
-        writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
-    else:
-        pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body='Closes #7')
-        writer.update_pr(pr, base='main', title='Feature', body=body)
-    fitted = remote.created_prs[0].body
-    retained = next((tmp_path / 'pr-bodies').iterdir())
-    assert retained.read_text(encoding='utf-8') == body
-    assert retained.relative_to(tmp_path).as_posix() in fitted
-    fitted = fitted.replace(retained.relative_to(tmp_path).as_posix(), 'pr-bodies/original.md')
-    fitted = fitted.replace("_Shortened to fit GitHub's limit; full text: ", '_full text: ')
-    _assert_required_survive(fitted)
-
-
-QUOTES = {
-    'quoted-approval-section': '## Needs a human check\n\n' + '- [ ] quoted box\n' * 5000,
-    'quoted-summaries': '## What changed\nquoted summary\n\n' * 3000,
-    'distinct-sections': ''.join(f'## section {i}\n- [ ] quoted {i}\n' for i in range(4000)),
-    'table-headers': ''.join(f'## section {i}\n| a | b |\n| - | - |\n\n' for i in range(3000)),
-    'marker-pairs': ''.join(f'<!-- foragent:q{i} -->\nx\n<!-- /foragent:q{i} -->\n' for i in range(3000)),
-    'references': ''.join(f'Closes #{i}\n' for i in range(9000)),
-}
-
-
-def _sent_through_tracker(tmp_path, body, operation):
-    from types import SimpleNamespace
-
-    from foragent.config import Config
-    from foragent.state import StateStore
-    from foragent.tracker import FakeTracker, RecordingTracker
-
-    remote = FakeTracker()
-    writer = RecordingTracker(remote, SimpleNamespace(store=StateStore(tmp_path), config=Config()))
-    if operation == 'create':
-        writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
-        return writer, remote, 1
-    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body='Closes #7')
-    writer.update_pr(pr, base='main', title='Feature', body=body)
-    return writer, remote, pr
-
-
-def _as_notice(fitted, tmp_path):
-    retained = next(p for p in (tmp_path / 'pr-bodies').iterdir() if p.suffix == '.md')
-    path = retained.relative_to(tmp_path).as_posix()
-    assert path in fitted
-    return (fitted.replace(path, 'pr-bodies/original.md')
-            .replace("_Shortened to fit GitHub's limit; full text: ", '_full text: '))
-
-
-@pytest.mark.parametrize('operation', ['create', 'update'])
-@pytest.mark.parametrize('name', QUOTES)
-@pytest.mark.parametrize('slot', ['searched', 'rebuttals'])
-def test_quoted_structure_cannot_cost_the_real_parts(tmp_path, name, operation, slot):
-    body = _rendered('pr-body', **{slot: QUOTES[name]})
-    assert len(body) > 65536
-    _, remote, _ = _sent_through_tracker(tmp_path, body, operation)
-    fitted = _as_notice(remote.created_prs[0].body, tmp_path)
-    _assert_required_survive(fitted)
-    assert 'keep risk' in fitted and 'keep decision' in fitted
-    assert fitted.splitlines()[0] == 'Closes #7'
-
-
-@pytest.mark.parametrize('name', QUOTES)
-def test_quoted_findings_cannot_cost_the_real_parts(tmp_path, name):
-    from types import SimpleNamespace
-
-    from foragent.pr_body_limit import fit_pr_body
-    from foragent.run_review import ReviewResult
-
-    parsed = SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Human approval')])
-    body = _pr_body(7, parsed, [CheckResult('real check', 0, False, '')], 1,
-                    [ReviewResult('PASS', QUOTES[name])], SUMMARY_CARD + QUOTES[name])
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    _assert_required_survive(fitted)
-
-
-def _refresh(root, body, notes='new risk', decisions='new decision'):
-    from foragent.run_review import refreshed_native_body
-
-    return refreshed_native_body(root, body, 7, 'tests/acceptance/', 'en', notes, decisions)
-
-
-@pytest.mark.parametrize('sent', ['fits', 'was-shortened'])
-@pytest.mark.parametrize('name', QUOTES)
-def test_refresh_uses_the_recorded_quotes_of_the_sent_body(tmp_path, name, sent):
-    """The review-only path starts from GitHub's plain text of what the gate sent."""
-    from foragent.run_review import ReviewResult
-
-    def render(quote):
-        return _pr_body(7, SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Human approval')]),
-                        [CheckResult('real check', 0, False, '')], 1, [ReviewResult('PASS', '')], SUMMARY_CARD,
-                        review_scope='pr-body', risk_notes='old risk', lane_decisions='old decision',
-                        searched=quote)
-
-    quote = (QUOTES[name] * 2)[:80000]
-    if sent == 'fits':
-        quote = quote[:65536 - len(render('x')) + 1]
-    body = render(quote)
-    assert (len(body) == 65536) == (sent == 'fits')
-    writer, remote, pr = _sent_through_tracker(tmp_path, body, 'create')
+def test_a_shortened_body_still_knows_the_quotes_it_kept(tmp_path):
+    writer, remote = _writer(tmp_path)
+    quote = QUOTES['approval'][:8000]
+    body = _rendered(searched=quote, risk_notes='r' * 70000)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body=body)
     plain = str(remote.created_prs[0].body)
-    # The refresh must cost more than the blocks of a quote read as structure could give up alone.
-    writer.update_pr(pr, base='main', title='Feature', body=_refresh(tmp_path, plain, 'new risk\n' + 'z' * 20000))
+    assert quote in plain
+    assert load_quoted(tmp_path, pr, plain).quoted, 'A later refresh can only mask what the send recorded'
+    writer.update_pr(pr, base='main', title='Feature', body=_refresh(tmp_path, plain, 'new risk\n' + 'z' * 5000, pr=pr))
+    _assert_required(remote.created_prs[0].body)
+
+
+@pytest.mark.parametrize('summary', ['First sentence.\n\nSecond sentence.\n', 'First sentence.\n\nSecond sentence.'])
+def test_a_short_summary_keeps_all_its_paragraphs(tmp_path, summary):
+    card = f'## What changed\n{summary}\n## Try it\n' + 'e\n' * 35000
+    rendered = fit_pr_body(_rendered(try_text=card), _note)
+    assert 'First sentence.' in rendered and 'Second sentence.' in rendered
+    refreshed = fit_pr_body(_refresh(tmp_path, str(_rendered(try_text=card))), _note)
+    assert 'First sentence.' in refreshed and 'Second sentence.' in refreshed
+
+
+def test_summary_paragraphs_past_the_short_limit_are_prose():
+    card = '## What changed\nFirst sentence.\n\n' + 's' * 70000 + '\n'
+    fitted = fit_pr_body(_rendered(try_text=card), _note)
+    assert 'First sentence.' in fitted and 's' * 70000 not in fitted
+
+
+@pytest.mark.parametrize('recorded', [True, False])
+@pytest.mark.parametrize('pair', ['risk-notes', 'lane-decisions'])
+@pytest.mark.parametrize('flood', ['- [ ] checklist line\n' * 4000, 'VERDICT: FAIL\n' * 6000])
+def test_pair_text_under_the_final_approval_section_stays_optional(tmp_path, recorded, pair, flood):
+    head = 'Closes #7\n\n## Review scope\n\nRule.\n\n## Needs a human check\n\n- [ ] Human approval\n\n'
+    block = f'<!-- foragent:{pair} -->\n{flood}<!-- /foragent:{pair} -->\n'
+    body = join_pr_body([head, block, Quoted('quoted', 'Searched')]) if recorded else head + block
+    fitted = fit_pr_body(body, _note)
+    assert '- [ ] Human approval' in fitted.splitlines() and flood not in fitted and len(fitted) <= LIMIT
+
+
+def test_a_refresh_appended_under_the_approval_section_stays_optional(tmp_path):
+    body = 'Closes #7\n\n## Review scope\n\nRule.\n\n## Needs a human check\n\n- [ ] Human approval\n'
+    fitted = fit_pr_body(_refresh(tmp_path, body, '- [ ] checklist\n' * 6000), _note)
+    assert '- [ ] Human approval' in fitted.splitlines() and '- [ ] checklist' not in fitted
+
+
+def test_a_section_stops_at_a_marker():
+    body = 'Closes #7\n## Summary\nShort.\n<!-- foragent:risk-notes -->\n' + 'r' * 3000 + '\n<!-- /foragent:risk-notes -->\n'
+    fitted = fit_pr_body(body, _note, limit=2000)
+    assert 'Short.' in fitted.splitlines() and 'r' * 3000 not in fitted
+
+
+def test_a_block_shorter_than_its_note_stays_past_its_share():
+    body = join_pr_body(['Closes #7\n', Quoted('e' * 110, 'One'), '\n', Quoted('t', 'Two'), '\n', Quoted('u', 'Three'), '\n',
+                         Quoted('g' * 400, 'Big'), '\n'])
+    fitted = fit_pr_body(body, lambda label: 'n' * 120, limit=260)
+    assert 'e' * 110 in fitted and 'g' * 400 not in fitted and len(fitted) <= 260
+
+
+def test_every_recorded_verdict_stays_even_inside_long_text():
+    body = join_pr_body(['Closes #7\n', Quoted('quoted', 'Searched'), '\nRound 1: VERDICT: FAIL\n', 'e' * 70000,
+                         '\nRound 2: VERDICT: FAIL\n', 'f' * 70000, '\nRound 3: VERDICT: PASS\n'])
+    lines = fit_pr_body(body, _note).splitlines()
+    for line in ('Round 1: VERDICT: FAIL', 'Round 2: VERDICT: FAIL', 'Round 3: VERDICT: PASS'):
+        assert line in lines
+
+
+def test_all_review_notes_of_a_round_are_one_block():
+    review = ReviewResult('PASS', '', review_notes=('a' * 30000, 'b' * 30000), notes=('c' * 30000,))
+    fitted = fit_pr_body(_rendered(reviews=[review], review_scope='claude-local'), _note)
+    assert fitted.count('_Round 1 notes: removed') == 1
+
+
+@pytest.mark.parametrize('edit', [lambda body: body + ' ', lambda body: 'Edited by a person.\n' + body],
+                         ids=['trailing-space', 'line-above'])
+@pytest.mark.parametrize('name', QUOTES)
+def test_a_body_edited_on_github_keeps_its_quotes_optional(tmp_path, edit, name):
+    '''The held case: a fitting body full of quotes, one edit on GitHub, then a normal refresh.'''
+    writer, remote = _writer(tmp_path)
+    quote = (QUOTES[name] * 2)[:64000]
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature',
+                          body=_rendered(searched=quote[:LIMIT - len(_rendered(searched='x')) - 40]))
+    plain = edit(str(remote.created_prs[0].body))
+    writer.update_pr(pr, base='main', title='Feature', body=_refresh(tmp_path, plain, pr=pr))
     fitted = remote.created_prs[0].body
-    lines = fitted.splitlines()
-    assert len(fitted) <= 65536
-    assert lines[0] == 'Closes #7' and 'The short summary.' in lines
-    assert 'VERDICT: PASS' in fitted and 'Opened by Foragent gate (attempt 1)' in lines
-    assert '| <code>real check</code> | pass |' in lines
-    assert re.search(r'^## Needs a human check\n\s*- \[ \] Human approval$', fitted, re.MULTILINE)
-    assert 'new risk' in lines and 'z' * 20000 in lines and 'new decision' in lines
-    assert 'old risk' not in lines and 'old decision' not in lines
+    assert len(fitted) <= LIMIT and 'Closes #7' in fitted.splitlines()
+    assert APPROVAL.search(fitted) and 'The short summary.' in fitted.splitlines()
+    assert 'VERDICT: PASS' in fitted.splitlines() and 'new risk' in fitted.splitlines()
 
 
-def _exact_limit_pairs(closing_first):
-    pairs = []
-    size = len('Closes #7\n')
-    for i in range(10000):
-        pair = f'<!-- foragent:q{i} -->\nx\n<!-- /foragent:q{i} -->\n'
-        if size + len(pair) > 65536:
-            break
-        pairs.append(pair)
-        size += len(pair)
-    flood = ''.join(pairs)
-    return ('Closes #7\n' + flood) if closing_first else (flood + 'Closes #7\n')
+OLDER_HEAD = 'Closes #7\n\n## What changed\nThe short summary.\n\n## Review\n\n'
+OLDER_TAIL = 'Opened by Foragent gate (attempt 1)\n'
 
 
-@pytest.mark.parametrize('closing_first', [True, False])
-def test_refresh_of_an_unrecorded_body_keeps_what_it_writes(tmp_path, closing_first):
-    from foragent.pr_body_limit import fit_pr_body
-
-    body = _exact_limit_pairs(closing_first)
-    assert 65000 < len(body) <= 65536
-    notes = 'new risk\n' + 'z' * 20000
-    refreshed = _refresh(tmp_path, body, notes)
-    fitted = fit_pr_body(refreshed, notice='_full text: pr-bodies/original.md_')
-    assert len(fitted) <= 65536
-    lines = fitted.splitlines()
-    assert 'Closes #7' in lines and 'new risk' in lines and 'z' * 20000 in lines and 'new decision' in lines
-    for marker in ('risk-notes', 'lane-decisions'):
-        assert lines.count(f'<!-- foragent:{marker} -->') == lines.count(f'<!-- /foragent:{marker} -->') == 1
-    assert '## Review scope' in lines
-    # Everything the flood gives up, it gives up a whole pair at a time.
-    opened = re.findall(r'<!-- foragent:(q\d+) -->', fitted)
-    assert opened and opened == re.findall(r'<!-- /foragent:(q\d+) -->', fitted)
+def _older(*lines, text='e' * 70000):
+    return OLDER_HEAD + '\n'.join(lines) + '\n\n## Searched\n\n' + text + '\n\n' + OLDER_TAIL
 
 
-def test_only_a_reference_flood_outlasts_nothing_the_caller_wrote(tmp_path):
-    from foragent.pr_body_limit import fit_pr_body
-
-    flood = ''.join(f'Closes #{i}\n' for i in range(100, 7000))
-    refreshed = _refresh(tmp_path, flood[:60000].rsplit('\n', 1)[0] + '\nCloses #7\n', 'new risk\n' + 'z' * 20000)
-    fitted = fit_pr_body(refreshed, notice='_full text: pr-bodies/original.md_')
-    assert len(fitted) <= 65536
-    lines = fitted.splitlines()
-    assert 'Closes #7' in lines and 'new risk' in lines and 'new decision' in lines
-    assert 'z' * 20000 in lines
+def test_an_older_body_keeps_every_real_approval_line(tmp_path):
+    boxes = [f'- [ ] approval {i}' for i in range(400)]
+    body = _older('## Needs a human check\n', *boxes)
+    lines = fit_pr_body(_refresh(tmp_path, body), _note).splitlines()
+    assert all(box in lines for box in boxes) and '## Needs a human check' in lines
 
 
-@pytest.mark.parametrize('field', ['notes', 'review_notes'])
-def test_review_notes_are_quoted_text(field):
-    from foragent.pr_body_limit import fit_pr_body
-    from foragent.run_review import ReviewResult
-
-    parsed = SimpleNamespace(done_when_checklist=[SimpleNamespace(text='Human approval')])
-    review = ReviewResult('PASS', '', **{field: (QUOTES['distinct-sections'] * 2,)})
-    body = _pr_body(7, parsed, [CheckResult('real check', 0, False, '')], 1, [review], SUMMARY_CARD)
-    fitted = fit_pr_body(body, notice='_full text: pr-bodies/original.md_')
-    _assert_required_survive(fitted)
+def test_an_older_body_keeps_more_approval_sections_than_a_few(tmp_path):
+    sections = [line for i in range(6) for line in ('## Needs a human check', f'- [ ] section {i}')]
+    lines = fit_pr_body(_refresh(tmp_path, _older(*sections)), _note).splitlines()
+    assert all(f'- [ ] section {i}' in lines for i in range(6))
 
 
-def test_batch_pr_records_child_titles_as_quoted(run_case):  # noqa: F811
-    from runner_support import batch_setup
+def test_approval_lines_read_the_way_the_inbox_reads_them():
+    from foragent.inspect_data import _human_checks
 
-    from foragent.pr_body_limit import load_quoted
+    long = 'e' * 70000
+    body = '\n'.join(['Closes #7', long, '### Needs a human check', '* [ ] star box', long, '#### Under it', long,
+                      '  + [ ] nested box', long, '## Other', '- [ ] not an approval', long, ''])
+    fitted = fit_pr_body(body, _note)
+    assert len(fitted) <= LIMIT and long not in fitted
+    assert _human_checks(fitted).splitlines() == ['* [ ] star box', '+ [ ] nested box']
+
+
+def test_an_approval_heading_inside_a_pair_is_pair_text():
+    body = ('Closes #7\n<!-- foragent:risk-notes -->\n## Needs a human check\n- [ ] inner\n' + 'r' * 70000
+            + '\n<!-- /foragent:risk-notes -->\n')
+    fitted = fit_pr_body(body, _note)
+    assert 'Needs a human check' not in fitted and '- [ ] inner' not in fitted
+
+
+def test_an_update_records_the_quotes_it_sent(tmp_path):
+    writer, remote = _writer(tmp_path)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body='Closes #7')
+    writer.update_pr(pr, base='main', title='Feature', body=_rendered(searched='small'))
+    known = load_quoted(tmp_path, pr, str(remote.created_prs[0].body))
+    assert 'Searched' in [label for _, _, label in known.quoted]
+
+
+def test_an_older_body_keeps_every_verdict_of_a_real_review(tmp_path):
+    body = _older('Round 1: VERDICT: FAIL', '', 'f' * 70000, '', 'Round 2: VERDICT: FAIL', '', 'g' * 70000, '', 'Round 3: VERDICT: PASS')
+    lines = fit_pr_body(_refresh(tmp_path, body), _note).splitlines()
+    for line in ('Round 1: VERDICT: FAIL', 'Round 2: VERDICT: FAIL', 'Round 3: VERDICT: PASS'):
+        assert line in lines
+
+
+def test_an_older_body_keeps_a_summary_among_quoted_copies(tmp_path):
+    quoted = '## What changed\nquoted summary\n\n'
+    body = quoted + 'e' * 70000 + '\n## What changed\nThe real summary.\n\n' + 'f' * 70000 + '\n' + quoted
+    lines = fit_pr_body(_refresh(tmp_path, 'Closes #7\n' + body), _note).splitlines()
+    assert 'The real summary.' in lines
+
+
+@pytest.mark.parametrize('line', ['- [ ] box\n', 'Round 1: VERDICT: PASS\n', 'Opened by Foragent gate (attempt 1)\n'])
+def test_required_looking_text_past_the_limit_refuses_when_nothing_tells_it_apart(tmp_path, line):
+    '''Without a record a quote and a real line look the same, and required content is never cut.'''
+    body = 'Closes #7\n## Needs a human check\n' + line * (70000 // len(line) + 1)
+    with pytest.raises(PrBodyTooLarge):
+        fit_pr_body(body, _note)
+    writer, remote = _writer(tmp_path)
+    pr = writer.create_pr(head='foragent/issue-7', base='main', title='Feature', body='Closes #7')
+    with pytest.raises(PrBodyTooLarge):
+        writer.update_pr(pr, base='main', title='Feature', body=_refresh(tmp_path, body, pr=pr))
+    assert remote.created_prs[0].body == 'Closes #7'
+
+
+def test_required_too_large_holds_the_run_before_any_write(run_case, monkeypatch):  # noqa: F811
+    from foragent import run_publish
+    from foragent.reasons import Reason
     from foragent.runner import run_issue
+
+    c = run_case
+    monkeypatch.setattr(run_publish, '_pr_body', lambda *_a, **_k: _too_much_required(1))
+    assert run_issue(1, c.ctx) == 'held'
+    assert not c.tracker.created_prs
+    flagged = c.store.load_flag(1)
+    assert flagged.reason == Reason.RETRIES_EXCEEDED
+    assert any('Required PR body content' in comment.body for comment in c.tracker.list_comments(1))
+
+
+def test_harness_hold_reports_a_body_it_could_not_send(tmp_path, monkeypatch):
+    from foragent import harness_guard, run_publish
+
+    writer, remote = _writer(tmp_path)
+    remote.add_issue(1, title='Feature')
+    ctx = writer._context
+    ctx.tracker, ctx.repo = writer, 'o/r'
+    ctx.store.start_run(1, branch='foragent/issue-1', worktree=tmp_path, lane='main')
+    huge = _too_much_required(1)
+    monkeypatch.setattr(run_publish, 'commit_exclusions', lambda *_a: None)
+    monkeypatch.setattr(run_publish, '_push_branch', lambda *_a: None)
+    monkeypatch.setattr(run_publish, '_render_pr_body', lambda *_a: huge)
+    attempt = SimpleNamespace(n=1, ctx=ctx, branch='foragent/issue-1', target_branch='main', failure='held', pr_title=None)
+    assert harness_guard.publish_hold(attempt) == 'held'
+    assert not remote.created_prs
+    assert any('Required PR body content' in comment.body for comment in remote.list_comments(1))
+
+
+def test_batch_pr_keeps_its_parent_and_quotes_child_titles(run_case):  # noqa: F811
+    from foragent.runner import run_issue
+
+    from runner_support import batch_setup
 
     c = run_case
     batch_setup(c)
@@ -483,43 +631,8 @@ def test_batch_pr_records_child_titles_as_quoted(run_case):  # noqa: F811
     c.tracker.set_parent(200, 99)
     assert run_issue(1, c.ctx) == 'merged'
     batch = next(pr for pr in c.tracker.created_prs if pr.head == 'foragent/batch-99')
-    quoted = load_quoted(c.store.root, batch.body)
-    assert quoted.quoted
-    assert all(quoted[start:end].startswith('- #') for start, end in quoted.quoted)
-    assert any('## Needs a human check' in quoted[start:end] for start, end in quoted.quoted)
-
-
-def test_refresh_edits_the_real_block_not_a_quoted_copy(tmp_path):
-    from foragent.pr_body_limit import (
-        PrBody,
-        Quoted,
-        change_outside_quoted,
-        join_pr_body,
-        record_quoted,
-    )
-
-    quote = '<!-- foragent:risk-notes -->\nquoted\n<!-- /foragent:risk-notes -->'
-    body = join_pr_body(['Closes #7\n', Quoted(quote), '\n<!-- foragent:risk-notes -->\nreal\n<!-- /foragent:risk-notes -->'])
-    record_quoted(tmp_path, body)
-    refreshed = _refresh(tmp_path, str(body))
-    assert quote in refreshed and '\nreal\n' not in refreshed and 'new risk' in refreshed
-    assert isinstance(change_outside_quoted(PrBody('x'), str.upper), PrBody)
-    assert refreshed[slice(*refreshed.quoted[0])] == quote
-
-
-def test_a_recorded_body_edited_on_github_falls_back_to_its_text(tmp_path):
-    from foragent.pr_body_limit import Quoted, join_pr_body, load_quoted, record_quoted
-
-    body = join_pr_body(['Closes #7\n', Quoted('quoted')])
-    record_quoted(tmp_path, body)
-    assert load_quoted(tmp_path, str(body)).quoted == body.quoted
-    assert load_quoted(tmp_path, str(body) + ' edited').quoted == ()
-
-
-def test_batch_titles_quoting_structure_cannot_cost_the_parent_line():
-    from foragent.pr_body_limit import Quoted, fit_pr_body, join_pr_body
-
-    lines = ['Sub-issues of #99', '', '## Children', '',
-             *(Quoted(f'- #{i}: Closes #{i}\n<!-- foragent:q{i} -->') for i in range(6000))]
-    fitted = fit_pr_body(join_pr_body(lines, '\n'))
-    assert len(fitted) <= 65536 and fitted.startswith('Sub-issues of #99\n\n## Children\n')
+    quoted = load_quoted(c.store.root, batch.number, batch.body)
+    assert [label for _, _, label in quoted.quoted] == ['Children']
+    start, end, _ = quoted.quoted[0]
+    assert '## Needs a human check' in quoted[start:end]
+    assert batch.body.startswith('Sub-issues of #99\n\n## Children\n')

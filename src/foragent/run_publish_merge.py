@@ -152,13 +152,14 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     # No closing keyword: the parent's completion belongs to the gate's order
     # aggregation (board_parents), which comments first and closes the parent only
     # once no child is open. A merge here must not close it behind that.
-    lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
+    children_lines = []
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
-        lines.append(Quoted(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else "")))
+        children_lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
     issue = ctx.tracker.get_issue(parent)
     title = f"Batch: {issue.title} (#{parent})"
-    body = join_pr_body(lines, "\n")
+    body = join_pr_body([run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", "",
+                         Quoted("\n".join(children_lines), "Children")], "\n")
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
         if issue.state == "open":  # A completed order (#411) stays in Done.

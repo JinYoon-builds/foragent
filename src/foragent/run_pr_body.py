@@ -6,7 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from foragent import risks
-from foragent.pr_body_limit import PrBody, Quoted, join_pr_body
+from foragent.pr_body_limit import PrBody, Quoted, join_pr_body, short_section_end
 from foragent.run_prompts import lane_decisions_block, review_scope_rules
 
 if TYPE_CHECKING:
@@ -15,15 +15,16 @@ if TYPE_CHECKING:
     from foragent.run_review import ReviewResult
 
 
-_SHORT_SUMMARY = re.compile(r"^## What changed[ \t]*\n\s*(?:(?!#)[^\n]+(?:\n|$))+", re.MULTILINE)
+_SUMMARY_HEADING = re.compile(r"^## What changed[ \t]*\n", re.MULTILINE)
 
 
 def _try_parts(try_text: str) -> list[str]:
-    """The card is the implementer's text, apart from the short summary the PR must keep."""
-    match = _SHORT_SUMMARY.search(try_text)
+    """The card is the implementer's text, apart from the summary a shortened body keeps."""
+    match = _SUMMARY_HEADING.search(try_text)
     if match is None:
-        return [Quoted(try_text)]
-    return [Quoted(try_text[:match.start()]), match[0], Quoted(try_text[match.end():])]
+        return [Quoted(try_text, "Try card")]
+    end = short_section_end(try_text, match.end())
+    return [Quoted(try_text[:match.start()], "Try card"), try_text[match.start():end], Quoted(try_text[end:], "Try card")]
 
 
 def _pr_body(
@@ -37,13 +38,13 @@ def _pr_body(
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
     risk_notes: str = "", language: str = "en", lane_decisions: str = "",
 ) -> PrBody:
-    lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
+    table = ["| Done when command | Result |", "| --- | --- |"]
     for check in checks:
         command = check.command.replace("&", "&amp;").replace("<", "&lt;").replace("|", "&#124;")
         command = command.replace("`", "&#96;").replace("\n", "<br>")
         passed = check.exit_code == 0 and not check.timed_out
-        lines.append(f"| <code>{command}</code> | {'pass' if passed else 'fail'} |")
-    lines.extend(["", "## Review", ""])
+        table.append(f"| <code>{command}</code> | {'pass' if passed else 'fail'} |")
+    lines = [f"Closes #{n}", "", Quoted("\n".join(table), "Done when table"), "", "## Review", ""]
     if review_scope == "pr-body":
         lines.append(f"VERDICT: {reviews[-1].verdict}" if reviews else "Pending review.")
         lines.extend(["", "## Review scope", "", review_scope_rules(acceptance_dir, language),
@@ -58,15 +59,15 @@ def _pr_body(
     for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
         lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
         if review.findings:
-            lines.append(Quoted(review.findings))
-        lines.extend(Quoted(f"NOTE: {note}") for note in review.review_notes)
-        lines.extend(Quoted(note) for note in review.notes)
+            lines.append(Quoted(review.findings, f"Round {round_number} findings"))
+        if notes := [*(f"NOTE: {note}" for note in review.review_notes), *review.notes]:
+            lines.append(Quoted("\n".join(notes), f"Round {round_number} notes"))
         lines.append("")
     if rebuttals:
-        lines.extend(["", "## Rebuttals", "", Quoted(rebuttals)])
+        lines.extend(["", "## Rebuttals", "", Quoted(rebuttals, "Rebuttals")])
     if searched:
         # The lane's own list of what it searched for, where and what it found; read, never judged.
-        lines.extend(["", "## Searched", "", Quoted(searched)])
+        lines.extend(["", "## Searched", "", Quoted(searched, "Searched")])
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
@@ -85,3 +86,4 @@ def _pr_body(
         join_pr_body(lines, "\n"), "\n\n## Try it\n\n",
         *(["_not provided by the implementer_"] if try_text is None else _try_parts(try_text)),
     ])
+
