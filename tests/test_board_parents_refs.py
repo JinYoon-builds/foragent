@@ -662,3 +662,40 @@ def test_a_write_is_sent_again_when_the_card_needs_it_again(parent_case, monkeyp
     case.store.record_board_value(10, case.board_id, "Status", BACKLOG)
     gate_tick(case, refresh=True)
     assert card_column(case.tracker, case.board_id, 10) == IN_PROGRESS
+
+
+@pytest.mark.parametrize(("total", "hidden", "edited"), [
+    pytest.param(1, set(), [], id="listed-child"),
+    pytest.param(1, set(), [7], id="listed-child-and-reference"),
+    pytest.param(1, {5}, [], id="fallback-child-without-a-row"),
+    pytest.param(1, {5}, [7], id="fallback-child-without-a-row-and-reference"),
+    pytest.param(2, set(), [], id="fallback-total-mismatch"),
+    pytest.param(2, set(), [7], id="fallback-total-mismatch-and-reference"),
+])
+def test_parent_closes_once_with_slow_calls_and_a_missing_card(parent_case, monkeypatch, total, hidden, edited):  # noqa: F811
+    """Closing is what this issue promises: finishing the card of a closed parent is a separate issue."""
+    case = parent_case
+    add_work(case, 5, closed=True)
+    case.tracker.add_issue(7, "A pull request", is_pull_request=True)
+    add_record(case, 40, mapping={"a": 5}, edited=edited)
+    case.tracker.add_sub_issue(40, 5)
+    _delete_card(case, 40)
+    summary = (("total", total), ("completed", total), ("percent_completed", 100))
+    listing, recent = case.tracker.list_issues, case.tracker.issues_closed_since
+    monkeypatch.setattr(case.tracker, "list_issues", lambda *a, **k: [
+        replace(i, updated_at="2026-01-01T00:00:00+00:00", sub_issues_summary=summary) if i.number == 40 else i
+        for i in listing(*a, **k) if i.number not in hidden])
+    monkeypatch.setattr(case.tracker, "issues_closed_since", lambda *a, **k: [
+        i for i in recent(*a, **k) if i.number not in hidden])
+    latency = _slow(case, monkeypatch)
+    calls = []
+    for _ in range(8):
+        latency.calls.clear()
+        case.clock[0] += timedelta(minutes=5, seconds=1)
+        tick(tick_context(case, start_runs=False))
+        calls.append([call[0] for call in latency.calls if call[2] and call[3] == 4.0])
+        if case.tracker.issues[40].state == "closed":
+            break
+    assert case.tracker.issues[40].state == "closed", f"The action restarted: {calls}"
+    assert sum(number == 40 for number, _ in case.tracker.closures) == 1
+    assert len(case.tracker.comments[40]) == 1 and "#5" in case.tracker.comments[40][0].body
