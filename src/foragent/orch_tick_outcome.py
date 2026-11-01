@@ -138,7 +138,8 @@ def record_success(store: StateStore, *, duration_seconds: float = 0,
     alert = previous.get("alert_request")
     if alert:
         try:
-            orch_inbox.set_request_status(store, alert, "done", f"gate tick recovered at {record['at']}")
+            recovered = f"gate tick recovered at {record['at']}"
+            orch_inbox.set_request_status(store, alert, "done", recovered, answer=recovered)
         except orch_inbox.InboxError:
             pass  # The request was removed by hand; nothing is left to resolve.
     return record

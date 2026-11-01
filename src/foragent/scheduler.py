@@ -11,6 +11,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import time
 
 from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_scope, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
@@ -55,6 +56,7 @@ class TickContext:
     kill_runner: Callable[[int], None] = kill_process_group
     baseline_launcher: Callable = start_baseline_thread
     committed_config: bool = False  # fa gate tick: settings from origin/<base> after the fetch.
+    monotonic: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self, queue_writes=True)

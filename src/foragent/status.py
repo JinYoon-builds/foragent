@@ -12,7 +12,7 @@ from typing import Any
 from foragent.config import Config
 from foragent.labels import (APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, WAITING_PERSON, issue_lane,
                              lane_display, lane_order)
-from foragent.reasons import parse_reason
+from foragent.reasons import current_blocker
 from foragent.state import StateStore
 from foragent.tracker import Issue
 
@@ -38,27 +38,23 @@ def local_group(row: dict[str, Any]) -> str:
     return "approved-waiting" if APPROVED in labels else "unapproved"
 
 
-def _reason(row: dict[str, Any]) -> str | None:
-    comments = sorted(row.get("comments") or [],
-                      key=lambda comment: (datetime.fromisoformat(comment["created_at"]), comment["id"]))
-    return next((reason.value for comment in reversed(comments)
-                 if (reason := parse_reason(comment["body"])) is not None), None)
-
-
 def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     """Build the shared status JSON from local records only."""
     from foragent.scheduler_stop import unfinished_runs
+    from foragent.run_group_check import group_limit
 
     observation = store.issues_observation()
     rows = store.local_issues()
     states = {row["number"]: row["state"] for row in rows}
     open_rows = [row for row in rows if row["state"] == "open"]
+    pending = store.github_outbox()
     groups: dict[str, list[dict[str, Any]]] = {state: [] for state in GROUPS}
     for row in open_rows:
         item: dict[str, Any] = {"number": row["number"], "title": row["title"]}
         group = local_group(row)
         if group == NEEDS_HUMAN:
-            item["reason"] = _reason(row)
+            marker = current_blocker(row, pending)
+            item["reason"] = marker[1] if marker else None
         groups[group].append(item)
     issues = [Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
               for row in open_rows]
@@ -70,7 +66,9 @@ def collect(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
     if observation["as_of"] is None:
         # Nothing usable was observed; only local runs are known facts.
         summary = {key: None for key in SUMMARY_KEYS} | {"working": summary["working"] or None}
+    limit, mode = group_limit(store, config)
     return {
+        "merge_group": {"limit": limit, "mode": mode},
         "issues": groups,
         "lanes": lanes,
         "summary": summary,

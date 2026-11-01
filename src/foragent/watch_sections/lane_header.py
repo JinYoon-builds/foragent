@@ -37,8 +37,9 @@ def _working(status: dict[str, Any]) -> bool:
     """Whether a worker is running now: a lane row in the working state (status.issue_state:
     a live run, not held by a person or blocked) or listing running issues. Queued, blocked
     and waiting work, and live runs on held issues, are pending, not running."""
-    return any(row.get("state") == "working" or row.get("running")
-               for row in status.get("lanes", {}).values())
+    from foragent.watch_scene import lane_rows
+
+    return any(row.get("state") == "working" or row.get("running") for row in lane_rows(status))
 
 
 def _warnings(snapshot: Snapshot, language: str, now: Any) -> list[str]:
@@ -48,7 +49,7 @@ def _warnings(snapshot: Snapshot, language: str, now: Any) -> list[str]:
     words = []
     if status_unknown(snapshot.status):
         words.append(watch.text("status_unknown", language))
-    gate = snapshot.heartbeats.get("gate")
+    gate = (snapshot.heartbeats or {}).get("gate")
     if gate is not None:
         gate += max(0.0, (now - snapshot.captured_at).total_seconds())
         if gate > GATE_STALE_SECONDS:

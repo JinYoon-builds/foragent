@@ -107,9 +107,11 @@ class Scope:
     def _capture(self):
         if self._issues is not None:
             return
-        rows = _rows(getattr(self._ctx, "store", None))
-        self._issues = {row["number"]: _model(row["number"], row.get("observed") or row) for row in rows
-                        if row.get("observed") or row.get("title") or row.get("labels")}
+        store = getattr(self._ctx, "store", None)
+        # The latest observation (any read), never a pending intent's effect.
+        rows = store.observed_issues() if hasattr(store, "observed_issues") else _rows(store)
+        self._issues = {row["number"]: _model(row["number"], row) for row in rows
+                        if row.get("observed_at") or row.get("observed") or row.get("title") or row.get("labels")}
         self._prs = {row["pr_number"]: row["number"] for row in rows if row.get("pr_number")}
 
     def login(self) -> str | None:
@@ -219,6 +221,12 @@ def check(ctx, number: int, issue=None, *, read=True) -> str | None:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         return _unreadable(ctx, number, exc)
+
+
+def end_entry(ctx) -> None:
+    """An entry's read ends with its run or review; decisions stay, a later entry reads again."""
+    if getattr(ctx, "_scope", None) is not None:
+        ctx._scope.entry = False
 
 
 # Compatibility names for cleanup/publication callers: all use the same decision,

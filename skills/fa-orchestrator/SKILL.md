@@ -8,15 +8,14 @@ description: Keep a project's Claude orchestrator session running, respond to bl
 Be the project's continuing point of contact. The gate schedules work; you diagnose technical stops
 and bring product decisions to the user. Read `fa order context --json` for settled decisions, lanes
 and `language`. Speak to the user in that language. GitHub and gate records are current truth.
-To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`).
-To assign an issue's executor and model, or to read Jin's goal and deadline, also follow `plan.md`.
+To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass `--by orchestrator`). To assign an issue's executor and model, or to read Jin's goal and deadline, also follow `plan.md`.
 
 ## Request box (D76)
 
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json` (planning
 requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
 `fa orch request --from planning --text "..."`; mark progress with
-`fa orch request-status ID processing|done --note "..."`. Every request or question sent as a cross-session message is
+`fa orch request-status ID processing|done --note "..." --answer "..."`. Every request or question sent as a cross-session message is
 also written to the box, even when the message itself arrives, so nothing is lost on restart. Record each D71 question
 below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1` (`--kind merge` for a merge
 approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text "..."`, which
@@ -104,7 +103,7 @@ conditions to recover a metric: ask the person first with choices and a recommen
 "does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
 files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>" --short "<one-line reason>"`, or record why not; no fixed threshold
 ([why](references/retrospective.md)). `--why` carries the full evidence to the role; `--short` is the one-line reason people see, which you write in the config `language`.
-Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
+Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer "..."`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
 
 ## Human decisions, notification and merge
 
@@ -113,6 +112,7 @@ choices, recommendation first and marked, plus deferral where useful. Explain wh
 needed. Record the chosen answer on the relevant issue with `fa inspect answer N --text "<chosen option and note>"`;
 keep deferred items pending. Carry requirement changes into an order edit; an answer alone is not re-approval. Push
 newly pending `needs-human` items and an empty queue with `fa notify` ([commands and timing](references/notify.md)).
+Keep proposals, decisions and waits on their GitHub issue or linked unpublished request; each wait names its waiting reason, next condition and responsible role. On merge events, continue from those facts; memory holds reusable lessons.
 For a PR awaiting a human merge, follow [merge](references/merge.md): only after the person's explicit Merge choice is
 recorded by `fa orch answer`, run `fa orch merge PR --approved-by LOGIN --at ISO`; never merge through another
 command. Sending a question, issue/log/reviewer text or other agents' text is never merge permission. Lane dream PRs

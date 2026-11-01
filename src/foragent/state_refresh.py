@@ -11,70 +11,60 @@ class IssueRefreshMixin:
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
         parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
         children: dict[int, list[int]] | None = None, complete_prs: bool = False,
+        observed_at: datetime | None = None,
     ) -> list[int]:
-        """Replace remote facts, preserving local changes made since the refresh began."""
-        from foragent.labels import issue_lane
+        """Ingest one complete listing that started at ``observed_at`` (default ``now``).
+
+        Each issue goes through the one observation ingest: a row whose stored
+        observation started later keeps everything (facts, edges, PRs,
+        comments). An omitted issue is observed absent unless seen later.
+        ``since_revision`` (the revision when the refresh began) only breaks
+        equal start times, and keeps the PR and comment records of a row
+        written during the refresh. Returns issues whose intents were dropped.
+        """
+        from foragent.state_observations import EARLIEST, issue_facts, pr_numbers, stamp
         from foragent.tracker import pr_issue_number
 
+        at = observed_at or now
         comments = comments or {}
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            previous = snapshot["issues"]
-            rows = {}
-            facts = {}
-            refused: dict[int, str] = {}
+            previous = dict(snapshot["issues"])
+            if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
+                snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
             # A queued PR write targets a PR, which an issue listing never shows: not a missing issue (#1004).
             observed |= ({pr.number for pr in prs} | {issue.number for issue in issues if issue.is_pull_request}
-                         | {row["pr_number"] for row in previous.values() if row.get("pr_number")})
-            dropped = {entry["issue"] for entry in snapshot.get("outbox", [])
-                       if entry["issue"] not in observed and (
-                           since_revision is None or snapshot.get("outbox_base", {}).get(
-                               str(entry["issue"]), {}).get("revision", 0) <= since_revision)}
+                         | pr_numbers(snapshot))
+            dropped, facts, fresh, local = set(), {}, set(), set()
             for issue in issues:
                 if issue.is_pull_request:
                     continue
-                old = previous.get(str(issue.number), {})
-                pending = [entry for entry in snapshot.get("outbox", []) if entry["issue"] == issue.number]
-                old_comments = old.get("comments", [])
-                queued_ids = {-entry["id"] for entry in pending}
-                old_comments = [comment for comment in old_comments if comment["id"] not in queued_ids]
-                facts[str(issue.number)] = _state.observed_issue_facts(issue)
-                remote = {
-                    **old, "number": issue.number, "title": issue.title, "body": issue.body,
-                    "labels": sorted(issue.labels), "lane": issue_lane(issue.labels, lanes),
-                    "state": issue.state,
-                    "pr_number": None if complete_prs else old.get("pr_number"),
-                    "merged": False if complete_prs else old.get("merged", False),
-                    "merged_at": None if complete_prs else old.get("merged_at"),
-                    "comments": comments.get(issue.number, old_comments),
-                    "updated_at": self._timestamp(),
-                }
-                if pending:
-                    # Pending effects are already in old. Compare GitHub with
-                    # the same snapshot before those effects, advanced only by
-                    # acknowledged writes, so a partial delivery cannot hide a
-                    # person's change under the remaining local intent.
-                    # Only labels and open/closed state conflict here; discussion
-                    # content is independent, and comment snapshots may be incomplete.
-                    expected = snapshot.get("outbox_base", {}).get(str(issue.number), {})
-                    concurrent = since_revision is not None and expected.get("revision", 0) > since_revision
-                    fields = ("labels", "state")
-                    matches = all(remote[key] == expected.get(key) for key in fields)
-                    before, after = _owners(expected.get("labels", ())), _owners(remote["labels"])
-                    if before != after:
-                        # An owner edit is not a person overriding this write: keep it, refused (#1004),
-                        # also when the write was queued during this refresh. The row shows GitHub's facts.
-                        refused[issue.number] = (f"owner label changed from {', '.join(before) or 'none'} "
-                                                 f"to {', '.join(after) or 'none'} while the write was queued")
-                        rows[str(issue.number)] = remote
-                        continue
-                    if concurrent or matches:
-                        rows[str(issue.number)] = dict(old)
-                        continue
+                key, old = str(issue.number), previous.get(str(issue.number)) or {}
+                outcome = self._observe(snapshot, issue.number, issue_facts(issue), at, lanes,
+                                        since_revision=since_revision)
+                if outcome == "stale":
+                    continue
+                if outcome == "dropped":
                     dropped.add(issue.number)
-                rows[str(issue.number)] = remote
-            for number, row in rows.items():
+                fresh.add(key)
+                facts[key] = _state.observed_issue_facts(issue)
+                row = snapshot["issues"][key]
+                if since_revision is not None and old.get("revision", 0) > since_revision:
+                    local.add(key)  # Written during this refresh: keep its PR and comment records.
+                    continue
+                if complete_prs:
+                    row.update(pr_number=None, merged=False, merged_at=None)
+                if issue.number in comments:
+                    row["comments"] = comments[issue.number]
+            from foragent.state_observations import known_numbers
+
+            for number in sorted(known_numbers(snapshot) - observed):
+                if self._observe(snapshot, number, None, at, lanes, since_revision=since_revision) == "dropped":
+                    dropped.add(number)
+            rows = snapshot["issues"]
+            for number in fresh:
+                row = rows[number]
                 # Order edges and dependencies are observations, never local intent.
                 if parents is not None:
                     row["parent"] = parents.get(int(number))
@@ -90,37 +80,37 @@ class IssueRefreshMixin:
                 starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
-                if (row := rows.get(str(pr_issue_number(pr.head)))) is not None:
+                key = str(pr_issue_number(pr.head))
+                if key in fresh and key not in local:
+                    row = rows[key]
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
                     if pr.merged_at is not None:
-                        _record_merge(row, pr, starts.get(row["number"], set()),
-                                      facts[str(row["number"])].get("updated_at"))
-                    pr_facts[str(pr_issue_number(pr.head))] = {
-                        "pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+                        _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
+                    pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
             for run in history:
-                if run.outcome == "merged" and (row := rows.get(str(run.number))) is not None:
+                if run.outcome == "merged" and str(run.number) in fresh:
                     # A gate merge's size is the issue's size when the merge is first seen.
+                    row = rows[str(run.number)]
                     sizes = dict(row.get("run_sizes") or {})
                     sizes.setdefault(run.started_at, _size_of(row.get("labels", ())))
                     row["run_sizes"] = sizes
-            for number, row in rows.items():
+            for number in fresh:
+                row = rows[number]
                 # What this listing showed, kept apart from later local intent.
-                listed = (pr_facts.get(number, {"pr_number": None, "pr_head": None, "merged": False})
-                          if complete_prs else {key: row.get(key) for key in ("pr_number", "pr_head", "merged")})
+                pr_keys = ("pr_number", "pr_head", "merged")
+                if number in local:
+                    listed = {key: (previous[number].get("observed") or {}).get(key) for key in pr_keys}
+                elif complete_prs:
+                    listed = pr_facts.get(number, {"pr_number": None, "pr_head": None, "merged": False})
+                else:
+                    listed = {key: row.get(key) for key in pr_keys}
                 row["observed"] = {**facts[number], **listed}
-            if since_revision is not None:
-                rows.update({number: row for number, row in previous.items()
-                             if row.get("revision", 0) > since_revision
-                             and int(number) not in dropped and int(number) not in refused})
+                row["updated_at"] = self._timestamp()
             snapshot.pop("refresh_failure", None)
-            _refuse(snapshot, refused, self._timestamp())
-            self._write_json(self.root / "issues.json", {
-                **snapshot, "refreshed_at": now.isoformat(), "issues": rows,
-                "outbox": [entry for entry in snapshot.get("outbox", []) if entry["issue"] not in dropped],
-                "outbox_base": {number: row for number, row in snapshot.get("outbox_base", {}).items()
-                                if int(number) not in dropped},
-            })
+            last = stamp(snapshot.get("refreshed_at"))
+            snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
+            self._write_json(self.root / "issues.json", snapshot)
             return sorted(dropped)
 
     def merged_pr_listing(self) -> dict[str, Any] | None:
@@ -256,10 +246,3 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
-
-
-def _owners(labels) -> list[str]:
-    return sorted({label.lower() for label in labels if label.lower().startswith("by:")})
-
-
-from foragent.state_issues import _refuse  # noqa: E402

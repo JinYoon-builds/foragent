@@ -21,6 +21,21 @@ order는 질문하기 전에 스스로 찾을 수 있는 것을 먼저 찾는다
 - **기다리는 일:** 열린 이슈마다 본문의 `## Waiting` 구역(이유, 다음 조건, 맡은 역할)이 `fa order context`의 `open_issues[].waiting`에 그대로 나온다. 승인 전 이슈도 포함한다.
 - **사람의 새 요청:** order를 부를 때 한 말.
 
+`fa order context --json`의 `other_orders`는 다른 주문자의 열린 이슈 번호·제목·주문자·
+`Files`를 보여 줘요. 번호로 기존 이슈에 링크하고 `open_issues`의 현재 상태와 함께
+새 주문의 파일 범위가 겹치는 사실을 보여 줘요. 사람은 기다리기 / 파일 나누기 /
+그대로 진행 중에서 골라요. 경로와 glob은 적힌 그대로 보존해요. `Files`가 비었거나
+없으면 범위를 모르는 것이므로 겹침이 없다고 판단하지 않아요.
+
+이슈 질문은 유효 주문자(effective orderer)의 공장에 있는 기획 세션에서만 답해요.
+`decisions`에 나온 기존 @orderer GitHub 이슈 댓글과 결정 흐름을 그대로 사용해요.
+다른 사람의 질문은 `other_orders`에서 읽을 수 있는 사실로 남아요. 소유자 판정 거절은
+설정 언어로 `open_issues[].owner_error`에 나와요. 로그인 조회가 실패하면 `identity`에
+이유를 보여 주면서 레거시·기존 단일 공장의 질문은 `decisions`에 유지해요. 이때 주인
+라벨이 있는 이슈는 `other_orders`에서 계속 보여 주되 공장 계정은 추측하지 않아요.
+모순된 라벨이나 주인 미확정 표식이 있는 이슈를 레거시로 다루지는 않아요. 소유자 라벨이
+없고 `legacy_owner` 설정도 없는 기존 단일 공장에서는 기존 질문 흐름을 유지해요.
+
 ## 2. 인터뷰
 
 순정 방식을 쓴다: `AskUserQuestion` 도구로 객관식 질문, 추천안 표시. Ouroboros MCP에는 의존하지 않는다. 대신 Ouroboros에서 쓸모 있는 구조 셋만 가져온다.
@@ -143,3 +158,21 @@ no new interpretation of issue meaning or conflict-resolution policy is added.
 
 - Accepted limit (#448): scheduler admission can race the final late check (TOCTOU); a soft-lock breach costs one merge conflict, which the runner resolves.
 - Accepted limit (#448): multi-way glob intersections do not guarantee Unicode literal-alias equivalence such as Straße/STRASSE.
+
+Publication checks the current GitHub title and body against the fields this plan
+last read, for both existing children and explicit edits. If either changed,
+`fa order publish` stops before changing files, issues, labels or approvals. The
+diagnostic identifies each issue and shows the old and current values, including
+changed Done when commands. This applies with or without `--approve`; `--dry-run`
+remains a preview.
+
+Run `fa order preread PLAN.json` to explicitly re-read: the implementer sees the
+current GitHub title and full body before the observed base is refreshed. A statement
+issue has no reader turn, so the command itself prints those fields for the agent that
+ran it (`current` with `--json`) and refreshes the base. Resolve
+the requirements in the plan before publishing again; no automatic merge chooses
+which requirement wins. Each successful issue write immediately records the title
+and body it wrote as the next base, before labels, links or comments are updated.
+If a later publication step fails, retrying can continue from those writes. The local `.foragent/order-observed.json` stores these
+observations by plan id and issue number. Legacy targets without a recorded base
+publish as before. Labels, comments and native dependency edges are not compared.

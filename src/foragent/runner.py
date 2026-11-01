@@ -182,6 +182,8 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = f"origin/{branch}"
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
+    if not _restore_approved_base(n, ctx, git, approval, target_branch, branch=branch):
+        return "hash-mismatch"
     _inject_lane_skills(ctx, n, git, f"origin/{target_branch}")
     _progress(n, ctx)
 
@@ -190,6 +192,37 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         flag(ctx, n, Reason.NO_MACHINE_CHECK, "Done when has no machine check.")
         return "no-machine-check"
     return _implement_and_publish(n, ctx, git, target_branch=target_branch)
+
+
+def _restore_approved_base(
+    n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
+    *, branch: str,
+) -> bool:
+    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    locks = approval.acceptance_blobs
+    if git.blob_shas("HEAD", locks) == locks:
+        return True
+    base = f"origin/{ctx.config.base_branch}"
+    own_edits = git._call([
+        "rev-list", "HEAD", f"^origin/{target_branch}", f"^{base}", "--", *locks,
+    ]).strip()
+    if own_edits:
+        return _acceptance_matches(n, ctx, git, approval)
+    if git.is_ancestor("HEAD", base):
+        # No own commits: recreate at the approved base without a merge commit.
+        ctx.git.remove_worktree(git.root)
+        ctx.git.add_worktree(git.root, branch, base)
+    else:
+        try:
+            git.merge_base(base)
+        except GitError:
+            conflicts = git.conflict_paths()
+            if not conflicts:
+                raise
+            # Resume's resolver can finish this merge, including a stale batch's base update.
+            pending = ctx.store.get_run(n).merge_conflicts
+            ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    return True
 
 
 def _implement_and_publish(
@@ -309,6 +342,7 @@ def review_only(
     detail = ""
     previous = ctx.store.get_run(n)
     started = False
+    admission = ExitStack()
     try:
         until = ctx.store.github_wait_until(ctx.now())
         issue = (orch_scope.scope(ctx).issue(n) if getattr(getattr(ctx, "_scope", None), "entry", False) else None)
@@ -325,6 +359,11 @@ def review_only(
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
+        # The shared machine budget admits this review after its ownership check and before any
+        # label or run-record change; a start the tick reserved reuses its slot. Once the run
+        # records this pid, the run holds it.
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind="review", issue=n, now=ctx.now))
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
         if RUNNING in issue.labels:
@@ -332,6 +371,7 @@ def review_only(
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
                             lane=issue_lane(issue.labels, ctx.config.lanes))
         started = True
+        admission.close()
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
@@ -369,6 +409,8 @@ def review_only(
         detail = f"Review runner exited: {exc}"
         raise
     finally:
+        admission.close()
+        orch_scope.end_entry(ctx)
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
@@ -393,7 +435,25 @@ def review_only(
     return outcome
 
 
+def _admission_seconds(ctx: RunContext) -> int:
+    """A direct start waits for a slot as long as one run may take: the work ahead of it is valid."""
+    return int(ctx.config.max_runtime_minutes) * 60
+
+
 def run_issue(n: int, ctx: RunContext) -> str:
+    """Run issue N once the shared budget admits it, before it claims the run record's pid.
+
+    Admission reads the live slot holders, never the record's status: a record the tick
+    launched this process for (its pid is this one) or a fresh reservation is reused at once;
+    a finished record, or a running one whose pid has died, must fit the budget. Once the
+    run is started (or its running record claims this pid), that record holds the slot
+    and the temporary admission is released.
+    """
+    with ExitStack() as admission:
+        return _run_issue(n, ctx, admission)
+
+
+def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)
@@ -409,8 +469,23 @@ def run_issue(n: int, ctx: RunContext) -> str:
             return "refused"
         if issue is not None:
             ctx.store.record_issue(issue, ctx.config.lanes)
-        run = ctx.store.update_run(n, pid=os.getpid(),
-                                   process_identities=observe_tree(roots=(os.getpid(),)))
+        # Ownership first: a refused run takes no machine slot and leaves no state.
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
+        run = ctx.store.get_run(n)
+        if run is not None and run.status == "finished":
+            # update_run deliberately leaves finished records untouched. A direct retry needs
+            # a new lifecycle, including the running identity the merge queue admits.
+            run = ctx.store.start_run(
+                n, branch=run.branch, worktree=worktree, pid=os.getpid(), lane=run.lane,
+                tier=run.tier, implementer=run.implementer, executor=run.executor,
+                reviewer=run.reviewer, executor_model=run.executor_model,
+            )
+        else:
+            run = ctx.store.update_run(n, pid=os.getpid(),
+                                       process_identities=observe_tree(roots=(os.getpid(),)))
+        if run.status == "running":
+            admission.close()  # The record now names this live process: it holds the slot.
         if until:
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
@@ -458,6 +533,7 @@ def run_issue(n: int, ctx: RunContext) -> str:
         # restart decision (ready, or blocked with an open PR), so keep labels.
         raise
     finally:
+        orch_scope.end_entry(ctx)
         # A tick may already have finished the record while terminating this runner.
         try:
             run = ctx.store.get_run(n)

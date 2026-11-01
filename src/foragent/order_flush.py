@@ -7,7 +7,7 @@ Interrupted batches deliberately refuse here; their recovery is a separate issue
 from pathlib import PurePosixPath
 from uuid import uuid4
 
-from foragent import order, order_flush_journal as journal, order_notes, order_references
+from foragent import order, order_flush_journal as journal, order_notes, order_references, order_reviewed
 from foragent.i18n import text
 from foragent.order_files import check_destinations, check_write
 from foragent.ownership import LABEL_COLOR, label_description, owner_label
@@ -48,7 +48,7 @@ def _note_files(root, notes, language):
     return files
 
 
-def _preflight(rows, notes, root, config, tracker, repo):
+def _preflight(rows, notes, root, config, tracker, repo, git):
     prepared, files, roots = [], {}, {}
     for row in rows:
         try:
@@ -56,7 +56,7 @@ def _preflight(rows, notes, root, config, tracker, repo):
             publication = order._publication_checks(
                 plan, root, config, tracker, repo=repo, approve=row["approve"],
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-                retained_files=row.get("files"))
+                retained_files=row.get("files"), git=git, refreshed=True)
             _merge(files, publication.files, config.language)
         except (ValueError, OSError, TrackerError) as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
@@ -98,7 +98,8 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
     # Before lock creation or checkpoint reads: a wrong-branch invocation has no effects.
     if git.current_branch() != config.base_branch:
         raise order.PlanError(text("order_flush_branch", language, branch=config.base_branch))
-    with journal.locked(store):
+    # The gate spans the checks below and every write, as in order.publish.
+    with journal.locked(store), order_reviewed.publication_gate(repo):
         records = journal.entries(store)
         done = {row["batch"] for row in records if row["kind"] == "done"}
         if any(row["kind"] == "selected" and row["batch"] not in done for row in records):
@@ -116,7 +117,13 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         with git.publish_lock():
             git.update_base(config.base_branch)
             # Validate against the refreshed base before starting a durable batch.
-            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo)
+            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git)
+            own = set().union(*(publication.own for _row, publication in prepared))
+            affected = order._affected_owners(tracker.list_issues(), own, files, repo, config,
+                                              lambda: git, fetch=False)
+            if affected:
+                raise order.PlanError(text("order_locks_refused", language,
+                                           owners="\n".join(order._owner_lines(affected))))
             batch = uuid4().hex[:12]
             journal.append(store, "selected", batch, boundary=boundary,
                            orders=[row["entry_id"] for row in orders],

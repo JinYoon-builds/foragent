@@ -18,6 +18,12 @@ On 2026-10-27 the #370 loop was found only because a person asked about a merge 
 look at `fa orch facts` and `fa orch log` finds lost run time and repeated failures without waiting
 for someone to ask.
 
+Also read `fa decisions --json`. Rows in state `decided, nothing ordered` are decisions with no
+linked issue yet. They are context, not a queue: decide whether to propose an order, defer it or
+raise it with the person. Older issues link only through exact D-number citations in their
+published spec, so a missing link does not prove a decision was never implemented. `observed_at`
+says how old the issue facts behind a row are.
+
 ## The architect question
 
 The four signals are read from `fa orch facts` and the log; there is no threshold automation, and

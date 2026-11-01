@@ -12,7 +12,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, quota_reviewer, usage_events, usage_recheck
+from foragent import board, cuts, quota_reviewer, run_check_slot, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -50,7 +50,7 @@ def _write_claude_settings(n: int, ctx: RunContext, worktree: Path) -> Path:
             "Bash(git merge:*)",
         ]},
         "hooks": {"Stop": [{"hooks": [{"type": "command", "command": command,
-                                      "timeout": max(900, ctx.config.max_runtime_minutes * 60)}]}]},
+                                      "timeout": run_check_slot.hook_seconds(ctx.config)}]}]},
     }
     path = directory / "claude-settings.json"
     path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -129,25 +129,33 @@ def lane_default(ctx: RunContext, run) -> bool:
     return run.executor == (ctx.lane_executor or ctx.config.executor)
 
 
-def _limit_wait(n: int, ctx: RunContext, detail: str) -> None:
-    """Hand the issue back to the queue; ``usage_recheck`` already wrote the executor and lane pauses."""
+def _limit_wait(n: int, ctx: RunContext, detail: str, *, requeue: bool = True) -> None:
+    """Record the wait; panel members leave the shared issue transition to their caller."""
     ctx.store.update_run(n, detail=detail)
+    if requeue:
+        _requeue_limit(n, ctx)
+    raise ExecutorStopped("limit-wait")
+
+
+def _requeue_limit(n: int, ctx: RunContext) -> None:
+    """Hand the issue back after a usage limit wins the outcome decision."""
     ctx.tracker.add_labels(n, [READY])
     ctx.tracker.remove_labels(n, [RUNNING])
     board.sync_status(ctx, n, "Ready")
-    raise ExecutorStopped("limit-wait")
 
 
 def _available_executor(
     n: int, ctx: RunContext, executor: Executor, *, reviewer: bool = False,
     session_body: str | None = None, resume_prompt: str | None = None, flag_exhaustion: bool = True,
     on_result: Callable[[ExecResult], None] | None = None,
+    requeue: bool = True,
     **kwargs,
 ) -> ExecResult:
     """Run until the executor is available; ``flag_exhaustion=False`` leaves the block to the caller.
 
     ``on_result`` sees every result the executor returns, including the ones a usage limit,
     a transient retry or transient exhaustion discards, before this function decides on it.
+    ``requeue=False`` records quota facts and stops, leaving the issue transition to the panel.
     """
     from foragent import runner
     from foragent.run_checks import _append
@@ -177,7 +185,7 @@ def _available_executor(
         if reviewer and quota_reviewer.reviewer_limited(n, ctx, name, view):
             raise ReviewerLimited(name)  # Before _limit_wait: the review moves to the worker (#186).
         if (hold := _session_hold(ctx, name, current.lane if lane_default(ctx, current) else None, view)) is not None:
-            _limit_wait(n, ctx, hold)
+            _limit_wait(n, ctx, hold, requeue=requeue)
         log = kwargs["log_path"]
         offset = log.stat().st_size if log.exists() else 0
         if live is not None:
@@ -265,7 +273,8 @@ def _available_executor(
             # One write pauses the executor and lane and notes the levels; the gate may end it early.
             usage_recheck.note_limit(ctx.store, name, until, windows, now,
                                      lane=run.lane if lane_default(ctx, run) else None)
-            _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.")
+            _limit_wait(n, ctx, result.last_message or result.log_tail or "Executor usage limit reached.",
+                        requeue=requeue)
         if kind == "transient" and not reviewer:
             run = ctx.store.update_run(n, transient_errors=run.transient_errors + 1)
             if run.transient_errors >= 2 and ctx.config.executor_fallback_model and run.fallback_model is None:

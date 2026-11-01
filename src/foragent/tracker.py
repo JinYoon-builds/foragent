@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 import zlib
 from typing import Any, Literal, Protocol
@@ -156,6 +157,17 @@ class TrackerError(RuntimeError):
 
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+# Colour codes and any other terminal control a CI log printed; tabs and newlines stay.
+_TERMINAL_CONTROL = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
+
+
+def _unavailable(what: str, exc: TrackerError) -> str:
+    """The notice for CI evidence that could not be read; a rate limit keeps its own handling."""
+    if exc.is_rate_limit:
+        raise exc
+    return f"(CI evidence unavailable: {what}: {str(exc).strip()})"
 
 
 class IdentityError(TrackerError):
@@ -192,7 +204,7 @@ class WriteRefused(TrackerError):
 
 
 # What `_write` returns for a refused write: no result, nothing queued, no local effect.
-_REFUSED = {"id": 0, "refused": True}
+_REFUSED = {"id": 0, "refused": True, "labels": []}
 
 
 class RecordingTracker:
@@ -223,19 +235,57 @@ class RecordingTracker:
         def observe(*args, **kwargs):
             if name in {"add_sub_issue", "add_blocked_by", "remove_blocked_by"}:
                 self._require(args[0] if args else kwargs.get("parent", kwargs.get("n")))
+            started = self._started()
             result = value(*args, **kwargs)
-            if name == "list_issues" and getattr(self._context, "_scope", None) is None:
-                from foragent import orch_scope
-
-                self._context._scope = orch_scope.Scope(self._context, issues=result)
+            # Any delegated read that returns issues (one or a filtered list) is an observation.
             if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
+                self._ingest([result], started)
+            elif isinstance(result, list) and result and all(isinstance(item, Issue) for item in result):
+                self._ingest(result, started)
             return result
 
         return observe
 
+    def _started(self):
+        """When a read or write begins: observations and intents are ordered by it, not by completion."""
+        now = getattr(self._context, "now", None)
+        return now() if now is not None else datetime.now(UTC)
+
+    def _ingest(self, issues, started, *, complete=False):
+        """Send what one read that began at ``started`` showed through the store's one ingest."""
+        shown = {issue.number for issue in issues}
+        for number in self._context.store.ingest(issues, started, self._context.config.lanes, complete=complete):
+            self._outbox_dropped(number, "remote change" if number in shown else "issue not found")
+
+    def _absent(self, number, started):
+        if self._context.store.ingest_absence(number, started):
+            self._outbox_dropped(number, "issue not found")
+
+    def list_issues(self, state="all"):
+        started = self._started()
+        issues = self._tracker.list_issues(state)
+        # The bulk refresh ingests its own listing with its comments, edges and PRs.
+        if self.__dict__.get("_bulk_listing") != threading.get_ident():
+            if getattr(self._context, "_scope", None) is None:
+                from foragent import orch_scope
+
+                self._context._scope = orch_scope.Scope(self._context, issues=issues)
+            self._ingest(issues, started, complete=state == "all")
+        return issues
+
+    def get_issue(self, n):
+        started = self._started()
+        try:
+            issue = self._tracker.get_issue(n)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                self._absent(n, started)
+            raise
+        self._ingest([issue], started)
+        return issue
+
     def _pending_issues(self):
-        pending = {entry["issue"] for entry in self._context.store.github_outbox()}
+        pending = {entry["issue"] for entry in self._context.store.github_blocking_outbox()}
         if not pending:
             return {}
         return {issue.number: issue for issue in local_issue_models(self._context.store)
@@ -248,7 +298,9 @@ class RecordingTracker:
         return self.get_issue(n)
 
     def sub_issues(self, n):
+        started = self._started()
         children = self._tracker.sub_issues(n)
+        self._ingest(children, started)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
 
@@ -299,9 +351,13 @@ class RecordingTracker:
 
         store = self._context.store
         revision = store.issues_revision()
-        pending = {entry["issue"] for entry in store.github_outbox()}
+        pending = store.github_write_issues()
         previous = {row["number"]: row for row in store.local_issues()}
-        issues = self.list_issues()
+        self._bulk_listing = threading.get_ident()
+        try:
+            issues = self.list_issues()
+        finally:
+            self._bulk_listing = None
         # The listing is the change signal: an issue whose listed facts match the
         # last listing keeps its last per-issue reads. A changed issue also marks
         # the issues it blocks, because a dependent does not change when its blocker closes.
@@ -328,19 +384,21 @@ class RecordingTracker:
             try:
                 comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
             except TrackerError as exc:
-                if not exc.is_not_found or not self._issue_missing(issue.number):
+                if not exc.is_not_found or not self._missing(issue.number):
                     raise
                 missing.add(issue.number)
         issues = [issue for issue in issues if issue.number not in missing]
         # Order edges and dependencies let views group work without per-frame reads.
         open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
-        children = {}
+        children, child_reads = {}, []
         for issue in open_issues:
             known = (previous.get(issue.number) or {}).get("children")
-            children[issue.number] = (
-                [child.number for child in self._tracker.sub_issues(issue.number)]
-                if issue.number in changed or known is None else known
-            )
+            if issue.number in changed or known is None:
+                started = self._started()  # Each child read is its own observation, ingested after the listing.
+                read = self._tracker.sub_issues(issue.number)
+                child_reads.append((read, started))
+                known = [child.number for child in read]
+            children[issue.number] = known
         parents = {child: parent for parent, numbers in children.items() for child in numbers}
         blocked_by = {}
         for issue in open_issues:
@@ -352,18 +410,17 @@ class RecordingTracker:
                           **({"repository": dep.repository} if dep.repository else {})}
                          for dep in self._tracker.blocked_by(issue.number)]
             blocked_by[issue.number] = known
-        refused_before = len(store.refused_github_writes())
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
         if (snapshot := getattr(self._context, "_scope", None)) is not None:
             for pr in prs:
                 snapshot.link_pr(pr.number, pr.head)  # PRs observed with the listing share its write boundary.
+        for read, started in child_reads:
+            dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
             store.record_merged_pr_listing(listing)
-        for entry in store.refused_github_writes()[refused_before:]:
-            self._outbox_refused(entry["issue"], entry["refused"])
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
@@ -417,20 +474,21 @@ class RecordingTracker:
                     raise
                 log.warning("Could not read recently closed issues: %s", exc)
                 return  # Keep the watermark; the next tick reads this span again.
-            closed = {row["number"] for row in store.local_issues() if row.get("state") == "closed"}
-            for issue in issues:
-                if issue.state == "closed" and issue.number not in closed and not issue.is_pull_request:
-                    store.record_issue(issue, self._context.config.lanes)
+            # Every closed issue is an observation, so a changed close reason is seen too.
+            self._ingest([issue for issue in issues if issue.state == "closed"], observed_at)
         store.record_closed_issue_watermark(observed_at)
 
-    def _issue_missing(self, number):
-        """A missing write resource alone does not prove that its issue is gone."""
+    def _missing(self, number):
+        """Whether the issue itself is gone, not only a write resource; both answers are observations."""
+        started = self._started()
         try:
-            self._tracker.get_issue(number)
+            issue = self._tracker.get_issue(number)
         except TrackerError as exc:
             if exc.is_not_found:
+                self._absent(number, started)
                 return True
             raise
+        self._ingest([issue], started)
         return False
 
     def _refused(self, n):
@@ -442,23 +500,72 @@ class RecordingTracker:
     def board_write_refused(self, n):
         return self._refused(n) is not None
 
-    def _write(self, n, action, operation, **payload):
+    def _premise(self, n):
+        """The visible issue a write is based on, taken when the write starts."""
+        from foragent.state_observations import observed_facts
+
+        row = next((row for row in self._context.store.local_issues() if row["number"] == n), None)
+        return observed_facts(row) if row is not None else None
+
+    def _write(self, n, action, operation, started, *, queued=None, **payload):
+        """Every write is an intent first, counted from ``started`` against the issue as it was then.
+
+        It is sent now unless writes must wait (then ``queued`` replaces the
+        payload, e.g. the rest of a label removal). A sent intent is visible
+        to every later intent's premise while its send is in flight; the
+        result is appended as an attempt. A failure nobody retries is final.
+        Comments stay direct sends: they change no labels or state.
+        """
         if self._refused(n) is not None:
             return None, _REFUSED  # Neither sent nor queued, and no local effect.
         store = self._context.store
+        premise = self._premise(n)
         pending = store.github_outbox()
-        if (any(entry["issue"] == n for entry in pending)
-                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+        evidence = action == "comment" and payload.get("evidence", False)
+        if evidence:
+            preceding = [entry for entry in pending if entry.get("evidence")]
+        else:
+            preceding = store.github_blocking_outbox()
+        if (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
+                (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
+            return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
+        # A direct combined close exposes only its field effect to concurrent flushes.
+        # Its comment is send-only; the composite payload enters the retry queue only on failure.
+        field_payload = {**payload, "body": None} if action == "close_issue" else payload
+        entry = self._queue(n, action, started, premise, field_payload) if action != "comment" else None
         try:
-            return operation(), None
+            result = operation()
         except TrackerError as exc:
-            if not self.queue_writes or not exc.is_rate_limit:
+            retry = self.queue_writes and exc.is_rate_limit
+            if entry is not None and retry and field_payload != payload:
+                store.record_github_attempt(entry["id"], started, False, final=True)
+                entry = None  # Retry the unsent composite close, preserving its original premise.
+            if entry is None and retry:
+                entry = self._queue(n, action, started, premise, payload)
+            if entry is not None and action != "comment":
+                store.record_github_attempt(entry["id"], started, False, final=not retry,
+                                            labels=payload["labels"] if action == "remove_labels" else None)
+            if not retry:
                 raise
             from foragent.orch_github import pause
 
             pause(self._context, exc)
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+            return None, entry
+        if entry is not None and action != "comment":
+            store.record_github_attempt(entry["id"], started, True,
+                                        labels=payload["labels"] if action == "remove_labels" else None)
+        return result, None
+
+    def _queue(self, n, action, started, premise, payload):
+        """Append the intent; a read made after it started may already have dropped it."""
+        dropped = []
+        entry = self._context.store.queue_github_write(n, action, lanes=self._context.config.lanes,
+                                                       started_at=started, premise=premise, dropped=dropped,
+                                                       **payload)
+        if any(dropped):
+            missing = not any(row["number"] == n for row in self._context.store.local_issues())
+            self._outbox_dropped(n, "issue not found" if missing else "remote change")
+        return entry
 
     def flush_outbox(self):
         from foragent import orch_scope
@@ -469,15 +576,22 @@ class RecordingTracker:
             self._flush_outbox()
 
     def _flush_outbox(self):
-        """Deliver a FIFO against one refreshed ownership snapshot."""
+        """Deliver the pending intents in queue order against one refreshed ownership snapshot;
+        each attempt is appended to its intent."""
         from foragent.orch_github import pause
 
         store = self._context.store
         dropped = set()
-        for entry in store.github_outbox():
-            number, action = entry["issue"], entry["action"]
+
+        def current(identity):
+            """The intent as stored now: a read during an earlier send may have retired it."""
+            return next((entry for entry in store.github_outbox() if entry["id"] == identity), None)
+
+        for queued in store.github_outbox():
+            number, action = queued["issue"], queued["action"]
             if number in dropped:
                 continue
+            started = None
             try:
                 # Every target uses this replay's latest observed ownership snapshot.
                 if (refusal := self._replay_refusal(number)) is not None:
@@ -487,60 +601,84 @@ class RecordingTracker:
                     dropped.add(number)
                     continue
                 if action == "remove_labels":
-                    labels = entry["labels"]
-                    for index, label in enumerate(labels):
+                    while (entry := current(queued["id"])) is not None and entry["labels"]:
+                        label, started = entry["labels"][0], self._started()
                         self._tracker.remove_labels(number, [label])
-                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
-                elif action == "update_issue":
+                        store.record_github_attempt(entry["id"], started, True, labels=[label])
+                    continue
+                if (entry := current(queued["id"])) is None:
+                    continue
+                started = self._started()
+                if action == "update_issue":
                     self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
-                    store.deliver_github_write(entry)
+                    store.record_github_attempt(entry["id"], started, True)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
                     result = getattr(self._tracker, action)(number, payload)
-                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
+                    if action == "comment":
+                        store.acknowledge_github_comment(entry, result)
+                    else:
+                        store.record_github_attempt(entry["id"], started, True)
             except TrackerError as exc:
+                if started is not None and action != "comment":
+                    # Every field-send attempt is recorded, whatever its failure.
+                    store.record_github_attempt(queued["id"], started, False,
+                                                labels=[label] if action == "remove_labels" else None)
                 try:
-                    if exc.is_not_found and self._issue_missing(number):
-                        store.drop_missing_github_issue(number)
-                        self._outbox_dropped(number, "issue not found")
+                    if exc.is_not_found and self._missing(number):
                         dropped.add(number)
                         continue
                 except TrackerError as lookup_error:
                     exc = lookup_error
                 if not exc.is_rate_limit:
+                    if queued.get("evidence") and not exc.is_not_found:
+                        log.warning("Could not publish issue #%s evidence: %s", number, exc)
+                        continue
                     raise exc
                 pause(self._context, exc)
                 return
+
+    def _acknowledge(self, n, started, result):
+        """A write's response that echoes the issue is an observation started with the write."""
+        if isinstance(result, Issue):
+            self._ingest([result], started)
 
     def add_labels(self, n, labels):
         labels = list(labels)
         if not labels:
             return
-        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
-        if queued:
-            return
-        if isinstance(result, Issue):
-            self._context.store.record_issue(result, self._context.config.lanes)
-        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+        from foragent.labels import READY
+
+        started = self._started()
+        # A ready label belongs to the approval current when the write started, not when it lands.
+        approval = self._context.store.load_approval(n) if READY in labels else None
+        approved = {"ready_approval": approval.approved_at if approval is not None else None} if READY in labels else {}
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), started,
+                                     labels=labels, **approved)
+        if not queued:
+            self._acknowledge(n, started, result)
 
     def remove_labels(self, n, labels):
         labels = list(labels)
         for index, label in enumerate(labels):
+            started = self._started()
             result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
-                                         labels=labels[index:])
+                                         started, labels=[label], queued={"labels": labels[index:]})
             if queued:
+                if queued["labels"] == [label] and labels[index + 1:]:
+                    # This label's send was rate-limited: the rest wait behind it, in order.
+                    self._queue(n, "remove_labels", started, self._premise(n), {"labels": labels[index + 1:]})
                 break
-            if isinstance(result, Issue):
-                self._context.store.record_issue(result, self._context.config.lanes)
-            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+            self._acknowledge(n, started, result)
 
     def list_comments(self, n):
         comments = self._tracker.list_comments(n)
         self._context.store.record_comments(n, [asdict(comment) for comment in comments])
         return comments
 
-    def comment(self, n, body):
-        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
+    def comment(self, n, body, *, evidence=False):
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
+                                       body=body, **({"evidence": True} if evidence else {}))
         if queued:
             return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,
@@ -549,25 +687,26 @@ class RecordingTracker:
 
     def create_issue(self, title, body, labels):
         labels = list(labels)
+        started = self._started()
         n = self._tracker.create_issue(title, body, labels)
         from foragent import orch_scope
 
         issue = Issue(n, title, body, frozenset(labels), "open")
-        self._context.store.record_issue(issue, self._context.config.lanes)
+        self._ingest([issue], started)
         orch_scope.scope(self._context).created(issue)
         return n
 
     def update_issue(self, n, *, title, body):
+        started = self._started()
         _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
-                                title=title, body=body)
-        if not queued:
-            self._context.store.update_local_issue(n, title=title, body=body)
+                                started, title=title, body=body)
+        del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
     def close_issue(self, n, comment=None):
+        started = self._started()
         _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), body=comment)
-        if not queued:
-            self._context.store.update_local_issue(n, state="closed")
+                               else self._tracker.close_issue(n, comment), started, body=comment)
+        del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)
@@ -805,6 +944,9 @@ class FakeTracker:
         self.labels.update((spec.name, spec) for spec in specs)
 
     def close_issue(self, n: int, comment: str | None = None) -> None:
+        self._close(n, comment)
+
+    def _close(self, n: int, comment: str | None) -> None:
         if comment is not None:
             self.comment(n, comment)
         self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
@@ -830,7 +972,7 @@ class FakeTracker:
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
 
     def close_pr(self, pr: int, comment: str | None = None) -> None:
-        self.close_issue(pr, comment)
+        self._close(pr, comment)
         self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
@@ -1385,12 +1527,16 @@ class GhTracker:
 
     def _acceptance_run_ids(self, pr: int, runs: list[dict]) -> set[int]:
         """Only unchanged measurement workflows may be separated from ordinary CI."""
-        from foragent.ci_workflow import WORKFLOW
-
-        candidates = {run["id"] for run in runs if run.get("path") == WORKFLOW}
+        candidates = self._measurement_run_ids(runs)
         if candidates and any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
             return set()
         return candidates
+
+    @staticmethod
+    def _measurement_run_ids(runs: list[dict]) -> set[int]:
+        from foragent.ci_workflow import WORKFLOW
+
+        return {run["id"] for run in runs if run.get("path") == WORKFLOW}
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
@@ -1478,52 +1624,101 @@ class GhTracker:
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
+        A failed job counts as soon as it has failed, even while its run is unfinished.
+        Each part is read on its own: one that cannot be read leaves an "unavailable"
+        line and the others survive; a rate limit still propagates.
         ``not_started`` is true only when every failed job never ran (no steps or a
         "job was not started" annotation); such jobs have no code failure to repair.
         """
-        runs = self._pr_workflow_runs(pr)
-        excluded_runs = self._acceptance_run_ids(pr, runs)
+        try:
+            runs = self._pr_workflow_runs(pr)
+        except TrackerError as exc:
+            return CIEvidence(_unavailable("workflow runs", exc))
         parts = []
+        try:
+            excluded_runs = self._acceptance_run_ids(pr, runs)
+        except TrackerError as exc:
+            # An unverified change must not let measurement text into the evidence.
+            parts.append(_unavailable("changed files of the pull request", exc))
+            excluded_runs = self._measurement_run_ids(runs)
         failed_runs = 0
         code_failure = False
         for run in runs:
-            if run["id"] in excluded_runs or run["conclusion"] not in _FAILED_CONCLUSIONS:
+            if run["id"] in excluded_runs:
+                continue
+            if run.get("conclusion") is not None and run["conclusion"] not in _FAILED_CONCLUSIONS:
+                continue
+            evidence = self._run_evidence(run, full_text_dir)
+            if evidence is None:
                 continue
             failed_runs += 1
+            parts.append(evidence[0])
+            code_failure = code_failure or evidence[1]
+        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+
+    def _run_evidence(self, run: dict[str, Any], full_text_dir: Path | None) -> tuple[str, bool] | None:
+        """One run's text and whether it may hold a code failure; None if nothing failed yet."""
+        run_id = run["id"]
+        unfinished = run.get("conclusion") is None
+        state = run.get("conclusion") or run.get("status") or "unfinished"
+        url = run.get("html_url") or run.get("url") or ""
+        lines = [f"Actions run {run_id} ({run.get('name') or 'workflow'}) {state} {url}".rstrip()]
+        run_logs = ["run", "view", str(run_id), "-R", self.repo, "--log-failed"]
+        try:
             jobs = _items(self._call([
                 "api", "--paginate", "--jq", ".jobs",
-                f"{self._path}/actions/runs/{run['id']}/jobs?per_page=100",
+                f"{self._path}/actions/runs/{run_id}/jobs?per_page=100",
             ]))
-            url = run.get("html_url") or run.get("url") or ""
-            lines = [f"Actions run {run['id']} ({run.get('name') or 'workflow'}) {run['conclusion']} {url}".rstrip()]
-            started_failure = False
-            failed_jobs = 0
-            for job in jobs:
-                if job.get("conclusion") not in _FAILED_CONCLUSIONS:
-                    continue
-                failed_jobs += 1
-                steps = job.get("steps") or []
+        except TrackerError as exc:
+            # Unknown jobs do not prove that nothing started. gh refuses run-wide
+            # logs until the run completes, so only a completed run can still try them.
+            lines.append(_unavailable(f"jobs of run {run_id}", exc))
+            if not unfinished:
+                lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                            full_text_dir, f"ci-run-{run_id}.log"))
+            return "\n".join(lines), True
+        failed = [job for job in jobs if job.get("conclusion") in _FAILED_CONCLUSIONS]
+        if unfinished and not failed:
+            return None
+        started_failure = False
+        for job in failed:
+            steps = job.get("steps") or []
+            try:
                 messages = self._job_annotations(job)
-                job_url = job.get("html_url") or job.get("url") or ""
-                if not steps or any(_NOT_STARTED.search(message) for message in messages):
-                    lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
-                else:
-                    started_failure = True
-                    lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
-                lines.extend(f"  annotation: {message}" for message in messages)
-            # A failed run without failed jobs (e.g. an invalid workflow file) is
-            # still a failure the implementer may be able to repair.
-            if started_failure or not failed_jobs:
-                code_failure = True
-                try:
-                    output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
-                except TrackerError as exc:
-                    if "log not found" not in f"{exc}\n{exc.stdout}".lower():
-                        raise
-                    output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
-            parts.append("\n".join(lines))
-        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+                annotations = [f"  annotation: {message}" for message in messages]
+            except TrackerError as exc:
+                messages = []
+                annotations = ["  " + _unavailable(f"annotations of job {job.get('name')}", exc)]
+            job_url = job.get("html_url") or job.get("url") or ""
+            if not steps or any(_NOT_STARTED.search(message) for message in messages):
+                lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
+                lines.extend(annotations)
+                continue
+            started_failure = True
+            lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
+            lines.extend(annotations)
+            # gh also refuses one job's log until its run completes; the REST log does not.
+            # gh api prints a log with colour codes only with the flag; _log_tail removes them.
+            job_logs = (["api", "--allow-escape-sequences", f"{self._path}/actions/jobs/{job['id']}/logs"] if unfinished
+                        else [*run_logs[:-1], "--job", str(job["id"]), "--log-failed"])
+            lines.append(self._log_tail(job_logs, f"log of job {job.get('name')}",
+                                        full_text_dir, f"ci-job-{job['id']}.log"))
+        # A failed run without failed jobs (e.g. an invalid workflow file) is
+        # still a failure the implementer may be able to repair.
+        if not failed:
+            lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                        full_text_dir, f"ci-run-{run_id}.log"))
+        return "\n".join(lines), started_failure or not failed
+
+    def _log_tail(self, args: list[str], what: str, full_text_dir: Path | None, name: str) -> str:
+        try:
+            output = self._call(args)
+        except TrackerError as exc:
+            return _unavailable(what, exc)
+        output = _TERMINAL_CONTROL.sub("", output)
+        if not output.strip():
+            return f"(CI evidence unavailable: {what}: GitHub returned an empty log)"
+        return cuts.tail(output, 4000, full_text_dir, name)
 
     def _job_annotations(self, job: dict[str, Any]) -> list[str]:
         check_run = job.get("check_run_url") or f"{self._path}/check-runs/{job['id']}"

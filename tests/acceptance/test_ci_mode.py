@@ -648,6 +648,7 @@ def test_init_honors_choice_over_recommendation_and_keeps_it_on_rerun(
 def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_outputs(
     git_history, tmp_path, monkeypatch,
 ):
+    """Reject omitting PR evidence or imposing PR-only outputs on a push-only base producer."""
     case = init_case(git_history, tmp_path, monkeypatch, private=False)
     assert case.main(case.argv) == 0
     path = case.root / WORKFLOW
@@ -656,7 +657,13 @@ def test_init_generates_pr_workflow_with_shards_and_machine_readable_comparison_
     events = document.get("on", document.get(True))
     assert "pull_request" in events
     jobs = document["jobs"]
-    sharded = [job for job in jobs.values() if "shard" in job.get("strategy", {}).get("matrix", {})]
+    # Push-only base producers have no PR comparison artifact/output. Check
+    # the jobs reachable by this PR, preserving all existing PR obligations.
+    from test_ci_base_cache_workflow import active_steps, event_context
+
+    active_jobs = {id(row["job"]) for row in active_steps(document, event_context("pull_request", "main"))}
+    sharded = [job for job in jobs.values() if id(job) in active_jobs
+               and "shard" in job.get("strategy", {}).get("matrix", {})]
     assert sharded, "Acceptance must be distributed over a shard matrix"
     for job_config in sharded:
         strategy = job_config["strategy"]
@@ -788,7 +795,15 @@ def test_green_ci_without_usable_all_shard_comparison_holds_unprotected_merge(
     case = mode_case(git_history, tmp_path, monkeypatch)
     case.ci.damage = damage
     outcome = run(case)
-    assert_infrastructure_hold(case, outcome)
+    if damage == "failed-run":
+        # Keep the captured node ID: completed evidence is still the feature,
+        # and conclusion alone no longer invalidates complete trusted reports.
+        assert outcome == "merged", "A completed failure conclusion does not invalidate usable artifacts"
+        assert case.tracker.merged_prs == [2] and len(case.implementer.calls) == 1
+        assert case.ci.artifact_reads and len(set(case.ci.downloads)) == case.config.ci_shards
+        comparison_record(case, "ci")
+    else:
+        assert_infrastructure_hold(case, outcome)
     assert case.ci.reads, "Look for acceptance evidence even when all ordinary checks are green"
     assert_remote_only(case)
 
