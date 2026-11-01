@@ -54,6 +54,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
     def refresh_base(move: BaseMove, conflicts: list[str] | None = None) -> str:
         # Only the run's time budget (finish_base) bounds repeated base moves (#712).
+        run_publish._phase(n, ctx, "checking")
         neutral = conflicts is None and run_publish.base_move_is_neutral(attempt, move)
         run_publish._append(log, f"{run_publish.REUSED if neutral else run_publish.REVERIFY}: {move.target_sha}")
         # Exclude the merged base's paths from policy and patch replay. The
@@ -180,7 +181,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             return stopped
         queued_status = None
         # Wait for the FIFO turn without re-verifying; CI is checked again on getting it (#712).
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr)
         if stopped:
             return stopped
         if waited:
@@ -232,7 +233,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 move = run_publish.capture_move(git, inputs.base_sha)
             if continue_merge and move is None and inputs.comparison_current:
                 run_publish._check_publication(git, attempt.target_branch, inputs.base_sha)
-                run_publish._phase(n, ctx, "merging")
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(
                     ctx, pr, title=title, current_title=attempt.pr_title,
@@ -280,7 +280,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
-            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge, pr)
             queued_status = None
             continue
         if inputs.stop is not None:

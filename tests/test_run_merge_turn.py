@@ -435,3 +435,307 @@ def test_failed_merge_rejoins_at_the_tail_and_takes_a_later_turn(run_case, monke
     assert c.store.get_run(1).waited_seconds == 30
     assert "rejoining the merge queue: Pull request is not mergeable" in c.store.log_path(1).read_text()
     assert path == "review-only" or started == c.store.get_run(1).started_at
+
+
+class Reads:
+    """A tracker that answers issue state by number and records every read."""
+
+    def __init__(self, states=None, errors=None):
+        self.states, self.errors = states or {}, errors or {}
+        self.reads, self.removed = [], []
+
+    def get_issue(self, number):
+        self.reads.append(number)
+        if number in self.errors:
+            raise self.errors[number]
+        return SimpleNamespace(state=self.states.get(number, "open"))
+
+    def add_labels(self, n, labels):
+        pass
+
+    def remove_labels(self, n, labels):
+        self.removed.append((n, set(labels)))
+
+
+def waited_ctx(tmp_path, monkeypatch, tracker, waited=0):
+    ctx = make_ctx(tmp_path, 1, 2)
+    ctx.tracker = tracker
+    ctx.store.update_run(2, merge_waited_seconds=waited)
+    monkeypatch.setattr(turn, "monotonic", ctx.monotonic)
+    ctx.sleep = lambda seconds: ctx.clock.__setitem__(0, ctx.clock[0] + timedelta(seconds=seconds))
+    return ctx
+
+
+def test_merge_wait_ceiling_is_sixteen_hours_with_five_minute_checks():
+    assert turn.MERGE_WAIT_SECONDS == 57_600
+    assert turn.REMOTE_CHECK_SECONDS == 300
+
+
+@pytest.mark.parametrize("closed", [2, 7], ids=["issue", "pr"])
+def test_retry_pause_ends_on_a_remote_fact_without_reporting(tmp_path, monkeypatch, closed):
+    from foragent import orch_events, orch_inbox
+    from foragent.run_attempt import ExecutorStopped
+
+    tracker = Reads({closed: "closed"})
+    ctx = waited_ctx(tmp_path, monkeypatch, tracker, waited=299)
+    own = turn.seat(ctx, 2, "main")
+    turn.join(ctx, own, "b")
+    with pytest.raises(ExecutorStopped) as stopped:
+        turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), pr=7)
+    assert stopped.value.outcome == "remote-ended"
+    assert tracker.reads == ([2] if closed == 2 else [2, 7]), "An ended issue needs no PR read"
+    assert ctx.store.get_run(2).merge_wait_polls == 1, "The first read was not yet due"
+    assert [row["event"] for row in rows(ctx)] == ["ready", "withdrawn"]
+    assert (2, {"ready", "running"}) in tracker.removed
+    assert orch_inbox.requests(ctx.store, pending=True) == []
+    assert orch_events.events(ctx.store, "merge-wait-limit") == []
+    assert ctx.store.load_flag(2) is None
+
+
+@pytest.mark.parametrize("error", ["HTTP 502: bad gateway", "HTTP 404: Not Found"], ids=["transport", "missing"])
+def test_read_failure_is_unknown_and_the_next_check_is_a_full_interval_later(tmp_path, monkeypatch, error):
+    from foragent.tracker import TrackerError
+
+    tracker = Reads(errors={2: TrackerError(error)})
+    ctx = waited_ctx(tmp_path, monkeypatch, tracker, waited=299)
+    own = turn.seat(ctx, 2, "main")
+    for _ in range(10):  # The first pause wakes at the 300 s read; nine more of 30 s stay below 600 s.
+        turn.join(ctx, own, "b")
+        turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), pr=7)
+    assert tracker.reads == [2, 7], "A failed read and re-entry must not bring a check forward"
+    assert "could not read Issue #2" in ctx.store.log_path(2).read_text()
+    tracker.errors.clear()
+    tracker.states[7] = "closed"
+    turn.join(ctx, own, "b")
+    from foragent.run_attempt import ExecutorStopped
+
+    with pytest.raises(ExecutorStopped, match="PR #7 ended"):
+        turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), pr=7)
+    assert tracker.reads == [2, 7, 2, 7]
+
+
+def test_unknown_pr_reads_only_the_issue_and_never_guesses_an_end(tmp_path, monkeypatch):
+    tracker = Reads()
+    ctx = waited_ctx(tmp_path, monkeypatch, tracker, waited=299)
+    own = turn.seat(ctx, 2, "main")
+    turn.join(ctx, own, "b")
+    turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"))
+    assert tracker.reads == [2]
+    assert ctx.store.get_run(2).status == "running"
+
+
+def test_due_check_at_the_ceiling_prefers_a_remote_end_over_a_limit_hit(tmp_path, monkeypatch):
+    from foragent import orch_events, orch_inbox
+    from foragent.run_attempt import ExecutorStopped
+
+    ctx = waited_ctx(tmp_path, monkeypatch, Reads({2: "closed"}), waited=turn.MERGE_WAIT_SECONDS - 30)
+    turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+    with pytest.raises(ExecutorStopped) as stopped:
+        turn.await_turn(2, ctx, turn.seat(ctx, 2, "main"), "b", 7)
+    assert stopped.value.outcome == "remote-ended"
+    assert [row["event"] for row in rows(ctx) if row["n"] == 2] == ["ready", "withdrawn"]
+    assert orch_inbox.requests(ctx.store, pending=True) == []
+    assert orch_events.events(ctx.store, "merge-wait-limit") == []
+
+
+@pytest.mark.parametrize("path", ["queue", "retry"])
+def test_each_limit_hit_is_one_event_per_execution_and_survives_reload(tmp_path, monkeypatch, path):
+    from foragent import orch_events, orch_inbox
+    from foragent.run_attempt import ExecutorStopped
+
+    ctx = waited_ctx(tmp_path, monkeypatch, Reads())
+    monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 30)
+    turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+    started = []
+    for _ in range(2):
+        ctx.clock[0] += timedelta(seconds=1)
+        run = ctx.store.start_run(2, branch="foragent/issue-2", worktree=ctx.store.worktree_path(2))
+        started.append(run.started_at)
+        own = turn.seat(ctx, 2, "main")
+        with pytest.raises(ExecutorStopped, match="Merge-turn wait limit"):
+            if path == "queue":
+                turn.await_turn(2, ctx, own, "b", 7)
+            else:
+                turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), 7)
+        turn.withdraw(ctx, own)
+        ctx.store.finish_run(2, outcome="merge-wait")
+    hits = orch_events.events(StateStore(ctx.store.root), "merge-wait-limit")
+    assert [hit["run_started_at"] for hit in hits] == started and len(set(started)) == 2
+    assert all(hit["issue"] == 2 and hit["waited_seconds"] == 30 and hit["limit_seconds"] == 30 for hit in hits)
+    assert len(orch_inbox.requests(ctx.store, pending=True)) >= 1
+
+
+def test_review_only_run_stops_quietly_when_its_pr_closes_with_the_issue_open(run_case, monkeypatch):
+    from foragent import orch_inbox, runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, review="careful")
+    assert run_issue(1, c.ctx) == "pr-open"
+    c.now[0] += timedelta(seconds=1)
+    c.ctx.config = replace(c.ctx.config, review="fast")
+    queue_behind_live_run(c, monkeypatch)
+    monkeypatch.setattr(turn, "monotonic", c.ctx.monotonic)
+
+    def sleep(seconds):
+        c.now[0] += timedelta(seconds=seconds)
+        if c.store.get_run(1).merge_waited_seconds >= 330:
+            c.tracker.issues[2] = replace(c.tracker.issues[2], state="closed")
+
+    c.ctx.sleep = sleep
+    head = c.tracker.pr_head_sha(2)
+    assert runner.review_only(1, c.ctx, verdict_head=head) == "remote-ended"
+    assert c.store.load_flag(1) is None
+    labels = c.tracker.get_issue(1).labels
+    assert not labels & {"running", "ready", "blocked", "needs-human"}
+    assert c.tracker.get_issue(1).state == "open" and c.tracker.get_issue(2).state == "closed"
+    assert c.tracker.merged_prs == []
+    assert orch_inbox.requests(c.store, pending=True) == []
+    assert c.store.get_run(1).outcome == "remote-ended"
+
+
+@pytest.mark.parametrize("path", ["queue", "retry"])
+@pytest.mark.parametrize(("first", "later"), [(5, 5), (10, 1), (1, 10)], ids=["even", "slow-first", "slow-later"])
+def test_slow_reads_keep_every_check_of_each_fact_a_full_interval_apart(tmp_path, monkeypatch, path, first, later):
+    ctx = waited_ctx(tmp_path, monkeypatch, None)
+    own = turn.seat(ctx, 2, "main")
+    read_at = {2: [], 7: []}
+
+    class SlowReads(Reads):
+        def get_issue(self, number):
+            read_at[number].append((ctx.clock[0] - NOW).total_seconds())
+            ctx.clock[0] += timedelta(seconds=first if len(read_at[number]) == 1 else later)
+            return super().get_issue(number)
+
+    ctx.tracker = SlowReads()
+    sleep = ctx.sleep
+
+    def bounded(seconds):
+        assert seconds > 0
+        sleep(seconds)
+        if len(read_at[7]) == 5:
+            ctx.store.finish_run(1, outcome="merged")
+
+    ctx.sleep = bounded
+    if path == "queue":
+        turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+        assert turn.await_turn(2, ctx, own, "b", 7) == (True, None)
+    else:
+        while len(read_at[7]) < 5:
+            turn.join(ctx, own, "b")
+            turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), 7)
+    for number, times in read_at.items():
+        assert len(times) >= 5, times
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        # Reads run in turn, so a PR read may start late behind a slow issue read, but never early.
+        assert all(300 <= gap <= 300 + max(first, later) for gap in gaps), (number, times)
+    assert {b - a for a, b in zip(read_at[2], read_at[2][1:])} == {300}, read_at[2]
+    assert read_at[2][0] == 300 and read_at[7][0] == 300 + first
+
+
+def test_turn_released_at_a_due_read_still_reads_first(tmp_path, monkeypatch):
+    from foragent.run_attempt import ExecutorStopped
+
+    tracker = Reads()
+    ctx = waited_ctx(tmp_path, monkeypatch, tracker)
+    own = turn.seat(ctx, 2, "main")
+    turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+    sleep = ctx.sleep
+
+    def sleep_and_release(seconds):
+        sleep(seconds)
+        waited = (ctx.clock[0] - NOW).total_seconds()
+        if waited >= 330:
+            tracker.states[2] = "closed"
+        if waited >= 600:
+            ctx.store.finish_run(1, outcome="merged")
+
+    ctx.sleep = sleep_and_release
+    with pytest.raises(ExecutorStopped) as stopped:
+        turn.await_turn(2, ctx, own, "b", 7)
+    assert stopped.value.outcome == "remote-ended"
+    assert turn.holds_turn(ctx.store, turn.seat(ctx, 1, "main")) is False
+
+
+def test_holding_the_turn_on_entry_still_makes_a_read_that_is_already_due(tmp_path, monkeypatch):
+    from foragent.run_attempt import ExecutorStopped
+
+    tracker = Reads()
+    ctx = waited_ctx(tmp_path, monkeypatch, tracker, waited=299)
+    own = turn.seat(ctx, 2, "main")
+    turn.join(ctx, own, "b")
+    turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), 7)
+    assert tracker.reads == [2, 7]
+    # Closing the last wait can credit past the next due point with no read after it.
+    ctx.store.update_run(2, merge_waited_seconds=600.5)
+    assert turn.await_turn(2, ctx, own, "b", 7) == (True, None), "A read is made, then the turn is taken"
+    assert tracker.reads == [2, 7, 2, 7]
+    assert turn.await_turn(2, ctx, own, "b", 7) == (False, None), "Nothing is due now: no wait and no read"
+    assert tracker.reads == [2, 7, 2, 7]
+    ctx.store.update_run(2, merge_waited_seconds=901)
+    tracker.states[7] = "closed"
+    with pytest.raises(ExecutorStopped, match="PR #7 ended"):
+        turn.await_turn(2, ctx, own, "b", 7)
+
+
+@pytest.mark.parametrize("path", ["implementation", "review-only"])
+def test_issue_closed_before_a_turn_released_at_the_due_read_never_merges(run_case, monkeypatch, path):
+    from foragent import runner
+
+    c = run_case
+    if path == "review-only":
+        c.ctx.config = replace(c.ctx.config, review="careful")
+        assert run_issue(1, c.ctx) == "pr-open"
+        c.now[0] += timedelta(seconds=1)
+        c.ctx.config = replace(c.ctx.config, review="fast")
+    ahead_live = queue_behind_live_run(c, monkeypatch)
+    monkeypatch.setattr(turn, "monotonic", c.ctx.monotonic)
+    waited = [0]
+
+    def sleep(seconds):
+        c.now[0] += timedelta(seconds=seconds)
+        waited[0] += seconds
+        if waited[0] >= 330:
+            c.tracker.close_issue(1)
+        if waited[0] >= 600:
+            ahead_live[0] = False
+
+    c.ctx.sleep = sleep
+    outcome = (runner.review_only(1, c.ctx, verdict_head=c.tracker.pr_head_sha(2))
+               if path == "review-only" else run_issue(1, c.ctx))
+    assert outcome == "remote-ended"
+    assert c.tracker.merged_prs == []
+    assert waited[0] == 600
+
+
+@pytest.mark.parametrize("path", ["queue", "retry"])
+@pytest.mark.parametrize("stop", ["remote-ended", "merge-wait"])
+def test_a_stopping_run_never_queues_for_a_machine_slot(tmp_path, monkeypatch, path, stop):
+    from foragent import capacity
+    from foragent.run_attempt import ExecutorStopped
+
+    states = {2: "closed"} if stop == "remote-ended" else {}
+    ctx = waited_ctx(tmp_path, monkeypatch, Reads(states), waited=turn.MERGE_WAIT_SECONDS - 30)
+    if stop == "remote-ended":
+        monkeypatch.setattr(turn, "MERGE_WAIT_SECONDS", 10 * turn.MERGE_WAIT_SECONDS)
+    ctx.store.update_run(2, phase="merging")
+    own = turn.seat(ctx, 2, "main")
+    deadlines = []
+
+    def full_machine(store, n, identity, *, deadline, **_):
+        deadlines.append(deadline)
+        assert deadline is not None, "Ending behind a full machine would keep the run and its claims forever"
+        raise TimeoutError("machine is full")
+
+    monkeypatch.setattr(capacity, "admit_run", full_machine)
+    with pytest.raises(ExecutorStopped) as stopped:
+        if path == "queue":
+            turn.join(ctx, turn.seat(ctx, 1, "main"), "a")
+            turn.await_turn(2, ctx, own, "b", 7)
+        else:
+            turn.join(ctx, own, "b")
+            turn.rejoin_after_failed_merge(2, ctx, own, RuntimeError("merge refused"), 7)
+    assert stopped.value.outcome == stop
+    assert deadlines, "The stop must have tried to restore the interrupted phase"
+    run = ctx.store.get_run(2)
+    assert run.status == "running" and run.waiting_until is None and run.pause_regions == {}
+    assert [row["event"] for row in rows(ctx) if row["n"] == 2][-1] == "withdrawn"

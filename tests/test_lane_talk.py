@@ -793,8 +793,39 @@ def test_find_pending_table_for_tmux_listings(tmp_path, monkeypatch, socket, exi
 def _cli(store, monkeypatch, tmp_path, *argv, executor="codex"):
     from foragent import cli
 
-    monkeypatch.setattr("foragent.commands.repo_store", lambda root: (config(executor=executor), "owner/repo", store))
+    monkeypatch.setattr(cli, "load_config", lambda root: config(executor=executor))
+    monkeypatch.setattr(cli.StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
     return cli.main(["lanes", "talk", "1", "--repo-root", str(tmp_path), *argv])
+
+
+def test_cli_fixture_does_not_capture_its_store_in_a_lazily_imported_command(store, tmp_path, monkeypatch):
+    import importlib.util
+
+    from foragent import cli, commands
+
+    resolvers = []
+
+    def first_cli_call(argv):
+        assert argv[:3] == ["lanes", "talk", "1"]
+        # A fresh namespace models first command discovery without resetting global modules.
+        path = Path(commands.__file__).with_name("report.py")
+        spec = importlib.util.spec_from_file_location("foragent.commands._fixture_report", path)
+        command = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(command)
+        resolvers.append(command.repo_store)
+        return 0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, "main", first_cli_call)
+        assert _cli(store, patch, tmp_path) == 0
+
+    following = StateStore(tmp_path / "following")
+    following_config = config(repo="next/repo")
+    monkeypatch.setattr(cli, "load_config", lambda root: following_config)
+    monkeypatch.setattr(cli.StateStore, "for_repo", classmethod(lambda cls, repo, **kw: following))
+    actual_config, actual_repo, actual_store = resolvers[0](tmp_path)
+    assert actual_config is following_config and actual_repo == "next/repo"
+    assert actual_store is following
 
 
 def test_unknown_terminal_delivers_the_message_then_exits_one_with_nothing_opened(
@@ -1338,7 +1369,9 @@ def test_a_refused_stop_does_not_stop_the_tick_from_closing_a_talk(git_history, 
     tick(ctx)
     sched.mark_running(ctx)
     talk_event(ctx.store, sched.NOW)
-    ctx.store.save_flag(1, Reason.STOP_REFUSED, flagged_at=(sched.NOW + timedelta(minutes=1)).isoformat())
+    ctx.now = lambda: sched.NOW + timedelta(minutes=1)
+    sched.flag(ctx, 1, Reason.STOP_REFUSED, "Stop refused: prior attempt")
+    assert ctx.store.load_flag(1).reason == Reason.STOP_REFUSED
     monkeypatch.setattr(probe, "liveness", lambda event, cwd: probe.CLOSED)  # The terminal is gone.
     ctx.now = lambda: sched.NOW + timedelta(minutes=5)
     tick(ctx)

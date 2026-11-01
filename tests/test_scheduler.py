@@ -1598,10 +1598,13 @@ def test_first_snapshot_rejects_edits_at_or_after_approval(ctx, edit_seconds):
         assert ctx.store.load_approval(1) is None
         assert ctx.tracker.get_issue(1).labels == {"blocked"}
         assert len(ctx.tracker.list_comments(1)) == 1
-        comment = ctx.tracker.list_comments(1)[0].body
-        assert parse_reason(comment) == Reason.HASH_MISMATCH
-        assert "approval predates an edit" in comment
-        assert ctx.store.load_flag(1).flagged_at == ctx.now().isoformat()
+        comment = ctx.tracker.list_comments(1)[0]
+        assert parse_reason(comment.body) == Reason.HASH_MISMATCH
+        assert "approval predates an edit" in comment.body
+        # The tracker clock is deliberately frozen at the edit, separately from tick's clock.
+        assert ctx.store.load_flag(1).flagged_at == comment.created_at == (
+            NOW + timedelta(seconds=edit_seconds)
+        ).isoformat()
     else:
         assert ctx.store.load_approval(1).body == BODY + "Edited\n"
         assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}

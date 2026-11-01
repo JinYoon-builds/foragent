@@ -104,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         return group.run(args)
     try:
         return group.run(args)
+    except order.DoneWhenExecutableError as exc:
+        for line in exc.lines:
+            print(f"foragent: {line}", file=sys.stderr)
+        return 1
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError, design_session.DesignError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
             order.PlanError, orch.OrchError, orch_inbox.InboxError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:

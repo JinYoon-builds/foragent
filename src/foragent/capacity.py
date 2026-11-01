@@ -54,6 +54,8 @@ HELD_ENV = {TEST_SLOT_ENV: "held"}
 SLOT_POLL_SECONDS = 0.1
 # How often a waiting test command reports that it is still waiting.
 SLOT_HEARTBEAT_SECONDS = 10.0
+# Only these idle phases release the run's machine slot. Unknown/legacy phases count.
+IDLE_RUN_PHASES = frozenset({"merge-turn-wait", "merge-lock-wait", "ci", "overlap-wait"})
 
 # Inside observing(), machine_load() reads the sensors without writing their baselines.
 _OBSERVING: ContextVar[bool] = ContextVar("foragent_capacity_observing", default=False)
@@ -352,6 +354,10 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def phase_holds_slot(phase: str | None) -> bool:
+    return phase not in IDLE_RUN_PHASES
+
+
 def _holds_slot(run: Run, now: datetime) -> bool:
     if run.pid is None:
         # Between its record and its launch; after the grace it is a leftover.
@@ -376,7 +382,7 @@ def _store_scan(
 
     runs = store.active_runs()
     running = {run.number for run in runs}
-    counted = [run for run in runs if _holds_slot(run, now)] if live else runs
+    counted = [run for run in runs if phase_holds_slot(run.phase) and (not live or _holds_slot(run, now))]
     holders = [f"#{run.number}" for run in counted]
     # A start reserves its slot before the GitHub labels and the run record.
     starts = [number for number, prepared_at in store.run_starts().items()
@@ -394,9 +400,14 @@ def _store_scan(
             return True
         return False
 
-    for workload in capacity_sessions.read(store.root):
-        if _alive(workload.pid) and not reuses(workload):
+    live = [workload for workload in capacity_sessions.read(store.root) if _alive(workload.pid)]
+    # A direct runner (no admitted run) holds its slot through a RUN_KIND workload: like a run
+    # record with its pid, it covers its own first further workload (its first reviewer).
+    for workload in sorted(live, key=lambda item: item.kind != RUN_KIND):
+        if not reuses(workload):
             holders.append(workload.label())
+            if workload.kind == RUN_KIND:
+                by_pid[workload.pid] += 1
     return holders, candidate is not None and reuses(candidate)
 
 
@@ -713,6 +724,10 @@ def hold_test_slot(
 
 # How often a waiting workload re-checks the machine budget and sensors.
 WORKLOAD_POLL_SECONDS = 2.0
+# The workload kind of a runner started without an admitted run; it holds that run's slot.
+RUN_KIND = "run"
+# A free slot behind a machine lock another admission holds for a moment is retried this soon.
+LOCK_RETRY_SECONDS = 0.05
 # The thread that holds each piece, with the workload record. A copied context
 # carries these values into other threads (run_review's reviewers do that), so
 # only the holding thread itself may reuse them: that is synchronous nesting.
@@ -774,9 +789,33 @@ def _say(message: str, wait_s: float) -> None:
 _ADMISSION = threading.Lock()
 
 
+def admit_run(
+    store: StateStore, number: int, identity: dict[str, Any], *, deadline: float | None,
+    now: Callable[[], datetime], waiting: Callable[[], None],
+) -> None:
+    """Reclaim an idle run's slot and publish its active phase under the machine lock.
+
+    Keep the idle phase while queued. The run record itself holds the admitted
+    slot, so returning work needs no extra reservation or workload record.
+    ``deadline=None`` waits until a slot opens; the caller credits this paused time.
+    Only the count decides: the run already started, and overload reaches it by shrinking the budget.
+    """
+    while True:
+        with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
+            holders, _ = _machine_scan(store, datetime.now(UTC), live=True)
+            if locked and len(holders) < workload_budget(store):
+                store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
+                return
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("No machine run slot became free in time")
+        waiting()
+        time.sleep(WORKLOAD_POLL_SECONDS if remaining is None else min(WORKLOAD_POLL_SECONDS, remaining))
+
+
 def _acquire_workload(
     store: StateStore, record: Path, language: str, wait_s: float, deadline: float, *,
-    kind: str, issue: int | None, role: str | None,
+    kind: str, issue: int | None, role: str | None, now: Callable[[], datetime],
 ) -> None:
     """Write this process's workload ``record`` once a slot is free, by the monotonic ``deadline``.
 
@@ -785,7 +824,7 @@ def _acquire_workload(
     """
     from foragent import capacity_sessions
 
-    pid, shown = os.getpid(), None
+    pid, shown, busy_since = os.getpid(), None, None
     candidate = capacity_sessions.Workload(Path(), pid, kind, issue, role)
     while True:
         sensed = _sensor_block()  # Read outside the lock: waiting holds no lock.
@@ -794,7 +833,7 @@ def _acquire_workload(
         # flock as another process's.
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
             # One scan decides admission: reuse is matched by identity, never by comparing counts.
-            holders, reused = _machine_scan(store, datetime.now(UTC), live=True, candidate=candidate)
+            holders, reused = _machine_scan(store, now(), live=True, candidate=candidate)
             budget = workload_budget(store)
             reason = None if reused else sensed or ("full" if len(holders) >= budget else None)
             if locked and reason is None:
@@ -806,10 +845,14 @@ def _acquire_workload(
             message = _workload_text("workload_timeout", language, reason, holders, budget, seconds=f"{wait_s:g}")
             _say(message, wait_s)
             raise TimeoutError(message)
-        if (reason, tuple(holders)) != shown:
+        # Concurrent admissions (N reviewers starting together) hold the lock only for one scan:
+        # retry soon, and report the lock only once it stays busy for a whole poll interval.
+        busy_since = (busy_since or time.monotonic()) if reason == "busy" else None
+        brief = busy_since is not None and time.monotonic() - busy_since < WORKLOAD_POLL_SECONDS
+        if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        time.sleep(min(WORKLOAD_POLL_SECONDS, remaining))
+        time.sleep(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining))
 
 
 def _held_test_slots() -> int:
@@ -865,8 +908,12 @@ def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: f
 def hold_workload(
     store: StateStore, config: Any, *, tests: bool = False, wait_s: float = 600,
     kind: str = "workload", issue: int | None = None, role: str | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Iterator[None]:
     """Hold one machine slot for one agent workload; ``tests`` also holds a test slot.
+
+    ``now`` is the caller's clock for judging reservation grace: a runner's own context
+    wrote its reservation, so it passes that context's clock.
 
     The slot is the shared gate budget: the same AIMD value, machine.yml ceiling,
     load and critical-memory holds, and the same count of live runs across
@@ -887,7 +934,7 @@ def hold_workload(
     record = capacity_sessions.new_path(store, holder[0]) if held is None or not _held_here(held[0]) else None
     try:
         if record is not None:
-            _acquire_workload(store, record, language, wait_s, deadline, kind=kind, issue=issue, role=role)
+            _acquire_workload(store, record, language, wait_s, deadline, kind=kind, issue=issue, role=role, now=now)
             token = _WORKLOAD.set((holder, record))
         if tests and not _held_here(_WORKLOAD_TESTS.get()):
             tests_token = None

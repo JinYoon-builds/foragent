@@ -91,7 +91,7 @@ def recorded_github(values, *, runs=None):
             return json.dumps({'full_name': 'owner/repo', 'default_branch': 'trunk'})
         if '/actions/runs?head_sha=head&' in endpoint:
             return json.dumps(runs if runs is not None else [values[0]['run'] if values else report()['run']])
-        if '/actions/runs/42/artifacts?' in endpoint:
+        if '/artifacts?' in endpoint:
             artifacts = [value['artifact'] for value in values]
             return '\n'.join(json.dumps([artifact]) for artifact in artifacts) or '[]'
         for value in values:
@@ -286,7 +286,9 @@ def test_rejects_unusable_shards(damage):
         checks[1] = deepcopy(checks[0])
         payload = checks[1]['report']
     elif damage == "cancelled":
+        # A red run alone is usable evidence; its incomplete report is not.
         checks[1]['run']["conclusion"] = "cancelled"
+        payload["head"]["complete"] = False
     elif damage == "exclusions":
         payload['excluded'] = ['tests/acceptance/test_unapproved.py']
     checks[1]['report'] = '{' if damage == 'malformed' else payload
@@ -864,7 +866,8 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
     assert payload['base']['complete'] and payload['head']['complete']
     assert f'{keep}::test_keep' in payload['base']['passing_ids']
     assert f'{keep}::test_keep' not in payload['head']['passing_ids']
-    assert output.read_text() == 'comparison=true\n'
+    assert output.read_text() == 'comparison=true\nlost=1\n'
+    assert (tmp_path / 'shard-0.lost').read_text() == f'{keep}::test_keep\n'
 
 
 @pytest.mark.parametrize('legacy_value', ['["stale-tree"]', 'invalid JSON'])

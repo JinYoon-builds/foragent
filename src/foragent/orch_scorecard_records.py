@@ -81,7 +81,8 @@ def _occupancy(store: StateStore, now: datetime, executions: list[dict[str, Any]
                ) -> tuple[list[tuple[Any, Interval]], list[Interval]]:
     """Machine-wide run and test-slot holders over time, by fa orch facts' counting rule.
 
-    This store's running records hold a slot through now. Another store's running record
+    Idle phase intervals release their run's slot. Otherwise this store's running records
+    hold a slot through now. Another store's running record
     holds one while its process may live: with a pid through now (liveness is not probed),
     without one only for the launch grace. A prepared start holds one for the grace until
     its run starts. ``open_end`` ends still-open holds (default ``now``); a replay of one
@@ -93,11 +94,21 @@ def _occupancy(store: StateStore, now: datetime, executions: list[dict[str, Any]
             [(store, executions, phases)] + [(other, _executions(other, now), _phase_intervals(other, now))
                                             for other in _siblings(store)]):
         counted = set()
+        open_waits = {(run.number, _time(run.phase_started_at)) for run in source.active_runs()
+                      if run.status == "running" and run.phase in capacity.IDLE_RUN_PHASES}
+        waits = [(number, (start, open_end if (number, start) in open_waits else end))
+                 for number, phase, (start, end) in spans if phase in capacity.IDLE_RUN_PHASES]
         for row in rows:
             end = row["finished"] or open_end
             if index and row["finished"] is None and row.get("pid") is None:
                 end = min(open_end, row["started"] + capacity.LAUNCH_GRACE)
-            occupied.append(((index, row["number"]), (row["started"], end)))
+            active = [(row["started"], end)]
+            for number, (a, b) in waits:
+                if number != row["number"]:
+                    continue
+                active = [piece for start, stop in active for piece in (
+                    (start, min(stop, a)), (max(start, b), stop)) if piece[0] < piece[1]]
+            occupied.extend(((index, row["number"]), span) for span in active)
             if row["finished"] is not None or not index or row.get("pid") is not None:
                 counted.add(row["number"])
         for number, prepared in source.run_starts().items():
@@ -215,7 +226,7 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
     flag = store.load_flag(row["number"])
     return {"events": events, "approved_at": approved_at, "labels": set(row.get("labels") or ()),
             "open_until": (_time(row.get("merged_at")) if closed else None), "closed": closed,
-            "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag else None,
+            "blocked_until": blocked_until, "flagged_at": _time(flag.flagged_at) if flag and not flag.local_only else None,
             "updated_at": _time(row.get("updated_at")),
             "lane": issue_lane(row.get("labels") or (), lanes)}
 

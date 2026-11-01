@@ -24,6 +24,121 @@ from runner_support import BODY, COMMAND, batch_setup, enable_reviewer, run_case
 CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
 
 
+def test_protected_collection_after_ci_base_move_still_holds_a_slot(run_case, monkeypatch):
+    import shlex
+    import sys
+
+    from foragent import capacity, runner
+
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max=1,
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider")
+    c.history.update({"tests/acceptance/test_unowned_collection.py": "def test_unowned():\n    assert True\n"})
+    c.ctx.git.fetch("origin", "main")
+    moved, collected = [], []
+    execute = runner.run_logged
+
+    def checks(pr):
+        if not moved:
+            c.history.update({"src/after_ci.py": "VALUE = 1\n"})
+            moved.append(c.history.tip)
+        return "pass"
+
+    def command(argv, **kwargs):
+        if "--collect-only" in argv[-1]:
+            assert moved, "Exercise the protected collection after the CI wait"
+            assert capacity.phase_holds_slot(c.store.get_run(1).phase)
+            assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+            collected.append(argv[-1])
+        return execute(argv, **kwargs)
+
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    monkeypatch.setattr(runner, "run_logged", command)
+    assert run_issue(1, c.ctx) == "merged"
+    assert len(collected) == 1
+    assert capacity.machine_runs(c.store, c.ctx.now()) == 0
+
+
+@pytest.mark.parametrize("idle", ["ci", "merge-turn-wait", "merge-lock-wait", "overlap-wait"])
+@pytest.mark.parametrize("head_changed", [False, True])
+def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(tmp_path, monkeypatch, idle, head_changed):
+    import os
+    from types import SimpleNamespace
+
+    from foragent import capacity, run_publish
+    from foragent.config import Config
+    from foragent.tracker import FakeTracker
+
+    clock = [BASE_TIME]
+    store = StateStore(tmp_path / "own", now=lambda: clock[0])
+    other = StateStore(tmp_path / "other", now=lambda: clock[0])
+    store.start_run(1, branch="branch", worktree="worktree", pid=os.getpid())
+    store.update_run(1, phase=idle, phase_started_at=clock[0].isoformat())
+    other.start_run(9, branch="other", worktree="other", pid=os.getpid())
+    capacity.write_state(store, 1, clock[0])
+    tracker = FakeTracker(now=lambda: clock[0], strict=True)
+    tracker.add_issue(1, "Reviewed work", "body", labels=["approved", "running"])
+    number = tracker.create_pr(head="branch", base="main", title="Reviewed work", body="body")
+    pr = tracker.created_prs[0]
+    tracker.set_pr_head_sha(number, "reviewed")
+    ctx = SimpleNamespace(store=store, tracker=tracker, repo="owner/repo", config=Config(),
+                          now=lambda: clock[0], monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
+    effects, sleeps = [], []
+    local_head = ["reviewed"]
+
+    def effect(name):
+        assert sleeps, f"{name} ran before the other repository released its slot"
+        assert store.get_run(1).phase == "checking"
+        assert capacity.machine_runs(store, clock[0]) == 1
+        effects.append(name)
+
+    def merge(base):
+        assert base == "new-base"
+        effect("merge")
+        local_head[0] = "refreshed"
+
+    def verify(head):
+        assert head == "refreshed"
+        effect("verify")
+
+    def publication(base):
+        assert base == "new-base"
+        effect("publication")
+
+    def push(branch, *, lease):
+        assert branch == "branch" and lease == "reviewed"
+        effect("push")
+        tracker.set_pr_head_sha(number, local_head[0])
+
+    def sleep(seconds):
+        assert effects == [] and store.get_run(1).phase == idle
+        assert capacity.machine_runs(store, clock[0]) == 1
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+        other.finish_run(9, outcome="merged")
+        if head_changed:
+            tracker.set_pr_head_sha(number, "someone-else")
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
+    git = SimpleNamespace(head_sha=lambda: local_head[0], merge_base=merge,
+                          check_publication=publication, push_head=push)
+    result = run_publish._refresh_reviewed_head(1, ctx, git, pr, "reviewed", "new-base", verify)
+    if head_changed:
+        assert result == ("reviewed", "held") and effects == []
+        assert store.load_flag(1).reason == Reason.RISK_HIGH
+    else:
+        assert result == ("refreshed", None)
+        assert effects == ["merge", "verify", "publication", "push"]
+    assert sleeps == [capacity.WORKLOAD_POLL_SECONDS]
+    assert store.get_run(1).waited_seconds == sum(sleeps)
+    assert store.get_run(1).waiting_until is None
+    store.finish_run(1, outcome="held" if head_changed else "merged")
+    assert capacity.machine_runs(store, clock[0]) == 0
+
+
 def test_base_only_paths_merged_during_ci_do_not_retarget_the_pr(run_case, monkeypatch):
     c = run_case
     batch_setup(c)

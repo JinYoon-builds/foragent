@@ -31,6 +31,7 @@ def _refresh_reviewed_head(
         return head, run_publish._timeout(n, ctx)
     if reverify is None:
         return head, run_publish._reviewed_base_changed(n, ctx, pr)
+    run_publish._phase(n, ctx, "checking")
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr.number) != head:
         link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
         return head, run_publish._hold_changed_head(n, ctx, link)
@@ -155,13 +156,14 @@ def _publish_reviewed_in_turn(
         return True
 
     while True:
+        run_publish._phase(n, ctx, "ci")
         if stopped := run_publish._wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
             lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
             comparison_mode=comparison_attempt is not None,
         ):
             return stopped
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number)
         if stopped:
             return stopped
         if waited:
@@ -245,7 +247,7 @@ def _publish_reviewed_in_turn(
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
-            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge, pr.number)
             queued_status = None
             continue
         if inputs.stop is not None:

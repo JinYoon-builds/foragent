@@ -7,9 +7,16 @@ and of the ``<name>-call`` event. The session itself, started as the hidden
 ``fa gate run-architect --role <name>``, is the only writer of its ``<name>-done``
 event. Roles never message a person: proposals reach the orchestrator through
 ``fa orch request``. Roles are read from ``foragent.roles.load_roles`` (D95).
+
+Every start takes one machine slot through ``capacity.hold_workload``, then passes that
+slot's one workload record to the session's pid, so the worker counts once for as long as
+it lives. The session removes that record when it ends, and a record left by a crash stops
+counting with its pid; the next start removes it. A start that cannot record its session
+stops that session, because nothing else could count or find it.
 """
 
 from contextlib import contextmanager
+import contextvars
 from datetime import UTC, datetime
 import fcntl
 import json
@@ -19,7 +26,7 @@ import subprocess
 import sys
 from typing import Iterator
 
-from foragent import executors, processes, review_notes
+from foragent import capacity, capacity_sessions, executors, processes, review_notes
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
@@ -95,6 +102,27 @@ def _call_lock(store: StateStore, role: str = ARCHITECT) -> Iterator[None]:
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def _remove_workload(record: dict | None) -> None:
+    """Remove the machine-slot record that a role record names, if it names one."""
+    workload = record.get("workload") if record else None
+    if isinstance(workload, str):
+        capacity_sessions.remove(Path(workload))
+
+
+def _pass_slot(store: StateStore, role: str, pid: int, target: Path) -> None:
+    """Turn this command's held slot into the session's record at ``target``.
+
+    The one record changes owner in place, so no reader counts the worker twice. It then
+    moves to the session's own name, which this command's hold does not remove. The machine
+    lock keeps every admission out until the move ends, so none can see the record missing.
+    """
+    with capacity.machine_lock(store):
+        held = next(item.path for item in capacity_sessions.read(store.root)
+                    if item.pid == os.getpid() and item.kind == "role" and item.role == role)
+        capacity_sessions.add(store, held, pid=pid, kind="role", role=role)
+        os.replace(held, target)
+
+
 def _say(key: str, role: str, language: str, **values) -> str:
     """The architect keeps its own wording; every other role shares the role_* strings."""
     if role == ARCHITECT:
@@ -125,20 +153,41 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
         if session_alive(record):
             raise ArchitectRefused(_say("running", role, language, pid=record["pid"],
                                         started_at=record.get("started_at", "?")))
+        _remove_workload(record)  # The session is gone, so a crash's leftover is no one's slot.
         started_at = now.astimezone(UTC).isoformat()
         log = log_path(store, started_at, role)
         log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("ab") as stream:
-            process = subprocess.Popen(
-                [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
-                 "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
-                cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
-                stdout=stream, stderr=stream, env=gate_environment(),
-            )
-        store._write_json(record_path(store, role), {
-            "pid": process.pid, "start_time": _start_time(process.pid),
-            "started_at": started_at, "why": why, **({"short": short} if short else {}),
-        })
+
+        def start() -> subprocess.Popen:
+            with capacity.hold_workload(store, config, wait_s=0, kind="role", role=role, now=lambda: now):
+                with log.open("ab") as stream:
+                    process = subprocess.Popen(
+                        [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
+                         "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
+                        cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
+                        stdout=stream, stderr=stream, env=gate_environment(),
+                    )
+                workload = capacity_sessions.new_path(store, process.pid)
+                try:
+                    _pass_slot(store, role, process.pid, workload)
+                    store._write_json(record_path(store, role), {
+                        "pid": process.pid, "start_time": _start_time(process.pid),
+                        "started_at": started_at, "why": why, "workload": str(workload),
+                        **({"short": short} if short else {}),
+                    })
+                except BaseException:
+                    # No record can count or find this session, so it must not run. It has only just started.
+                    process.kill()
+                    process.wait()
+                    capacity_sessions.remove(workload)
+                    raise
+            return process
+
+        try:
+            # A fresh context: the session is a new worker, so an outer hold of this thread cannot cover it.
+            process = contextvars.Context().run(start)
+        except TimeoutError as exc:
+            raise ArchitectRefused(str(exc)) from exc
     append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
                  **({"short": short} if short else {}))
     return _say("started", role, language, pid=process.pid, log=log)
@@ -201,7 +250,12 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         message = _keep_message(log, result.full_message or result.last_message or "", role)
     finally:
         first = message.splitlines()[0][:200] if message else ""
-        append_event(store, now(), None, f"{role}-done",
-                     f"exit code {code}" + (f": {first}" if first else ""),
-                     started_at=started_at, exit_code=code, message=message)
+        try:
+            append_event(store, now(), None, f"{role}-done",
+                         f"exit code {code}" + (f": {first}" if first else ""),
+                         started_at=started_at, exit_code=code, message=message)
+        finally:
+            record = read_record(store, role)
+            if record is not None and record.get("started_at") == started_at:
+                _remove_workload(record)
     return code
