@@ -161,6 +161,8 @@ def _preread(args, root) -> int:
                                           f"{len(result['unknowns'])} unknown(s)"))
             for unknown in result["unknowns"]:
                 print(f"  - {unknown}")
+            if "current" in result:
+                print(result["current"])
     return 0
 
 

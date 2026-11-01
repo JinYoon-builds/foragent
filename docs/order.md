@@ -158,3 +158,21 @@ no new interpretation of issue meaning or conflict-resolution policy is added.
 
 - Accepted limit (#448): scheduler admission can race the final late check (TOCTOU); a soft-lock breach costs one merge conflict, which the runner resolves.
 - Accepted limit (#448): multi-way glob intersections do not guarantee Unicode literal-alias equivalence such as Straße/STRASSE.
+
+Publication checks the current GitHub title and body against the fields this plan
+last read, for both existing children and explicit edits. If either changed,
+`fa order publish` stops before changing files, issues, labels or approvals. The
+diagnostic identifies each issue and shows the old and current values, including
+changed Done when commands. This applies with or without `--approve`; `--dry-run`
+remains a preview.
+
+Run `fa order preread PLAN.json` to explicitly re-read: the implementer sees the
+current GitHub title and full body before the observed base is refreshed. A statement
+issue has no reader turn, so the command itself prints those fields for the agent that
+ran it (`current` with `--json`) and refreshes the base. Resolve
+the requirements in the plan before publishing again; no automatic merge chooses
+which requirement wins. Each successful issue write immediately records the title
+and body it wrote as the next base, before labels, links or comments are updated.
+If a later publication step fails, retrying can continue from those writes. The local `.foragent/order-observed.json` stores these
+observations by plan id and issue number. Legacy targets without a recorded base
+publish as before. Labels, comments and native dependency edges are not compared.

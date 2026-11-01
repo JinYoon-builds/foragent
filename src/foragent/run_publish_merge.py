@@ -19,20 +19,28 @@ if TYPE_CHECKING:
 
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
-    # Keep tick informed during an unbounded blocking flock acquisition.
-    started = None
-    try:
+    from foragent import capacity
+
+    while True:
+        # Budget waits happen unlocked. A contended merge lock releases this slot again.
+        run_publish._phase(n, ctx, "merging")
+        started = None
         with run_publish.ExitStack() as stack:
             def acquire():
                 nonlocal started
                 stack.enter_context(ctx.store.merge_lock())
                 started = ctx.now()
 
-            run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False)  # Phase only if it waits.
-            yield
-    finally:
-        if started is not None:
-            ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
+            try:
+                # Phase only if it waits: a free lock keeps the slot and adds no phase events.
+                run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False, resume=False)
+                if not capacity.phase_holds_slot(ctx.store.get_run(n).phase):
+                    continue  # A new start took the freed slot: give the lock back.
+                yield
+                return
+            finally:
+                if started is not None:
+                    ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
 def _policy_allows(decision: Decision, base: str, batch_branch: str | None) -> bool:

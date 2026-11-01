@@ -38,6 +38,28 @@ def test_bucket_edges_are_newer_inclusive_and_older_exclusive():
     assert orch_scorecard._bucket(NOW + timedelta(seconds=1), NOW, 7) is None
 
 
+@pytest.mark.parametrize("sibling", [False, True])
+def test_open_idle_phase_releases_historical_and_current_occupancy(store, sibling):
+    import os
+
+    from foragent.orch_scorecard_records import _executions, _occupancy, _phase_intervals
+
+    source = StateStore(store.root.parent / "sibling", now=store._now) if sibling else store
+    start, wait = NOW - timedelta(minutes=30), NOW - timedelta(minutes=20)
+    store.clock[0] = start
+    source.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    source.update_run(1, phase="checking", phase_started_at=start.isoformat())
+    store.clock[0] = wait
+    source.update_run(1, phase="ci", phase_started_at=wait.isoformat())
+    store.clock[0] = NOW
+    executions, phases = _executions(store, NOW), _phase_intervals(store, NOW)
+    occupied, testing = _occupancy(store, NOW, executions, phases, open_end=NOW + timedelta(days=1))
+    assert [span for _, span in occupied] == [(start, wait)]
+    assert testing == [(start, wait)]
+    assert not any(a <= NOW < b for _, (a, b) in occupied)
+    assert source.get_run(1).phase == "ci" and len(source.active_runs()) == 1
+
+
 def test_pr_open_counts_as_merged_only_after_a_merge_and_otherwise_is_no_failure(store):
     finish(store, 1, at=NOW - timedelta(hours=2), outcome="pr-open", minutes=20,
            merged_at=NOW - timedelta(hours=1))
@@ -175,6 +197,32 @@ def test_flow_idle_counts_sibling_repositories_on_the_shared_budgets(tmp_path, m
         "A sibling's live run and its checking phase fill the machine-wide budgets")
 
 
+def test_waiting_run_keeps_its_project_place_without_becoming_ready_work(store, monkeypatch, tmp_path):
+    import os
+
+    from foragent import capacity
+    from foragent.config import Config
+    from foragent.issue import body_hash
+    from foragent.orch_scorecard_flow import binding_at
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path)
+    start = NOW - timedelta(hours=1)
+    body = "<!-- foragent:v1 -->\n## Goal\nG\n## Files\n- a.py\n## Out of scope\nO\n## Done when\n```sh\ntrue\n```\n"
+    for number in (1, 2):
+        store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs={},
+                            approved_by="human", approved_at=start.isoformat())
+    store.update_local_issue(1, title="waiter", body=body, labels=["approved", "running"], state="open", blocked_by=[])
+    store.clock[0] = start
+    store.start_run(1, branch="b", worktree="w", pid=os.getpid())
+    store.update_run(1, phase="ci", phase_started_at=start.isoformat())
+    capacity.write_state(store, 2, start)
+    store.clock[0] = NOW
+    assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == 0
+    store.update_local_issue(2, title="ready", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
+    assert binding_at(store, Config(max_parallel=1, overlap_per_file=1), tmp_path, NOW, current=True) == "cap"
+    assert binding_at(store, Config(max_parallel=None, overlap_per_file=1), tmp_path, NOW, current=True) == "structure"
+
+
 def test_flow_waste_counts_ongoing_runtime_and_merged_running_records(store):
     finish(store, 1, at=NOW - timedelta(hours=2), minutes=10, outcome="error")
     store.clock[0] = NOW - timedelta(minutes=90)
@@ -211,12 +259,15 @@ def test_flow_idle_without_label_events_uses_records_not_current_labels(tmp_path
                              merged=True, merged_at=clock[0].isoformat())
     clock[0] = NOW
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(30)
-    # A hold counts from its flag time, not from the approval.
+    # A hold counts from its GitHub marker time, not from approval or a stale local flag.
     store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready", "blocked"], state="open",
                              blocked_by=[])
     store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
                         approved_by="human", approved_at=(NOW - timedelta(minutes=20)).isoformat())
-    store.save_flag(2, "stalled", flagged_at=(NOW - timedelta(minutes=10)).isoformat())
+    store.save_flag(2, "stalled", flagged_at=(NOW - timedelta(minutes=15)).isoformat())
+    store.record_comments(2, [{"id": 1, "author": "bot",
+                              "body": "<!-- foragent:blocked reason=stalled -->\nNo progress",
+                              "created_at": (NOW - timedelta(minutes=10)).isoformat()}])
     assert orch_scorecard.collect(store, 2)["window"]["today"]["idle_minutes"] == pytest.approx(40)
 
 
@@ -360,3 +411,77 @@ def test_flow_removed_approval_rule_spares_running_and_closed_issues():
     assert _labels_at({**issue, "running": True}, NOW) == {"ready"}
     assert _labels_at({**issue, "closed": True}, before) == {"approved", "ready"}
     assert _labels_at({**issue, "labels": {"approved"}}, NOW) == {"approved", "ready"}
+
+
+def test_proposal_retry_and_correction_count_only_the_latest_explicit_acceptance(store):
+    from types import SimpleNamespace
+    from foragent import orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    ordinary = orch_inbox.add_request(store, "planning", "ordinary")
+    orch_inbox.set_request_status(store, ordinary["id"], "done", answer="Completed", require_answer=True)
+    proposal = orch_inbox.add_request(store, "architect", "proposal")
+
+    def count():
+        reopened = StateStore(store.root, now=lambda: store.clock[0])
+        card = orch_roles.scorecard(reopened, config, orch_scorecard.collect(reopened, days=2))
+        return card["window"]["today"]["roles"]["architect"]["accepted_proposals"]
+
+    assert count() == 0
+    for _ in range(2):
+        orch_roles.decide(store, proposal["id"], "accepted", "architect", answer="Applied")
+        assert count() == 1
+    orch_roles.decide(store, proposal["id"], "rejected", None, answer="Reconsidered")
+    assert count() == 0
+    assert orch_inbox.requests(store)[1]["accepted"] is False
+
+
+@pytest.mark.parametrize("stage", ["status-event", "proposal-event"])
+@pytest.mark.parametrize("decision", ["accepted", "rejected"])
+def test_scorecard_uses_committed_decision_when_its_audit_event_fails(store, monkeypatch, stage, decision):
+    from types import SimpleNamespace
+    from foragent import orch_events, orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    request = orch_inbox.add_request(store, "architect", "proposal")
+    previous = "rejected" if decision == "accepted" else "accepted"
+    orch_roles.decide(store, request["id"], previous, "architect", answer="Earlier decision")
+    store.clock[0] += timedelta(minutes=1)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("audit write failed")
+
+    target = orch_inbox if stage == "status-event" else orch_events
+    monkeypatch.setattr(target, "append_event", unavailable)
+    with pytest.raises(OSError, match="audit write failed"):
+        orch_roles.decide(store, request["id"], decision, None, answer="Corrected decision")
+    reopened = StateStore(store.root, now=lambda: store.clock[0])
+    [row] = orch_inbox.requests(reopened)
+    assert row["status"] == "done"
+    assert row["answer"] == "Corrected decision"
+    assert row["accepted"] is (decision == "accepted")
+    assert row["decided_at"] == store.clock[0].isoformat()
+
+    def count():
+        card = orch_roles.scorecard(reopened, config, orch_scorecard.collect(reopened, days=2))
+        return card["window"]["today"]["roles"]["architect"]["accepted_proposals"]
+
+    assert count() == int(decision == "accepted")
+    assert count() == int(decision == "accepted"), "Reading must not duplicate the acceptance"
+    (store.root / "orch-events.jsonl").write_text("")
+    assert count() == int(decision == "accepted"), "Journal retention must not erase an inbox decision"
+
+
+def test_scorecard_keeps_the_decision_day_after_a_later_status_note(store):
+    from types import SimpleNamespace
+    from foragent import orch_inbox, orch_roles
+
+    config = SimpleNamespace(roles={"architect": {"agent": "fa-architect"}})
+    store.clock[0] = NOW - timedelta(hours=30)
+    request = orch_inbox.add_request(store, "architect", "proposal")
+    orch_roles.decide(store, request["id"], "accepted", "architect", answer="Applied")
+    store.clock[0] = NOW
+    orch_inbox.set_request_status(store, request["id"], "processing", "Follow-up")
+    card = orch_roles.scorecard(store, config, orch_scorecard.collect(store, days=2))
+    assert card["window"]["today"]["roles"]["architect"]["accepted_proposals"] == 0
+    assert card["window"]["previous"]["roles"]["architect"]["accepted_proposals"] == 1

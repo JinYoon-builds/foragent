@@ -223,7 +223,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     except curses.error:
         pass
     try:
-        curses.set_escdelay(25)  # Esc closes a box at once instead of waiting for a sequence.
+        curses.set_escdelay(25)  # Esc clears the explanation at once.
     except (curses.error, AttributeError):
         pass
     screen.keypad(True)
@@ -248,7 +248,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     painted = False  # The screen is erased once; later frames paint over it in place.
     pending = None
     started_build = watch._installed_build()
-    # Memory across frames: fireworks start times, folds, scroll and the open issue box.
+    # Memory across frames: fireworks start times, folds, scroll and the explanation.
     view_state: dict = {}
     if store is not None:
         view_state["store"] = store
@@ -322,7 +322,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 bottom = max(0, height - 1)
                 visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
             # One highlighted row, by its position: the first issue row on screen.
-            mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
+            mark = watch.highlighted_row(view_state)
             if mark is None:
                 marked = set()
             elif row_map is not None:
@@ -353,16 +353,18 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                                          + palette.link(style, attribute) + watch.osc8(url, found[0]) + "\x1b[0m")
                     x += watch._cells(value)
                 if x < width:
+                    # A screen that only paints (the minimal screen the locked live-view tests
+                    # drive) has no move/clrtoeol: it keeps no remnants to clear.
                     try:
                         screen.move(y, x)
                         screen.clrtoeol()  # The rest of a shorter row from the last frame.
-                    except curses.error:
+                    except (curses.error, AttributeError):
                         pass
             if len(shown) < height:
                 try:
                     screen.move(len(shown), 0)
                     screen.clrtobot()  # Rows below the frame that the last frame used.
-                except curses.error:
+                except (curses.error, AttributeError):
                     pass
             screen.refresh()
             # Curses cannot write OSC 8, so every visible #n is written again as a link after
@@ -374,7 +376,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 watch.sys.stdout.write(SAVE_CURSOR + "".join(links) + RESTORE_CURSOR)
                 watch.sys.stdout.flush()
             key = screen.getch()
-            slugs = list(snapshot.status["lanes"])
+            slugs = list(snapshot.status.get("lanes") or ())
             if view_state.get("settings"):
                 # The window is keyboard-only and takes every key but q.
                 name = window_key(key, window_keys, view_state.get("settings_prompt") is not None,
@@ -414,7 +416,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 if keys[key] in ("q", "Q") or (keys[key] == "esc" and store is None):
                     return
                 if store is not None or keys[key] == "s":
-                    # Esc goes through handle_key: it closes a selection or box before it quits.
+                    # Esc goes through handle_key: it clears an explanation before it quits.
                     if watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root):
                         return
                 elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):
