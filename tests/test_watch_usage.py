@@ -193,8 +193,9 @@ def test_usage_line_is_last_even_below_the_other_gates(tmp_path):
     snap.status["installed_gates"] = [{"repo": "o/other", "last_tick": None, "stale": False,
                                        "running_runs": 0, "current": False}]
     rows = render_frame(snap, config(), tmp_path, width=200, now=NOW).splitlines()
-    # The other gates keep the blank line before them; the footer follows them directly.
-    assert rows[-4] == "" and "o/other" in rows[-3]
+    # The other gates follow the lane scene directly (its sections set GAP_AFTER = False);
+    # the footer follows them directly.
+    assert "o/other" in rows[-3] and "o/other" not in rows[-4]
     assert rows[-2].startswith("Claude —") and rows[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit"
     plain = render_frame(snapshot(), config(), tmp_path, width=200, now=NOW).splitlines()
     assert plain[-2].startswith("Claude —") and plain[-1] == "Click an acorn to see what it is · s settings · m usage mode · q quit", "hints directly under usage"
