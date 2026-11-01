@@ -108,10 +108,14 @@ class IssueSnapshotMixin:
         """Pending GitHub writes, derived from the intent log, in queue order."""
         return self._pending(self._issue_record())
 
+    def github_blocking_outbox(self) -> list[dict[str, Any]]:
+        """Pending workflow writes; issue evidence never holds the run start gate."""
+        return [entry for entry in self.github_outbox() if not entry.get("evidence")]
+
     def github_write_issues(self) -> set[int]:
-        """Issues with unretired writes, including sends awaiting their next observation."""
+        """Issues with unretired workflow writes, including sends awaiting observation."""
         return {entry["issue"] for entry in self._issue_record().get("outbox", [])
-                if not _observations.abandoned(entry)}
+                if not _observations.abandoned(entry) and not entry.get("evidence")}
 
     def local_board_value(self, number: int, project: str, field: str) -> Any:
         """The board value last recorded for an issue's card, copying only that value."""

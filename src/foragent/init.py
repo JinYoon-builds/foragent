@@ -1,6 +1,7 @@
 """Idempotent repository setup; all external commands can be injected."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 import json
 import logging
@@ -252,7 +253,7 @@ def init_repo(
     executor: str | None = None, run_hours: str | None = None, language: str | None = None,
     no_push: bool = False,
     no_launchd: bool = False, no_board: bool = False, dry_run: bool = False, git: GitRepo | None = None,
-    board_map: str | None = None, claude_quota: str | None = None,
+    board_map: str | None = None, claude_quota: str | None = None, fa_allow: str | None = None,
     gh_run: Callable[..., str] | None = None, tracker: Tracker | None = None,
     install_launchd: Callable[[Path], str] | None = None,
 ) -> InitReport:
@@ -464,6 +465,166 @@ def init_repo(
         git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
+    if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root.resolve())):
+        notes.append("FA commands permission: not yet decided — /fa setup asks, or run `fa init --fa-allow yes|no`.")
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)
+
+
+FA_ALLOW_RULE = "Bash(fa:*)"
+FA_ALLOW_PROMPT = (
+    f"Allow Foragent (fa) commands in this project's Claude settings?\n"
+    f"  This adds one rule, {FA_ALLOW_RULE}, to .claude/settings.local.json for this project only,\n"
+    "  not your whole account. Claude can then run fa commands here without asking each time.\n"
+    "  fa commands do not expose permanent deletion, money transactions, sending to others,\n"
+    "  or widening permissions. [y/N] "
+)
+
+
+def fa_allow_record_path() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state_home) / "foragent" / "fa-allow.json"
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read_fa_allow_settings(path: Path) -> dict | None:
+    settings = _read_json_object(path)
+    if settings is None:
+        return None
+    permissions = settings.get("permissions", {})
+    if not isinstance(permissions, dict) or not isinstance(permissions.get("allow", []), list):
+        return None
+    return settings
+
+
+def _write_json_atomic(path: Path, value: dict) -> None:
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _has_fa_allow(settings: dict | None) -> bool:
+    permissions = (settings or {}).get("permissions")
+    allow = permissions.get("allow") if isinstance(permissions, dict) else None
+    return isinstance(allow, list) and FA_ALLOW_RULE in allow
+
+
+@contextmanager
+def _flock(path: Path, *, wait: bool) -> Iterator[bool]:
+    """Hold an exclusive flock on ``path``; yield False when ``wait`` is off and another holds it."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _remember_fa_allow(key: str, decision: str) -> None:
+    """Add one project's answer to the shared record, re-read under the record lock."""
+    record_file = fa_allow_record_path()
+    # Other projects write the same file; merge into a fresh read, never a snapshot.
+    with _flock(record_file.with_suffix(".lock"), wait=True):
+        record = _read_json_object(record_file)
+        if record is None:
+            # Rewriting an unreadable record would erase every other project's answer.
+            raise OSError(f"{record_file} is not a readable JSON object")
+        _write_json_atomic(record_file, {**record, key: decision})
+
+
+def _fa_allow_decided(key: str) -> bool:
+    return (_read_json_object(fa_allow_record_path()) or {}).get(key) in {"accepted", "declined"}
+
+
+def _has_claude_settings(root: Path) -> bool:
+    return any((root / ".claude" / name).exists() for name in ("settings.json", "settings.local.json"))
+
+
+def offer_fa_allow(root: Path, ask: Callable[[str], str] = input, *, require_settings: bool = True,
+                   answer: str | None = None) -> str:
+    """Ask once whether Claude may run fa commands in this project; remember either answer.
+
+    Returns "added", "declined", "present" (the rule was already there), "kept" (already
+    decided), "busy" (another init is deciding for this project now), "skipped" (the project
+    has no Claude settings file yet, so the fa-init skill asks using the summary note;
+    pass ``require_settings=False`` to bypass that settings-file condition),
+    "unanswered" (no terminal) or "unreadable" (invalid local settings). An explicit
+    ``answer`` revises the remembered decision without asking; declining preserves existing settings.
+    Raises OSError when a file
+    cannot be written; then nothing is remembered.
+
+    One per-project lock covers the whole check, prompt and write, so two inits of the same
+    project never both ask. Files are re-read after the answer, because the prompt can wait
+    for minutes while an editor or Claude changes them.
+    """
+    import hashlib
+
+    key = str(root.resolve())
+    # New projects defer the question to the skill without creating state or lock files.
+    if answer is None and require_settings and not _has_claude_settings(root):
+        return "kept" if _fa_allow_decided(key) else "skipped"
+    claude = root / ".claude"
+    local_file = claude / "settings.local.json"
+
+    def rule_present() -> bool:
+        return _has_fa_allow(_read_json_object(local_file)) or _has_fa_allow(
+            _read_json_object(claude / "settings.json"))
+
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    project_lock = fa_allow_record_path().parent / f"fa-allow-{digest}.lock"
+    with _flock(project_lock, wait=False) as held:
+        if not held:
+            return "busy"
+        if answer is None:
+            if _fa_allow_decided(key):
+                return "kept"
+            if rule_present():
+                _remember_fa_allow(key, "accepted")
+                return "present"
+            if _read_fa_allow_settings(local_file) is None:
+                return "unreadable"
+            try:
+                answer = ask(FA_ALLOW_PROMPT)
+            except (EOFError, OSError):
+                return "unanswered"
+        if answer.strip().lower() not in {"y", "yes"}:
+            _remember_fa_allow(key, "declined")
+            return "declined"
+        if rule_present():  # Added by hand while the prompt waited: do not add it twice.
+            _remember_fa_allow(key, "accepted")
+            return "present"
+        local = _read_fa_allow_settings(local_file)
+        if local is None:
+            return "unreadable"
+        permissions = local.get("permissions", {})
+        allow = permissions.get("allow", [])
+        local["permissions"] = {**permissions, "allow": [*allow, FA_ALLOW_RULE]}
+        # Settings first: a recorded acceptance without the rule would never be offered again.
+        _write_json_atomic(local_file, local)
+        _remember_fa_allow(key, "accepted")
+    return "added"
