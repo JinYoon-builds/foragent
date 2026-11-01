@@ -116,6 +116,8 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     points = {start, now}
     for spans in [[span for _, span in occupied], testing, *pauses.values()]:
         points.update(moment for span in spans for moment in span)
+    for row in executions:
+        points.update((row["started"], row["finished"] or now))
     points.update(at for values in budgets.values() for at, _ in values)
     for issue in issues.values():
         points.update(at for at, _, _ in issue["events"])
@@ -126,6 +128,7 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     for low, high in zip(ordered, ordered[1:]):
         moment = low + (high - low) / 2
         busy = {number for (index, number), (a, b) in occupied if not index and a <= moment < b}
+        busy |= {row["number"] for row in executions if row["started"] <= moment < (row["finished"] or now)}
         if not any(number not in busy and _startable(issue, moment, pauses) for number, issue in issues.items()):
             continue
         parallel, slots = _value_at(budgets["parallel"], moment), _value_at(budgets["test_slots"], moment)
@@ -219,6 +222,8 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     occupied, _ = _occupancy(store, moment, executions, phases, open_end=moment + 3650 * DAY)
     holding = [(index, number) for (index, number), (a, b) in occupied if a <= moment < b]
     busy = {number for index, number in holding if not index}
+    # Waiting runs retain their project place and file claims even while their machine slot is free.
+    busy |= {row["number"] for row in executions if row["started"] <= moment < (row["finished"] or moment + DAY)}
     runs = {(run.number, _time(run.started_at)): run for run in [*store.read_history(), *store.active_runs()]}
     known, unknown = [], []
     for row in executions:  # This repository's runs holding a slot at the moment claim their Files.
