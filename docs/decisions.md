@@ -930,3 +930,6 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D108. 지금 규칙은 rules.md, 지난 기록은 decisions.md (2026-10-31, Jin)
 - 결정: `docs/rules.md`는 지금 지키는 규칙만 한두 줄씩 담고, 줄마다 살아 있는 결정 번호를 붙인다. `docs/decisions.md`는 덧붙이기만 하는 기록이다. 규칙은 Jin만 만든다. 뜻을 바꾸는 수정은 하지 않고 기획 세션에 질문으로 보낸다.
+
+### D82 보강 5-4를 대체한 결정의 기록 (2026-10-30, Jin; 2026-11-01 기록)
+- D82 보강 5-4(5-④)는 Jin의 2026-10-30 결정(아키텍트가 프로젝트 전체를 독립적으로 검토한다)과 D99로 대체되었다. 지금 깨우는 계기는 D99가 정한다.

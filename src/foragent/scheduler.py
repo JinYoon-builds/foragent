@@ -13,14 +13,14 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
-from foragent.orch_dream import DREAM_EVERY_MERGES, dream_due  # noqa: F401
+from foragent.orch_dream import dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
@@ -292,12 +292,16 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
+    timed("order_finish_check", orch_role_schedule.observe, ctx)  # Facts only; a no-start tick records them too.
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
+    roles = timed("role_check", orch_role_schedule.startable, ctx, sample)  # So is a due role session.
     if not ready:
-        orch_dream.start(ctx, dreams, timed("machine_budget", _machine_budget, ctx, ready, sample), report)
+        budget = timed("machine_budget", _machine_budget, ctx, ready, sample)
+        orch_dream.start(ctx, dreams, budget, report)
+        orch_role_schedule.dispatch(ctx, roles, budget, report)
         _reopen_view(ctx, report)
         return report
 
@@ -307,6 +311,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     if started is None:
         return report
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
+    orch_role_schedule.dispatch(ctx, roles, ctx._tick_budget, report)  # Then what the dream left.
     _reopen_view(ctx, report)
     return report
 
