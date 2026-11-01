@@ -58,10 +58,8 @@ def intact(case):
     assert flush(case)["status"] == "empty"
 
 
-@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-record"])
-def test_rebuild_interruption_finishes_tree_ref_and_journal_once(waiting, git_history, monkeypatch, edge):
-    case = waiting
-    root, _config, _tracker, git, store = case
+def interrupt_rebuild(case, git_history, monkeypatch, edge):
+    git = case[3]
     fail_push(case, monkeypatch)
     old = git.head_sha()
     git_history.update({"upstream.txt": "Moved base\n"})
@@ -80,12 +78,22 @@ def test_rebuild_interruption_finishes_tree_ref_and_journal_once(waiting, git_hi
         if kind == "rebased" and edge == "before-record":
             raise Interrupted()
         append(store, kind, batch, **values)
+        if kind == "rebased" and edge == "after-record":
+            raise Interrupted()
 
     with monkeypatch.context() as patch:
         patch.setattr(git, "_call", command)
         patch.setattr(journal, "append", record)
         with pytest.raises(Interrupted):
             flush(case)
+    return old
+
+
+@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-record"])
+def test_rebuild_interruption_finishes_tree_ref_and_journal_once(waiting, git_history, monkeypatch, edge):
+    case = waiting
+    root, _config, _tracker, git, store = case
+    old = interrupt_rebuild(case, git_history, monkeypatch, edge)
     intent = next(row for row in journal.entries(store) if row["kind"] == "rebuilding")
     flush(case)
     assert git.head_sha() == intent["sha"] != old
@@ -246,3 +254,166 @@ def test_resume_holds_the_shared_publication_gate(waiting, monkeypatch):
     monkeypatch.setattr(git, "push_base", pushed)
     assert flush(waiting)["status"] == "published"
     assert not held
+
+
+def interrupt_before_recording(case, monkeypatch):
+    git, append = case[3], journal.append
+
+    def record(store, kind, batch, **values):
+        if kind == "committed":
+            raise Interrupted()
+        append(store, kind, batch, **values)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, "append", record)
+        with pytest.raises(Interrupted):
+            flush(case)
+    return git.head_sha()
+
+
+def stop_recorded(case, monkeypatch):
+    fail_push(case, monkeypatch)
+    return case[3].head_sha()
+
+
+def move_back(case, sha):
+    """This clone's branch lost the published batch commit, keeping unrelated bytes."""
+    root = case[0]
+    parent = git_command(root, "rev-parse", f"{sha}~1")
+    git_command(root, "read-tree", "-m", "-u", sha, parent)
+    git_command(root, "update-ref", "refs/heads/main", parent, sha)
+
+
+def forbid_commit(case, monkeypatch):
+    # The fixture's fixed clock gives an identical retry the same SHA, hiding the repeat.
+    def forbidden(paths, title):
+        pytest.fail("a published batch must not be committed again")
+
+    monkeypatch.setattr(case[3], "commit_paths", forbidden)
+
+
+def published_once(case, origin):
+    root = case[0]
+    assert (root / "docs/decisions.md").read_text().count("One retained decision") == 1
+    assert git_command(origin, "show", "refs/heads/main:docs/decisions.md").count("One retained decision") == 1
+    assert len(git_command(origin, "log", "--format=%H", "--grep=Foragent batch", "refs/heads/main").splitlines()) == 1
+    intact(case)
+
+
+@pytest.mark.parametrize("stop", [interrupt_before_recording, stop_recorded], ids=["unrecorded", "recorded"])
+@pytest.mark.parametrize("behind", [False, True], ids=["in-head", "outside-head"])
+def test_commit_pushed_externally_is_recognized_not_published_again(waiting, git_history, monkeypatch, stop, behind):
+    sha = stop(waiting, monkeypatch)
+    waiting[3].push_base("main")  # Someone else's push of this clone's branch.
+    if behind:
+        move_back(waiting, sha)
+    forbid_commit(waiting, monkeypatch)
+    assert flush(waiting)["status"] == "published"
+    assert waiting[3].head_sha() == sha
+    published_once(waiting, git_history.origin)
+
+
+def rewritten_copy(case, git_history, sha):
+    """Publish the same batch commit, under its title, rewritten onto a moved base."""
+    root = case[0]
+    git_history.update({"upstream.txt": "Moved base\n"})
+    git_command(root, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    tree = git_command(root, "merge-tree", "--write-tree", "origin/main", sha).splitlines()[0]
+    subject = git_command(root, "log", "-1", "--format=%s", sha)
+    copy = git_command(root, "-c", "user.name=Other", "-c", "user.email=other@example.com",
+                       "commit-tree", tree, "-p", "origin/main", "-m", subject)
+    git_command(root, "update-ref", "refs/copy/batch", copy)
+    git_command(git_history.origin, "fetch", str(root), "refs/copy/batch:refs/heads/main")
+    return copy
+
+
+@pytest.mark.parametrize("stop", [interrupt_before_recording, stop_recorded], ids=["unrecorded", "recorded"])
+def test_rewritten_copy_on_the_remote_replaces_the_local_commit_without_a_rebuild(
+    waiting, git_history, monkeypatch, stop,
+):
+    copy = rewritten_copy(waiting, git_history, stop(waiting, monkeypatch))
+    assert flush(waiting)["status"] == "published"
+    assert waiting[3].head_sha() == copy
+    assert git_command(git_history.origin, "rev-parse", "refs/heads/main") == copy
+    published_once(waiting, git_history.origin)
+
+
+def test_rewritten_copy_with_local_descendants_refuses_and_retains_pending(waiting, git_history, monkeypatch):
+    root, _config, _tracker, git, store = waiting
+    sha = stop_recorded(waiting, monkeypatch)
+    copy = rewritten_copy(waiting, git_history, sha)
+    (root / "later.txt").write_text("Later\n")
+    git.ensure_tracked(["later.txt"])
+    git.commit_paths(["later.txt"], "Unrelated descendant")
+    later = git.head_sha()
+    with pytest.raises(PlanError, match="local descendants") as error:
+        flush(waiting)
+    assert len(str(error.value).splitlines()) == 1
+    assert git.head_sha() == later != copy
+    assert git_command(git_history.origin, "rev-parse", "refs/heads/main") == copy
+    assert order_notes.pending(store)["notes"][0]["status"] == "waiting"
+
+
+def test_published_batch_clears_leftover_batch_bytes_before_catching_up(waiting, git_history, monkeypatch):
+    root, _config, _tracker, git, _store = waiting
+    sha = stop_recorded(waiting, monkeypatch)
+    git.push_base("main")
+    move_back(waiting, sha)
+    (root / "docs/decisions.md").write_text("A partial batch write\n")
+    git_command(root, "add", "--", "docs/decisions.md")
+    forbid_commit(waiting, monkeypatch)
+    assert flush(waiting)["status"] == "published"
+    assert git.head_sha() == sha
+    published_once(waiting, git_history.origin)
+
+
+def merge_externally(case, git_history, sha):
+    """Someone merges the recorded batch commit into the moved remote base."""
+    root = case[0]
+    git_command(root, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    tree = git_command(root, "merge-tree", "--write-tree", "origin/main", sha).splitlines()[0]
+    merged = git_command(root, "-c", "user.name=Other", "-c", "user.email=other@example.com",
+                         "commit-tree", tree, "-p", "origin/main", "-p", sha, "-m", "Merge the batch")
+    git_command(root, "update-ref", "refs/copy/batch", merged)
+    git_command(git_history.origin, "fetch", str(root), "refs/copy/batch:refs/heads/main")
+    return merged
+
+
+def forbid_rebuild(case, monkeypatch):
+    git, run = case[3], case[3]._call
+
+    def command(args):
+        assert args[0] != "commit-tree", "a published batch must not be rebuilt"
+        return run(args)
+
+    monkeypatch.setattr(git, "_call", command)
+    forbid_commit(case, monkeypatch)
+
+
+def assert_only_recorded_commit_published(case, git_history, sha, merged):
+    root, _config, _tracker, git, store = case
+    assert git.head_sha() == sha
+    assert git_command(git_history.origin, "rev-parse", "refs/heads/main") == merged
+    assert not git_command(root, "diff", "--name-only", "HEAD", "--", "upstream.txt", "docs/decisions.md")
+    assert not (root / "upstream.txt").exists()
+    assert not git.uncommitted_paths(["docs/decisions.md"])
+    assert [row["sha"] for row in journal.entries(store) if row["kind"] == "pushed"] == [sha]
+    published_once(case, git_history.origin)
+
+
+@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-record", "after-record"])
+def test_interrupted_rebuild_stops_when_the_batch_was_merged_externally(waiting, git_history, monkeypatch, edge):
+    sha = interrupt_rebuild(waiting, git_history, monkeypatch, edge)
+    merged = merge_externally(waiting, git_history, sha)
+    forbid_rebuild(waiting, monkeypatch)
+    assert flush(waiting)["status"] == "published"
+    assert_only_recorded_commit_published(waiting, git_history, sha, merged)
+
+
+def test_retried_push_does_not_rebuild_a_batch_merged_externally(waiting, git_history, monkeypatch):
+    sha = stop_recorded(waiting, monkeypatch)
+    git_history.update({"upstream.txt": "Moved base\n"})
+    merged = merge_externally(waiting, git_history, sha)
+    forbid_rebuild(waiting, monkeypatch)
+    assert flush(waiting)["status"] == "published"
+    assert_only_recorded_commit_published(waiting, git_history, sha, merged)

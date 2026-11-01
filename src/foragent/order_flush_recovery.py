@@ -22,8 +22,9 @@ def restore(root, git, paths):
             repo_path(root, name).unlink(missing_ok=True)
 
 
-def _find(git, remote, batch):
-    records = git._call(["log", "--format=%H%x00%s", f"{remote}..HEAD"]).splitlines()
+def _find(git, rev, batch):
+    """The batch commit in ``rev``'s whole history: its title carries the batch's unique id."""
+    records = git._call(["log", "--format=%H%x00%s", "--fixed-strings", f"--grep={title(batch)}", rev]).splitlines()
     return next((line.split("\0", 1)[0] for line in records
                  if line.partition("\0")[2] == title(batch)), None)
 
@@ -35,6 +36,28 @@ def _install(git, config, old, new):
     git._call(["update-ref", f"refs/heads/{config.base_branch}", new, old])
 
 
+def _land(root, config, git, batch, local, published):
+    """Bring HEAD to a batch commit the remote already has, repeating nothing."""
+    if git.is_ancestor(published, "HEAD"):
+        return
+    if local is None:
+        restore(root, git, batch["paths"])
+        git.update_base(config.base_branch)
+    elif git.head_sha() == local:
+        _install(git, config, local, published)
+    else:
+        raise PlanError(text("order_flush_descendants", config.language))
+
+
+def _unfinished_rebuild(git, history, saved):
+    """The rebuild intent whose ref never moved: the tree may sit on either side of it."""
+    rebuilding = [row for row in history if row["kind"] == "rebuilding"]
+    if (rebuilding and history.index(rebuilding[-1]) > history.index(saved[-1])
+            and git.head_sha() == rebuilding[-1]["old"]):
+        return rebuilding[-1]
+    return None
+
+
 def committed(root, config, git, store, batch, records):
     """Return the recognized SHA, or restore the uncommitted intent for retry."""
     remote = f"origin/{config.base_branch}"
@@ -42,22 +65,29 @@ def committed(root, config, git, store, batch, records):
     history = [row for row in records if row["batch"] == batch["batch"]]
     saved = [row for row in history if row["kind"] in {"committed", "rebased"}]
     sha = saved[-1]["sha"] if saved else None
-    # A non-ancestor is handled before any moved-base rebuild. The ref may
-    # already name a rebuilt commit whose rebased record was interrupted.
-    if sha is None or not git.is_ancestor(sha, "HEAD"):
-        found = _find(git, remote, batch)
-        if found:
+    # The recorded SHA may be stale: a rebuilt ref can have outlived its rebased record.
+    local = sha if sha and git.is_ancestor(sha, "HEAD") else _find(git, "HEAD", batch)
+    intent = _unfinished_rebuild(git, history, saved) if saved else None
+    # Publication is a remote fact, whatever this clone recorded or holds; it ends any rebuild.
+    found = _find(git, remote, batch)
+    if found:
+        if intent:
+            # Two-tree read-tree lands on the unmoved ref from either side of the interruption.
+            git._call(["read-tree", "-m", "-u", intent["sha"], intent["old"]])
+        _land(root, config, git, batch, local, found)
+        if found != sha:
             journal.append(store, "rebased" if sha else "committed", batch["batch"], sha=found, old=sha)
-            return found
+        return found
+    if local is None:
         restore(root, git, batch["paths"])
         return None
-    rebuilding = [row for row in history if row["kind"] == "rebuilding"]
-    if rebuilding and history.index(rebuilding[-1]) > history.index(saved[-1]):
-        intent = rebuilding[-1]
-        if git.head_sha() == intent["old"]:
-            _install(git, config, intent["old"], intent["sha"])
-            journal.append(store, "rebased", batch["batch"], old=intent["old"], sha=intent["sha"])
-            sha = intent["sha"]
+    if local != sha:
+        journal.append(store, "rebased" if sha else "committed", batch["batch"], sha=local, old=sha)
+        return local
+    if intent:
+        _install(git, config, intent["old"], intent["sha"])
+        journal.append(store, "rebased", batch["batch"], old=intent["old"], sha=intent["sha"])
+        sha = intent["sha"]
     return sha
 
 

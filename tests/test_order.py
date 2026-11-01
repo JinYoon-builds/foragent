@@ -77,6 +77,11 @@ class PublishingGit:
         self.saved.update(contents)
         self.pushed = False
 
+    def _call(self, args):
+        # Recovery's history search: this fake keeps no history, so it finds no batch commit.
+        assert args[0] == "log"
+        return ""
+
     def is_ancestor(self, ancestor, head):
         # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
         return self.pushed if head.startswith("origin/") else ancestor in {"published", "origin/main"}
