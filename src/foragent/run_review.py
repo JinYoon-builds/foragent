@@ -20,13 +20,14 @@ from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
 from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
 from foragent.executors import ExecResult
+from foragent.pr_body_limit import PrBody, change_outside_quoted, load_quoted, own_written_text
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
 from foragent.run_execution import _available_executor, _requeue_limit
 from foragent.run_prompts import (
-    build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
+    build_review_prompt, lane_decisions_block, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
 )
 from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
 from foragent.run_waits import _phase, _progress, _timeout
@@ -450,6 +451,20 @@ def _risk_notes(git: GitRepo, base_ref: str) -> str:
     return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
 
 
+def refreshed_native_body(root: Path, body: str, n: int, acceptance_dir: str, language: str,
+                          notes: str, decisions: str) -> PrBody:
+    """Bring an open PR's body up to this head; what this writes outlasts the older text."""
+    def refresh(text: str) -> str:
+        text = with_review_scope(text, acceptance_dir, language)
+        return refresh_lane_decisions(risks.refresh_notes(text, notes), decisions)
+
+    refreshed = change_outside_quoted(load_quoted(root, body), refresh)
+    return own_written_text(refreshed, f"Closes #{n}", [
+        "## Review scope", *review_scope_rules(acceptance_dir, language).splitlines(),
+        risks.notes_block(notes), lane_decisions_block(decisions),
+    ])
+
+
 def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
     """Add the review scope, or every rule line an older PR's existing scope section lacks."""
     rules = review_scope_rules(acceptance_dir, language)
@@ -610,9 +625,10 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
             # Native PR review reads only the PR body: refresh the risk notes for this head and base.
-            body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
-            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config))
-            body = refresh_lane_decisions(body, _lane_decisions(n, ctx, git.root))
+            body = refreshed_native_body(
+                ctx.store.root, pr.body, n, ctx.config.acceptance_dir, ctx.config.language,
+                review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config),
+                _lane_decisions(n, ctx, git.root))
             if body != pr.body:
                 pr = replace(pr, body=body)
                 ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from foragent.pr_body_limit import Quoted, join_pr_body
 from foragent.policy import Decision
 from typing import TYPE_CHECKING
 
@@ -146,10 +147,10 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
     lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")
-        lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
+        lines.append(Quoted(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else "")))
     issue = ctx.tracker.get_issue(parent)
     title = f"Batch: {issue.title} (#{parent})"
-    body = "\n".join(lines)
+    body = join_pr_body(lines, "\n")
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
         if issue.state == "open":  # A completed order (#411) stays in Done.

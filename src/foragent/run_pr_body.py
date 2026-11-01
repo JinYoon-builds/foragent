@@ -2,15 +2,28 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from foragent import risks
+from foragent.pr_body_limit import PrBody, Quoted, join_pr_body
 from foragent.run_prompts import lane_decisions_block, review_scope_rules
 
 if TYPE_CHECKING:
     from foragent.issue import ParsedIssue
     from foragent.run_checks import CheckResult
     from foragent.run_review import ReviewResult
+
+
+_SHORT_SUMMARY = re.compile(r"^## What changed[ \t]*\n\s*(?:(?!#)[^\n]+(?:\n|$))+", re.MULTILINE)
+
+
+def _try_parts(try_text: str) -> list[str]:
+    """The card is the implementer's text, apart from the short summary the PR must keep."""
+    match = _SHORT_SUMMARY.search(try_text)
+    if match is None:
+        return [Quoted(try_text)]
+    return [Quoted(try_text[:match.start()]), match[0], Quoted(try_text[match.end():])]
 
 
 def _pr_body(
@@ -23,7 +36,7 @@ def _pr_body(
     rebuttals: str = "", searched: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
     risk_notes: str = "", language: str = "en", lane_decisions: str = "",
-) -> str:
+) -> PrBody:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
         command = check.command.replace("&", "&amp;").replace("<", "&lt;").replace("|", "&#124;")
@@ -45,15 +58,15 @@ def _pr_body(
     for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
         lines.append(f"Round {round_number}: VERDICT: {review.verdict}")
         if review.findings:
-            lines.append(review.findings)
-        lines.extend(f"NOTE: {note}" for note in review.review_notes)
-        lines.extend(review.notes)
+            lines.append(Quoted(review.findings))
+        lines.extend(Quoted(f"NOTE: {note}") for note in review.review_notes)
+        lines.extend(Quoted(note) for note in review.notes)
         lines.append("")
     if rebuttals:
-        lines.extend(["", "## Rebuttals", "", rebuttals])
+        lines.extend(["", "## Rebuttals", "", Quoted(rebuttals)])
     if searched:
         # The lane's own list of what it searched for, where and what it found; read, never judged.
-        lines.extend(["", "## Searched", "", searched])
+        lines.extend(["", "## Searched", "", Quoted(searched)])
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)
@@ -68,7 +81,7 @@ def _pr_body(
     if attempt_tiers:
         lines.extend(["", *(f"Attempt {number} at tier {tier}" for number, tier in attempt_tiers.items())])
     lines.extend(["", f"Opened by Foragent gate (attempt {attempt})"])
-    return "\n".join(lines) + "\n\n## Try it\n\n" + (
-        try_text if try_text is not None else "_not provided by the implementer_"
-    )
-
+    return join_pr_body([
+        join_pr_body(lines, "\n"), "\n\n## Try it\n\n",
+        *(["_not provided by the implementer_"] if try_text is None else _try_parts(try_text)),
+    ])

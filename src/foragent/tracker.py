@@ -673,9 +673,10 @@ class RecordingTracker:
         from hashlib import sha256
 
         from foragent.i18n import text
-        from foragent.pr_body_limit import PR_BODY_LIMIT, fit_pr_body
+        from foragent.pr_body_limit import PR_BODY_LIMIT, fit_pr_body, record_quoted
 
         if len(body) <= PR_BODY_LIMIT:
+            record_quoted(self._context.store.root, body)
             return body
         # Content-addressed originals survive worktree/run cleanup and later edits.
         digest = sha256(body.encode("utf-8")).hexdigest()[:12]
@@ -685,7 +686,9 @@ class RecordingTracker:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
         notice = text("pr_body_shortened", self._context.config.language, path=relative)
-        return fit_pr_body(body, notice=notice)
+        fitted = fit_pr_body(body, notice=notice)
+        record_quoted(self._context.store.root, fitted)
+        return fitted
 
     def _record_pr_state(self, pr, **fields):
         for row in self._context.store.local_issues():
