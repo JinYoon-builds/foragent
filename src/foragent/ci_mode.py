@@ -25,6 +25,14 @@ class StaleComparison(UnusableComparison):
     """Every check passed except the base or measurement producer is no longer current."""
 
 
+def serialize_reports(reports):
+    """Pin external evidence without letting malformed data escape as a code error."""
+    try:
+        return json.dumps(reports, sort_keys=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
 def _excluded_subset(value, required):
     """CI's exclusions still protect every file the gate requires now."""
     return (isinstance(value, list) and all(isinstance(path, str) for path in value)
@@ -46,6 +54,17 @@ def _trusted_sha(git, tracker):
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         return None
+
+
+def changed_workflows(git, trusted_sha, head):
+    """PR artifacts are trusted only when their workflow matches the default branch."""
+    if trusted_sha is None:
+        raise GitError("Default branch reference unavailable")
+    return git._call([
+        "diff", "--name-only", "-z", trusted_sha, head, "--",
+        ".github/workflows/foragent-acceptance*.yml",
+        ".github/workflows/foragent-acceptance*.yaml",
+    ])
 
 
 @dataclass(frozen=True)
@@ -75,8 +94,8 @@ class ComparisonEvidence:
                     return False
             if self.reports is None:
                 return True  # Local evidence is pinned to the same base/head and scope.
-            return self.reports == json.dumps(ctx.tracker.pr_acceptance_reports(head), sort_keys=True)
-        except (AttributeError, TrackerError) as exc:
+            return self.reports == serialize_reports(ctx.tracker.pr_acceptance_reports(head))
+        except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
             return False
@@ -257,7 +276,7 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                         if node.split("::", 1)[0] not in excluded)
             reports[index] = evidence["report"]
             duration = max(duration, seconds)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError, RecursionError, OverflowError) as exc:
             raise UnusableComparison(f"Unusable acceptance shard: {exc}") from exc
     if not expected_shards or set(reports) != expected_shards:
         raise MissingComparison(f"missing acceptance shards: report.shard_index: observed {_shown(sorted(reports))}, "
@@ -284,17 +303,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
     try:
-        if trusted_sha is None:
-            raise GitError("Default branch reference unavailable")
-        changed_workflows = attempt.git._call([
-            "diff", "--name-only", "-z", trusted_sha, head, "--",
-            ".github/workflows/foragent-acceptance*.yml",
-            ".github/workflows/foragent-acceptance*.yaml",
-        ])
+        workflows_changed = changed_workflows(attempt.git, trusted_sha, head)
     except GitError as exc:
-        changed_workflows = False
+        workflows_changed = False
         workflow_error = str(exc)
-    if changed_workflows:
+    if workflows_changed:
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             return evidence
@@ -311,6 +324,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
                                            expected_scope=scope,
                                            expected_shards=range(ctx.config.ci_shards))
+                recorded_reports = serialize_reports(reports)
                 break
             except (MissingComparison, StaleComparison):
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
@@ -323,7 +337,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
 
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
-    except (UnusableComparison, AttributeError, TrackerError) as exc:
+    except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
@@ -350,7 +364,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                              json.dumps(reports, sort_keys=True))
+                              recorded_reports)
 
 
 def review_checks(n, ctx, git, target_branch):

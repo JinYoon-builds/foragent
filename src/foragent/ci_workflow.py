@@ -87,7 +87,8 @@ def workflow_text(config):
     base = config.base_branch.replace("'", "''")
     job = {
         "if": ("github.event.pull_request.head.repo.full_name == github.repository && "
-               "startsWith(github.event.pull_request.head.ref, 'foragent/issue-') && "
+               "(startsWith(github.event.pull_request.head.ref, 'foragent/issue-') || "
+               "startsWith(github.event.pull_request.head.ref, 'foragent/group-')) && "
                f"github.event.pull_request.base.ref == '{base}'"),
         "runs-on": config.ci_runs_on,
         "permissions": {"contents": "read"},
