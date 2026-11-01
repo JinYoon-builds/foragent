@@ -40,6 +40,11 @@ The orchestrator calls you with `fa orch role docs` when one of your signals is 
    - `docs/rules.md` holds the rules in force now, one short line each.
    - `docs/decisions.md` is append-only history: decisions, each with its why and its date. Add
      new entries at the end; never edit or remove old ones.
+     A decision heading carries no implementation status (implemented, not implemented,
+     partial). Status is derived: `fa decisions --json` links each decision to issues from
+     their decision markers and published order specs, and derives `decided, nothing ordered`,
+     `in progress` or `done` from the last recorded issue facts. It shows links and completion,
+     not whether code fulfils every sentence of a decision. Do not write status by hand.
    - `README*` holds what the project is and how to use it.
    - `docs/voice.md` holds voice and wording rules.
    - Each other doc names its one purpose in its first line.
