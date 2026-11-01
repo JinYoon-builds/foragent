@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 from foragent import orch_reviewers, review_perspectives  # noqa: E402
 from foragent.config import Config  # noqa: E402
 from foragent.executors import ExecResult  # noqa: E402
+from foragent.reasons import flag_text  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
 from foragent.state import StateStore  # noqa: E402
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
@@ -202,5 +203,8 @@ def test_merge_fail_blocks_once_with_merged_classes_and_no_raw_reviewer_text(git
     assert outcome != "merged" and case.tracker.merged_prs == []
     returns = [comment.body for comment in case.tracker.list_comments(1)
                if comment.body.startswith("<!-- foragent:blocked")]
-    assert len(returns) == 1 and returns[0].count(merged) == 1
-    assert "RAW-PANEL-" not in returns[0], "The blocked return carries the merger's classes, not raw verdicts"
+    assert len(returns) == 1
+    assert len(returns[0].splitlines()) == 1, "The blocked announcement is one line (#1186)"
+    _, evidence = flag_text(returns[0])
+    assert evidence.count(merged) == 1
+    assert "RAW-PANEL-" not in evidence, "The blocked return carries the merger's classes, not raw verdicts"
