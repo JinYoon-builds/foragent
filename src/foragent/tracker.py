@@ -157,6 +157,17 @@ class TrackerError(RuntimeError):
 
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+# Colour codes and any other terminal control a CI log printed; tabs and newlines stay.
+_TERMINAL_CONTROL = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
+
+
+def _unavailable(what: str, exc: TrackerError) -> str:
+    """The notice for CI evidence that could not be read; a rate limit keeps its own handling."""
+    if exc.is_rate_limit:
+        raise exc
+    return f"(CI evidence unavailable: {what}: {str(exc).strip()})"
 
 
 class IdentityError(TrackerError):
@@ -1437,12 +1448,16 @@ class GhTracker:
 
     def _acceptance_run_ids(self, pr: int, runs: list[dict]) -> set[int]:
         """Only unchanged measurement workflows may be separated from ordinary CI."""
-        from foragent.ci_workflow import WORKFLOW
-
-        candidates = {run["id"] for run in runs if run.get("path") == WORKFLOW}
+        candidates = self._measurement_run_ids(runs)
         if candidates and any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
             return set()
         return candidates
+
+    @staticmethod
+    def _measurement_run_ids(runs: list[dict]) -> set[int]:
+        from foragent.ci_workflow import WORKFLOW
+
+        return {run["id"] for run in runs if run.get("path") == WORKFLOW}
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
@@ -1530,52 +1545,101 @@ class GhTracker:
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
+        A failed job counts as soon as it has failed, even while its run is unfinished.
+        Each part is read on its own: one that cannot be read leaves an "unavailable"
+        line and the others survive; a rate limit still propagates.
         ``not_started`` is true only when every failed job never ran (no steps or a
         "job was not started" annotation); such jobs have no code failure to repair.
         """
-        runs = self._pr_workflow_runs(pr)
-        excluded_runs = self._acceptance_run_ids(pr, runs)
+        try:
+            runs = self._pr_workflow_runs(pr)
+        except TrackerError as exc:
+            return CIEvidence(_unavailable("workflow runs", exc))
         parts = []
+        try:
+            excluded_runs = self._acceptance_run_ids(pr, runs)
+        except TrackerError as exc:
+            # An unverified change must not let measurement text into the evidence.
+            parts.append(_unavailable("changed files of the pull request", exc))
+            excluded_runs = self._measurement_run_ids(runs)
         failed_runs = 0
         code_failure = False
         for run in runs:
-            if run["id"] in excluded_runs or run["conclusion"] not in _FAILED_CONCLUSIONS:
+            if run["id"] in excluded_runs:
+                continue
+            if run.get("conclusion") is not None and run["conclusion"] not in _FAILED_CONCLUSIONS:
+                continue
+            evidence = self._run_evidence(run, full_text_dir)
+            if evidence is None:
                 continue
             failed_runs += 1
+            parts.append(evidence[0])
+            code_failure = code_failure or evidence[1]
+        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+
+    def _run_evidence(self, run: dict[str, Any], full_text_dir: Path | None) -> tuple[str, bool] | None:
+        """One run's text and whether it may hold a code failure; None if nothing failed yet."""
+        run_id = run["id"]
+        unfinished = run.get("conclusion") is None
+        state = run.get("conclusion") or run.get("status") or "unfinished"
+        url = run.get("html_url") or run.get("url") or ""
+        lines = [f"Actions run {run_id} ({run.get('name') or 'workflow'}) {state} {url}".rstrip()]
+        run_logs = ["run", "view", str(run_id), "-R", self.repo, "--log-failed"]
+        try:
             jobs = _items(self._call([
                 "api", "--paginate", "--jq", ".jobs",
-                f"{self._path}/actions/runs/{run['id']}/jobs?per_page=100",
+                f"{self._path}/actions/runs/{run_id}/jobs?per_page=100",
             ]))
-            url = run.get("html_url") or run.get("url") or ""
-            lines = [f"Actions run {run['id']} ({run.get('name') or 'workflow'}) {run['conclusion']} {url}".rstrip()]
-            started_failure = False
-            failed_jobs = 0
-            for job in jobs:
-                if job.get("conclusion") not in _FAILED_CONCLUSIONS:
-                    continue
-                failed_jobs += 1
-                steps = job.get("steps") or []
+        except TrackerError as exc:
+            # Unknown jobs do not prove that nothing started. gh refuses run-wide
+            # logs until the run completes, so only a completed run can still try them.
+            lines.append(_unavailable(f"jobs of run {run_id}", exc))
+            if not unfinished:
+                lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                            full_text_dir, f"ci-run-{run_id}.log"))
+            return "\n".join(lines), True
+        failed = [job for job in jobs if job.get("conclusion") in _FAILED_CONCLUSIONS]
+        if unfinished and not failed:
+            return None
+        started_failure = False
+        for job in failed:
+            steps = job.get("steps") or []
+            try:
                 messages = self._job_annotations(job)
-                job_url = job.get("html_url") or job.get("url") or ""
-                if not steps or any(_NOT_STARTED.search(message) for message in messages):
-                    lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
-                else:
-                    started_failure = True
-                    lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
-                lines.extend(f"  annotation: {message}" for message in messages)
-            # A failed run without failed jobs (e.g. an invalid workflow file) is
-            # still a failure the implementer may be able to repair.
-            if started_failure or not failed_jobs:
-                code_failure = True
-                try:
-                    output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
-                except TrackerError as exc:
-                    if "log not found" not in f"{exc}\n{exc.stdout}".lower():
-                        raise
-                    output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
-            parts.append("\n".join(lines))
-        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+                annotations = [f"  annotation: {message}" for message in messages]
+            except TrackerError as exc:
+                messages = []
+                annotations = ["  " + _unavailable(f"annotations of job {job.get('name')}", exc)]
+            job_url = job.get("html_url") or job.get("url") or ""
+            if not steps or any(_NOT_STARTED.search(message) for message in messages):
+                lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
+                lines.extend(annotations)
+                continue
+            started_failure = True
+            lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
+            lines.extend(annotations)
+            # gh also refuses one job's log until its run completes; the REST log does not.
+            # gh api prints a log with colour codes only with the flag; _log_tail removes them.
+            job_logs = (["api", "--allow-escape-sequences", f"{self._path}/actions/jobs/{job['id']}/logs"] if unfinished
+                        else [*run_logs[:-1], "--job", str(job["id"]), "--log-failed"])
+            lines.append(self._log_tail(job_logs, f"log of job {job.get('name')}",
+                                        full_text_dir, f"ci-job-{job['id']}.log"))
+        # A failed run without failed jobs (e.g. an invalid workflow file) is
+        # still a failure the implementer may be able to repair.
+        if not failed:
+            lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                        full_text_dir, f"ci-run-{run_id}.log"))
+        return "\n".join(lines), started_failure or not failed
+
+    def _log_tail(self, args: list[str], what: str, full_text_dir: Path | None, name: str) -> str:
+        try:
+            output = self._call(args)
+        except TrackerError as exc:
+            return _unavailable(what, exc)
+        output = _TERMINAL_CONTROL.sub("", output)
+        if not output.strip():
+            return f"(CI evidence unavailable: {what}: GitHub returned an empty log)"
+        return cuts.tail(output, 4000, full_text_dir, name)
 
     def _job_annotations(self, job: dict[str, Any]) -> list[str]:
         check_run = job.get("check_run_url") or f"{self._path}/check-runs/{job['id']}"
