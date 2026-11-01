@@ -1296,10 +1296,19 @@ def test_default_gh_timeout_is_wrapped(monkeypatch):
 
 
 @pytest.mark.parametrize("comment", [None, "Closed by Foragent retry"])
-def test_close_pr_deletes_branch_and_records_optional_comment(comment):
+def test_close_pr_deletes_branch_and_records_optional_comment(comment, monkeypatch):
     fake = FakeTracker()
     pr = fake.create_pr(head="foragent/issue-1", base="main", title="PR", body="")
+    issue_closes = []
+    close_issue = fake.close_issue
+
+    def observe_issue_close(n, comment=None):
+        issue_closes.append(n)
+        close_issue(n, comment)
+
+    monkeypatch.setattr(fake, "close_issue", observe_issue_close)
     fake.close_pr(pr, comment)
+    assert issue_closes == []
     assert fake.get_issue(pr).state == "closed"
     assert fake.deleted_branches == ["foragent/issue-1"]
     assert [item.body for item in fake.list_comments(pr)] == ([] if comment is None else [comment])
@@ -1760,3 +1769,29 @@ def test_close_not_planned_survives_recording_and_outbox(tmp_path):
     store.record_issue(remote.get_issue(42), {})
     tracker.close_issue(42, reason="not_planned")
     assert next(row for row in store.local_issues() if row["number"] == 42)["state_reason"] == "not_planned"
+
+
+def test_pending_close_reason_waits_for_the_matching_observation(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(41, "Old work", "body", state="closed")
+    remote.issues[41] = replace(remote.get_issue(41), state_reason="completed")
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: clock[0]))
+    tracker.get_issue(41)
+    store.queue_github_write(41, "close_issue", body=None, reason="not_planned")
+    clock[0] += timedelta(seconds=1)
+    tracker.get_issue(41)
+    # Merely seeing closed does not confirm the requested close reason was delivered.
+    assert [entry["reason"] for entry in store.github_outbox()] == ["not_planned"]
+    assert store.local_issues()[0]["state_reason"] == "not_planned"
+    clock[0] += timedelta(seconds=1)
+    tracker.flush_outbox()
+    clock[0] += timedelta(seconds=1)
+    assert tracker.get_issue(41).state_reason == "not_planned"
+    assert store.github_outbox() == []
