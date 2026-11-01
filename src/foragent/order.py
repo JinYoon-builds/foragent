@@ -268,7 +268,8 @@ def _strings(value, label: str, *, nonempty: bool = False) -> list[str]:
     return value
 
 
-def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | bytes]:
+def validate_plan(plan: dict, root: Path, config: Config, *,
+                  retained_files: dict[str, str] | None = None) -> dict[str, str | bytes]:
     """Every file the order publishes: text as str, reference images as decoded bytes."""
     _object(plan, {"id", "title", "summary", "spec_markdown", "issues"},
             {"new_lanes", "edits", "reference_files"}, "plan")
@@ -361,13 +362,16 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             for name in acceptance_paths(item["done_when"], config.acceptance_dir):
                 if name in files:
                     continue
+                if retained_files is not None and name in retained_files:
+                    files[name] = _text(retained_files[name], f"retained_files[{name}]", empty=True)
+                    continue
                 if not repo_path(root, name).is_file():
                     # A statement issue's tests are written in preparation; publication refuses
                     # it until they are reviewed, so a draft may name tests not written yet.
                     if "statements" in item:
                         continue
                     raise PlanError(f"Done when references missing acceptance file: {name}")
-                files[name] = repo_path(root, name).read_text(encoding="utf-8")
+                files[name] = repo_path(root, name).read_bytes().decode("utf-8")
     for name, content in references.items():
         if name in files and files[name] != content:
             raise PlanError(f"conflicting file contents: {name}")
@@ -604,13 +608,30 @@ def _reconcile_dependencies(tracker: Tracker, number: int, desired: set[int]) ->
         tracker.add_blocked_by(number, blocker)
 
 
-def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
-            git: GitRepo | None = None, manager: SkillManager | None = None,
+@dataclass
+class _Publication:
+    files: dict[str, str | bytes]
+    keys: set[str]
+    selected_keys: set[str]
+    selected_numbers: set[int]
+    parent: int | None
+    mapping: dict[str, int]
+    saved_blobs: dict[str, dict[str, str]]
+    by_number: dict[int, Issue]
+    edit_numbers: set[int]
+    unconfirmed: list[Issue]
+    rows: list[dict]
+    owner: str | None
+
+
+def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
-            defer: str | None = None, urgent: bool = False) -> PublishReport:
+            check_owner: bool = True, retained_files: dict[str, str] | None = None) -> "_Publication":
     try:
-        files = validate_plan(plan, root, config)
+        files = (validate_plan(plan, root, config) if retained_files is None else
+                 validate_plan(plan, root, config, retained_files=retained_files))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     keys = {item["key"] for item in plan["issues"]}
@@ -694,7 +715,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
-        return PublishReport(plan["title"], parent, rows, sorted(files), True)
+        return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
+                            by_number, edit_numbers, unconfirmed, rows, None)
     require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
@@ -708,21 +730,54 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
           if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
-    if defer is not None and not urgent:
+    owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
+                          [by_number[n] for n in mapping.values()]) if check_owner else None)
+    return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
+                        by_number, edit_numbers, unconfirmed, rows, owner)
+
+
+def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            git: GitRepo | None = None, manager: SkillManager | None = None,
+            approve: bool = False, approve_keys: list[str] | None = None,
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            defer: str | None = None, urgent: bool = False) -> PublishReport:
+    waiting = defer is not None and not urgent and not plan.get("new_lanes")
+    publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
+                                      approve=approve, approve_keys=approve_keys,
+                                      approve_numbers=approve_numbers, dry_run=dry_run,
+                                      check_owner=not waiting)
+    if dry_run:
+        return PublishReport(plan["title"], publication.parent, publication.rows,
+                             sorted(publication.files), True)
+    if waiting:
         from foragent import order_submissions
         order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
-                                 approve_numbers=approve_numbers, language=config.language)
-        return PublishReport(plan["title"], parent, rows, sorted(files), False, defer, config.language)
-    owner = _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
-                         [by_number[n] for n in mapping.values()])
+                                 approve_numbers=approve_numbers, language=config.language,
+                                 files=publication.files)
+        return PublishReport(plan["title"], publication.parent, publication.rows,
+                             sorted(publication.files), False, defer, config.language)
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
-    # The owner label exists before any file or issue does: without it, nothing is published.
+    owner = publication.owner
     tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
-        published_blobs = _publish_files(plan, root, config, git, files, manager)
+        published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
+    return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
+                           published_blobs=published_blobs, approve=approve)
+
+
+def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+                    publication: _Publication, published_blobs: dict[str, str],
+                    approve: bool = False) -> PublishReport:
+    """Apply existing issue/approval controls using files from an already published commit."""
+    files, keys = publication.files, publication.keys
+    selected_keys, selected_numbers = publication.selected_keys, publication.selected_numbers
+    parent, mapping, saved_blobs = publication.parent, publication.mapping, publication.saved_blobs
+    by_number, edit_numbers = publication.by_number, publication.edit_numbers
+    unconfirmed, rows, owner = publication.unconfirmed, publication.rows, publication.owner
+    assert owner is not None
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
