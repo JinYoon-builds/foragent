@@ -3,7 +3,11 @@
 import argparse
 from datetime import UTC, datetime, timedelta
 import json
+import os
+import shutil
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -587,15 +591,79 @@ def test_git_failures_are_unknown(repo, monkeypatch, error):
                "command": subprocess.CalledProcessError(128, "git", stderr="bad object"),
                "os": OSError("gone")}[error]
 
-    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root: GitRepo(root, fail))
+    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root, run: GitRepo(root, fail))
     assert orch_scorecard_reverts.times(repo, "main") is None
 
 
 @pytest.mark.parametrize("stamp", ["not-a-time", "9" * 40, ""])
 def test_an_unreadable_commit_time_is_unknown(repo, monkeypatch, stamp):
     output = f'{stamp}\nRevert "Add x"\n\nThis reverts commit {SHA}.\n\0'
-    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root: GitRepo(
+    monkeypatch.setattr(orch_scorecard_reverts, "GitRepo", lambda root, run: GitRepo(
         root, lambda args: "false\n" if args[0] == "rev-parse" else output))
+    assert orch_scorecard_reverts.times(repo, "main") is None
+
+
+def _git_shim(tmp_path, monkeypatch, body):
+    """A `git` first on PATH; ``$REAL_GIT`` is the real one."""
+    folder = tmp_path / "shim"
+    folder.mkdir()
+    shim = folder / "git"
+    shim.write_text(f"#!/bin/sh\n{body}\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("REAL_GIT", shutil.which("git"))
+    monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_a_git_that_is_slow_to_exit_is_read_without_polling(repo, tmp_path, monkeypatch):
+    # The output is complete and the pipes are closed while the process still runs:
+    # waiting with a timeout here is what calls time.sleep, which local fixtures forbid.
+    tip = git_command(repo, "rev-parse", "refs/remotes/origin/main")
+    tree = git_command(repo, "rev-parse", f"{tip}^{{tree}}")
+    at = NOW - timedelta(hours=1)
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _publish(repo, _committed(repo, tree, tip, at=at, message=message, monkeypatch=monkeypatch))
+    _git_shim(tmp_path, monkeypatch, '"$REAL_GIT" "$@"\ncode=$?\nexec >&- 2>&-\nsleep 0.3\nexit $code')
+    monkeypatch.setattr(time, "sleep", lambda seconds: pytest.fail("The read must not poll"))
+    assert orch_scorecard_reverts.times(repo, "main") == [at]
+
+
+def test_a_git_past_its_deadline_is_killed_and_unknown(tmp_path, monkeypatch):
+    # A stand-in process: the test guard makes real kills no-ops, so a real child would not end.
+    (tmp_path / ".git").mkdir()
+    killed = threading.Event()
+
+    class Process:
+        returncode = None
+
+        def __init__(self, command, **options):
+            self.command = command
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *details):
+            return False
+
+        def kill(self):
+            killed.set()
+
+        def communicate(self):
+            if self.command[1] == "rev-parse":
+                self.returncode = 0
+                return "false\n", ""
+            self.returncode = -9 if killed.wait(5) else 0
+            return "", ""
+
+    monkeypatch.setattr(subprocess, "Popen", Process)
+    monkeypatch.setattr(orch_scorecard_reverts, "TIMEOUT_SECONDS", 0.05)
+    assert orch_scorecard_reverts.times(tmp_path, "main") is None
+    assert killed.is_set()
+
+
+def test_a_failing_git_is_unknown_even_with_output(repo, tmp_path, monkeypatch):
+    message = f'Revert "Add x"\n\nThis reverts commit {SHA}.'
+    _git_shim(tmp_path, monkeypatch, 'case "$1" in rev-parse) exec "$REAL_GIT" "$@";; esac\n'
+              f"printf '1700000000\\n{message}\\0'\nexit 128".replace('"Add x"', '\\"Add x\\"'))
     assert orch_scorecard_reverts.times(repo, "main") is None
 
 
