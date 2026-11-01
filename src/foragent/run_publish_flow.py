@@ -181,7 +181,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             return stopped
         queued_status = None
         # Wait for the FIFO turn without re-verifying; CI is checked again on getting it (#712).
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr)
         if stopped:
             return stopped
         if waited:
@@ -280,7 +280,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
-            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge, pr)
             queued_status = None
             continue
         if inputs.stop is not None:

@@ -1,4 +1,9 @@
-"""Locked acceptance for ci-empty-logs: real runner and GhTracker, fake GitHub I/O."""
+"""Locked ci-empty-logs coverage with #1511's ordinary acceptance-CI contract.
+
+#1507 keeps failed-job evidence readable before siblings finish, explicit missing
+evidence and not-started holds. #1511 supersedes only its measurement exclusion:
+this PR's acceptance run and logs count; runs for another head stay unrelated.
+"""
 
 from copy import deepcopy
 import json
@@ -20,6 +25,9 @@ from test_state_split import offline_acceptance  # noqa: F401
 
 REPO = "owner/repo"
 MEASUREMENT = RUN + 1
+MEASUREMENT_JOB = 999
+UNRELATED = RUN + 2
+UNRELATED_JOB = 1000
 JOB = 910
 SECOND_JOB = 911
 FAILED_TESTS = (
@@ -29,7 +37,9 @@ FAILED_TESTS = (
 LOST = "tests/acceptance/test_payload.py::test_missing_from_head"
 JOB_ANNOTATION = "AssertionError: the lane must be preserved"
 SECOND_ANNOTATION = "Comparison step reported lost test IDs"
-EXCLUDED = "EXCLUDED_MEASUREMENT_EVIDENCE"
+MEASUREMENT_ANNOTATION = "Acceptance verdict reported lost passing tests"
+MEASUREMENT_LOST = "tests/acceptance/test_measurement.py::test_keeps_passing"
+EXCLUDED = "EXCLUDED_UNRELATED_RUN_EVIDENCE"
 LOG_HEAD = "OLD_LOG_PREFIX_MUST_NOT_REPLACE_THE_TAIL"
 
 
@@ -49,8 +59,8 @@ class GitHubCI:
 
     Run-wide gh logs remain unavailable until completion, including --job, as
     gh run view currently behaves. Completed job REST logs are already readable.
-    The ordinary job named acceptance must count; the trusted measurement run
-    with the same job display name must stay excluded by workflow provenance.
+    The ordinary job named acceptance and this PR's trusted measurement run with
+    the same job display name both count. The head query excludes unrelated runs.
     """
 
     def __init__(self, case, monkeypatch, *, completed, fault=None,
@@ -69,11 +79,15 @@ class GitHubCI:
         self.annotations = {
             JOB: ANNOTATION if not_started else JOB_ANNOTATION,
             SECOND_JOB: SECOND_ANNOTATION,
+            MEASUREMENT_JOB: ANNOTATION if not_started else MEASUREMENT_ANNOTATION,
+            UNRELATED_JOB: EXCLUDED,
         }
         self.logs = {
             JOB: LOG_HEAD + "\n" + "setup chatter\n" * 1200
                  + "\n".join(f"FAILED {name} - AssertionError" for name in FAILED_TESTS),
             SECOND_JOB: f"Compare acceptance passing sets\nLost test IDs:\n{LOST}\n",
+            MEASUREMENT_JOB: f"Acceptance comparison lost 1 passing test(s):\n{MEASUREMENT_LOST}\n",
+            UNRELATED_JOB: EXCLUDED,
         }
         reader = GhTracker(REPO, self.command)
         monkeypatch.setattr(case.tracker, "pr_checks", reader.pr_checks)
@@ -111,15 +125,31 @@ class GitHubCI:
             "repository": {"full_name": REPO}, "jobs": jobs,
         }
         measurement_job = {
-            **job(999, "test (1)"), "run_id": MEASUREMENT,
-            "html_url": f"https://github.com/{REPO}/actions/runs/{MEASUREMENT}/job/999",
+            **job(MEASUREMENT_JOB, "test (1)", steps=self.jobs[0]["steps"],
+                  conclusion="success" if self.passing else "failure"),
+            "run_id": MEASUREMENT,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{MEASUREMENT}/job/{MEASUREMENT_JOB}",
         }
         measurement = {
             **run, "id": MEASUREMENT, "databaseId": MEASUREMENT,
             "name": "custom measurement label", "path": WORKFLOW,
-            "status": "completed", "conclusion": "failure", "check_suite_id": MEASUREMENT,
+            "status": "completed", "conclusion": measurement_job["conclusion"],
+            "check_suite_id": MEASUREMENT,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{MEASUREMENT}",
             "jobs": [measurement_job],
         }
+        unrelated_job = {
+            **job(UNRELATED_JOB, "unrelated"), "run_id": UNRELATED,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{UNRELATED}/job/{UNRELATED_JOB}",
+        }
+        unrelated = {
+            **measurement, "id": UNRELATED, "databaseId": UNRELATED, "name": EXCLUDED,
+            "head_sha": "another-head", "headSha": "another-head", "check_suite_id": UNRELATED,
+            "html_url": f"https://github.com/{REPO}/actions/runs/{UNRELATED}",
+            "jobs": [unrelated_job],
+        }
+        runs = [run, measurement, unrelated]
+        all_jobs = [item for workflow in runs for item in workflow["jobs"]]
         checks = [
             {"name": item["name"], "workflow": "ci", "link": item["html_url"],
              "bucket": "fail" if item["conclusion"] == "failure" else
@@ -127,23 +157,25 @@ class GitHubCI:
             for item in jobs
         ]
         checks.append({"name": "test (1)", "workflow": "custom measurement label",
-                       "bucket": "fail", "link": measurement["jobs"][0]["html_url"]})
+                       "bucket": "pass" if self.passing else "fail",
+                       "link": measurement_job["html_url"]})
         if args[:2] == ["pr", "checks"]:
             output = json.dumps(checks)
             raise subprocess.CalledProcessError(1, ["gh", *args], output=output, stderr="")
         if args[:2] == ["run", "view"]:
+            selected = next(workflow for workflow in runs if str(workflow["id"]) == args[2])
             number = int(args[args.index("--job") + 1]) if "--job" in args else None
-            assert number is not None or args[2] == str(RUN), args
+            assert number is None or number in {item["id"] for item in selected["jobs"]}, args
             if "--log-failed" in args or "--log" in args:
-                if run["status"] != "completed":
-                    self.fail(f"run {RUN} is still in progress; logs will be available when it is complete")
+                if selected["status"] != "completed":
+                    self.fail(f"run {selected['id']} is still in progress; logs will be available when it is complete")
                 return self.log(number) if number else "\n".join(
-                    self.log(item["id"]) for item in jobs if item["conclusion"] == "failure"
+                    self.log(item["id"]) for item in selected["jobs"] if item["conclusion"] == "failure"
                 )
             if self.fault == "jobs-denied":
                 self.fail("HTTP 403: job metadata unavailable")
             fields = args[args.index("--json") + 1].split(",")
-            return json.dumps({field: run[field] for field in fields})
+            return json.dumps({field: selected[field] for field in fields})
 
         assert args[0] == "api", f"Unrecorded GitHub command: {args}"
         prefix = f"repos/{REPO}/"
@@ -153,35 +185,36 @@ class GitHubCI:
         responses = {
             f"{prefix}pulls/2": {"head": {"sha": head}},
             f"{prefix}pulls/2/files": [{"filename": "feature.txt"}],
-            f"{prefix}actions/runs/{RUN}": run,
-            f"{prefix}actions/runs/{RUN}/jobs": {"jobs": jobs, "total_count": len(jobs)},
         }
+        for workflow in runs:
+            responses[f"{prefix}actions/runs/{workflow['id']}"] = workflow
+            responses[f"{prefix}actions/runs/{workflow['id']}/jobs"] = {
+                "jobs": workflow["jobs"], "total_count": len(workflow["jobs"]),
+            }
         if path == f"{prefix}actions/runs":
-            runs = [run, measurement]
             if "check_suite_id" in query:
                 runs = [r for r in runs if str(r["check_suite_id"]) == query["check_suite_id"][0]]
-            elif self.fault == "no-runs":
+            if "head_sha" in query:
+                runs = [r for r in runs if r["head_sha"] == query["head_sha"][0]]
+            if self.fault == "no-runs":
                 runs = []
             response = {"workflow_runs": runs}
         elif path == f"{prefix}commits/{head}/check-runs":
             response = {"check_runs": [
                 {"id": item["id"], "name": item["name"], "details_url": item["html_url"],
                  "app": {"slug": "github-actions"},
-                 "check_suite": {"id": MEASUREMENT if item["id"] == 999 else RUN}}
+                 "check_suite": {"id": item["run_id"]}}
                 for item in [*jobs, *measurement["jobs"]]
             ]}
-        elif path == f"{prefix}actions/runs/{RUN}/jobs" and self.fault == "jobs-denied":
+        elif path.endswith("/jobs") and self.fault == "jobs-denied":
             self.fail("HTTP 403: job metadata unavailable")
-        elif path.startswith(f"{prefix}actions/runs/{MEASUREMENT}"):
-            pytest.fail("Excluded measurement run must not supply failure evidence")
         elif path.startswith(f"{prefix}actions/jobs/"):
             number = int(path.split("/")[-2] if path.endswith("/logs") else path.split("/")[-1])
             if path.endswith("/logs"):
                 return self.log(number)
-            response = next(item for item in jobs if item["id"] == number)
+            response = next(item for item in all_jobs if item["id"] == number)
         elif path.startswith(f"{prefix}check-runs/") and path.endswith("/annotations"):
             number = int(path.split("/")[-2])
-            assert number != 999, EXCLUDED
             if self.fault == "annotations-denied":
                 self.fail("HTTP 403: annotations unavailable")
             response = [{"message": self.annotations[number]}]
@@ -237,9 +270,17 @@ def test_completed_and_in_progress_runs_deliver_each_failed_jobs_annotation_and_
     for completed in (True, False):
         case, ci = scenario(git_history, tmp_path, monkeypatch,
                             completed=completed, second_failure=True)
+        with monkeypatch.context() as green_ordinary:
+            green_ordinary.setattr(ci, "jobs", [
+                {**item, "status": "completed", "conclusion": "success"} for item in ci.jobs
+            ])
+            assert case.ctx.tracker.pr_checks(2) == "fail", (
+                "A failed acceptance measurement alone must keep ordinary CI red"
+            )
         prompt = retry(case, ci)
         for expected in ("test (1)", "acceptance (0)", JOB_ANNOTATION, SECOND_ANNOTATION,
-                         *FAILED_TESTS, LOST):
+                         *FAILED_TESTS, LOST, MEASUREMENT_ANNOTATION, MEASUREMENT_LOST,
+                         f"Actions run {MEASUREMENT}"):
             assert expected in prompt, f"Missing failed-job evidence with completed={completed}: {expected}"
         assert LOG_HEAD not in prompt, "Keep the useful log tails within today's bounded feedback"
 
@@ -257,8 +298,10 @@ def test_unreadable_evidence_is_explicit_in_the_retry_and_readable_parts_survive
         assert "test (1)" in prompt
     if fault in {"logs-denied", "empty-logs"}:
         assert JOB_ANNOTATION in prompt, "Unavailable logs must not discard a readable annotation"
+        assert MEASUREMENT_ANNOTATION in prompt, "Acceptance annotations must survive unavailable logs too"
     if fault == "annotations-denied":
         assert all(name in prompt for name in FAILED_TESTS), "Unavailable annotations must not discard readable logs"
+        assert MEASUREMENT_LOST in prompt, "Acceptance log tails must survive unavailable annotations too"
 
 
 def test_not_started_still_holds_without_a_retry_even_with_pending_siblings(

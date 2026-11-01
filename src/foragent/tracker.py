@@ -115,7 +115,6 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
-    def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
@@ -963,9 +962,6 @@ class FakeTracker:
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
-    def pr_acceptance_checks(self, pr: int) -> list[dict]:
-        return []
-
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
 
@@ -1430,13 +1426,7 @@ class GhTracker:
             if exc.returncode not in {1, 8} or not exc.stdout.strip():
                 raise
             output = exc.stdout
-        checks = _items(output)
-        # gh supplies workflow only for CheckRun entries, never StatusContext.
-        # Commit-status target URLs are caller-controlled and confer no identity.
-        candidates = [item for item in checks if item.get("workflow") and "/job/" in (item.get("link") or "")]
-        excluded = self._acceptance_check_keys(pr) if candidates else set()
-        buckets = {item["bucket"] for item in checks
-                   if not (item.get("workflow") and (item.get("name"), item.get("link")) in excluded)}
+        buckets = {item["bucket"] for item in _items(output)}
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1447,45 +1437,6 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
-    def _acceptance_check_keys(self, pr: int) -> set[tuple[str, str]]:
-        """Exclude only Actions checks with API-verified workflow provenance."""
-        from foragent.ci_workflow import WORKFLOW
-
-        try:
-            if any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
-                return set()
-            checks = self.pr_acceptance_checks(pr)
-            suites = {}
-            excluded = set()
-            counted = set()
-            for check in checks:
-                key = (check.get("name"), check.get("details_url"))
-                suite = (check.get("check_suite") or {}).get("id")
-                if ((check.get("app") or {}).get("slug") != "github-actions"
-                        or type(suite) is not int or suite <= 0):
-                    counted.add(key)
-                    continue
-                if suite not in suites:
-                    runs = _items(self._call([
-                        "api", "--paginate", "--jq", ".workflow_runs",
-                        f"{self._path}/actions/runs?check_suite_id={suite}&per_page=100",
-                    ]))
-                    suites[suite] = bool(runs) and all(
-                        run.get("check_suite_id") == suite and run.get("path") == WORKFLOW
-                        and (run.get("repository") or {}).get("full_name") == self.repo
-                        for run in runs
-                    )
-                if suites[suite] and all(key):
-                    excluded.add(key)
-                else:
-                    counted.add(key)
-            # gh exposes display keys, so an ambiguous match must count too.
-            return excluded - counted
-        except (TrackerError, AttributeError, TypeError, KeyError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
-                raise
-            return set()  # Unverifiable checks remain ordinary CI.
-
     def _pr_workflow_runs(self, pr: int) -> list[dict]:
         head = self.pr_head_sha(pr)
         return _items(self._call([
@@ -1493,29 +1444,8 @@ class GhTracker:
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
 
-    def _acceptance_run_ids(self, pr: int, runs: list[dict]) -> set[int]:
-        """Only unchanged measurement workflows may be separated from ordinary CI."""
-        candidates = self._measurement_run_ids(runs)
-        if candidates and any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
-            return set()
-        return candidates
-
-    @staticmethod
-    def _measurement_run_ids(runs: list[dict]) -> set[int]:
-        from foragent.ci_workflow import WORKFLOW
-
-        return {run["id"] for run in runs if run.get("path") == WORKFLOW}
-
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
-
-    def pr_acceptance_checks(self, pr: int) -> list[dict]:
-        """Display data only; check runs cannot establish measurement provenance."""
-        head = self.pr_head_sha(pr)
-        return _items(self._call([
-            "api", "--paginate", "--jq", ".check_runs",
-            f"{self._path}/commits/{head}/check-runs?per_page=100&filter=latest",
-        ]))
 
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""
@@ -1548,10 +1478,10 @@ class GhTracker:
             run = max(candidates, key=lambda value: value["id"])
             if run.get("status") in {"queued", "in_progress"}:
                 return []  # No evidence yet; ci_mode retains its existing polling budget.
-            if (run.get("status") != "completed" or run.get("conclusion") != "success"
+            if (run.get("status") != "completed"
                     or run["repository"]["full_name"] != self.repo
                     or run["head_repository"]["full_name"] != self.repo):
-                raise ValueError("measurement run is foreign or unsuccessful")
+                raise ValueError("measurement run is foreign or unfinished")
             artifacts = _items(self._call([
                 "api", "--paginate", "--jq", ".artifacts",
                 f"{self._path}/actions/runs/{run['id']}/artifacts?per_page=100",
@@ -1603,17 +1533,9 @@ class GhTracker:
         except TrackerError as exc:
             return CIEvidence(_unavailable("workflow runs", exc))
         parts = []
-        try:
-            excluded_runs = self._acceptance_run_ids(pr, runs)
-        except TrackerError as exc:
-            # An unverified change must not let measurement text into the evidence.
-            parts.append(_unavailable("changed files of the pull request", exc))
-            excluded_runs = self._measurement_run_ids(runs)
         failed_runs = 0
         code_failure = False
         for run in runs:
-            if run["id"] in excluded_runs:
-                continue
             if run.get("conclusion") is not None and run["conclusion"] not in _FAILED_CONCLUSIONS:
                 continue
             evidence = self._run_evidence(run, full_text_dir)
