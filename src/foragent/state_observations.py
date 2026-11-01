@@ -91,7 +91,10 @@ def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any
     if facts is None:
         return "absent"
     if intent["action"] == "comment":
-        # Send-only entries end with an acknowledgement or an outbox drop.
+        # Evidence ends on acknowledgement or absence, independent of workflow transitions.
+        if intent.get("evidence"):
+            return None
+        # Ordinary send-only entries may also end with a workflow supersession.
         premise = intent.get("premise")
         return "dropped" if by_person and premise is not None and person_fields(premise) != person_fields(expected) else None
     if abandoned(intent):
@@ -180,7 +183,7 @@ class IssueObservationsMixin:
         gone, dropped = set(), False
         row = snapshot["issues"].get(str(number))
         for intent in intents:
-            if "premise" not in intent and legacy is not None:
+            if intent.get("premise") is None and legacy is not None:
                 intent = {**intent, "premise": observed_facts(legacy)}
             reason = retirement(facts, at, intent, expected, by_person=by_person)
             if reason is None:

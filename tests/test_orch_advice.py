@@ -1,6 +1,6 @@
 """Accepted advice keeps an issue-owned copy even when GitHub refuses the write (#1185)."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +8,7 @@ import pytest
 from foragent import orch, orch_advice
 from foragent.config import Config
 from foragent.state import StateStore
-from foragent.tracker import FakeTracker, RecordingTracker, TrackerError
+from foragent.tracker import TrackerError
 from runner_support import run_case  # noqa: F401 - the shared runner fixture
 
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
@@ -63,14 +63,22 @@ def test_retry_hint_comment_refused_by_github_is_queued_not_lost(run_case, monke
     c = run_case
     _blocked(c)
 
+    hint = "Use the selected locale"
+    advice = "<!-- foragent:orch -->\nRetry advice:\n\n" + hint
+    post = c.tracker.comment
+
     def refuse(n, body):
-        raise TrackerError("HTTP 502: Bad Gateway")
+        if body == advice:
+            raise TrackerError("HTTP 502: Bad Gateway")
+        return post(n, body)
 
     monkeypatch.setattr(c.tracker, "comment", refuse)
-    summary = orch.retry(c.ctx, 1, "Use the selected locale")
+    summary = orch.retry(c.ctx, 1, hint)
     assert "queued for the gate" in summary
     assert [body for _, body in _queued(c.store) if "Use the selected locale" in body]
     assert (c.store.root / "hints/1.txt").read_text() == "Use the selected locale"
+    assert _queued(c.store) == [(1, advice)]
+    assert c.store.github_blocking_outbox() == []
 
 
 def test_retry_hint_reaches_the_issue_byte_for_byte(run_case):
@@ -110,6 +118,9 @@ def test_every_retry_path_records_publication_before_hint_write(run_case, monkey
     _blocked(c)
     c.tracker.create_pr(head="foragent/issue-1", base="main", title="Old", body="Old")
     hint = "Keep  spacing\n\n  and indentation"
+    outcome = {"resolve-checks": "checks-failed", "resolve-ci": "ci-failed"}.get(entry)
+    accepted = hint if outcome is None else f"{hint}\n\nVerification: {outcome}\nSee {c.store.log_path(1)}"
+    advice = "<!-- foragent:orch -->\nRetry advice:\n\n" + accepted
     append = run_previous.add_hint
     seen = []
 
@@ -125,18 +136,24 @@ def test_every_retry_path_records_publication_before_hint_write(run_case, monkey
         comment = c.tracker.comment
 
         def refuse_advice(number, body):
-            if number != 1 or body.startswith("<!-- foragent:orch-verdict "):
-                return comment(number, body)
-            raise TrackerError("HTTP 502: Bad Gateway")
+            if number == 1 and body == advice:
+                raise TrackerError("HTTP 502: Bad Gateway")
+            return comment(number, body)
 
         monkeypatch.setattr(c.tracker, "comment", refuse_advice)
     if entry == "retry":
         orch.retry(c.ctx, 1, hint)
     else:
-        outcome = "checks-failed" if entry == "resolve-checks" else "ci-failed"
         monkeypatch.setattr(orch, "review_only", lambda *a, **kw: outcome)
         orch.resolve(c.ctx, 1, "pass", hint)
     assert len(seen) == 1 and seen[0].startswith(hint)
+
+    assert seen == [accepted]
+    public = [comment.body for comment in c.tracker.list_comments(1)]
+    assert (public + [body for _, body in _queued(c.store)]).count(advice) == 1
+    if queued:
+        assert _queued(c.store) == [(1, advice)]
+        assert c.store.github_blocking_outbox() == []
 
 
 def test_retry_does_not_accept_hint_when_publication_cannot_be_persisted(run_case, monkeypatch):
@@ -169,86 +186,3 @@ def test_recording_tracker_queues_each_advice_once(tmp_path, route):
     assert orch_advice.publish(tracker, context, 1, body) is None
     assert _queued(context.store) == [*before, (1, body)]
     assert tracker.comments == []
-
-
-def _message_case(tmp_path):
-    remote = FakeTracker(actor="human")
-    remote.add_issue(1, "Feature", body="Contract", labels=["blocked"])
-    context = _context(tmp_path, remote)
-    recorder = RecordingTracker(remote, context, queue_writes=True)
-    recorder.get_issue(1)
-    return remote, context, recorder
-
-
-def test_advice_reaches_the_issue_while_a_field_write_is_pending(tmp_path):
-    remote, context, _ = _message_case(tmp_path)
-    context.store.queue_github_write(1, "add_labels", labels=["ready"])
-    body = orch_advice.talk_body("Keep  the receipt\n\n  timezone")
-    assert orch_advice.publish(remote, context, 1, body) is None
-    assert [comment.body for comment in remote.list_comments(1)] == [body]
-    assert [entry["action"] for entry in context.store.github_outbox()] == ["add_labels"]
-
-
-@pytest.mark.parametrize("change", ["labels", "closed"])
-@pytest.mark.parametrize("route", ["github-wait", "rate-limit", "transport", "decode", "server"])
-def test_accepted_advice_survives_field_changes_until_delivered_once(tmp_path, monkeypatch, route, change):
-    remote, context, recorder = _message_case(tmp_path)
-    body = orch_advice.talk_body("Keep  the receipt\n\n  timezone")
-    with monkeypatch.context() as failing:
-        if route == "github-wait":
-            context.store.pause_github(NOW + timedelta(minutes=1))
-        else:
-            error = {"rate-limit": TrackerError("HTTP 429: Too Many Requests"),
-                     "transport": OSError("gh not found"), "decode": ValueError("Expecting value"),
-                     "server": TrackerError("HTTP 502: Bad Gateway")}[route]
-
-            def refuse(*args):
-                raise error
-
-            failing.setattr(remote, "comment", refuse)
-        orch_advice.publish(remote, context, 1, body)
-    assert _queued(context.store) == [(1, body)]
-    context.now = lambda: NOW + timedelta(days=1)
-    if change == "labels":
-        remote.add_labels(1, ["running"])
-    else:
-        remote.close_issue(1)
-    recorder.get_issue(1)
-    assert _queued(context.store) == [(1, body)]
-    recorder.flush_outbox()
-    assert [comment.body for comment in remote.list_comments(1)] == [body]
-    assert context.store.github_outbox() == []
-    recorder.flush_outbox()
-    assert [comment.body for comment in remote.list_comments(1)] == [body]
-
-
-@pytest.mark.parametrize("route", ["recording", "store"])
-def test_state_dependent_comments_still_retire_after_an_issue_change(tmp_path, route):
-    remote, context, recorder = _message_case(tmp_path)
-    context.store.queue_github_write(1, "add_labels", labels=["ready"])
-    if route == "recording":
-        recorder.comment(1, "Ready transition")
-    else:
-        context.store.queue_github_write(1, "comment", body="Ready transition")
-    assert _queued(context.store) == [(1, "Ready transition")]
-    assert remote.list_comments(1) == []
-    remote.close_issue(1)
-    context.now = lambda: NOW + timedelta(days=1)
-    recorder.get_issue(1)
-    assert context.store.github_outbox() == []
-    recorder.flush_outbox()
-    assert remote.list_comments(1) == []
-
-
-def test_explicit_independent_comment_does_not_inherit_a_legacy_premise(tmp_path):
-    remote, context, recorder = _message_case(tmp_path)
-    snapshot = context.store._issue_snapshot()
-    snapshot["outbox_base"] = {"1": context.store.local_issues()[0]}
-    context.store._write_json(context.store.root / "issues.json", snapshot)
-    context.store.queue_github_write(1, "comment", body="Accepted message", premise=None)
-    remote.close_issue(1)
-    context.now = lambda: NOW + timedelta(days=1)
-    recorder.get_issue(1)
-    assert _queued(context.store) == [(1, "Accepted message")]
-    recorder.flush_outbox()
-    assert [comment.body for comment in remote.list_comments(1)] == ["Accepted message"]

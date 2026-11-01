@@ -48,6 +48,16 @@ PANEL_MERGE_PROMPT = (
     "format above. Reviewer verdicts do not count; only yours does."
 )
 
+CONFIRM_PROMPT = (
+    "Limit this review to confirming that the first-round defect classes below are fixed. "
+    "For every class, verify the fix across all instances throughout the changed code, including "
+    "instances beyond the cited lines and files. Use all the first-round evidence and affected "
+    "instances as the starting point for your own search. Judge the implementer's rebuttals. "
+    "This is one confirmation task, not another perspective review or findings merge. "
+    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
+    "every remaining finding, each one line with file:line and the concrete failure."
+)
+
 
 def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     """Scope rules for reviewers; PR bodies pass the repository language for the human-read question."""
@@ -81,6 +91,7 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
+    task: str = REVIEW_PROMPT,
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
@@ -88,7 +99,7 @@ def build_review_prompt(
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
-        f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
+        f"{task}\n\n{review_scope_rules(acceptance_dir)}"
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
@@ -96,6 +107,17 @@ def build_review_prompt(
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
+
+
+def build_confirm_prompt(
+    parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "",
+) -> str:
+    """The complete first-round result and current change for one confirming reviewer."""
+    return build_review_prompt(
+        parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT,
+    ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
 def parent_section(parent_context: str) -> str:

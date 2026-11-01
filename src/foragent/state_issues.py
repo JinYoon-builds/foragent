@@ -108,10 +108,14 @@ class IssueSnapshotMixin:
         """Pending GitHub writes, derived from the intent log, in queue order."""
         return self._pending(self._issue_record())
 
+    def github_blocking_outbox(self) -> list[dict[str, Any]]:
+        """Pending workflow writes; issue evidence never holds the run start gate."""
+        return [entry for entry in self.github_outbox() if not entry.get("evidence")]
+
     def github_write_issues(self) -> set[int]:
-        """Issues with unretired writes, including sends awaiting their next observation."""
+        """Issues with unretired workflow writes, including sends awaiting observation."""
         return {entry["issue"] for entry in self._issue_record().get("outbox", [])
-                if not _observations.abandoned(entry)}
+                if not _observations.abandoned(entry) and not entry.get("evidence")}
 
     def local_board_value(self, number: int, project: str, field: str) -> Any:
         """The board value last recorded for an issue's card, copying only that value."""
@@ -142,15 +146,14 @@ class IssueSnapshotMixin:
             row["state"] = "closed"
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
-                           started_at: datetime | None = None, premise: Any = _observations._UNSET,
+                           started_at: datetime | None = None, premise: dict[str, Any] | None = None,
                            dropped: list[bool] | None = None, ready_approval: Any = _observations._UNSET,
                            **payload: Any) -> dict[str, Any]:
         """Append one intent to the log.
 
         ``queued_at`` is when the write began (``started_at``, default now).
         Its premise is the visible issue then (``premise``, default the
-        visible issue now; explicit None makes it independent of issue fields).
-        A write queued late is judged at once, by the same
+        visible issue now). A write queued late is judged at once, by the same
         rule as any read, against the issue's latest observation (facts or
         absence) if that read started after it; ``dropped`` receives whether
         that dropped it unsent. An issue observed missing gets no placeholder row.
@@ -160,8 +163,8 @@ class IssueSnapshotMixin:
             identity = snapshot.get("outbox_sequence", 0) + 1
             when = self._now() if started_at is None else started_at
             row = snapshot["issues"].get(str(number))
-            if premise is _observations._UNSET:
-                premise = _observations.observed_facts(self._visible(snapshot, row)) if row is not None else None
+            if premise is None and row is not None:
+                premise = _observations.observed_facts(self._visible(snapshot, row))
             entry = {"id": identity, "issue": number, "action": action,
                      "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
             from foragent.labels import READY
