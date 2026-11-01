@@ -803,7 +803,8 @@ def _acquire_workload(
         # flock as another process's.
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
             # One scan decides admission: reuse is matched by identity, never by comparing counts.
-            holders, reused = _machine_scan(store, datetime.now(UTC), live=True, candidate=candidate)
+            # The store's clock wrote its run and start timestamps, so it alone judges their grace.
+            holders, reused = _machine_scan(store, store._now(), live=True, candidate=candidate)
             budget = workload_budget(store)
             reason = None if reused else sensed or ("full" if len(holders) >= budget else None)
             if locked and reason is None:
@@ -853,7 +854,7 @@ def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: f
             reason = "tests"
         else:
             reason = "busy"  # A slot is free; another process held the slot guard lock.
-        return reason, machine_holders(store, datetime.now(UTC), live=True), budget, used
+        return reason, machine_holders(store, store._now(), live=True), budget, used
 
     def waiting() -> None:
         nonlocal shown

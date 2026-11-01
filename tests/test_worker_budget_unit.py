@@ -1,5 +1,6 @@
 """A direct rerun's own slot covers its first reviewer, as an admitted run's record does (#993)."""
 
+from datetime import timedelta
 import os
 from pathlib import Path
 import subprocess
@@ -11,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
-from foragent import capacity, review_perspectives, runner
+from foragent import capacity, capacity_sessions, review_perspectives, runner
 from foragent.executors import ExecResult
 from foragent.state import StateStore
 from test_orch_review_handoff import make_case
@@ -189,3 +190,29 @@ def test_a_running_record_is_no_reservation_unless_its_pid_is_this_live_process(
         assert waits and waits[0] == pid, "a dead pid's record started work in an occupied budget"
     else:
         assert not waits, "the run the tick launched this process for must reuse its own slot"
+
+
+@pytest.mark.parametrize("age,waits", [(timedelta(0), False), (capacity.LAUNCH_GRACE, True)],
+                         ids=["fresh-reservation", "reservation-past-grace"])
+def test_direct_admission_judges_a_reservation_by_the_clock_that_wrote_it(
+        git_history, tmp_path, monkeypatch, age, waits):
+    """An overloaded machine holds only new work: the store's own clock tells a reservation from a leftover."""
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    case.clock[0] += age  # The wall clock is days past this store's fake clock in both cases.
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", capacity.OVERLOAD_LOAD))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    entered = []
+
+    def admit():
+        with capacity.hold_workload(case.store, case.config, wait_s=0, kind=capacity.RUN_KIND, issue=1):
+            entered.append(capacity.machine_runs(case.store, case.clock[0]))
+
+    if waits:
+        with pytest.raises(TimeoutError):
+            admit()
+        assert entered == []
+    else:
+        admit()
+        assert entered == [1]  # The reservation and its runner are one slot.
+    assert list(capacity_sessions.read(case.store.root)) == []
