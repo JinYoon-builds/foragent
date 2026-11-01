@@ -240,6 +240,7 @@ class IssueSnapshotMixin:
                 return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
             facts = {key: fields.pop(key) for key in _observations.FACTS if key in fields}
+            outcome = None
             if facts:
                 outcome = self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
                                         observed_at or self._now(), None, by_person=False)
@@ -250,6 +251,9 @@ class IssueSnapshotMixin:
                 _state._forget_reads(row)
             row.update(fields)
             self._save_local_issue(snapshot, row)
+            if outcome != "stale" and (facts or "blocked_by" in fields):
+                self._flow_issue_states(
+                    snapshot, [number], {number: (fields["blocked_by"], observed_at)} if "blocked_by" in fields else None)
 
     def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
         """Record an issue as an observation at its time (default now)."""
@@ -273,6 +277,7 @@ class IssueSnapshotMixin:
             if "ready_approval" in changed:
                 row["ready_approval"] = changed["ready_approval"]
             self._save_local_issue(snapshot, row)
+            self._flow_issue_states(snapshot, [number])
 
     def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict,
                        ready_approval: Any = _observations._UNSET) -> None:

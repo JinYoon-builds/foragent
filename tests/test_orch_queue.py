@@ -43,3 +43,15 @@ def test_global_queue_cli_rejects_non_numbers_and_mixed_clear(tmp_path, monkeypa
             cli.main(["orch", "queue", *argv, "--repo-root", str(tmp_path)])
         assert raised.value.code not in (0, None)
     assert orch_queue.get_global(StateStore(tmp_path)) == []
+
+
+def test_global_priority_changes_are_recorded_once_and_a_corrupt_list_stays_replaceable(tmp_path):
+    store = StateStore(tmp_path)
+    orch_queue.set_global(store, [])  # Nothing changed: clearing an empty list is no fact.
+    assert store.flow_records() == []
+    orch_queue.set_global(store, [5, 4, 5])
+    orch_queue.set_global(store, [5, 4])
+    (tmp_path / "global-queue.json").write_text("not json", encoding="utf-8")
+    assert orch_queue.set_global(store, [5, 4]) == [5, 4]
+    orch_queue.set_global(store, [])
+    assert [row["data"]["issues"] for row in store.flow_records()] == [[5, 4], [5, 4], []]

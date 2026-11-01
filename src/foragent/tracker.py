@@ -236,6 +236,23 @@ class RecordingTracker:
 
         return observe
 
+    def blocked_by(self, n):
+        """A dependency read is an observation of the issue's edges, ordered by when it started."""
+        started = self._started()
+        dependencies = self._tracker.blocked_by(n)
+        self._context.store.record_edges_read(n, [asdict(dependency) for dependency in dependencies], started)
+        return dependencies
+
+    def add_blocked_by(self, n, blocker):
+        started = self._started()
+        self._tracker.add_blocked_by(n, blocker)
+        self._context.store.record_edge_write(n, blocker, started, remove=False)
+
+    def remove_blocked_by(self, n, blocker):
+        started = self._started()
+        self._tracker.remove_blocked_by(n, blocker)
+        self._context.store.record_edge_write(n, blocker, started, remove=True)
+
     def _started(self):
         """When a read or write begins: observations and intents are ordered by it, not by completion."""
         now = getattr(self._context, "now", None)
@@ -366,19 +383,21 @@ class RecordingTracker:
                 known = [child.number for child in read]
             children[issue.number] = known
         parents = {child: parent for parent, numbers in children.items() for child in numbers}
-        blocked_by = {}
+        blocked_by, edge_reads = {}, {}
         for issue in open_issues:
             if not issue.labels & {APPROVED, READY}:
                 continue
             known = (previous.get(issue.number) or {}).get("blocked_by")
             if issue.number in changed | dependents or known is None:
+                edge_reads[issue.number] = self._started()  # Only these are news; the others repeat the row.
                 known = [{"number": dep.number, "state": dep.state, "state_reason": dep.state_reason,
                           **({"repository": dep.repository} if dep.repository else {})}
                          for dep in self._tracker.blocked_by(issue.number)]
             blocked_by[issue.number] = known
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
-                                            blocked_by=blocked_by, children=children, complete_prs=True)
+                                            blocked_by=blocked_by, children=children, complete_prs=True,
+                                            edge_reads=edge_reads)
         for read, started in child_reads:
             dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
         if listing is not None:

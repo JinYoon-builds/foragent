@@ -135,6 +135,7 @@ def record_success(store: StateStore, *, duration_seconds: float = 0,
     record = {"at": store._now().isoformat(), "status": "ok", "consecutive_failures": 0,
               "duration_seconds": duration_seconds, "steps": list(steps or [])}
     store._write_json(outcome_path(store), record)
+    store.record_flow("tick", status="ok", duration_seconds=duration_seconds, steps=record["steps"])
     alert = previous.get("alert_request")
     if alert:
         try:
@@ -167,6 +168,7 @@ def record_failure(store: StateStore, config: Config, repo: str, exc: BaseExcept
         record["alert_request"] = alert
     # Write the streak before alerting so a failed alert never loses the count.
     store._write_json(outcome_path(store), record)
+    store.record_flow("tick", status="failed", duration_seconds=duration_seconds, steps=record["steps"])
     if alert is None and streak >= config.tick_failure_alert:
         line = (f"{streak} consecutive gate ticks failed. Last error: "
                 f"{record['error_type']}: {record['error_message']}. Traceback: {log_path}")

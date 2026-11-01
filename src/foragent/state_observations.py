@@ -156,6 +156,28 @@ def latest(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any] | None
     return (observed_facts(row), stored) if stored is not None else (None, None)
 
 
+def accepted_facts(snapshot: dict[str, Any], number: int) -> tuple[dict[str, Any] | None, datetime | None]:
+    """What GitHub accepted: the latest observation plus sends it does not yet show, and the time of the newest.
+
+    A send that succeeded is a fact even when no read followed it, and a read that
+    started before the send cannot undo it (such a read leaves the intent unretired).
+    An unsent intent is only a wish, so it adds nothing.
+    """
+    facts, at = latest(snapshot, number)
+    if facts is None or at is None:
+        return facts, at
+    for intent in sorted((item for item in snapshot.get("outbox", []) if item["issue"] == number), key=queue_order):
+        if intent["action"] == "comment":
+            continue
+        if intent["action"] == "remove_labels":
+            sent = sent_labels(intent)
+            facts = {**facts, "labels": sorted(set(facts["labels"]) - sent)}
+        elif sent_at(intent) is not None:
+            facts = effect(facts, intent)
+        at = max([at, *(start for start in ok_starts(intent) if start is not None)])
+    return facts, at
+
+
 def tombstoned(snapshot: dict[str, Any], number: int, at: datetime) -> bool:
     """A local change at ``at`` has no issue to change: a read that started after it found the
     issue missing. A change made after the absence is a newer observation and counts."""
@@ -270,7 +292,7 @@ class IssueObservationsMixin:
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            dropped, seen, applied, changed = set(), set(), set(), False
+            dropped, seen, applied, gone, changed = set(), set(), set(), set(), False
             for issue in issues:
                 if issue.is_pull_request:
                     continue
@@ -286,12 +308,15 @@ class IssueObservationsMixin:
                     changed = True
                 for number in sorted(known_numbers(snapshot) - seen):
                     outcome = self._observe(snapshot, number, None, started_at, lanes)
-                    changed |= outcome != "stale"
+                    if outcome != "stale":
+                        changed = True
+                        gone.add(number)
                     if outcome == "dropped":
                         dropped.add(number)
             if changed or applied:
                 # Only accepted observations are stamped; an older one persists nothing.
                 self._save_rows(snapshot, applied)
+                self._flow_issue_states(snapshot, applied | gone)
             return sorted(dropped)
 
     def ingest_absence(self, number: int, started_at: datetime) -> bool:
@@ -301,6 +326,7 @@ class IssueObservationsMixin:
             outcome = self._observe(snapshot, number, None, started_at, {})
             if outcome != "stale":
                 self._save_rows(snapshot, ())
+                self._flow_issue_states(snapshot, [number])
             return outcome == "dropped"
 
     def _save_rows(self, snapshot: dict[str, Any], numbers: Any) -> None:
@@ -333,6 +359,8 @@ class IssueObservationsMixin:
                 # it judges the now sent intent by the same rule as a later read.
                 self._retire(snapshot, intent["issue"], facts, seen)
             self._save_rows(snapshot, (intent["issue"],))
+            if ok:
+                self._flow_issue_states(snapshot, [intent["issue"]])
 
     def _visible(self, snapshot: dict[str, Any], row: dict[str, Any], lanes: dict | None = None) -> dict[str, Any]:
         """The latest observation plus the issue's unretired intents in queue order."""

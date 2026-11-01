@@ -596,3 +596,386 @@ def test_a_stored_write_without_a_premise_is_judged_by_its_recorded_base(case):
     case.reader.get_issue(7)
     assert case.store.github_outbox() == []
     assert case.events == [(7, "remote change")]
+
+
+# Flow records: the local history next to the observations, beyond the locked flow-record tests.
+
+def flow(store, kind=None, issue=None, **window):
+    return [row for row in store.flow_records(**window)
+            if (kind is None or row["kind"] == kind) and (issue is None or row["issue"] == issue)]
+
+
+def flow_store(tmp_path, clock=None):
+    clock = clock if clock is not None else [T0]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.clock = clock
+    return store
+
+
+def plain_issue(number=7, labels=("approved",), state="open"):
+    return Issue(number, "Title", "Body", frozenset(labels), state)
+
+
+def test_reading_flow_records_creates_nothing(tmp_path):
+    store = flow_store(tmp_path)
+    assert store.flow_records() == []
+    assert not store.root.exists(), "A read has no side effects, not even a directory"
+
+
+def test_flow_window_is_half_open_and_chronological(tmp_path):
+    store = flow_store(tmp_path)
+    store.record_flow("spawn", decision="one")
+    store.clock[0] = at(1)
+    store.record_flow("tick", status="ok", duration_seconds=1)
+    store.clock[0] = at(2)
+    store.record_flow("stop", decision="two", issue=7, run_started_at="r")
+    assert [row["kind"] for row in store.flow_records()] == ["spawn", "tick", "stop"]
+    assert [row["kind"] for row in store.flow_records(since=at(1), until=at(2))] == ["tick"]
+    last = store.flow_records(since=at(2))[0]
+    assert (last["issue"], last["run_started_at"], last["data"]) == (7, "r", {"decision": "two"})
+
+
+def test_torn_and_malformed_lines_are_unknown_and_never_merge_with_the_next_record(tmp_path):
+    store = flow_store(tmp_path)
+    store.record_flow("spawn", decision="kept")
+    path = store.root / "flow" / "other.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write('[1]\n{"at":"not-a-time","kind":"x","issue":null,"run_started_at":null,"data":{}}\n'
+                     '{"at":"2026-10-31T09:00:00","kind":"naive","issue":null,"run_started_at":null,"data":{}}\n'
+                     '{"at":"2026-10-31T09:00:00+00:00","kind":"to')
+    store.record_flow("spawn", decision="after")
+    assert [row["data"]["decision"] for row in flow(store)] == ["kept", "after"]
+
+
+def test_observation_failure_changes_no_result_or_write(tmp_path):
+    store = flow_store(tmp_path)
+    store.root.mkdir(parents=True)
+    (store.root / "flow").write_text("a file where the directory belongs", encoding="utf-8")
+    store.record_flow("spawn", decision="lost")
+    assert store.ingest([plain_issue()], T0, {}) == []
+    assert [row["number"] for row in store.local_issues()] == [7]
+    assert store.flow_records() == [], "The failed evidence stays unknown"
+
+
+def test_oversized_record_stays_readable_within_the_limit(tmp_path):
+    store = flow_store(tmp_path)
+    store.record_flow("spawn", decision="x" * 200_000)
+    row = flow(store)[0]
+    assert row["data"]["truncated"] is True and row["data"]["bytes"] > 200_000
+    assert (store.root / "flow" / "other.jsonl").stat().st_size < 70_000
+
+
+def test_frequent_ticks_never_push_out_decision_records(tmp_path):
+    store = flow_store(tmp_path)
+    store.record_flow("priority", issues=[1])
+    for _ in range(3000):
+        store.record_flow("tick", status="ok", duration_seconds=1)
+    rows = store.flow_records()
+    assert len(flow(store, "tick")) <= 512 and len(rows) <= 2048
+    assert [row["data"]["issues"] for row in flow(store, "priority")] == [[1]]
+
+
+def test_rotation_keeps_the_previous_generation_and_every_kept_fact_as_written(tmp_path):
+    store = flow_store(tmp_path)
+    for number in range(800):
+        store.record_flow("spawn", decision=number)
+    rows = flow(store, "spawn")
+    assert [row["data"]["decision"] for row in rows] == list(range(800)), "One rotation loses nothing"
+    for number in range(800, 1700):
+        store.record_flow("spawn", decision=number)
+    kept = [row["data"]["decision"] for row in flow(store, "spawn")]
+    assert kept == list(range(kept[0], 1700)) and len(kept) <= 1536
+
+
+@pytest.mark.parametrize("delete", ["ingest_absence", "complete"])
+def test_absence_keeps_last_known_edges_and_is_recorded_once(tmp_path, delete):
+    store = flow_store(tmp_path)
+    edge = {"number": 3, "state": "open", "repository": None}
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [edge]})
+    for second in (2, 3):
+        if delete == "complete":
+            store.ingest([], at(second), {}, complete=True)
+        else:
+            store.ingest_absence(7, at(second))
+    rows = flow(store, "issue-state", 7)
+    assert [row["data"]["state"] for row in rows] == ["open", "absent"]
+    assert rows[-1]["data"]["labels"] == [] and rows[-1]["data"]["blocked_by"] == [edge]
+
+
+def test_listing_silent_about_an_issue_keeps_its_edges_and_unread_edges_stay_unknown(tmp_path):
+    store = flow_store(tmp_path)
+    edge = {"number": 3, "state": "open", "repository": "other/repo"}
+    store.refresh_local_issues([plain_issue(), plain_issue(8)], [], {}, at(1), blocked_by={7: [edge]})
+    store.refresh_local_issues([plain_issue(state="closed"), plain_issue(8)], [], {}, at(2), blocked_by={})
+    assert [row["data"]["blocked_by"] for row in flow(store, "issue-state", 7)] == [[edge], [edge]]
+    assert [row["data"]["blocked_by"] for row in flow(store, "issue-state", 8)] == [None], "Unread is unknown, not none"
+
+
+def edge_rows(store, number=7):
+    return [row["data"]["blocked_by"] for row in flow(store, "issue-state", number)]
+
+
+OPEN_EDGE = {"number": 3, "state": "open", "repository": None}
+CLOSED_EDGE = {"number": 3, "state": "closed", "repository": None}
+
+
+def test_edge_only_change_from_a_live_read_is_a_transition(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: []})
+    read = {"number": 3, "state": "open", "state_reason": None, "repository": None}
+    store.record_edges_read(7, [read], at(2))
+    assert edge_rows(store) == [[], [OPEN_EDGE]]
+
+
+def test_blocked_by_reads_finishing_in_reverse_order_keep_the_newer_edges(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
+    store.record_edges_read(7, [CLOSED_EDGE], at(3))
+    store.record_edges_read(7, [OPEN_EDGE], at(2))  # Started first, finished last.
+    assert edge_rows(store) == [[OPEN_EDGE], [CLOSED_EDGE]]
+
+
+def test_equal_edges_still_advance_the_read_time(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
+    store.record_edges_read(7, [OPEN_EDGE], at(3))
+    store.record_edges_read(7, [CLOSED_EDGE], at(2))
+    assert edge_rows(store) == [[OPEN_EDGE]], "The newer read changed nothing visible but still outranks the older"
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["equal", "initially-empty"])
+def test_a_listing_that_read_edges_equal_to_the_row_advances_the_read_time(tmp_path, empty):
+    store = flow_store(tmp_path)
+    listed = [] if empty else [OPEN_EDGE]
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: listed}, edge_reads={7: at(1)})
+    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: listed}, edge_reads={7: at(5)})
+    store.record_edges_read(7, [CLOSED_EDGE], at(4))  # After the listing began, before its own edge read.
+    assert edge_rows(store) == [listed]
+
+
+def test_a_listing_that_read_edges_outranks_a_read_started_before_it(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
+    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: [CLOSED_EDGE]})
+    store.record_edges_read(7, [OPEN_EDGE], at(2))
+    assert edge_rows(store) == [[OPEN_EDGE], [CLOSED_EDGE]]
+
+
+def test_a_listing_repeating_its_old_list_does_not_undo_a_newer_live_read(tmp_path):
+    store = flow_store(tmp_path)
+    remote = {"number": 3, "state": "open", "repository": "other/repo"}
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [remote]})
+    closed = {**remote, "state": "closed"}
+    store.record_edges_read(7, [closed], at(2))
+    # The other repository's issue shows no change here, so the tracker repeats the row's list.
+    store.refresh_local_issues([plain_issue()], [], {}, at(3), blocked_by={7: [remote]}, edge_reads={})
+    assert edge_rows(store) == [[remote], [closed]]
+
+
+def test_a_repeated_list_alone_never_establishes_edges(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]}, edge_reads={})
+    assert edge_rows(store) == [None], "No read in this history established them"
+
+
+def test_edges_first_read_equal_to_a_rows_unread_default_become_known(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={})  # The row now holds an unread [].
+    store.refresh_local_issues([plain_issue()], [], {}, at(2), blocked_by={7: []})  # A real read of no edges.
+    assert edge_rows(store) == [None, []]
+
+
+def test_tracker_marks_only_the_edges_it_read_during_a_listing(case):
+    calls = []
+    original = case.remote.blocked_by
+    case.remote.blocked_by = lambda n: calls.append(n) or original(n)
+    case.remote.add_labels(7, ["approved"])
+    case.clock[0] = at(1)
+    case.reader.refresh_issues(observed_at=at(1))  # Changed: read.
+    assert calls == [7] and edge_rows(case.store)[-1] == []
+    calls.clear()
+    case.store.record_edges_read(7, [OPEN_EDGE], at(2))
+    case.clock[0] = at(3)
+    case.reader.refresh_issues(observed_at=at(3))  # Unchanged: the row's [] is repeated.
+    assert calls == [] and edge_rows(case.store)[-1] == [OPEN_EDGE]
+
+
+def test_delegated_dependency_read_is_an_observation_and_keeps_its_result(case):
+    from foragent.tracker import Dependency
+
+    case.remote.set_blocked_by(7, [Dependency(3, "open")])
+    assert [dep.number for dep in case.reader.blocked_by(7)] == [3]
+    assert edge_rows(case.store)[-1] == [OPEN_EDGE]
+
+
+def test_dependency_writes_enter_history_before_any_read_and_without_one(case):
+    case.remote.add_issue(3, "Blocker", "", labels=[])
+    case.reader.get_issue(3)
+    case.store.record_edges_read(7, [], T0)
+    calls = []
+    for name in ("add_blocked_by", "remove_blocked_by"):
+        setattr(case.remote, name, lambda *args, _name=name: calls.append((_name, *args)))
+    case.remote.blocked_by = lambda n: pytest.fail("Recording a write must not read GitHub")
+    case.clock[0] = at(1)
+    case.reader.add_blocked_by(7, 3)
+    case.clock[0] = at(2)
+    case.reader.remove_blocked_by(7, 3)
+    assert calls == [("add_blocked_by", 7, 3), ("remove_blocked_by", 7, 3)]
+    assert edge_rows(case.store)[-3:] == [[], [OPEN_EDGE], []], "Adding then removing keeps both transitions"
+
+
+def test_removing_an_edge_of_unknown_edges_does_not_claim_there_are_none(case):
+    case.reader.remove_blocked_by(7, 3)
+    assert edge_rows(case.store)[-1] is None
+
+
+def test_a_failed_dependency_write_records_nothing(case):
+    def refused(*args):
+        raise TrackerError("gh: forbidden (HTTP 403)")
+
+    case.store.record_edges_read(7, [], T0)
+    case.remote.add_blocked_by = refused
+    with pytest.raises(TrackerError):
+        case.reader.add_blocked_by(7, 3)
+    assert edge_rows(case.store)[-1] == []
+
+
+def test_a_read_started_before_a_dependency_write_cannot_undo_it(case):
+    case.remote.add_issue(3, "Blocker", "", labels=[])
+    case.store.record_edges_read(7, [], T0)
+    case.clock[0] = at(5)
+    case.reader.add_blocked_by(7, 3)
+    case.store.record_edges_read(7, [], at(1))
+    assert edge_rows(case.store)[-1][0]["number"] == 3
+
+
+@pytest.mark.parametrize("facts", [True, False], ids=["with-facts", "edge-only"])
+def test_a_stale_local_update_cannot_enter_edge_history(tmp_path, facts):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(5), blocked_by={7: [CLOSED_EDGE]})
+    extra = {"state": "open"} if facts else {}
+    store.update_local_issue(7, blocked_by=[OPEN_EDGE], observed_at=at(1), **extra)
+    assert edge_rows(store) == [[CLOSED_EDGE]]
+
+
+def test_edges_a_stale_update_left_on_the_row_never_enter_history_later(tmp_path):
+    store = flow_store(tmp_path)
+    store.ingest([plain_issue()], at(5), {})  # Edges still unknown.
+    store.update_local_issue(7, state="open", blocked_by=[OPEN_EDGE], observed_at=at(1))
+    assert [row["blocked_by"] for row in store.local_issues()] == [[OPEN_EDGE]], "The row keeps today's behavior"
+    store.ingest([plain_issue(labels=("approved", "ready"))], at(6), {})
+    store.refresh_local_issues([plain_issue(labels=("approved",))], [], {}, at(7),
+                               blocked_by={7: [OPEN_EDGE]}, edge_reads={})
+    assert edge_rows(store) == [None, None, None], "Neither the row nor a list repeating it is evidence"
+
+
+def test_a_stale_observation_cannot_carry_edges_newer_than_the_stored_edges(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [CLOSED_EDGE]})
+    store.ingest([plain_issue()], at(5), {})  # A newer observation that read no edges.
+    store.update_local_issue(7, state="open", blocked_by=[OPEN_EDGE], observed_at=at(3))
+    assert edge_rows(store) == [[CLOSED_EDGE]], "The update lost to the observation; its edges go with it"
+
+
+def test_a_local_edge_update_newer_than_the_stored_read_is_accepted(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(5), blocked_by={7: [CLOSED_EDGE]})
+    store.update_local_issue(7, blocked_by=[OPEN_EDGE], observed_at=at(6))
+    assert edge_rows(store) == [[CLOSED_EDGE], [OPEN_EDGE]]
+
+
+def test_a_read_cannot_add_edges_to_an_issue_observed_missing(tmp_path):
+    store = flow_store(tmp_path)
+    store.refresh_local_issues([plain_issue()], [], {}, at(1), blocked_by={7: [OPEN_EDGE]})
+    store.queue_github_write(7, "add_labels", labels=["pending"], started_at=at(9))  # Keeps the row.
+    store.ingest_absence(7, at(5))
+    store.record_edges_read(7, [CLOSED_EDGE], at(2))  # Newer than the stored edges, so only the absence refuses it.
+    assert edge_rows(store)[-1] == [OPEN_EDGE]
+
+
+def labels_history(store, number=7):
+    return [row["data"]["labels"] for row in flow(store, "issue-state", number)]
+
+
+@pytest.fixture
+def silent_writes(case):
+    """A production-like tracker: label and close writes answer nothing to ingest."""
+    for name in ("add_labels", "remove_labels", "close_issue"):
+        original = getattr(case.remote, name)
+        setattr(case.remote, name, lambda *args, _send=original, **kwargs: _send(*args, **kwargs) and None)
+    return case
+
+
+def test_sends_without_an_issue_response_enter_history_before_any_read(silent_writes):
+    case = silent_writes
+    case.reader.add_labels(7, ["ready"])
+    case.reader.remove_labels(7, ["ready"])
+    assert labels_history(case.store) == [["base"], ["base", "ready"], ["base"]]
+    case.reader.close_issue(7)
+    assert [row["data"]["state"] for row in flow(case.store, "issue-state", 7)][-1] == "closed"
+    case.clock[0] = at(1)
+    case.reader.get_issue(7)  # Confirms what the sends already recorded.
+    assert len(flow(case.store, "issue-state", 7)) == 4
+
+
+def test_a_queued_write_enters_history_only_when_its_flush_succeeds(silent_writes):
+    case = silent_writes
+    case.store.pause_github(at(60))
+    case.reader.add_labels(7, ["queued"])
+    case.reader.get_issue(7)  # A read while it waits records the facts without the wish.
+    assert labels_history(case.store) == [["base"]], "An unsent intent is not an accepted fact"
+    case.clock[0] = at(61)
+    case.reader.flush_outbox()
+    assert labels_history(case.store) == [["base"], ["base", "queued"]]
+
+
+def test_a_failed_send_records_nothing(case):
+    def refused(*args, **kwargs):
+        raise TrackerError("gh: forbidden (HTTP 403)")
+
+    case.remote.add_labels = refused
+    with pytest.raises(TrackerError):
+        case.reader.add_labels(7, ["nope"])
+    assert labels_history(case.store) == [["base"]]
+
+
+def test_a_read_started_before_a_send_cannot_undo_it_in_history(silent_writes):
+    case = silent_writes
+    before = case.remote.get_issue(7)
+    case.clock[0] = at(2)
+    case.reader.add_labels(7, ["ready"])
+    case.store.ingest([before], at(1), {})  # Stale: older than the stored observation or the send.
+    case.clock[0] = at(3)
+    late_listing = Issue(7, "Title", "Body", frozenset({"base"}), "open")
+    case.store.ingest([late_listing], at(1), {})
+    assert labels_history(case.store) == [["base"], ["base", "ready"]]
+
+
+def test_local_writes_are_observations_and_stale_ones_add_nothing(tmp_path):
+    store = flow_store(tmp_path)
+    store.ingest([plain_issue()], at(5), {})
+    store.record_labels(7, ["ready"], remove=False, lanes={}, observed_at=at(6))
+    store.update_local_issue(7, state="closed", observed_at=at(7))
+    store.record_labels(7, ["old"], remove=False, lanes={}, observed_at=at(1))
+    store.update_local_issue(7, state="open", observed_at=at(2))
+    assert [(row["data"]["labels"], row["data"]["state"]) for row in flow(store, "issue-state", 7)] == [
+        (["approved"], "open"), (["approved", "ready"], "open"), (["approved", "ready"], "closed"),
+    ]
+
+
+def test_a_local_field_without_an_observation_records_no_issue_state(tmp_path):
+    store = flow_store(tmp_path)
+    store.update_local_issue(7, pr_number=3)
+    store.update_local_issue(8, blocked_by=[])
+    assert flow(store, "issue-state") == [], "A placeholder row must not read as absent or open"
+
+
+def test_an_evicted_unchanged_issue_is_not_recorded_again_by_each_listing(tmp_path):
+    store = flow_store(tmp_path)
+    closed = plain_issue(state="closed")
+    store.ingest([closed], at(1), {})
+    for number in range(1700):
+        store.record_flow("spawn", decision=number)
+    assert flow(store, "issue-state", 7) == [], "The fixture evicted the record"
+    store.ingest([closed], at(2), {})
+    assert flow(store, "issue-state", 7) == []

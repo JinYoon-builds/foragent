@@ -19,6 +19,7 @@ from typing import IO, Any  # noqa: F401
 
 from foragent.records import load_record, write_back  # noqa: F401
 from foragent.state_base import StateBase
+from foragent.state_flow import FlowRecordsMixin
 from foragent.state_issues import (  # noqa: F401
     REFRESH_INTERVAL,
     IssueSnapshotMixin,
@@ -41,7 +42,7 @@ LOG_LIMIT_BYTES = 500 * 1024 * 1024
 
 class StateStore(
     IssueSnapshotMixin, IssueObservationsMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
-    LogRetentionMixin, StateLocksMixin, StateBase,
+    FlowRecordsMixin, LogRetentionMixin, StateLocksMixin, StateBase,
 ):
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":

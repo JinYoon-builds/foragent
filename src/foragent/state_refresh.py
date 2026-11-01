@@ -11,7 +11,7 @@ class IssueRefreshMixin:
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,
         parents: dict[int, int] | None = None, blocked_by: dict[int, list[dict]] | None = None,
         children: dict[int, list[int]] | None = None, complete_prs: bool = False,
-        observed_at: datetime | None = None,
+        observed_at: datetime | None = None, edge_reads: dict[int, datetime] | None = None,
     ) -> list[int]:
         """Ingest one complete listing that started at ``observed_at`` (default ``now``).
 
@@ -21,6 +21,8 @@ class IssueRefreshMixin:
         ``since_revision`` (the revision when the refresh began) only breaks
         equal start times, and keeps the PR and comment records of a row
         written during the refresh. Returns issues whose intents were dropped.
+        ``edge_reads`` names the ``blocked_by`` entries read for this listing, and when
+        each read started; the rest repeat what the caller held. Without it, every entry was read.
         """
         from foragent.state_observations import EARLIEST, issue_facts, stamp
         from foragent.tracker import pr_issue_number
@@ -33,7 +35,7 @@ class IssueRefreshMixin:
             if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
                 snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
-            dropped, facts, fresh, local = set(), {}, set(), set()
+            dropped, facts, fresh, local, gone = set(), {}, set(), set(), set()
             for issue in issues:
                 if issue.is_pull_request:
                     continue
@@ -57,7 +59,10 @@ class IssueRefreshMixin:
             from foragent.state_observations import known_numbers
 
             for number in sorted(known_numbers(snapshot) - observed):
-                if self._observe(snapshot, number, None, at, lanes, since_revision=since_revision) == "dropped":
+                outcome = self._observe(snapshot, number, None, at, lanes, since_revision=since_revision)
+                if outcome != "stale":
+                    gone.add(number)
+                if outcome == "dropped":
                     dropped.add(number)
             rows = snapshot["issues"]
             for number in fresh:
@@ -108,6 +113,10 @@ class IssueRefreshMixin:
             last = stamp(snapshot.get("refreshed_at"))
             snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
             self._write_json(self.root / "issues.json", snapshot)
+            # Only a read establishes edges: an unread issue's [] and a repeated list prove nothing.
+            self._flow_issue_states(snapshot, {int(number) for number in fresh} | gone, {
+                int(number): (blocked_by[int(number)], (edge_reads or {}).get(int(number), at)) for number in fresh
+                if int(number) in (blocked_by or {}) and (edge_reads is None or int(number) in edge_reads)})
             return sorted(dropped)
 
     def merged_pr_listing(self) -> dict[str, Any] | None:

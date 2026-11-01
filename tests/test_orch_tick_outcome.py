@@ -172,3 +172,37 @@ def test_github_wait_budget_failure_records_its_step_and_slow_line(store, pushes
     assert record["steps"] == [{"name": "github_wait_check", "seconds": 75.0}]
     err = capsys.readouterr().err.splitlines()
     assert len(err) == 1 and "github_wait_check" in err[0] and "75" in err[0]
+
+
+def _ticks(store):
+    return [row["data"] for row in store.flow_records() if row["kind"] == "tick"]
+
+
+def test_each_acquired_tick_is_one_flow_record_and_a_busy_tick_records_none(store, pushes):
+    assert orch_tick_outcome.run_recorded(store, Config(), "o/r", lambda: "done") == "done"
+    assert orch_tick_outcome.run_recorded(store, Config(), "o/r", lambda: "again") == "again"
+    assert [row["status"] for row in _ticks(store)] == ["ok", "ok"], "A repeated tick is still an occurrence"
+    with store.tick_lock() as held:
+        assert held
+        assert orch_tick_outcome.run_recorded(store, Config(), "o/r", lambda: "busy") is None
+    assert len(_ticks(store)) == 2
+
+
+def test_tick_flow_record_carries_duration_and_steps_and_failure_keeps_its_error(store, pushes):
+    def failing():
+        with orch_tick_outcome.step("fetch_base"):
+            raise ValueError("fixture failure")
+
+    with pytest.raises(ValueError, match="fixture failure"):
+        orch_tick_outcome.run_recorded(store, Config(), "o/r", failing)
+    row = _ticks(store)[0]
+    assert row["status"] == "failed" and row["duration_seconds"] >= row["steps"][0]["seconds"] >= 0
+    assert row["steps"][0]["name"] == "fetch_base"
+    assert orch_tick_outcome.read(store)["error_type"] == "ValueError"
+
+
+def test_a_flow_write_failure_keeps_the_tick_outcome(store, pushes, monkeypatch):
+    store.root.mkdir(parents=True)
+    (store.root / "flow").write_text("not a directory", encoding="utf-8")
+    assert orch_tick_outcome.run_recorded(store, Config(), "o/r", lambda: "done") == "done"
+    assert orch_tick_outcome.read(store)["status"] == "ok"

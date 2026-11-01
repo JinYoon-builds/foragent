@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -85,7 +85,7 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
@@ -195,9 +195,9 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
             if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
-                return  # Its repair read GitHub; a second read before a start waits for the next tick.
+                return scheduler_flow.waits(ctx, issue.number, "refresh-failed")  # Its repair read GitHub; a second read before a start waits for the next tick.
         if ctx._refresh_failed and issue.number in recovered:
-            return
+            return scheduler_flow.waits(ctx, issue.number, "refresh-failed")
         if issue.number in parents:
             return  # Its column follows its children, whatever its own labels say.
         issue = _escalate_overdue_blocker(ctx, issue, report)
@@ -211,6 +211,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
         ):
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
+            scheduler_flow.waits(ctx, issue.number, "held-no-retry", held_by=sorted(waiting_labels))
             return
         if APPROVED not in issue.labels and not waiting_labels:
             # Removing approval returns a known card to Backlog.
@@ -225,13 +226,16 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             report.actions.append(
                 f"#{issue.number} ignored approved label from non-approver(s): {', '.join(sorted(ignored))}"
             )
+        held_by = sorted(waiting_labels)
         if event is None:
-            return
+            if waiting_labels:
+                return scheduler_flow.waits(ctx, issue.number, "held-no-retry", held_by=held_by)
+            return scheduler_flow.waits(ctx, issue.number, "no-approval")
         if waiting_labels:
             if datetime.fromisoformat(event.created_at) <= datetime.fromisoformat(previous_flag.flagged_at):
-                return
+                return scheduler_flow.waits(ctx, issue.number, "held-no-retry", held_by=held_by)
             if ctx._refresh_failed:
-                return  # A re-approval is new evidence; it is read and resumed after a successful refresh.
+                return scheduler_flow.waits(ctx, issue.number, "refresh-failed")  # A re-approval is new evidence; it is read and resumed after a successful refresh.
             # A new approval is a new generation even between full refreshes.
             issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
@@ -243,20 +247,21 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         approval = ctx.store.load_approval(issue.number)
         if approval is None or approval.approved_at != event.created_at:
             if ctx._refresh_failed:
-                return  # Missing approval evidence: the snapshot needs a read; only stored approvals start now.
+                return scheduler_flow.waits(ctx, issue.number, "refresh-failed")  # Missing approval evidence: the snapshot needs a read; only stored approvals start now.
             if not waiting_labels:
                 issue = ctx.tracker.get_issue(issue.number)
             if issue.state != "open" or issue.is_pull_request or APPROVED not in issue.labels:
                 return
             approval = _snapshot(ctx, issue, event, base_ref, report)
             if approval is None:
-                return
+                return scheduler_flow.waits(ctx, issue.number, "approval-rejected")
         elif not _check_integrity(ctx, issue, approval, base_ref, report):
-            return
+            return scheduler_flow.waits(ctx, issue.number, "integrity")
         if RUNNING in issue.labels:
             board.sync_status(ctx, issue, "Running")
             return
         if not _check_prerequisites(ctx, issue, approval, report, confirmed=listing_current):
+            scheduler_flow.prerequisite(ctx, issue.number)
             return
         if READY in issue.labels:
             board.sync_status(ctx, issue, "Ready")
@@ -274,6 +279,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     with step("board_sync"):
         parents = board_parents.order_parents(ctx.store.local_issues())  # Columns follow children.
         for issue in local_issue_models(ctx.store):
+            scheduler_flow.considering(ctx, issue.number)
             try:
                 consider(issue)
             except TrackerError as exc:
@@ -282,8 +288,11 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     raise
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
+                scheduler_flow.waits(ctx, issue.number, "read-deferred")
+        scheduler_flow.considering(ctx, None)
         if listing_current:  # Children change only through observed facts and this tick's writes.
             _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
+    scheduler_flow.candidates(ctx, ready)
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
@@ -292,6 +301,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        scheduler_flow.hold(ctx, "starts-off" if not ctx.start_runs else "outside-run-hours")
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
