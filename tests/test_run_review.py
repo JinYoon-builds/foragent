@@ -896,3 +896,64 @@ def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monk
     assert "earlier failure" in cuts.failures_path(c.store.root, 1).read_text()
     c.store.finish_run(1, "error")
     c.tracker.remove_labels(1, ["running"])
+
+
+def test_lane_decisions_block_is_appended_replaced_and_dropped_once():
+    from foragent.run_prompts import lane_decisions_section, refresh_lane_decisions
+
+    old, new = lane_decisions_section(["Old choice."]), lane_decisions_section(["New choice."])
+    body = refresh_lane_decisions("Closes #1", old)
+    assert body.startswith("Closes #1\n\n") and body.count("- Old choice.") == 1
+    replaced = refresh_lane_decisions(body + "\n\nTail.", new)
+    assert "Old choice." not in replaced and replaced.count("- New choice.") == 1 and replaced.endswith("Tail.")
+    assert refresh_lane_decisions(replaced, new) == replaced
+    assert refresh_lane_decisions(body, "") == "Closes #1"
+
+
+def _native_pr_reviewer(c, seen):
+    def review(**kwargs):
+        seen.append(c.tracker.get_issue(kwargs["review_pr"]).body)
+        return ExecResult(0, False, json.dumps({"result": "(none)"}), kwargs["log_path"])
+
+    c.ctx.config = replace(c.ctx.config, reviewer="claude", review_scope="pr-body")
+    c.ctx.executor_factory = lambda name: c.executor if name == "codex" else SimpleNamespace(run=review)
+
+
+def test_pr_body_review_receives_the_lanes_decide_lines(run_case, monkeypatch):
+    from foragent import run_review
+    from foragent.run_prompts import lane_decisions_section
+
+    c = run_case
+    section = lane_decisions_section(["Choose a helper name while implementing."])
+    monkeypatch.setattr(run_review, "_lane_decisions", lambda n, ctx, worktree: section)
+    seen = []
+    _native_pr_reviewer(c, seen)
+    assert run_issue(1, c.ctx) == "merged"
+    # Native PR review reads only the PR body, so the decisions must be there when it runs.
+    assert len(seen) == 1 and seen[0].count("- Choose a helper name while implementing.") == 1
+
+
+def test_pr_body_re_review_refreshes_the_lanes_decide_lines(run_case, monkeypatch):
+    from foragent import run_review
+    from foragent.run_prompts import lane_decisions_section, refresh_lane_decisions
+    from foragent.runner import review_only
+
+    c = run_case
+    c.store.finish_run(1, outcome="held")
+    c.now[0] += timedelta(seconds=1)
+    c.tracker.remove_labels(1, ["running"])
+    base = c.history.tip
+    c.history.update({"feature.txt": "done"})
+    head = c.history.tip
+    old = refresh_lane_decisions("Review", lane_decisions_section(["Obsolete choice."]))
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body=old)
+    c.tracker.set_pr_head_sha(pr, head)
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    section = lane_decisions_section(["Use a local tuple."])
+    monkeypatch.setattr(run_review, "_lane_decisions", lambda n, ctx, worktree: section)
+    seen = []
+    _native_pr_reviewer(c, seen)
+    assert review_only(1, c.ctx) == "merged"
+    assert len(seen) == 1 and seen[0].count("- Use a local tuple.") == 1
+    assert "Obsolete choice." not in seen[0]

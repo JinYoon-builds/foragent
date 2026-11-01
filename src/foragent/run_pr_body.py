@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from foragent import risks
-from foragent.run_prompts import review_scope_rules
+from foragent.run_prompts import lane_decisions_block, review_scope_rules
 
 if TYPE_CHECKING:
     from foragent.issue import ParsedIssue
@@ -20,9 +20,9 @@ def _pr_body(
     attempt_tiers: dict[str, str] | None = None,
     missing_skills: list[str] | None = None,
     skills_line: str | None = None,
-    rebuttals: str = "",
+    rebuttals: str = "", searched: str = "",
     review_scope: str = "claude-local", acceptance_dir: str = "tests/acceptance/",
-    risk_notes: str = "", language: str = "en",
+    risk_notes: str = "", language: str = "en", lane_decisions: str = "",
 ) -> str:
     lines = [f"Closes #{n}", "", "| Done when command | Result |", "| --- | --- |"]
     for check in checks:
@@ -37,6 +37,9 @@ def _pr_body(
                       "The acceptance tests are locked."])
         if risk_notes:
             lines.extend(["", risks.notes_block(risk_notes)])
+        if lane_decisions:
+            # Native PR review reads only the PR body, so the lane's DECIDE lines travel here.
+            lines.extend(["", lane_decisions_block(lane_decisions)])
     elif not reviews:
         lines.append("Disabled (reviewer: none).")
     for round_number, review in enumerate(reviews if review_scope == "claude-local" else [], 1):
@@ -48,6 +51,9 @@ def _pr_body(
         lines.append("")
     if rebuttals:
         lines.extend(["", "## Rebuttals", "", rebuttals])
+    if searched:
+        # The lane's own list of what it searched for, where and what it found; read, never judged.
+        lines.extend(["", "## Searched", "", searched])
     if parsed.done_when_checklist:
         lines.extend(["", "## Needs a human check", ""])
         lines.extend(f"- [ ] {item.text}" for item in parsed.done_when_checklist)

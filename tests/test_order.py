@@ -19,7 +19,8 @@ from foragent.reasons import Reason, format_comment
 from foragent.scheduler import TickContext, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import FakeTracker, TrackerError
+from foragent.ownership import OwnershipError, effective_orderer
+from foragent.tracker import FakeTracker, IdentityError, TrackerError
 
 from conftest import BASE_TIME, git_command
 
@@ -145,6 +146,57 @@ def publish(case, plan, **kwargs):
     return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **kwargs)
 
 
+@pytest.mark.parametrize("selection", [
+    {}, {"approve": True}, {"approve_keys": ["client", "api", "api"]}, {"approve_numbers": [101, 100]},
+])
+def test_deferred_order_retains_exact_plan_and_approval_selection(publishing, plan, selection):
+    from foragent import order_notes
+
+    original = deepcopy(plan)
+    report = publish(publishing, plan, defer="next-code-merge", **selection)
+    store = StateStore.for_repo("owner/repo")
+    row, = order_notes.pending(StateStore(store.root))["orders"]
+    assert row["plan"] == original
+    assert {key: row[key] for key in ("approve", "approve_keys", "approve_numbers")} == {
+        "approve": selection.get("approve", False), "approve_keys": selection.get("approve_keys", []),
+        "approve_numbers": selection.get("approve_numbers", []),
+    }
+    assert row["status"] == "waiting" and row["recorded_at"] and row["boundary"] == "next-code-merge"
+    assert "approved" not in row and "preread" not in row
+    assert "waiting" in report.summary() and "next-code-merge" in report.summary()
+    assert publishing[4] == [] and publishing[2].list_issues() == []
+    assert not (publishing[0] / FILE).exists()
+
+
+def test_deferred_order_replacement_only_appends_and_pending_does_not_write(publishing, plan):
+    from foragent import order_notes
+
+    publish(publishing, plan, defer="first", approve=True)
+    store = StateStore.for_repo("owner/repo")
+    journal = store.root / "orders.jsonl"
+    earlier = journal.read_bytes()
+    plan["summary"] = "Revised scope"
+    publish(publishing, plan, defer="second", approve_keys=["client"])
+    saved = journal.read_bytes()
+    assert saved.startswith(earlier) and len(saved) > len(earlier)
+    for _ in range(2):
+        row, = order_notes.pending(StateStore(store.root))["orders"]
+        assert row["plan"] == plan and row["boundary"] == "second"
+        assert row["approve"] is False and row["approve_keys"] == ["client"]
+        assert row["status"] == "waiting"
+        assert journal.read_bytes() == saved
+    assert len(order_notes.entries(store, "orders.jsonl")) == 2
+
+
+def test_deferred_dry_run_retains_nothing(publishing, plan):
+    from foragent import order_notes
+
+    report = publish(publishing, plan, defer="next-code-merge", approve=True, dry_run=True)
+    assert report.dry_run and report.waiting_for is None
+    assert order_notes.pending(StateStore.for_repo("owner/repo")) == {"orders": [], "notes": []}
+    assert publishing[4] == []
+
+
 @pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_interactive_requires_boolean_before_writes(publishing, plan, value, dry_run):
@@ -176,7 +228,7 @@ def test_interactive_republication_syncs_label_without_duplicate_children(publis
     assert "interactive" in tracker.get_issue(2).labels
     publish(publishing, plan)
     assert len(tracker.issues) == 3
-    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "custom"}
+    assert tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "custom"}
     plan["issues"][0]["interactive"] = True
     publish(publishing, plan)
     assert "interactive" in tracker.get_issue(2).labels
@@ -195,11 +247,13 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
         f"```sh\nuv run pytest -q {FILE}\n```\n```sh\ntrue\n```\n- [ ] Looks right\n"
         f"[{FILE}](https://github.com/owner/repo/blob/main/{FILE})\n\n"
         "<!-- foragent:plan-child id=2026-10-20-login key=api -->\n"
+        "<!-- foragent:owner-label -->\n"
     )
     assert tracker.get_issue(2).body == expected
     assert parse_body(expected).done_when_commands == plan["issues"][0]["done_when"]
-    assert tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
-    assert tracker.get_issue(3).labels == {"size:s", "approved"}
+    assert tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "approved"}
+    assert tracker.get_issue(3).labels == {"by:human", "size:s", "approved"}
+    assert tracker.get_issue(1).labels == {"by:human"}
     assert tracker.parent_of(2) == tracker.parent_of(3) == 1
     assert [dep.number for dep in tracker.blocked_by(3)] == [2]
     assert {"size:s", "size:m", "size:l", "lane:api"} <= tracker.labels.keys()
@@ -223,7 +277,7 @@ def test_publish_projects_are_idempotent_and_failure_does_not_stop_publication(p
     for _ in range(2):
         report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
         assert report.parent == 1
-    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"lane:api", "size:m", "approved"}
+    assert len(tracker.issues) == 3 and tracker.get_issue(2).labels == {"by:human", "lane:api", "size:m", "approved"}
     if offline:
         assert "Could not add issue" in caplog.text and "Could not set board Status" in caplog.text
     else:
@@ -529,6 +583,67 @@ def test_republication_reconciles_removed_and_replaced_dependencies(publishing, 
     assert [dep.number for dep in tracker.blocked_by(3)] == expected
 
 
+@pytest.mark.parametrize("target", ["child", "edit"])
+@pytest.mark.parametrize("change", ["add", "restore", "remove", "replace"])
+@pytest.mark.parametrize("reapprove", [False, True])
+def test_dependency_reconciliation_invalidates_before_edges(publishing, plan, monkeypatch, target, change, reapprove):
+    tracker = publishing[2]
+    other = {**deepcopy(plan["issues"][1]), "key": "other", "title": "Other", "blocked_by": []}
+    plan["issues"].append(other)
+    if target == "edit":
+        tracker.add_issue(70, "Edited", "old", ["size:s"])
+        item = {"number": 70, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        plan["edits"] = [item]
+    else:
+        item = plan["issues"][1]
+    item["blocked_by"] = [] if change == "add" else ["api"]
+    first = publish(publishing, plan, approve=True)
+    numbers = {row["title"]: row["number"] for row in first.rows}
+    number = numbers["Edited" if target == "edit" else "Login client"]
+    api, other_number = numbers["Login API"], numbers["Other"]
+    if change == "restore":
+        # The recorded plan and body still match; the native edge was removed by hand.
+        tracker.remove_blocked_by(number, api)
+    elif change == "add":
+        item["blocked_by"] = ["api"]
+    elif change == "remove":
+        item["blocked_by"] = []
+    else:
+        item["blocked_by"] = ["other"]
+    tracker.add_labels(number, ["ready"])
+    before_comments = tracker.list_comments(number)
+    calls = []
+
+    def checked(action, real):
+        def mutate(n, blocker):
+            if n == number:
+                assert not {"approved", "ready"} & tracker.get_issue(n).labels
+                calls.append((action, blocker))
+            return real(n, blocker)
+        return mutate
+
+    monkeypatch.setattr(tracker, "add_blocked_by", checked("add", tracker.add_blocked_by))
+    monkeypatch.setattr(tracker, "remove_blocked_by", checked("remove", tracker.remove_blocked_by))
+    report = publish(publishing, plan, approve=reapprove)
+    expected = [] if change == "remove" else [other_number if change == "replace" else api]
+    assert [dep.number for dep in tracker.blocked_by(number)] == expected
+    assert calls == ({"add": [("add", api)], "restore": [("add", api)],
+                      "remove": [("remove", api)], "replace": [("remove", api), ("add", other_number)]}[change])
+    assert "ready" not in tracker.get_issue(number).labels
+    assert ("approved" in tracker.get_issue(number).labels) == reapprove
+    assert next(row for row in report.rows if row["number"] == number)["approved"] == reapprove
+    if change == "restore":
+        assert tracker.list_comments(number) == before_comments
+    # An unchanged retry neither mutates edges nor repeats approval invalidation.
+    events = tracker.label_events(number)
+    comments = tracker.list_comments(number)
+    calls.clear()
+    publish(publishing, plan, approve=reapprove)
+    assert calls == []
+    assert tracker.label_events(number) == events
+    assert tracker.list_comments(number) == comments
+
+
 def test_partial_failure_before_parent_map_update_recovers_child(publishing, plan, monkeypatch):
     tracker = publishing[2]
     update = tracker.update_issue
@@ -600,11 +715,14 @@ def test_json_duplicate_fields_are_rejected(tmp_path):
         order.read_plan(path)
 
 
-def test_publish_new_lane_is_created_once(publishing, plan):
+@pytest.mark.parametrize("defer", [None, "chosen"])
+def test_publish_new_lane_is_created_once(publishing, plan, defer):
     plan["new_lanes"] = [{"name": "web", "paths": ["web/**"], "skills": []}]
     plan["issues"][1]["lane"] = "web"
-    publish(publishing, plan)
+    publish(publishing, plan, defer=defer)
     root = publishing[0]
+    from foragent import order_notes
+    assert order_notes.pending(StateStore.for_repo("owner/repo"))["orders"] == []
     assert (root / ".claude/agents/fa-web.md").exists()
     assert load_config(root).lanes["web"]["paths"] == ["web/**"]
     updated = (root, load_config(root), *publishing[2:])
@@ -627,7 +745,7 @@ def test_interrupted_lane_commit_is_completed_before_issues(publishing, plan, mo
     monkeypatch.setattr(git, "commit_paths", original)
     publish((root, load_config(root), tracker, git, events), plan)
     assert events[0][1] == "Foragent lane web"
-    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md"}
+    assert set(events[0][2]) == {".foragent.yml", ".claude/agents/fa-web.md", ".gitattributes"}
 
 
 def test_edit_with_changed_acceptance_invalidates_approval_on_retry(publishing, plan):
@@ -661,7 +779,9 @@ def test_edit_reverting_to_a_prior_revision_still_refreshes_approval(publishing,
     git.saved[name] = "first\n"
     publish(publishing, plan, approve_numbers=[9])
     assert [event.action for event in tracker.label_events(9)[len(events):]] == ["unlabeled", "labeled"]
-    assert len(tracker.list_comments(9)) == 2
+    # The latest revision was "second"; going back to "first" is a new change that needs approval.
+    comments = tracker.list_comments(9)
+    assert len(comments) == 3 and comments[-1].body == comments[0].body
     snapshot = json.loads(re.search(r"acceptance=(\{[^\n]*\}) -->", tracker.get_issue(10).body)[1])
     assert snapshot["9"] == {name: git.blob_shas(git.head_sha(), [name])[name]}
 
@@ -707,7 +827,7 @@ def test_lane_skills_stay_local_and_copy_into_runner_worktree(offline_publicatio
     assert "skills: [testing-strategy]" in (runner / ".claude/agents/fa-web.md").read_text()
     lane_commit = next(args for args in calls if "commit" in args and args[args.index("-m") + 1] == "Foragent lane web")
     assert set(lane_commit[lane_commit.index("--") + 1:]) == {
-        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ":!CLAUDE.local.md",
+        ".foragent.yml", ".claude/agents/fa-web.md", ".gitignore", ".gitattributes", ":!CLAUDE.local.md",
     }
     assert len([args for args in calls if args[0] == "push"]) == 1
     order.publish(plan, root, load_config(root), tracker, repo="owner/repo", git=git, manager=manager)
@@ -789,7 +909,8 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
     assert result["feedback"] == [{"number": 1, "title": "Feedback", "body": "Fix it\n\nAbout #8.", "about": 8}]
@@ -799,6 +920,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert result["decisions"][0]["body"] == "Current issue body"
     assert [item["state_group"] for item in result["open_issues"]] == ["unapproved", "needs-human", "needs-human", "needs-human", "running", "approved-waiting"]
     assert result["open_issues"][1]["lane"] == "api" and result["open_issues"][1]["size"] == "l"
+    assert {item["waiting"] for item in result["open_issues"]} == {None}
     assert result["specs"] == [{"path": "docs/specs/one.md", "heading": "First heading"}]
     assert result["repo"]["test_commands"] == ["uv run pytest", "pnpm test", "go test ./..."]
     assert result["repo"]["languages"] == ["Go", "JavaScript", "Python"]
@@ -807,6 +929,95 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert not any(path.startswith((".git/", ".venv/", "node_modules/")) for path in result["repo"]["tree"])
     (tmp_path / "package.json").write_text('{"scripts":{"test":"test"}}')
     assert "npm test" in order.context(tmp_path, config, tracker)["repo"]["test_commands"]
+
+
+@pytest.mark.parametrize("legacy_owner,foreign", [(None, False), ("alice", False), ("bob", True)])
+def test_context_legacy_orderer_and_foreign_scope(tmp_path, monkeypatch, legacy_owner, foreign):
+    tracker = FakeTracker(login="Alice")
+    # Deliberately return an unfiltered, unsorted listing to exercise the context boundary.
+    tracker.add_issue(8, "Foreign PR", "## Files\n- pr.py", ["by:bob"], is_pull_request=True)
+    tracker.add_issue(7, "Closed", "## Files\n- closed.py", ["by:bob"], state="closed")
+    tracker.add_issue(6, "Unknown scope", "## Goal\nNot scoped yet", ["by:bob"])
+    tracker.add_issue(5, "Empty scope", "## Files\n## Out of scope\nRest", ["by:bob"])
+    tracker.add_issue(4, "Declared scope", "## Files\n- src/shared.py\n- ui/**\n", ["by:BOB"])
+    tracker.add_issue(2, "Legacy question", "## Files\n- legacy/**\n", ["needs-human"])
+    tracker.add_issue(1, "Own question", "body", ["by:alice", "needs-human"])
+    for n in (1, 2, 4):
+        tracker.comment(n, format_comment(Reason.SPEC_QUESTION, "Choose", "A or B?"))
+    tracker.add_labels(4, ["needs-human"])
+    monkeypatch.setattr(tracker, "list_open_issues", lambda: list(tracker.issues.values()))
+    reads, logins = [], []
+    comments = tracker.list_comments
+    monkeypatch.setattr(tracker, "list_comments", lambda n: reads.append(n) or comments(n))
+    monkeypatch.setattr(tracker, "authenticated_login", lambda: logins.append(True) or "Alice")
+    result = order.context(tmp_path, Config(legacy_owner=legacy_owner), tracker)
+    expected = [{"number": 4, "title": "Declared scope", "orderer": "bob",
+                 "files": ["src/shared.py", "ui/**"]},
+                {"number": 5, "title": "Empty scope", "orderer": "bob", "files": []},
+                {"number": 6, "title": "Unknown scope", "orderer": "bob", "files": []}]
+    if foreign:
+        expected.insert(0, {"number": 2, "title": "Legacy question", "orderer": "bob",
+                            "files": ["legacy/**"]})
+    assert result["other_orders"] == expected
+    assert [row["number"] for row in result["decisions"]] == ([1] if foreign else [1, 2])
+    assert reads == ([1] if foreign else [1, 2])
+    assert logins == [True]
+    assert [row["number"] for row in result["open_issues"]] == [1, 2, 4, 5, 6]
+
+
+@pytest.mark.parametrize("labels,body,error", [
+    (["by:alice", "by:bob"], "", "ownership_ambiguous"),
+    ([], order.OWNED_MARKER, "ownership_unconfirmed"),
+    (["by:???"], "", "ownership_invalid_login"),
+])
+@pytest.mark.parametrize("factory_login", ["alice", None])
+def test_context_unresolved_owner_stays_visible(tmp_path, monkeypatch, labels, body, error, factory_login):
+    from foragent.i18n import text
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Unresolved", body, [*labels, "needs-human"])
+    tracker.comment(1, format_comment(Reason.SPEC_QUESTION, "Choose"))
+    monkeypatch.setattr(tracker, "authenticated_login", lambda: factory_login)
+    result = order.context(tmp_path, Config(language="ko"), tracker)
+    assert result["decisions"] == result["other_orders"] == []
+    assert result["open_issues"][0]["owner_error"] == text(
+        error, "ko", owners="alice, bob", number=1, value="???")
+
+
+@pytest.mark.parametrize("failure", [TrackerError("offline"), IdentityError("robot", "Bot"),
+                                     OwnershipError("unavailable"), None])
+@pytest.mark.parametrize("legacy_owner", [None, "alice"])
+def test_context_identity_failure_preserves_legacy_questions(tmp_path, monkeypatch, failure, legacy_owner):
+    from foragent.i18n import text
+    tracker = FakeTracker()
+    tracker.add_issue(1, "Known owner", "## Files\n- ui/**", ["by:alice", "needs-human"])
+    tracker.add_issue(2, "Legacy", "", ["needs-human"])
+    tracker.add_issue(3, "Legacy without check", "", ["needs-human", "approved"])
+    tracker.add_issue(4, "Other owner", "## Files\n- src/**", ["by:bob", "needs-human"])
+    for n in (1, 2, 3, 4):
+        reason = Reason.NO_MACHINE_CHECK if n == 3 else Reason.SPEC_QUESTION
+        tracker.comment(n, format_comment(reason, "Choose", f"Question #{n}"))
+    tracker.comment(2, "<!-- foragent:decision -->\nExisting answer")
+    def unavailable():
+        if failure is not None:
+            raise failure
+        return None
+    monkeypatch.setattr(tracker, "authenticated_login", unavailable)
+    reads, comments = [], tracker.list_comments
+    monkeypatch.setattr(tracker, "list_comments", lambda n: reads.append(n) or comments(n))
+    result = order.context(tmp_path, Config(language="ko", legacy_owner=legacy_owner), tracker)
+    cause = failure or text("ownership_invalid_login", "ko", value=None)
+    error = (text("identity_not_a_person", "ko", login="robot", kind="Bot")
+             if isinstance(failure, IdentityError) else text("init_identity_failed", "ko", error=cause))
+    assert result["identity"] == {"login": None, "error": error}
+    assert [row["number"] for row in result["decisions"]] == [2, 3]
+    assert [row["reason"] for row in result["decisions"]] == ["spec-question", "no-machine-check"]
+    assert [row["question"] for row in result["decisions"]] == ["Question #2", "Question #3"]
+    assert [row["answer"] for row in result["decisions"]] == ["Existing answer", None]
+    assert reads == [2, 3]
+    assert all("owner_error" not in row for row in result["open_issues"])
+    assert result["other_orders"] == [
+        {"number": 1, "title": "Known owner", "orderer": "alice", "files": ["ui/**"]},
+        {"number": 4, "title": "Other owner", "orderer": "bob", "files": ["src/**"]}]
 
 
 def test_context_lane_skills_come_only_from_configuration(tmp_path):
@@ -997,6 +1208,22 @@ def test_preread_reply_lists_one_unknown_per_line(message, unknowns):
     assert order._unknowns(message) == unknowns
 
 
+@pytest.mark.parametrize("message,unknowns", [
+    ("Notes first.\nDECIDE: Use the catalog.\nNotes after.", []),
+    ("Plan notes.\n- APPROACH: Reuse the parser.\n* more notes", []),
+    ("Notes.\n1. QUESTION: Which locale?\nTrailing note.\nquestion: Which region?", ["Which locale?", "Which region?"]),
+    ("NONE\nDECIDE: Keep it.", []),
+])
+def test_structured_preread_reply_blocks_only_on_question_lines(message, unknowns):
+    assert order._unknowns(message) == unknowns
+
+
+def test_structured_preread_reply_keeps_decisions_and_approach():
+    message = "Note.\n- DECIDE: Use the catalog.\nAPPROACH: Reuse it.\nQUESTION: Which?"
+    assert order._decisions(message) == ["Use the catalog."]
+    assert order._approach(message) == ["Reuse it."]
+
+
 def test_preread_failed_execution_records_nothing(publishing, plan, monkeypatch):
     from foragent.executors import ExecResult
 
@@ -1057,8 +1284,9 @@ REPO = "owner/repo"
 
 
 def _child_body(plan, item, config):
-    """The body publish writes for a plan child, marker included."""
-    return order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"]) + "\n"
+    """The body publish writes for a new plan child, its plan and owner-label markers included."""
+    return (order._published_body(plan, item, REPO, config) + "\n" + order._child_marker(plan["id"], item["key"])
+            + "\n" + order.OWNED_MARKER + "\n")
 
 
 API_FILES = {FILE: "assert True\n"}
@@ -1087,6 +1315,13 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert proposal["approach"] == ["Reuse the writer."]
     assert proposal["decisions"] == ["Name the helper while implementing."]
     assert _handover(root, 7, body.replace("\n", "\r\n"), API_FILES) is not None
+    legacy = body.replace(order.OWNED_MARKER + "\n", "")  # A child published before owner labels.
+    assert _handover(root, 7, legacy, API_FILES) == proposal
+    # The body publish writes is exactly the one the run is handed the proposal for.
+    tracker, git = publishing[2], publishing[3]
+    publish(publishing, plan)
+    assert tracker.get_issue(2).body == body
+    assert _handover(root, 7, body + "\nAppended by a person.\n", API_FILES) is None
     other = order._published_body(plan, plan["issues"][1], REPO, config) + order._child_marker(plan["id"], "api")
     assert _handover(root, 7, other, API_FILES) is None, "another issue's content is not this proposal"
     assert _handover(root, 7, body.replace(f"id={plan['id']}", "id=another-order"), API_FILES) is None
@@ -1175,6 +1410,9 @@ def test_preread_proposal_of_an_edit_is_bound_to_its_number(publishing, plan, mo
     order.preread(plan, root, config, lambda: tracker, repo=REPO)
     body = order._published_body(plan, edit, REPO, config)
     assert _handover(root, 3, body, API_FILES)["approach"] == ["Reuse the writer."], "the api issue supplies FILE"
+    # An edit of an issue published under owner labels keeps that contract line at its end.
+    contract = order._with_contract(body, f"old\n{order.OWNED_MARKER}\n")
+    assert contract != body and _handover(root, 3, contract, API_FILES)["approach"] == ["Reuse the writer."]
     assert _handover(root, 4, body, API_FILES) is None
     assert _handover(root, 3, body, {FILE: "assert 1 == 1\n"}) is None
 
@@ -1316,8 +1554,9 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
     assert {key: implementation[key] for key in setup.options} == setup.options
     if lane == "api":
         assert ("agent" in setup.options) == (executor == "claude")
-    expected_prefix = implementation["prompt"].removesuffix("PROMPT")
-    assert prompt.startswith(expected_prefix) and prompt.removeprefix(expected_prefix) == order.preread_prompt(plan, item)
+    # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
+    expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 
@@ -1882,7 +2121,7 @@ def test_publication_rechecks_each_destination_right_before_writing_it(publishin
     assert list(elsewhere.iterdir()) == [] and events == []
 
 
-@pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp"])
+@pytest.mark.parametrize("name", [".gitignore", "preread.json.tmp", "preread.json.lock"])
 def test_preread_local_files_never_write_through_symlinks(publishing, plan, monkeypatch, tmp_path, name):
     root, config = publishing[0], publishing[1]
     target = tmp_path / f"outside-{name}"
@@ -1894,7 +2133,7 @@ def test_preread_local_files_never_write_through_symlinks(publishing, plan, monk
             return SimpleNamespace(exit_code=0, timed_out=False, last_message="NONE")
 
     monkeypatch.setattr(order, "executor_for", lambda executor: Reader())
-    if name == ".gitignore":
+    if name in (".gitignore", "preread.json.lock"):
         with pytest.raises(order.PlanError, match="symlink"):
             order.preread(plan, root, config)
     else:
@@ -1955,3 +2194,1016 @@ def test_publication_write_must_stay_inside_its_own_root(tmp_path):
                       ("tests/test_a.py", "tests/acceptance/")):
         with pytest.raises(order.PlanError, match="outside"):
             check_write(tmp_path, name, own)
+
+
+def make_legacy(tracker, number):
+    """Turn an issue into one published before owner labels existed."""
+    issue = tracker.get_issue(number)
+    tracker.remove_labels(number, [label for label in issue.labels if label.startswith("by:")])
+    tracker.update_issue(number, title=issue.title, body=issue.body.replace(order.OWNED_MARKER + "\n", ""))
+
+
+def owners(tracker):
+    return {n: {label for label in issue.labels if label.startswith("by:")} for n, issue in tracker.issues.items()}
+
+
+def test_publish_without_an_authenticated_person_changes_nothing(publishing, plan):
+    tracker, events = publishing[2], publishing[4]
+    tracker.login = ""
+    with pytest.raises(order.PlanError, match="GitHub account"):
+        publish(publishing, plan, approve=True)
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
+
+
+def test_owner_label_dropped_by_github_closes_the_issue_and_stops(publishing, plan):
+    tracker = publishing[2]
+    created = tracker.create_issue
+
+    def drop_owner(title, body, labels):  # GitHub ignores labels its caller may not apply.
+        return created(title, body, [label for label in labels if not label.startswith("by:")])
+
+    tracker.create_issue = drop_owner
+    with pytest.raises(order.PlanError, match="by:human"):
+        publish(publishing, plan)
+    assert [(n, issue.state) for n, issue in tracker.issues.items()] == [(1, "closed")]
+    assert "by:human" in tracker.list_comments(1)[0].body
+
+
+def test_republication_and_approval_keep_the_publishers_owner(publishing, plan):
+    tracker = publishing[2]
+    publish(publishing, plan)
+    tracker.login = "Bob"
+    plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
+    publish(publishing, plan, approve=True)
+    assert owners(tracker) == {1: {"by:human"}, 2: {"by:human"}, 3: {"by:human"}, 4: {"by:human"}}
+    assert "by:bob" not in tracker.labels
+
+
+def test_republication_refuses_contradictory_owner_labels(publishing, plan):
+    tracker = publishing[2]
+    publish(publishing, plan)
+    tracker.add_labels(3, ["by:bob"])
+    before = deepcopy(tracker.issues)
+    with pytest.raises(order.PlanError, match="by:human|bob"):
+        publish(publishing, plan, approve=True)
+    assert tracker.issues == before
+
+
+def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    for number in (1, 2, 3):  # An order published before owner labels existed.
+        make_legacy(tracker, number)
+    tracker.login = "bob"
+    plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
+    order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert owners(tracker) == {1: set(), 2: set(), 3: set(), 4: {"by:jin"}}
+
+
+def test_edits_keep_the_existing_issue_owner(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(9, "Legacy", "old body", labels=["size:s"])
+    tracker.add_issue(10, "Alice's", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s", "by:alice"])
+    tracker.add_issue(11, "Ownerless", f"old body\n{order.OWNED_MARKER}\n", labels=["size:s"])
+    edit = {key: plan["issues"][1][key] for key in ("goal", "out_of_scope", "done_when", "checklist")}
+    plan["issues"], plan["edits"] = [], [{**edit, "number": n} for n in (9, 10, 11)]
+    publish(publishing, plan, approve=True)
+    assert owners(tracker)[9] == set() and owners(tracker)[10] == {"by:alice"} and owners(tracker)[11] == set()
+    # The rewritten body keeps each issue's owner-label contract, and only theirs.
+    assert [order.OWNED_MARKER in tracker.get_issue(n).body for n in (9, 10, 11)] == [False, True, True]
+    with pytest.raises(OwnershipError):
+        effective_orderer(tracker.get_issue(11), replace(publishing[1], legacy_owner="jin"), "jin")
+    events = {n: list(tracker.label_events(n)) for n in (9, 10, 11)}
+    publish(publishing, plan, approve=True)  # Idempotent: the kept contract does not look like a change.
+    assert {n: list(tracker.label_events(n)) for n in (9, 10, 11)} == events
+
+
+@pytest.mark.parametrize("refused", ["parent", "child"])
+@pytest.mark.parametrize("fault", ["label", "read", "read-unlabelled", "retire", "close", "retire-and-close"])
+def test_retry_after_any_unconfirmed_creation_never_reuses_that_issue(publishing, plan, refused, fault):
+    tracker = publishing[2]
+    target = plan["title"] if refused == "parent" else plan["issues"][1]["title"]
+    created, read, write, close = tracker.create_issue, tracker.get_issue, tracker.update_issue, tracker.close_issue
+    victim = []
+
+    def create(title, body, labels):
+        if title == target and not victim:
+            if fault != "read":  # GitHub drops a label its caller may not apply.
+                labels = [label for label in labels if not label.startswith("by:")]
+            victim.append(created(title, body, labels))
+            return victim[0]
+        return created(title, body, labels)
+
+    def faulty(method, kinds, once=False):
+        failed = []
+
+        def call(n, *args, **kwargs):
+            if victim and n == victim[0] and fault in kinds and not (once and failed):
+                failed.append(n)
+                raise TrackerError(f"{method.__name__} failed")
+            return method(n, *args, **kwargs)
+        return call
+
+    tracker.create_issue = create
+    # One transient read failure: any rollback after it would succeed, so a wrong one shows.
+    tracker.get_issue = faulty(read, {"read", "read-unlabelled"}, once=True)
+    tracker.update_issue = faulty(write, {"retire", "retire-and-close"})
+    tracker.close_issue = faulty(close, {"close", "retire-and-close"})
+    with pytest.raises((order.PlanError, TrackerError)):
+        publish(publishing, plan)
+    number = victim[0]
+    for name, original in (("create_issue", created), ("get_issue", read),
+                           ("update_issue", write), ("close_issue", close)):
+        setattr(tracker, name, original)
+    first = tracker.get_issue(number)
+    # Each cleanup step runs even when the other one fails.
+    assert (first.state == "closed") == (fault in ("label", "retire"))
+    assert ("<!-- foragent:plan" not in first.body) == (fault in ("label", "close"))
+    if fault == "read":  # The outcome was unknown, and it was a labelled issue: nothing undone.
+        assert owners(tracker)[number] == {"by:human"} and first.state == "open"
+        assert "<!-- foragent:plan" in first.body, "its live markers let a retry find it"
+    if fault != "read":  # Whatever rollback failed, an unlabelled leftover is nobody's work, never legacy work.
+        assert not owners(tracker)[number] and order.OWNED_MARKER in first.body
+        for config in (publishing[1], replace(publishing[1], legacy_owner="jin")):
+            with pytest.raises(OwnershipError, match=f"#{number} was published for an owner label"):
+                effective_orderer(first, config, "human")
+    tracker.login = "bob"  # Anyone may retry; the unconfirmed issue must not decide the owner.
+    report = publish(publishing, plan)
+    numbers = {report.parent, *(row["number"] for row in report.rows)}
+    labelled = "by:human" in tracker.get_issue(number).labels
+    assert labelled == (fault == "read")
+    assert (number in numbers) == labelled, "A labelled issue is reused, an unlabelled one never"
+    # A reused labelled parent keeps its original owner; a fresh parent belongs to the retrying person.
+    expected = {"by:bob"} if refused == "parent" and number not in numbers else {"by:human"}
+    assert all(owners(tracker)[n] == expected for n in numbers)
+    assert all(tracker.get_issue(n).state == "open" for n in numbers)
+    leftover = tracker.get_issue(number)
+    if fault != "read":  # A labelled (confirmed but unread) issue stays a normal owned issue.
+        assert leftover.state == "closed" and "<!-- foragent:plan" not in leftover.body
+        assert order.OWNED_MARKER in leftover.body
+    publish(publishing, plan)  # Stable afterwards: no duplicate parents or children.
+    assert {report.parent, *(row["number"] for row in publish(publishing, plan).rows)} == numbers
+
+
+STATEMENT = "A caller observes one receipt per login."
+# A test the lane has not written yet: a statement draft may name it before preparation.
+UNWRITTEN = "uv run pytest -q tests/acceptance/test_receipt.py"
+
+
+@pytest.mark.parametrize("statements", [False, True])
+def test_only_statement_drafts_may_name_unwritten_tests(publishing, plan, statements):
+    plan["issues"][1]["done_when"] = [UNWRITTEN]
+    if statements:
+        plan["issues"][1]["statements"] = [STATEMENT]
+        report = publish(publishing, plan, dry_run=True)
+        assert "tests/acceptance/test_receipt.py" not in report.paths
+    else:
+        with pytest.raises(order.PlanError, match="missing acceptance file: tests/acceptance/test_receipt.py"):
+            publish(publishing, plan, dry_run=True)
+
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("options", [{}, {"approve": True}])
+def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
+        publishing, plan, monkeypatch, kind, options):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    root, config, tracker, _, events = publishing
+    if kind == "edits":
+        tracker.add_issue(9, "Existing", "old", ["needs-human"])
+        plan["id"] = "2026-10-21-login-update"
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.",
+                          "done_when": [UNWRITTEN], "statements": [STATEMENT]}]
+        key = "#9"
+    else:
+        # Tests already in the plan and a clean old preread do not turn it into legacy work.
+        plan["issues"][0]["statements"] = [STATEMENT]
+        plan["issues"][0]["done_when"].append(UNWRITTEN)
+        for item in plan["issues"]:
+            _record_preread(root, config, plan, item, [])
+        key = "api"
+    assert publish(publishing, deepcopy(plan), dry_run=True).dry_run
+    before = dict(tracker.issues)
+    with pytest.raises(order.PlanError, match=rf"statement issue\(s\) {re.escape(key)} have no reviewed tests"):
+        publish(publishing, plan, **options)
+    assert events == [] and tracker.issues == before
+    assert not (root / "docs").exists()
+
+
+def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT]
+    with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
+        publish(publishing, plan, approve=True)
+
+
+@pytest.mark.parametrize("value", [[], [""], [" "], "one", [7], ["two\nlines"]])
+def test_invalid_statements_name_the_field(publishing, plan, value):
+    plan["issues"][1]["statements"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[1\]\.statements"):
+        publish(publishing, plan, dry_run=True)
+
+
+def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
+    publish(publishing, plan)
+    body = publishing[2].get_issue(2).body
+    assert f"## Behaviour\n- {STATEMENT}\n- Nothing else changes.\n" in body
+    assert parse_body(body).goal == "Implement login."
+    assert "## Behaviour" not in publishing[2].get_issue(3).body
+
+
+@pytest.mark.parametrize("partial", ["parent-only", "unmapped-child"])
+def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishing, plan, partial):
+    """A pre-team order that stopped early is still the original factory's order."""
+    root, config, tracker, git, _ = publishing
+    if partial == "parent-only":  # Stopped before its first child: the parent records none.
+        tracker.add_issue(1, plan["title"], f"{plan['summary']}\n\n\n\n{order._plan_marker(plan['id'], {}, {})}\n")
+    else:  # Stopped after creating the client child, before recording it in the map.
+        publish(publishing, plan)
+        parent = tracker.get_issue(1)
+        body = re.sub(r"map=\{[^\n]*?\}", 'map={"api": 2}', parent.body)
+        tracker.update_issue(1, title=parent.title, body=body)
+        for number in (1, 2, 3):
+            make_legacy(tracker, number)
+    tracker.login = "bob"
+    report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert report.parent == 1, "The legacy parent is kept"
+    children = {row["number"] for row in report.rows}
+    survivors = set() if partial == "parent-only" else {2, 3}
+    assert survivors <= children, "Legacy children found by marker are kept"
+    assert all(owners(tracker)[n] == {"by:jin"} for n in children - survivors)
+    assert all(owners(tracker)[n] == set() for n in {1} | survivors), "Legacy issues are not relabelled"
+    assert all(order.OWNED_MARKER not in tracker.get_issue(n).body for n in {1} | survivors)
+    assert all(tracker.get_issue(n).state == "open" for n in {1} | children)
+
+
+
+def test_a_parent_whose_owner_label_a_person_removed_is_refused_not_replaced(publishing, plan):
+    """A recorded order without its by: label is neither recreated nor given to anyone."""
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    tracker.remove_labels(1, ["by:human"])
+    tracker.login = "bob"
+    before = deepcopy(tracker.issues)
+    with pytest.raises(order.PlanError, match="#1 was published for an owner label"):
+        order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
+    assert tracker.issues == before
+    tracker.add_labels(1, ["by:human"])  # A person restores the owner; publication continues.
+    assert order.publish(plan, root, config, tracker, repo="owner/repo", git=git).parent == 1
+    assert len(tracker.issues) == 3
+
+
+def _budget_case(tmp_path, monkeypatch, budget):
+    """One store in a private machine root with ``budget`` slots and a calm machine."""
+    from datetime import UTC, datetime
+    from foragent import capacity
+
+    store = StateStore(tmp_path / "machine" / "owner__project")
+    store.root.mkdir(parents=True)
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    capacity.write_state(store, budget, datetime.now(UTC))
+    return store
+
+
+def test_perspectives_seat_without_a_slot_in_time_fails_in_the_configured_language(
+        tmp_path, monkeypatch, capsys, fake_process_table):
+    import shutil
+    from foragent import capacity, executors, order_perspectives
+
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree=sibling.worktree_path(99), pid=capacity.os.getpid())
+    clock = [0.0]
+    monkeypatch.setattr(capacity.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: pytest.fail("no seat may start without a slot"))
+    result = order_perspectives.run({"id": "p"}, tmp_path, Config(language="ko"), store)
+    assert result["questions"] == []
+    assert len(result["failures"]) == len(order_perspectives.SEATS)
+    assert all("시작하지 못했어요" in failure["error"] and "기계 여유" in failure["error"]
+               for failure in result["failures"])
+    err = capsys.readouterr().err
+    assert f"관점 자리 {len(order_perspectives.SEATS)}개" in err and "남은 칸은 0개" in err
+    assert capacity.machine_runs(store, capacity.datetime.now(capacity.UTC)) == 1  # Only the sibling's run.
+
+
+def test_perspectives_wave_notice_only_when_seats_outnumber_free_slots(tmp_path, monkeypatch, capsys):
+    import shutil
+    from foragent import executors, order_perspectives
+    from foragent.executors import ExecResult
+
+    class Worker:
+        def run(self, **kwargs):
+            return ExecResult(0, False, "NONE", kwargs["log_path"])
+
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: f"/bin/{name}")
+    monkeypatch.setattr(executors, "executor_for", lambda name: Worker())
+    seats = len(order_perspectives.SEATS)
+    store = _budget_case(tmp_path / "wide", monkeypatch, seats)
+    (store.root.parent / "machine.yml").write_text(f"max_parallel: {seats}\n")
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    assert capsys.readouterr().err == ""
+    store = _budget_case(tmp_path / "narrow", monkeypatch, 2)
+    assert order_perspectives.run({"id": "p"}, tmp_path, Config(), store)["failures"] == []
+    err = capsys.readouterr().err
+    assert f"{seats} perspective seats" in err and "2 free slot(s)" in err and f"{-(-seats // 2)} wave(s)" in err
+
+
+def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, monkeypatch, capsys,
+                                                   fake_process_table):
+    from foragent import capacity
+
+    root, config = publishing[0], publishing[1]
+    store = _budget_case(tmp_path, monkeypatch, 1)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    sibling = StateStore(store.root.parent / "other")
+    sibling.start_run(99, branch="other", worktree="other", pid=capacity.os.getpid())
+    monkeypatch.setattr(capacity.time, "sleep", lambda seconds: sibling.active_runs() and sibling.finish_run(99, "merged"))
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    assert len(order.preread(plan, root, config)) == len(plan["issues"]) > 1
+    err = capsys.readouterr().err
+    assert f"Each of the {len(plan['issues'])} issues is read in its own turn" in err
+    assert "Waiting for machine capacity" in err
+    order.preread(plan, root, config)  # A free slot: no notice.
+    assert "own turn" not in capsys.readouterr().err
+
+
+class _WaitIssue:
+    """One issue's body and comments, written the way publication writes them."""
+
+    def __init__(self, body=None):
+        from foragent import order_waiting
+        self.waiting = order_waiting
+        self.tracker = FakeTracker()
+        self.number = self.tracker.add_issue(1, "Wait", body or "", labels=[]).number
+        self.body = body
+
+    def write(self, after, language="en", comment=True):
+        self.body = self.waiting.stamp(self.body, after)
+        self.tracker.update_issue(self.number, title="Wait", body=self.body)
+        if comment:
+            self.waiting.announce(self.tracker, self.number, self.body, language)
+
+    def lines(self):
+        return [c.body for c in self.tracker.list_comments(self.number) if "foragent:waiting" in c.body]
+
+
+def test_waiting_section_is_read_raw_and_ends_at_the_next_heading():
+    from foragent import order_waiting
+    body = "## Goal\nShip.\n\n## Waiting\nReason: A\n### Detail\nNext: B\n\n## Out of scope\nX\n"
+    assert order_waiting.section(body) == "Reason: A\n### Detail\nNext: B"
+    assert order_waiting.section("## Waiting\nNone.\n<!-- foragent:child plan=p key=k -->") == "None."
+    assert order_waiting.section("## Goal\nNo wait.") is None
+    line = order_waiting.comment_line("0" * 64, "1" * 32, "Reason: A\nNext: B")
+    assert len(line.splitlines()) == 1 and line.startswith("Waiting: Reason: A · Next: B <!--")
+    assert "cleared" in order_waiting.comment_line("0" * 64, "1" * 32, None)
+
+
+def test_bodies_without_a_wait_change_are_written_unchanged():
+    from foragent import order_waiting
+    plain = "## Goal\nShip.\n<!-- foragent:plan-child id=p key=k -->\n"
+    assert order_waiting.stamp(None, plain) == plain
+    assert order_waiting.stamp(plain, plain) == plain
+    legacy = "## Goal\nShip.\n\n## Waiting\nOld\n"
+    assert order_waiting.stamp(legacy, legacy) == legacy
+
+
+def test_waiting_announcement_follows_the_transition_recorded_on_the_issue():
+    issue = _WaitIssue()
+    issue.write("## Goal\nNo wait.\n")
+    assert issue.lines() == []
+    issue.write("## Waiting\nA\n")
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 1
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 2 and issue.lines()[-1].startswith("Waiting cleared.")
+    issue.write("## Goal\ny\n")
+    assert len(issue.lines()) == 2
+    # A wait identical to an older one, after a different one, is a new transition.
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 3
+
+
+def test_waiting_removed_from_an_issue_without_any_marker_comments_cleared():
+    """The issue's current body is a fact too: a hand-written wait never announced still clears."""
+    issue = _WaitIssue("## Waiting\nLegacy\n")
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1 and issue.lines()[0].startswith("Waiting cleared.")
+
+
+def test_cleared_hand_written_wait_survives_a_lost_comment():
+    """The body is written, the comment fails: the retry still owes the clearing line, once."""
+    issue = _WaitIssue("## Waiting\nLegacy\n")
+    issue.write("## Goal\nDone.\n", comment=False)
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1 and issue.lines()[0].startswith("Waiting cleared.")
+    issue.write("## Goal\nDone.\n")
+    assert len(issue.lines()) == 1
+
+
+def test_waiting_edited_by_hand_and_republished_back_comments_the_transition():
+    """The last line announced A, a person edited the body to C; writing A again is a real change."""
+    issue = _WaitIssue()
+    issue.write("## Waiting\nA\n")
+    issue.body = issue.body.replace("## Waiting\nA", "## Waiting\nC")
+    issue.write("## Waiting\nA\n", comment=False)
+    issue.write("## Waiting\nA\n")
+    assert len(issue.lines()) == 2 and issue.lines()[-1].startswith("Waiting: A ")
+
+
+def test_waiting_line_follows_the_configured_language_and_keeps_authored_text():
+    issue = _WaitIssue()
+    issue.write("## Waiting\nReason: locale pending\n", "ko")
+    issue.write("## Goal\nDone.\n", "ko")
+    first, second = issue.lines()
+    assert first.startswith("기다리는 중: Reason: locale pending <!-- foragent:waiting")
+    assert second.startswith("기다림이 풀렸어요. <!--")
+    assert "Waiting" not in first.split("<!--")[0] and "cleared" not in second
+
+
+def test_publication_waiting_comments_use_the_configured_language(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    korean = replace(config, language="ko")
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: locale pending\n"
+    order.publish(plan, root, korean, tracker, repo="owner/repo", git=git)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    plan["issues"][0]["goal"] = plan["issues"][0]["goal"].split("\n\n## Waiting")[0]
+    order.publish(plan, root, korean, tracker, repo="owner/repo", git=git)
+    lines = [c.body for c in tracker.list_comments(child) if "foragent:waiting" in c.body]
+    assert [line.split(" <!--")[0] for line in lines] == ["기다리는 중: Reason: locale pending", "기다림이 풀렸어요."]
+
+
+
+def test_edit_blocked_by_must_name_plan_keys(tmp_path, plan):
+    plan["edits"] = [{"number": 9, "goal": "g", "out_of_scope": "o", "done_when": ["true"], "blocked_by": ["nope"]}]
+    with pytest.raises(order.PlanError, match="unknown blocked_by key: nope"):
+        order.validate_plan(plan, tmp_path, Config(lanes={"api": {"paths": ["api/**"]}, "web": {"paths": ["web/**"]}}))
+    plan["edits"][0]["blocked_by"] = "api"
+    with pytest.raises(order.PlanError, match=r"edits\[0\]\.blocked_by"):
+        order.validate_plan(plan, tmp_path, Config(lanes={"api": {"paths": ["api/**"]}, "web": {"paths": ["web/**"]}}))
+
+
+def test_edit_dependency_change_alone_revokes_approval_and_absent_field_keeps_edges(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    api = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    report = publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    assert report.rows[-1]["blocked_by"] == [api]
+    tracker.add_labels(child, ["approved"])
+    publish(publishing, changed)
+    assert "approved" in tracker.get_issue(child).labels
+    del edit["blocked_by"]
+    publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    tracker.add_labels(child, ["approved"])
+    edit["blocked_by"] = []
+    publish(publishing, changed)
+    assert tracker.blocked_by(child) == [] and "approved" not in tracker.get_issue(child).labels
+
+
+def test_dependency_edit_back_to_an_older_revision_revokes_approval(publishing, plan):
+    """A -> B -> A: an older matching revision is not the approval the issue holds now."""
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    api = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    publish(publishing, changed)
+    edit["blocked_by"] = []
+    publish(publishing, changed)
+    tracker.add_labels(child, ["approved"])
+    edit["blocked_by"] = ["api"]
+    publish(publishing, changed)
+    assert [dep.number for dep in tracker.blocked_by(child)] == [api]
+    assert "approved" not in tracker.get_issue(child).labels
+
+
+def test_waiting_comment_lost_after_child_creation_is_posted_on_retry(publishing, plan, monkeypatch):
+    from foragent import order_waiting
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: locale pending\n"
+    real = order_waiting.announce
+    monkeypatch.setattr(order_waiting, "announce", lambda *args: (_ for _ in ()).throw(TrackerError("comment failed")))
+    with pytest.raises(TrackerError):
+        publish(publishing, plan)
+    monkeypatch.setattr(order_waiting, "announce", real)
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    waiting = [c for c in tracker.list_comments(child) if "locale pending" in c.body]
+    assert len(waiting) == 1
+    publish(publishing, plan)
+    assert len([c for c in tracker.list_comments(child) if "locale pending" in c.body]) == 1
+
+
+def test_waiting_comment_lost_after_edit_body_update_is_posted_on_retry(publishing, plan, monkeypatch):
+    from foragent import order_waiting
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.\n\n## Waiting\nReason: catalog\n", "out_of_scope": "Other.",
+            "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    real_comment = tracker.comment
+
+    def failing(n, text):
+        if "foragent:waiting" in text:
+            raise TrackerError("comment failed")
+        return real_comment(n, text)
+
+    # The body is already written by an earlier attempt that stopped before commenting.
+    from foragent import order_waiting
+    tracker.update_issue(child, title="Edited", body=order_waiting.stamp(body, order._with_contract(
+        order._published_body(changed, edit, "owner/repo", config), body)))
+    monkeypatch.setattr(tracker, "comment", failing)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    monkeypatch.setattr(tracker, "comment", real_comment)
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(child) if "Reason: catalog" in c.body]) == 1
+
+
+def _failing_update(tracker, monkeypatch, number):
+    real = tracker.update_issue
+
+    def update(n, **kwargs):
+        if n == number:
+            raise TrackerError("update failed")
+        return real(n, **kwargs)
+    monkeypatch.setattr(tracker, "update_issue", update)
+    return real
+
+
+def test_failed_child_body_update_leaves_no_waiting_comment(publishing, plan, monkeypatch):
+    """The wait is announced only once the body holding it is written."""
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    plan["issues"][0]["goal"] += "\n\n## Waiting\nReason: A\n"
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    before = tracker.list_comments(child)
+    changed = deepcopy(plan)
+    changed["issues"][0]["goal"] = changed["issues"][0]["goal"].replace("Reason: A", "Reason: B")
+    real = _failing_update(tracker, monkeypatch, child)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+    monkeypatch.setattr(tracker, "update_issue", real)
+    publish(publishing, plan)
+    assert tracker.list_comments(child) == before
+
+
+def test_failed_edit_body_update_leaves_no_waiting_or_revision_comment(publishing, plan, monkeypatch):
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.\n\n## Waiting\nReason: A\n", "out_of_scope": "Other.", "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    publish(publishing, changed)
+    before = tracker.list_comments(child)
+    edit["goal"] = "Ship.\n\n## Waiting\nReason: B\n"
+    real = _failing_update(tracker, monkeypatch, child)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+    monkeypatch.setattr(tracker, "update_issue", real)
+    edit["goal"] = "Ship.\n\n## Waiting\nReason: A\n"
+    publish(publishing, changed)
+    assert tracker.list_comments(child) == before
+
+
+def test_failed_edit_dependency_sync_leaves_no_revision_comment(publishing, plan, monkeypatch):
+    root, config, tracker, git, _ = publishing
+    publish(publishing, plan)
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    child = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+    edit = {"number": child, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"], "blocked_by": ["api"]}
+    changed = {**deepcopy(plan), "issues": deepcopy(plan["issues"][:1]), "edits": [edit]}
+    real = tracker.add_blocked_by
+
+    def failing(n, blocker):
+        if n == child:
+            raise TrackerError("edge failed")
+        return real(n, blocker)
+    monkeypatch.setattr(tracker, "add_blocked_by", failing)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert not any("foragent:edit " in c.body for c in tracker.list_comments(child))
+    monkeypatch.setattr(tracker, "add_blocked_by", real)
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(child) if "foragent:edit " in c.body]) == 1
+    assert tracker.blocked_by(child) != []
+
+
+def test_republished_child_clears_a_hand_written_wait_with_no_marker(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    plan["issues"] = plan["issues"][:1]
+    publish(publishing, plan)
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+    published = tracker.get_issue(child).body
+    tracker.update_issue(child, title="Login API", body=published + "\n## Waiting\nThe person asked to hold.\n")
+    assert not any("foragent:waiting" in c.body for c in tracker.list_comments(child))
+    publish(publishing, plan)
+    lines = [c.body for c in tracker.list_comments(child) if "foragent:waiting" in c.body]
+    assert len(lines) == 1 and lines[0].startswith("Waiting cleared.")
+    assert tracker.get_issue(child).body.startswith(published)
+    publish(publishing, plan)
+    assert len([c for c in tracker.list_comments(child) if "foragent:waiting" in c.body]) == 1
+
+
+def _fail_waiting_comments(tracker, monkeypatch):
+    real = tracker.comment
+
+    def failing(n, text):
+        if "foragent:waiting" in text:
+            raise TrackerError("comment failed")
+        return real(n, text)
+    monkeypatch.setattr(tracker, "comment", failing)
+    return real
+
+
+@pytest.mark.parametrize("path", ["child", "edit"])
+def test_cleared_hand_written_wait_is_announced_after_a_failed_comment(publishing, plan, monkeypatch, path):
+    """Publication clears a wait no marker announced, the comment fails; the retry owes it once."""
+    root, config, tracker, git, _ = publishing
+    if path == "child":
+        plan["issues"] = plan["issues"][:1]
+        publish(publishing, plan)
+        number = next(issue.number for issue in tracker.list_issues() if issue.title == "Login API")
+        changed = plan
+    else:
+        body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+        number = tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"]).number
+        edit = {"number": number, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title, body=issue.body + "\n## Waiting\nThe person asked to hold.\n")
+    real = _fail_waiting_comments(tracker, monkeypatch)
+    with pytest.raises(TrackerError):
+        publish(publishing, changed)
+    assert order_waiting_section(tracker.get_issue(number).body) is None
+    monkeypatch.setattr(tracker, "comment", real)
+    publish(publishing, changed)
+    lines = [c.body for c in tracker.list_comments(number) if "foragent:waiting" in c.body]
+    assert len(lines) == 1 and lines[0].startswith("Waiting cleared.")
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(number) if "foragent:waiting" in c.body]) == 1
+
+
+def order_waiting_section(body):
+    from foragent import order_waiting
+    return order_waiting.section(body)
+
+
+def test_repeating_a_change_after_a_hand_restore_comments_again():
+    """A→B is announced, a person restores A by hand, publication writes B again: a new change."""
+    issue = _WaitIssue()
+    issue.write("## Waiting\nA\n")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 2
+    issue.body = issue.body.replace("## Waiting\nB", "## Waiting\nA")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 3 and issue.lines()[-1].startswith("Waiting: B ")
+    issue.write("## Waiting\nB\n")
+    assert len(issue.lines()) == 3
+
+
+def test_repeated_clearing_after_a_hand_restore_comments_each_time():
+    issue = _WaitIssue("## Waiting\nHold\n")
+    issue.write("## Goal\nDone.\n")
+    issue.body = issue.body.replace("## Goal\nDone.\n", "## Goal\nDone.\n\n## Waiting\nHold\n")
+    issue.write("## Goal\nDone.\n")
+    assert [line.split(" <!--")[0] for line in issue.lines()] == ["Waiting cleared.", "Waiting cleared."]
+
+
+@pytest.mark.parametrize("path", ["child", "edit"])
+def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan, path):
+    root, config, tracker, git, _ = publishing
+    a, b = "\n\n## Waiting\nReason: A\n", "\n\n## Waiting\nReason: B\n"
+    if path == "child":
+        plan["issues"] = plan["issues"][:1]
+        base = plan["issues"][0]["goal"]
+        item, changed = plan["issues"][0], plan
+    else:
+        body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+        tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"])
+        base, item = "Ship.", {"number": 70, "goal": "Ship.", "out_of_scope": "Other.", "done_when": ["true"]}
+        changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [item]}
+    item["goal"] = base + a
+    publish(publishing, changed)
+    number = 70 if path == "edit" else next(i.number for i in tracker.list_issues() if i.title == "Login API")
+    item["goal"] = base + b
+    publish(publishing, changed)
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title, body=issue.body.replace("Reason: B", "Reason: A"))
+    publish(publishing, changed)
+    lines = [c.body.split(" <!--")[0] for c in tracker.list_comments(number) if "foragent:waiting" in c.body]
+    assert lines == ["Waiting: Reason: A", "Waiting: Reason: B", "Waiting: Reason: B"]
+    publish(publishing, changed)
+    assert len([c for c in tracker.list_comments(number) if "foragent:waiting" in c.body]) == 3
+
+
+def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(publishing, plan):
+    """The edit comment names this write; rewriting over a hand edit is not the old revision."""
+    root, config, tracker, git, _ = publishing
+    body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
+    tracker.add_issue(70, "Edited", body, labels=["lane:api", "size:s"])
+    edit = {"number": 70, "goal": "Ship it.", "out_of_scope": "Other.", "done_when": ["true"]}
+    changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
+    publish(publishing, changed)
+    publish(publishing, changed)
+    revisions = lambda: [c for c in tracker.list_comments(70) if "foragent:edit " in c.body]
+    assert len(revisions()) == 1
+    issue = tracker.get_issue(70)
+    tracker.update_issue(70, title=issue.title, body=issue.body.replace("Ship it.", "Ship it by hand."))
+    tracker.add_labels(70, ["approved"])
+    publish(publishing, changed)
+    assert "Ship it.\n" in tracker.get_issue(70).body and "approved" not in tracker.get_issue(70).labels
+    assert len(revisions()) == 2
+    publish(publishing, changed)
+    assert len(revisions()) == 2
+
+
+def test_planning_notes_replacement_and_interrupted_tail(tmp_path):
+    from foragent import order_notes
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    first = order_notes.append(store, kind="decision", boundary="chosen", content="Earlier decision")
+    path = store.root / "notes.jsonl"
+    before = path.read_bytes()
+    # Simulate a killed append, including a partial UTF-8 character.
+    with path.open("ab") as stream:
+        stream.write(b'{"text":"partial\xe2')
+    interrupted = path.read_bytes()
+    later = order_notes.append(store, kind="decision", boundary="later", content="New decision",
+                               replaces=first["id"])
+    assert path.read_bytes().startswith(interrupted)
+    rows = order_notes.pending(StateStore(store.root))["notes"]
+    assert [row["id"] for row in rows] == [first["id"], later["id"]]
+    assert rows[1]["replaces"] == first["id"]
+    assert all(row["status"] == "waiting" for row in rows)
+    assert b'"status"' not in path.read_bytes()
+    assert before in path.read_bytes()
+
+
+@pytest.mark.parametrize("kind,replaces", [("idea", "earlier"), ("decision", "missing")])
+def test_planning_notes_reject_invalid_replacement_without_writing(tmp_path, kind, replaces):
+    from foragent import order_notes
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    first = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this")
+    path = store.root / "notes.jsonl"
+    before = path.read_bytes()
+    with pytest.raises(order.PlanError):
+        order_notes.append(store, kind=kind, boundary="chosen", content="Replacement",
+                           replaces=first["id"] if replaces == "earlier" else replaces)
+    assert path.read_bytes() == before
+
+
+def flush_waiting(case, boundary="chosen"):
+    from foragent import order_flush
+
+    root, config, tracker, git, _events = case
+    return order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"),
+                             repo="owner/repo", boundary=boundary)
+
+
+def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(publishing, plan):
+    from foragent import order_notes
+
+    store = StateStore.for_repo("owner/repo")
+    publish(publishing, plan, defer="chosen", approve=True)
+    plan["summary"] += " Revised before the selection."
+    publish(publishing, plan, defer="chosen", approve_keys=["client"])
+    note = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this decision")
+    order_notes.append(store, kind="idea", boundary="other", content="Keep waiting")
+    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    result = flush_waiting(publishing)
+    assert result["status"] == "published"
+    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    rows = order_notes.pending(store)
+    assert len(rows["orders"]) == 2 and all(row["status"] == "published" for row in rows["orders"])
+    assert next(row for row in rows["notes"] if row["id"] == note["id"])["status"] == "published"
+    assert next(row for row in rows["notes"] if row["boundary"] == "other")["status"] == "waiting"
+    _root, _config, tracker, _git, events = publishing
+    children = {issue.title: issue for issue in tracker.list_issues()}
+    assert "approved" not in children[plan["issues"][0]["title"]].labels
+    assert "approved" in children[plan["issues"][1]["title"]].labels
+    assert [event[0] for event in events] == ["commit", "push", "issue", "issue", "issue"]
+    saved = list(events)
+    checkpoint = (store.root / "flush-journal.jsonl").read_bytes()
+    assert flush_waiting(publishing)["status"] == "empty"
+    assert events == saved and (store.root / "flush-journal.jsonl").read_bytes() == checkpoint
+    for item in plan["issues"]:
+        item["goal"] += " A new revision after publication."
+    plan["spec_markdown"] += "A new revision after publication.\n"
+    publish(publishing, plan, defer="chosen")
+    rows = order_notes.pending(store)["orders"]
+    assert [row["status"] for row in rows] == ["published", "published", "waiting"]
+    identities = {issue.title: issue.number for issue in tracker.list_issues()}
+    flush_waiting(publishing)
+    assert identities == {issue.title: issue.number for issue in tracker.list_issues()}
+    assert all("approved" not in issue.labels for issue in tracker.list_issues())
+    assert len([event for event in events if event[0] == "commit"]) == 2
+
+
+@pytest.mark.parametrize("refusal", ["map", "approve", "owner", "preread", "rule", "conflict"])
+def test_flush_checks_every_order_before_writing_checkpoint_or_files(publishing, plan, monkeypatch, refusal):
+    from foragent import order_notes, order_submissions
+
+    root, config, tracker, git, events = publishing
+    store = StateStore.for_repo("owner/repo")
+    publish(publishing, plan, defer="chosen")
+    later = deepcopy(plan)
+    later["id"] += "-second"
+    later["title"] += " second"
+    selection = {"approve": False, "approve_keys": [], "approve_numbers": []}
+    if refusal == "map":
+        tracker.create_issue("Bad parent", f'<!-- foragent:plan id={later["id"]} map={{"api":"wrong"}} -->', [])
+    elif refusal == "approve":
+        selection["approve_keys"] = ["missing"]
+    elif refusal == "owner":
+        monkeypatch.setattr(tracker, "authenticated_login", lambda: (_ for _ in ()).throw(TrackerError("no identity")))
+    elif refusal == "preread":
+        selection["approve"] = True
+        monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    elif refusal == "rule":
+        order_notes.append(store, kind="rule", boundary="chosen", content="- New rule", replace="- Missing rule")
+    elif refusal == "conflict":
+        later["issues"][0]["acceptance_files"][FILE] += "# Conflicting locked test\n"
+    order_submissions.retain(later, "owner/repo", "chosen", language="en", **selection)
+    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl",)}
+    events.clear()
+    labels = []
+    monkeypatch.setattr(tracker, "ensure_labels", lambda specs: labels.extend(specs))
+    with pytest.raises(order.PlanError):
+        flush_waiting(publishing)
+    assert not (store.root / "flush-journal.jsonl").exists()
+    assert not (root / FILE).exists()
+    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert events == labels == []
+
+
+def test_flush_other_branch_refuses_before_lock_or_journal(publishing, plan, monkeypatch):
+    from foragent import order_flush_journal
+
+    publish(publishing, plan, defer="chosen")
+    publishing[3].branch = "feature"
+    store = StateStore.for_repo("owner/repo")
+    monkeypatch.setattr(order_flush_journal, "entries", lambda store: pytest.fail("must not read journal"))
+    with pytest.raises(order.PlanError, match="main"):
+        flush_waiting(publishing)
+    assert not (store.root / "flush.lock").exists()
+    assert publishing[4] == []
+
+
+def test_flush_rule_replaces_exact_line_and_preserves_other_rules_and_note_history(publishing):
+    from foragent import order_notes
+
+    root = publishing[0]
+    docs = root / "docs"
+    docs.mkdir()
+    rules = docs / "rules.md"
+    rules.write_text("# Rules\n- Old rule\n- Unrelated rule\n")
+    store = StateStore.for_repo("owner/repo")
+    first = order_notes.append(store, kind="decision", boundary="chosen", content="First decision")
+    order_notes.append(store, kind="decision", boundary="chosen", content="Superseding decision", replaces=first["id"])
+    order_notes.append(store, kind="rule", boundary="chosen", content="- New rule", replace="- Old rule")
+    before = (store.root / "notes.jsonl").read_bytes()
+    flush_waiting(publishing)
+    assert rules.read_text() == "# Rules\n- New rule\n- Unrelated rule\n"
+    assert (docs / "decisions.md").read_text() == "- First decision\n- Superseding decision\n"
+    assert (store.root / "notes.jsonl").read_bytes() == before
+    record = publishing[4][0]
+    assert record[0] == "commit" and set(record[2]) == {"docs/decisions.md", "docs/rules.md"}
+    assert publishing[4][1] == ("push", "main")
+
+
+def test_flush_retains_implicit_done_when_test_bytes_after_the_source_is_gone(publishing, plan):
+    root, config, tracker, git, _events = publishing
+    path = root / FILE
+    path.parent.mkdir(parents=True)
+    original = "# Exact retained test\nassert False\n"
+    path.write_text(original)
+    plan["issues"][0]["acceptance_files"] = {}
+    publish(publishing, plan, defer="chosen")
+    path.unlink()
+    flush_waiting(publishing)
+    assert path.read_bytes() == original.encode()
+    assert git.saved[FILE] == original
+    assert len(tracker.list_issues()) == 3
+
+
+@pytest.mark.parametrize("change", ["rule_removed", "rule_duplicated", "destination", "preread"])
+def test_flush_refreshed_base_refusals_never_select_a_batch(publishing, plan, monkeypatch, change):
+    from foragent import order_notes
+
+    root, config, tracker, git, events = publishing
+    store = StateStore.for_repo("owner/repo")
+    publish(publishing, plan, defer="chosen", approve=change == "preread")
+    docs = root / "docs"
+    docs.mkdir()
+    rules = docs / "rules.md"
+    rules.write_text("# Rules\n- Old rule\n- Unrelated rule\n")
+    if change.startswith("rule"):
+        order_notes.append(store, kind="rule", boundary="chosen", content="- New rule", replace="- Old rule")
+    if change == "preread":
+        directory = root / ".foragent"
+        directory.mkdir()
+        records = {order.preread_target(plan, item, config, root)[2]: {"unknowns": []} for item in plan["issues"]}
+        (root / order.PREREAD_FILE).write_text(json.dumps(records))
+        monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    order_notes.append(store, kind="idea", boundary="other", content="Keep the other boundary available")
+    logs = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+
+    def refresh(branch):
+        if change == "rule_removed":
+            rules.write_text("# Rules\n- Upstream rule\n- Unrelated rule\n")
+        elif change == "rule_duplicated":
+            rules.write_text("# Rules\n- Old rule\n- Old rule\n- Unrelated rule\n")
+        elif change == "destination":
+            (root / FILE).mkdir(parents=True)
+        else:
+            (root / order.PREREAD_FILE).write_text("{}")
+
+    monkeypatch.setattr(git, "update_base", refresh)
+    with pytest.raises(order.PlanError):
+        flush_waiting(publishing)
+    assert not (store.root / "flush-journal.jsonl").exists()
+    assert not (root / f"docs/specs/{plan['id']}.md").exists()
+    assert events == [] and tracker.list_issues() == []
+    assert all((store.root / name).read_bytes() == data for name, data in logs.items())
+    assert all(row["status"] == "waiting" for rows in order_notes.pending(store).values() for row in rows)
+    # A refused batch must not strand even an unrelated boundary behind an incomplete record.
+    monkeypatch.setattr(git, "update_base", lambda branch: None)
+    assert flush_waiting(publishing, "other")["status"] == "published"
+    assert (docs / "ideas.md").read_text() == "- Keep the other boundary available\n"
+    assert [event[0] for event in events] == ["commit", "push"]
+
+
+@pytest.mark.parametrize("kind", ["decision", "idea"])
+def test_flush_appends_notes_to_the_refreshed_history(publishing, monkeypatch, kind):
+    from foragent import order_notes
+
+    root, _config, _tracker, git, events = publishing
+    store = StateStore.for_repo("owner/repo")
+    docs = root / "docs"
+    docs.mkdir()
+    destination = docs / ("decisions.md" if kind == "decision" else "ideas.md")
+    destination.write_text("# History\nLocal history\n")
+    order_notes.append(store, kind=kind, boundary="chosen", content="New note")
+
+    def refresh(branch):
+        destination.write_text("# History\nUpstream history\n")
+
+    monkeypatch.setattr(git, "update_base", refresh)
+    flush_waiting(publishing)
+    assert destination.read_text() == "# History\nUpstream history\n- New note\n"
+    assert events[0][2][destination.relative_to(root).as_posix()] == destination.read_text()
+    assert [event[0] for event in events] == ["commit", "push"]
+
+
+@pytest.mark.parametrize("with_order", [True, False])
+def test_flush_pushes_before_reading_only_required_issue_blob_metadata(publishing, plan, monkeypatch, with_order):
+    from foragent import order_notes
+
+    _root, _config, tracker, git, events = publishing
+    store = StateStore.for_repo("owner/repo")
+    if with_order:
+        publish(publishing, plan, defer="chosen")
+    else:
+        order_notes.append(store, kind="decision", boundary="chosen", content="Only a note")
+    reads = []
+
+    def blob_metadata(ref, paths):
+        assert with_order, "note-only publication does not need issue blob metadata"
+        assert [event[0] for event in events] == ["commit", "push"]
+        reads.append((ref, set(paths)))
+        # Git supplies object ids; publication passes them to the issue controls verbatim.
+        return {name: "git-opaque-object-id" for name in paths}
+
+    monkeypatch.setattr(git, "blob_shas", blob_metadata)
+    assert flush_waiting(publishing)["status"] == "published"
+    if with_order:
+        assert reads == [(git.head_sha(), {FILE, f"docs/specs/{plan['id']}.md"})]
+        parent = next(issue for issue in tracker.list_issues() if "<!-- foragent:plan " in issue.body)
+        assert f'"{FILE}": "git-opaque-object-id"' in parent.body
+    else:
+        assert reads == [] and tracker.list_issues() == []
+        assert [event[0] for event in events] == ["commit", "push"]

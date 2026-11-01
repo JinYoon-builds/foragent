@@ -28,6 +28,7 @@ from foragent.processes import claude_session, run_logged
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
+from foragent.run_baseline import pending_acceptance_exclusions
 from foragent.run_checks import CheckResult, trusts_ci
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
@@ -134,7 +135,7 @@ def _issue(ctx: RunContext, n: int) -> Issue:
         raise OrchError(f"#{n} must be an open issue")
     from foragent.scheduler_stop import run_is_live
 
-    if run_is_live(ctx.store.get_run(n)):  # The same rule as fa orch stop (#435).
+    if run_is_live(ctx.store.get_run(n)):  # Live workers, as the status lane row (#435).
         raise OrchError(f"issue #{n} is running; wait for its runner to finish")
     return issue
 
@@ -413,6 +414,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
             ci_units = trusts_ci(ctx.repo_root, ctx.config)
             excluded = _baseline_exclusions(ctx, base, log_path)
+            pending = set(pending_acceptance_exclusions(ctx, (base, head), log_path))
             label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
             runs = []
             for i, command in enumerate(commands):
@@ -421,7 +423,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 selection = command
                 if acceptance_only:
                     selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
-                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in sorted(pending))
                 if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
                     run = _SuiteRun(True, frozenset())
                 else:
@@ -438,7 +440,8 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            head_failing = run.failing or frozenset()
+            head_failing = frozenset(node for node in (run.failing or ())
+                                     if node.split("::", 1)[0] not in pending)
             base_failing = frozenset()
             if acceptance_only:
                 try:
@@ -529,6 +532,22 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
                     or ctx.tracker.pr_head_sha(n) != checked.head):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
+            if current.head.startswith("foragent/dream-"):
+                from foragent.orch_dream import memory_path, published_event, stale_for_redo
+                from foragent.orch_dream_publish import memory_moved
+
+                lane = current.head.removeprefix("foragent/dream-")
+                if stale_for_redo(ctx.store, lane, n):
+                    raise OrchError(f"dream PR #{n} predates a redo of lane {lane}; the gate closes it "
+                                    "and the lane dreams again")
+                if (published := published_event(ctx.store, lane, n)) is None or "inputs" not in published:
+                    raise OrchError(f"dream PR #{n} has no recorded dream inputs; close it and the lane "
+                                    "dreams again from the base")
+                folder = str(Path(memory_path(ctx.config, lane)).parent)
+                if moved := memory_moved(ctx.git, current.base, current.head, folder,
+                                         published["inputs"], published.get("outputs") or {}):
+                    raise OrchError(f"dream PR #{n} is stale: {', '.join(moved)} changed since the dream; "
+                                    "close it and the lane dreams again from the base")
             ci = ctx.tracker.pr_checks(n)
             if ci not in {"pass", "none"}:
                 raise OrchError(f"PR #{n} is not ready: CI {ci}")

@@ -6,7 +6,7 @@ import subprocess
 import pytest
 import yaml
 
-from foragent import cli
+from foragent import cli, lane_memory
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
@@ -395,10 +395,12 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     text = (root / ".claude/agents/fa-api.md").read_text()
     header = yaml.safe_load(text.split("---")[1])
     assert header == {"name": "fa-api", "description": 'Foragent lane "api": implements issues in api/**, shared/**.',
-                      "memory": "project", "skills": ["testing-strategy"]}
+                      "skills": ["testing-strategy"]}
     assert "repository's api lane (api/**, shared/**)." in text
-    assert "Record durable, project-specific lessons" in text
-    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore"]
+    assert "Append durable, project-specific lessons" in text and ".claude/agent-memory/fa-api/MEMORY.new.md" in text
+    assert lane_memory.migrate_agent(text, "fa-api") == text, "A new lane needs no memory migration"
+    assert lane_memory.UNION in (root / ".gitattributes").read_text().splitlines(), "The first lane installs the union line"
+    expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore", ".gitattributes"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]
     before = (root / ".foragent.yml").read_text()
@@ -471,7 +473,7 @@ def test_nonfree_lane_skill_installs_locally_with_warning(two_libraries, tmp_pat
     assert lane["skills"] == ["frontend-design", "docx"]
     assert "unknown" in capsys.readouterr().err
     assert (root / ".claude/skills/docx/SKILL.md").is_file()
-    assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore"]
+    assert published == [".foragent.yml", ".claude/agents/fa-design.md", ".gitignore", ".gitattributes"]
 
 
 @pytest.fixture
@@ -1024,3 +1026,14 @@ def test_install_into_another_project_keeps_the_advertised_vendored_source(tmp_p
     assert "Installed: principle-local" in capsys.readouterr().out
     entry = skills.vendored_library(tmp_path / "nothing", empty)
     assert entry["path"] == str(source)
+
+
+def test_shipped_lane_agents_carry_the_generated_github_writes_paragraph():
+    from foragent.lanes import GITHUB_WRITES, agent_text
+
+    root = Path(__file__).resolve().parents[1]
+    assert agent_text("api", ["src/api/**"], []).endswith("\n\n" + GITHUB_WRITES + "\n")
+    roles = {"fa-orchestrator", "fa-architect", "fa-docs"}
+    for path in sorted((root / ".claude/agents").glob("fa-*.md")):
+        if path.stem not in roles:
+            assert path.read_text(encoding="utf-8").count("\n\n" + GITHUB_WRITES + "\n") == 1, path

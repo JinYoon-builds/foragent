@@ -3,14 +3,18 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
+import sys
 from urllib.parse import quote
 
-from foragent import board, design, order_references
+from foragent import board, capacity, design, order_references, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
@@ -25,7 +29,11 @@ from foragent.order_files import check_destinations, check_write, issue_body, va
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
-from foragent.tracker import LabelSpec, Tracker, pr_issue_number
+from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
+from foragent.tracker import IdentityError, Issue, LabelSpec, Tracker, TrackerError, pr_issue_number
+
+
+log = logging.getLogger(__name__)
 
 
 class PlanError(ValueError):
@@ -171,14 +179,38 @@ def _pull_requests(tracker: Tracker) -> list[dict]:
 
 
 def context(root: Path, config: Config, tracker: Tracker) -> dict:
-    issues = sorted(tracker.list_open_issues(), key=lambda issue: issue.number)
-    feedback, decisions = [], []
+    issues = sorted((issue for issue in tracker.list_open_issues()
+                     if issue.state == "open" and not issue.is_pull_request), key=lambda issue: issue.number)
+    login, identity = None, {}
+    try:
+        login = ownership.normalize_login(tracker.authenticated_login(), config.language)
+    except IdentityError as exc:
+        identity = {"identity": {"login": None, "error": text(
+            "identity_not_a_person", config.language, login=exc.login, kind=exc.kind)}}
+    except (TrackerError, OwnershipError) as exc:
+        identity = {"identity": {"login": None, "error": text(
+            "init_identity_failed", config.language, error=exc)}}
+    feedback, decisions, other_orders, owner_errors = [], [], [], {}
     for issue in issues:
+        owner, ours = None, False
+        try:
+            # Keep legacy questions visible on identity failure without inventing an owner.
+            # An unconfirmed owner-label publication is not legacy work.
+            legacy = (login is None and ownership.parse_orderer(issue.labels, config.language) is None
+                      and OWNED_MARKER not in issue.body)
+            if not (legacy and config.legacy_owner is None):
+                owner = ownership.effective_orderer(issue, config, login)
+            ours = legacy or (login is not None and owner == login)
+        except OwnershipError as exc:
+            owner_errors[issue.number] = {"owner_error": str(exc)}
+        if owner is not None and not ours:
+            other_orders.append({"number": issue.number, "title": issue.title, "orderer": owner,
+                                 "files": parse_body(issue.body).files})
         if "feedback" in issue.labels:
             about = re.search(r"(?:^|\n)About #(\d+)\.", issue.body)
             feedback.append({"number": issue.number, "title": issue.title, "body": issue.body,
                              "about": int(about[1]) if about else None})
-        if "needs-human" in issue.labels:
+        if ours and "needs-human" in issue.labels:
             comments = tracker.list_comments(issue.number)
             flag = latest_flag(comments)
             if flag and flag[1] in {"spec-question", "no-machine-check"}:
@@ -220,15 +252,18 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     lanes = {name: {"paths": lane.get("paths", []), "agent": lane.get("agent"),
                     "skills": lane.get("skills", [])} for name, lane in config.lanes.items()}
     return {
+        **identity,
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
         "profile": config.profile,
         "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
-        "feedback": feedback, "decisions": decisions,
+        "feedback": feedback, "decisions": decisions, "other_orders": other_orders,
         "open_issues": [{"number": issue.number, "title": issue.title, "labels": sorted(issue.labels),
                          "lane": issue_lane(issue.labels, config.lanes), "size": issue_size(issue.labels),
-                         "state_group": state_group(issue, tracker)} for issue in issues],
+                         "state_group": state_group(issue, tracker),
+                         "waiting": order_waiting.section(issue.body),
+                         **owner_errors.get(issue.number, {})} for issue in issues],
         "pull_requests": _pull_requests(tracker),
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
@@ -260,7 +295,8 @@ def _strings(value, label: str, *, nonempty: bool = False) -> list[str]:
     return value
 
 
-def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | bytes]:
+def validate_plan(plan: dict, root: Path, config: Config, *,
+                  retained_files: dict[str, str] | None = None) -> dict[str, str | bytes]:
     """Every file the order publishes: text as str, reference images as decoded bytes."""
     _object(plan, {"id", "title", "summary", "spec_markdown", "issues"},
             {"new_lanes", "edits", "reference_files"}, "plan")
@@ -296,13 +332,18 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references", "decisions"} if kind == "issues"
-                    else {"checklist", "acceptance_files", "files", "exclusive", "references", "decisions"}, label)
+                                     "references", "statements", "decisions"} if kind == "issues"
+                    else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
+                          "statements", "decisions"}, label)
             if "decisions" in item:
                 try:
                     decision_links.validate(item["decisions"], f"{label}.decisions")
                 except ValueError as exc:
                     raise PlanError(str(exc)) from exc
+            if "statements" in item:
+                _strings(item["statements"], f"{label}.statements", nonempty=True)
+                if any("\n" in line or "\r" in line for line in item["statements"]):
+                    raise PlanError(f"{label}.statements items must each be a single line")
             _text(item["goal"], f"{label}.goal")
             _text(item["out_of_scope"], f"{label}.out_of_scope")
             _strings(item["done_when"], f"{label}.done_when", nonempty=True)
@@ -330,6 +371,7 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
                 if type(item["number"]) is not int or item["number"] <= 0 or item["number"] in edits:
                     raise PlanError(f"{label}.number must be a unique positive integer")
                 edits.add(item["number"])
+                _strings(item.get("blocked_by", []), f"{label}.blocked_by")
             acceptance_files = item.get("acceptance_files", {})
             if not isinstance(acceptance_files, dict):
                 raise PlanError(f"{label}.acceptance_files must be an object")
@@ -350,10 +392,18 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
     for kind in ("issues", "edits"):
         for item in plan.get(kind, []):
             for name in acceptance_paths(item["done_when"], config.acceptance_dir):
-                if name not in files and not repo_path(root, name).is_file():
+                if name in files:
+                    continue
+                if retained_files is not None and name in retained_files:
+                    files[name] = _text(retained_files[name], f"retained_files[{name}]", empty=True)
+                    continue
+                if not repo_path(root, name).is_file():
+                    # A statement issue's tests are written in preparation; publication refuses
+                    # it until they are reviewed, so a draft may name tests not written yet.
+                    if "statements" in item:
+                        continue
                     raise PlanError(f"Done when references missing acceptance file: {name}")
-                if name not in files:
-                    files[name] = repo_path(root, name).read_text(encoding="utf-8")
+                files[name] = repo_path(root, name).read_bytes().decode("utf-8")
     for name, content in references.items():
         if name in files and files[name] != content:
             raise PlanError(f"conflicting file contents: {name}")
@@ -376,6 +426,11 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 
     for key in dependencies:
         visit(key)
+    # An edit is no plan key, so nothing depends on it and it closes no cycle.
+    for item in plan.get("edits", []):
+        for key in item.get("blocked_by", []):
+            if key not in keys:
+                raise PlanError(f"unknown blocked_by key: {key}")
     check_destinations(root, files)
     return files
 
@@ -384,6 +439,9 @@ def validate_plan(plan: dict, root: Path, config: Config) -> dict[str, str | byt
 def _plan_marker(identity: str, mapping: dict[str, int], acceptance: dict[str, dict[str, str]]) -> str:
     return (f"<!-- foragent:plan id={identity} map={json.dumps(mapping, sort_keys=True)} "
             f"acceptance={json.dumps(acceptance, sort_keys=True)} -->")
+
+
+_EDIT_MARKER = "<!-- foragent:edit plan="
 
 
 def _child_marker(identity: str, key: str) -> str:
@@ -402,8 +460,12 @@ class PublishReport:
     rows: list[dict]
     paths: list[str]
     dry_run: bool
+    waiting_for: str | None = None
+    language: str = "en"
 
     def summary(self) -> str:
+        if self.waiting_for is not None:
+            return text("order_submission_waiting", self.language, id=self.title, boundary=self.waiting_for)
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
@@ -463,14 +525,152 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     return published_blobs
 
 
-def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
-            git: GitRepo | None = None, manager: SkillManager | None = None,
-            approve: bool = False, approve_keys: list[str] | None = None,
-            approve_numbers: list[int] | None = None, dry_run: bool = False) -> PublishReport:
+def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> str:
+    """The person this order's new issues belong to; republication never transfers it.
+
+    An existing order keeps its parent's owner (the effective legacy owner for an
+    unlabelled parent). A new order belongs to the authenticated publisher. Every
+    existing issue of the order must have at most one owner label.
+    """
+    language = config.language
     try:
-        files = validate_plan(plan, root, config)
+        login = tracker.authenticated_login()
+    except IdentityError as exc:
+        raise PlanError(text("identity_not_a_person", language, login=exc.login, kind=exc.kind)) from exc
+    except TrackerError as exc:
+        raise PlanError(text("identity_unavailable", language, error=" ".join(str(exc).split())[:300])) from exc
+    try:
+        for issue in children:
+            parse_orderer(issue.labels, language)
+        return effective_orderer(parent, config, login) if parent is not None else parse_orderer(
+            [owner_label(login)], language)
+    except OwnershipError as exc:
+        raise PlanError(str(exc)) from exc
+
+
+_MARKER_PREFIX = "<!-- foragent:"
+# A retired issue keeps its text for the record, but no Foragent marker matches it.
+_RETIRED_PREFIX = "<!-- foragent-refused:"
+
+
+def _labelled(issue) -> bool:
+    return any(label.lower().startswith(ownership.PREFIX) for label in issue.labels)
+
+
+def _retired_body(body: str) -> str:
+    """``body`` with its publication markers retired and its owner-label contract kept.
+
+    The plan, child and v1 markers stop matching, so nothing finds or works it as
+    order content; ``OWNED_MARKER`` stays, so an unlabelled issue still has no owner
+    (``ownership.effective_orderer``) instead of turning into legacy work.
+    """
+    retired_contract = OWNED_MARKER.replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+    return body.replace(_MARKER_PREFIX, _RETIRED_PREFIX).replace(retired_contract, OWNED_MARKER)
+
+
+def _with_contract(body: str, existing_body: str) -> str:
+    """Rewritten ``body`` that keeps the owner-label contract of the issue it replaces."""
+    return f"{body}{OWNED_MARKER}\n" if OWNED_MARKER in existing_body and OWNED_MARKER not in body else body
+
+
+def _retire(tracker: Tracker, config: Config, issue, label: str) -> None:
+    """Close an unconfirmed issue and retire its markers, each step on its own.
+
+    Closing comes first: a closed issue is never work. Retiring the markers is
+    attempted even when closing fails, and the other way round. Whatever still fails
+    is harmless: discovery never reuses an unconfirmed issue (``_unconfirmed``), and
+    the next publication of the order retires it again.
+    """
+    if issue.state == "open":
+        try:
+            tracker.close_issue(issue.number, text("identity_closed_unlabelled", config.language, label=label))
+        except Exception:
+            log.warning("could not close unconfirmed issue #%s", issue.number, exc_info=True)
+    retired = _retired_body(issue.body)
+    if retired != issue.body:
+        try:
+            tracker.update_issue(issue.number, title=issue.title, body=retired)
+        except Exception:
+            log.warning("could not retire the markers of unconfirmed issue #%s", issue.number, exc_info=True)
+
+
+def _unconfirmed(issue, mapped: set[int]) -> bool:
+    """Created under the owner-label contract, yet unlabelled and not part of its order.
+
+    Only bodies written by this publisher carry ``OWNED_MARKER``; legacy issues
+    (published before owner labels) never do, so they keep being reused and
+    belong to ``legacy_owner``. A labelled issue, or one already in its parent's
+    map, is a confirmed member of the order.
+    """
+    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
+
+
+def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str]) -> int:
+    """Create an issue carrying ``owner``'s label, or refuse it and stop publication.
+
+    GitHub silently drops labels a creator may not apply, so the label is read back.
+    Only an issue observed without its label is retired, and publication stops. When
+    the read itself fails, the outcome is unknown and nothing is touched: a labelled
+    issue keeps its live markers, so a retry reuses it under its original owner; an
+    unlabelled one carries ``OWNED_MARKER`` without the label, so it is nobody's work
+    (``ownership.effective_orderer``), discovery never reuses it (``_unconfirmed``),
+    and a retry retires it. The same holds when every rollback step fails.
+    The issue is created in one request so its body has no edit that would
+    postdate an approval added in the same publication.
+    """
+    label = owner_label(owner)
+    number = tracker.create_issue(title, body, [label, *labels])
+    confirmed = label in tracker.get_issue(number).labels
+    if not confirmed:
+        _retire(tracker, config, Issue(number, title, body, frozenset(), "open"), label)
+        raise PlanError(text("identity_label_missing", config.language, number=number, label=label))
+    return number
+
+
+def _reconcile_dependencies(tracker: Tracker, number: int, desired: set[int]) -> None:
+    """Invalidate approval before changing native edges, including restoring hand removals."""
+    existing = {dep.number for dep in tracker.blocked_by(number)}
+    if existing != desired:
+        # Approval covers the dependency contract; ready must be reconsidered by the gate.
+        # Do this before either mutation so an interrupted sync cannot leave stale readiness.
+        tracker.remove_labels(number, ["approved", "ready"])
+    for blocker in sorted(existing - desired):
+        tracker.remove_blocked_by(number, blocker)
+    for blocker in sorted(desired - existing):
+        tracker.add_blocked_by(number, blocker)
+
+
+@dataclass
+class _Publication:
+    files: dict[str, str | bytes]
+    keys: set[str]
+    selected_keys: set[str]
+    selected_numbers: set[int]
+    parent: int | None
+    mapping: dict[str, int]
+    saved_blobs: dict[str, dict[str, str]]
+    by_number: dict[int, Issue]
+    edit_numbers: set[int]
+    unconfirmed: list[Issue]
+    rows: list[dict]
+    owner: str | None
+
+
+def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            manager: SkillManager | None = None,
+            approve: bool = False, approve_keys: list[str] | None = None,
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            check_owner: bool = True, retained_files: dict[str, str] | None = None) -> "_Publication":
+    try:
+        files = (validate_plan(plan, root, config) if retained_files is None else
+                 validate_plan(plan, root, config, retained_files=retained_files))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    if dry_run:
+        # A dry run only previews: read GitHub without recording any observation locally.
+        from foragent.tracker import RecordingTracker
+
+        tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
     keys = {item["key"] for item in plan["issues"]}
     selected_keys, selected_numbers = set(approve_keys or []), set(approve_numbers or [])
     if selected_keys - keys:
@@ -479,6 +679,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
     parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    # A parent is part of its order once it records a child; until then, like a child
+    # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
+    unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
+    parents = [(issue, marker) for issue, marker in parents if issue not in unconfirmed]
     if len(parents) > 1:
         raise PlanError(f"multiple parents for plan {plan['id']}")
     parent, mapping, saved_blobs = None, {}, {}
@@ -500,12 +704,21 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 raise ValueError("invalid acceptance blob map")
         except ValueError as exc:
             raise PlanError(f"invalid plan map on parent #{parent}") from exc
+    mapped = set(mapping.values())
     for item in plan["issues"]:
-        matches = [issue.number for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        found = [issue for issue in all_issues if _child_marker(plan["id"], item["key"]) in issue.body]
+        unconfirmed += [issue for issue in found if _unconfirmed(issue, mapped)]
+        matches = [issue.number for issue in found if not _unconfirmed(issue, mapped)]
         if len(matches) > 1:
             raise PlanError(f"duplicate children for key {item['key']}")
         if item["key"] not in mapping and matches:
             mapping[item["key"]] = matches[0]
+    # An earlier refusal may have retired an issue's markers but failed to close it.
+    retired = (f"{_RETIRED_PREFIX}plan id={plan['id']} map=",
+               *(_child_marker(plan["id"], item["key"]).replace(_MARKER_PREFIX, _RETIRED_PREFIX)
+                 for item in plan["issues"]))
+    unconfirmed += [issue for issue in all_issues
+                    if issue.state == "open" and any(marker in issue.body for marker in retired)]
     by_number = {issue.number: issue for issue in all_issues}
     edit_numbers = {item["number"] for item in plan.get("edits", [])}
     if edit_numbers & set(mapping.values()):
@@ -535,26 +748,75 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         issue = by_number[item["number"]]
         rows.append({"number": issue.number, "title": issue.title, "size": issue_size(issue.labels),
                      "interactive": "interactive" in issue.labels,
-                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": [dep.number for dep in tracker.blocked_by(issue.number)],
+                     "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
+                                    else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     if dry_run:
-        return PublishReport(plan["title"], parent, rows, sorted(files), True)
+        return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
+                            by_number, edit_numbers, unconfirmed, rows, None)
+    require_reviewed_tests(plan)
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
+    # Statement issues take the reviewed-tests route instead of preread.
     new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
     require_clean_preread(plan, root, config, [
         *(item for item in plan["issues"]
-          if approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
-          or (new_numbers and item["key"] not in mapping)),
+          if "statements" not in item
+          and (approve or item["key"] in selected_keys or mapping.get(item["key"]) in selected_numbers
+               or (new_numbers and item["key"] not in mapping))),
         *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
-          if approve or item["number"] in selected_numbers),
+          if "statements" not in item and (approve or item["number"] in selected_numbers)),
     ])
+    owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
+                          [by_number[n] for n in mapping.values()]) if check_owner else None)
+    return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
+                        by_number, edit_numbers, unconfirmed, rows, owner)
+
+
+def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+            git: GitRepo | None = None, manager: SkillManager | None = None,
+            approve: bool = False, approve_keys: list[str] | None = None,
+            approve_numbers: list[int] | None = None, dry_run: bool = False,
+            defer: str | None = None, urgent: bool = False) -> PublishReport:
+    waiting = defer is not None and not urgent and not plan.get("new_lanes")
+    publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
+                                      approve=approve, approve_keys=approve_keys,
+                                      approve_numbers=approve_numbers, dry_run=dry_run,
+                                      check_owner=not waiting)
+    if dry_run:
+        return PublishReport(plan["title"], publication.parent, publication.rows,
+                             sorted(publication.files), True)
+    if waiting:
+        from foragent import order_submissions
+        order_submissions.retain(plan, repo, defer, approve=approve, approve_keys=approve_keys,
+                                 approve_numbers=approve_numbers, language=config.language,
+                                 files=publication.files)
+        return PublishReport(plan["title"], publication.parent, publication.rows,
+                             sorted(publication.files), False, defer, config.language)
     git = git or GitRepo(root)
     if git.current_branch() != config.base_branch:
         raise GitError(f"order publish must run on the base branch {config.base_branch!r}")
+    owner = publication.owner
+    tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
     with git.publish_lock():
         git.update_base(config.base_branch)
-        published_blobs = _publish_files(plan, root, config, git, files, manager)
+        published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
+    return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
+                           published_blobs=published_blobs, approve=approve)
+
+
+def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
+                    publication: _Publication, published_blobs: dict[str, str],
+                    approve: bool = False) -> PublishReport:
+    """Apply existing issue/approval controls using files from an already published commit."""
+    files, keys = publication.files, publication.keys
+    selected_keys, selected_numbers = publication.selected_keys, publication.selected_numbers
+    parent, mapping, saved_blobs = publication.parent, publication.mapping, publication.saved_blobs
+    by_number, edit_numbers = publication.by_number, publication.edit_numbers
+    unconfirmed, rows, owner = publication.unconfirmed, publication.rows, publication.owner
+    assert owner is not None
+    for issue in unconfirmed:
+        _retire(tracker, config, issue, owner_label(owner))
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
     tracker.ensure_labels([*LABELS, *(LabelSpec(f"lane:{name}", "ededed", f"Foragent lane {name}.") for name in sorted(lane_names))])
     if any(item.get("interactive", False) for item in plan["issues"]):
@@ -571,13 +833,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     def parent_body() -> str:
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n"
+        owned = f"{OWNED_MARKER}\n" if parent_owned else ""
+        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.
     childless = not plan["issues"] and not mapping
+    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
     if parent is None:
-        parent = tracker.create_issue(plan["title"], parent_body(), [])
+        parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
     else:
         tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -586,17 +850,22 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if not childless:
         board.add_issue(tracker, repo, config.board, parent, board_map=config.board_map)
     for item in plan["issues"]:
-        body = _published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+        number = mapping.get(item["key"])
+        existing = tracker.get_issue(number) if number is not None else None
+        owned = existing is None or OWNED_MARKER in existing.body
+        body = (_published_body(plan, item, repo, config) + "\n" + _child_marker(plan["id"], item["key"]) + "\n"
+                + (f"{OWNED_MARKER}\n" if owned else ""))
+        # The written body itself records the wait it replaces, so the transition survives a lost comment.
+        body = order_waiting.stamp(existing.body if existing else None, body)
         labels = [f"size:{item['size']}", *([f"lane:{item['lane']}"] if item["lane"] != "main" else [])]
         if item.get("interactive", False):
             labels.append("interactive")
-        number = mapping.get(item["key"])
         blobs = acceptance_blobs(item)
-        existing = tracker.get_issue(number) if number is not None else None
         body = decision_links.with_marker(body, item.get("decisions"), existing.body if existing else None)
         if number is None:
-            number = tracker.create_issue(item["title"], body, labels)
+            number = _create_owned(tracker, config, owner, item["title"], body, labels)
             mapping[item["key"]] = number
+            order_waiting.announce(tracker, number, body, config.language)
             recorded_blobs[str(number)] = blobs
             # Persist progress before native edge calls so retries reuse the child.
             tracker.update_issue(parent, title=plan["title"], body=parent_body())
@@ -605,6 +874,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                     or ("interactive" in existing.labels) != item.get("interactive", False)):
                 tracker.remove_labels(number, ["approved", "ready"])
             tracker.update_issue(number, title=item["title"], body=body)
+            # A record follows the fact it describes: announce the wait the body now holds.
+            order_waiting.announce(tracker, number, body, config.language)
             tracker.remove_labels(number, [label for label in existing.labels
                                            if (label.startswith(("lane:", "size:")) or label == "interactive")
                                            and label not in labels])
@@ -616,29 +887,41 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         board.add_issue(tracker, repo, config.board, number, item["lane"], item["size"], config.board_map)
     for item in plan["issues"]:
         number = mapping[item["key"]]
-        desired = {mapping[key] for key in item.get("blocked_by", [])}
-        existing = {dep.number for dep in tracker.blocked_by(number)}
-        for blocker in sorted(existing - desired):
-            tracker.remove_blocked_by(number, blocker)
-        for blocker in sorted(desired - existing):
-            tracker.add_blocked_by(number, blocker)
+        _reconcile_dependencies(tracker, number, {mapping[key] for key in item.get("blocked_by", [])})
     for item in plan.get("edits", []):
         number = item["number"]
         existing = tracker.get_issue(number)
-        body = decision_links.with_marker(_published_body(plan, item, repo, config), item.get("decisions"),
-                                          existing.body)
+        # An edit keeps both the owner contract and omitted decision links.
+        body = decision_links.with_marker(_with_contract(_published_body(plan, item, repo, config), existing.body),
+                                          item.get("decisions"), existing.body)
+        body = order_waiting.stamp(existing.body, body)
+        # A revision comment identifies this write, including a changed decision marker.
+        body = order_waiting.mark_write(existing.body, body)
         blobs = acceptance_blobs(item)
         revision = body_hash(body + json.dumps({
             name: files[name] if isinstance(files[name], str) else hashlib.sha256(files[name]).hexdigest()
-            for name in sorted(blobs)}, sort_keys=True))
+            for name in sorted(blobs)}, sort_keys=True)
+            # Dependencies are part of what was approved; absent, the existing edges stay.
+            + (json.dumps(item["blocked_by"]) if "blocked_by" in item else ""))
         comment = ("<!-- foragent:edited -->\nUpdated by order from your decision; needs approval.\n\n"
                    f"<!-- foragent:edit plan={plan['id']} sha256={revision} -->")
-        prior = any(c.body == comment for c in tracker.list_comments(number))
-        if existing.body != body or not prior or "needs-human" in existing.labels or saved_blobs.get(str(number), {}) != blobs:
+        # Only the latest edit revision is what the issue stands approved for: an older
+        # matching revision (A, then B, then A again) does not keep B's approval.
+        latest = max((c for c in tracker.list_comments(number) if _EDIT_MARKER in c.body),
+                     key=comment_key, default=None)
+        current = latest is not None and latest.body == comment
+        changed = (existing.body != body or not current or "needs-human" in existing.labels
+                   or saved_blobs.get(str(number), {}) != blobs)
+        if changed:
             tracker.remove_labels(number, ["needs-human", "approved", "ready"])
             tracker.update_issue(number, title=existing.title, body=body)
-            if not prior:
-                tracker.comment(number, comment)
+        # Records follow the facts they describe: the revision comment covers the body and
+        # the dependencies, and the waiting line the body's wait, so each comes after them.
+        if "blocked_by" in item:
+            _reconcile_dependencies(tracker, number, {mapping[key] for key in item["blocked_by"]})
+        order_waiting.announce(tracker, number, body, config.language)
+        if changed and not current:
+            tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
     tracker.update_issue(parent, title=plan["title"], body=parent_body())
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
@@ -651,9 +934,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
         tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
-    for item, row in zip(plan["issues"], rows):
-        row["number"] = mapping[item["key"]]
-        row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
+    for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
+        row["number"] = mapping[item["key"]] if "key" in item else item["number"]
+        if "key" in item or "blocked_by" in item:
+            row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
     return PublishReport(plan["title"], parent, rows, sorted(files), False)
@@ -739,6 +1023,41 @@ def _preread_records(root: Path) -> dict:
     return records if isinstance(records, dict) else {}
 
 
+def _record_preread(root: Path, directory: Path, digest: str, record: dict) -> None:
+    """Merge one answer into the records under a lock, so concurrent prereads keep every answer.
+
+    The lock covers only re-reading, adding and replacing, never an agent turn. Each write
+    uses its own exclusively created temporary file, so no other writer can remove or
+    overwrite it before it replaces the records. Nothing here follows a symlink.
+    """
+    flags = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    path = directory / "preread.json.lock"
+    if path.is_symlink():
+        raise PlanError(f"{path} must be a regular file, not a symlink")
+    lock = os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        records = _preread_records(root)
+        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
+        records.pop(digest, None)
+        records[digest] = record
+        while True:
+            temporary = directory / f"preread.json.{secrets.token_hex(8)}.tmp"
+            try:
+                os.close(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600))
+                break
+            except FileExistsError:
+                continue
+        try:
+            temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, directory / "preread.json")
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    finally:
+        os.close(lock)  # closing releases the lock
+
+
 def _preread_lines(message: str) -> list[str]:
     if message.strip() == "NONE":
         return []
@@ -746,19 +1065,25 @@ def _preread_lines(message: str) -> list[str]:
     return [line for line in lines if line and line != "NONE"]
 
 
+_TAG = re.compile(r"(?i)^(APPROACH|DECIDE|QUESTION):\s*")
+
+
 def _unknowns(message: str) -> list[str]:
-    """QUESTION lines, and unprefixed lines as before; the lane's APPROACH and DECIDE lines do not block."""
-    unknowns = []
-    for line in _preread_lines(message):
-        if re.match(r"(?i)^(?:APPROACH|DECIDE):", line):
-            continue
-        unknowns.append(re.sub(r"(?i)^QUESTION:\s*", "", line))
-    return unknowns
+    """What blocks approval. Once any line carries a tag, only QUESTION lines do and the
+    unprefixed lines are notes; an all-plain reply keeps every line as an unknown."""
+    lines = _preread_lines(message)
+    if not any(_TAG.match(line) for line in lines):
+        return lines
+    return _tagged(message, "QUESTION")
 
 
 def _tagged(message: str, tag: str) -> list[str]:
-    return [re.sub(rf"(?i)^{tag}:\s*", "", line) for line in _preread_lines(message)
-            if re.match(rf"(?i)^{tag}:", line)]
+    tagged = []
+    for line in _preread_lines(message):
+        match = _TAG.match(line)
+        if match and match.group(1).upper() == tag:
+            tagged.append(line[match.end():])
+    return tagged
 
 
 def _decisions(message: str) -> list[str]:
@@ -778,9 +1103,16 @@ def _body_digest(body: str) -> str:
 
 
 def _without_child_marker(body: str) -> tuple[str, re.Match | None]:
-    """Split off the plan-child marker publish appends as the body's last line, nothing else."""
+    """Split off the lines publish appends after the rendered body, nothing else.
+
+    Those are the plan-child marker (children) and the owner-label contract line
+    (``OWNED_MARKER``, last; children and edits of contract issues).
+    """
     text = body.replace("\r\n", "\n").rstrip()
     head, _, last = text.rpartition("\n")
+    if last == OWNED_MARKER:
+        text = head.rstrip()
+        head, _, last = text.rpartition("\n")
     marker = _CHILD_LINE.fullmatch(last)
     return (head if marker else text), marker
 
@@ -817,7 +1149,7 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
     A record counts only when its key names this issue (plan child key in the same order,
     or an edit of #n), the body publish rendered for it equals the approved body byte for byte
-    (apart from the trailing plan-child marker publish appends), and every file it bound
+    (apart from the trailing lines publish appends), and every file it bound
     (acceptance tests and references) has the same content in the run's worktree and, where
     the approval snapshot names the file, in that snapshot. The preread writer keeps
     records in write order, so the last match is the latest answer; when that answer
@@ -883,6 +1215,10 @@ def preread(plan: dict, root: Path, config: Config,
         raise PlanError(f"{ignore} must be a regular file, not a symlink")
     if not ignore.exists():
         ignore.write_text("*\n", encoding="utf-8")
+    store = _workload_store(root, repo or config.repo)
+    language = (getattr(config, "language", None) or "en").lower().split("-")[0]
+    if len(items) > 1 and _free_slots(store) < 1:
+        print(text("preread_turns_wait", language, count=len(items)), file=sys.stderr, flush=True)
     results = []
     for item in items:
         # Each reader gets its own snapshot directory, never the references' destination.
@@ -892,30 +1228,47 @@ def preread(plan: dict, root: Path, config: Config,
             log = logs / f"{item['key'].lstrip('#')}-{digest[:12]}.log"
             if log.is_symlink():
                 log.unlink()
-            result = executor_for(setup.executor).run(
-                worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
-                log_path=log, read_only=True, **setup.options)
+            admitted = False
+            try:
+                # Each turn is one agent: it holds one shared machine slot only while it runs.
+                with capacity.hold_workload(store, config, kind="preread", role=item["key"]):
+                    admitted = True
+                    result = executor_for(setup.executor).run(
+                        worktree=root, prompt=prompt, model=setup.model, timeout_s=PREREAD_TIMEOUT_S,
+                        log_path=log, read_only=True, **setup.options)
+            except TimeoutError as exc:
+                if admitted:
+                    raise
+                raise PlanError(str(exc)) from exc
         finally:
             order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
         unknowns = _unknowns(result.last_message)
-        records = _preread_records(root)
         decisions = _decisions(result.last_message)
         approach = _approach(result.last_message)
-        # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
-        records.pop(digest, None)
-        records[digest] = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-                           "unknowns": unknowns, "decisions": decisions, "approach": approach,
-                           "at": datetime.now(UTC).isoformat(timespec="seconds")}
-        temporary = root / (PREREAD_FILE + ".tmp")
-        temporary.unlink(missing_ok=True)  # never write through a leftover link
-        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary, root / PREREAD_FILE)
+        _record_preread(root, directory, digest, {
+            "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
+            "unknowns": unknowns, "decisions": decisions, "approach": approach,
+            "at": datetime.now(UTC).isoformat(timespec="seconds")})
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
                        | ({"approach": approach} if approach else {}))
     return results
+
+
+def _workload_store(root: Path, repo: str | None) -> StateStore:
+    """The state store whose machine slots this planning agent counts in; a repository-less root gets its own."""
+    if not repo:
+        repo = f"local/{root.name}-{hashlib.sha256(str(root.resolve()).encode('utf-8')).hexdigest()[:12]}"
+    store = StateStore.for_repo(repo)
+    store.root.mkdir(parents=True, exist_ok=True)  # The machine scan reads its parent; a first run has none.
+    return store
+
+
+def _free_slots(store: StateStore) -> int:
+    """Machine slots free right now; only for telling the person why a turn may wait."""
+    return capacity.workload_budget(store) - len(capacity.machine_holders(store, datetime.now(UTC), live=True))
 
 
 def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[list[str], list[str]]:
@@ -927,6 +1280,22 @@ def _uncreated_lanes(plan: dict, config: Config, items: list[dict]) -> tuple[lis
 
 NEW_LANE_STEPS = ("publish the order without --approve first so the lane's agent and skills exist, "
                   "then run fa order preread PLAN.json and publish again with --approve")
+
+
+def require_reviewed_tests(plan: dict) -> None:
+    """A statement issue is published only with tests its lane wrote and an independent reviewer passed.
+
+    The ``statements`` field selects this route for good, even once acceptance_files exist.
+    No reviewed-tests record is read or written here yet, so every statement issue is refused.
+    """
+    keys = [item["key"] for item in plan["issues"] if "statements" in item]
+    keys += [f"#{item['number']}" for item in plan.get("edits", []) if "statements" in item]
+    if keys:
+        raise PlanError(
+            f"cannot publish: statement issue(s) {', '.join(keys)} have no reviewed tests; "
+            "prepare them with fa order prepare PLAN.json so the lane writes the tests and the "
+            "configured reviewer reviews them, then publish again (fa order publish PLAN.json "
+            "--dry-run still previews the plan)")
 
 
 def require_clean_preread(plan: dict, root: Path, config: Config, items: list[dict]) -> None:

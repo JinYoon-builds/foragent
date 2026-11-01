@@ -24,6 +24,8 @@ PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acce
 # The orchestrator and architect agents, memory and skill copies follow the setup files.
 ROLE_PATHS = list(role_agents.missing_files(Path("/nonexistent-foragent-project"))[0])
 ALL_PATHS = [*PATHS, *ROLE_PATHS]
+# Init also installs the pending lane-memory union line (#1000); it is published, not "created".
+PUBLISHED_PATHS = [*ALL_PATHS, ".gitattributes"]
 def without_roles(text):
     """Settings text without the roles block init writes (#769); each default role must be in it."""
     lines, kept, inside = text.splitlines(keepends=True), [], False
@@ -133,6 +135,10 @@ class Setup:
             return json.dumps({"isPrivate": self.private})
         if args == ["api", "user", "--jq", ".login"]:
             return "human\n"
+        if args == ["api", "user"]:
+            return json.dumps({"login": "Human", "type": "User"})
+        if args[:3] == ["api", "--paginate", "repos/owner/repo/issues?state=all&per_page=100"]:
+            return "[]"
         if args[:3] == ["api", "-X", "POST"]:
             return "{}"
         raise AssertionError(args)
@@ -188,10 +194,10 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     assert config.executor == "codex" and config.acceptance_dir == "tests/acceptance/"
     assert config.run_hours == "always"
     assert list(setup.tracker.labels.values()) == LABELS
-    assert ["add", "-f", "--", *ALL_PATHS] in setup.git_calls
+    assert ["add", "-f", "--", *PUBLISHED_PATHS] in setup.git_calls
     assert [
         "-c", "user.name=Test Human", "-c", "user.email=human@example.com",
-        "commit", "--only", "-m", "Set up Foragent", "--", *ALL_PATHS, ":!CLAUDE.local.md",
+        "commit", "--only", "-m", "Set up Foragent", "--", *PUBLISHED_PATHS, ":!CLAUDE.local.md",
     ] in setup.git_calls
     assert ["push", "origin", "refs/heads/main:refs/heads/main"] in setup.git_calls
     assert report.committed and report.pushed and setup.installs == [setup.root]
@@ -401,7 +407,7 @@ def test_existing_partial_config_and_template_remain_byte_for_byte(setup):
     assert (setup.root / PATHS[0]).read_text() == config + "checks: local\n"
     assert template.read_text() == "Existing template\n"
     assert report.created == [PATHS[2], *ROLE_PATHS]
-    assert ["add", "-f", "--", PATHS[2], *ROLE_PATHS, *PATHS[:2]] in setup.git_calls
+    assert ["add", "-f", "--", PATHS[2], *ROLE_PATHS, PATHS[0], ".gitattributes", PATHS[1]] in setup.git_calls
 
 
 def test_existing_acceptance_directory_gets_no_placeholder(setup):
@@ -513,8 +519,8 @@ def test_dirty_worktree_and_unrelated_staged_changes_are_preserved(setup):
     assert readme.read_text() == "Unstaged user change\n"
     assert (setup.root / "untracked.txt").read_text() == "Keep me\n"
     commit = next(args for args in setup.git_calls if "commit" in args)
-    assert "--only" in commit and commit[commit.index("--") + 1:] == [*ALL_PATHS, ":!CLAUDE.local.md"]
-    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *ALL_PATHS]]
+    assert "--only" in commit and commit[commit.index("--") + 1:] == [*PUBLISHED_PATHS, ":!CLAUDE.local.md"]
+    assert [args for args in setup.git_calls if args[0] == "add"] == [["add", "-f", "--", *PUBLISHED_PATHS]]
 
 
 def test_no_push_still_commits_and_no_launchd_skips_install(setup):
@@ -652,7 +658,7 @@ def test_rerun_recovers_after_commit_hook_failure(setup):
     with pytest.raises(GitError, match="pre-commit hook failed"):
         setup.init()
     assert git_command(setup.root, "rev-parse", "HEAD") == before
-    assert set(git_command(setup.root, "diff", "--cached", "--name-only").splitlines()) == set(ALL_PATHS)
+    assert set(git_command(setup.root, "diff", "--cached", "--name-only").splitlines()) == set(PUBLISHED_PATHS)
     setup.commit_fails = False
     setup.git_calls.clear()
     report = setup.init()

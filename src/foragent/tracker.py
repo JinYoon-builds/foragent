@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 import zlib
 from typing import Any, Literal, Protocol
@@ -85,6 +86,7 @@ class PullRequest:
 
 class Tracker(Protocol):
     def rate_limit_reset(self) -> datetime | None: ...
+    def authenticated_login(self, *, refresh: bool = False) -> str: ...
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
     def list_open_issues(self) -> list[Issue]: ...
     def list_issues(self, state: str = "all") -> list[Issue]: ...
@@ -157,6 +159,14 @@ _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
 
 
+class IdentityError(TrackerError):
+    """The signed-in GitHub principal is not a person who can order work (for example an App token)."""
+
+    def __init__(self, login: str, kind: str):
+        super().__init__(f"GitHub credential belongs to {login} ({kind}), not a person")
+        self.login, self.kind = login, kind
+
+
 class CIEvidence(str):
     """Failed CI text. ``not_started`` marks evidence where no failed job ever ran."""
 
@@ -204,17 +214,50 @@ class RecordingTracker:
             return value
 
         def observe(*args, **kwargs):
-            # A read's facts are as of when it began, not when its answer arrived.
-            started = self._read_started()
+            started = self._started()
             result = value(*args, **kwargs)
+            # Any delegated read that returns issues (one or a filtered list) is an observation.
             if isinstance(result, Issue):
-                self._observe([result], started)
+                self._ingest([result], started)
             elif isinstance(result, list) and result and all(isinstance(item, Issue) for item in result):
-                # A list read (sub_issues, list_issues, ...) observes each issue it returns.
-                self._observe(result, started)
+                self._ingest(result, started)
             return result
 
         return observe
+
+    def _started(self):
+        """When a read or write begins: observations and intents are ordered by it, not by completion."""
+        now = getattr(self._context, "now", None)
+        return now() if now is not None else datetime.now(UTC)
+
+    def _ingest(self, issues, started, *, complete=False):
+        """Send what one read that began at ``started`` showed through the store's one ingest."""
+        shown = {issue.number for issue in issues}
+        for number in self._context.store.ingest(issues, started, self._context.config.lanes, complete=complete):
+            self._outbox_dropped(number, "remote change" if number in shown else "issue not found")
+
+    def _absent(self, number, started):
+        if self._context.store.ingest_absence(number, started):
+            self._outbox_dropped(number, "issue not found")
+
+    def list_issues(self, state="all"):
+        started = self._started()
+        issues = self._tracker.list_issues(state)
+        # The bulk refresh ingests its own listing with its comments, edges and PRs.
+        if self.__dict__.get("_bulk_listing") != threading.get_ident():
+            self._ingest(issues, started, complete=state == "all")
+        return issues
+
+    def get_issue(self, n):
+        started = self._started()
+        try:
+            issue = self._tracker.get_issue(n)
+        except TrackerError as exc:
+            if exc.is_not_found:
+                self._absent(n, started)
+            raise
+        self._ingest([issue], started)
+        return issue
 
     def _pending_issues(self):
         pending = {entry["issue"] for entry in self._context.store.github_outbox()}
@@ -229,29 +272,12 @@ class RecordingTracker:
             return issue
         return self.get_issue(n)
 
-    def list_issues(self, *args, **kwargs):
-        """List issues; each one returned is an observation.
-
-        Inside refresh_issues the listing is not recorded here: refresh_local_issues applies
-        it with its own bookkeeping (PR facts, dropped writes, issues no longer listed)."""
-        started = self._read_started()
-        result = self._tracker.list_issues(*args, **kwargs)
-        if not getattr(self, "_refreshing", False):
-            self._observe(result, started)
-        return result
-
     def sub_issues(self, n):
-        started = self._read_started()
+        started = self._started()
         children = self._tracker.sub_issues(n)
-        self._observe(children, started)
+        self._ingest(children, started)
         pending = self._pending_issues()
         return [pending.get(child.number, child) for child in children]
-
-    def _observe(self, issues, started):
-        """Every issue a read returns lands through the store's one observation writer."""
-        for number in self._context.store.record_issues(list(issues), self._context.config.lanes,
-                                                        observed_at=started):
-            self._outbox_dropped(number, "remote change")
 
     def _outbox_dropped(self, number, reason):
         from foragent.orch_events import append_event
@@ -269,11 +295,7 @@ class RecordingTracker:
         Returns whether the listing showed any change since the last one.
         """
         try:
-            self._refreshing = True
-            try:
-                return self._refresh_issues(observed_at or self._context.now())
-            finally:
-                self._refreshing = False
+            return self._refresh_issues(observed_at or self._context.now())
         except TrackerError as exc:
             self._context.store.record_issues_refresh_failure(" ".join(str(exc).split()), self._context.now())
             raise
@@ -284,9 +306,13 @@ class RecordingTracker:
 
         store = self._context.store
         revision = store.issues_revision()
-        pending = {entry["issue"] for entry in store.github_outbox()}
+        pending = store.github_write_issues()
         previous = {row["number"]: row for row in store.local_issues()}
-        issues = self.list_issues()
+        self._bulk_listing = threading.get_ident()
+        try:
+            issues = self.list_issues()
+        finally:
+            self._bulk_listing = None
         # The listing is the change signal: an issue whose listed facts match the
         # last listing keeps its last per-issue reads. A changed issue also marks
         # the issues it blocks, because a dependent does not change when its blocker closes.
@@ -313,19 +339,21 @@ class RecordingTracker:
             try:
                 comments[issue.number] = [asdict(comment) for comment in self._tracker.list_comments(issue.number)]
             except TrackerError as exc:
-                if not exc.is_not_found or self._issue_missing(issue.number) is None:
+                if not exc.is_not_found or not self._missing(issue.number):
                     raise
                 missing.add(issue.number)
         issues = [issue for issue in issues if issue.number not in missing]
         # Order edges and dependencies let views group work without per-frame reads.
         open_issues = [issue for issue in issues if issue.state == "open" and not issue.is_pull_request]
-        children = {}
+        children, child_reads = {}, []
         for issue in open_issues:
             known = (previous.get(issue.number) or {}).get("children")
-            children[issue.number] = (
-                [child.number for child in self._tracker.sub_issues(issue.number)]
-                if issue.number in changed or known is None else known
-            )
+            if issue.number in changed or known is None:
+                started = self._started()  # Each child read is its own observation, ingested after the listing.
+                read = self._tracker.sub_issues(issue.number)
+                child_reads.append((read, started))
+                known = [child.number for child in read]
+            children[issue.number] = known
         parents = {child: parent for parent, numbers in children.items() for child in numbers}
         blocked_by = {}
         for issue in open_issues:
@@ -340,6 +368,8 @@ class RecordingTracker:
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
+        for read, started in child_reads:
+            dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
             store.record_merged_pr_listing(listing)
@@ -379,8 +409,6 @@ class RecordingTracker:
         already showed every earlier close. Each closed issue the local record
         does not show closed is recorded, including one created and closed
         between listings, so this tick's board sync moves its card to Done.
-        Issues already closed locally are recorded too: a changed close reason
-        (completed to not_planned) is a newer observation.
         """
         read = getattr(self._tracker, "issues_closed_since", None)
         if read is None:
@@ -398,84 +426,129 @@ class RecordingTracker:
                     raise
                 log.warning("Could not read recently closed issues: %s", exc)
                 return  # Keep the watermark; the next tick reads this span again.
-            # Every issue the read shows is an observation, including one already closed
-            # locally whose close reason changed; the store keeps whichever is newer.
-            self._observe(issues, observed_at)
+            # Every closed issue is an observation, so a changed close reason is seen too.
+            self._ingest([issue for issue in issues if issue.state == "closed"], observed_at)
         store.record_closed_issue_watermark(observed_at)
 
-    def _issue_missing(self, number):
-        """When a lookup that found the issue gone began, or None if it exists.
-
-        A missing write resource alone does not prove that its issue is gone; the absence is
-        an observation as old as the lookup's start, never as new as its answer."""
-        started = self._read_started()
+    def _missing(self, number):
+        """Whether the issue itself is gone, not only a write resource; both answers are observations."""
+        started = self._started()
         try:
             issue = self._tracker.get_issue(number)
         except TrackerError as exc:
             if exc.is_not_found:
-                return started or self._context.store._now()
+                self._absent(number, started)
+                return True
             raise
-        if isinstance(issue, Issue):
-            self._observe([issue], started)
-        return None
+        self._ingest([issue], started)
+        return False
 
-    def _read_started(self):
-        """When a read begins; record_issue uses the store clock when the context has none."""
-        now = getattr(self._context, "now", None)
-        return now() if callable(now) else None
+    def _premise(self, n):
+        """The visible issue a write is based on, taken when the write starts."""
+        from foragent.state_observations import observed_facts
 
-    def _write(self, n, action, operation, **payload):
+        row = next((row for row in self._context.store.local_issues() if row["number"] == n), None)
+        return observed_facts(row) if row is not None else None
+
+    def _write(self, n, action, operation, started, *, queued=None, **payload):
+        """Every write is an intent first, counted from ``started`` against the issue as it was then.
+
+        It is sent now unless writes must wait (then ``queued`` replaces the
+        payload, e.g. the rest of a label removal). A sent intent is visible
+        to every later intent's premise while its send is in flight; the
+        result is appended as an attempt. A failure nobody retries is final.
+        Comments stay direct sends: they change no labels or state.
+        """
         store = self._context.store
+        premise = self._premise(n)
         pending = store.github_outbox()
         if (any(entry["issue"] == n for entry in pending)
                 or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+            return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
+        # A direct combined close exposes only its field effect to concurrent flushes.
+        # Its comment is send-only; the composite payload enters the retry queue only on failure.
+        field_payload = {**payload, "body": None} if action == "close_issue" else payload
+        entry = self._queue(n, action, started, premise, field_payload) if action != "comment" else None
         try:
-            return operation(), None
+            result = operation()
         except TrackerError as exc:
-            if not self.queue_writes or not exc.is_rate_limit:
+            retry = self.queue_writes and exc.is_rate_limit
+            if entry is not None and retry and field_payload != payload:
+                store.record_github_attempt(entry["id"], started, False, final=True)
+                entry = None  # Retry the unsent composite close, preserving its original premise.
+            if entry is None and retry:
+                entry = self._queue(n, action, started, premise, payload)
+            if entry is not None and action != "comment":
+                store.record_github_attempt(entry["id"], started, False, final=not retry,
+                                            labels=payload["labels"] if action == "remove_labels" else None)
+            if not retry:
                 raise
             from foragent.orch_github import pause
 
             pause(self._context, exc)
-            return None, store.queue_github_write(n, action, lanes=self._context.config.lanes, **payload)
+            return None, entry
+        if entry is not None and action != "comment":
+            store.record_github_attempt(entry["id"], started, True,
+                                        labels=payload["labels"] if action == "remove_labels" else None)
+        return result, None
+
+    def _queue(self, n, action, started, premise, payload):
+        """Append the intent; a read made after it started may already have dropped it."""
+        dropped = []
+        entry = self._context.store.queue_github_write(n, action, lanes=self._context.config.lanes,
+                                                       started_at=started, premise=premise, dropped=dropped,
+                                                       **payload)
+        if any(dropped):
+            missing = not any(row["number"] == n for row in self._context.store.local_issues())
+            self._outbox_dropped(n, "issue not found" if missing else "remote change")
+        return entry
 
     def flush_outbox(self):
-        """Deliver an already refreshed FIFO; a renewed limit leaves its tail intact."""
+        """Deliver the pending intents in queue order; each attempt is appended to its intent."""
         from foragent.orch_github import pause
 
         store = self._context.store
         dropped = set()
-        for entry in store.github_outbox():
-            number, action = entry["issue"], entry["action"]
+
+        def current(identity):
+            """The intent as stored now: a read during an earlier send may have retired it."""
+            return next((entry for entry in store.github_outbox() if entry["id"] == identity), None)
+
+        for queued in store.github_outbox():
+            number, action = queued["issue"], queued["action"]
             if number in dropped:
                 continue
+            started = None
             try:
                 if action == "remove_labels":
-                    labels = entry["labels"]
-                    for index, label in enumerate(labels):
-                        started = self._read_started()
+                    while (entry := current(queued["id"])) is not None and entry["labels"]:
+                        label, started = entry["labels"][0], self._started()
                         result = self._tracker.remove_labels(number, [label])
-                        store.deliver_github_write(entry, remaining_labels=labels[index + 1:])
-                        if isinstance(result, Issue):
-                            self._observe([result], started)
-                elif action == "update_issue":
-                    self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
-                    store.deliver_github_write(entry)
+                        store.record_github_attempt(entry["id"], started, True, labels=[label])
+                        self._acknowledge(number, started, result)
+                    continue
+                if (entry := current(queued["id"])) is None:
+                    continue
+                started = self._started()
+                if action == "update_issue":
+                    result = self._tracker.update_issue(number, title=entry["title"], body=entry["body"])
+                    store.record_github_attempt(entry["id"], started, True)
+                    self._acknowledge(number, started, result)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
-                    started = self._read_started()
                     result = getattr(self._tracker, action)(number, payload)
-                    store.deliver_github_write(entry, comment_id=result if action == "comment" else None)
-                    if isinstance(result, Issue):
-                        # The write's answer shows the issue; delivered first, so it is not judged
-                        # against its own queued write.
-                        self._observe([result], started)
+                    if action == "comment":
+                        store.acknowledge_github_comment(entry, result)
+                    else:
+                        store.record_github_attempt(entry["id"], started, True)
+                        self._acknowledge(number, started, result)
             except TrackerError as exc:
+                if started is not None and action != "comment":
+                    # Every field-send attempt is recorded, whatever its failure.
+                    store.record_github_attempt(queued["id"], started, False,
+                                                labels=[label] if action == "remove_labels" else None)
                 try:
-                    gone = self._issue_missing(number) if exc.is_not_found else None
-                    if gone is not None and store.drop_missing_github_issue(number, observed_at=gone):
-                        self._outbox_dropped(number, "issue not found")
+                    if exc.is_not_found and self._missing(number):
                         dropped.add(number)
                         continue
                 except TrackerError as lookup_error:
@@ -485,29 +558,38 @@ class RecordingTracker:
                 pause(self._context, exc)
                 return
 
+    def _acknowledge(self, n, started, result):
+        """A write's response that echoes the issue is an observation started with the write."""
+        if isinstance(result, Issue):
+            self._ingest([result], started)
+
     def add_labels(self, n, labels):
         labels = list(labels)
         if not labels:
             return
-        started = self._read_started()
-        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), labels=labels)
-        if queued:
-            return
-        if isinstance(result, Issue):
-            self._observe([result], started)
-        self._context.store.record_labels(n, labels, remove=False, lanes=self._context.config.lanes)
+        from foragent.labels import READY
+
+        started = self._started()
+        # A ready label belongs to the approval current when the write started, not when it lands.
+        approval = self._context.store.load_approval(n) if READY in labels else None
+        approved = {"ready_approval": approval.approved_at if approval is not None else None} if READY in labels else {}
+        result, queued = self._write(n, "add_labels", lambda: self._tracker.add_labels(n, labels), started,
+                                     labels=labels, **approved)
+        if not queued:
+            self._acknowledge(n, started, result)
 
     def remove_labels(self, n, labels):
         labels = list(labels)
         for index, label in enumerate(labels):
-            started = self._read_started()
+            started = self._started()
             result, queued = self._write(n, "remove_labels", lambda: self._tracker.remove_labels(n, [label]),
-                                         labels=labels[index:])
+                                         started, labels=[label], queued={"labels": labels[index:]})
             if queued:
+                if queued["labels"] == [label] and labels[index + 1:]:
+                    # This label's send was rate-limited: the rest wait behind it, in order.
+                    self._queue(n, "remove_labels", started, self._premise(n), {"labels": labels[index + 1:]})
                 break
-            if isinstance(result, Issue):
-                self._observe([result], started)
-            self._context.store.record_labels(n, [label], remove=True, lanes=self._context.config.lanes)
+            self._acknowledge(n, started, result)
 
     def list_comments(self, n):
         comments = self._tracker.list_comments(n)
@@ -515,7 +597,8 @@ class RecordingTracker:
         return comments
 
     def comment(self, n, body):
-        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), body=body)
+        identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
+                                       body=body)
         if queued:
             return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,
@@ -524,22 +607,24 @@ class RecordingTracker:
 
     def create_issue(self, title, body, labels):
         labels = list(labels)
-        started = self._read_started()
+        started = self._started()
         n = self._tracker.create_issue(title, body, labels)
-        self._observe([Issue(n, title, body, frozenset(labels), "open")], started)
+        self._ingest([Issue(n, title, body, frozenset(labels), "open")], started)
         return n
 
     def update_issue(self, n, *, title, body):
-        _, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
-                                title=title, body=body)
+        started = self._started()
+        result, queued = self._write(n, "update_issue", lambda: self._tracker.update_issue(n, title=title, body=body),
+                                     started, title=title, body=body)
         if not queued:
-            self._context.store.update_local_issue(n, title=title, body=body)
+            self._acknowledge(n, started, result)
 
     def close_issue(self, n, comment=None):
-        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), body=comment)
+        started = self._started()
+        result, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                                    else self._tracker.close_issue(n, comment), started, body=comment)
         if not queued:
-            self._context.store.update_local_issue(n, state="closed")
+            self._acknowledge(n, started, result)
 
     def record_board_value(self, n, project, field, value):
         self._context.store.record_board_value(n, project, field, value)
@@ -605,9 +690,11 @@ class FakeTracker:
 
     def __init__(
         self, actor: str = "foragent-bot", now: Callable[[], datetime] | None = None,
-        *, strict: bool = False,
+        *, strict: bool = False, login: str | None = None,
     ):
         self.actor = actor
+        # The injectable authenticated person (D78 revision); defaults to the actor.
+        self.login = actor if login is None else login
         self._now = now or (lambda: datetime.now(UTC))
         self.strict = strict
         self.issues: dict[int, Issue] = {}
@@ -630,6 +717,11 @@ class FakeTracker:
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         return self._projects.graphql(query, variables, self)
+
+    def authenticated_login(self, *, refresh: bool = False) -> str:
+        if not self.login:
+            raise TrackerError("not authenticated")
+        return self.login.lower()
 
     def _timestamp(self) -> str:
         return self._now().astimezone(UTC).isoformat()
@@ -929,6 +1021,33 @@ class GhTracker:
             ) from exc
         except (OSError, subprocess.TimeoutExpired, gh.DeadlineExhausted) as exc:
             raise TrackerError(str(exc)) from exc
+
+    def authenticated_login(self, *, refresh: bool = False) -> str:
+        """The lowercase login of the person gh is signed in as on this machine.
+
+        The answer is cached in the machine data root under a hash of the host and
+        the active credential, so repositories and processes share one ``gh api user``
+        read, and switching accounts or tokens never reuses another principal.
+        ``refresh`` (fa init) reads it again. Credentials themselves are never stored.
+        """
+        from foragent import identity_cache
+
+        key = identity_cache.credential_key()
+        if not refresh and key is not None and (login := identity_cache.read(key)):
+            return login
+        try:
+            data = json.loads(self._call(["api", "user"]))
+        except json.JSONDecodeError as exc:
+            raise TrackerError(f"invalid user JSON: {exc}") from exc
+        login = data.get("login") if isinstance(data, dict) else None
+        if not isinstance(login, str) or not login:
+            raise TrackerError("gh api user returned no login")
+        if data.get("type", "User") != "User":
+            raise IdentityError(login, str(data.get("type")))
+        login = login.lower()
+        if key is not None:
+            identity_cache.write(key, login)
+        return login
 
     def rate_limit_reset(self) -> datetime | None:
         """Also keeps the core requests remaining from the same response in ``rate_limit_remaining``."""

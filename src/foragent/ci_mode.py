@@ -21,10 +21,25 @@ class MissingComparison(UnusableComparison):
     pass
 
 
+class StaleComparison(UnusableComparison):
+    """Every check passed except the base or measurement producer is no longer current."""
+
+
+def serialize_reports(reports):
+    """Pin external evidence without letting malformed data escape as a code error."""
+    try:
+        return json.dumps(reports, sort_keys=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
 def _excluded_subset(value, required):
     """CI's exclusions still protect every file the gate requires now."""
-    return (isinstance(value, list) and all(isinstance(path, str) for path in value)
-            and set(value) <= set(required))
+    return _paths(value) and set(value) <= set(required)
+
+
+def _paths(value):
+    return isinstance(value, list) and all(isinstance(path, str) for path in value)
 
 
 def scope_covers(recorded, required):
@@ -42,6 +57,17 @@ def _trusted_sha(git, tracker):
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         return None
+
+
+def changed_workflows(git, trusted_sha, head):
+    """PR artifacts are trusted only when their workflow matches the default branch."""
+    if trusted_sha is None:
+        raise GitError("Default branch reference unavailable")
+    return git._call([
+        "diff", "--name-only", "-z", trusted_sha, head, "--",
+        ".github/workflows/foragent-acceptance*.yml",
+        ".github/workflows/foragent-acceptance*.yaml",
+    ])
 
 
 @dataclass(frozen=True)
@@ -71,16 +97,28 @@ class ComparisonEvidence:
                     return False
             if self.reports is None:
                 return True  # Local evidence is pinned to the same base/head and scope.
-            return self.reports == json.dumps(ctx.tracker.pr_acceptance_reports(head), sort_keys=True)
-        except (AttributeError, TrackerError) as exc:
+            return self.reports == serialize_reports(ctx.tracker.pr_acceptance_reports(head))
+        except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
             return False
 
 
-def enabled(ctx, target_branch):
-    return (ctx.config.checks == "ci" and target_branch == ctx.config.base_branch
+def ci_protection(ctx):
+    """CI owns portable protection even when a target cannot produce evidence."""
+    return (ctx.config.checks == "ci" and ctx.config.checks_fallback != "local"
             and acceptance_command(ctx.config, ctx.repo_root) is not None)
+
+
+def ci_evidence_target(ctx, target_branch):
+    """The generated acceptance workflow runs only against the configured base."""
+    return target_branch == ctx.config.base_branch
+
+
+def enabled(ctx, target_branch):
+    return (ci_protection(ctx)
+            or (ctx.config.checks == "ci" and ci_evidence_target(ctx, target_branch)
+                and acceptance_command(ctx.config, ctx.repo_root) is not None))
 
 
 def commit_exclusions(attempt, title):
@@ -102,78 +140,168 @@ def commit_exclusions(attempt, title):
     git.commit(title, allow_empty=not committing)
 
 
-def suite(value):
-    if not isinstance(value, dict) or value.get("complete") is not True:
-        raise UnusableComparison("incomplete suite")
+def suite(value, path="suite"):
+    """Collected and passing ids; a rejection names the field, observed and expected value."""
+    if not isinstance(value, dict):
+        raise UnusableComparison(f"{path}: observed {_shown(value)}, expected an object")
+    complete = _shown(value["complete"]) if "complete" in value else "missing"
+    if value.get("complete") is not True:
+        raise UnusableComparison(f"incomplete suite: {path}.complete: observed {complete}, expected true")
     sets = []
     for key in ("collected_ids", "passing_ids"):
-        ids = value.get(key)
-        if not isinstance(ids, list) or any(not isinstance(node, str) or "::" not in node for node in ids):
-            raise UnusableComparison(f"invalid {key}")
-        if len(ids) != len(set(ids)):
-            raise UnusableComparison(f"duplicate {key}")
+        if key not in value:
+            raise UnusableComparison(f"{path}.{key}: observed missing, expected a list of test ids")
+        ids = value[key]
+        if not isinstance(ids, list):
+            raise UnusableComparison(f"{path}.{key}: observed {_shown(ids)}, expected a list of test ids")
+        for node in ids:
+            if not isinstance(node, str) or "::" not in node:
+                raise UnusableComparison(f"{path}.{key}: observed {_shown(node)}, expected a test id containing '::'")
+        duplicate = next((node for position, node in enumerate(ids) if node in ids[:position]), None)
+        if duplicate is not None:
+            raise UnusableComparison(f"{path}.{key}: observed {_shown(duplicate)} twice, expected unique test ids")
         sets.append(set(ids))
     if not sets[1] <= sets[0]:
-        raise UnusableComparison("passing tests were not collected")
+        node = sorted(sets[1] - sets[0])[0]
+        raise UnusableComparison(f"{path}.passing_ids: observed {_shown(node)}, "
+                                 f"expected only ids listed in {path}.collected_ids")
     return sets
 
 
+def _shown(value):
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _field(evidence, path, expected="a value"):
+    """Read a dotted path, naming the first missing or non-object step."""
+    value, seen = evidence, []
+    for key in path.split("."):
+        if not isinstance(value, dict):
+            where = ".".join(seen) or "shard"
+            raise UnusableComparison(f"{where}: observed {_shown(value)}, expected an object")
+        seen.append(key)
+        if key not in value:
+            raise UnusableComparison(f"{'.'.join(seen)}: observed missing, expected {expected}")
+        value = value[key]
+    return value
+
+
+def _positive(value):
+    return type(value) is int and value > 0
+
+
 def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
+    """Validate every shard; the first failing field names its observed and expected value.
+
+    Only a moved base or a superseded measurement producer is stale. Those wait
+    until every other check passes, so an unrelated invalid field never retries.
+    The exclusions CI recorded are the reference for a completed measurement;
+    today's ``excluded`` may differ either way and neither waives nor adds a test.
+    """
     reports = {}
     expected_shards = set(expected_shards)
     producer = None
+    stale = None
     duration = 0
     lost = set()
     seen = {"base": set(), "head": set()}
     if not isinstance(artifacts, list):
-        raise UnusableComparison("invalid artifact listing")
+        raise UnusableComparison(f"artifacts: observed {type(artifacts).__name__}, expected a list")
     artifact_ids = set()
-    excluded = set(excluded)
+    recorded = None
     for evidence in artifacts:
         try:
-            run, artifact, payload = evidence["run"], evidence["artifact"], evidence["report"]
-            run_id, artifact_id = run["id"], artifact["id"]
-            index, shards = payload["shard_index"], payload["shard_count"]
-            if (type(run_id) is not int or run_id <= 0
-                    or run["head_sha"] != head_sha or run["status"] != "completed"
-                    or run["conclusion"] != "success" or run["event"] != "pull_request"
-                    or run["path"].split("@", 1)[0] != WORKFLOW
-                    or run["repository"]["full_name"] != repo
-                    or run["head_repository"]["full_name"] != repo
-                    or type(artifact_id) is not int or artifact_id <= 0 or artifact_id in artifact_ids
-                    or artifact["expired"] is not False
-                    or type(artifact["workflow_run"]["id"]) is not int
-                    or artifact["workflow_run"]["id"] != run_id
-                    or artifact["workflow_run"]["head_sha"] != head_sha
-                    or type(payload["schema_version"]) is not int or payload["schema_version"] != 1
-                    or payload["repository"] != repo or payload["base_sha"] != base_sha
-                    or payload["head_sha"] != head_sha or not _excluded_subset(payload["excluded"], excluded)
-                    or not scope_covers(payload["scope"], expected_scope)
-                    or payload["scope"]["excluded"] != payload["excluded"]
-                    or type(index) is not int or type(shards) is not int or not 1 <= shards <= 256
-                    or shards != len(expected_shards) or index not in expected_shards
-                    or not 0 <= index < shards or artifact["name"] != f"acceptance-{index}"
-                    or index in reports or (producer is not None and producer != run_id)):
-                raise UnusableComparison("shard identity, status or exclusions do not match")
+            def need(path, ok, expected, freshness=False):
+                nonlocal stale
+                value = _field(evidence, path, expected)
+                if ok(value):
+                    return value
+                message = f"{path}: observed {_shown(value)}, expected {expected}"
+                if not freshness:
+                    raise UnusableComparison(message)
+                stale = stale or message
+                return value
+
+            def equal(path, want, freshness=False):
+                return need(path, lambda value: value == want, _shown(want), freshness)
+
+            run_id = need("run.id", _positive, "a positive integer")
+            equal("run.head_sha", head_sha)
+            equal("run.status", "completed")
+            equal("run.conclusion", "success")
+            equal("run.event", "pull_request")
+            need("run.path", lambda value: isinstance(value, str) and value.split("@", 1)[0] == WORKFLOW,
+                 _shown(WORKFLOW))
+            equal("run.repository.full_name", repo)
+            equal("run.head_repository.full_name", repo)
+            artifact_id = need("artifact.id", _positive, "a positive integer")
+            need("artifact.id", lambda value: value not in artifact_ids, "unique across shards")
+            need("artifact.expired", lambda value: value is False, _shown(False))
+            need("artifact.workflow_run.id", lambda value: type(value) is int and value == run_id, _shown(run_id))
+            equal("artifact.workflow_run.head_sha", head_sha)
+            need("report.schema_version", lambda value: type(value) is int and value == 1, _shown(1))
+            equal("report.repository", repo)
+            equal("report.base_sha", base_sha, freshness=True)
+            equal("report.head_sha", head_sha)
+            ci_excluded = need("report.excluded", _paths, "a list of test file paths")
+            need("report.scope", lambda value: isinstance(value, dict) and value.keys() == expected_scope.keys(),
+                 f"an object with keys {_shown(sorted(expected_scope))}")
+            for key in expected_scope:
+                if key != "excluded":
+                    equal(f"report.scope.{key}", expected_scope[key])
+            scope_excluded = need("report.scope.excluded", _paths, "a list of test file paths")
+            equal("report.excluded", scope_excluded)
+            if recorded is not None:
+                need("report.excluded", lambda value: set(value) == recorded,
+                     f"{_shown(sorted(recorded))} (exclusions of earlier shards)")
+            recorded = set(ci_excluded)
+            shards = need("report.shard_count", lambda value: type(value) is int and 1 <= value <= 256,
+                          "an integer from 1 to 256")
+            equal("report.shard_count", len(expected_shards))
+            index = need("report.shard_index", lambda value: type(value) is int, "an integer")
+            need("report.shard_index", lambda value: value in expected_shards and 0 <= value < shards,
+                 f"one of {_shown(sorted(expected_shards))}")
+            equal("artifact.name", f"acceptance-{index}")
+            need("report.shard_index", lambda value: value not in reports, "unique across shards")
+            if producer is not None:
+                need("run.id", lambda value: value == producer, f"{producer} (producer of earlier shards)",
+                     freshness=True)
             artifact_ids.add(artifact_id)
-            seconds = payload["duration_seconds"]
-            if type(seconds) not in (int, float) or not isfinite(seconds) or seconds < 0:
-                raise UnusableComparison("invalid duration")
-            producer = run_id
-            base, head = suite(payload["base"]), suite(payload["head"])
-            ci_excluded = set(payload["excluded"])
-            for side, ids in (("base", base[0]), ("head", head[0])):
-                if seen[side] & ids or any(node.split("::", 1)[0] in ci_excluded for node in ids):
-                    raise UnusableComparison("overlapping or excluded tests")
+            seconds = need("report.duration_seconds",
+                           lambda value: type(value) in (int, float) and isfinite(value) and value >= 0,
+                           "a finite number of seconds, at least 0")
+            producer = producer if producer is not None else run_id
+            sides = {}
+            for side in ("base", "head"):
+                sides[side] = suite(_field(evidence, f"report.{side}", "an object"), f"report.{side}")
+            ci_excluded = set(ci_excluded)
+            for side in ("base", "head"):
+                ids = sides[side][0]
+                path = f"report.{side}.collected_ids"
+                overlap = sorted(seen[side] & ids)
+                if overlap:
+                    raise UnusableComparison(f"{path}: observed {_shown(overlap[0])}, "
+                                             "expected each test in only one shard")
+                dropped = sorted(node for node in ids if node.split("::", 1)[0] in ci_excluded)
+                if dropped:
+                    raise UnusableComparison(f"{path}: observed {_shown(dropped[0])}, "
+                                             f"expected no tests from report.excluded {_shown(sorted(ci_excluded))}")
                 seen[side].update(ids)
-            # Files excluded since CI started are no longer protected.
-            lost.update(node for node in base[1] - head[1] if node.split("::", 1)[0] not in excluded)
-            reports[index] = payload
+            # Tests from CI's excluded files are already rejected above, so every
+            # measured test stays protected even if it is excluded today.
+            lost.update(sides["base"][1] - sides["head"][1])
+            reports[index] = evidence["report"]
             duration = max(duration, seconds)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError, RecursionError, OverflowError) as exc:
             raise UnusableComparison(f"Unusable acceptance shard: {exc}") from exc
     if not expected_shards or set(reports) != expected_shards:
-        raise MissingComparison("missing acceptance shards")
+        raise MissingComparison(f"missing acceptance shards: report.shard_index: observed {_shown(sorted(reports))}, "
+                                f"expected {_shown(sorted(expected_shards)) if expected_shards else 'at least one shard'}")
+    if stale:
+        raise StaleComparison(f"Stale acceptance shard: {stale}")
     return sorted(lost), duration
 
 
@@ -194,23 +322,22 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
     try:
-        if trusted_sha is None:
-            raise GitError("Default branch reference unavailable")
-        changed_workflows = attempt.git._call([
-            "diff", "--name-only", "-z", trusted_sha, head, "--",
-            ".github/workflows/foragent-acceptance*.yml",
-            ".github/workflows/foragent-acceptance*.yaml",
-        ])
+        workflows_changed = changed_workflows(attempt.git, trusted_sha, head)
     except GitError as exc:
-        changed_workflows = False
+        workflows_changed = False
         workflow_error = str(exc)
-    if changed_workflows:
+    if workflows_changed:
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             return evidence
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
+    if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
+        detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
+                  "(checks: ci, no local fallback)")
+        flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
+        raise ExecutorStopped("held", detail)
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
@@ -221,8 +348,10 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
                                            expected_scope=scope,
                                            expected_shards=range(ctx.config.ci_shards))
+                recorded_reports = serialize_reports(reports)
                 break
-            except MissingComparison:
+            except (MissingComparison, StaleComparison):
+                # Fresh CI replaces stale evidence; it never costs a worker turn.
                 from foragent import runner
 
                 remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
@@ -232,11 +361,12 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
 
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
-    except (UnusableComparison, AttributeError, TrackerError) as exc:
+    except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
-        if ctx.config.checks_fallback == "local":
+        # A local measurement is no substitute for current CI evidence.
+        if ctx.config.checks_fallback == "local" and not isinstance(exc, StaleComparison):
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 return evidence
@@ -258,7 +388,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                              json.dumps(reports, sort_keys=True))
+                              recorded_reports)
 
 
 def review_checks(n, ctx, git, target_branch):

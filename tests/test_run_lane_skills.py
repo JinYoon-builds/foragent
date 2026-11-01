@@ -3,6 +3,7 @@ from datetime import timedelta
 
 import pytest
 
+from foragent import lane_memory
 from foragent.git import GitRepo
 from foragent.runner import _lane_skills, goal_condition, run_issue
 from foragent.scheduler import TickContext, TickReport, _kill_run, _recover_orphan, _recover_runs
@@ -103,7 +104,10 @@ def test_lane_null_overrides_and_main_use_project_defaults(run_case, lane):
     assert run_issue(1, c.ctx) == "merged"
     call = c.executor.calls[0]
     assert call["model"] == "project-model" and "agent" not in call
-    assert not call["prompt"].startswith("Lane notes:")
+    # No agent file: the executor still gets the lane's append-only memory contract (D95).
+    contract = lane_memory.instruction(lane_memory.memory_dir(c.ctx.config, lane))
+    assert call["prompt"].startswith("Lane notes:\n" + contract + "\n\n")
+    assert call["prompt"].count(contract) == 1
     if lane == "main":
         assert "## Outside lane" not in c.tracker.created_prs[0].body
 
@@ -139,7 +143,8 @@ def test_lane_skills_come_from_worktree_and_only_extend_codex_prompts(run_case, 
         assert "agent" not in call
     elif kind == "codex":
         assert "- configured: Skill metadata (.claude/skills/configured/SKILL.md)\n\n" in call["prompt"]
-        assert call["prompt"].startswith("Lane notes:\nLane instructions.\n\nLane skills (read the file when relevant and follow it):\n")
+        assert call["prompt"].startswith("Lane notes:\nLane instructions.\n\n" + lane_memory.instruction("fa-ui")
+                                         + "\n\nLane skills (read the file when relevant and follow it):\n")
         assert "Configured strategy." not in call["prompt"] and "Agent strategy." not in call["prompt"]
         assert "description: Skill metadata" not in call["prompt"]
         assert "Wrong local strategy." not in call["prompt"]
@@ -162,7 +167,9 @@ def test_codex_configured_skills_do_not_require_an_agent_file(run_case, agent):
     c.ctx.config = replace(c.ctx.config, lanes={"ui": {"agent": agent, "skills": ["testing"]}})
     c.store.update_run(1, lane="ui")
     assert run_issue(1, c.ctx) == "merged"
-    assert c.executor.calls[0]["prompt"].startswith("Lane skills (read the file when relevant and follow it):\n"
+    contract = lane_memory.instruction(agent or "ui")
+    assert c.executor.calls[0]["prompt"].startswith("Lane notes:\n" + contract + "\n\n"
+                                                "Lane skills (read the file when relevant and follow it):\n"
                                                 "- testing: Focused checks (.claude/skills/testing/SKILL.md)\n\n")
     assert "Use focused checks." not in c.executor.calls[0]["prompt"]
     assert "missing skill:" not in c.tracker.created_prs[0].body

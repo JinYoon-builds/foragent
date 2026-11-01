@@ -63,6 +63,25 @@ description: Set up a project folder for Foragent.
    it in a separate configuration commit. `checks_fallback: local`
    optionally runs a local acceptance comparison when CI evidence is unusable.
 
+   Team readiness: every `fa init` reads the signed-in GitHub account again and
+   prints `GitHub account: <login>`. This factory works only issues labelled
+   `by:<login>` (stamped when that person publishes an order), plus unlabelled
+   issues when `legacy_owner` in `.foragent.yml` names this login or is unset.
+   Show the account line to the person. If it says unknown, ask them to run
+   `gh auth login` (their own account, not an App or bot token) and rerun
+   `fa init`; nothing can be published until it works. After `gh auth switch`,
+   rerun `fa init` so the factory uses the new account. If the summary reports
+   that team setup is missing, another person's orders already exist without a
+   shared `legacy_owner`: before this factory starts, the original factory adds
+   `legacy_owner: <its login>` through a normal PR. Before a second person joins,
+   every running `fa` must be stopped or upgraded (an old gate ignores `by:`
+   labels), and each person runs one gate per repository. Each person needs write
+   access including labels; a publication whose owner label GitHub drops stops
+   and closes that issue. `by:` labels are trusted: to hand work over or fix a
+   wrong label, stop the affected factories, keep their unfinished work, agree on
+   the new owner, change the single `by:` label (and `legacy_owner` if needed),
+   then restart only the owning factory. README "Working as a team" has details.
+
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
 

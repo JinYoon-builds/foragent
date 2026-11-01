@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ def _publish_reviewed_in_turn(
     pushed (as the implementation path does after its review); without
     ``reverify`` or on a conflict it stops as base-changed.
     """
-    from foragent import runner
+    from foragent import run_group_check, run_group_ci, run_group_evidence, runner
 
     worktree = git.root
     log = ctx.store.log_path(n)
@@ -116,6 +117,24 @@ def _publish_reviewed_in_turn(
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)
     queued_status = None
+    group_checked: set = set()
+    reused_base = None
+    # The reviewed head has no baseline of its own; run_base_move then judges locked
+    # files against each commit's parent, as for an implementation without one.
+    view = SimpleNamespace(n=n, ctx=ctx, git=git, approval=approval, baseline=None)
+
+    def reuse(target: str) -> bool:
+        """Every base-move point asks this: does the joint pass verify this exact head on ``target``?"""
+        nonlocal base_sha, reused_base
+        if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
+            return False
+        if comparison_attempt is not None and run_group_ci.evidence(view, head, target) is None:
+            return False
+        if run_group_evidence.note(n, ctx, head, target, run_group_evidence.neutral_rule(view)):
+            return False
+        base_sha = reused_base = target  # group-reuse: no merge, recheck or push
+        return True
+
     while True:
         if stopped := run_publish._wait_for_ci(
             n, ctx, git, pr.number, head, started, ci_wait,
@@ -131,12 +150,21 @@ def _publish_reviewed_in_turn(
             ci_wait, queued_status = run_publish._CIWait(ctx.now().timestamp()), None
             continue
         ctx.git.fetch("origin", pr.base)
-        if (target_sha := ctx.git.ref_sha(base_ref)) != base_sha:
+        if (target_sha := ctx.git.ref_sha(base_ref)) != base_sha and not reuse(target_sha):
             if stopped := refresh(target_sha):
                 return stopped
             continue
+        if reused_base != base_sha:  # Consecutive ready FIFO runs share one check, outside the lock.
+            run_group_check.check(n, ctx, place, head, base_sha, group_checked)
         comparison = None
         if comparison_attempt is not None:
+            comparison = run_group_ci.evidence(view, head, base_sha)
+            if comparison is None and reused_base == base_sha:
+                reused_base = None
+                if stopped := refresh(base_sha):
+                    return stopped
+                continue
+        if comparison is None and comparison_attempt is not None:
             comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
                                                         base_sha=base_sha, status=ci_wait.status,
                                                         deadline=ci_wait.deadline)
@@ -173,6 +201,7 @@ def _publish_reviewed_in_turn(
                     else:
                         failed_merge = exc
                 else:
+                    run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
@@ -205,6 +234,8 @@ def _publish_reviewed_in_turn(
         if stopped := policy_hold(inputs.decision, inputs.batch_branch):
             return stopped
         if moved:
+            if reuse(inputs.base_sha):
+                continue
             if stopped := refresh(inputs.base_sha):
                 return stopped
             continue

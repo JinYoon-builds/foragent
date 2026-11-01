@@ -3,11 +3,15 @@
 Sprites follow docs/design/lane-view-sketch/cast.py. Pixels are palette keys or
 None (transparent); half-block cells carry glyph, foreground and background.
 A None colour means an unpainted pixel (the terminal background), including
-when only the bottom pixel is painted. Only the upper half-block and ASCII are
-used. Consumers must map transparent foregrounds to the terminal background.
+when only the bottom pixel is painted. half_blocks keeps that data shape (an
+upper half-block with a None foreground); the serializers pixel_rows and
+ansi_rows draw such a cell as a lower half-block in the bottom colour, so its
+upper half stays the terminal background.
 """
 
 from collections.abc import Mapping, Sequence
+
+from foragent.watch_cells import Line
 
 
 PixelGrid = Sequence[Sequence[str | None]]
@@ -17,6 +21,7 @@ Cell = tuple[str, int | None, int | None]
 PALETTE = {
     "K": 52, "O": 173, "R": 130, "W": 230, "E": 232, "N": 94,
     "A": 137, "C": 58, "P": 209, "T": 173, "Z": 147, "X": 221,
+    "D": 250,
 }
 
 
@@ -113,6 +118,103 @@ LANE_POSES = {
 }
 
 
+# A lane squirrel watching for work: 11 x 8 pixels (4 cell rows). Ticks 0-1 face
+# right and 2-3 left; only head rows 0 and 2 turn, and D dots count tick % 4.
+_LOOKOUT_BODY = [
+    '...OOOO....',
+    'T..OOOO....',
+    'TT.OWWO....',
+    'TT.OWWO....',
+    '.TTOOOO....',
+    '...O..O....',
+]
+_LOOKOUT_HEAD = {"right": ('....O.O....', '..OOOEO....'), "left": ('...O.O.....', '..OOEOO....')}
+_LOOKOUT_DOTS = ((1, 8), (1, 9), (1, 10))
+
+
+def _frame(rows: Sequence[str], width: int, key: str,
+           points: Sequence[tuple[int, int]]) -> tuple[tuple[str | None, ...], ...]:
+    """Paint one palette key at zero-based (y, x) points over dot-notation rows."""
+    grid = [list(row) for row in rows]
+    for y, x in points:
+        grid[y][x] = key
+    return _pixels(["".join(row) for row in grid], width)
+
+
+def _lookout_frame(tick: int) -> tuple[tuple[str | None, ...], ...]:
+    ear, eye = _LOOKOUT_HEAD["right" if tick < 2 else "left"]
+    return _frame([ear, _LOOKOUT_BODY[0], eye, *_LOOKOUT_BODY[1:]], 11, "D", _LOOKOUT_DOTS[:tick])
+
+
+_LOOKOUT_FRAMES = tuple(_lookout_frame(tick) for tick in range(4))
+
+# A lane squirrel asleep on its side: 9 x 8 pixels (4 cell rows); Z drifts up.
+_LYING_ROWS = [
+    '.........',
+    '.........',
+    '.........',
+    'WT.......',
+    'TT..O.O..',
+    'TT.OOOOO.',
+    'TTOOOKOOO',
+    '.TOOOOOO.',
+]
+_LYING_ZS = (((2, 7),), ((2, 7), (1, 8)), ((1, 8), (0, 8)), ((0, 8),))
+_LYING_FRAMES = tuple(_frame(_LYING_ROWS, 9, "Z", points) for points in _LYING_ZS)
+
+
+def lookout(tick: int) -> PixelGrid:
+    """The watching squirrel's frame for one animation tick."""
+    return _LOOKOUT_FRAMES[tick % 4]
+
+
+def lying_asleep(tick: int) -> PixelGrid:
+    """The sleeping squirrel's frame for one animation frame (callers pass tick // 2)."""
+    return _LYING_FRAMES[tick % 4]
+
+
+def pixel_rows(grid: PixelGrid, palette: Mapping[str, int] = PALETTE) -> list[Line]:
+    """half_blocks as styled spans: ("art", fg, bg) per cell, never ANSI.
+
+    A bottom-only cell becomes a lower half-block in its own colour, so its upper half
+    is the terminal background rather than the default text colour.
+    """
+    rows = []
+    for cells in half_blocks(grid, palette):
+        row: Line = []
+        for glyph, upper, lower in cells:
+            if glyph == " ":
+                row.append((" ", ("art", None, None)))
+            elif upper is None:
+                row.append(("▄", ("art", lower, None)))
+            else:
+                row.append(("▀", ("art", upper, lower)))
+        rows.append(row)
+    return rows
+
+
+# Sideways acorn colours by canonical style: (stem and cap fg, body fg, body bg).
+_ACORN_COLOURS = {"working": (94, 232, 220), "question": (94, 232, 203), "next": (237, 252, 240)}
+_ACORN_STYLES = {"yellow": "working", "working": "working", "question": "question"}
+_WORKING_STEMS = ("◖", "◜", "◖", "◟")
+
+
+def sideways_acorn(number: int, word: str, style: str, *, tick: int = 0, ascii: bool = False) -> Line:
+    """One issue as a sideways acorn ``◖█#N word▌``, or ``[#N word]`` in ASCII.
+
+    yellow means working; parked and unknown styles use the next colours, so unknown
+    work never looks running. Only working stems rock with tick; ASCII ignores tick.
+    """
+    style = _ACORN_STYLES.get(style, "next")
+    label = f"#{number} {word}" if word else f"#{number}"
+    if ascii:
+        return [(f"[{label}]", style)]
+    cap, ink, body = _ACORN_COLOURS[style]
+    stem = _WORKING_STEMS[tick % 4] if style == "working" else "◖"
+    return [(stem, ("art", cap, None)), ("█", ("art", cap, None)),
+            (label, ("art", ink, body)), ("▌", ("art", body, None))]
+
+
 def acorn_colour(done: bool) -> int:
     """Completed nuts are brown; remaining nuts are grey (xterm-256)."""
     return PALETTE["A"] if done else 240
@@ -140,19 +242,24 @@ def acorn(number: int | None, done: bool) -> list[str]:
 
 
 def ansi_rows(grid: PixelGrid, palette: Mapping[str, int]) -> list[str]:
-    """half_blocks as xterm-256 ANSI text, one string per cell row, glyphs unchanged.
+    """half_blocks as xterm-256 ANSI text, one string per cell row.
 
-    A None colour sets no SGR code, so that half shows the terminal's own colour.
-    Each painted cell resets afterwards; trailing transparent cells are dropped.
+    Only painted halves get colour; the other half stays the terminal's own colour.
+    A bottom-only cell is a lower half-block in foreground ink, never an upper block
+    drawn in the default text colour. Each painted cell resets afterwards, and
+    trailing transparent cells are dropped.
     """
     rows = []
     for cells in half_blocks(grid, palette):
         row = ""
-        for glyph, foreground, background in cells:
+        for glyph, upper, lower in cells:
             if glyph == " ":
                 row += glyph
                 continue
-            codes = [f"38;5;{foreground}"] * (foreground is not None) + [f"48;5;{background}"] * (background is not None)
+            if upper is None:
+                glyph, codes = "▄", [f"38;5;{lower}"]
+            else:
+                codes = [f"38;5;{upper}"] + [f"48;5;{lower}"] * (lower is not None)
             row += f"\x1b[{';'.join(codes)}m{glyph}\x1b[0m"
         rows.append(row.rstrip(" "))
     return rows

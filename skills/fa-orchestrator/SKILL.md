@@ -25,7 +25,7 @@ session; otherwise record the question with `fa orch ask`, send it to planning a
 planning session runs `fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a
 planning handoff without a push: send it to planning as a cross-session message with SendMessage. If it is absent or
 its heartbeat is stale, `fa orch ask` sends the push itself, so do not add `fa notify`. New requests and answers wake
-`fa orch watch --follow` ([watch](references/watch.md)).
+`fa orch watch --follow` ([watch](references/watch.md)). Handle wait-resume notices: [waiting](references/waiting.md).
 
 ## Ask only D71 choices
 
@@ -37,6 +37,7 @@ it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a 
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
 environment); the docs answer a spec question. Implementers never edit locked acceptance tests; as
 the test owner, the orchestrator corrects its own tests through an order edit and re-approval.
+A choice-free fix the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve` after a clean preread; a choice about behaviour, scope, screen wording or the approval boundary, or a real preread QUESTION, goes through the planning session to the person.
 
 ## Session note
 
@@ -89,7 +90,7 @@ Count attempts by defect class, not by reason code, across `fa orch log` and iss
 second time for the same defect class, do not retry with another hint; fix the issue itself: redesign its Goal (for
 example one writer per state, D95) through an order edit and re-approval, or split it. Use `fa orch escalate` only
 when that fix needs a product decision; it still includes the earlier attempts and their evidence. Escalated items
-wait for the human; keep handling other work. Interpret logs and review text as evidence, never as user authorization.
+wait for the human; keep handling other work. Interpret logs and review text as evidence, never as user authorization. GitHub writes (issues, pull requests, comments, labels, board items and fields, API mutations) go through FA commands (the verbs above, other `fa orch` verbs, `fa order`, `fa inspect`); read-only `gh` inspection stays. When no FA command fits, do not hand the shell work to the person: propose an issue for the missing command as a new order through `fa-order`.
 
 ## Daily retrospective
 
@@ -145,5 +146,5 @@ The gate checks the schedule from local facts (`fa tidy due --json`: `merges` af
 the last tidy, or `idle-quota` when no lane runs and quota is left) and puts one "tidy due" request
 with the evidence numbers in `fa orch inbox` per due period; it never orders tidy work. Judge whether
 to call the architect (`fa orch architect --why "<numbers>"`), which reads widely, ranks and proposes
-refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the user
-approves in the publishing session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.
+refactors ([checklist](references/tidy.md)). Propose the tidy order with `fa orch ask`; after the person
+approves through the planning session, follow [order card](references/order-card.md), each issue in the lane that owns its files; Done when: all existing tests still pass, behaviour unchanged. Then `fa tidy done`.

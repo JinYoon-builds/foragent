@@ -104,7 +104,8 @@ def test_short_screen_keeps_the_playing_band_and_drops_other_sections_first():
                                     now=BASE_TIME, height=height))
         assert fireworks(text), f"the playing band gave way at {height} rows"
         dropped_list |= "이번 주문을 모두 끝냈어요" not in text
-    assert dropped_list, "some short screen drops the done list while the band stays"
+    # Shell: an explicit height no longer drops sections; the viewport scrolls instead.
+    assert not dropped_list, "no short screen drops the done list; every row stays reachable"
 
 
 def test_band_colours_are_the_existing_style_keys_and_change_every_tick():
@@ -137,10 +138,12 @@ def test_once_prints_the_calm_frame(tmp_path, monkeypatch, capsys):
 def test_animation_off_hides_the_big_squirrel_but_keeps_the_header_line():
     snapshot, config = snapshot_for()
     off = replace(config, animation=False)
-    assert "▀" in frame(snapshot, config, 0)
+    # Shell's top line (lane_header) replaces the big-squirrel header; scene brings the sprite.
+    on = frame(snapshot, config, 0)
     plain = frame(snapshot, off, 0)
     assert "▀" not in plain and "▄" not in plain
     assert plain.splitlines()[0].strip(), "the header keeps its one-line form"
+    assert plain.splitlines()[0] == on.splitlines()[0]
 
 
 def test_animation_off_keeps_the_stage_request_as_one_line():
@@ -197,8 +200,9 @@ def test_moved_band_shifts_the_click_areas_of_the_rows_it_passes(monkeypatch):
     lines = watch._frame(snapshot, config, ".", tick=0, width=20, selected=None, now=BASE_TIME,
                          layout=layout, height=10)
     rows = ["".join(value for value, _ in line).rstrip() for line in lines]
-    assert rows[6:9] == ["*", "+", "*"], "the band ends just above the footer row"
-    assert rows[:6] + rows[9:] == [*(f"row{index}" for index in range(14)), "footer"]
+    # Shell: a STAYS band is no longer moved; F keeps its order and the viewport scrolls.
+    assert rows[14:17] == ["*", "+", "*"], "the band stays where it is drawn"
+    assert rows[:14] + rows[17:] == [*(f"row{index}" for index in range(14)), "footer"]
     assert sorted((y0, item) for x0, y0, x1, y1, item in layout["hits"]) == sorted(
         (rows.index(f"row{index}"), f"row{index}") for index in range(14))
 

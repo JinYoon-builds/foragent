@@ -129,8 +129,8 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
-review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 7개(security·concurrency·failure·compatibility·realism·docs·performance)와 이름이 같으면 그 focus를 바꿈
-review_reviewers: 1      # 1 이상 정수; 1이면 리뷰어 하나가 모든 관점을 체크리스트로 받음
+review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 4개(goal-fidelity·concurrency·interruption-rollback·test-quality)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
+review_reviewers: 1      # 1 이상 정수; 동시에 도는 관점 리뷰어 수의 상한. 1이면 하나씩 차례로 돌고, 관점은 줄지 않음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
 approvers: [YOUR_GITHUB_LOGIN]   # v1 승인 라벨을 붙일 수 있는 사람 (D14); 자기 GitHub 로그인으로 바꿈. init은 `gh api user`의 로그인을 씀
@@ -141,9 +141,12 @@ stall_minutes: 30
 max_runtime_minutes: 90
 max_retries: 2
 conflict_retries: 2       # 별도 충돌 해결 예산; 소진하면 최신 대상 브랜치에서 한 번 재구축
+merge_group_max: auto    # auto(기본값) | 양의 정수; 1이면 그룹 검증을 끔
 ```
 
 init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 기존 파일에서는 명시한 옵션의 키가 없을 때만 추가하고, 이미 있는 값은 보존한다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).
+
+`merge_group_max`가 없거나 정확히 `auto`이면 이 저장소에 남아 있는 `group-check` 기록을 저널 순서대로 읽어 그룹 크기 한도를 계산한다. 4에서 시작하여 현재 한도 이상의 인원이 통과하면 1씩 올려 최대 8까지, 더 작은 그룹의 통과는 그대로 둔다. 실패하면 1씩 내려 최소 2까지이며, 한 명의 실패도 같은 규칙을 적용한다. 인프라 오류·시간 초과 등 `void` 결과는 그대로 둔다. 계산한 한도는 저장하지 않으며 로컬과 CI 그룹 모두 같은 한도를 쓴다. 양의 정수를 지정하면 기록과 무관하게 그 한도로 고정하고, 1이면 그룹을 끈다. `fa status --json`의 `merge_group`에서 `limit`과 `mode`(`auto` 또는 `fixed`)를 확인할 수 있다.
 
 Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. Stop 훅은 승인 스냅샷의 Done when 명령을 저장소 루트에서 실행하며, 실패하면 최대 8회 종료를 막는다. 이 한도는 runner의 재시도 사이에도 유지된다. 세션이 끝나면 runner가 독립적으로 다시 검증한다.
 

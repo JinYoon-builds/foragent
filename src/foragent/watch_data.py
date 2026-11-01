@@ -4,12 +4,16 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 """
 
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox
+from foragent import orch_inbox, watch_lane_facts, watch_role_facts
 from foragent.config import Config
 from foragent.labels import issue_lane
 from foragent.status import issue_state
@@ -66,6 +70,27 @@ class Snapshot:
     # The usage line's facts, read once per refresh (``meter``): usage.json, the machine's
     # running runs and budget, the effective Claude mode and memory pressure. Empty when not collected.
     meter: dict[str, Any] = field(default_factory=dict)
+    # Per-lane, per-role, per-waiting-issue and per-parked-issue facts for the lane blocks
+    # and their explanations. Empty until a collector fills them; manual snapshots stay safe.
+    lane_facts: dict[str, dict] = field(default_factory=dict)
+    role_facts: dict[str, dict] = field(default_factory=dict)
+    waiting_facts: dict[int, dict] = field(default_factory=dict)
+    park_facts: dict[int, dict] = field(default_factory=dict)
+
+
+# The checkout a refresh reads root-dependent facts under. watch.run binds it around its
+# five-argument collect call, so the facade's patch point keeps its shape.
+COLLECTION_ROOT: ContextVar[Path | None] = ContextVar("COLLECTION_ROOT", default=None)
+
+
+@contextmanager
+def collection_root(root: Path) -> Iterator[Path]:
+    """Bind the checkout root for collect calls in this context, restoring it afterwards."""
+    token = COLLECTION_ROOT.set(root)
+    try:
+        yield root
+    finally:
+        COLLECTION_ROOT.reset(token)
 
 
 def meter(store: StateStore, config: Config, now: datetime) -> dict[str, Any]:
@@ -102,8 +127,8 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
                     continue
                 if isinstance(event, dict) and isinstance(event.get("summary"), str):
                     events.append(event)
-    except FileNotFoundError:
-        pass
+    except OSError:
+        pass  # Missing or unreadable: no recent events.
     return list(reversed(events))
 
 
@@ -126,8 +151,8 @@ def journal_facts(store: StateStore) -> tuple[dict[int, list[dict[str, Any]]], d
                     phases.setdefault(event["issue"], []).append(event)
                 if isinstance(event.get("say"), str) and event["say"].strip():
                     say = event
-    except FileNotFoundError:
-        pass
+    except OSError:
+        pass  # Missing or unreadable: no phase events and no say line.
     return phases, say
 
 
@@ -153,12 +178,17 @@ def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict
 
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
+    *, repo_root: Path | None = None,
 ) -> Snapshot:
     """Supplement the shared status JSON with order edges and completions from local records.
 
-    The tracker is accepted for compatibility; refreshes never read it.
+    The tracker is accepted for compatibility; refreshes never read it. ``repo_root`` is
+    the checkout for root-dependent facts: an explicit value wins, else the bound
+    COLLECTION_ROOT; unbound it stays None (never the cwd or the state folder's parent).
     """
     from foragent import watch
+
+    repo_root = repo_root if repo_root is not None else COLLECTION_ROOT.get()
 
     rows = {row["number"]: row for row in store.local_issues()}
     issues = {number: Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
@@ -190,9 +220,12 @@ def collect(
     completed, total, orders = progress.totals(list(rows.values()))
     open_orders = {number for number, issue in issues.items() if issue.state == "open"}
     child_numbers = {number for number, row in rows.items() if row.get("parent") in open_orders}
-    history = store.read_history()  # status.history deliberately contains only ten entries
+    try:
+        history = store.read_history()  # status.history deliberately contains only ten entries
+    except (OSError, ValueError):
+        history = None  # Unreadable history: no completions or week counts, not zero ones.
     merged = {}
-    for run in history:
+    for run in history or []:
         if run.outcome == "merged":
             merged.pop(run.number, None)
             merged[run.number] = run
@@ -208,18 +241,22 @@ def collect(
             at = progress._time(rows[issue.number].get("merged_at"))
             if at is not None:  # Unseen merges are listed after the known times.
                 merged_at[issue.number] = at if at.tzinfo else at.replace(tzinfo=UTC)
-    merges = [(number, end) for number, *_, end in progress.merged_work(store) if end <= now]
+    try:
+        work = progress.merged_work(store)
+    except (OSError, ValueError):
+        work = None  # merged_work reads the same history; unreadable means unknown.
+    merges = [(number, end) for number, *_, end in work or [] if end <= now]
     finished = [end for _, end in merges]
     recent = sum(now - progress.RATE_WINDOW <= end for end in finished)
     midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     today = sum(midnight <= end for end in finished)
-    run_lanes = {run.number: run.lane for run in history}  # The latest run names the lane.
-    today_done: dict[str, int] = {}
+    run_lanes = {run.number: run.lane for run in history or []}  # The latest run names the lane.
+    today_done: dict[str, int] | None = {} if work is not None else None
     for number, end in merges:
         if midnight <= end:
             lane = run_lanes.get(number) or issue_lane(rows.get(number, {}).get("labels", ()), config.lanes)
             today_done[lane] = today_done.get(lane, 0) + 1
-    latest_runs = {run.number: run for run in history}  # History is oldest first; the last run wins.
+    latest_runs = {run.number: run for run in history or []}  # History is oldest first; the last run wins.
     run_starts = {number: run.started_at for number, run in latest_runs.items() if run.started_at}
     run_phases = {number: run.phase for number, run in latest_runs.items()}
     titles = {number: issue.title for number, issue in issues.items()}
@@ -249,9 +286,18 @@ def collect(
     shown = {run["number"] for run in status["active_runs"]} | {
         row["issue"] for row in lanes.values() if row.get("issue") is not None} | set(published)
     titles = {number: title for number, title in titles.items() if number in shown}
+    found_meter = meter(store, config, now)
+    events = watch_lane_facts.journal(store)  # One read shared by the park and review facts.
+    merged_at = watch_lane_facts.merged_today(merged_at, work, now)
     return watch.Snapshot(status, done, order, completed, total, eta, watch.recent_events(store), now,
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
                           worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
                           phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
                           today_done=today_done, prep=prep,
-                          meter=meter(store, config, now))
+                          meter=found_meter,
+                          lane_facts=watch_lane_facts.lane_facts(status, store, config, now, repo_root,
+                                                                 work, events, rows, history),
+                          role_facts=watch_role_facts.collect(store),
+                          waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
+                                                                       rows, found_meter, history),
+                          park_facts=watch_lane_facts.park_facts(events))

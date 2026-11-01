@@ -328,6 +328,38 @@ def test_premerge_ci_accepts_and_caches_an_entirely_excluded_acceptance_suite(me
     assert log.count("cache=hit") == 1
 
 
+@pytest.mark.parametrize("mode", ["ci", "local"])
+@pytest.mark.parametrize("owned", [True, False])
+def test_premerge_head_only_pending_lock_exclusion_keeps_unowned_failures(merge_case, mode, owned):
+    c = merge_case
+    base = c.history.tip
+    locked = "tests/acceptance/test_new_lock.py"
+    c.history.update({locked: '"""Locked by Foragent; do not edit."""\n'
+                      'def test_pending():\n    assert False, "not implemented yet"\n'})
+    head = c.history.tip
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
+    c.history.tip = base
+    c.tracker.set_pr_head_sha(c.pr, head)
+    c.ctx.config = replace(c.ctx.config, runner_unit_tests=mode,
+                           test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    if owned:
+        c.tracker.add_issue(99, "Pending feature", labels=["approved"])
+        c.ctx.store.save_approval(
+            99, body="pending", body_sha="body", acceptance_blobs={locked: "blob"},
+            approved_by="human", approved_at=BASE_TIME.isoformat(),
+        )
+    assert c.ctx.git.blob_sha(base, locked) is None
+    report = orch.premerge(c.ctx, c.pr)
+    assert report["broken"] == ([] if owned else [f"{locked}::test_pending"])
+    assert report["failing_on_base"] == []
+    assert report["tests"] == ("pass" if owned else "fail")
+    assert report["ready"] is owned
+    if owned:
+        log = (c.ctx.store.root / "runs" / f"premerge-pr-{c.pr}.log").read_text()
+        assert "Acceptance baseline skipped 1 files owned by open issues: #99" in log
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_premerge_suite_releases_slot_and_propagates_it_to_nested_tests(merge_case, monkeypatch, failure):
     from contextlib import contextmanager
@@ -457,3 +489,24 @@ def test_orch_merge_rechecks_the_base_after_waiting_for_the_merge_lock(merge_cas
     assert c.tracker.merged_prs == []
     assert c.tracker.list_comments(c.pr) == [], "Approval is recorded only for a fresh base"
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
+
+
+def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
+    """#1231: after `fa orch dream --redo`, a dream PR from an older prompt is never merged."""
+    from datetime import timedelta
+
+    from foragent import orch_dream
+
+    c = merge_case
+    git_command(c.history.origin, "update-ref", "refs/heads/foragent/dream-alpha", c.head)
+    pr = c.tracker.create_pr(head="foragent/dream-alpha", base="main", title="Dream", body="Old")
+    c.tracker.set_pr_head_sha(pr, c.head)
+    c.tracker.set_pr_checks(pr, "pass")
+    c.ctx.config = replace(c.ctx.config, lanes={"alpha": {"paths": ["a/**"]}})
+    earlier = BASE_TIME - timedelta(hours=1)
+    orch_dream.record_published(c.ctx.store, "alpha", 1, earlier, covered_until=earlier, pr=pr,
+                                inputs={}, outputs={})
+    assert orch_dream.redo(c.ctx, "alpha") == 0
+    with pytest.raises(orch.OrchError, match=f"dream PR #{pr} predates a redo of lane alpha"):
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert c.tracker.merged_prs == []

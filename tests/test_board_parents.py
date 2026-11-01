@@ -18,7 +18,7 @@ def child(number, labels=(), state="open", reason=None):
     ([child(1, state="closed", reason="completed"), child(2, state="closed")], set(), "Done"),
     ([child(1, ["approved"])], {1}, "Running"),
     ([child(1, ["approved"]), child(2, state="closed", reason="not_planned")], set(), "Approved"),
-    ([child(1, state="closed", reason="not_planned")], set(), "unapproved"),
+    ([child(1, state="closed", reason="not_planned")], set(), "Done"),  # A cancelled child has ended.
     ([child(1, ["approved"]), child(2)], set(), "unapproved"),
 ])
 def test_parent_state(children, open_prs, expected):
@@ -43,8 +43,17 @@ def test_gh_issue_keeps_state_reason():
 
 
 def test_messages_have_both_languages():
+    from foragent.board_parents import closing_comment
+
     assert "3" in text("order_record_closed", "en", count=3)
     assert "3" in text("order_record_closed", "ko", count=3)
+    assert closing_comment("en", [], []) == text("order_record_closed", "en", count=0)
+    for language, done, gone in (("en", "Completed:", "Cancelled"), ("ko", "완료:", "취소")):
+        comment = closing_comment(language, [11, 12], [13])
+        assert len(comment.splitlines()) == 1 and "3" in comment
+        assert comment.index(done) < comment.index("#11") < comment.index("#12") < comment.index(gone)
+        assert comment.index(gone) < comment.index("#13")
+        assert gone not in closing_comment(language, [11], []) and done not in closing_comment(language, [], [13])
     assert "#9" in text("parent_child_not_planned", "ko", number=1, children="#9")
     closing = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
     lines = {language: text("batch_pr_parent", language, parent=99) for language in ("en", "ko")}
@@ -64,11 +73,12 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
-        local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3]}],
+        local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
         load_flag=lambda n: flags.get(n),
         save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
-    children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned")]}
+    children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned"),
+                    child(4)]}
     tracker = SimpleNamespace(sub_issues=lambda n: children[n],
                               close_issue=lambda n, comment: closed.append((n, comment)))
     ctx = SimpleNamespace(store=store, tracker=tracker, config=SimpleNamespace(language=language),
@@ -81,12 +91,12 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
     assert flags[1].reason == board_parents.NOT_PLANNED_FLAG and len(events) == 1
     assert closed == [] and synced == [(1, "Running", True)]
 
-    children[1][1] = child(3, state="closed", reason="completed")
+    children[1][2] = child(4, state="closed", reason="completed")  # The last open child ends.
     report.actions.clear()
     board_parents.follow_children(ctx, report)
-    assert closed == [(1, text("order_record_closed", language, count=2))]
-    assert synced[-1] == (1, "Done", True)
-    assert report.actions == [text("parent_closed_report", language, number=1, count=2)]
+    assert closed == [(1, board_parents.closing_comment(language, [2, 4], [3]))]
+    assert synced[-1] == (1, "Done", True) and len(events) == 1, "Closing raises no new decision"
+    assert report.actions == [text("parent_closed_report", language, number=1, completed=2, cancelled=1)]
 
 
 def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
@@ -141,7 +151,7 @@ def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_ro
     monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
-    assert closed == [(9, text("order_record_closed", "en", count=1))]
+    assert closed == [(9, board_parents.closing_comment("en", [2], []))]
     assert synced == [(9, "Done")]
 
 
@@ -207,7 +217,7 @@ def test_record_counts_distinct_references_and_reads_no_close_reasons(monkeypatc
             _row(3, "closed"), _row(4, "closed")]
     ctx, out = _record_ctx(monkeypatch, rows, {}, children={1: [child(2, state="closed", reason="completed")]})
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.closed == [(1, text("order_record_closed", "en", count=3))], "Count distinct issues once"
+    assert out.closed == [(1, board_parents.closing_comment("en", [2, 3, 4], []))], "Count distinct issues once"
     assert out.reads == [], "Closed references in the listing count as done without reading a reason"
     assert out.synced == [(1, "Done", True)], "A record it closes moves to Done"
 
@@ -230,8 +240,8 @@ def test_record_reads_missing_references_and_ignores_pull_requests(monkeypatch):
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert out.reads == [3, 4], "References missing from the listing are read once each"
-    assert out.closed == [(1, text("order_record_closed", "en", count=2))], (
-        "A pull request is ignored and a closed reference is done whatever its reason"
+    assert out.closed == [(1, board_parents.closing_comment("en", [2], [4]))], (
+        "A pull request is ignored and a closed reference is done whatever its reason, named by it"
     )
     assert out.events == [], "Only native sub-issues raise the not_planned flag"
 
@@ -275,8 +285,8 @@ def test_every_unlisted_reference_is_read_fresh_in_one_tick_without_a_cap(monkey
     ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited}, root=tmp_path)
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.reads == [*edited, 100], "Each record reads its unlisted references fresh"
-    assert out.closed == [(1, text("order_record_closed", "en", count=25)),
-                          (2, text("order_record_closed", "en", count=1))]
+    assert out.closed == [(1, board_parents.closing_comment("en", edited, [])),
+                          (2, board_parents.closing_comment("en", [100], []))]
     assert list(tmp_path.iterdir()) == [], "Nothing about references is stored between ticks"
 
 
@@ -301,7 +311,7 @@ def test_reference_read_closed_earlier_is_read_again_on_every_tick(monkeypatch):
     remote[5] = child(5, state="closed")
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.reads[7:] == [4, 5, 6]
-    assert out.closed == [(1, text("order_record_closed", "en", count=2))], "The pull request is ignored"
+    assert out.closed == [(1, board_parents.closing_comment("en", [5, 6], []))], "The pull request is ignored"
 
 
 def test_unparseable_marker_is_skipped_quietly_even_with_completed_children(monkeypatch):
@@ -371,4 +381,20 @@ def test_known_pull_request_reference_spends_no_read(monkeypatch):
     ctx, out = _record_ctx(monkeypatch, rows, {})
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
     assert out.reads == [], "A pull request the listing already shows is ignored without a read"
-    assert out.closed == [(1, text("order_record_closed", "en", count=1))]
+    assert out.closed == [(1, board_parents.closing_comment("en", [2], []))]
+
+
+def test_order_whose_last_child_was_cancelled_closes_without_a_decision_flag(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, {"a": 2, "b": 3}, children=[2, 3]), _row(2, "closed"), _row(3, "closed")]
+    children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned")]}
+    ctx, out = _record_ctx(monkeypatch, rows, {}, children=children)
+    report = SimpleNamespace(actions=[])
+    board_parents.follow_children(ctx, report)
+    assert out.closed == [(1, board_parents.closing_comment("en", [2], [3]))]
+    assert out.events == [] and ctx.store.load_flag(1) is None, "A closed order needs no decision"
+    assert report.actions == [text("parent_closed_report", "en", number=1, completed=1, cancelled=1)]
+    assert out.synced == [(1, "Done", True)]

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 
 from foragent.config import Config
+from foragent.watch_cells import Style
 from foragent.watch_data import Snapshot
 
 
@@ -20,15 +21,122 @@ ISSUE_NUMBER = re.compile(r"(?<![\w#])#(\d+)(?!\w)")
 def color_pairs(colors: int) -> list[tuple[int, int]]:
     """Use the terminal's default text/background with base ANSI accents.
 
-    The public API accepts the terminal's color count, but 8- and 256-color
-    terminals deliberately share this palette; extended colors aren't needed.
+    Pair 2 (divider, working and the legacy yellow) is real yellow: COLOR_YELLOW on
+    8 colours, 220 on 256 (r53/r55). The other pairs are the same on both.
     """
     import curses
 
-    return [(-1, -1), (curses.COLOR_CYAN, -1),
+    return [(-1, -1), (curses.COLOR_YELLOW if colors < 256 else 220, -1),
             (curses.COLOR_GREEN, -1), (-1, -1),
             (curses.COLOR_MAGENTA, -1), (curses.COLOR_GREEN, -1),
             (curses.COLOR_BLUE, -1)]
+
+
+# xterm-256 index -> base ANSI colour 0..7 for structured art on an 8-colour terminal.
+# Fixed once by squared RGB distance (ties to the lower index); never probed per frame.
+ANSI8 = (
+    0, 1, 2, 3, 4, 5, 6, 7, 7, 1, 2, 3, 4, 5, 6, 7,  # 0..15
+    0, 4, 4, 4, 4, 4, 2, 6, 6, 6, 6, 6, 2, 6, 6, 6,  # 16..31
+    6, 6, 2, 6, 6, 6, 6, 6, 2, 6, 6, 6, 6, 6, 2, 6,  # 32..47
+    6, 6, 6, 6, 1, 5, 5, 5, 5, 5, 3, 3, 5, 5, 5, 7,  # 48..63
+    3, 3, 6, 6, 7, 7, 3, 3, 6, 7, 7, 7, 3, 3, 7, 7,  # 64..79
+    7, 7, 3, 7, 7, 7, 7, 7, 1, 5, 5, 5, 5, 5, 3, 3,  # 80..95
+    5, 5, 7, 7, 3, 3, 7, 7, 7, 7, 3, 3, 7, 7, 7, 7,  # 96..111
+    3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 1, 5, 5, 5,  # 112..127
+    5, 5, 3, 3, 5, 7, 7, 7, 3, 3, 7, 7, 7, 7, 3, 7,  # 128..143
+    7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7,  # 144..159
+    1, 5, 5, 5, 5, 5, 3, 3, 7, 7, 7, 7, 3, 7, 7, 7,  # 160..175
+    7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7,  # 176..191
+    7, 7, 7, 7, 1, 5, 5, 5, 5, 5, 3, 7, 7, 7, 7, 7,  # 192..207
+    3, 7, 7, 7, 7, 7, 3, 7, 7, 7, 7, 7, 3, 7, 7, 7,  # 208..223
+    7, 7, 3, 7, 7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 3, 3,  # 224..239
+    3, 3, 3, 3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,  # 240..255
+)
+
+
+def style_attribute(style: Style, *, styles: dict[str, int], pair: Callable[[int | None, int | None], int]) -> int:
+    """The curses attribute of one span's style: named styles by name, ("art", fg, bg) by pair."""
+    if isinstance(style, tuple):
+        return pair(style[1], style[2])
+    return styles.get(style, 0)
+
+
+class _Palette:
+    """Colour pairs beyond the seven base pairs, initialized only when first painted.
+
+    question/next/separator take pairs 8/9/10; structured colours (and working's
+    yellow) take cached pairs from 11 up to curses.COLOR_PAIRS. ``inks`` keeps each
+    painted style's normalized (fg, bg) for the links written after a refresh.
+    """
+
+    def __init__(self, curses, styles: dict[str, int]) -> None:
+        self.curses, self.styles = curses, styles
+        self.enabled = curses.has_colors()
+        self.extended = self.enabled and curses.COLORS >= 256
+        self.allocated: dict[tuple[int, int], int] = {}
+        self.next = 11
+        self.inks: dict[Style, tuple[int, int]] = {}
+        dim = curses.A_DIM
+        # Named styles: (pair, 256-colour fg, 8-colour fg, attributes on 8 colours or none).
+        self.named = {"question": (8, 203, curses.COLOR_RED, 0), "next": (9, 240, curses.COLOR_WHITE, dim),
+                      "separator": (10, 242, curses.COLOR_WHITE, dim)}
+        if not self.enabled:
+            styles.update({name: extra for name, (*_, extra) in self.named.items()})
+
+    def free(self, index: int) -> bool:
+        """Whether pair ``index`` exists; COLOR_PAIRS exists once start_color has run."""
+        return index < getattr(self.curses, "COLOR_PAIRS", 0)
+
+    def colour(self, value: int | None) -> int:
+        if value is None:
+            return -1
+        return value if self.extended else ANSI8[value]
+
+    def pair(self, foreground: int | None, background: int | None) -> int:
+        """A cached pair for two xterm-256 colours; 0 without colours or free pairs."""
+        if not self.enabled:
+            return 0
+        key = self.colour(foreground), self.colour(background)
+        if key not in self.allocated:
+            if not self.free(self.next):
+                return 0
+            self.curses.init_pair(self.next, *key)
+            self.allocated[key] = self.next
+            self.next += 1
+        return self.curses.color_pair(self.allocated[key])
+
+    def attribute(self, style: Style) -> int:
+        curses = self.curses
+        if self.enabled and isinstance(style, str) and style not in self.styles:
+            if style == "working":
+                self.styles[style] = self.pair(220, None)
+                if self.styles[style]:
+                    self.inks[style] = self.colour(220), -1
+            elif style in self.named:
+                index, extended, base, extra = self.named[style]
+                ink = extended if self.extended else base
+                if self.free(index):
+                    curses.init_pair(index, ink, -1)
+                    self.styles[style] = curses.color_pair(index) | (0 if self.extended else extra)
+                    self.inks[style] = ink, -1
+                else:
+                    self.styles[style] = extra  # No such pair: the text keeps its dim look.
+        attribute = style_attribute(style, styles=self.styles, pair=self.pair)
+        if isinstance(style, tuple):
+            if self.enabled and attribute:
+                self.inks[style] = self.colour(style[1]), self.colour(style[2])
+            if style[2] is not None:
+                attribute |= curses.A_BOLD  # An acorn body: bold text on its colour.
+        return attribute
+
+    def link(self, style: Style, attribute: int) -> str:
+        """SGR codes restoring a painted span's look, for a link written over it."""
+        curses = self.curses
+        codes = [code for flag, code in ((curses.A_BOLD, "1"), (curses.A_DIM, "2"), (curses.A_REVERSE, "7"))
+                 if attribute & flag]
+        foreground, background = self.inks.get(style, (-1, -1))
+        codes += [f"38;5;{foreground}"] * (foreground >= 0) + [f"48;5;{background}"] * (background >= 0)
+        return "\x1b[0m" + (f"\x1b[{';'.join(codes)}m" if codes else "")
 
 
 def _restart(cleanup: ExitStack) -> bool:
@@ -47,6 +155,33 @@ def window_key(key: int, names: dict[int, str], prompting: bool, not_keys: tuple
     if name is None and prompting and key not in not_keys:
         return "other"
     return name
+
+
+def _place(visible: list, row_map: dict[int, int], footer: int, height: int, alert: list,
+           layout: dict | None) -> tuple[list, dict[int, int]]:
+    """Put a pinned frame on the screen: its footer rows on the bottom rows, and a refresh
+    error in the position row's place above them (or on the last body row when it fits)."""
+    if height < 4 or not footer:
+        return visible[:height], row_map
+    rows = list(visible)
+    gap = height - len(rows)
+    if gap > 0:
+        # A short frame: the footer moves down to the bottom; its hits and rows move with it.
+        cut = len(rows) - footer
+        rows = rows[:cut] + [[]] * gap + rows[cut:]
+        row_map = {y + gap if y >= cut else y: row for y, row in row_map.items()}
+        if layout is not None:
+            layout["row_map"] = row_map
+            layout["hits"] = [(x0, y0 + gap if y0 >= cut else y0, x1, y1 + gap if y0 >= cut else y1, target)
+                              for x0, y0, x1, y1, target in layout.get("hits", [])]
+    if alert:
+        slot = height - footer - 1
+        rows[slot] = alert[0]
+        row_map = {y: row for y, row in row_map.items() if y != slot}
+        if layout is not None:
+            layout["row_map"] = row_map
+            layout["hits"] = [hit for hit in layout.get("hits", []) if not hit[1] <= slot < hit[3]]
+    return rows, row_map
 
 
 def _reload(config: Config, repo_root: Path) -> Config:
@@ -72,11 +207,17 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
         for index, (foreground, background) in enumerate(watch.color_pairs(curses.COLORS), 1):
             curses.init_pair(index, foreground, background)
         styles.update(road=curses.color_pair(1), edge=curses.color_pair(1) | curses.A_BOLD,
-                      divider=curses.color_pair(2), yellow=curses.color_pair(2),
+                      divider=curses.color_pair(2), yellow=curses.color_pair(2), working=curses.color_pair(2),
                       green=curses.color_pair(3), queue=curses.color_pair(4),
                       hit=curses.color_pair(4) | curses.A_BOLD, claude=curses.color_pair(5),
                       codex=curses.color_pair(6), blue=curses.color_pair(7))
         screen.bkgd(" ", styles["road"])
+    palette = _Palette(curses, styles)
+    if palette.enabled:
+        base = watch.color_pairs(curses.COLORS)
+        pairs = {"road": 1, "edge": 1, "divider": 2, "yellow": 2, "working": 2, "green": 3, "queue": 4, "hit": 4,
+                 "claude": 5, "codex": 6, "blue": 7}
+        palette.inks.update({name: base[index - 1] for name, index in pairs.items()})
     try:
         curses.curs_set(0)
     except curses.error:
@@ -94,13 +235,17 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             curses.mouseinterval(0)  # Presses arrive at once; a wheel step is never a click.
         except curses.error:
             pass  # A terminal without mouse support keeps the keyboard view.
-    screen.timeout(300)
+    screen.timeout(500)  # About two frames a second; data keeps its own five-second schedule.
     selected = None
     show_detail = False
     digits = ""
     error = ""
     animation_started = watch.time.monotonic()
+    # Data refreshes are due at fixed five-second deadlines from the start; missed ones are
+    # skipped, never caught up, and at most one refresh runs at a time.
     next_refresh = animation_started + 5
+    refresh_now = False  # A settings save asks for one refresh at once, keeping the deadlines.
+    painted = False  # The screen is erased once; later frames paint over it in place.
     pending = None
     started_build = watch._installed_build()
     # Memory across frames: fireworks start times, folds, scroll and the open issue box.
@@ -123,18 +268,21 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 except Exception as exc:
                     error = watch.text("watch_refresh_failed", config.language, error=watch._clean(exc))
                 pending = None
-                next_refresh = watch.time.monotonic() + 5
                 if watch.should_reload(started_build, watch._installed_build()):
                     return _restart(cleanup)
-            if watch.time.monotonic() >= next_refresh:
+            moment = watch.time.monotonic()
+            due = moment >= next_refresh
+            while next_refresh <= moment:
+                next_refresh += 5
+            if due or refresh_now:
                 if pending is None:
                     pending = worker.submit(refresh)
-                else:
+                    refresh_now = False
+                elif due:
                     # A slow snapshot must not hide a reinstall: check once per due refresh.
-                    next_refresh = watch.time.monotonic() + 5
                     if watch.should_reload(started_build, watch._installed_build()):
                         return _restart(cleanup)
-            tick = int((watch.time.monotonic() - animation_started) / 0.3)
+            tick = int((watch.time.monotonic() - animation_started) / 0.5)
             height, width = screen.getmaxyx()
             view_state["height"] = height  # The settings window fits itself to this screen.
             layout: dict = {}
@@ -156,7 +304,15 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                                     layout if store is not None else None)
             top = view_state.get("scroll", 0)
             alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
-            if height >= watch.MIN_SCREEN and len(frame) <= height and visible:
+            row_map = view_state.get("row_map")
+            footer = len((view_state.get("pinned_rows") or {}).get("footer", ())) if row_map is not None else 0
+            if row_map is not None:
+                visible, row_map = _place(visible, row_map, footer, height, alert,
+                                          layout if store is not None else None)
+                # Keys and the highlight read the state's map: it must name only the
+                # rows this screen shows (not a row the error covers).
+                view_state["row_map"] = row_map
+            elif height >= watch.MIN_SCREEN and len(frame) <= height and visible:
                 # F fits: painted as today, its last row (the key help) on the bottom row,
                 # where a refresh error takes its place.
                 body = visible[:-1]
@@ -167,14 +323,22 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
             # One highlighted row, by its position: the first issue row on screen.
             mark = watch.highlighted_row(view_state) if view_state.get("issue") is None else None
-            marked = set() if mark is None else {mark - top}
-            screen.erase()
+            if mark is None:
+                marked = set()
+            elif row_map is not None:
+                marked = {y for y, row in row_map.items() if row == mark}
+            else:
+                marked = {mark - top}
+            if not painted:
+                screen.erase()
+                painted = True
             links: list[str] = []
-            for y, line in enumerate(visible[:max(1, height)]):
+            shown = visible[:max(1, height)]
+            for y, line in enumerate(shown):
                 x = 0
                 # _frame already cut every line to the width; it is painted as it is.
                 for value, style in line:
-                    attribute = styles.get(style, 0) | (curses.A_REVERSE if y in marked else 0)
+                    attribute = palette.attribute(style) | (curses.A_REVERSE if y in marked else 0)
                     try:
                         screen.addstr(y, x, value, attribute)
                     except curses.error:
@@ -184,10 +348,22 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     for found in ISSUE_NUMBER.finditer(value):
                         url = watch.issue_url(config, int(found[1]))
                         if url is not None:
-                            look = ("\x1b[2m" if style == "dim" else "") + ("\x1b[7m" if y in marked else "")
-                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H{look}"
-                                         + watch.osc8(url, found[0]) + ("\x1b[0m" if look else ""))
+                            # The link keeps the span's colours, bold, dim and reverse, then resets.
+                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H"
+                                         + palette.link(style, attribute) + watch.osc8(url, found[0]) + "\x1b[0m")
                     x += watch._cells(value)
+                if x < width:
+                    try:
+                        screen.move(y, x)
+                        screen.clrtoeol()  # The rest of a shorter row from the last frame.
+                    except curses.error:
+                        pass
+            if len(shown) < height:
+                try:
+                    screen.move(len(shown), 0)
+                    screen.clrtobot()  # Rows below the frame that the last frame used.
+                except curses.error:
+                    pass
             screen.refresh()
             # Curses cannot write OSC 8, so every visible #n is written again as a link after
             # each refresh. No "unchanged" shortcut: curses also repaints unchanged text (after
@@ -211,7 +387,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     config = _reload(config, repo_root)
                     if hasattr(refresh, "config"):
                         refresh.config = config  # Later snapshots read the saved settings too.
-                    next_refresh = watch.time.monotonic()  # And the next one starts now.
+                    refresh_now = True  # One refresh at once; the five-second deadlines stay.
                 continue
             if key == curses.KEY_MOUSE and store is not None:
                 try:
@@ -235,10 +411,12 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     watch.handle_key("enter", store, config, state=view_state)
                 continue
             elif key in keys:
-                if keys[key] in ("q", "Q") or (keys[key] == "esc" and view_state.get("issue") is None):
+                if keys[key] in ("q", "Q") or (keys[key] == "esc" and store is None):
                     return
                 if store is not None or keys[key] == "s":
-                    watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root)
+                    # Esc goes through handle_key: it closes a selection or box before it quits.
+                    if watch.handle_key(keys[key], store, config, state=view_state, repo_root=repo_root):
+                        return
                 elif keys[key] in ("down", "up", "j", "k", "pagedown", "pageup"):
                     step = 1 if keys[key] in ("down", "up", "j", "k") else max(1, height - 2)
                     watch.scroll(view_state, -step if keys[key] in ("up", "k", "pageup") else step)

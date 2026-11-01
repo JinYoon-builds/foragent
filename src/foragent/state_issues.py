@@ -4,14 +4,8 @@ import threading as _threading
 from datetime import datetime, timedelta
 from typing import Any
 
-from foragent.labels import READY, issue_lane
-from foragent.state_observe import (
-    OBSERVED,
-    apply_observation,
-    newer_than,
-    record_removal,
-    record_result,
-)
+import foragent.state_observations as _observations
+
 
 REFRESH_INTERVAL = timedelta(minutes=5)
 
@@ -106,40 +100,27 @@ class IssueSnapshotMixin:
         return _copy(_EMPTY) if read is None else read[1]
 
     def local_issues(self) -> list[dict[str, Any]]:
-        """Read the last observed issue facts without contacting the tracker."""
-        rows = self._issue_record()["issues"].values()
-        return [_copy(row) for row in sorted(rows, key=lambda row: row["number"])]
+        """The visible issues: each latest observation plus its unretired intents, without the tracker."""
+        record = self._issue_record()
+        return [self._visible(record, row) for row in sorted(record["issues"].values(), key=lambda row: row["number"])]
 
     def github_outbox(self) -> list[dict[str, Any]]:
-        """Read pending GitHub writes in their persisted delivery order."""
-        return _copy(self._issue_record().get("outbox", []))
+        """Pending GitHub writes, derived from the intent log, in queue order."""
+        return self._pending(self._issue_record())
+
+    def github_write_issues(self) -> set[int]:
+        """Issues with unretired writes, including sends awaiting their next observation."""
+        return {entry["issue"] for entry in self._issue_record().get("outbox", [])
+                if not _observations.abandoned(entry)}
 
     def local_board_value(self, number: int, project: str, field: str) -> Any:
         """The board value last recorded for an issue's card, copying only that value."""
         row = self._issue_record()["issues"].get(str(number)) or {}
         return _copy((row.get("board_values") or {}).get(project, {}).get(field))
 
-    def drop_missing_github_issue(self, number: int, *, observed_at: datetime | None = None) -> bool:
-        """Remove a confirmed missing issue and all its pending writes atomically.
-
-        ``observed_at`` is when the lookup that found it missing began. The absence is older
-        than an observation of the issue or a write queued after that, so then nothing is
-        removed and this returns False; a later lookup decides again."""
-        at = observed_at or self._now()
-        with self._state_lock():
-            snapshot = self._issue_snapshot()
-            if newer_than(snapshot["issues"].get(str(number)), at, snapshot) or any(
-                    entry["issue"] == number and (_state.datetime.fromisoformat(entry["queued_at"]) > at)
-                    for entry in snapshot.get("outbox", [])):
-                return False
-            snapshot["outbox"] = [entry for entry in snapshot.get("outbox", [])
-                                  if entry["issue"] != number]
-            snapshot.get("outbox_base", {}).pop(str(number), None)
-            snapshot["issues"].pop(str(number), None)
-            record_removal(snapshot, number, at)
-            snapshot["revision"] = snapshot.get("revision", 0) + 1
-            self._write_json(self.root / "issues.json", snapshot)
-            return True
+    def drop_missing_github_issue(self, number: int) -> None:
+        """Observe a confirmed missing issue now; its pending writes go with it."""
+        self.ingest_absence(number, self._now())
 
     def _local_issue(self, snapshot: dict[str, Any], number: int) -> dict[str, Any]:
         return snapshot["issues"].setdefault(str(number), {
@@ -148,69 +129,78 @@ class IssueSnapshotMixin:
         })
 
     def _apply_github_write(self, row: dict[str, Any], entry: dict[str, Any], lanes: dict) -> None:
-        """Apply the same write facts to local intent and its delivery baseline."""
+        """Apply an observed-field intent to the derived view; comments never enter it."""
         action = entry["action"]
         if action != "comment":
             _state._forget_reads(row)
         if action in {"add_labels", "remove_labels"}:
-            self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes)
+            self._record_labels(row, entry["labels"], remove=action == "remove_labels", lanes=lanes,
+                                ready_approval=entry.get("ready_approval", _observations._UNSET))
         elif action == "update_issue":
             row.update(title=entry["title"], body=entry["body"])
         elif action == "close_issue":
             row["state"] = "closed"
-        if action == "comment" or action == "close_issue" and entry.get("body") is not None:
-            row["comments"] = row.get("comments", []) + [{
-                "id": -entry["id"], "body": entry["body"], "author": "foragent",
-                "created_at": entry["queued_at"],
-            }]
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
+                           started_at: datetime | None = None, premise: dict[str, Any] | None = None,
+                           dropped: list[bool] | None = None, ready_approval: Any = _observations._UNSET,
                            **payload: Any) -> dict[str, Any]:
-        """Persist the FIFO entry and its local effect in one transaction."""
+        """Append one intent to the log.
+
+        ``queued_at`` is when the write began (``started_at``, default now).
+        Its premise is the visible issue then (``premise``, default the
+        visible issue now). A write queued late is judged at once, by the same
+        rule as any read, against the issue's latest observation (facts or
+        absence) if that read started after it; ``dropped`` receives whether
+        that dropped it unsent. An issue observed missing gets no placeholder row.
+        """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            row = self._local_issue(snapshot, number)
-            snapshot.setdefault("outbox_base", {}).setdefault(str(number), _state.deepcopy(row))
             identity = snapshot.get("outbox_sequence", 0) + 1
+            when = self._now() if started_at is None else started_at
+            row = snapshot["issues"].get(str(number))
+            if premise is None and row is not None:
+                premise = _observations.observed_facts(self._visible(snapshot, row))
             entry = {"id": identity, "issue": number, "action": action,
-                     "queued_at": self._timestamp(), **payload}
-            snapshot.setdefault("outbox", []).append(entry)
+                     "queued_at": when.astimezone(_state.UTC).isoformat(), **payload}
+            from foragent.labels import READY
+
+            record = {**entry, "premise": premise}
+            if action != "comment":
+                record.update(attempts=[], lanes=sorted(lanes or {}))
+            if action in ("add_labels", "remove_labels") and READY in payload.get("labels", ()):
+                # The approval this ready-label write belongs to, fixed when the write started.
+                record["ready_approval"] = self._ready_approval(number, action == "remove_labels", ready_approval)
+            snapshot.setdefault("outbox", []).append(record)
             snapshot["outbox_sequence"] = identity
-            self._apply_github_write(row, entry, lanes or {})
-            self._save_local_issue(snapshot, row)
+            facts, seen = _observations.latest(snapshot, number)
+            # Only a read that started after the write judges it now; one stored at the same
+            # instant was ingested before the write began.
+            lost = started_at is not None and seen is not None and seen > started_at and self._retire(
+                snapshot, number, facts, seen)
+            if dropped is not None:
+                dropped.append(bool(lost))
+            if action != "comment" and not _observations.tombstoned(snapshot, number, when) and any(
+                    intent["issue"] == number for intent in snapshot["outbox"]):
+                row = self._local_issue(snapshot, number)
+            self._save_rows(snapshot, () if action == "comment" else (number,))
             return entry
 
-    def deliver_github_write(self, entry: dict[str, Any], *, comment_id: int | None = None,
-                             remaining_labels: list[str] | None = None) -> None:
-        """Acknowledge delivery without losing concurrent appends or later local intent."""
+    def acknowledge_github_comment(self, entry: dict[str, Any], identity: int) -> None:
+        """A send acknowledgement removes a send-only entry and records the returned comment id."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            pending = snapshot.get("outbox", [])
-            item = next((item for item in pending if item["id"] == entry["id"]), None)
-            if item is None:
-                return
-            delivered = dict(item)
-            if remaining_labels is not None:
-                delivered["labels"] = item["labels"][:len(item["labels"]) - len(remaining_labels)]
-                item["labels"] = remaining_labels
-            baseline = snapshot.get("outbox_base", {}).get(str(entry["issue"]))
-            if baseline is not None:
-                self._apply_github_write(baseline, delivered, {})
-            if not remaining_labels:
-                snapshot["outbox"] = [item for item in pending if item["id"] != entry["id"]]
-            row = self._local_issue(snapshot, entry["issue"])
-            if comment_id is not None:
-                for facts in (row, baseline or {}):
-                    for comment in facts.get("comments", []):
-                        if comment["id"] == -entry["id"]:
-                            comment["id"] = comment_id
-            if not any(item["issue"] == entry["issue"] for item in snapshot.get("outbox", [])):
-                snapshot.get("outbox_base", {}).pop(str(entry["issue"]), None)
-            elif baseline is not None:
-                baseline["revision"] = snapshot.get("revision", 0) + 1
-            if delivered["action"] in {"add_labels", "remove_labels", "update_issue", "close_issue"}:
-                record_result(snapshot, row, delivered, self._timestamp())
-            self._save_local_issue(snapshot, row)
+            snapshot["outbox"] = [item for item in snapshot.get("outbox", []) if item["id"] != entry["id"]]
+            row = snapshot["issues"].get(str(entry["issue"]))
+            if row is not None:
+                self._append_comment(row, {"id": identity, "body": entry["body"], "author": "foragent",
+                                           "created_at": self._timestamp()})
+            self._save_rows(snapshot, (entry["issue"],))
+
+    @staticmethod
+    def _append_comment(row: dict[str, Any], comment: dict[str, Any]) -> None:
+        if all(item["id"] != comment["id"] for item in row.get("comments", [])):
+            row.setdefault("comments", []).append(comment)
 
     def issues_observation(self) -> dict[str, Any]:
         """When the snapshot was last read and whether a later read failed."""
@@ -238,69 +228,51 @@ class IssueSnapshotMixin:
         refreshed = self._issue_record()["refreshed_at"]
         return refreshed is None or now - _state.datetime.fromisoformat(refreshed) >= _state.REFRESH_INTERVAL
 
-    def update_local_issue(self, number: int, **fields: Any) -> None:
+    def update_local_issue(self, number: int, *, observed_at: datetime | None = None, **fields: Any) -> None:
+        """Record local fields. Issue facts among them are an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+                return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
+            facts = {key: fields.pop(key) for key in _observations.FACTS if key in fields}
+            if facts:
+                outcome = self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
+                                        observed_at or self._now(), None, by_person=False)
+                if outcome == "stale" and not fields:
+                    return  # An older observation persists nothing.
+                row = self._local_issue(snapshot, number)
             if any(row.get(key) != value for key, value in fields.items()):
                 _state._forget_reads(row)
-            # Issue facts recorded here are results GitHub accepted: an overlay, not an observation.
-            seen = {key: value for key, value in fields.items() if key in OBSERVED and key != "observed_at"}
-            if seen:
-                record_result(snapshot, row, {"action": "facts", "fields": seen}, self._timestamp())
-            row.update({key: value for key, value in fields.items() if key not in seen})
+            row.update(fields)
             self._save_local_issue(snapshot, row)
 
-    def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> list[int]:
-        """Apply a single read; ``observed_at`` is when the read began (default: now)."""
-        return self.record_issues([issue], lanes, observed_at=observed_at)
+    def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
+        """Record an issue as an observation at its time (default now)."""
+        if not issue.is_pull_request:
+            self.ingest([issue], observed_at or self._now(), lanes)
 
-    def record_issues(self, issues: list, lanes: dict, *, observed_at: datetime | None = None) -> list[int]:
-        """Apply reads that began at ``observed_at`` (default: now) in one transaction.
-
-        Returns the issues whose queued writes the reads contradicted and dropped."""
-        at = observed_at or self._now()
+    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict,
+                      observed_at: datetime | None = None, ready_approval: Any = _observations._UNSET) -> None:
+        """A local label change, recorded as an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            changed, dropped = False, []
-            for issue in issues:
-                if issue.is_pull_request:
-                    continue
-                known = str(issue.number) in snapshot["issues"]
-                row = self._local_issue(snapshot, issue.number)
-                facts = {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels),
-                         "state": issue.state, "state_reason": getattr(issue, "state_reason", None),
-                         "lane": issue_lane(issue.labels, lanes)}
-                # An older observation changes nothing, not even this row's revision or update time.
-                applied, contradicted = apply_observation(snapshot, row, facts, at, lanes=lanes)
-                if contradicted:
-                    dropped.append(issue.number)
-                if not applied and not known:
-                    snapshot["issues"].pop(str(issue.number), None)
-                if applied:
-                    snapshot["revision"] = snapshot.get("revision", 0) + 1
-                    row.update(revision=snapshot["revision"], updated_at=self._timestamp())
-                    changed = True
-            if changed:
-                self._write_json(self.root / "issues.json", snapshot)
-            return dropped
-
-    def record_labels(self, number: int, labels: list[str], *, remove: bool, lanes: dict) -> None:
-        with self._state_lock():
-            snapshot = self._issue_snapshot()
+            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+                return  # The issue was observed missing; a local change does not bring it back.
             row = self._local_issue(snapshot, number)
-            # GitHub accepted the label change: an overlay until an observation shows it.
-            before = row.get("labels")
-            record_result(snapshot, row, {"action": "remove_labels" if remove else "add_labels",
-                                          "labels": list(labels)}, self._timestamp(), lanes)
-            if row.get("labels") != before:
-                _state._forget_reads(row)
-            if READY in labels:
-                approval = self.load_approval(number)
-                row["ready_approval"] = None if remove or approval is None else approval.approved_at
+            changed = dict(row, labels=list(row["labels"]))
+            self._record_labels(changed, labels, remove=remove, lanes=lanes, ready_approval=ready_approval)
+            if self._observe(snapshot, number, _observations.observed_facts(changed), observed_at or self._now(),
+                             lanes, by_person=False) == "stale":
+                return  # An older observation persists nothing, not even its ready approval.
+            row = self._local_issue(snapshot, number)
+            if "ready_approval" in changed:
+                row["ready_approval"] = changed["ready_approval"]
             self._save_local_issue(snapshot, row)
 
-    def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict) -> None:
+    def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict,
+                       ready_approval: Any = _observations._UNSET) -> None:
+        from foragent.labels import READY, issue_lane
 
         current = set(row["labels"])
         row["labels"] = sorted(current - set(labels) if remove else current | set(labels))
@@ -308,17 +280,18 @@ class IssueSnapshotMixin:
             _state._forget_reads(row)
         row["lane"] = issue_lane(row["labels"], lanes)
         if READY in labels:
-            approval = self.load_approval(row["number"])
-            row["ready_approval"] = None if remove or approval is None else approval.approved_at
+            row["ready_approval"] = self._ready_approval(row["number"], remove, ready_approval)
 
     def record_comments(self, number: int, comments: list[dict], *, append: bool = False) -> None:
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if not append and any(entry["issue"] == number for entry in snapshot.get("outbox", [])):
-                return
             row = snapshot["issues"].get(str(number))
             if row is not None:
-                row["comments"] = row["comments"] + comments if append else comments
+                if append:
+                    for comment in comments:
+                        self._append_comment(row, comment)
+                else:
+                    row["comments"] = comments
                 self._save_local_issue(snapshot, row)
 
     def record_board_value(self, number: int, project: str, field: str, value: str) -> None:

@@ -7,11 +7,11 @@ from datetime import date, datetime
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
-from foragent.config_validation import _validate
+from foragent.config_validation import _validate as _validate_settings
 
 
 class ConfigError(ValueError):
@@ -78,6 +78,8 @@ class Config:
     acceptance_dir: str = "tests/acceptance/"
     notify: Any = None
     notify_summary_hour: int = 8
+    # Personal push filter (#1030): all pushes every kind; decisions pushes only decision kinds.
+    notify_filter: str = "all"
     run_hours: str = "always"
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
@@ -92,6 +94,8 @@ class Config:
     conflict_retries: int = 2
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
+    # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
+    merge_group_max: int | Literal["auto"] = "auto"
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
@@ -102,6 +106,9 @@ class Config:
     animation: bool = True  # Lane-view fireworks and the big squirrel sprite (#168).
     update_check: bool = True  # The daily release check (#417); FORAGENT_UPDATE_CHECK=off also opts out.
     profile: dict[str, Any] | None = None
+    # The GitHub login whose factory works unlabelled (pre-team) issues (D78 revision, 2026-10-30).
+    # None keeps the single-factory path; set it before a second person's factory joins.
+    legacy_owner: str | None = None
     # Whether `fa report propose` may prepare upstream error reports; None means not asked yet (#419).
     upstream_reports: bool | None = None
     # Order perspective seat -> executor (#414); unnamed seats use the built-in split.
@@ -438,6 +445,19 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
     return value
 
 
+def _validate(values: dict[str, Any]) -> None:
+    """Every setting's checks, plus the repository's legacy_owner login."""
+    _validate_settings(values)
+    if values.get("legacy_owner") is not None:
+        from foragent.ownership import OwnershipError, normalize_login
+
+        language = values["language"] if isinstance(values.get("language"), str) else "en"
+        try:
+            normalize_login(values["legacy_owner"], language)
+        except OwnershipError as exc:
+            raise ConfigError(f"legacy_owner: {exc}") from exc
+
+
 def _hours(run_hours: str) -> tuple[int, int] | None:
     if run_hours == "always":
         return None
@@ -461,6 +481,7 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     local = _read_yaml(local_path)
     _overlay(values, local)
     _personal_glyphs(values, global_values)
+    _personal_notify_filter(values, global_values)
     _apply_executors(values, global_values, local)
     _validate(values)
     return Config(**values)
@@ -470,6 +491,12 @@ def _personal_glyphs(values: dict[str, Any], global_values: dict[str, Any]) -> N
     """A repository's view_glyphs auto makes no choice, so a person's own emoji or ascii applies (#173)."""
     if values.get("view_glyphs") == "auto" and global_values.get("view_glyphs") in ("emoji", "ascii"):
         values["view_glyphs"] = global_values["view_glyphs"]
+
+
+def _personal_notify_filter(values: dict[str, Any], global_values: dict[str, Any]) -> None:
+    """A person's own notify_filter wins: a project cannot turn a person's noise filter off (#1030)."""
+    if "notify_filter" in global_values:
+        values["notify_filter"] = global_values["notify_filter"]
 
 
 def _file_executors(source: dict[str, Any]) -> tuple[bool, Any]:

@@ -85,7 +85,19 @@ def test_native_goal_condition_length_cap_preserves_instructions():
     condition = goal_condition("a" * 5000)
     assert len(condition) == 3500
     assert condition.startswith('Every command in the "Done when" list below exits 0')
-    assert condition.endswith("no files outside this repository are changed. Or stop after 40 turns.")
+    assert condition.endswith(" is modified, and you did not edit files outside this repository."
+                              " Files that test tooling writes outside the repository do not count as your edits."
+                              " At 40 turns, end the run without repeating the stop check.")
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "quality/인수 checks/"])
+def test_native_goal_condition_scopes_outside_edits_to_the_implementer(acceptance_dir):
+    condition = goal_condition(acceptance_dir)
+    assert f"nothing under {acceptance_dir} is modified" in condition
+    assert "no files outside this repository are changed" not in condition
+    assert "you did not edit files outside this repository" in condition
+    assert "test tooling writes outside the repository do not count" in condition
+    assert condition.endswith("At 40 turns, end the run without repeating the stop check.")
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -165,3 +177,34 @@ def test_resume_prompt_restates_the_lanes_earlier_plan_only_when_given():
     section = lane_plan_section(["Reuse the writer."], [])
     assert section in build_resume_prompt(1, BODY, BODY, lane_plan=section)
     assert "Your lane's earlier plan" not in build_resume_prompt(1, BODY, BODY)
+
+
+def test_review_prompt_carries_lane_decisions_as_context_only_when_recorded():
+    from foragent.run_prompts import lane_decisions_section
+
+    parsed = parse_body(BODY)
+    assert lane_decisions_section([]) == ""
+    assert build_review_prompt(parsed, "diff", lane_decisions="") == build_review_prompt(parsed, "diff")
+    section = lane_decisions_section(["Name the helper while implementing.", "Use a local tuple."])
+    prompt = build_review_prompt(parsed, "diff", lane_decisions=section)
+    assert prompt.count("- Name the helper while implementing.") == 1
+    assert prompt.count("- Use a local tuple.") == 1
+    assert "not acceptance criteria" in section
+    # Context sits with the issue text, before the diff the reviewer judges.
+    assert prompt.index(section) < prompt.index("Done when commands:") < prompt.index("Diff:")
+
+
+def test_rework_prompts_ask_for_the_whole_class_and_a_searched_list_only_on_rework():
+    from foragent.run_prompts import SEARCHED_LIST_INSTRUCTIONS, build_resume_prompt
+
+    parsed = parse_body(BODY)
+    assert SEARCHED_LIST_INSTRUCTIONS not in build_prompt(1, parsed, "tests/acceptance/")
+    assert SEARCHED_LIST_INSTRUCTIONS not in build_resume_prompt(1, BODY, BODY, "check failed")
+    for prompt in (
+        build_prompt(1, parsed, "tests/acceptance/", reviewer_text="VERDICT: FAIL", review_feedback=True),
+        build_prompt(1, parsed, "tests/acceptance/", retry_default=True),
+        build_resume_prompt(1, BODY, BODY, reviewer_text="VERDICT: FAIL", review_feedback=True),
+        build_resume_prompt(1, BODY, BODY, retry_default=True),
+    ):
+        assert prompt.count(SEARCHED_LIST_INSTRUCTIONS) == 1
+    assert ".foragent/SEARCHED.md" in SEARCHED_LIST_INSTRUCTIONS

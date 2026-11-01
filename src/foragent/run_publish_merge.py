@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
     from foragent.ci_mode import ComparisonEvidence
+    from foragent.run_group_ci import GroupComparisonEvidence
     from foragent.git import GitRepo
     from foragent.runner import RunContext
     from foragent.state import Approval
@@ -55,7 +56,7 @@ def _final_merge_inputs(
     n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
     head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
     approved_body_sha: str | None = None,
-    comparison: ComparisonEvidence | None = None,
+    comparison: ComparisonEvidence | GroupComparisonEvidence | None = None,
 ) -> _MergeInputs:
     """Read every mutable prerequisite after acquiring the final merge lock.
 
@@ -140,8 +141,8 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
             ctx.git.remove_worktree(worktree)
     prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
     # No closing keyword: the parent's completion belongs to the gate's order
-    # aggregation (board_parents), which comments first and keeps a parent with
-    # a not-planned child open. A merge here must not close it behind that.
+    # aggregation (board_parents), which comments first and closes the parent only
+    # once no child is open. A merge here must not close it behind that.
     lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
     for child in sorted(children, key=lambda child: child.number):
         pr = prs.get(f"foragent/issue-{child.number}")

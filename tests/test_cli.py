@@ -722,8 +722,9 @@ def test_inspect_cli_notify_logs_failure_and_retries_then_dedupes(app, monkeypat
     root, git, tracker, store, _ = app
     tracker.add_issue(1, "Issue 1", labels=["needs-human"])
     tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nChoose a format")
+    # Off-summary hour comes from the command clock (NOW), not the wall clock.
     monkeypatch.setattr(cli, "load_config", lambda root: Config(
-        notify="command:/offline/notifier", notify_summary_hour=(datetime.now().astimezone().hour + 1) % 24,
+        notify="command:/offline/notifier", notify_summary_hour=(NOW.astimezone().hour + 1) % 24,
     ))
     args = ["inspect", "notify", "--repo-root", str(root)]
     calls = []
@@ -801,6 +802,8 @@ def test_tick_returns_while_notification_child_is_still_running(app, monkeypatch
     children = []
 
     def slow_notification(args, **kwargs):
+        if args[:1] == ["git"]:
+            return popen(args, **kwargs)  # Origin lookups (#1030) run as they are.
         # Replace GitHub/osascript with a real offline child that stays busy.
         child = popen([sys.executable, "-c", "import sys; sys.stdin.readline()"],
                       **{**kwargs, "stdin": subprocess.PIPE})

@@ -15,15 +15,23 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
     "acceptance_files": {"tests/acceptance/test_login.py": "..."},
     "references": ["docs/design/login/HANDOFF.md"]}],
   "edits": [{"number": 3, "goal": "...", "out_of_scope": "...", "done_when": ["true"],
-    "checklist": [], "files": [], "acceptance_files": {}, "references": []}],
+    "checklist": [], "blocked_by": ["login"], "files": [], "acceptance_files": {}, "references": []}],
   "reference_files": {"docs/design/login/HANDOFF.md": "# Approved login screen\n...",
     "docs/design/login/approved.png": {"path": "docs/design/login/approved.png",
       "base64": "<encoded image bytes>"}}
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+edits[].blocked_by names this plan's issue keys and replaces the edited issue's native
+dependencies ([] clears them); omit it to keep them.
+A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
+publication comments one line when it changes and nothing when it is unchanged.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
 decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
 decision marker. Omitted keeps an issue's existing marker; [] clears its links.
+issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
+behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
+for good: a real publish (with or without approval) refuses the issue until its lane has written
+tests and the configured reviewer has reviewed them; --dry-run still previews it.
 --approve (or --approve-keys) needs a clean `fa order preread` of each approved issue's current
 content; --dry-run never needs one.
 files lists repository-relative paths or globs expected to change; absolute paths and .. are rejected.
@@ -99,6 +107,23 @@ def add(commands) -> None:
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    note = order_actions.add_parser("note", help=say("order_notes_help"))
+    note.add_argument("--defer", required=True, help=say("order_notes_defer_help"))
+    note.add_argument("--kind", choices=("decision", "idea", "rule"), required=True, help=say("order_notes_kind_help"))
+    note.add_argument("--text", required=True, help=say("order_notes_text_help"))
+    note.add_argument("--replaces", help=say("order_notes_replaces_help"))
+    note.add_argument("--replace", help=say("order_flush_replace_help"))
+    pending = order_actions.add_parser("pending", help=say("order_notes_pending_help"))
+    flush = order_actions.add_parser("flush", help=say("order_flush_help"))
+    flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    for command in (note, pending, flush):
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+        command.add_argument("--json", action="store_true")
+    prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
+    prepare.add_argument("plan", type=cli.Path)
+    prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    prepare.add_argument("--status", action="store_true", help=say("prepare_help_status"))
+    prepare.add_argument("--json", action="store_true")
     perspectives = order_actions.add_parser("perspectives", help=say("perspectives_help"),
                                             description=say("perspectives_help"))
     perspectives.add_argument("target", help=say("perspectives_help_target"))
@@ -114,6 +139,8 @@ def add(commands) -> None:
     publish.add_argument("--approve-keys", type=cli._comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=cli._comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
+    publish.add_argument("--defer", help=say("order_submission_defer_help"))
+    publish.add_argument("--urgent", action="store_true", help=say("order_submission_urgent_help"))
 
 
 def _preread(args, root) -> int:
@@ -134,6 +161,24 @@ def _preread(args, root) -> int:
                                           f"{len(result['unknowns'])} unknown(s)"))
             for unknown in result["unknowns"]:
                 print(f"  - {unknown}")
+    return 0
+
+
+def _prepare(args, root) -> int:
+    from foragent import order_prepare
+
+    cli = facade()
+    config, repo, store = repo_store(root)
+    rows = order_prepare.prepare(cli.order.read_plan(args.plan), root, config, cli.GitRepo(root), store,
+                                 lambda: cli.GhTracker(repo), status=args.status, plan_path=args.plan)
+    if args.json:
+        print(cli.json.dumps({"issues": rows}, ensure_ascii=False))
+    else:
+        for row in rows:
+            print(cli.text("prepare_row", config.language, key=row["key"], status=row["status"],
+                           reason=row["reason"] or "-"))
+            for question in row["questions"]:
+                print(cli.text("prepare_row_question", config.language, text=question))
     return 0
 
 
@@ -182,6 +227,12 @@ def _perspectives(args, root) -> int:
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action == "flush":
+        from foragent import order_flush
+        return order_flush.run(args, root)
+    if args.action in {"note", "pending"}:
+        from foragent import order_notes
+        return order_notes.run(args, root)
     if args.action == "progress":
         _config, _repo, store = repo_store(root)
         fields = {name: getattr(args, name) for name in
@@ -193,6 +244,8 @@ def run(args) -> int:
         return _preread(args, root)
     if args.action == "perspectives":
         return _perspectives(args, root)
+    if args.action == "prepare":
+        return _prepare(args, root)
     git = cli.GitRepo(root)
     config = cli.load_config(root)
     repo = config.repo or git.remote_slug()
@@ -206,11 +259,12 @@ def run(args) -> int:
                                  store=cli.StateStore.for_repo(repo), config=config, git=git,
                                  now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
-    print(cli.order.publish(
+    report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
-        approve_numbers=args.approve_numbers, dry_run=args.dry_run,
-    ).summary())
-    if not args.dry_run:
+        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
+    )
+    print(report.summary())
+    if not args.dry_run and report.waiting_for is None:
         cli._open_lane_view(root)
     return 0

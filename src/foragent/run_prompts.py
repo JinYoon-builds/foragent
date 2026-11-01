@@ -27,6 +27,11 @@ DEFAULT_RETRY_HINT = (
     "find every other instance of that class in the change, fix them all, "
     "and state the class and the instances found."
 )
+SEARCHED_LIST_INSTRUCTIONS = (
+    "Fix the whole defect class, not only the cited line: repair every instance across the changed code. "
+    "Then write `.foragent/SEARCHED.md` as a list of what you searched for, where you looked and what you found; "
+    "the runner puts that list in the pull request. The tools and the search order are yours to choose."
+)
 
 BREAK_IT = ("Make the code return a wrong value, skip an effect, or do the effect twice. "
             "If the test still passes, it proves nothing.")
@@ -34,9 +39,13 @@ IMPLEMENTER_TEST_RULE = "When you write or fix a test, check it by the break-it 
 
 PANEL_MERGE_PROMPT = (
     "Independent reviewers checked this change, each from its own share of the review perspectives. "
-    "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
-    "and reproducible against the diff above. Your reply is the final review: give the verdict and the "
-    "kept findings in the format above. Reviewer verdicts do not count; only yours does."
+    "Their raw findings follow, unedited; several may describe the same defect in different words. "
+    "Group the findings by defect class, not by identical text: findings with one root cause are one class, "
+    "even when their wording, lines or files differ. Keep only the classes you judge real and reproducible "
+    "against the diff above, and leave out every claim you dismiss. For each kept class give one finding "
+    "line `path:line — summary`, then indented lines `class: <name>`, the evidence, and every affected "
+    "instance (path:line). Your reply is the final review: give the verdict and the kept classes in the "
+    "format above. Reviewer verdicts do not count; only yours does."
 )
 
 
@@ -48,6 +57,12 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
+        "Those grounds in full: FAIL only for a failing or circumvented locked acceptance test, an unmet Goal "
+        "(a change to Out of scope or a weakened check is one), a broken repository principle (as the "
+        "repository's own instruction and decision files state it), or a real defect: a bug, a race, "
+        "data loss or a security hole.\n"
+        "A different valid approach from the one you would choose is not a defect and never a reason to FAIL. "
+        "Naming, structure or other implementation taste is not a defect either; write it as a NOTE line.\n"
         f"Tests under {acceptance_dir} that this issue lists are locked acceptance tests. If a finding would "
         "require behaviour a locked acceptance test forbids, or forbid behaviour it requires, it is a spec "
         "conflict, not a defect: report it as one line "
@@ -65,15 +80,19 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
 def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
-    risk_notes: str = "", panel_findings: str = "",
+    risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
 ) -> str:
-    """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings."""
+    """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
+
+    `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
-        f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
+        + (f"\n\n{lane_decisions}" if lane_decisions else "")
+        + f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
@@ -94,6 +113,38 @@ def lane_plan_section(approach: list[str], decisions: list[str]) -> str:
     return "\n".join(lines)
 
 
+def lane_decisions_section(decisions: list[str]) -> str:
+    """The lane's recorded DECIDE lines for a reviewer: context, never acceptance criteria."""
+    if not decisions:
+        return ""
+    return "\n".join([
+        "Implementation choices the lane recorded before approval (its DECIDE lines). They are context "
+        "for this review, not acceptance criteria: settling one differently, or as recorded, is never "
+        "by itself a reason to FAIL.",
+        *(f"- {line}" for line in decisions),
+    ])
+
+
+DECISIONS_START = "<!-- foragent:lane-decisions -->"
+DECISIONS_END = "<!-- /foragent:lane-decisions -->"
+
+
+def lane_decisions_block(section: str) -> str:
+    """`section` between markers, so a later review of the same PR can replace it."""
+    return f"{DECISIONS_START}\n{section}\n{DECISIONS_END}" if section else ""
+
+
+def refresh_lane_decisions(body: str, section: str) -> str:
+    """Replace a PR body's lane-decisions block with `section` (append, or drop when empty)."""
+    import re
+
+    block = lane_decisions_block(section)
+    pattern = re.compile(rf"(?:\n\n)?{re.escape(DECISIONS_START)}.*?{re.escape(DECISIONS_END)}", re.S)
+    if pattern.search(body):
+        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
+    return f"{body}\n\n{block}" if block else body
+
+
 def moved_files_section(moved_files: list[str]) -> str:
     return ("The base branch moved or split files this branch edits (old -> new). "
             "Carry your edits to the new locations so none are orphaned:\n"
@@ -102,7 +153,9 @@ def moved_files_section(moved_files: list[str]) -> str:
 
 def goal_condition(acceptance_dir: str) -> str:
     prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
-    suffix = " is modified, and no files outside this repository are changed. Or stop after 40 turns."
+    suffix = (" is modified, and you did not edit files outside this repository."
+              " Files that test tooling writes outside the repository do not count as your edits."
+              " At 40 turns, end the run without repeating the stop check.")
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 
 
@@ -219,7 +272,7 @@ def build_prompt(
             failure if failure_limit is None else cuts.tail(failure, failure_limit, full_text_dir, "failure.txt")
         )
     if review_feedback:
-        prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n"
+        prompt += "\n" + REVIEW_FEEDBACK_INSTRUCTIONS + "\n" + SEARCHED_LIST_INSTRUCTIONS + "\n"
     if acceptance_baseline:
         prompt += (
             f"\nThese acceptance tests already pass on the base and must keep passing ({len(acceptance_baseline)}):\n"
@@ -239,7 +292,7 @@ def build_prompt(
         prompt = "Orchestrator hint:\n" + orchestrator_hint + "\n\n" + prompt
     if retry_default:
         # A queued retry's default always comes before any orchestrator hint.
-        prompt = "Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n\n" + prompt
+        prompt = "Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n" + SEARCHED_LIST_INSTRUCTIONS + "\n\n" + prompt
     return f"/goal {runner.goal_condition(acceptance_dir)}\n\n{prompt}" if native_goal else prompt
 
 
@@ -283,9 +336,9 @@ def build_resume_prompt(
     elif failure:
         parts.append("A previous attempt failed. Output or stop reason:\n" + failure)
     if review_feedback:
-        parts.append(REVIEW_FEEDBACK_INSTRUCTIONS)
+        parts.append(REVIEW_FEEDBACK_INSTRUCTIONS + "\n" + SEARCHED_LIST_INSTRUCTIONS)
     if retry_default:
-        parts.append("Retry instructions:\n" + DEFAULT_RETRY_HINT)
+        parts.append("Retry instructions:\n" + DEFAULT_RETRY_HINT + "\n" + SEARCHED_LIST_INSTRUCTIONS)
     if orchestrator_hint is not None:
         parts.append("Orchestrator hint:\n" + orchestrator_hint)
     if merge_conflicts is not None:

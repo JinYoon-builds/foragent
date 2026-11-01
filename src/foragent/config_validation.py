@@ -11,6 +11,8 @@ _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
 
+    if values["notify_filter"] not in ("decisions", "all"):
+        raise ConfigError("notify_filter must be decisions or all")
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
         raise ConfigError("notify_summary_hour must be an integer from 0 to 23")
     board_map = values["board_map"]
@@ -84,6 +86,9 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
     if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
+    maximum = values["merge_group_max"]
+    if maximum != "auto" and (type(maximum) is not int or maximum < 1):
+        raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]

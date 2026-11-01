@@ -220,11 +220,11 @@ def test_undelivered_close_is_local_intent_until_delivery(tmp_path):
     assert state.local_issues()[0]["state"] == "closed", "Local intent shows the queued close"
     assert d79(tmp_path, state)["state"] == "in progress", "GitHub has not closed it yet"
     clock.at = minutes(2)
-    state.deliver_github_write(entry)
+    state.record_github_attempt(entry["id"], clock.at, True)
     assert d79(tmp_path, state)["state"] == "done", "Delivery means GitHub accepted the close"
     state.refresh_local_issues([issue("closed", "completed")], [], {}, minutes(3))
     row = state.local_issues()[0]
-    assert "unconfirmed" not in row and row["github"]["state_reason"] == "completed"
+    assert row["state_reason"] == "completed" and state.github_outbox() == []
 
 
 def test_pending_comment_does_not_hide_a_newer_completion_reason(tmp_path):
@@ -234,18 +234,18 @@ def test_pending_comment_does_not_hide_a_newer_completion_reason(tmp_path):
     assert d79(tmp_path, state)["state"] == "done"
     clock.at = minutes(1)
     state.queue_github_write(9, "comment", body="note")
-    # A new close reason is a person's change, like a label or state change: it
-    # contradicts the issue's queued writes, comments included, as today.
-    assert state.refresh_local_issues([issue("closed", "not_planned")], [], {}, minutes(5)) == [9]
+    # Observation-ingest keeps send-only comments until acknowledged or contradicted
+    # in its declared person fields (labels/state); neither hides a changed close reason.
+    assert state.refresh_local_issues([issue("closed", "not_planned")], [], {}, minutes(5)) == []
     row = state.local_issues()[0]
     assert row["state_reason"] == "not_planned" and row["observed_at"] == minutes(5).isoformat()
-    assert state.github_outbox() == [] and row["comments"] == []
+    assert [entry["action"] for entry in state.github_outbox()] == ["comment"] and row["comments"] == []
     assert d79(tmp_path, state)["state"] == "in progress"
 
 
 @pytest.mark.parametrize("action, payload, seen, field, value", [
     ("update_issue", {"title": "T", "body": decisions.marker(["D7"])},
-     issue(body=decisions.marker(["D74"])), "body", decisions.marker(["D74"])),
+     issue(body=decisions.marker(["D74"]), labels=["person"]), "body", decisions.marker(["D74"])),
     ("add_labels", {"labels": ["x"]}, issue(labels=["y"]), "labels", ["y"]),
     ("close_issue", {"body": None}, issue("closed", "not_planned"), "state_reason", "not_planned"),
 ])
@@ -255,7 +255,7 @@ def test_a_newer_contradicting_observation_drops_the_pending_write(tmp_path, act
     state.refresh_local_issues([issue()], [], {}, NOW)
     clock.at = minutes(1)
     state.queue_github_write(9, action, **payload)
-    assert state.refresh_local_issues([seen], [], {}, minutes(2)) == [9]
+    assert state.refresh_local_issues([seen], [], {}, minutes(2)) == ([] if action == "close_issue" else [9])
     assert state.github_outbox() == []
     row = state.local_issues()[0]
     assert row[field] == value and state.confirmed_local_issues()[0][field] == value
@@ -305,7 +305,7 @@ def test_a_late_older_refresh_after_a_newer_one_keeps_a_dropped_write_dropped(tm
     state.refresh_local_issues([issue()], [], {}, NOW)
     clock.at = minutes(1)
     state.queue_github_write(9, "update_issue", title="T", body=decisions.marker(["D7"]))
-    state.refresh_local_issues([issue(body=decisions.marker(["D74"]))], [], {}, minutes(3))
+    state.refresh_local_issues([issue(body=decisions.marker(["D74"]), labels=["person"])], [], {}, minutes(3))
     assert state.github_outbox() == []
     state.refresh_local_issues([issue()], [], {}, minutes(2))
     row = state.confirmed_local_issues()[0]
@@ -329,27 +329,28 @@ def test_a_delivered_write_overlays_listings_that_began_before_its_delivery(tmp_
     clock.at = minutes(1)
     entry = state.queue_github_write(9, "add_labels", labels=["approved"])
     clock.at = minutes(3)
-    state.deliver_github_write(entry)
+    state.record_github_attempt(entry["id"], clock.at, True)
     state.refresh_local_issues([issue()], [], {}, minutes(2))
     assert state.local_issues()[0]["labels"] == ["approved"]
     state.refresh_local_issues([issue()], [], {}, minutes(4))
     assert state.local_issues()[0]["labels"] == [], "A later listing shows what GitHub has"
 
 
-def test_a_direct_write_result_never_hides_an_observed_reopening(tmp_path):
+@pytest.mark.parametrize("ack", ["update_local_issue", "record_labels"])
+def test_a_direct_write_result_never_hides_an_observed_reopening(tmp_path, ack):
     clock = Clock()
     state = clock.store(tmp_path)
     state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
     state.update_local_issue(9, merged=True)
-    since = state.issues_revision()
-    clock.at = minutes(2)
-    state.record_labels(9, ["approved"], remove=False, lanes={})
-    state.refresh_local_issues([issue()], [], {}, minutes(1), since_revision=since)
+    state.record_issue(issue("open", "reopened"), {}, observed_at=minutes(2))
+    clock.at = minutes(3)
+    if ack == "record_labels":
+        state.record_labels(9, ["approved"], remove=False, lanes={}, observed_at=minutes(1))
+    else:
+        state.update_local_issue(9, body=decisions.marker(["D7"]), observed_at=minutes(1))
     row = state.local_issues()[0]
-    assert (row["state"], row["labels"], row["observed_at"]) == ("open", ["approved"], minutes(1).isoformat())
+    assert (row["state"], row["labels"], row["observed_at"]) == ("open", [], minutes(2).isoformat())
     assert d79(tmp_path, state)["state"] == "in progress"
-    state.refresh_local_issues([issue()], [], {}, minutes(3))
-    assert state.local_issues()[0]["labels"] == []
 
 
 def test_a_recorded_close_overlays_an_older_listing_until_a_later_one(tmp_path):
@@ -466,7 +467,7 @@ def test_a_delayed_single_read_is_as_old_as_its_start(tmp_path):
 
 
 def _legacy_snapshot(state, row, outbox, base):
-    """An issues.json written before #1025: no github records."""
+    """A pre-ingest snapshot with queued effects on the row and observed facts in outbox_base."""
     import json
 
     (state.root / "issues.json").parent.mkdir(parents=True, exist_ok=True)
@@ -500,18 +501,17 @@ def test_writes_queued_before_the_first_observation_are_not_observed_facts(tmp_p
 
 
 @pytest.mark.parametrize("reason", ["reopened", "not_planned"])
-def test_a_changed_close_reason_contradicts_a_queued_close(tmp_path, reason):
+def test_an_observed_close_reason_outweighs_an_unsent_close(tmp_path, reason):
     clock = Clock()
     state = clock.store(tmp_path)
     state.refresh_local_issues([issue()], [], {}, NOW)
     clock.at = minutes(1)
     state.queue_github_write(9, "close_issue", body=None)
-    # Someone closed and reopened it (state matches the baseline, the reason does not),
-    # or closed it as not planned: flushing the queued close would be wrong.
     seen = issue("open", "reopened") if reason == "reopened" else issue("closed", "not_planned")
-    assert state.refresh_local_issues([seen], [], {}, minutes(2)) == [9]
-    assert state.github_outbox() == []
-    assert state.local_issues()[0]["state"] == seen.state
+    state.refresh_local_issues([seen], [], {}, minutes(2))
+    assert len(state.github_outbox()) == (1 if reason == "reopened" else 0)
+    assert state.confirmed_local_issues()[0]["state_reason"] == reason
+    assert d79(tmp_path, state)["state"] == "in progress"
 
 
 def test_a_close_reason_absent_from_an_old_baseline_is_no_contradiction(tmp_path):
@@ -537,14 +537,12 @@ def test_an_older_single_read_changes_nothing(tmp_path):
     assert (state.root / "issues.json").read_bytes() == before
 
 
-def test_an_older_listing_keeps_a_newer_refresh_failure(tmp_path):
+def test_decision_reads_leave_refresh_failures_unchanged(tmp_path):
     state = store(tmp_path)
     state.refresh_local_issues([issue()], [], {}, NOW)
     state.record_issues_refresh_failure("network down", minutes(5))
-    state.refresh_local_issues([issue()], [], {}, minutes(2))
+    assert d79(tmp_path, state)["state"] == "in progress"
     assert state.issues_observation()["failed_at"] == minutes(5).isoformat()
-    state.refresh_local_issues([issue()], [], {}, minutes(6))
-    assert state.issues_observation()["failed_at"] is None
 
 
 # Every tracker read lands through the one observation writer (#1025 review 9).
@@ -610,7 +608,7 @@ def test_a_read_that_contradicts_queued_writes_drops_them_and_says_so(tmp_path):
 
     class Reader:
         def get_issue(self, number):
-            return issue("open", "reopened")
+            return issue("open", "reopened", labels=["person"])
 
     clock.at = minutes(2)
     _recording(state, clock, Reader()).get_issue(9)
@@ -623,7 +621,7 @@ def test_an_older_list_read_changes_nothing(tmp_path):
     state = clock.store(tmp_path)
     state.refresh_local_issues([issue()], [], {}, minutes(5))
     before = (state.root / "issues.json").read_bytes()
-    state.record_issues([issue("closed", "completed")], {}, observed_at=minutes(1))
+    state.ingest([issue("closed", "completed")], minutes(1), {})
     assert (state.root / "issues.json").read_bytes() == before
 
 
@@ -654,7 +652,7 @@ def test_an_issue_removed_by_a_newer_listing_is_not_recreated_by_an_older_one(tm
     if late == "refresh":
         state.refresh_local_issues([issue("closed", "completed")], [], {}, minutes(3))
     else:
-        state.record_issues([issue("closed", "completed")], {}, observed_at=minutes(3))
+        state.ingest([issue("closed", "completed")], minutes(3), {})
     assert state.local_issues() == []
     assert d79(tmp_path, state)["issues"] == []
     state.record_issue(issue(), {}, observed_at=minutes(6))
@@ -722,7 +720,7 @@ def test_a_flushed_write_answer_and_a_missing_check_are_observations(tmp_path):
     tracker.flush_outbox()
     assert state.local_issues()[0]["state_reason"] == "not_planned"
     clock.at = minutes(3)
-    assert tracker._issue_missing(9) is None
+    assert tracker._missing(9) is False
     assert state.local_issues()[0]["state_reason"] == "reopened"
 
 
@@ -732,8 +730,8 @@ def test_a_rejected_read_in_a_batch_leaves_no_placeholder_row(tmp_path):
     state.refresh_local_issues([issue("closed", "completed")], [], {}, NOW)
     state.refresh_local_issues([], [], {}, minutes(5))
     other = Issue(10, "Other", "", frozenset(), "open")
-    state.record_issues([issue("closed", "completed"), other], {}, observed_at=minutes(3))
-    assert [row["number"] for row in state.local_issues()] == [10]
+    state.ingest([issue("closed", "completed"), other], minutes(3), {})
+    assert state.local_issues() == [], "The complete listing at T5 omitted both issues"
 
 
 # Review 11: an absence is as old as the lookup that found it (#1025).
@@ -763,11 +761,10 @@ def test_a_delayed_not_found_lookup_never_removes_a_newer_observation(tmp_path):
             raise _not_found()
 
     clock.at = minutes(2)
-    with pytest.raises(type(_not_found())):
-        _recording(state, clock, Gone()).flush_outbox()
+    _recording(state, clock, Gone()).flush_outbox()
     row, = state.local_issues()
     assert (row["state"], row["observed_at"]) == ("open", minutes(3).isoformat())
-    assert "9" not in (state._issue_record().get("removed") or {}), "No removal is recorded"
+    assert "9" not in (state._issue_record().get("absent") or {}), "No removal is recorded"
     assert d79(tmp_path, state) == {"id": "D79", "issues": [9], "state": "in progress",
                                     "observed_at": minutes(3).isoformat()}
 
@@ -802,7 +799,132 @@ def test_a_write_queued_after_the_lookup_began_keeps_the_issue(tmp_path):
     state.refresh_local_issues([issue()], [], {}, NOW)
     clock.at = minutes(3)
     state.queue_github_write(9, "comment", body="note")
-    assert state.drop_missing_github_issue(9, observed_at=minutes(2)) is False
+    assert state.ingest_absence(9, minutes(2)) is False
     assert len(state.github_outbox()) == 1 and len(state.local_issues()) == 1
-    assert state.drop_missing_github_issue(9, observed_at=minutes(4)) is True
+    assert state.ingest_absence(9, minutes(4)) is True
     assert state.local_issues() == [] and state.github_outbox() == []
+
+
+# After #1125: the decision view consumes the shared observation/intent model.
+
+def test_refresh_child_read_reopening_outranks_its_completed_listing(tmp_path):
+    from foragent.tracker import FakeTracker
+
+    clock = Clock()
+    state = clock.store(tmp_path)
+    remote = FakeTracker(now=lambda: clock.at)
+    remote.add_issue(1, "Parent")
+    remote.issues[9] = issue("closed", "completed")
+    remote.add_sub_issue(1, 9)
+    children, listing = remote.sub_issues, remote.list_issues
+
+    def listed(*args, **kwargs):
+        result = listing(*args, **kwargs)
+        clock.at = minutes(2)  # The child read begins after the listing.
+        return result
+
+    remote.list_issues = listed
+
+    def reopened(number):
+        clock.at = minutes(2)
+        remote.issues[9] = issue("open", "reopened")
+        return children(number)
+
+    remote.sub_issues = reopened
+    clock.at = minutes(1)
+    _recording(state, clock, remote).refresh_issues()
+    assert d79(tmp_path, state) == {"id": "D79", "issues": [9], "state": "in progress",
+                                    "observed_at": minutes(2).isoformat()}
+
+
+@pytest.mark.parametrize("path", ["direct", "flush", "local", "labels"])
+def test_delayed_write_ack_cannot_restore_an_older_decision_link(tmp_path, path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.record_issue(issue(body=decisions.marker(["D74"])), {})
+
+    def newer():
+        clock.at = minutes(2)
+        state.record_issue(issue(body=decisions.marker(["D7"])), {})
+        clock.at = minutes(3)
+
+    class Writer:
+        def update_issue(self, number, *, title, body):
+            newer()
+            return issue(body=body)  # Even an echoed issue is as old as the send's start.
+
+    clock.at = minutes(1)
+    if path == "direct":
+        _recording(state, clock, Writer()).update_issue(9, title="T", body=decisions.marker(["D79"]))
+    elif path == "flush":
+        state.queue_github_write(9, "update_issue", title="T", body=decisions.marker(["D79"]))
+        _recording(state, clock, Writer()).flush_outbox()
+    else:
+        newer()
+        if path == "local":
+            state.update_local_issue(9, body=decisions.marker(["D79"]), observed_at=minutes(1))
+        else:
+            state.record_labels(9, ["approved"], remove=False, lanes={}, observed_at=minutes(1))
+    result = {row["id"]: row for row in decisions.view(tmp_path, state.confirmed_local_issues(), LEDGER)}
+    assert result["D7"]["issues"] == [9] and result["D7"]["observed_at"] == minutes(2).isoformat()
+    assert result["D79"]["issues"] == [] and result["D74"]["issues"] == []
+    assert state.github_outbox() == []
+
+
+@pytest.mark.parametrize("action, payload", [
+    ("add_labels", {"labels": ["x"]}), ("remove_labels", {"labels": ["x"]}),
+    ("update_issue", {"title": "T", "body": decisions.marker(["D79"])}),
+    ("close_issue", {"body": None}),
+])
+@pytest.mark.parametrize("route", ["direct", "flush"])
+def test_each_write_issue_echo_is_an_observation(tmp_path, action, payload, route):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.record_issue(issue("closed", "completed"), {})
+    clock.at = minutes(1)
+    if route == "flush":
+        state.queue_github_write(9, action, **payload)
+
+    class Echo:
+        def __getattr__(self, name):
+            def response(*args, **kwargs):
+                return issue("open", "reopened")
+            return response
+
+    clock.at = minutes(2)
+    reader = _recording(state, clock, Echo())
+    if route == "flush":
+        reader.flush_outbox()
+    elif action == "update_issue":
+        reader.update_issue(9, **payload)
+    elif action == "close_issue":
+        reader.close_issue(9)
+    else:
+        getattr(reader, action)(9, payload["labels"])
+    assert d79(tmp_path, state) == {"id": "D79", "issues": [9], "state": "in progress",
+                                    "observed_at": minutes(2).isoformat()}
+
+
+def test_confirmed_view_shows_only_successful_parts_of_a_label_removal(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.record_issue(issue(labels=["a", "b", "c"]), {})
+    clock.at = minutes(1)
+    entry = state.queue_github_write(9, "remove_labels", labels=["a", "b"])
+    state.record_github_attempt(entry["id"], minutes(1), True, labels=["a"])
+    before = (state.root / "issues.json").read_bytes()
+    assert state.local_issues()[0]["labels"] == ["c"]
+    assert state.confirmed_local_issues()[0]["labels"] == ["b", "c"]
+    assert (state.root / "issues.json").read_bytes() == before
+
+
+def test_a_newer_absence_held_by_later_intent_never_proves_completion(tmp_path):
+    clock = Clock()
+    state = clock.store(tmp_path)
+    state.record_issue(issue("closed", "completed"), {})
+    clock.at = minutes(3)
+    state.queue_github_write(9, "comment", body="late intent")
+    state.ingest_absence(9, minutes(2))
+    assert len(state.local_issues()) == 1 and len(state.github_outbox()) == 1
+    assert d79(tmp_path, state)["state"] == "in progress"
+    assert d79(tmp_path, state)["observed_at"] == minutes(2).isoformat()

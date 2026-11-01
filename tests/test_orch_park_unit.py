@@ -38,28 +38,125 @@ def _escalate(ctx, minutes: int):
     return _escalate_overdue_blocker(ctx, issue, TickReport())
 
 
+def _comment(identity, kind, at=START, *, legacy=False, number=1):
+    marker = "<!-- foragent:orch -->" if legacy else f"<!-- foragent:orch kind={kind} -->"
+    return {"id": identity, "body": f"{marker}\n#{number}: {kind}; why: wait",
+            "created_at": at.isoformat(), "author": "bot"}
+
+
 @pytest.mark.parametrize("park_minute,escalated", [(1, False), (0, True)])
 def test_park_newer_than_the_blocker_answers_it_even_if_the_label_lingers(ctx, park_minute, escalated):
     rows = ctx.store.local_issues()
     rows[0]["comments"] = [{"id": 1, "body": "<!-- foragent:blocked reason=spec-question -->\nx",
-                            "created_at": START.isoformat(), "author": "bot"}]
+                            "created_at": START.isoformat(), "author": "bot"},
+                           _comment(2, "parked", START + timedelta(minutes=1 if park_minute else -1))]
     ctx.store.local_issues = lambda: rows
-    if park_minute:
-        append_event(ctx.store, START + timedelta(minutes=park_minute), 1, "parked", "#1: parked; why: wait")
-    else:
-        append_event(ctx.store, START - timedelta(minutes=1), 1, "parked", "#1: parked; why: older")
     issue = _escalate(ctx, 10)
     assert ("needs-human" in issue.labels) == escalated
 
 
-def test_parked_at_and_is_parked_follow_the_journal(ctx):
-    assert orch_park.parked_at(ctx.store, 1) is None and not orch_park.is_parked(ctx.store, 1)
+def test_parked_intent_ignores_the_journal_and_reads_issue_comments(ctx):
     append_event(ctx.store, START, 1, "parked", "p")
-    append_event(ctx.store, START, 2, "unparked", "other issue")
+    assert orch_park.parked_at(ctx.store, 1) is None and not orch_park.is_parked(ctx.store, 1)
+    ctx.store.record_comments(1, [_comment(1, "parked")])
     assert orch_park.parked_at(ctx.store, 1) == START and orch_park.is_parked(ctx.store, 1)
-    append_event(ctx.store, START + timedelta(minutes=1), 1, "unparked", "u")
+    (ctx.store.root / "orch-events.jsonl").unlink()
+    assert orch_park.is_parked(StateStore(ctx.store.root), 1)
+    ctx.store.record_comments(1, [_comment(1, "parked"), _comment(2, "unparked")])
+    assert orch_park.parked_at(ctx.store, 1) is None and not orch_park.is_parked(ctx.store, 1)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_newest_comment_wins_by_time_then_id_not_listing_order(ctx, legacy):
+    rows = [_comment(30, "parked", START - timedelta(minutes=1), legacy=legacy),
+            _comment(3, "unparked", legacy=legacy), _comment(2, "parked", legacy=legacy)]
+    ctx.store.record_comments(1, rows)
     assert not orch_park.is_parked(ctx.store, 1)
-    assert orch_park.parked_at(ctx.store, 1) == START
+    ctx.store.record_comments(1, rows + [_comment(4, "parked", legacy=legacy)])
+    assert orch_park.is_parked(ctx.store, 1)
+
+
+def test_unrelated_audit_comment_is_not_a_legacy_park(ctx):
+    ctx.store.record_comments(1, [_comment(1, "parked", legacy=True, number=2),
+                                _comment(2, "parkedness", legacy=True)])
+    assert not orch_park.is_parked(ctx.store, 1)
+
+
+def test_unpark_reads_remote_intent_without_local_journal_or_cache(ctx):
+    ctx.tracker._tracker.comment(1, "<!-- foragent:orch -->\n#1: parked; why: remote decision")
+    assert ctx.store.local_issues()[0]["comments"] == []
+    orch_park.unpark(ctx, 1)
+    assert not orch_park.is_parked(ctx.store, 1)
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 2 and comments[-1].body.startswith("<!-- foragent:orch kind=unparked -->")
+
+
+def test_rate_limited_commands_keep_one_marker_each_and_fifo_intent(ctx):
+    ctx.store.pause_github(START + timedelta(hours=1))
+    orch_park.park(ctx, 1, "wait for the catalog")
+    assert orch_park.is_parked(StateStore(ctx.store.root), 1)
+    orch_park.unpark(ctx, 1)
+    assert not orch_park.is_parked(StateStore(ctx.store.root), 1)
+    from foragent import order_waiting
+    assert order_waiting.section(ctx.tracker.current_issue(1).body) is None
+    orch_park.park(ctx, 1, "wait again", for_person=True)
+    assert orch_park.is_parked(ctx.store, 1)
+    pending = ctx.store.github_outbox()
+    comments = [entry for entry in pending if entry["action"] == "comment"]
+    assert len(comments) == 3 and "wait again" in comments[-1]["body"]
+    assert ctx.tracker.list_comments(1) == []
+    ctx.tracker.flush_outbox()
+    assert ctx.store.github_outbox() == []
+    delivered = ctx.tracker.list_comments(1)
+    assert [c.body for c in delivered] == [entry["body"] for entry in comments]
+    assert orch_park.is_parked(ctx.store, 1)
+    assert "approved" not in ctx.tracker.get_issue(1).labels
+    waiting = order_waiting.section(ctx.tracker.get_issue(1).body)
+    assert "wait again" in waiting and "Responsible role: person" in waiting
+
+
+@pytest.mark.parametrize("for_person,role", [(False, "orchestrator"), (True, "person")])
+def test_park_and_unpark_publish_the_issue_wait_without_extra_comments(ctx, for_person, role):
+    from foragent import order_waiting
+
+    before = ("<!-- foragent:v1 -->\n## Goal\nKeep the authored goal.\n"
+              "## Waiting\nOld reason.\n## Done when\n```sh\ntrue\n```\n"
+              "<!-- foragent:custom keep-this -->\n")
+    ctx.tracker.update_issue(1, title="Blocked work", body=before)
+    ctx.tracker.add_labels(1, ["approved"])
+    orch_park.park(ctx, 1, "Wait for the catalog", for_person=for_person)
+    parked = ctx.tracker.get_issue(1)
+    waiting = order_waiting.section(parked.body)
+    assert "Reason: Wait for the catalog" in waiting
+    assert f"Responsible role: {role}" in waiting
+    assert "Next condition:" in waiting and "unpark" in waiting
+    assert "Old reason." not in parked.body
+    for kept in ("## Goal\nKeep the authored goal.", "## Done when\n```sh\ntrue\n```", "<!-- foragent:custom keep-this -->"):
+        assert kept in parked.body
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 1 and "Wait for the catalog" in comments[0].body
+    order_waiting.announce(ctx.tracker, 1, parked.body, ctx.config.language)
+    assert ctx.tracker.list_comments(1) == comments
+
+    orch_park.unpark(ctx, 1)
+    unparked = ctx.tracker.get_issue(1)
+    assert order_waiting.section(unparked.body) is None
+    assert "approved" not in unparked.labels
+    assert "waiting-person" not in unparked.labels
+    for kept in ("## Goal\nKeep the authored goal.", "## Done when\n```sh\ntrue\n```", "<!-- foragent:custom keep-this -->"):
+        assert kept in unparked.body
+    comments = ctx.tracker.list_comments(1)
+    assert len(comments) == 2
+    order_waiting.announce(ctx.tracker, 1, unparked.body, ctx.config.language)
+    assert ctx.tracker.list_comments(1) == comments
+
+
+def test_explicit_unpark_replaces_cached_park_and_does_not_suppress_a_lingering_blocker(ctx):
+    ctx.store.record_comments(1, [_comment(1, "parked", START + timedelta(minutes=1)),
+                                _comment(2, "unparked", START + timedelta(minutes=2)),
+                                {"id": 3, "body": "<!-- foragent:blocked reason=spec-question -->\nx",
+                                 "created_at": START.isoformat(), "author": "bot"}])
+    assert "needs-human" in _escalate(ctx, 10).labels
 
 
 def test_unpark_without_park_changes_nothing(ctx):
@@ -123,21 +220,27 @@ def test_park_status_and_stop_agree_a_live_run_is_running(ctx, monkeypatch):
 
 
 def test_park_status_and_stop_agree_a_dead_run_is_not_running(ctx, monkeypatch):
-    """#435: stop, park and the status row agree a record whose processes are all gone is not running.
+    """#435: park and the status row agree a record whose processes are all gone has no worker.
 
     The status active_runs list still keeps the running record after park removes approved,
-    so a view can mark the gone worker ("no worker") instead of hiding the run.
+    so a view can mark the gone worker ("no worker") instead of hiding the run. fa orch
+    stop reads that same list (#1207), so it stops the record and keeps its work.
     """
-    from foragent import orch_stop, status
+    from foragent import orch_stop, scheduler, status
     from foragent.scheduler_stop import run_is_live
 
     _running(ctx, monkeypatch, alive=False, labels=("running", "approved"))
     assert not run_is_live(ctx.store.get_run(1))
-    ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
-    with pytest.raises(OrchError, match="not running"):
-        orch_stop.stop(ctx, 1, "stuck")
     orch_park.park(ctx, 1, "wait")
     assert "approved" not in ctx.tracker.get_issue(1).labels
+    assert [run["number"] for run in status.collect(ctx.store, ctx.config, START)["active_runs"]] == [1]
+    stopped = []
+    monkeypatch.setattr(scheduler, "_kill_run", lambda c, n, report, **kw: stopped.append(n) or True)
+    monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr("foragent.scheduler_stop._restore_stopped", lambda *a: None)
+    ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
+    orch_stop.stop(ctx, 1, "stuck")
+    assert stopped == [1]
     assert _status_state(ctx) != "working"
     assert [run["number"] for run in status.collect(ctx.store, ctx.config, START)["active_runs"]] == [1]
 
@@ -197,8 +300,10 @@ def test_a_reused_runner_pid_is_not_running_in_park_status_or_stop(ctx, monkeypa
     assert not _live_with(ctx, monkeypatch, [(42000, 1, 42000, 42000, 99.0)])
     assert _status_state(ctx) != "working"
     ctx.monotonic, ctx.sleep = (lambda: 0.0), (lambda seconds: None)
-    with pytest.raises(OrchError, match="not running"):
+    # The record is unfinished (#1207), but #261 never signals a PID another process now has.
+    with pytest.raises(OrchError, match="a different process now has this PID"):
         orch_stop.stop(ctx, 1, "stuck")
+    assert ctx.store.get_run(1).status == "running"
     orch_park.park(ctx, 1, "wait")
     assert "approved" not in ctx.tracker.get_issue(1).labels
 

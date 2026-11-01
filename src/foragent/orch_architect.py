@@ -19,7 +19,7 @@ import subprocess
 import sys
 from typing import Iterator
 
-from foragent import executors, processes
+from foragent import executors, processes, review_notes
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
@@ -192,8 +192,9 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         options = session_options(config, store, root, role, entry)
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
+        notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""
         result = executors.executor_for(config.executor).run(
-            worktree=root, prompt=build_prompt(why, root, config.executor, role, entry),
+            worktree=root, prompt=build_prompt(why, root, config.executor, role, entry, review_notes=notes),
             timeout_s=config.max_runtime_minutes * 60, log_path=log, **options,
         )
         code = 1 if result.timed_out or result.exit_code is None else result.exit_code
