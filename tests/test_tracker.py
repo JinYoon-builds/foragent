@@ -183,7 +183,7 @@ def test_outbox_missing_issue_drops_all_its_writes_and_delivers_fifo_tail(
 
     assert attempts == ([1, 2] if deleted_at == "flush" else [2])
     assert ctx.store.github_outbox() == []
-    assert ctx.store._issue_snapshot()["outbox_base"] == {}
+    assert ctx.store._issue_snapshot().get("outbox_base", {}) == {}
     assert [row["number"] for row in ctx.store.local_issues()] == [2]
     assert [item.body for item in ctx.remote.list_comments(2)] == ["Surviving evidence"]
     event, = orch.log(ctx)

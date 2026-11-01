@@ -21,6 +21,50 @@ from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
 
+@pytest.mark.parametrize('checks,command,fallback,protected', [
+    ('ci', 'pytest', None, True),
+    ('ci', 'pytest', 'local', False),
+    ('ci', 'npm test', None, False),
+    ('local', 'pytest', None, False),
+])
+@pytest.mark.parametrize('target', ['trunk', 'foragent/batch-20'])
+def test_ci_protection_is_independent_of_evidence_target(tmp_path, checks, command, fallback, protected, target):
+    from foragent import ci_mode
+
+    ctx = SimpleNamespace(repo_root=tmp_path, config=Config(
+        checks=checks, test_command=command, checks_fallback=fallback, base_branch='trunk'))
+    assert ci_mode.ci_protection(ctx) is protected
+    assert ci_mode.ci_evidence_target(ctx, target) is (target == 'trunk')
+    expected = protected or (checks == 'ci' and command == 'pytest' and target == 'trunk')
+    assert ci_mode.enabled(ctx, target) is expected
+
+
+def test_ci_batch_target_holds_without_polling_or_local_comparison(tmp_path, monkeypatch):
+    from conftest import BASE_TIME
+    from foragent import ci_local, ci_mode
+    from foragent.reasons import Reason
+    from foragent.run_attempt import ExecutorStopped
+
+    def unexpected(*args):
+        pytest.fail('An unsupported CI target must neither poll nor fall back locally')
+
+    ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, now=lambda: BASE_TIME,
+                          config=Config(checks='ci', test_command='pytest'), sleep=unexpected,
+                          tracker=SimpleNamespace(pr_default_branch=lambda: 'main',
+                                                  pr_acceptance_reports=unexpected))
+    attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='foragent/batch-20', log=tmp_path / 'log',
+                              git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''))
+    flags = []
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
+    monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
+    with pytest.raises(ExecutorStopped, match='target foragent/batch-20 cannot obtain.*CI evidence') as exc:
+        ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+    assert exc.value.outcome == 'held'
+    assert len(flags) == 1
+    assert flags[0][2] == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+
+
 def report(index=0, count=2):
     node = f"tests/acceptance/test_keep_{index}.py::test_keep"
     payload = {"schema_version": 1, "repository": "owner/repo", "base_sha": "base", "head_sha": "head",
@@ -141,6 +185,83 @@ def compare(checks, count=2):
                       expected_shards=range(count))
 
 
+@pytest.mark.parametrize("damage", ["non-json-extra", "circular-extra", "overflow-duration",
+                                   "transport-key", "transport-type", "transport-json", "transport-recursion", "transport-overflow"])
+def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(tmp_path, monkeypatch, damage):
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks="ci", checks_fallback=None, test_command="pytest", ci_shards=2)
+    values = [report(), report(1)]
+    for value in values:
+        value["report"]["scope"] = measurement_scope(config, tmp_path, [])
+    flags, writes = [], []
+    git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
+    tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
+                          tracker=tracker, store=SimpleNamespace(
+                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: writes.append(kwargs)))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
+    evidence = ci_mode.require_comparison(attempt, 99, "head", base_sha="base")
+    assert evidence.current(1, ctx, git, 99, "head", "base", "pass")
+    writes.clear()
+    if damage == "non-json-extra":
+        values[0]["extra"] = {"not-json"}
+    elif damage == "circular-extra":
+        values[0]["extra"] = values
+    elif damage == "overflow-duration":
+        values[0]["report"]["duration_seconds"] = 10 ** 1000
+    else:
+        error = {"transport-key": KeyError, "transport-type": TypeError, "transport-json": ValueError,
+                 "transport-recursion": RecursionError, "transport-overflow": OverflowError}[damage]
+
+        def unreadable(head):
+            raise error("invalid acceptance reports")
+
+        tracker.pr_acceptance_reports = unreadable
+    assert evidence.current(1, ctx, git, 99, "head", "base", "pass") is False
+    with pytest.raises(ExecutorStopped) as stopped:
+        ci_mode.require_comparison(attempt, 99, "head", base_sha="base")
+    assert stopped.value.outcome == "held"
+    assert len(flags) == 1 and not writes
+
+
+@pytest.mark.parametrize("error", [TypeError, ValueError, RecursionError])
+def test_report_serialization_errors_are_unusable(monkeypatch, error):
+    from foragent import ci_mode
+
+    def unreadable(*args, **kwargs):
+        raise error("malformed report")
+
+    monkeypatch.setattr(ci_mode, "json", SimpleNamespace(dumps=unreadable))
+    with pytest.raises(UnusableComparison, match="Unusable acceptance reports"):
+        ci_mode.serialize_reports([])
+
+
+@pytest.mark.parametrize("damage", ["overflow-duration", "diagnostic-recursion"])
+def test_numeric_and_nested_report_faults_are_unusable_comparisons(monkeypatch, damage):
+    from foragent import ci_mode
+
+    values = [report(), report(1)]
+    if damage == "overflow-duration":
+        values[0]["report"]["duration_seconds"] = 10 ** 1000
+    else:
+        values[0]["report"]["scope"] = None
+        shown = ci_mode._shown
+
+        def unreadable(value):
+            if value is None:
+                raise RecursionError("report diagnostic is too deeply nested")
+            return shown(value)
+
+        monkeypatch.setattr(ci_mode, "_shown", unreadable)
+    with pytest.raises(UnusableComparison):
+        compare(values)
+
+
 def test_compare_records_parallel_wall_duration_and_detects_deselection():
     checks = [report(), report(1)]
     payload = checks[1]['report']
@@ -224,7 +345,8 @@ def test_suite_and_listing_rejections_name_field_observed_and_expected(damage, f
 def test_excluded_test_in_report_names_the_test_and_exclusions():
     checks = [report(), report(1)]
     excluded = ["tests/acceptance/test_keep_1.py"]
-    checks[1]['report']['excluded'] = checks[1]['report']['scope']['excluded'] = excluded
+    for check in checks:
+        check['report']['excluded'] = check['report']['scope']['excluded'] = list(excluded)
     with pytest.raises(UnusableComparison) as caught:
         comparison(checks, "owner/repo", "base", "head", excluded,
                    expected_scope=measurement_scope(Config(ci_shards=2), Path('.'), excluded),
@@ -232,6 +354,19 @@ def test_excluded_test_in_report_names_the_test_and_exclusions():
     message = str(caught.value)
     assert f'report.base.collected_ids: observed "{KEEP_1}"' in message, message
     assert '["tests/acceptance/test_keep_1.py"]' in message, message
+
+
+def test_shards_must_record_the_same_exclusions():
+    checks = [report(), report(1)]
+    excluded = ["tests/acceptance/test_other.py"]
+    checks[1]['report']['excluded'] = checks[1]['report']['scope']['excluded'] = excluded
+    with pytest.raises(UnusableComparison) as caught:
+        comparison(checks, "owner/repo", "base", "head", excluded,
+                   expected_scope=measurement_scope(Config(ci_shards=2), Path('.'), excluded),
+                   expected_shards=range(2))
+    message = str(caught.value)
+    assert 'report.excluded: observed ["tests/acceptance/test_other.py"]' in message, message
+    assert "exclusions of earlier shards" in message, message
 
 
 @pytest.mark.parametrize("key,value", [
@@ -934,12 +1069,24 @@ def test_review_checks_unit_selection_honors_runner_unit_tests(git_history, tmp_
     assert 'tests/test_demo.py' in store.log_path(1).read_text()
 
 
-def test_workflow_only_measures_issue_prs_to_the_configured_primary_base():
+@pytest.mark.parametrize('branch,repo,base,allowed', [
+    ('foragent/issue-1', 'owner/repo', 'release', True),
+    ('foragent/group-5-abcdef', 'owner/repo', 'release', True),
+    ('foragent/group-5-abcdef', 'fork/repo', 'release', False),
+    ('foragent/group-5-abcdef', 'owner/repo', 'main', False),
+    ('foragent/batch-1', 'owner/repo', 'release', False),
+])
+def test_workflow_only_measures_issue_and_group_prs_to_the_primary_base(branch, repo, base, allowed):
     document = yaml.safe_load(workflow_text(Config(base_branch='release')))
     condition = document['jobs']['acceptance']['if']
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
     assert "startsWith(github.event.pull_request.head.ref, 'foragent/issue-')" in condition
     assert "github.event.pull_request.base.ref == 'release'" in condition
+    github = SimpleNamespace(repository='owner/repo', event=SimpleNamespace(pull_request=SimpleNamespace(
+        head=SimpleNamespace(repo=SimpleNamespace(full_name=repo), ref=branch),
+        base=SimpleNamespace(ref=base))))
+    expression = condition.replace('&&', 'and').replace('||', 'or')
+    assert eval(expression, {'github': github, 'startsWith': str.startswith}) is allowed
 
 
 @pytest.mark.parametrize('damage', ['foreign-run', 'missing-run', 'wrong-workflow', 'wrong-repository',
@@ -1395,7 +1542,7 @@ def test_missing_trusted_default_branch_obeys_fallback_configuration(tmp_path, m
     ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, now=lambda: BASE_TIME,
                           config=Config(checks='ci', checks_fallback=fallback, test_command='pytest'),
                           tracker=SimpleNamespace(pr_default_branch=unavailable))
-    attempt = SimpleNamespace(n=1, ctx=ctx, log=tmp_path / 'log', git=SimpleNamespace())
+    attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='main', log=tmp_path / 'log', git=SimpleNamespace())
     monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
