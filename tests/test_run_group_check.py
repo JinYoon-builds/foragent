@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -175,6 +176,7 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: (
         captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
     monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
+    monkeypatch.setattr(group, "_trees", lambda *args: ["tree-5", "tree-1"])
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
 
     def check(command, worktree, log, limit, **kwargs):
@@ -198,3 +200,51 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     ]
     assert orch_events.has_event(ctx.store, 5, "group-check", passed=not timed_out,
                                  verdict="void" if timed_out else "passed")
+
+
+@pytest.mark.parametrize("conflict_index", [0, 1, 2])
+def test_combine_stops_at_first_real_conflict(git_history, monkeypatch, conflict_index):
+    from conftest import git_command
+    from foragent.git import GitRepo
+
+    history = git_history
+    original = history.tip
+    history.update({"conflict.txt": "base\n"})
+    base = history.tip
+    members = []
+    for index in range(4):
+        history.tip = original
+        git_command(history.origin, "update-ref", "refs/heads/main", original)
+        history.update({"conflict.txt" if index == conflict_index else f"member-{index}": f"{index}\n"})
+        members.append(group.Member(index, history.tip, ()))
+    git = GitRepo(history.origin)
+    call = git._call
+    attempted = []
+
+    def observe(args):
+        if args[:2] == ["merge-tree", "--write-tree"]:
+            attempted.append(args[-1])
+        return call(args)
+
+    monkeypatch.setattr(git, "_call", observe)
+    combined = group._combine(git, base, members)
+    assert attempted == [m.head_sha for m in members[:conflict_index + 1]]
+    trees = group._trees(git, base, combined)
+    assert len(trees) == conflict_index
+    assert git_command(history.origin, "show", f"{combined}:conflict.txt") == "base"
+    files = git_command(history.origin, "ls-tree", "--name-only", combined).splitlines()
+    assert [f"member-{i}" in files for i in range(4)] == [i < conflict_index for i in range(4)]
+    if conflict_index == 0:
+        assert combined == base
+
+
+def test_combine_does_not_swallow_merge_tree_infrastructure_error():
+    from foragent.git import GitError
+
+    def call(args):
+        if args[0] == "merge-tree":
+            raise GitError("unreadable CONFLICT object") from subprocess.CalledProcessError(128, args)
+        return ""
+
+    with pytest.raises(GitError, match="unreadable CONFLICT object"):
+        group._combine(SimpleNamespace(_call=call), "base", [group.Member(5, "head", ())])

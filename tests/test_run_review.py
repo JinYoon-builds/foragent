@@ -89,7 +89,8 @@ def test_review_failure_retries_implementation_and_done_when(run_case):
     body = c.tracker.created_prs[0].body
     assert "Round 1: VERDICT: FAIL" in body and finding in body
     assert "Round 2: VERDICT: PASS" in body
-    assert finding not in calls[1]["prompt"]
+    assert finding in calls[1]["prompt"]
+    assert "Limit this review to confirming" in calls[1]["prompt"]
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == f"VERDICT: FAIL\n{finding}"
     assert (directory / "review-2.txt").read_text() == "VERDICT: PASS"
@@ -266,9 +267,12 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     c = run_case
     c.executor.steps.append({})
     finding = "- feature.txt:1 — " + "x" * 930
-    messages = iter(["VERDICT: FAIL\n" + "\n".join([finding] * 5), "VERDICT: PASS\n(none)"])
+    messages = iter(["VERDICT: FAIL\n" + "\n".join([finding] * 5)])
     monkeypatch.setattr("foragent.executors.claude_review_command", lambda level, model, *, pr=None: [
         sys.executable, "-c", f"print({json.dumps({'result': next(messages)})!r})",
+    ])
+    monkeypatch.setattr("foragent.executors.claude_command", lambda *args, **kwargs: [
+        sys.executable, "-c", f"print({json.dumps({'type': 'result', 'result': 'VERDICT: PASS'})!r})",
     ])
     c.ctx.config = replace(c.ctx.config, reviewer="claude")
     c.ctx.executor_factory = lambda name: c.executor if name == "codex" else ClaudeExecutor()
@@ -279,7 +283,7 @@ def test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypat
     assert "Round 2: VERDICT: PASS" in c.tracker.created_prs[0].body
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == "VERDICT: FAIL\n" + "\n".join([finding] * 5)
-    assert (directory / "review-2.txt").read_text() == "VERDICT: PASS\n(none)"
+    assert (directory / "review-2.txt").read_text() == "VERDICT: PASS"
 
 
 def test_reviewer_timeout_at_runtime_limit_does_not_launch_more_sessions(run_case):
@@ -463,7 +467,11 @@ def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case,
 
     def review(**kwargs):
         pr = c.tracker.created_prs[0]
-        assert kwargs["review_pr"] == pr.number
+        if not heads:
+            assert kwargs["review_pr"] == pr.number
+        else:
+            assert "review_pr" not in kwargs and "review_level" not in kwargs
+            assert finding in kwargs["prompt"] and "Limit this review to confirming" in kwargs["prompt"]
         assert not (kwargs["worktree"] / "CLAUDE.local.md").exists()
         assert "## Review scope" in pr.body and finding not in pr.body
         assert git_command(kwargs["worktree"], "diff", "--cached", "--name-only") == ""
@@ -473,8 +481,11 @@ def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case,
         if checks == "ci":
             value = git_command(c.history.origin, "log", "-1", f"--format=%(trailers:key={EXCLUSIONS_TRAILER},valueonly)", head)
             assert json.loads(value) == [ACCEPTANCE]
+        message = next(messages)
+        raw = json.dumps({"result": message}) if not heads else (
+            "VERDICT: PASS" if message == "(none)" else message)
         heads.append(head)
-        return ExecResult(0, False, json.dumps({"result": next(messages)}), kwargs["log_path"])
+        return ExecResult(0, False, raw, kwargs["log_path"])
 
     c.ctx.executor_factory = lambda name: c.executor if name == "codex" else SimpleNamespace(run=review)
     assert run_issue(1, c.ctx) == outcome
@@ -634,14 +645,14 @@ def test_codex_review_gets_the_same_rules_without_a_temporary_scope_file(review_
 
 
 @pytest.mark.parametrize("fenced", [False, True])
-def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_raw_results(run_case, fenced):
+def test_native_json_findings_trigger_prompt_confirmation_and_save_raw_results(run_case, fenced):
     c = run_case
     c.executor.steps.append({})
     raw = json.dumps(REPORTED_JSON_FINDINGS, ensure_ascii=False, indent=2)
     if fenced:
         raw = f"```json\n{raw}\n```"
     raw = "VERDICT: FAIL\n" + raw
-    calls = enable_native_reviewer(c, [json.dumps({"result": raw}), json.dumps({"result": "VERDICT: PASS\n[]"})])
+    calls = enable_native_reviewer(c, [json.dumps({"result": raw}), "VERDICT: PASS"])
     assert run_issue(1, c.ctx) == "merged"
     assert len(calls) == len(c.executor.calls) == 2
     for item in REPORTED_JSON_FINDINGS:
@@ -650,7 +661,8 @@ def test_native_json_findings_trigger_repair_then_empty_array_passes_and_saves_r
     assert "Round 2: VERDICT: PASS" in c.tracker.created_prs[0].body
     directory = c.store.root / "runs/issue-1"
     assert (directory / "review-1.txt").read_text() == raw
-    assert (directory / "review-2.txt").read_text() == "VERDICT: PASS\n[]"
+    assert (directory / "review-2.txt").read_text() == "VERDICT: PASS"
+    assert raw in calls[1]["prompt"] and "review_level" not in calls[1]
     assert "CLAUDE.local.md" not in git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
     assert not c.store.worktree_path(1).exists()
 
@@ -664,7 +676,7 @@ def test_native_prose_empty_array_cannot_skip_defects_and_merge(run_case, fenced
     if fenced:
         raw = "VERDICT: FAIL\n" + raw
         c.executor.steps.append({})
-        messages = [json.dumps({"result": raw}), json.dumps({"result": "VERDICT: PASS\n[]"})]
+        messages = [json.dumps({"result": raw}), "VERDICT: PASS"]
     else:
         c.executor.steps.append({})
         messages = [json.dumps({"result": raw})] * 2
@@ -754,7 +766,7 @@ def test_native_review_findings_repair_and_reviewer_commits_are_restored(run_cas
         import_index(worktree, "Reviewer commit")
         (worktree / "feature.txt").write_text("unstaged edit")
 
-    calls = enable_native_reviewer(c, [json.dumps({"result": "VERDICT: FAIL\n" + finding}), json.dumps({"result": "VERDICT: PASS\n(none)"})], edit)
+    calls = enable_native_reviewer(c, [json.dumps({"result": "VERDICT: FAIL\n" + finding}), "VERDICT: PASS"], edit)
     assert run_issue(1, c.ctx) == "merged"
     assert len(calls) == len(c.executor.calls) == 2
     assert finding in c.executor.calls[1]["prompt"]
@@ -1029,6 +1041,43 @@ def test_failed_review_retains_retry_ceiling_without_a_defect_hold(run_case, exi
     assert "Reviewer still found defects" not in comments
 
 
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("exit_code,timed_out", [(1, False), (0, True)])
+def test_confirmation_failure_retains_retry_ceiling_without_a_defect_hold(run_case, native, exit_code, timed_out):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, review_max=1, max_retries=2)
+    # Supply a third attempt so losing the execution ceiling would silently merge.
+    c.executor.steps += [{}, {}]
+    finding = "VERDICT: FAIL\nfeature.txt:1 — the selected locale is lost"
+    calls = (enable_native_reviewer if native else enable_reviewer)(c, [
+        json.dumps({"result": finding}) if native else finding,
+        ExecResult(exit_code, timed_out, "VERDICT: PASS", Path("unused")),
+        "VERDICT: PASS",
+    ])
+    assert run_issue(1, c.ctx) == "review-failed"
+    assert len(calls) == len(c.executor.calls) == c.store.get_run(1).attempts == 2
+    assert finding in calls[1]["prompt"] and "review_level" not in calls[1]
+    assert not c.tracker.merged_prs
+    assert c.store.load_flag(1).reason == Reason.RETRIES_EXCEEDED
+    assert "Reviewer still found defects" not in "\n".join(comment.body for comment in c.tracker.list_comments(1))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_break_it_confirmation_cannot_lose_the_execution_ceiling(run_case, monkeypatch, native):
+    from foragent import run_review
+
+    result_type = run_review.ReviewResult
+
+    def lose_execution_failure(*args, **kwargs):
+        return result_type(*args, **{**kwargs, "execution_failed": False})
+
+    monkeypatch.setattr(run_review, "ReviewResult", lose_execution_failure)
+    with pytest.raises(AssertionError, match="review-failed"):
+        test_confirmation_failure_retains_retry_ceiling_without_a_defect_hold(run_case, native, 1, False)
+    assert run_case.store.get_run(1).outcome == "merged"
+    assert len(run_case.executor.calls) == 3
+
+
 def test_break_it_rejects_charging_unusable_reviews_as_defects(run_case, monkeypatch):
     """The handoff regression check must reject the old defect-budget behavior."""
     import inspect
@@ -1075,6 +1124,22 @@ def test_break_it_rejects_native_none_becoming_a_pass(run_case, monkeypatch):
     monkeypatch.setattr(run_review, "parse_code_review", none_passes)
     with pytest.raises(AssertionError, match="UNUSABLE"):
         test_empty_review_merges_without_rework_or_a_recorded_pass(run_case, True, "(none)")
+
+
+@pytest.mark.parametrize("case", ["full-message", "json", "fenced-json", "fenced-prose", "restored-commit"])
+def test_break_it_native_confirmation_rejects_a_false_first_pass(run_case, monkeypatch, case):
+    from foragent import run_review
+
+    monkeypatch.setattr(run_review, "parse_code_review", lambda message: run_review.ReviewResult("PASS", ""))
+    with pytest.raises(AssertionError):
+        if case == "full-message":
+            test_full_claude_verdict_survives_output_tail_truncation(run_case, monkeypatch)
+        elif case in {"json", "fenced-json"}:
+            test_native_json_findings_trigger_prompt_confirmation_and_save_raw_results(run_case, case == "fenced-json")
+        elif case == "fenced-prose":
+            test_native_prose_empty_array_cannot_skip_defects_and_merge(run_case, True)
+        else:
+            test_native_review_findings_repair_and_reviewer_commits_are_restored(run_case)
 
 
 def test_break_it_shared_retry_budget_rejects_an_extra_unusable_rework(run_case, monkeypatch):
