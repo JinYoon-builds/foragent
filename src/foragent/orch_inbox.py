@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -497,12 +498,17 @@ def note_location(environ: dict[str, str], title: str | None = None,
 
 def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
                where: dict[str, Any]) -> dict[str, Any]:
-    """Overwrite the orchestrator's latest note: what it does, why, what next, where."""
+    """Replace the latest note and journal a response for each issue it names."""
     if not now.strip():
         raise InboxError("--now must not be empty")
     record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
     store.root.mkdir(parents=True, exist_ok=True)
-    store._write_json(note_path(store), record)
+    summary = "\n".join(text for text in (now, why, next_step) if text)
+    with store._state_lock():
+        store._write_json(note_path(store), record)
+        for number in sorted({int(n) for n in re.findall(r"#(\d+)", summary)}):
+            append_event(store, datetime.fromisoformat(record["at"]), number, "acknowledged", summary,
+                         locked=True)
     return record
 
 
