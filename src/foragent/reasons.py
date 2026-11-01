@@ -43,6 +43,12 @@ GROUP: dict[Reason, str] = {
 }
 
 APPROVAL_MARKER = "<!-- foragent:approved"
+REASON_CODE = r"[a-z-]+"
+
+
+def is_reason_code(value: str) -> bool:
+    """Validate the marker's wire grammar, including codes unknown to this version."""
+    return re.fullmatch(REASON_CODE, value) is not None
 
 
 def format_comment(
@@ -57,7 +63,7 @@ def format_comment(
 def marked_reason(comment_body: str) -> str | None:
     """Read a blocker marker, including reason codes a newer version introduced."""
     first_line = comment_body.split("\n", 1)[0].removesuffix("\r")
-    match = re.fullmatch(r"<!-- foragent:(?:blocked|needs-human) reason=([a-z-]+) -->", first_line)
+    match = re.fullmatch(rf"<!-- foragent:(?:blocked|needs-human) reason=({REASON_CODE}) -->", first_line)
     return match[1] if match else None
 
 

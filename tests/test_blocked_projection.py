@@ -131,6 +131,21 @@ def test_machine_only_flag_keeps_its_local_contract(case):
     assert case.store.load_flag(1) is None
 
 
+@pytest.mark.parametrize("value,local_only", [
+    ("spec-question", False), ("future-reason", False),
+    ("RuntimeError: private detail", True), ("Traceback (most recent call last):\nValueError: private", True),
+    ("spec-question -->\nprivate text", True),
+])
+def test_legacy_flag_api_distinguishes_error_records_from_marker_codes(case, value, local_only):
+    case.store.update_local_issue(1, labels=["approved"])
+    case.store.save_flag(1, value)
+    stored = StateStore(case.store.root).load_local_flag(1)
+    assert stored.reason == value and stored.local_only is local_only
+    assert case.store.load_flag(1) == (stored if local_only else None)
+    assert orch.list_blocked(case) == []
+    assert orch_push.blocked_now(case.store) == {}
+
+
 def test_parent_local_notice_is_deduplicated_without_masking_a_shared_blocker(case, monkeypatch):
     from foragent import board, board_parents
 

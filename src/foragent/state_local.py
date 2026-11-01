@@ -83,7 +83,13 @@ class LocalRecordsMixin:
             (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
     def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None,
-                  local_only: bool = False) -> None:
+                  local_only: bool | None = None) -> None:
+        from foragent.reasons import is_reason_code
+
+        # The legacy API also accepts error text/tracebacks, not just shared marker codes.
+        # Classify that wire shape here, once; readers never infer current blockage from it.
+        if local_only is None:
+            local_only = not is_reason_code(reason)
         self._write_mapping(self.root / "flags" / f"{number}.json", _state.Flag, {
             "number": number, "reason": reason,
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
@@ -91,7 +97,7 @@ class LocalRecordsMixin:
         })
 
     def load_flag(self, number: int) -> Flag | None:
-        """Project a shared blocker from current issue facts, including pending intent."""
+        """Project the current shared blocker, while retaining explicitly local records."""
         from foragent.reasons import current_blocker
 
         snapshot = self._issue_record()
@@ -108,7 +114,7 @@ class LocalRecordsMixin:
         return local if local is not None and (local.local_only or not known) else None
 
     def load_local_flag(self, number: int) -> Flag | None:
-        """Read a machine-only flag; this record does not establish shared blockage."""
+        """Read stored local facts or error history; this does not establish shared blockage."""
         try:
             value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:
