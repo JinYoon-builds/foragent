@@ -9,7 +9,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 from tempfile import TemporaryDirectory
 import time
@@ -19,13 +18,13 @@ from foragent import capacity, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
-from foragent.records import load_record
+from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
@@ -33,7 +32,7 @@ from foragent.run_checks import CheckResult, trusts_ci
 from foragent.run_previous import retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
-from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
+from foragent.tracker import Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -164,11 +163,7 @@ def list_blocked(ctx: RunContext) -> list[dict]:
         if row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
-        comments = [load_record(Comment, item) for item in row["comments"]]
-        flags = [(comment, match[1]) for comment in comments
-                 if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
-                                           comment.body.splitlines()[0] if comment.body else ""))]
-        latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
+        latest = current_blocker(row, ctx.store.github_outbox())
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
             reviews.append({"path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})
@@ -179,8 +174,8 @@ def list_blocked(ctx: RunContext) -> list[dict]:
                 tail = "".join(deque(stream, maxlen=60))
         items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
-                      "blocked_at": latest[0].created_at if latest else None,
-                      "details": latest[0].body if latest else "",
+                      "blocked_at": latest[0]["created_at"] if latest else None,
+                      "details": latest[0]["body"] if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
     append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items

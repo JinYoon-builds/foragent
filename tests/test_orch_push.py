@@ -48,6 +48,11 @@ def label(case, n, *labels, state="open"):
     case.store.record_issue(Issue(n, f"Issue {n}", "", frozenset(labels), state), {})
 
 
+def marker(case, n, reason, label="blocked"):
+    case.store.record_comments(n, [{"id": 1, "body": f"<!-- foragent:{label} reason={reason} -->",
+                                   "author": "bot", "created_at": case.clock[0].isoformat()}])
+
+
 def kinds(store):
     path = store.root / "orch-events.jsonl"
     if not path.exists():
@@ -60,7 +65,7 @@ def test_first_tick_sends_one_combined_push_with_lowest_issue_link(case):
     label(case, 3, "needs-human")
     label(case, 5, "approved")
     label(case, 9, "blocked", state="closed")
-    case.store.save_flag(7, "retries-exceeded")
+    marker(case, 7, "retries-exceeded")
     assert orch_push.after_tick(case.ctx, spawned=False) == ([3, 7], False)
     assert len(case.pushes) == 1
     line = case.pushes[0]["line"]
@@ -91,19 +96,22 @@ def test_unblock_then_reblock_pushes_again(case):
 
 def test_reason_change_pushes_again(case):
     label(case, 4, "blocked")
-    case.store.save_flag(4, "stalled")
+    marker(case, 4, "stalled")
     orch_push.after_tick(case.ctx, spawned=False)
-    case.store.save_flag(4, "retries-exceeded")
+    marker(case, 4, "retries-exceeded")
     orch_push.after_tick(case.ctx, spawned=False)
     assert len(case.pushes) == 2 and "retries-exceeded" in case.pushes[1]["line"]
 
 
-def test_needs_human_reason_is_newest_escalation(case):
+def test_needs_human_reason_is_current_marker_even_when_journal_disagrees(case):
     label(case, 6, "needs-human")
     orch_push.after_tick(case.ctx, spawned=False)
     append_event(case.store, NOW, 6, "escalate", "#6: escalated to human; pick a schema")
     orch_push.after_tick(case.ctx, spawned=False)
-    assert len(case.pushes) == 2 and "pick a schema" in case.pushes[1]["line"]
+    assert len(case.pushes) == 1  # A historical local event does not change the blocker.
+    marker(case, 6, "spec-question", label="needs-human")
+    orch_push.after_tick(case.ctx, spawned=False)
+    assert len(case.pushes) == 2 and "spec-question" in case.pushes[1]["line"]
     orch_push.after_tick(case.ctx, spawned=False)
     assert len(case.pushes) == 2
 

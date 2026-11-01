@@ -20,8 +20,8 @@ from foragent.commands.orch import ALIVE_SECONDS
 from foragent.i18n import text
 from foragent.labels import BLOCKED, NEEDS_HUMAN
 from foragent.orch_events import append_event
+from foragent.reasons import current_blocker
 from foragent.state import StateStore
-from foragent.tracker import local_issue_models
 
 PUSH_BLOCKED = "push-blocked"
 PUSH_ORCH_OFF = "push-orch-off"
@@ -78,26 +78,23 @@ def tick_line(issues: list[int], outage: bool, language: str) -> str | None:
     return text("push_blocked_tick", language, items=", ".join(items)) if items else None
 
 
-def blocked_now(store: StateStore, events: list[dict]) -> dict[int, tuple[str, str]]:
+def blocked_now(store: StateStore) -> dict[int, tuple[str, str]]:
     """Open issues whose cached labels include blocked or needs-human: number -> (label, reason).
 
-    The reason is the local flag reason; for needs-human alone it is the newest
-    escalate event summary. Either is the empty string when there is no record.
+    The reason comes from the current GitHub marker, including undelivered intent.
+    The journal is an audit trail, not a source of current blocker reasons.
     """
-    escalations: dict[int, str] = {}
-    for event in events:
-        if event.get("kind") == "escalate" and isinstance(event.get("issue"), int):
-            escalations[event["issue"]] = str(event.get("summary", ""))
     current = {}
-    for issue in local_issue_models(store):
-        waiting = issue.labels & {BLOCKED, NEEDS_HUMAN}
-        if issue.state != "open" or issue.is_pull_request or not waiting:
+    pending = store.github_outbox()
+    for row in store.local_issues():
+        waiting = set(row["labels"]) & {BLOCKED, NEEDS_HUMAN}
+        if row["state"] != "open" or not waiting:
             continue
-        flag = store.load_flag(issue.number)
+        marker = current_blocker(row, pending)
         if BLOCKED in waiting:
-            current[issue.number] = (BLOCKED, flag.reason if flag is not None else "")
+            current[row["number"]] = (BLOCKED, marker[1] if marker else "")
         else:
-            current[issue.number] = (NEEDS_HUMAN, escalations.get(issue.number, ""))
+            current[row["number"]] = (NEEDS_HUMAN, marker[1] if marker else "")
     return current
 
 
@@ -126,7 +123,7 @@ def after_tick(ctx, spawned: bool) -> tuple[list[int], bool]:
     for event in events:
         if event.get("kind") == PUSH_BLOCKED and isinstance(event.get("issue"), int):
             pushed_reason[event["issue"]] = str(event.get("reason", ""))
-    current = blocked_now(store, events)
+    current = blocked_now(store)
     due = sorted(n for n, (_, reason) in current.items()
                  if n not in pushed_reason or pushed_reason[n] != reason
                  or (previous is not None and n not in previous))

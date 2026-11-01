@@ -82,13 +82,33 @@ class LocalRecordsMixin:
         with self._state_lock():
             (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
-    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
+    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None,
+                  local_only: bool = False) -> None:
         self._write_mapping(self.root / "flags" / f"{number}.json", _state.Flag, {
             "number": number, "reason": reason,
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
+            **({"local_only": True} if local_only else {}),
         })
 
     def load_flag(self, number: int) -> Flag | None:
+        """Project a shared blocker from current issue facts, including pending intent."""
+        from foragent.reasons import current_blocker
+
+        snapshot = self._issue_record()
+        row = snapshot["issues"].get(str(number))
+        if row is not None:
+            visible = self._visible(snapshot, row)
+            if (marker := current_blocker(visible, self._pending(snapshot))) is not None:
+                comment, reason = marker
+                return _state.Flag(number, reason, comment["created_at"])
+        # Compatibility before the first observation; a known issue never falls back
+        # to a historical shared blocker. Explicit machine-only facts stay local.
+        local = self.load_local_flag(number)
+        known = row is not None or snapshot.get("complete_at") or str(number) in snapshot.get("absent", {})
+        return local if local is not None and (local.local_only or not known) else None
+
+    def load_local_flag(self, number: int) -> Flag | None:
+        """Read a machine-only flag; this record does not establish shared blockage."""
         try:
             value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:

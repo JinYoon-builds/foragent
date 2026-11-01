@@ -1,5 +1,6 @@
 """Machine-readable comments for decisions and approval snapshots."""
 
+from datetime import datetime
 from enum import StrEnum
 import re
 from typing import Literal
@@ -53,13 +54,41 @@ def format_comment(
     return f"{body}\n\n{details}" if details else body
 
 
-def parse_reason(comment_body: str) -> Reason | None:
+def marked_reason(comment_body: str) -> str | None:
+    """Read a blocker marker, including reason codes a newer version introduced."""
     first_line = comment_body.split("\n", 1)[0].removesuffix("\r")
     match = re.fullmatch(r"<!-- foragent:(?:blocked|needs-human) reason=([a-z-]+) -->", first_line)
-    if match is None:
+    return match[1] if match else None
+
+
+def current_blocker(row: dict, pending=()) -> tuple[dict, str] | None:
+    """Current waiting labels own blockage; comments supply its reason and actual time.
+
+    Pending comments are explicit undelivered intent, in outbox FIFO order.
+    They take precedence over delivered comments until observation ingest retires them.
+    """
+    labels = set(row.get("labels", ())) & {"blocked", "needs-human"}
+    if row.get("state") != "open" or not labels:
         return None
+
+    def relevant(body):
+        return marked_reason(body) is not None and any(
+            body.startswith(f"<!-- foragent:{label} ") for label in labels)
+
+    intents = [entry for entry in pending if entry["issue"] == row["number"]
+               and entry["action"] == "comment" and relevant(entry["body"])]
+    if intents:
+        entry = intents[-1]
+        comment = {"body": entry["body"], "created_at": entry["queued_at"], "id": -entry["id"]}
+    else:
+        comments = [comment for comment in row.get("comments", ()) if relevant(comment["body"])]
+        comment = max(comments, key=lambda c: (datetime.fromisoformat(c["created_at"]), c["id"]), default=None)
+    return (comment, marked_reason(comment["body"])) if comment else None
+
+
+def parse_reason(comment_body: str) -> Reason | None:
     try:
-        return Reason(match[1])
+        return Reason(marked_reason(comment_body))
     except ValueError:
         return None
 

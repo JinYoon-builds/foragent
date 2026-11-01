@@ -13,6 +13,7 @@ from foragent import cli, orch, runner
 from foragent.executors import ExecResult
 from foragent.issue import body_hash
 from foragent.reasons import Reason
+from foragent.state import Flag
 
 
 @pytest.fixture
@@ -112,6 +113,7 @@ def test_failed_review_merge_does_not_reinstall(review_case, monkeypatch):
 ])
 def test_review_rate_limit_remains_a_local_wait_including_audit_cleanup(review_case, monkeypatch, entry, operation):
     c = review_case
+    original_blocker = Flag(1, "review-dispute", c.now[0].isoformat())
     until = c.now[0] + timedelta(minutes=10)
     failed = False
     followups = []
@@ -143,7 +145,9 @@ def test_review_rate_limit_remains_a_local_wait_including_audit_cleanup(review_c
     assert failed
     assert c.store.get_run(1).waiting_until == until.isoformat()
     assert c.store.get_run(1).outcome == "limit-wait"
-    assert c.store.load_flag(1) is None
+    # A read refused before review starts leaves the existing GitHub blocker intact;
+    # later failures occur after the waiting labels were removed. Neither creates a blocker.
+    assert c.store.load_flag(1) == (original_blocker if operation == "get_issue" else None)
 
 
 def test_resolve_queues_ci_repair_without_changing_the_verdict_head(review_case):
