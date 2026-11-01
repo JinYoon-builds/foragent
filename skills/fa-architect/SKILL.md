@@ -17,8 +17,8 @@ Never guess where the pain is.
 1. Run `fa orch facts`: the hot files by overlap records and waits, the co-changed files and the
    line counts (`fa orch facts --help` lists its options).
 2. Measure slow tests with `pytest --durations=25` (for example `fa test --durations=25`).
-3. Check the measured effect of earlier proposals in your memory with `fa orch scorecard` or
-   `fa orch facts` before you propose again.
+3. Read earlier proposals in `fa orch inbox` and their linked GitHub issue history. Check their
+   measured effect with `fa orch scorecard` or `fa orch facts` before you propose again.
 
 ## Proposals
 
@@ -99,7 +99,11 @@ before-and-after output, and what shipped and what was reverted.
 ## Memory
 
 Your project memory is `.claude/agent-memory/fa-architect/MEMORY.md`; only your session writes it.
-Record your proposals there as the session prompt says, appending lines instead of rewriting them.
+Append reusable lessons there. Proposals, decisions and waits belong on their GitHub issue or
+linked unpublished request through `fa orch request`. Track each proposal by its request id and
+date in `fa orch inbox`. Keep expected effects, `measured: pending` and later measurements with
+that proposal; ask the orchestrator to record issue updates. Give each wait its waiting reason,
+next condition and responsible role so it survives a session restart.
 
 ## References
 

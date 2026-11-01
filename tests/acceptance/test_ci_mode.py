@@ -795,7 +795,15 @@ def test_green_ci_without_usable_all_shard_comparison_holds_unprotected_merge(
     case = mode_case(git_history, tmp_path, monkeypatch)
     case.ci.damage = damage
     outcome = run(case)
-    assert_infrastructure_hold(case, outcome)
+    if damage == "failed-run":
+        # Keep the captured node ID: completed evidence is still the feature,
+        # and conclusion alone no longer invalidates complete trusted reports.
+        assert outcome == "merged", "A completed failure conclusion does not invalidate usable artifacts"
+        assert case.tracker.merged_prs == [2] and len(case.implementer.calls) == 1
+        assert case.ci.artifact_reads and len(set(case.ci.downloads)) == case.config.ci_shards
+        comparison_record(case, "ci")
+    else:
+        assert_infrastructure_hold(case, outcome)
     assert case.ci.reads, "Look for acceptance evidence even when all ordinary checks are green"
     assert_remote_only(case)
 
