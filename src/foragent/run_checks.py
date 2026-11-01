@@ -239,7 +239,28 @@ def _record_related_check(
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
 
 
-def junit_failing_ids(report: Path, exit_code: int | None) -> frozenset[str] | None:
+def _related_node_id(case: ET.Element, selected: list[str]) -> str | None:
+    """Recover the collected node, not its possibly imported definition's file.
+
+    pytest builds classname from nodeid but file from report.location. Resolve
+    the dotted module against the selection; ambiguous addresses prove nothing.
+    Related reports clear junit-prefix so classname starts with that module.
+    """
+    classname, name = case.get("classname", ""), case.get("name")
+    if not name:
+        return None
+    matches = set()
+    for path in selected:
+        module = path.removesuffix(".py").replace("/", ".")
+        if classname == module or classname.startswith(module + "."):
+            classes = classname[len(module):].lstrip(".").replace(".", "::")
+            matches.add("::".join(part for part in (path, classes, name) if part))
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def junit_failing_ids(
+    report: Path, exit_code: int | None, selected: list[str] | None = None,
+) -> frozenset[str] | None:
     """Failing node ids of a pytest run that the report fully explains, else None.
 
     Only an exit of 0 or 1 whose report names every failing node counts: a
@@ -251,11 +272,13 @@ def junit_failing_ids(report: Path, exit_code: int | None) -> frozenset[str] | N
         tree = ET.parse(report)
     except (OSError, ET.ParseError):
         return None
+    if tree.getroot().tag not in {"testsuites", "testsuite"}:
+        return None
     if tree.find(".//error[@message='collection failure']") is not None:
         return None
     failing = set()
     for case in tree.iter("testcase"):
-        node_id = junit_node_id(case)
+        node_id = junit_node_id(case) if selected is None else _related_node_id(case, selected)
         if node_id is None:
             return None
         if any(case.find(tag) is not None for tag in ("failure", "error")):
@@ -271,17 +294,21 @@ def split_base_failures(head: frozenset[str], base: frozenset[str] | None) -> tu
 
 
 def _related_base_failures(
-    n: int, ctx: RunContext, worktree: Path, unit_command: str, failing: frozenset[str], base_sha: str, limit: int,
+    n: int, ctx: RunContext, unit_command: str, failing: frozenset[str], base_sha: str, limit: int,
 ) -> frozenset[str] | None:
     """Run the files holding head failures on a fresh base checkout; None when unmeasured."""
     import tempfile
     from foragent import runner
     from foragent.run_baseline import _with_python_path
 
+    if runner._remaining(n, ctx) <= 0:
+        return None
     report = ctx.store.root / "runs" / f"issue-{n}-related-base.xml"
     report.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="foragent-related-base-") as directory:
-        checkout = Path(directory) / "worktree"
+        # pytest resolves rootdir; use the same identity for absolute selections
+        # when the temporary root is a symlink (for example macOS /var).
+        checkout = (Path(directory) / "worktree").resolve()
         ctx.git.add_detached_worktree(checkout, base_sha)
         try:
             # Whole files: a node id that exists only on head would stop pytest before it runs anything.
@@ -289,15 +316,23 @@ def _related_base_failures(
                            if (checkout / name).is_file())
             if not files:
                 return frozenset()
-            junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+            junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy --junit-prefix="
             # The base sources must win over the head's editable installation (or an inherited
             # PYTHONPATH): otherwise a head regression would fail on "base" too and be exempted.
             roots = os.pathsep.join(str(root) for root in (checkout / "src", checkout) if root.is_dir())
-            command = _with_python_path(f"{unit_command} {junit} {shlex.join(files)}", roots)
+            # Qualify the comparison selection with its checkout, independently of
+            # the head's repo-relative related-check request and its retry history.
+            paths = [str(checkout / name) for name in files]
+            command = _with_python_path(f"{unit_command} {junit} {shlex.join(paths)}", roots)
+            # The head check and checkout preparation have already consumed run
+            # time. Queue waits are credited by the slot, not charged again here.
+            base_limit = min(limit, runner._remaining(n, ctx))
+            if base_limit <= 0:
+                return None
             result = runner._check(command, checkout, ctx.store.log_path(n),
-                                   limit, progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                                   base_limit, progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
                                    clock=ctx.monotonic, full_text_dir=cuts.issue_dir(ctx.store.root, n))
-            return None if result.timed_out else junit_failing_ids(report, result.exit_code)
+            return None if result.timed_out else junit_failing_ids(report, result.exit_code, files)
         finally:
             report.unlink(missing_ok=True)
             ctx.git.remove_worktree(checkout)
@@ -320,22 +355,29 @@ def run_related_check(
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
-    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
+    junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy --junit-prefix="
     result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
                            progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                            full_text_dir=cuts.issue_dir(ctx.store.root, n))
     base: dict | None = None
-    failing = None if result.timed_out else junit_failing_ids(report, result.exit_code)
+    failing = None if result.timed_out else junit_failing_ids(report, result.exit_code, unit_tests)
     base_sha = None
     if failing and base_ref:
         try:
             base_sha = ctx.git.at(worktree)._own_base(base_ref)
-        except GitError:
+        except (GitError, OSError):
             base_sha = None  # an unknown base proves no failure on it
     if failing and base_sha:
-        exempt, blocking = split_base_failures(
-            failing, _related_base_failures(n, ctx, worktree, unit_command, failing, base_sha, limit))
-        base = {"base_sha": base_sha, "base_failing": sorted(exempt)}
+        try:
+            base_failures = _related_base_failures(n, ctx, unit_command, failing, base_sha, limit)
+        except (GitError, OSError) as exc:
+            # Checkout creation, report I/O and cleanup can all make a base
+            # measurement unavailable. Keep the head failure and its record.
+            _append(ctx.store.log_path(n), f"Related base comparison unavailable: {exc}")
+            base_failures = None
+        exempt, blocking = split_base_failures(failing, base_failures)
+        if exempt:
+            base = {"base_sha": base_sha, "base_failing": sorted(exempt)}
         _append(ctx.store.log_path(n),
                 f"Related base comparison: base_failing={sorted(exempt)} blocking={sorted(blocking)}")
         if not blocking:
