@@ -31,6 +31,16 @@ def scorecard_case(git_history, tmp_path, monkeypatch):
 
 def completed_run(case, number, *, finished, minutes=10, outcome="merged", detail=""):
     case.clock[0] = finished - timedelta(minutes=minutes)
+    # These legacy scorecard scenarios intend approval and run start to coincide.
+    # Make that fact explicit for approval-to-merge measurement. A caller's
+    # earlier approval remains authoritative; missing history is tested separately.
+    if case.store.load_approval(number) is None:
+        from foragent.issue import body_hash
+
+        body = f"Scorecard fixture #{number}"
+        case.store.save_approval(number, body=body, body_sha=body_hash(body),
+                                 acceptance_blobs={}, approved_by="human",
+                                 approved_at=case.clock[0].isoformat())
     case.store.start_run(number, branch=f"foragent/issue-{number}",
                          worktree=case.store.worktree_path(number))
     case.clock[0] = finished
