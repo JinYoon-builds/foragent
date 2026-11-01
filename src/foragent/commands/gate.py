@@ -235,7 +235,5 @@ def run(args) -> int:
             repo=repo, repo_root=root, tracker=tracker, store=store,
             config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
         ))
-        if outcome == "refused":  # Another person's work (#1004): its one line, nothing done.
-            print(store.get_run(args.number).detail, file=cli.sys.stderr)
         return 1 if outcome in {"error", "refused"} else 0
     return 0

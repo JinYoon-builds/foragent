@@ -185,8 +185,9 @@ class IssueSnapshotMixin:
             facts, seen = _observations.latest(snapshot, number)
             # Only a read that started after the write judges it now; one stored at the same
             # instant was ingested before the write began.
-            lost = started_at is not None and seen is not None and seen > started_at and self._retire(
-                snapshot, number, facts, seen)
+            lost = (started_at is not None and seen is not None and seen > started_at
+                    and (facts is not None or _observations.seen_as_issue(snapshot, number))
+                    and self._retire(snapshot, number, facts, seen))
             if dropped is not None:
                 dropped.append(bool(lost))
             if action != "comment" and not _observations.tombstoned(snapshot, number, when) and any(

@@ -573,7 +573,8 @@ class RecordingTracker:
         if not self._context.store.github_outbox():
             return
         with orch_scope.replaying(self._context):
-            self._flush_outbox()
+            if orch_scope.scope(self._context).usable:  # An unreadable team setting judges nothing: writes wait.
+                self._flush_outbox()
 
     def _flush_outbox(self):
         """Deliver the pending intents in queue order against one refreshed ownership snapshot;

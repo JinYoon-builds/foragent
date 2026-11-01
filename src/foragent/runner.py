@@ -512,6 +512,8 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
+        if outcome == "refused":  # Ownership lost during the run: its one line, like an entry refusal.
+            print(detail, file=sys.stderr)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())

@@ -85,9 +85,17 @@ def _judged_by_person(premise: dict[str, Any], expected: dict[str, Any]) -> str:
     return "refused" if owners(premise) != owners(expected) else "dropped"
 
 
-def pr_numbers(snapshot: dict[str, Any]) -> set[int]:
-    """PRs known through their issue's row; an issue listing never shows a PR, so it says nothing of them."""
-    return {row["pr_number"] for row in snapshot["issues"].values() if row.get("pr_number")}
+def seen_as_issue(snapshot: dict[str, Any], number: int) -> bool:
+    """A read showed this number as an issue. A number known only through a queued write may be a PR,
+    which an issue listing never shows, so a listing's silence says nothing about it (#1004)."""
+    row = snapshot["issues"].get(str(number)) or {}
+    return (str(number) in snapshot.get("absent", {})
+            or any(row.get(key) for key in ("observed_at", "observed", "title", "labels")))
+
+
+def missing_from_listing(snapshot: dict[str, Any], listed: set[int]) -> list[int]:
+    """The known issues a complete listing's omission observes as missing."""
+    return sorted(number for number in known_numbers(snapshot) - listed if seen_as_issue(snapshot, number))
 
 
 def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any],
@@ -316,8 +324,7 @@ class IssueObservationsMixin:
                 if (stamp(snapshot.get("complete_at")) or EARLIEST) <= started_at:
                     snapshot["complete_at"] = started_at.isoformat()
                     changed = True
-                shown_prs = {issue.number for issue in issues if issue.is_pull_request}
-                for number in sorted(known_numbers(snapshot) - seen - shown_prs - pr_numbers(snapshot)):
+                for number in missing_from_listing(snapshot, seen):
                     outcome = self._observe(snapshot, number, None, started_at, lanes)
                     changed |= outcome != "stale"
                     if outcome == "dropped":
@@ -361,7 +368,7 @@ class IssueObservationsMixin:
                 attempt["final"] = True
             intent.setdefault("attempts", []).append(attempt)
             facts, seen = latest(snapshot, intent["issue"])
-            if ok and seen is not None and seen > started_at:
+            if ok and seen is not None and seen > started_at and (facts is not None or seen_as_issue(snapshot, intent["issue"])):
                 # A read that started during this send was stored before the send completed:
                 # it judges the now sent intent by the same rule as a later read.
                 self._retire(snapshot, intent["issue"], facts, seen)

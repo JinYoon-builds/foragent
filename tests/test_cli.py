@@ -1013,3 +1013,14 @@ def test_dream_workload_reuses_its_run_slot_and_releases_on_exit(app, monkeypatc
     assert calls == ["main"]
     assert capacity_sessions.read(store.root) == []
     assert capacity.machine_runs(store, NOW) == 0
+
+
+def test_gate_run_issue_adds_no_second_line_to_a_refusal(app, monkeypatch, capsys):
+    """The runner prints the one refusal line; a stored run's old detail must not follow it (#1004)."""
+    root, _, _, store, _ = app
+    store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
+    store.finish_run(1, "blocked", detail="An older run's long detail")
+    monkeypatch.setattr(cli, "run_issue", lambda n, ctx: print("#1 is worked by bob", file=sys.stderr) or "refused")
+
+    assert cli.main(["gate", "run-issue", "1", "--repo-root", str(root)]) == 1
+    assert capsys.readouterr().err.splitlines() == ["#1 is worked by bob"]

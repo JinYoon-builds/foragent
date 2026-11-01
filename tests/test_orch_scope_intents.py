@@ -317,3 +317,231 @@ def test_a_new_tick_never_reuses_the_last_ticks_decisions_and_reads_identity_onc
 
     assert decided == [False]
     assert len(logins) == 1
+
+
+def config_case(tmp_path, content, *, local=None, unreadable=False):
+    from foragent.scheduler_config import record_tick_config
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Unlabelled", "")
+    tracker.add_issue(2, "Bob's", "", labels=["by:bob"])
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(legacy_owner=local))
+    recorder = RecordingTracker(tracker, context, queue_writes=True)
+    context.tracker = recorder
+    store.refresh_local_issues([tracker.get_issue(1), tracker.get_issue(2)], [], {}, NOW)
+    record_tick_config(store, "origin/main:.foragent.yml", content, unreadable=unreadable)
+    return store, tracker, recorder, context
+
+
+@pytest.mark.parametrize("content, local, unreadable", [
+    ("legacy_owner: 'not a login!'\n", None, False),  # A team setting that does not validate.
+    ("legacy_owner: alice\nbroken: [\n", None, False),  # A file naming one that does not parse.
+    ("broken: [\n", "alice", False),  # A team factory whose committed file does not parse.
+    (None, "alice", True),  # A team factory whose committed file cannot be read.
+    (None, None, True),  # Any factory: an unreadable origin file may hold a team setting.
+    ("\"legacy_owner\": 'not a login!'\n", None, False),  # Quoted key.
+    ("{legacy_owner: 'not a login!'}\n", None, False),  # Flow mapping.
+    ("? legacy_owner\n: 'not a login!'\n", None, False),  # Explicit key.
+])
+def test_an_unreadable_team_setting_authorizes_nothing_and_keeps_queued_writes(tmp_path, content, local, unreadable):
+    from foragent import orch_scope
+
+    store, tracker, recorder, context = config_case(tmp_path, content, local=local, unreadable=unreadable)
+    store.queue_github_write(1, "comment", body="Waits for a valid setting")
+
+    assert orch_scope.may_write(context, 1) is False
+    recorder.comment(1, "Refused")
+    recorder.add_labels(1, ["blocked"])
+    recorder.flush_outbox()
+
+    assert tracker.list_comments(1) == [] and "blocked" not in tracker.get_issue(1).labels
+    assert [entry["body"] for entry in store.github_outbox()] == ["Waits for a valid setting"]
+    assert store.refused_github_writes() == []
+    assert orch_scope.check(SimpleNamespace(store=store, config=context.config, tracker=recorder), 1) is not None
+
+
+@pytest.mark.parametrize("content", ["broken: [\n", None])
+def test_a_singleton_repo_keeps_its_local_config_when_origin_has_no_team_setting(tmp_path, content):
+    from foragent import orch_scope
+
+    _, tracker, recorder, context = config_case(tmp_path, content)
+    assert orch_scope.may_write(context, 1) is True
+    assert orch_scope.may_write(context, 2) is False  # An owner label still counts.
+    recorder.comment(1, "Mine")
+    assert [c.body for c in tracker.list_comments(1)] == ["Mine"]
+
+
+def test_a_valid_committed_team_setting_overrides_a_stale_local_config(tmp_path):
+    from foragent import orch_scope
+
+    _, tracker, recorder, context = config_case(tmp_path, "legacy_owner: bob\n")
+    assert context.config.legacy_owner is None
+    assert orch_scope.may_write(context, 1) is False  # Unlabelled work is Bob's, whatever this checkout says.
+    recorder.comment(1, "Refused")
+    assert tracker.list_comments(1) == []
+
+
+def test_a_pre_upgrade_foreign_entry_is_refused_and_lets_owned_writes_through(tmp_path):
+    store, tracker, recorder = queue_case(tmp_path, (1, ["by:bob"]), (2, ["by:alice"]))
+    snapshot = json.loads((store.root / "issues.json").read_text())
+    snapshot.setdefault("outbox", []).extend([  # The shape before intents had a premise or attempts.
+        {"id": 1, "issue": 1, "action": "comment", "body": "Old foreign", "queued_at": NOW.isoformat()},
+        {"id": 2, "issue": 2, "action": "comment", "body": "Old owned", "queued_at": NOW.isoformat()},
+    ])
+    snapshot["outbox_sequence"] = 2
+    (store.root / "issues.json").write_text(json.dumps(snapshot))
+
+    recorder.flush_outbox()
+
+    assert tracker.list_comments(1) == []
+    assert [c.body for c in tracker.list_comments(2)] == ["Old owned"]
+    assert store.github_outbox() == [] and store.github_blocking_outbox() == []
+    [refused] = store.refused_github_writes()
+    assert refused["body"] == "Old foreign" and "bob" in refused["refused"]
+    assert [(e["kind"], e["owner"]) for e in events(store)] == [("ownership-refused", "bob")]
+
+
+def test_a_foreign_running_label_never_reaches_a_signal(git_history, tmp_path, monkeypatch):
+    from foragent import scheduler
+    from test_orch_review_handoff import make_case, tick_context
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    object.__setattr__(case.ctx.config, "legacy_owner", "alice")
+    monkeypatch.setattr(case.tracker, "authenticated_login", lambda **kw: "alice", raising=False)
+    case.tracker.add_issue(9, "Bob's running work", "", labels=["by:bob", "running"])
+    killed = []
+    ctx = tick_context(case, start_runs=False)
+    ctx.kill_runner = killed.append
+
+    scheduler.tick(ctx)
+
+    assert killed == []
+    assert sorted(case.tracker.get_issue(9).labels) == ["by:bob", "running"]
+    assert ctx.store.get_run(9) is None
+
+
+def test_a_foreign_blocker_holds_owned_work_until_it_really_closes(git_history, tmp_path, monkeypatch):
+    from foragent import scheduler
+    from foragent.tracker import Issue
+    from test_orch_review_handoff import make_case, tick_context
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    object.__setattr__(case.ctx.config, "legacy_owner", "alice")
+    monkeypatch.setattr(case.tracker, "authenticated_login", lambda **kw: "alice", raising=False)
+    case.store.finish_run(1, "blocked")
+    case.tracker.remove_labels(1, ["running"])
+    case.tracker.add_labels(1, ["by:alice"])
+    case.tracker.add_issue(7, "Bob's", "", labels=["by:bob"])
+    state = ["open"]
+    monkeypatch.setattr(scheduler, "_blockers", lambda ctx, n, confirmed=False: [
+        Issue(7, "Bob's", "", frozenset({"by:bob"}), state[0], state_reason="completed" if state[0] == "closed" else None)])
+    ctx = tick_context(case)
+    issue, approval = case.tracker.get_issue(1), case.store.load_approval(1)
+
+    assert scheduler._check_prerequisites(ctx, issue, approval, scheduler.TickReport()) is False
+    state[0] = "closed"
+    assert scheduler._check_prerequisites(ctx, issue, approval, scheduler.TickReport()) is True
+    assert sorted(case.tracker.get_issue(7).labels) == ["by:bob"] and case.tracker.list_comments(7) == []
+
+
+@pytest.mark.parametrize("labels, owned", [(["by:bob"], False), (["by:alice"], True)])
+def test_an_issue_observed_after_the_snapshot_is_judged_without_another_read(tmp_path, labels, owned):
+    from foragent import orch_scope
+
+    store, tracker, recorder = queue_case(tmp_path, (1, ["by:alice"]))
+    context = recorder._context
+    assert orch_scope.may_write(context, 1) is True  # The snapshot is taken here, without #2.
+    issue = tracker.add_issue(2, "Later", "", labels=labels)
+    store.record_issue(issue, {})
+    reads = []
+    tracker.get_issue = lambda n: reads.append(n) or issue
+
+    assert orch_scope.may_write(context, 2) is owned
+    assert reads == []
+
+
+@pytest.mark.parametrize("record", ["{not json", '{"source": "x"}', "[]"])
+def test_a_broken_config_record_authorizes_nothing(tmp_path, record):
+    from foragent import orch_scope
+    from foragent.scheduler_config import TICK_CONFIG_FILE
+
+    store, tracker, _, context = config_case(tmp_path, "max_parallel: 1\n")
+    (store.root / TICK_CONFIG_FILE).write_text(record, encoding="utf-8")
+    context._scope = None
+    assert orch_scope.may_write(context, 1) is False
+
+
+@pytest.mark.parametrize("read", ["bulk", "listing"])
+@pytest.mark.parametrize("state", ["open", "closed"])
+def test_a_listing_keeps_a_queued_write_on_an_older_pr(tmp_path, read, state):
+    """Neither listing shows it; only the replay can say what the number is."""
+    store, tracker, recorder = queue_case(tmp_path, (1, ["by:bob"]))
+    older = tracker.create_pr(head="foragent/issue-1", base="main", title="Old", body="")
+    newer = tracker.create_pr(head="foragent/issue-1", base="main", title="New", body="")
+    if state == "closed":
+        tracker.close_pr(older)
+    store.update_local_issue(1, pr_number=newer)
+    store.queue_github_write(older, "comment", body="Keep me")
+
+    if read == "listing":
+        recorder.list_issues("all")
+    else:
+        store.refresh_local_issues([tracker.get_issue(1)], [], {}, NOW)
+
+    assert [entry["body"] for entry in store.github_outbox()] == ["Keep me"]
+    assert [e["kind"] for e in events(store)] == []
+
+    recorder.flush_outbox()
+    assert store.github_outbox() == [] and tracker.list_comments(older) == []
+    assert [entry["body"] for entry in store.refused_github_writes()] == ["Keep me"]
+
+
+def test_a_known_issue_missing_from_a_listing_still_drops_its_writes(tmp_path):
+    store, tracker, _ = queue_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]))
+    store.queue_github_write(2, "comment", body="Gone with the issue")
+
+    store.refresh_local_issues([tracker.get_issue(1)], [], {}, NOW)
+
+    assert store.github_outbox() == []
+    assert store.refused_github_writes() == []
+
+
+def test_a_write_queued_for_an_unknown_number_truly_gone_is_dropped_at_replay(tmp_path):
+    store, tracker, recorder = queue_case(tmp_path, (1, ["by:alice"]))
+    store.queue_github_write(99, "comment", body="Nobody")
+
+    recorder.flush_outbox()  # Scoped as absent: the send's own 404 retires it.
+
+    assert store.github_outbox() == []
+
+
+def test_foreign_run_issue_prints_one_line(git_history, tmp_path, monkeypatch, capsys):
+    from foragent.runner import run_issue
+    from test_orch_review_handoff import make_case
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    object.__setattr__(case.ctx.config, "legacy_owner", "alice")
+    monkeypatch.setattr(case.tracker, "authenticated_login", lambda **kw: "alice", raising=False)
+    case.tracker.add_labels(1, ["by:bob"])
+
+    assert run_issue(1, case.ctx) == "refused"
+
+    captured = capsys.readouterr()
+    assert len(captured.err.splitlines()) == 1 and "bob" in captured.err and captured.out == ""
+
+
+def test_ownership_lost_during_a_run_prints_its_one_line(git_history, tmp_path, monkeypatch, capsys):
+    from foragent import runner
+    from foragent.run_attempt import OwnershipLost
+    from test_orch_review_handoff import make_case
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    case.store.finish_run(1, "blocked")
+    case.tracker.remove_labels(1, ["running"])
+    monkeypatch.setattr(runner, "kick_tick", lambda root: None)
+    monkeypatch.setattr(runner, "_execute", lambda n, ctx, worktree: (_ for _ in ()).throw(OwnershipLost("#1 is Bob's now")))
+
+    assert runner.run_issue(1, case.ctx) == "refused"
+
+    assert capsys.readouterr().err.splitlines() == ["#1 is Bob's now"]

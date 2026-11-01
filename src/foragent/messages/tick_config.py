@@ -3,10 +3,13 @@
 MESSAGES = {
     "en": {
         "tick_config_fallback": "{ref} .foragent.yml is missing or invalid; this tick uses the local .foragent.yml.",
+        "tick_config_team_invalid": (
+            "{ref} .foragent.yml cannot confirm team ownership; no issue is worked or changed until it is fixed."),
         "tick_config_key_ignored": "{ref} .foragent.yml sets {key} differently; this tick keeps the local {key}.",
     },
     "ko": {
         "tick_config_fallback": "{ref}의 .foragent.yml이 없거나 잘못됐어요. 이번 tick은 local .foragent.yml을 써요",
+        "tick_config_team_invalid": "{ref}의 .foragent.yml로 팀 소유권을 확인할 수 없어요. 고칠 때까지 이슈를 처리하거나 바꾸지 않아요",
         "tick_config_key_ignored": "{ref}의 .foragent.yml이 {key}를 다르게 정했어요. 이번 tick은 local {key}를 그대로 써요",
     },
 }

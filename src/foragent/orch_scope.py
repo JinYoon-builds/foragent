@@ -10,6 +10,7 @@ from contextlib import contextmanager
 
 from foragent.i18n import text
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, parse_orderer, require_owned
+from foragent.scheduler_config import ownership_config
 from foragent.tracker import Issue, RecordingTracker, TrackerError, pr_issue_number
 
 ISSUE_VERBS = frozenset({"stop", "retry", "park", "unpark", "resolve", "rerun-review", "escalate"})
@@ -45,6 +46,17 @@ def _rows(store) -> list[dict]:
         return store.local_issues()
     except (AttributeError, OSError, ValueError):
         return []
+
+
+def _stored_rows(store) -> list[dict]:
+    """Each issue's latest observation (any read), never a pending intent's effect."""
+    return store.observed_issues() if hasattr(store, "observed_issues") else _rows(store)
+
+
+def _observed_rows(store) -> list[dict]:
+    """The stored rows a read has shown, without placeholder rows that only hold a link or a queued write."""
+    return [row for row in _stored_rows(store)
+            if row.get("observed_at") or row.get("observed") or row.get("title") or row.get("labels")]
 
 
 def _model(number: int, facts: dict) -> Issue:
@@ -124,6 +136,7 @@ class Scope:
     def __init__(self, ctx, issue=None, *, issues=None):
         self._ctx, self._login, self._read = ctx, None, False
         self.reader = getattr(ctx, "tracker", None)
+        self._config = None
         self.entry = False
         self._issues, self._prs, self._decisions = None, {}, {}
         if issues is not None or issue is not None:
@@ -136,11 +149,24 @@ class Scope:
         if self._issues is not None:
             return
         store = getattr(self._ctx, "store", None)
-        # The latest observation (any read), never a pending intent's effect.
-        rows = store.observed_issues() if hasattr(store, "observed_issues") else _rows(store)
-        self._issues = {row["number"]: _model(row["number"], row) for row in rows
-                        if row.get("observed_at") or row.get("observed") or row.get("title") or row.get("labels")}
+        rows = _stored_rows(store)
+        self._issues = {row["number"]: _model(row["number"], row) for row in _observed_rows(store)}
         self._prs = {row["pr_number"]: row["number"] for row in rows if row.get("pr_number")}
+
+    def _read_config(self):
+        local = self._ctx.config  # A tick swaps it for origin's config after its fetch.
+        if self._config is None or self._config[0] is not local:
+            self._config = (local, ownership_config(getattr(self._ctx, "store", None), local))
+        return self._config[1]
+
+    @property
+    def config(self):
+        """The config this operation decides ownership with, read once (#1004)."""
+        return self._read_config()[0]
+
+    @property
+    def usable(self) -> bool:
+        return self._read_config()[1]
 
     def login(self) -> str | None:
         if not self._read:
@@ -183,6 +209,8 @@ class Scope:
         return self.for_number(issue.number)
 
     def for_number(self, number) -> str | None:
+        if not self.usable:
+            return text("ownership_config_invalid", getattr(self.config, "language", "en"), number=number)
         try:
             target = self._target(number)
         except Unresolved as exc:
@@ -204,8 +232,12 @@ class Scope:
         return self._decisions[number]
 
     def _outside_snapshot(self, number) -> str | None:
-        """A target no read has shown: nothing says it is ours, so read it once; absent is nobody's."""
-        if getattr(self._ctx.config, "legacy_owner", None) is not None:
+        """A target outside the snapshot: a later observation decides, else read it once; absent is nobody's."""
+        row = next((row for row in _observed_rows(getattr(self._ctx, "store", None)) if row["number"] == number), None)
+        if row is not None:
+            self._issues[number] = _model(number, row)
+            return self._judge(self._issues[number])
+        if getattr(self.config, "legacy_owner", None) is not None:
             return _unreadable(self._ctx, number, Unresolved("issue absent from snapshot"))
         try:
             issue = _target_issue(getattr(self._ctx, "store", None), self.reader, number)
@@ -223,10 +255,10 @@ class Scope:
         return self.for_number(issue.number) if issue.number != number else self._judge(issue)
 
     def _judge(self, issue) -> str | None:
-        if singleton(issue, self._ctx.config):
+        if singleton(issue, self.config):
             return None
         try:
-            require_owned(issue, self._ctx.config, self.login())
+            require_owned(issue, self.config, self.login())
         except OwnershipError as exc:
             return str(exc)
         return None
@@ -234,7 +266,7 @@ class Scope:
     def unseen(self, number) -> bool:
         """No team setting and no read has shown this number: entry has nothing to judge yet."""
         self._capture()
-        return (getattr(self._ctx.config, "legacy_owner", None) is None
+        return (self.usable and getattr(self.config, "legacy_owner", None) is None
                 and number not in self._issues and number not in self._prs)
 
     def owns(self, issue) -> bool:
@@ -264,7 +296,8 @@ def check(ctx, number: int, issue=None, *, read=True) -> str | None:
     """Check once at entry, before any shared effect, and retain that snapshot."""
     try:
         if getattr(ctx, "_scope", None) is None or not ctx._scope.entry:
-            if read and issue is None and not stored_singleton(ctx.store, ctx.config, number):
+            config, usable = ownership_config(ctx.store, ctx.config)
+            if read and usable and issue is None and not stored_singleton(ctx.store, config, number):
                 issue = current_issue(ctx, number)
             ctx._scope = Scope(ctx, issue)
             ctx._scope.entry = True
@@ -290,7 +323,7 @@ def entry_issue(ctx, number: int):
     try:
         return observe(ctx.tracker).get_issue(number)
     except TrackerError as exc:
-        if exc.is_not_found and stored_singleton(ctx.store, ctx.config, number):
+        if exc.is_not_found and stored_singleton(ctx.store, ownership_config(ctx.store, ctx.config)[0], number):
             return None
         raise
 
@@ -298,7 +331,7 @@ def entry_issue(ctx, number: int):
 def begin_entry(ctx, number: int) -> None:
     """Until the entry read answers, a stored team row authorizes no shared effect."""
     ctx._scope = Scope(ctx)
-    if not stored_singleton(ctx.store, ctx.config, number):
+    if not stored_singleton(ctx.store, ctx._scope.config, number):
         ctx._scope._decisions[number] = _unreadable(ctx, number, Unresolved("entry read did not finish"))
 
 
@@ -357,7 +390,7 @@ def replaying(ctx):
     """Replay uses the latest observed rows, frozen once for the whole FIFO."""
     previous = getattr(ctx, "_scope", None)
     issues = None
-    if (getattr(ctx.config, "legacy_owner", None) is not None
+    if (getattr(ownership_config(ctx.store, ctx.config)[0], "legacy_owner", None) is not None
             and not any(row.get("observed") or row.get("title") or row.get("labels") for row in _rows(ctx.store))):
         issues = observe(ctx.tracker).list_issues()  # A direct replay has no preceding tick's listing.
     ctx._scope = Scope(ctx, issues=issues)
@@ -377,9 +410,9 @@ def refuse_verb(ctx, action: str, number: int | None) -> str | None:
 
 def ask_orderer(ctx, number: int, summary: str) -> str:
     issue = scope(ctx).issue(number)
-    if issue is None or singleton(issue, ctx.config):
+    if issue is None or singleton(issue, scope(ctx).config):
         return summary
     try:
-        return f"@{effective_orderer(issue, ctx.config, scope(ctx).login())} {summary}"
+        return f"@{effective_orderer(issue, scope(ctx).config, scope(ctx).login())} {summary}"
     except OwnershipError:
         return summary
