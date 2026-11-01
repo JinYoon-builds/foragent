@@ -419,7 +419,8 @@ def review_only(
                     # A rate-limit wait is discoverable locally; defer label repair.
                     if outcome != "limit-wait" and outcome != "refused" and orch_scope.may_write(ctx, n):
                         current = ctx.tracker.current_issue(n)
-                        if current.state == "open" and not current.labels & {BLOCKED, READY}:
+                        if (outcome != "remote-ended" and current.state == "open"
+                                and not current.labels & {BLOCKED, READY}):
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
                 except TrackerError as exc:

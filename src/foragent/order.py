@@ -40,6 +40,20 @@ class PlanError(ValueError):
     """An order plan is malformed or cannot be applied."""
 
 
+class DoneWhenExecutableError(PlanError):
+    """One diagnostic per unavailable Done when command, in plan order."""
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        super().__init__("\n".join(lines))
+
+
+def check_done_when_executables(plan: dict, root: Path, language: str = "en") -> None:
+    from foragent.order_executables import check
+
+    check(plan, root, language)
+
+
 PROGRESS_SLOTS = ("goal", "out_of_scope", "done_when", "lane", "skills")
 PROGRESS_STEPS = ("start", "ledger", "chunk", "cell", "tests", "check", "approval", "publish", "end")
 
@@ -736,12 +750,14 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
-            git: GitRepo | None = None, refreshed: bool = False) -> "_Publication":
+            git: GitRepo | None = None, refreshed: bool = False, landed: bool = False) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    check_done_when_executables(plan, root, config.language)
+
     if dry_run:
         # A dry run only previews: read GitHub without recording any observation locally.
         from foragent.tracker import RecordingTracker
@@ -781,6 +797,13 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {})
+    if landed:
+        # A resumed batch commit passed the gates below before its intent was recorded, and later
+        # commits (its own too) must not reopen them: only its issue effects remain.
+        return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
+                            by_number, edit_numbers, unconfirmed, rows,
+                            _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
+                                         [by_number[n] for n in mapping.values()]), {})
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)

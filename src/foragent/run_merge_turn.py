@@ -35,8 +35,13 @@ if TYPE_CHECKING:
     from foragent.state import StateStore
 
 QUEUE = "merge-queue.jsonl"
-MERGE_WAIT_SECONDS = 60 * 60
+# Temporary ceiling: the maximum measured on 2026-11-01, including the 2026-10-31 night incident.
+# Re-measure and lower it when the flow records exist; 16 hours is not a permanent target.
+MERGE_WAIT_SECONDS = 16 * 60 * 60
 POLL_SECONDS = 30
+REMOTE_CHECK_SECONDS = 5 * 60
+# Credited wait at each execution's last read of one fact. Process memory only, never written to disk.
+_last_reads: dict[tuple, float] = {}
 
 
 @dataclass(frozen=True)
@@ -162,10 +167,12 @@ def _merge_wait(n: int, ctx: RunContext):
         )
         return now
 
+    completed = False
     try:
         yield credit
+        completed = True
     finally:
-        wait.close(credit(close=True))
+        wait.close(credit(close=True), resume=completed)
 
 
 def _wait_limit_reached(n: int, ctx: RunContext) -> bool:
@@ -173,14 +180,57 @@ def _wait_limit_reached(n: int, ctx: RunContext) -> bool:
     return run.merge_waited_seconds >= MERGE_WAIT_SECONDS
 
 
-def _pause(n: int, ctx: RunContext) -> None:
+def _next_read(n: int, ctx: RunContext, number: int) -> float:
+    """Credited wait at which this run may read ``number`` again; the first read waits for the next multiple."""
+    run = ctx.store.get_run(n)
+    first = run.merge_waited_seconds // REMOTE_CHECK_SECONDS * REMOTE_CHECK_SECONDS
+    return _last_reads.setdefault((ctx.store.root, n, run.started_at, number), first) + REMOTE_CHECK_SECONDS
+
+
+def _read_due(n: int, ctx: RunContext, pr: int | None) -> float:
+    return min(_next_read(n, ctx, number) for number in (n, pr) if number is not None)
+
+
+def _remote_end(n: int, ctx: RunContext, credit, pr: int | None) -> str | None:
+    """Name this run's closed issue or known PR, reading each at most once per check interval.
+
+    Each fact keeps its own interval, measured when its read starts, so a slow
+    read of one cannot shorten the other's. A due read spends its interval first:
+    a failed read or a re-entered wait never brings a check forward. A failed read
+    is unknown, not an end. GitHub reports a merged PR as closed, too. Rate limits
+    keep their resumable wait.
+    """
+    from foragent.run_checks import _append as append_log
+    from foragent.tracker import TrackerError
+
+    for name, number in (("Issue", n), ("PR", pr)):
+        if number is None:
+            continue
+        run = ctx.store.get_run(n)
+        if run.merge_waited_seconds < _next_read(n, ctx, number):
+            continue
+        _last_reads[ctx.store.root, n, run.started_at, number] = run.merge_waited_seconds
+        try:
+            if ctx.tracker.get_issue(number).state == "closed":
+                return f"{name} #{number}"
+        except TrackerError as exc:
+            if exc.is_rate_limit:
+                raise
+            append_log(ctx.store.log_path(n), f"Merge wait could not read {name} #{number}; still waiting: {exc}")
+        credit()
+    return None
+
+
+def _pause(n: int, ctx: RunContext, pr: int | None) -> None:
     run = ctx.store.get_run(n)
     ctx.store.update_run(n, merge_wait_polls=run.merge_wait_polls + 1)
-    ctx.sleep(min(POLL_SECONDS, max(0, MERGE_WAIT_SECONDS - run.merge_waited_seconds)))
+    # Wake exactly when a read is due, so slow reads do not push later checks off their interval.
+    ctx.sleep(min(POLL_SECONDS, max(0, MERGE_WAIT_SECONDS - run.merge_waited_seconds),
+                  max(0, _read_due(n, ctx, pr) - run.merge_waited_seconds)))
 
 
 def _report_wait_limit(n: int, ctx: RunContext, place: Seat) -> NoReturn:
-    from foragent import orch_inbox
+    from foragent import orch_events, orch_inbox
     from foragent.labels import BLOCKED, READY, RUNNING
     from foragent.run_attempt import ExecutorStopped
     from foragent.run_checks import _append as append_log
@@ -190,6 +240,9 @@ def _report_wait_limit(n: int, ctx: RunContext, place: Seat) -> NoReturn:
     detail = (f"Merge-turn wait limit ({MERGE_WAIT_SECONDS:g}s) reached after "
               f"{run.merge_waited_seconds:g}s ({run.merge_wait_polls} polls). "
               f"PR kept on {run.branch}; resume review of the existing PR when its merge turn can proceed.")
+    orch_events.append_event(ctx.store, ctx.now(), n, "merge-wait-limit", detail,
+                             run_started_at=run.started_at, waited_seconds=run.merge_waited_seconds,
+                             limit_seconds=MERGE_WAIT_SECONDS)
     orch_inbox.add_request(ctx.store, "runner", f"Issue #{n}: {detail}", {
         "kind": "merge-wait", "issue": n, "branch": run.branch,
         "run_started_at": run.started_at, "waited_seconds": run.merge_waited_seconds,
@@ -201,27 +254,51 @@ def _report_wait_limit(n: int, ctx: RunContext, place: Seat) -> NoReturn:
     raise ExecutorStopped("merge-wait", detail)
 
 
-def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str) -> tuple[bool, str | None]:
+def _report_remote_end(n: int, ctx: RunContext, place: Seat, ended: str) -> NoReturn:
+    from foragent.labels import READY, RUNNING
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_checks import _append as append_log
+
+    withdraw(ctx, place)
+    detail = f"{ended} ended on GitHub during the merge-turn wait; this run stops without merging."
+    append_log(ctx.store.log_path(n), detail)
+    ctx.tracker.remove_labels(n, [READY, RUNNING])
+    raise ExecutorStopped("remote-ended", detail)
+
+
+def _stop_if_ended(n: int, ctx: RunContext, credit, place: Seat, pr: int | None) -> None:
+    """Credit the wait and stop on a remote end, from inside the wait.
+
+    Stopping by exception closes the wait without queueing for a machine slot:
+    a run that is ending does no more work, and must not keep its claims behind a full machine.
+    The wait-limit stop leaves the same way.
+    """
+    credit()
+    if ended := _remote_end(n, ctx, credit, pr):
+        _report_remote_end(n, ctx, place, ended)
+
+
+def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str, pr: int | None = None) -> tuple[bool, str | None]:
     """Join and wait without re-verifying or polling CI; return (waited, stop).
 
     The whole merge-turn wait is credited as waited, preserving the work budget.
-    Queue waits and retry pauses share a separate one-hour bound per run.
+    Queue waits and retry pauses share a separate bound per run, MERGE_WAIT_SECONDS.
     """
     join(ctx, place, head_sha)
-    if holds_turn(ctx.store, place):
+    if holds_turn(ctx.store, place) and ctx.store.get_run(n).merge_waited_seconds < _read_due(n, ctx, pr):
         return False, None
     with _merge_wait(n, ctx) as credit:
-        while not holds_turn(ctx.store, place):
-            credit()
+        while True:
+            # A due read comes before the turn: a released turn must not skip it and merge ended work.
+            _stop_if_ended(n, ctx, credit, place, pr)
+            if holds_turn(ctx.store, place):
+                return True, None
             if _wait_limit_reached(n, ctx):
-                break
-            _pause(n, ctx)
-        else:
-            return True, None
-    _report_wait_limit(n, ctx, place)
+                _report_wait_limit(n, ctx, place)
+            _pause(n, ctx, pr)
 
 
-def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Exception) -> None:
+def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Exception, pr: int | None = None) -> None:
     """A refused merge of an unchanged head: withdraw now and rejoin at the tail when ready again.
 
     The run is not ended; it takes a later turn (and appends another turn record).
@@ -233,13 +310,13 @@ def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Excep
     withdraw(ctx, place)
     append_log(ctx.store.log_path(n), f"Merge failed with the head unchanged; rejoining the merge queue: {error}")
     with _merge_wait(n, ctx) as credit:
-        credit()
-        if not _wait_limit_reached(n, ctx):
-            _pause(n, ctx)
-        credit()
-        exhausted = _wait_limit_reached(n, ctx)
-    if exhausted:
-        _report_wait_limit(n, ctx, place)
+        _stop_if_ended(n, ctx, credit, place, pr)
+        if _wait_limit_reached(n, ctx):
+            _report_wait_limit(n, ctx, place)
+        _pause(n, ctx, pr)
+        _stop_if_ended(n, ctx, credit, place, pr)
+        if _wait_limit_reached(n, ctx):
+            _report_wait_limit(n, ctx, place)
 
 
 def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:
