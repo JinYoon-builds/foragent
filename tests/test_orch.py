@@ -548,6 +548,20 @@ def test_hint_keeps_native_goal_and_is_consumed_once(run_case, native):
     assert not hint.exists()
 
 
+def test_retry_adds_to_undelivered_advice_and_never_clears_it(run_case):
+    c = run_case
+    c.store.finish_run(1, outcome="blocked")
+    c.tracker.remove_labels(1, ["running"])
+    c.tracker.add_labels(1, ["blocked"])
+    path = c.store.root / "hints/1.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Preserve the receipt timezone")  # A talk message not yet delivered.
+    orch.retry(c.ctx, 1)
+    assert path.read_text() == "Preserve the receipt timezone"
+    orch.retry(c.ctx, 1, "Use the selected locale")
+    assert path.read_text() == "Preserve the receipt timezone\n\nUse the selected locale"
+
+
 @pytest.mark.parametrize("entry", ["retry", "resolve-fail"])
 @pytest.mark.parametrize("failure", ["limit", "transient", "transient-timeout", "missing-executor", "crash", "interrupted"])
 def test_hint_survives_unavailable_or_interrupted_executor_until_next_implementation(run_case, monkeypatch, entry, failure):
