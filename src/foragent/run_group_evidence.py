@@ -81,7 +81,7 @@ def void_reason(ctx: RunContext, n: int, head_sha: str, base_sha: str,
     try:
         current = _current_head(ctx, n)
     except TrackerError as exc:
-        if exc.is_rate_limit:
+        if exc.waits:
             raise
         return f"PR head unreadable: {exc}"
     if current != head_sha:

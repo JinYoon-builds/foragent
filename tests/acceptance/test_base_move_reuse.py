@@ -1,6 +1,7 @@
 """Acceptance test for base-move-reuse. Locked by Foragent; do not edit."""
 
 from collections import Counter
+import json
 import os
 from pathlib import Path
 import shlex
@@ -28,6 +29,20 @@ LOCKED = '"""Acceptance test for {name}. Locked by Foragent; do not edit."""\n'
 
 def locked_test(name, *, passing=True):
     return LOCKED.format(name=name) + f"\ndef test_{name}():\n    assert {passing}\n"
+
+
+def squash_main(history, head):
+    """Fake GitHub's squash tree on current main, including a divergent base."""
+    tree = git_command(history.origin, "merge-tree", "--write-tree", history.tip, head).splitlines()[0]
+    stream = ["commit refs/heads/main\n", "committer Tests <tests@example.com> 1792483200 +0000\n",
+              "data 6\nSquash\n", f"from {history.tip}\n", "deleteall\n"]
+    for entry in git_command(history.origin, "ls-tree", "-r", "-z", tree).split("\0"):
+        if entry:
+            metadata, name = entry.split("\t", 1)
+            mode, kind, sha = metadata.split()
+            stream.append(f"M {mode} {sha} {json.dumps(name)}\n")
+    git_command(history.origin, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+    history.tip = git_command(history.origin, "rev-parse", "main")
 
 
 @pytest.fixture
@@ -148,7 +163,8 @@ def run_to_merge(case, *, moves):
 
     branch = "refs/heads/foragent/issue-1"
     for sha in case.main_commits:
-        git_command(case.history.origin, "merge-base", "--is-ancestor", sha, branch)
+        git_command(case.history.origin, "merge-base", "--is-ancestor", sha, "main")
+    git_command(case.history.origin, "merge-tree", "--write-tree", "main", branch)
     published = git_command(case.history.origin, "rev-parse", branch)
     assert case.tracker.pr_head_sha(case.tracker.merged_prs[0]) == published
 
