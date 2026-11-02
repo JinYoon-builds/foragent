@@ -226,9 +226,11 @@ def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:
 
 
 def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = None) -> str:
-    _issue(ctx, n)
     if verdict not in {"pass", "fail"}:
         raise OrchError("verdict must be pass or fail")
+    if ctx.store.load_approval(n) is None:  # The gate alone writes approval records; resolve only reads.
+        raise OrchError(f"issue #{n} has no approval record (missing); re-approve it, then resolve again")
+    _issue(ctx, n)
     note = _text(note, "note")
     pr = ctx.tracker.find_pr(f"foragent/issue-{n}")
     if pr is None:
