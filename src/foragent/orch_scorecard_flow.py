@@ -12,11 +12,11 @@ from statistics import median
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import capacity
+from foragent import capacity, orch_scorecard_split as split
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
-    _pauses, _phase_intervals, _run_value, _siblings, _value_at,
+    _pauses, _phase_intervals, _run_value, _siblings, _value_at, latest_approval as _latest_approval,
 )
 from foragent.state import StateStore
 
@@ -28,6 +28,7 @@ CAUSE_ORDER = ("slot", "overlap", "merge", "quota")
 INTERVENTIONS = {"ask", "escalate", "person-found"}
 HOLDING = {"blocked", "needs-human", "running"}  # Labels that keep an approved issue from starting.
 NAMES = ("idle_minutes", "waste_share", "wait_minutes_by_cause", "lead_time_minutes", "person_interventions")
+EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge")  # Reported, never compared.
 
 
 def _minutes(start: datetime, end: datetime, now: datetime, days: int) -> list[float]:
@@ -99,17 +100,11 @@ def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[I
             and not _inside(pauses.get(issue["lane"], []), moment))
 
 
-def _latest_approval(issue: dict[str, Any], moment: datetime) -> datetime | None:
-    times = [at for at, label, action in issue["events"]
-             if label == "approved" and action == "labeled" and at <= moment]
-    if issue["approved_at"] is not None and issue["approved_at"] <= moment:
-        times.append(issue["approved_at"])
-    return max(times, default=None)
-
-
 def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[str, Any]],
-          executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[float]:
-    """Wall minutes with a startable approved issue while a run or test slot sat unused."""
+          executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[list[float]]:
+    """Wall minutes with a startable approved issue while a slot sat unused: [legacy run-or-test, run, test].
+
+    Run and test slots are measured separately, each against its own recorded budget, and may overlap."""
     budgets, pauses = _budgets(store, now), _pauses(store)
     occupied, testing = _occupancy(store, now, executions, phases)
     start = now - days * DAY
@@ -124,7 +119,7 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
         points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"], issue["updated_at"],
                                     *issue["blocked_until"]) if at is not None)
     ordered = sorted(moment for moment in points if start <= moment <= now)
-    idle = [0.0] * days
+    idle, run_idle, test_idle = [0.0] * days, [0.0] * days, [0.0] * days
     for low, high in zip(ordered, ordered[1:]):
         moment = low + (high - low) / 2
         busy = {number for (index, number), (a, b) in occupied if not index and a <= moment < b}
@@ -134,9 +129,12 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
         parallel, slots = _value_at(budgets["parallel"], moment), _value_at(budgets["test_slots"], moment)
         testing_now = sum(1 for a, b in testing if a <= moment < b)
         running_now = sum(1 for _, (a, b) in occupied if a <= moment < b)
-        if (parallel is not None and running_now < parallel) or (slots is not None and testing_now < slots):
-            idle = [total + part for total, part in zip(idle, _minutes(low, high, now, days))]
-    return idle
+        part = _minutes(low, high, now, days)
+        run_free, test_free = parallel is not None and running_now < parallel, slots is not None and testing_now < slots
+        for free, totals in ((run_free or test_free, idle), (run_free, run_idle), (test_free, test_idle)):
+            if free:
+                totals[:] = [total + minutes for total, minutes in zip(totals, part)]
+    return [idle, run_idle, test_idle]
 
 
 def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None) -> list[dict[str, Any]]:
@@ -168,8 +166,10 @@ def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None
     for event in _jsonl(store.root / "orch-events.jsonl"):
         if event.get("kind") in INTERVENTIONS and (bucket := _bucket(_time(event.get("at")), now, days)) is not None:
             people[bucket] += 1
-    idle = _idle(store, now, days, issues, executions, phases)
-    return [{"merges": merges[k], "idle_minutes": idle[k],
+    idle, run_idle, test_idle = _idle(store, now, days, issues, executions, phases)
+    approval = split.windows(store, now, days, issues, executions, phases)
+    return [{"merges": merges[k], "idle_minutes": idle[k], "run_slot_idle_minutes": run_idle[k],
+             "test_slot_idle_minutes": test_idle[k], "approval_to_merge": approval[k],
              "waste_share": wasted[k] / runtime[k] if runtime[k] else None,
              "wait_minutes_by_cause": waits[k],
              "lead_time_minutes": median(leads[k]) if leads[k] else None,
@@ -185,8 +185,11 @@ def previous(days: list[dict[str, Any]]) -> dict[str, Any]:
     result = {name: mid([day[name] for day in days]) for name in ("merges", *NAMES) if name != "wait_minutes_by_cause"}
     result["wait_minutes_by_cause"] = {cause: mid([day["wait_minutes_by_cause"][cause] for day in days]) or 0
                                        for cause in CAUSE_ORDER}
+    for name in ("run_slot_idle_minutes", "test_slot_idle_minutes"):
+        result[name] = mid([day[name] for day in days]) or 0
     for name in ("idle_minutes", "person_interventions"):
         result[name] = result[name] or 0
+    result["approval_to_merge"] = split.previous([day["approval_to_merge"] for day in days])
     return result
 
 

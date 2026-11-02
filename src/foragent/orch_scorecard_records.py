@@ -239,3 +239,22 @@ def _issues(store: StateStore, lanes: dict) -> dict[int, dict[str, Any]]:
     for number, view in views.items():
         view["running"] = number in running  # An active run record, for the removed-approval rule.
     return views
+
+
+def latest_approval(issue: dict[str, Any], moment: datetime) -> datetime | None:
+    """The issue's latest approval at or before ``moment``: a label event or the snapshot time."""
+    times = [at for at, label, action in issue["events"]
+             if label == "approved" and action == "labeled" and at <= moment]
+    if issue["approved_at"] is not None and issue["approved_at"] <= moment:
+        times.append(issue["approved_at"])
+    return max(times, default=None)
+
+
+def approval_before(store: StateStore, issues: dict[int, dict[str, Any]], number: int,
+                    moment: datetime) -> datetime | None:
+    """Like ``latest_approval``; an issue with no local row falls back to its approval snapshot."""
+    if (issue := issues.get(number)) is not None:
+        return latest_approval(issue, moment)
+    approval = store.load_approval(number)
+    approved = _time(approval.approved_at) if approval else None
+    return approved if approved is not None and approved <= moment else None

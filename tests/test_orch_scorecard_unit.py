@@ -29,6 +29,9 @@ def store(tmp_path):
 
 def finish(store, number, *, at, minutes=10, outcome="merged", detail="", merged_at=None):
     store.clock[0] = at - timedelta(minutes=minutes)
+    if store.load_approval(number) is None:  # Approval at run start, as the locked seed helper does.
+        store.save_approval(number, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                            approved_at=store.clock[0].isoformat())
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     store.clock[0] = at
     if merged_at is not None:
@@ -74,7 +77,7 @@ def test_pr_open_counts_as_merged_only_after_a_merge_and_otherwise_is_no_failure
     card = orch_scorecard.collect(store)
     today = card["window"]["today"]
     assert today["runs"] == 2 and today["merge_rate"] == 0.5
-    assert today["median_minutes_to_merge"] == 20  # Start to finish, not to merge.
+    assert today["median_minutes_to_merge"] == 80  # Approval (run start) to the actual merge, not to finish.
     assert card["unexplained_failures"] == [] and card["repeated_failures"] == []
 
 
@@ -109,8 +112,10 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["repeated_failures"] == [{"reason": "Boom", "count": 2, "issues": [1, 2]}]
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
-    # Today, its flow line, the previous days, their flow line, the verdict, failures, then main tests.
-    assert len(lines) == 8 and "Main tests" in lines[7] and "flow" in lines[1] and "Boom" in lines[5] and "#3" in lines[6]
+    # Today, its flow line, the previous days, their flow line, both approval-to-merge splits,
+    # the verdict, failures, then main tests.
+    assert len(lines) == 10 and "Main tests" in lines[9] and "flow" in lines[1] and "Boom" in lines[7] and "#3" in lines[8]
+    assert "approval to merge" in lines[4] and "previous-days total" in lines[5]
 
 
 @pytest.mark.parametrize("value", ["1", "0", "x", "2.5"])
@@ -741,3 +746,76 @@ def test_human_output_says_unknown_on_both_window_lines(store, language, unknown
     moments = [NOW - timedelta(hours=1), NOW - timedelta(days=1, hours=1)]
     lines = orch_scorecard.human(orch_scorecard.collect(store, 2, revert_times=moments), language).splitlines()
     assert known in lines[0] and known in lines[2] and unknown not in "\n".join(lines)
+
+
+def _flow_split(store, number, approved, merged, records=(), phases=()):
+    """Run the real split for one merge after writing ``records`` as (minute, kind, data)."""
+    from foragent import orch_scorecard_split as split
+
+    for minute, kind, data in records:
+        store.clock[0] = approved + timedelta(minutes=minute)
+        store.record_flow(kind, issue=number, **data)
+    store.clock[0] = NOW
+    executions = [{"number": number, "started": approved, "finished": merged, "merged": True,
+                   "merged_at": merged}]
+    issues = {number: {"events": [], "approved_at": approved}}
+    spans = [(number, phase, (approved + timedelta(minutes=a), approved + timedelta(minutes=b)))
+             for phase, a, b in phases]
+    return split.windows(store, NOW, 2, issues, executions, spans)
+
+
+def _activity(approved, cause, a, b):
+    return (b, "activity", {"activity": "checking", "cause": cause,
+                            "started_at": (approved + timedelta(minutes=a)).isoformat(),
+                            "finished_at": (approved + timedelta(minutes=b)).isoformat()})
+
+
+def test_split_contradiction_is_unknown_and_duplicates_count_once(store):
+    approved = NOW - timedelta(hours=1)
+    today = _flow_split(store, 7, approved, approved + timedelta(minutes=10), [
+        _activity(approved, "initial", 0, 4), _activity(approved, "initial", 0, 4),  # Replayed: once.
+        _activity(approved, "queue", 2, 6),  # Overlaps work for 2 minutes: unknown there.
+    ])[0]
+    assert today["total_minutes"] == 10 and today["merges"] == 1
+    assert today["parts"] == {"work": 2, "concurrency_cost": 0, "machine_limit": 0, "ordering": 0,
+                              "waste": 2, "unknown": 6}
+
+
+@pytest.mark.parametrize(("slots", "part"), [
+    ({"limit": 2, "occupied": 2, "merge_waiters": 0}, "machine_limit"),
+    ({"limit": 2, "occupied": 2, "merge_waiters": 1}, "waste"),
+    ({"limit": 2, "occupied": 1, "merge_waiters": 0}, "unknown"),  # Not full: no proof.
+    ({"limit": 2, "occupied": None, "merge_waiters": 0}, "unknown"),  # Unmeasured holders.
+    (None, "unknown"),
+])
+def test_split_slots_full_needs_a_measured_full_slot(store, slots, part):
+    approved = NOW - timedelta(hours=1)
+    data = {"reason": "slots-full", "outcome": "waiting", "run_slots": slots}
+    parts = _flow_split(store, 7, approved, approved + timedelta(minutes=5), [(0, "ready", data)])[0]["parts"]
+    assert parts[part] == 5 and sum(parts.values()) == 5
+
+
+def test_split_phases_alone_name_only_first_work_and_overlap_waits(store):
+    approved = NOW - timedelta(hours=1)
+    parts = _flow_split(store, 7, approved, approved + timedelta(minutes=12), phases=[
+        ("implementing", 0, 3), ("overlap-wait", 3, 5), ("implementing", 5, 8), ("merge-lock-wait", 8, 10),
+        ("merging", 10, 12)])[0]["parts"]
+    # A second implementing and a merge-lock wait without a recorded cause stay unknown.
+    assert parts == {"work": 5, "concurrency_cost": 2, "machine_limit": 0, "ordering": 0,
+                     "waste": 0, "unknown": 5}
+
+
+def test_split_previous_is_an_additive_cohort_total_and_missing_approval_is_coverage(store):
+    for number, day, minutes in ((1, 1, 30), (2, 2, 50)):
+        finish(store, number, at=NOW - timedelta(days=day, hours=1), minutes=minutes)
+    finish(store, 3, at=NOW - timedelta(hours=1), minutes=20)
+    store.clock[0] = NOW - timedelta(hours=2)
+    store.start_run(4, branch="b", worktree=store.worktree_path(4))
+    store.clock[0] = NOW - timedelta(hours=1)
+    store.finish_run(4, outcome="merged")
+    store.clock[0] = NOW  # Issue 4 merged with no approval on record.
+    card = orch_scorecard.collect(store, days=3)
+    today, before = (card["window"][key]["approval_to_merge"] for key in ("today", "previous"))
+    assert before["total_minutes"] == 80 and before["merges"] == 2  # 30 + 50, not their median 40.
+    assert today["total_minutes"] == 20 and today["merges"] == 1
+    assert today["missing_approval"] == 1 and today["parts"]["unknown"] == 20
