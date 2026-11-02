@@ -248,7 +248,8 @@ def test_exemption_also_matches_a_path_brought_in_from_main(git_history, tmp_pat
     assert review_pass_scope.for_review(1, case.ctx, git, "origin/main").diff is not None
     case.history.update({"upstream.txt": "from main\n"})
     git._call(["fetch", "--quiet", "origin"])
-    git._call(["merge", "--quiet", "--no-edit", "origin/main"])
+    git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
+               "merge", "--quiet", "--no-edit", "origin/main"])
     boundary = review_pass_scope.for_review(1, case.ctx, git, "origin/main")
     assert boundary.diff is None and "upstream.txt" in boundary.section
 
