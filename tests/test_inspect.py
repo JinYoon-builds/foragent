@@ -169,7 +169,7 @@ def test_answered_requires_a_first_line_decision_newer_than_latest_flag(ctx):
     assert not collect(ctx).items[0].answered
 
 
-@pytest.mark.parametrize("mode", ["fast", "batch", "careful"])
+@pytest.mark.parametrize("mode", ["fast", "careful"])
 def test_open_pr_review_modes_exclude_flagged_issues_and_unrelated_heads(ctx, mode):
     ctx.config = replace(ctx.config, review=mode)
     flag(ctx, 1, Reason.ALWAYS_HUMAN_PATH)
@@ -185,16 +185,6 @@ def test_open_pr_review_modes_exclude_flagged_issues_and_unrelated_heads(ctx, mo
     assert reviews[0].pr == flagged_pr
     assert reviews[0].url == f"https://github.com/owner/repo/pull/{flagged_pr}"
     assert (reviews[1].number, reviews[1].pr, reviews[1].reason) == (3, unflagged_pr, None)
-
-
-def test_parent_batch_pr_appears_once_under_review(ctx):
-    ctx.tracker.add_issue(99, "Epic")
-    number = ctx.tracker.create_pr(
-        head="foragent/batch-99", base="main", title="Batch: Epic", body="Closes #99\n\nChildren",
-    )
-    item, = collect(ctx).items
-    assert item.group == "review" and item.number == 99 and item.pr == number
-    assert item.url == f"https://github.com/owner/repo/pull/{number}"
 
 
 def test_fast_mode_path_review_is_collected_and_notified(ctx):

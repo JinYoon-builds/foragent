@@ -1,5 +1,4 @@
 import json
-import re
 
 import pytest
 
@@ -55,10 +54,6 @@ def test_messages_have_both_languages():
         assert comment.index(gone) < comment.index("#13")
         assert gone not in closing_comment(language, [11], []) and done not in closing_comment(language, [], [13])
     assert "#9" in text("parent_child_not_planned", "ko", number=1, children="#9")
-    closing = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
-    lines = {language: text("batch_pr_parent", language, parent=99) for language in ("en", "ko")}
-    assert lines["en"] != lines["ko"] and all("#99" in line for line in lines.values())
-    assert not any(closing.search(line) for line in lines.values()), "Only the gate closes an order parent"
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
@@ -121,28 +116,17 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     assert written == [(3, "Needs human"), (5, "Needs human"), (7, "Needs human"), (1, "Running")]
 
 
-@pytest.mark.parametrize("batch_rows", [
-    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True}],
-                 id="child-merged-no-batch-pr"),
-    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True},
-                  {"number": 9, "pr_head": "foragent/batch-9", "pr_number": 51, "merged": False}],
-                 id="batch-pr-open"),
+@pytest.mark.parametrize("child_rows", [
     pytest.param([], id="no-batch"),
 ])
-def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_rows):
-    """Batch finalization continues for a closed parent, so completion never waits for it."""
+def test_batch_parent_completes_when_its_children_are_done(monkeypatch, child_rows):
+    """An ordinary parent completes as soon as all of its children are done."""
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
     from foragent import board, board_parents
 
-    rows = [{"number": 9, "state": "open", "labels": [], "children": [2]}]
-    for row in batch_rows:
-        target = next((r for r in rows if r["number"] == row["number"]), None)
-        if target is None:
-            rows.append({"state": "closed", "labels": [], **row})
-        else:
-            target.update(row)
+    rows = [{"number": 9, "state": "open", "labels": [], "children": [2]}] + child_rows
     synced, closed = [], []
     tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
                               close_issue=lambda n, comment: closed.append((n, comment)))

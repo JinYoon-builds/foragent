@@ -149,9 +149,9 @@ def test_legacy_committed_record_with_none_effective_files_uses_declarations(con
 def test_recorded_target_branch_drives_subsequent_scheduler_measurement(context):
     reserve(context, 1, ['src/a.py', 'src/b.py'])
     path = edit(context, 1, {'src/a.py': 'new\n'}, commit=True)
-    context.git.at(path)._call(['update-ref', 'refs/remotes/origin/batch', 'HEAD'])
+    context.git.at(path)._call(['update-ref', 'refs/remotes/origin/integration', 'HEAD'])
     edit(context, 1, {'src/b.py': 'new\n'}, commit=True)
-    run = measure(context, context.store.get_run(1), parse_body(context.store.load_approval(1).body), 'batch')
+    run = measure(context, context.store.get_run(1), parse_body(context.store.load_approval(1).body), 'integration')
     assert run.effective_files == ['src/b.py']
     assert claims(context)[0][0].run.effective_files == ['src/b.py']
 
