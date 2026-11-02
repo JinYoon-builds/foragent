@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from foragent.policy import Decision
+from foragent.run_checks_approved import acceptance_mismatches
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -107,10 +108,8 @@ def _final_merge_inputs(
     if base != ctx.config.base_branch:
         ctx.git.fetch("origin", ctx.config.base_branch)
         configured_base_sha = git.ref_sha(f"origin/{ctx.config.base_branch}")
-    for ref in (head, configured_base_sha):
-        blobs = git.blob_shas(ref, approval.acceptance_blobs)
-        if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
-            return run_publish._MergeInputs(stop=invalid_approval)
+    if any(acceptance_mismatches(git, approval, ref) for ref in (head, configured_base_sha)):
+        return run_publish._MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
     decision = run_publish._merge_decision(n, ctx, git, paths, issue.labels)
     # Bind this status and all verification evidence to the exact head we merge.

@@ -56,7 +56,7 @@ def test_get_without_key_prints_every_setting_nested_or_dotted(root, store, caps
     assert json.loads(get_all(root, capsys, "--json"))["claude_quota"]["mode"] == "burn"
     lines = get_all(root, capsys).splitlines()
     assert "claude_quota.mode burn" in lines and "max_parallel -" in lines and "always_human -" in lines
-    assert len(lines) == 15 and "runner_unit_tests auto" in lines
+    assert len(lines) == 16 and "runner_unit_tests auto" in lines
 
 
 def test_live_team_change_asks_in_the_window_and_n_reverts(root, store):

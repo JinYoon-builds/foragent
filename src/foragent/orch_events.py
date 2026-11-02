@@ -46,7 +46,10 @@ def append_event(store: StateStore, at: datetime, issue: int | None, kind: str, 
 
 def _write_line(store: StateStore, event: dict) -> None:
     with (store.root / "orch-events.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        # A note's fields keep the text as given. Escape what str.splitlines would split on, so every
+        # reader of the journal still sees one record per line.
+        line = json.dumps(event, ensure_ascii=False)
+        stream.write(line.replace("\x85", "\\u0085").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029") + "\n")
 
 
 def acknowledged_at(store: StateStore, n: int) -> datetime | None:

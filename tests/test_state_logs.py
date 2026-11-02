@@ -240,3 +240,31 @@ def test_size_order_skips_an_issue_whose_run_finished_after_ordering(tmp_path, m
     finish_before_lock(store, monkeypatch, 1, "merged")
     assert store.prune_logs(NOW) == [older]
     assert newest.is_file()
+
+
+def test_trim_keeps_only_the_newest_marked_retrospective_note(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    import json
+
+    now = datetime(2026, 11, 2, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: now)
+    store.root.mkdir(parents=True, exist_ok=True)
+
+    def row(days, label, **fields):
+        return json.dumps({"at": (now - timedelta(days=days)).isoformat(), "kind": "note", "now": label, **fields})
+
+    path = store.root / "orch-events.jsonl"
+    path.write_text("\n".join([
+        row(50, "newest marked", retrospective=True),  # Newest by time, though not last in the file.
+        row(90, "older marked", retrospective=True),
+        row(45, "plain old"),
+        row(40, "marked false", retrospective=False),
+        row(1, "plain recent"),
+    ]) + "\n", encoding="utf-8")
+    store.trim_journals(now)
+    assert [json.loads(line)["now"] for line in path.read_text(encoding="utf-8").splitlines()] == [
+        "newest marked", "plain recent"]
+    path.write_text(row(1, "recent marked", retrospective=True) + "\n" + row(50, "old marked", retrospective=True)
+                    + "\n", encoding="utf-8")
+    store.trim_journals(now)
+    assert [json.loads(line)["now"] for line in path.read_text(encoding="utf-8").splitlines()] == ["recent marked"]
