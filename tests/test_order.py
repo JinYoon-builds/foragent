@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, order
+from foragent import cli, order, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
@@ -1580,7 +1580,8 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
         assert ("agent" in setup.options) == (executor == "claude")
     # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
     expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
-    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
+    # The size request is sent beside the preread prompt; the evidence key binds neither it nor memory.
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + size_signal.PROMPT + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 
@@ -4448,3 +4449,69 @@ def test_preread_reader_gets_current_memory_while_only_lane_instructions_move_th
     assert skilled != digest
     agent.write_text("---\nname: fa-api\n---\nAPI lane rules changed.\n")
     assert target()[2] not in (digest, skilled)
+
+
+
+def _git_commit(repo, files, message, date, parents=None):
+    """Write ``files`` and commit them at ``date`` with ``parents`` (default: HEAD); returns the commit."""
+    import os
+    import subprocess
+
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_AUTHOR_DATE": date,
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_COMMITTER_DATE": date}
+    run = lambda *args: subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,  # noqa: E731
+                                       text=True, env=env).stdout.strip()
+    run("add", "-A")
+    if parents is None:
+        parents = [p for p in [subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=repo,
+                                              capture_output=True, text=True).stdout.strip()] if p]
+    commit = run("commit-tree", run("write-tree"), *[arg for p in parents for arg in ("-p", p)], "-m", message)
+    run("update-ref", "HEAD", commit)
+    return commit
+
+
+@pytest.mark.parametrize("approved_handoff, later_main, kept", [
+    ("approved handoff\n", None, True),
+    ("approved handoff\n", "main changed it after approval\n", True),
+    ("someone else's handoff\n", None, False),
+], ids=["run-changed-reference", "refresh-onto-main-that-changed-it", "approved-a-different-reference"])
+def test_merge_record_binds_references_to_the_approval_not_the_run_or_later_main(
+        publishing, plan, tmp_path, approved_handoff, later_main, kept):
+    """A run may edit a reference preread read, and a refresh may merge a newer main that edits it;
+    the estimate still belongs to the merge. Only a different approved reference loses it (#1696)."""
+    import subprocess
+    from types import SimpleNamespace
+
+    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    name = "docs/design/a/HANDOFF.md"
+    plan["reference_files"] = {name: "approved handoff\n"}
+    item["references"] = [name]
+    _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=2 tests=0 files=2")])
+    repo = tmp_path / "merge-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    approved = _git_commit(repo, {**API_FILES, name: approved_handoff}, "approved", "2026-11-01T10:00:00Z")
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", approved], cwd=repo, check=True)
+    base = approved
+    if later_main is not None:
+        base = _git_commit(repo, {name: later_main}, "main", "2026-11-01T12:00:00Z", parents=[approved])
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", base], cwd=repo, check=True)
+    head = _git_commit(repo, {name: "updated by the run\n", "src/login.py": "A = 1\nB = 2\n"}, "run",
+                       "2026-11-01T11:00:00Z", parents=[approved])
+    if later_main is not None:  # The refresh merges the newer main; the run keeps its own handoff.
+        head = _git_commit(repo, {}, "refresh", "2026-11-01T13:00:00Z", parents=[head, base])
+    ctx = SimpleNamespace(repo_root=root, store=SimpleNamespace(root=tmp_path / "store"), config=config)
+    approval = SimpleNamespace(body=_child_body(plan, item, config), approved_at="2026-11-01T10:30:00+00:00",
+                               acceptance_blobs={FILE: order._blob(API_FILES[FILE].encode())})
+    notes = []
+    size_signal.record(7, ctx, GitRepo(repo), approval, base, head, 12, notes.append)
+    assert notes == []
+    record, = size_signal.report(ctx.store.root)["records"]
+    assert (record["issue"], record["pr"]) == (7, 12)
+    # Measured from the merge base: the base's own change is not the run's size.
+    assert record["actual_size"] == {"source_lines": 2, "test_lines": 0, "file_count": 2}
+    assert record["expected_size"] == ({"source_lines": 2, "test_lines": 0, "file_count": 2} if kept else None)

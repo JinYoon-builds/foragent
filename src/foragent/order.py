@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
 from foragent import order_replaces
 from foragent.config import Config
@@ -1145,7 +1145,7 @@ def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: P
     run_config = lane_config(config, item["lane"])
     setup = implementer_setup(run_config, item["lane"], item["size"], root)
     prompt = preread_prompt(plan, item, root)
-    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + setup.memory_notice
+    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + size_signal.PROMPT + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan, _lane_instructions(run_config, item["lane"], root)],
@@ -1353,22 +1353,7 @@ def _binding(plan: dict, item: dict, config: Config, repo: str | None,
 
 def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str],
                   worktree: Path) -> dict | None:
-    """The latest preread proposal recorded for what this run's implementer receives, if any.
-
-    A record counts only when its key names this issue (plan child key in the same order,
-    or an edit of #n), the body publish rendered for it equals the approved body byte for byte
-    (apart from the trailing lines publish appends), and every file it bound
-    (acceptance tests and references) has the same content in the run's worktree and, where
-    the approval snapshot names the file, in that snapshot. The preread writer keeps
-    records in write order, so the last match is the latest answer; when that answer
-    proposed nothing (NONE or questions only), there is no proposal to hand over.
-    """
-    try:
-        records = _preread_records(root)
-    except PlanError:
-        return None
-    text, child = _without_child_marker(order_done_when.without_record(decision_links.MARKER_LINE.sub("", body)))
-    content = _body_digest(text)
+    """The latest preread proposal (see latest_preread); an answer that proposed nothing hands over none."""
     actual: dict[str, str] = {}
 
     def current(name: str) -> str:
@@ -1377,6 +1362,31 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
             actual[name] = _blob(path.read_bytes()) if path.is_file() else "missing"
         return actual[name]
 
+    latest = latest_preread(root, n, body, acceptance_blobs, current)
+    if latest is None or not (latest.get("approach") or latest.get("decisions")):
+        return None
+    return latest
+
+
+def latest_preread(root: Path, n: int, body: str, acceptance_blobs: dict[str, str],
+                   current: Callable[[str], str]) -> dict | None:
+    """The latest preread record for what this run's implementer receives, if any.
+
+    A record counts only when its key names this issue (plan child key in the same order,
+    or an edit of #n), the body publish rendered for it equals the approved body byte for byte
+    (apart from the trailing lines publish appends), and every file it bound
+    (acceptance tests and references) has the blob ``current(name)`` (``"missing"`` when absent)
+    and, where the approval snapshot names the file, that snapshot's blob. ``current`` reads the
+    files as the implementer starts from them: a worktree before the run changes it, or the
+    approval's own state after the run (``size_signal.approved_files``), never the run's result. The preread writer keeps
+    records in write order, so the last match is the latest answer.
+    """
+    try:
+        records = _preread_records(root)
+    except PlanError:
+        return None
+    text, child = _without_child_marker(order_done_when.without_record(decision_links.MARKER_LINE.sub("", body)))
+    content = _body_digest(text)
     latest = None
     for record in records.values():
         if not isinstance(record, dict) or record.get("content") != content:
@@ -1389,8 +1399,6 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
         if record.get("key") == f"#{n}" or (
                 child is not None and record.get("plan") == child[1] and record.get("key") == child[2]):
             latest = record
-    if latest is None or not (latest.get("approach") or latest.get("decisions")):
-        return None
     return latest
 
 
@@ -1472,18 +1480,19 @@ def preread(plan: dict, root: Path, config: Config,
             order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
-        unknowns = _unknowns(result.last_message)
-        decisions = _decisions(result.last_message)
-        approach = _approach(result.last_message)
+        size, answer = size_signal.parse(result.last_message), size_signal.without(result.last_message)
+        unknowns = _unknowns(answer)
+        decisions = _decisions(answer)
+        approach = _approach(answer)
         _record_preread(root, directory, digest, {
             "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-            "unknowns": unknowns, "decisions": decisions, "approach": approach,
+            "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
             "at": datetime.now(UTC).isoformat(timespec="seconds")})
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
-                       | ({"approach": approach} if approach else {}))
+                       | ({"approach": approach} if approach else {}) | size_signal.row(size, item["size"], config))
     # A statement issue has no reader turn, yet a refused publication must have this way back:
     # the agent that ran this re-read sees the current fields it now stands on.
     read = {item["key"] for item in items}

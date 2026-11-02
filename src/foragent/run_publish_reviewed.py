@@ -236,6 +236,8 @@ def _publish_reviewed_in_turn(
                 else:
                     run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    size_signal.record(n, ctx, git, approval, inputs.base_sha, head, pr.number,
+                                       lambda line: run_publish._append(log, line))
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:
@@ -276,4 +278,4 @@ def _publish_reviewed_in_turn(
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish  # noqa: E402
+from foragent import run_publish, size_signal  # noqa: E402
