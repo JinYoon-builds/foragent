@@ -300,6 +300,10 @@ def test_a_library_skill_reached_through_a_symlinked_folder_is_no_default_but_st
 
 from foragent.license_texts import STANDARD_LICENSES  # noqa: E402
 
+JANE_MIT = STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane Doe")
+BANNED_HOLDER_MIT = STANDARD_LICENSES["MIT"].replace(
+    "<year> <copyright holders>", "2026 Jane Doe. Redistribution is prohibited.")
+
 RESTRICTED_TEXTS = {
     "standard-then-ban": STANDARD_LICENSES["MIT"] + "\nRedistribution of this skill is prohibited.\n",
     "spdx-then-ban": "SPDX-License-Identifier: MIT\nRedistribution of this skill is prohibited.\n",
@@ -325,6 +329,19 @@ RESTRICTED_TEXTS = {
     "attribution-noncommercial-no-space": "example by Jane Doe,CC-BY-NC-4.0\n" + STANDARD_LICENSES["MIT"],
     "identifier-as-name-word": "Attribution: Jane Doe GPL-3.0-only\n" + STANDARD_LICENSES["MIT"],
     "one-word-attribution-is-no-work": "Attribution: noncommercial\n" + STANDARD_LICENSES["MIT"],
+    # #1652 review 3: a name the file's copyright lines or URLs do not carry is unsure and fails safe.
+    "title-case-ban": "Attribution: Redistribution Is Prohibited.\n" + JANE_MIT,
+    "title-case-source-ban": "Source: No Commercial Use\n" + JANE_MIT,
+    "title-case-work-ban": "No Commercial Use by Jane Doe, MIT License\n" + JANE_MIT,
+    "unbacked-author": "pstack by Someone Else\nhttps://example.org/pstack\n" + JANE_MIT,
+    "work-without-url": "Source: pstack\n" + JANE_MIT,
+    "holder-then-condition": "Attribution: Jane Doe, Noncommercial\n" + JANE_MIT,
+    # #1652 review 4: only a whole holder backs a notice, never a part of a copyright line.
+    "condition-from-copyright-line": "Attribution: Redistribution is prohibited.\n" + BANNED_HOLDER_MIT,
+    "holder-sentence-repeated": "Attribution: Jane Doe. Redistribution is prohibited.\n" + BANNED_HOLDER_MIT,
+    "name-cut-from-a-longer-holder": "Attribution: Jane Doe\n" + BANNED_HOLDER_MIT,
+    "part-of-a-holder": "Attribution: Doe\n" + JANE_MIT,
+    "part-of-a-url-part": "Source: pst\nhttps://example.org/pstack\n" + JANE_MIT,
 }
 
 # Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
@@ -376,11 +393,15 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
     "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
     # #1652: attribution and source notices around a complete permissive text.
-    "Attribution: Jane Doe\nSource: Example Project\n" + STANDARD_LICENSES["MIT"],
-    "Example Project by Jane Doe, MIT License, Copyright (c) 2026 Jane Doe\n" + STANDARD_LICENSES["MIT"],
-    STANDARD_LICENSES["MIT"] + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe <jane@example.org>\n",
-    "Attribution: Jane Doe, MIT License\n" + STANDARD_LICENSES["MIT"],
-    "Source: pstack\n" + STANDARD_LICENSES["MIT"],
+    # Names in notices repeat what the file's copyright lines or URLs already name.
+    "Attribution: Jane Doe\nSource: example-project\nhttps://example.org/example-project\n" + JANE_MIT,
+    "example-project by Jane Doe, MIT License, Copyright (c) 2026 Jane Doe\n"
+    "Upstream: https://example.org/example-project\n" + STANDARD_LICENSES["MIT"],
+    JANE_MIT + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe <jane@example.org>\n"
+    "https://example.org/tool\n",
+    "Attribution: Jane Doe, MIT License\n" + JANE_MIT,
+    "Source: pstack\nUpstream: https://github.com/example/pstack\n" + JANE_MIT,
+    "Attribution: Jane van Doe\n" + STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane van Doe"),
 ])
 def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
     root = tmp_path / "root"
@@ -595,9 +616,9 @@ def test_a_license_entry_that_is_not_a_readable_file_is_unknown(tmp_path):
 
 
 NOTICED_TEXTS = {
-    "attribution-prefix": "Attribution: Jane Doe\nSource: https://example.org/noticed\n" + STANDARD_LICENSES["MIT"],
-    "attribution-suffix": STANDARD_LICENSES["MIT"] + "\nExample Project by Jane Doe, MIT License\n",
-    "spdx-and-license-name": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe, MIT License\n" + STANDARD_LICENSES["MIT"],
+    "attribution-prefix": "Attribution: Jane Doe\nSource: https://example.org/noticed\n" + JANE_MIT,
+    "attribution-suffix": JANE_MIT + "\nnoticed by Jane Doe, MIT License\nhttps://example.org/noticed\n",
+    "spdx-and-license-name": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe, MIT License\n" + JANE_MIT,
 }
 
 

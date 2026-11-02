@@ -156,52 +156,77 @@ _LABEL = re.compile(
 _BY = re.compile(r"(.+?) by (.+?)(?:, *((?:Copyright\b|©).*))?")
 
 
-def _name_words(value: str, *, first_any_case: bool = False) -> bool:
-    """Whether ``value`` only names or locates someone or something: URLs, `<e-mail>` and name words.
+def _backed(name: str, facts: set[str]) -> bool:
+    """Whether ``name`` is, as a whole, one of the names the file's own facts carry (see `_facts`).
 
-    A name word starts with a capital letter, holds no sentence punctuation and no digit (a year is
-    all digits), so neither a sentence such as "Redistribution is prohibited." nor a license
-    identifier such as `GPL-3.0-only` is a name. A single word of any case is a name when
-    ``first_any_case`` (a work such as `pstack`). No name declares a license or holds a comma: a
-    license is only ever accepted by its exact permissive name (`_named_license`).
+    A person is not judged by the spelling of the name (Jin's rule for copyright lines): a notice may
+    only repeat a whole holder that a copyright line names, or a whole path part of one of the file's
+    URLs. A part of a copyright line is not a name. Anything else is unsure, and an unsure notice
+    fails safe (#1652 review standard, option 1).
     """
+    return " ".join(name.split()) in facts
+
+
+def _person(value: str, holders: set[str]) -> bool:
+    """`<holder>`, `<holder> <e-mail>` or `<e-mail>`, the holder being one a copyright line names."""
     words = value.split()
-    if "," in value or any(re.search(r"licen[cs]e", word, re.I) and not _URL.fullmatch(word) for word in words):
-        return False
-    if first_any_case and len(words) == 1 and re.fullmatch(r"[^\W\d_][\w.+]*", words[0]):
-        return True
-    return bool(words) and all(
-        _URL.fullmatch(word) or re.fullmatch(r"<[^\s<>@]+@[^\s<>@]+>", word) or word == "&"
-        or re.fullmatch(r"\d{4}(?:[-–]\d{4})?", word)
-        or (word[0].isupper() and re.fullmatch(r"[^\W\d_][^\W\d_.'&-]*(?:[.'&-][^\W\d_]*)*\.?", word))
-        for word in words)
+    while words and re.fullmatch(r"<[^\s<>@]+@[^\s<>@]+>", words[-1]):
+        words.pop()
+    return (not words and bool(value.split())) or _backed(" ".join(words), holders)
 
 
-def _named_license(value: str) -> bool:
-    """`<name>` or `<name>, <exact permissive license name>`: anything after the comma must be one."""
+def _named_license(value: str, holders: set[str]) -> bool:
+    """`<holder>` or `<holder>, <exact permissive license name>`: anything after the comma must be one."""
     name, comma, license_name = value.partition(",")
-    return _name_words(name) and (
+    return _person(name, holders) and (
         not comma or _LICENSE_NAMES.get(license_name.strip().casefold()) in OPEN_SOURCE_LICENSES)
 
 
-def _attribution(line: str) -> bool:
-    """`<work> by <author>[, <permissive license name>][, Copyright …]`; the copyright part is not judged."""
+def _attribution(line: str, holders: set[str], works: set[str]) -> bool:
+    """`<work> by <holder>[, <permissive license name>][, Copyright …]`; the copyright part is not judged."""
     if (match := _BY.fullmatch(line)) is None:
         return False
     work, rest, _ = match.groups()
-    return _name_words(work, first_any_case=True) and _named_license(rest)
+    return _backed(work, works) and _named_license(rest, holders)
 
 
-def _notice(line: str) -> bool:
-    """A line allowed around a complete license text: permissive SPDX, copyright, attribution, source or URL."""
+_HOLDER = re.compile(
+    r"(?:Copyright\b|©)[ \t]*(?:\(c\)|©)?[ \t]*(?:\d{4}(?:[ \t]*[-–][ \t]*(?:\d{4}|present)?)?[ \t]*,?[ \t]*)+(.+)",
+    re.I)
+
+
+def _facts(lines: list[str]) -> tuple[set[str], set[str]]:
+    """The names a LICENSE file carries itself: whole copyright holders, and the path parts of its URLs.
+
+    A holder is all of a copyright line after `Copyright`, `(c)` and the years, and it backs a notice
+    only when it is one name: a holder that goes on into another sentence (`Jane Doe. Redistribution
+    is prohibited.`) or clause (`;`, `:`) is no name a notice can repeat. Copyright lines themselves
+    stay unjudged.
+    """
+    clauses = [line for line in lines if _copyright_line(line)]
+    clauses += [match[3] for line in lines if (match := _BY.fullmatch(line)) and match[3]]
+    holders = {" ".join(match[1].split()) for clause in clauses if (match := _HOLDER.fullmatch(clause.strip()))}
+    holders = {holder for holder in holders if not re.search(r"[.!?][ \t]+\S|[;:!?]", holder)}
+    urls = [url.strip("<>") for line in lines for url in _URL.findall(line)]
+    works = {part for url in urls for part in re.split(r"[/?#=&]", url.split("://", 1)[-1]) if part}
+    return holders, works
+
+
+def _notice(line: str, holders: set[str], works: set[str]) -> bool:
+    """A line allowed around a complete license text: permissive SPDX, copyright, attribution, source or URL.
+
+    Names in attribution and source notices must be ones the file's copyright lines (``holders``) or
+    URLs (``works``) already carry; see `_facts`.
+    """
     line = line.strip()
     if _copyright_line(line) or _spdx(line) in OPEN_SOURCE_LICENSES or _URL.fullmatch(line):
         return True
     if (label := _LABEL.fullmatch(line)) is not None:
-        # A source label names the work, which may be one word of any case (`Source: pstack`).
-        return (_named_license(label[2]) or _attribution(label[2])
-                or (label[1] is not None and _name_words(label[2], first_any_case=True)))
-    return _attribution(line)
+        value = label[2]
+        return (_URL.fullmatch(value) is not None or _named_license(value, holders)
+                or _attribution(value, holders, works)
+                or (label[1] is not None and _backed(value, works)))  # `Source: pstack`, with pstack in a URL.
+    return _attribution(line, holders, works)
 
 
 def _permissive(text: str) -> str:
@@ -220,8 +245,10 @@ def _permissive(text: str) -> str:
         return "unknown"  # A nonpermissive declaration fails whatever text follows it.
     standards = {identity: _terms(standard) for identity, standard in STANDARD_LICENSES.items()}
     # The license text is one run of lines; only notices may stand before or after it.
-    first = next((index for index, line in enumerate(lines) if not _notice(line)), len(lines))
-    last = next((index for index in range(len(lines) - 1, -1, -1) if not _notice(lines[index])), -1)
+    holders, works = _facts(lines)
+    notices = [_notice(line, holders, works) for line in lines]
+    first = next((index for index, notice in enumerate(notices) if not notice), len(lines))
+    last = next((index for index in range(len(lines) - 1, -1, -1) if not notices[index]), -1)
     for start in range(first + 1):
         for end in range(max(last + 1, start + 1), len(lines) + 1):
             terms = _terms("\n".join(lines[start:end]))
