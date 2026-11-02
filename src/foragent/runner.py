@@ -30,7 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
-from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
+from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -188,29 +188,45 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 def _restore_approved_base(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, *, branch: str,
 ) -> bool:
-    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    """Bring the saved branch onto the approved base, then require the approved locked bytes.
+
+    After the base merge, a locked file that still differs from approval (or conflicts) can
+    only be the branch's own edit, so no history needs tracing: a WIP commit that saved an
+    earlier base merge as an ordinary commit merges cleanly and takes the approved bytes.
+    """
     locks = approval.acceptance_blobs
     if git.blob_shas("HEAD", locks) == locks:
         return True
     base = f"origin/{ctx.config.base_branch}"
-    own_edits = git._call(["rev-list", "HEAD", f"^{base}", "--", *locks]).strip()
-    if own_edits:
-        return _acceptance_matches(n, ctx, git, approval)
     if git.is_ancestor("HEAD", base):
         # No own commits: recreate at the approved base without a merge commit.
         ctx.git.remove_worktree(git.root)
         ctx.git.add_worktree(git.root, branch, base)
-    else:
-        try:
-            git.merge_base(base)
-        except GitError:
-            conflicts = git.conflict_paths()
-            if not conflicts:
-                raise
-            # Resume's resolver finishes this saved branch's base update.
-            pending = ctx.store.get_run(n).merge_conflicts
-            ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+        return True
+    try:
+        git.merge_base(base)
+    except GitError:
+        conflicts = git.conflict_paths()
+        if not conflicts:
+            raise
+        if _staged_blobs(git, locks) != locks:
+            return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
+        # Resume's resolver can finish this merge.
+        pending = ctx.store.get_run(n).merge_conflicts
+        ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    # A clean merge leaves only the branch's own lock edits; the check before implementation rejects them.
     return True
+
+
+def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
+    """Index blob of each path: ABSENT_BLOB when missing, None while it is still conflicted."""
+    staged: dict[str, str | None] = {path: ABSENT_BLOB for path in paths}
+    output = git._call(["--literal-pathspecs", "ls-files", "-s", "-z", "--", *paths])
+    for entry in filter(None, output.split("\0")):
+        meta, path = entry.split("\t", 1)
+        _mode, sha, stage = meta.split()
+        staged[path] = sha if stage == "0" else None
+    return staged
 
 
 def _implement_and_publish(

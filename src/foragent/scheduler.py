@@ -69,7 +69,9 @@ class TickReport:
 
 
 # Facade bindings for callers and monkeypatches; split modules call each other through here.
-from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
+from foragent.scheduler_approval import (  # noqa: E402
+    _check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
+)
 from foragent.scheduler_recovery import (  # noqa: E402
     _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
     _restore_after_crash, _restore_stalled, _reap_inactive_runs,
@@ -213,6 +215,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         if waiting_labels and (
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
         ):
+            _record_held_approval(ctx, issue, previous_flag, base_ref, report, confirmed=listing_current)
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             return
         if APPROVED not in issue.labels and not waiting_labels:

@@ -129,20 +129,80 @@ def _terms(text: str) -> str:
     return " ".join(" ".join(line for line in text.splitlines() if not _copyright_line(line)).split())
 
 
-def _permissive(text: str) -> str:
-    """The permissive license a whole LICENSE text is, else "unknown" (Jin's rule, 2026-11-02).
+# A license declaration: any line whose label (the text before its first colon) names SPDX or a license,
+# in any case, spacing or word order and behind a comment mark (`SPDX License Identifier:`, `License:` …).
+_DECLARATION = re.compile(r"[\W_]*([^:]*?(?:spdx|licen[cs]e)[^:]*?)[ \t]*:(?!//)[ \t]*(.*)", re.I)
 
-    It passes when its text apart from the copyright lines equals a known permissive license word
-    for word, or when it is one `SPDX-License-Identifier:` line naming one, plus copyright lines
-    and nothing else. Everything else, no text included, fails; the copyright names are not judged.
+
+def _declaration(line: str) -> tuple[str, str] | None:
+    """(label, permissive license or "unknown") when ``line`` declares a license, else None.
+
+    The value is read as an SPDX expression: every identifier joined by `AND`/`OR` (and parentheses)
+    must be a permissive one. Anything else (`WITH`, `LicenseRef-…`, words, nothing) is "unknown".
+    """
+    if (match := _DECLARATION.fullmatch(line.strip())) is None:
+        return None
+    words = [word for word in re.split(r"[\s()]+", match[2].strip().removesuffix("*/")) if word]
+    identities = [word for word in words if word.upper() not in {"AND", "OR"}]
+    known = [next((name for name in OPEN_SOURCE_LICENSES if name.casefold() == word.casefold()), None)
+             for word in identities]
+    return " ".join(match[1].split()), (known[0] if known and all(known) else "unknown")
+
+
+def _spdx(line: str) -> str | None:
+    """The permissive license a declaration line names, "unknown" for any other declaration, None for no declaration."""
+    return None if (found := _declaration(line)) is None else found[1]
+
+
+_URL = re.compile(r"<?https?://\S+")
+# A labelled notice: one to three words, a colon, then anything (`Source: …`, `Upstream: …`).
+_LABEL = re.compile(r"[^\W\d_][\w-]*(?: [\w-]+){0,2}[ \t]*:(?!//)[ \t]*\S.*")
+# An attribution: `<work> by <anything>`, the work being one word.
+_BY = re.compile(r"\S+ by \S.*")
+
+
+def _notice(line: str) -> bool:
+    """A line allowed around a complete license text, and not judged (#1652 scope, 2026-11-02).
+
+    Copyright lines, permissive SPDX lines, URL lines, labelled lines (`Source:`, `Attribution:`,
+    `Upstream:` …) and `<work> by …` attributions pass whatever they say: their content is a NOTE for
+    the person who approves the role table or a library, the real filter. Only unlabelled sentences
+    are judged, by failing: they may add a condition.
+    """
+    line = line.strip()
+    if _copyright_line(line):
+        return True
+    # A declaration is always judged and never falls through to the unjudged forms below.
+    if (identity := _spdx(line)) is not None:
+        return identity in OPEN_SOURCE_LICENSES
+    return bool(_URL.fullmatch(line) or _LABEL.fullmatch(line) or _BY.fullmatch(line))
+
+
+def _permissive(text: str) -> str:
+    """The permissive license a whole LICENSE text is, else "unknown" (Jin's rules, 2026-11-02 and #1652).
+
+    It passes when it holds a known permissive license word for word (copyright lines and whitespace
+    aside) and every other nonblank line, before or after that text, is a `_notice`. The older short
+    form also passes: one `SPDX-License-Identifier:` line naming a permissive license plus copyright
+    lines and nothing else. Everything else fails; the copyright names are never judged.
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     declarations = [line for line in lines if not _copyright_line(line)]
-    if len(declarations) == 1 and (spdx := re.fullmatch(r"SPDX-License-Identifier: *(\S+)", declarations[0])):
-        return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == spdx[1].casefold()), "unknown")
-    terms = _terms(text)
-    return next((identity for identity, standard in STANDARD_LICENSES.items()
-                 if terms and terms == _terms(standard)), "unknown")
+    # The older short form is one `SPDX-License-Identifier:` line only; no other declaration stands in for terms.
+    if len(declarations) == 1 and (found := _declaration(declarations[0])) is not None:
+        label, identity = found
+        return identity if label.casefold() == "spdx-license-identifier" else "unknown"
+    standards = {identity: _terms(standard) for identity, standard in STANDARD_LICENSES.items()}
+    # The license text is one run of lines; only notices may stand before or after it.
+    notices = [_notice(line) for line in lines]
+    first = next((index for index, notice in enumerate(notices) if not notice), len(lines))
+    last = next((index for index in range(len(lines) - 1, -1, -1) if not notices[index]), -1)
+    for start in range(first + 1):
+        for end in range(max(last + 1, start + 1), len(lines) + 1):
+            terms = _terms("\n".join(lines[start:end]))
+            if terms and (identity := next((name for name, value in standards.items() if terms == value), None)):
+                return identity
+    return "unknown"
 
 
 _LICENSE_FILE = re.compile(r"(?:licen[cs]e|copying)", re.I)
@@ -496,7 +556,8 @@ class SkillManager:
         if license_id not in OPEN_SOURCE_LICENSES:
             raise SkillError(f"refusing to install {identity} as a default: cannot confirm an open-source license "
                              f"({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
-        return self.check_install(identity, root, commit=True)
+        # This judge alone decides a default; the catalog's looser reading must neither veto nor warn.
+        return replace(self.check_install(identity, root), license=license_id, license_file=found)
 
     def default_needs_ignore(self, skill: Skill, root: Path) -> bool:
         """Whether installing this default adds a line to .gitignore."""
@@ -524,7 +585,7 @@ class SkillManager:
         The license files that decided its eligibility are copied in when they sit above the skill
         folder (a library often licenses its skills in one root file), and SOURCE records where it came from.
         """
-        self.install(identity, root)
+        self.install(identity, root, checked=skill)
         destination = repo_path(root, f".claude/skills/{skill.path.name}")
         license_id, found = redistributable_license(skill.path, skill.library.path)
         kept = []
@@ -545,8 +606,9 @@ class SkillManager:
             f"Source: {skill.library.repo}\nPath: {skill.path.relative_to(skill.library.path).as_posix()}\n"
             f"Revision: {revision or 'unknown'}\nLicense: {license_id} ({licenses})\n", encoding="utf-8")
 
-    def install(self, identity: str, root: Path, *, commit: bool = False) -> str:
-        skill = self.check_install(identity, root, commit=commit)
+    def install(self, identity: str, root: Path, *, commit: bool = False, checked: Skill | None = None) -> str:
+        """Copy a skill into .claude/skills; ``checked`` is a skill `check_default` already judged."""
+        skill = checked or self.check_install(identity, root, commit=commit)
         if skill.license not in OPEN_SOURCE_LICENSES:
             location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
             print(f"Warning: {skill.id}: cannot confirm an open-source license "

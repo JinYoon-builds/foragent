@@ -1367,7 +1367,8 @@ def test_undetected_test_command_uses_local_path_and_invokes_worker(run_case):
 
 
 @pytest.mark.parametrize('reviewed', [False, True], ids=['implementation', 'review-only'])
-@pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure'])
+@pytest.mark.parametrize('change', ['producer', 'regression', 'missing', 'base', 'head', 'scope', 'infrastructure',
+                                    'appeared'])
 def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_case, monkeypatch, reviewed, change):
     from foragent import runner
     from foragent.git import GitRepo
@@ -1387,6 +1388,12 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         case.ctx.config = replace(case.ctx.config, checks_fallback='local')
         case.tracker.set_pr_checks(2, 'fail')
         case.tracker.set_pr_failed_logs(2, CIEvidence('Job did not start', not_started=True))
+    if change == 'appeared':
+        from foragent import ci_local
+
+        # No reports before the lock: the opt-in local measurement stands in until CI reports appear.
+        case.ctx.config = replace(case.ctx.config, checks_fallback='local')
+        monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base_sha: None)
 
     holder = [False]
     changed = [False]
@@ -1399,7 +1406,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     def checks(head):
         reads.append(holder[0])
         heads.add(head)
-        if changed[0] and change == 'missing':
+        if changed[0] and change == 'missing' or not changed[0] and change == 'appeared':
             return []
         excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
         values = [report(), report(1)]
@@ -1410,7 +1417,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
             payload = value['report']
             payload.update(base_sha=case.history.tip, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
-            if changed[0] and change == 'regression':
+            if changed[0] and change in {'regression', 'appeared'}:
                 payload['head']['passing_ids'] = []
             value['report'] = payload
         return values
@@ -1453,6 +1460,9 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         assert outcome != 'merged' and not case.tracker.merged_prs
     if change in {'producer', 'regression', 'missing'}:
         assert reads[:3] == [False, True, False], 'Changed evidence must be checked again outside the lock'
+    if change == 'appeared':
+        locked = reads.index(True)
+        assert False in reads[locked + 1:], 'Reports that replace a local fallback must be compared outside the lock'
     if change == 'head':
         assert outcome == 'held'
     assert git_command(case.history.origin, 'rev-parse', 'main') == case.history.tip
