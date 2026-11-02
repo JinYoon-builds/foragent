@@ -2,12 +2,23 @@
 
 MESSAGES = {
     "en": {
-        "scorecard_today": ("Last 24 h: {runs} runs, {merge_rate} merged, {merge_minutes} min to merge, "
+        "scorecard_today": ("Last 24 h: {runs} runs, {merge_rate} merged, {merge_minutes} min from approval to merge, "
                             "{calls} GitHub calls/h, {returns} review returns, {reverts}, "
                             "{questions} spec questions, load {load}, phase min: {phases}"),
         "scorecard_previous": ("Daily median of the {days} days before: {runs} runs, {merge_rate} merged, "
-                               "{merge_minutes} min to merge, {calls} GitHub calls/h, {returns} review returns, "
+                               "{merge_minutes} min from approval to merge, {calls} GitHub calls/h, {returns} review returns, "
                                "{reverts}, {questions} spec questions, load {load}, phase min: {phases}"),
+        "scorecard_split_today": ("  approval to merge (merged in the last 24 h, cohort total): {total} issue-min "
+                                  "over {merges} merges: {parts}; {missing} merges without a known approval left out"),
+        "scorecard_split_previous": ("  approval to merge (merged in the previous days, previous-days total): "
+                                     "{total} issue-min over {merges} merges: {parts}; "
+                                     "{missing} merges without a known approval left out"),
+        "scorecard_part_work": "work {minutes}",
+        "scorecard_part_concurrency_cost": "concurrency cost {minutes}",
+        "scorecard_part_machine_limit": "machine limit {minutes}",
+        "scorecard_part_ordering": "ordering {minutes}",
+        "scorecard_part_waste": "real waste {minutes}",
+        "scorecard_part_unknown": "unknown {minutes}",
         "scorecard_reverts": "{count} reverts",
         "scorecard_reverts_unknown": "unknown reverts",
         "scorecard_worse": "Got worse: {metric} {before} -> {now}",
@@ -43,12 +54,22 @@ MESSAGES = {
         "scorecard_label_phase_baseline": "baseline minutes",
     },
     "ko": {
-        "scorecard_today": ("최근 24시간: 실행 {runs}건, 머지 {merge_rate}, 머지까지 {merge_minutes}분, "
+        "scorecard_today": ("최근 24시간: 실행 {runs}건, 머지 {merge_rate}, 승인부터 머지까지 {merge_minutes}분, "
                             "GitHub 호출 시간당 {calls}회, 리뷰 반려 {returns}건, {reverts}, "
                             "명세 질문 {questions}건, 부하 {load}, 단계별 분: {phases}"),
         "scorecard_previous": ("그 전 {days}일의 하루 중앙값: 실행 {runs}건, 머지 {merge_rate}, "
-                               "머지까지 {merge_minutes}분, GitHub 호출 시간당 {calls}회, 리뷰 반려 {returns}건, "
+                               "승인부터 머지까지 {merge_minutes}분, GitHub 호출 시간당 {calls}회, 리뷰 반려 {returns}건, "
                                "{reverts}, 명세 질문 {questions}건, 부하 {load}, 단계별 분: {phases}"),
+        "scorecard_split_today": ("  승인부터 머지까지(최근 24시간에 머지된 이슈의 합계): {total} 이슈·분, "
+                                  "머지 {merges}건: {parts}; 승인을 모르는 머지 {missing}건은 뺌"),
+        "scorecard_split_previous": ("  승인부터 머지까지(그 전 며칠에 머지된 이슈의 합계, 중앙값 아님): "
+                                     "{total} 이슈·분, 머지 {merges}건: {parts}; 승인을 모르는 머지 {missing}건은 뺌"),
+        "scorecard_part_work": "일 {minutes}",
+        "scorecard_part_concurrency_cost": "동시 작업 비용 {minutes}",
+        "scorecard_part_machine_limit": "기계 한도 {minutes}",
+        "scorecard_part_ordering": "순서 {minutes}",
+        "scorecard_part_waste": "진짜 낭비 {minutes}",
+        "scorecard_part_unknown": "알 수 없음 {minutes}",
         "scorecard_reverts": "되돌림 {count}건",
         "scorecard_reverts_unknown": "되돌림 알 수 없음",
         "scorecard_worse": "나빠졌어요: {metric} {before} -> {now}",
