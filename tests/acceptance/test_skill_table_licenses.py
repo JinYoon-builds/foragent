@@ -61,8 +61,12 @@ def test_shipped_license_is_accepted_unchanged(setup, isolated_home, monkeypatch
                          'Copyright 2026 Example, Redistribution is prohibited.'),
     'SPDX-License-Identifier: Apache-2.0\nSource: https://example.org/apache\n'
     + (ROOT / 'LICENSE-APACHE').read_text(),
+    # Labeled notice lines are shown to the person who approves, not judged by the machine.
+    NOTICE + MIT + '\nSource: https://example.org/source Redistribution is prohibited.\n',
+    NOTICE + MIT + '\nAttribution: Redistribution is prohibited.\n',
 ], ids=['external-prefix', 'external-suffix', 'source-and-url', 'attribution-url',
-        'copyright-name-not-judged', 'another-permissive-license'])
+        'copyright-name-not-judged', 'another-permissive-license',
+        'source-label-not-judged', 'attribution-label-not-judged'])
 def test_permissive_text_with_notices_is_accepted(setup, isolated_home, monkeypatch, license_text):
     code, source, installed = initialize(setup, monkeypatch, license_text)
     assert code == 0
@@ -79,12 +83,10 @@ def test_permissive_text_with_notices_is_accepted(setup, isolated_home, monkeypa
     SHIPPED.replace('SPDX-License-Identifier: MIT', 'SPDX-License-Identifier: LicenseRef-Source-Available', 1),
     SHIPPED.replace('free of charge, ', '', 1),
     SHIPPED.split('THE SOFTWARE IS PROVIDED')[0],
-    NOTICE + MIT + '\nSource: https://example.org/source Redistribution is prohibited.\n',
-    NOTICE + MIT + '\nAttribution: Redistribution is prohibited.\n',
     NOTICE,  # SPDX plus arbitrary notices alone cannot substitute for full terms.
 ], ids=['ban-before', 'ban-after', 'ban-between', 'extra-condition', 'copyleft-spdx',
         'noncommercial-spdx', 'source-available-spdx', 'changed-terms', 'truncated-terms',
-        'source-label-with-condition', 'attribution-label-with-condition', 'no-full-license'])
+        'no-full-license'])
 def test_extra_terms_or_nonpermissive_declarations_are_rejected(
     setup, isolated_home, monkeypatch, capsys, license_text,
 ):

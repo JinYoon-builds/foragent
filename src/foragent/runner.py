@@ -30,7 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
-from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
+from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -131,7 +131,7 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_review import _review_implementation
+from foragent.run_review import _review_implementation, passed_head, unchanged_since_pass
 
 
 @dataclass
@@ -196,31 +196,45 @@ def _restore_approved_base(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
     *, branch: str,
 ) -> bool:
-    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    """Bring the saved branch onto the approved base, then require the approved locked bytes.
+
+    After the base merge, a locked file that still differs from approval (or conflicts) can
+    only be the branch's own edit, so no history needs tracing: a WIP commit that saved an
+    earlier base merge as an ordinary commit merges cleanly and takes the approved bytes.
+    """
     locks = approval.acceptance_blobs
     if git.blob_shas("HEAD", locks) == locks:
         return True
     base = f"origin/{ctx.config.base_branch}"
-    own_edits = git._call([
-        "rev-list", "HEAD", f"^origin/{target_branch}", f"^{base}", "--", *locks,
-    ]).strip()
-    if own_edits:
-        return _acceptance_matches(n, ctx, git, approval)
     if git.is_ancestor("HEAD", base):
         # No own commits: recreate at the approved base without a merge commit.
         ctx.git.remove_worktree(git.root)
         ctx.git.add_worktree(git.root, branch, base)
-    else:
-        try:
-            git.merge_base(base)
-        except GitError:
-            conflicts = git.conflict_paths()
-            if not conflicts:
-                raise
-            # Resume's resolver can finish this merge, including a stale batch's base update.
-            pending = ctx.store.get_run(n).merge_conflicts
-            ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+        return True
+    try:
+        git.merge_base(base)
+    except GitError:
+        conflicts = git.conflict_paths()
+        if not conflicts:
+            raise
+        if _staged_blobs(git, locks) != locks:
+            return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
+        # Resume's resolver can finish this merge, including a stale batch's base update.
+        pending = ctx.store.get_run(n).merge_conflicts
+        ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    # A clean merge leaves only the branch's own lock edits; the check before implementation rejects them.
     return True
+
+
+def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
+    """Index blob of each path: ABSENT_BLOB when missing, None while it is still conflicted."""
+    staged: dict[str, str | None] = {path: ABSENT_BLOB for path in paths}
+    output = git._call(["--literal-pathspecs", "ls-files", "-s", "-z", "--", *paths])
+    for entry in filter(None, output.split("\0")):
+        meta, path = entry.split("\t", 1)
+        _mode, sha, stage = meta.split()
+        staged[path] = sha if stage == "0" else None
+    return staged
 
 
 def _implement_and_publish(
@@ -235,19 +249,29 @@ def _implement_and_publish(
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 raise ExecutorStopped("hash-mismatch")
             attempt.approved_ref = git.head_sha()
+            # A resumed head that already passed review returns to its checks and publication.
+            reviewed = not resume_verified and not failure and passed_head(n, ctx, git)
+            passed = git.head_sha() if reviewed else None
             while True:
+                reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
                     attempt.failure = ""
                     resume_verified = False
                 else:
-                    _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    if not reuse:
+                        _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:
                         attempt.failure = _recover_replay(attempt, exc)
                 attempt.reviewer_text = None
                 run = ctx.store.get_run(n)
-                if not attempt.failure and ctx.config.reviewer != "none":
+                if reuse and not attempt.failure and not unchanged_since_pass(git, passed):
+                    _append(attempt.log, f"Checks changed head {passed} after its PASS: reviewing the new contents")
+                    reuse = False
+                if reuse and not attempt.failure:
+                    _append(attempt.log, f"Head {passed} already passed review: resuming its publication")
+                elif not attempt.failure and ctx.config.reviewer != "none":
                     if _remaining(n, ctx) <= 0:
                         outcome = _timeout(n, ctx)
                         return outcome
@@ -300,7 +324,7 @@ def _implement_and_publish(
         raise
     except TrackerError as exc:
         attempt.tracker_available = False
-        outcome = "limit-wait" if exc.is_rate_limit else "error"
+        outcome = "limit-wait" if exc.waits else "error"
         raise
     except (SystemExit, KeyboardInterrupt):
         outcome = "killed"
@@ -381,14 +405,14 @@ def review_only(
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
-            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+            if not isinstance(exc, TrackerError) or not exc.waits:
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
+            outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
@@ -412,8 +436,7 @@ def review_only(
                 except TrackerError as exc:
                     if not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    detail = str(exc) or type(exc).__name__
-                    outcome = "limit-wait"
+                    detail, outcome = orch_github.cause(exc), "limit-wait"
                 finally:
                     try:
                         ctx.store.finish_run(n, outcome=outcome, detail=detail)
@@ -490,7 +513,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
+            outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"

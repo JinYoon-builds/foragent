@@ -280,7 +280,7 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
                 "detail": f"load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}"}
     if "github" in held:
         return {"kind": "github", "normal": True,
-                "detail": f"GitHub rate limit until {work['github_wait_until']}; the tick starts nothing: "
+                "detail": f"GitHub pause until {work['github_wait_until']}; the tick starts nothing: "
                           + ", ".join(held["github"])}
     if "run_hours" in held:
         return {"kind": "run_hours", "normal": True,

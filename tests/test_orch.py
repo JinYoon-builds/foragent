@@ -353,6 +353,15 @@ def test_all_failure_exits_are_visible_and_never_merge(review_case, monkeypatch,
 
     if entry == "rerun-review":
         orch.rerun_review(c.ctx, 1)
+    elif failure == "missing-approval":
+        # Missing evidence refuses resolve before any write: approval stays and nothing is flagged.
+        labels = c.tracker.get_issue(1).labels
+        with pytest.raises(orch.OrchError, match="re-approve"):
+            orch.resolve(c.ctx, 1, "pass", "Reviewed, still require checks and CI")
+        assert c.tracker.get_issue(1).labels == labels and "approved" in labels
+        assert (c.store.load_flag(1) or Flag(1, "", "")).reason != Reason.HASH_MISMATCH
+        assert c.tracker.merged_prs == [] and c.review_calls == []
+        return
     else:
         orch.resolve(c.ctx, 1, "pass", "Reviewed, still require checks and CI")
     if failure == "base":
@@ -833,3 +842,22 @@ def test_review_done_when_that_commits_a_harness_change_holds(review_case, last)
     assert c.store.load_flag(1).reason == Reason.TEST_HARNESS_CHANGED
     assert {"blocked", "needs-human"} <= c.tracker.get_issue(1).labels
     assert c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail"])
+def test_resolve_without_an_approval_record_refuses_before_reads_or_writes(review_case, monkeypatch, verdict):
+    c = review_case
+    c.store.clear_approval(1)
+    before = {p: p.read_bytes() for p in c.store.root.rglob("*") if p.is_file()}
+    calls = []
+    for name in ("get_issue", "find_pr", "pr_head_sha", "comment", "add_labels", "remove_labels",
+                 "close_pr", "merge_pr"):
+        monkeypatch.setattr(c.ctx.tracker, name, lambda *args, _name=name, **kwargs: calls.append(_name))
+    monkeypatch.setattr(orch, "kick_tick", lambda root: calls.append("kick"))
+
+    with pytest.raises(orch.OrchError, match="no approval record .*re-approve"):
+        orch.resolve(c.ctx, 1, verdict, "Reviewed the current head")
+
+    assert calls == []
+    assert {p: p.read_bytes() for p in c.store.root.rglob("*") if p.is_file()} == before
+    assert c.store.load_approval(1) is None, "resolve reads approval records; only the gate writes them"

@@ -289,16 +289,16 @@ def _start_ready(
         if not scheduler._reserve_slot(ctx, number, budget):
             scheduler_flow.hold_slots(ctx, candidates)
             return started
+        failure = None  # this start's own GitHub failure, if it met one
         try:
             ctx.tracker.remove_labels(number, [scheduler.READY])
             ctx.tracker.add_labels(number, [scheduler.RUNNING])
             scheduler.board.sync_status(ctx, number, "Running")
             until = ctx.store.github_wait_until(ctx.now())  # A queued label write may have met the limit.
-            detail = f"GitHub rate limit until {until.isoformat()}" if until else ""
         except scheduler.TrackerError as exc:
             if not exc.is_rate_limit:
                 raise
-            until, detail = scheduler.orch_github.pause(ctx, exc), str(exc)
+            until, failure = scheduler.orch_github.pause(ctx, exc), exc
         # Every start, also one a GitHub limit stops, stores its pair and journals its switch (#186).
         run = ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
@@ -308,9 +308,9 @@ def _start_ready(
         )
         if until:  # A label may already say running though no process started: availability, not a crash.
             ctx.store.clear_run_start(number)
-            scheduler.orch_github.wait_run(ctx, number, until)
-            ctx.store.finish_run(number, "limit-wait", detail=detail)
-            report.skipped = f"GitHub rate limit until {until.isoformat()}"
+            scheduler.orch_github.wait_run(ctx, number, until, failure)
+            ctx.store.finish_run(number, "limit-wait")
+            report.skipped = ctx.store.get_run(number).detail
             scheduler_flow.hold(ctx, candidates, "github-wait")
             return None
         if start.switch is not None:  # Claude is held back: this run implements with Codex (#107).
@@ -340,10 +340,10 @@ def _reopen_view(ctx: TickContext, report: TickReport) -> None:
 def _github_wait(ctx: TickContext, ready: dict[str, list[int]], name: str) -> str | None:
     """One timed check of the GitHub pause; budgets still apply while it lasts."""
     with step(name):
-        if until := ctx.store.github_wait_until(ctx.now()):
+        if waiting := scheduler.orch_github.wait_text(ctx.store, ctx.now()):
             scheduler_flow.hold_stored(ctx, "github-wait")
             scheduler._apply_budgets(ctx, ready)
-            return f"GitHub rate limit until {until.isoformat()}"
+            return waiting
     return None
 
 
@@ -354,4 +354,4 @@ def _github_pause(ctx: TickContext, exc: Exception) -> str:
         scheduler_flow.hold_stored(ctx, "github-wait")
         until = scheduler.orch_github.pause(ctx, exc)
         scheduler._apply_budgets(ctx, {})
-    return f"GitHub rate limit until {until.isoformat()}"
+    return scheduler.orch_github.wait_text(ctx.store, ctx.now(), exc) or f"GitHub rate limit until {until.isoformat()}"
