@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from foragent import capacity, order, order_collect, order_flush, processes
+from foragent import capacity, order, order_collect, order_flush, order_flush_recovery, order_landing, processes
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.state import StateStore
@@ -166,7 +166,7 @@ def test_each_inherited_import_setting_is_gone_for_the_command(case, monkeypatch
     monkeypatch.setenv(name, "/caller")
     with pytest.raises(order.PlanError, match="unavailable"):  # This launcher writes no report.
         check(case, {GOOD: "VALUE = 1\n"}, command=str(tool / "pytest"))
-    assert f"{name}=" not in seen.read_text()
+    assert f"{name}=/caller" not in seen.read_text()
 
 
 @pytest.fixture
@@ -190,6 +190,59 @@ def test_a_helper_from_outside_through_the_command_is_refused(case, caller_only,
         check(case, {GOOD: IMPORTS}, command=command)
     assert "collect_helper" in str(refusal.value) and "outside the base" in str(refusal.value)
     assert str(caller_only) in str(refusal.value)
+
+
+@pytest.mark.parametrize("body", [
+    "import collect_helper, sys\ndel sys.modules['collect_helper']\n",
+    "import importlib.util as u, sys\n"
+    "s = u.spec_from_file_location('other', next(p for p in sys.path if 'caller-only' in p) + '/collect_helper.py')\n"
+    "u.module_from_spec(s); s.loader.exec_module(u.module_from_spec(s))\n",
+    "import shared_space.part\n",
+    "import shared_space\n",
+], ids=["removed-from-modules", "unregistered-importlib", "namespace-submodule", "namespace-package"])
+def test_a_helper_loaded_quietly_from_outside_is_refused(case, caller_only, body):
+    (caller_only / "shared_space").mkdir()
+    (caller_only / "shared_space/part.py").write_text("VALUE = 1\n")
+    command = f"PYTHONPATH={caller_only} {sys.executable} -m pytest"
+    with pytest.raises(order.PlanError, match="outside the base"):
+        check(case, {GOOD: body}, command=command)
+
+
+def test_a_helper_run_as_text_from_outside_is_refused(case, caller_only):
+    (caller_only / "helper.txt").write_text("VALUE = 1\n")
+    body = f"import runpy\nVALUE = runpy.run_path({str(caller_only / 'helper.txt')!r})['VALUE']\n"
+    with pytest.raises(order.PlanError, match="outside the base"):
+        check(case, {GOOD: body})
+
+
+def test_any_file_read_from_the_callers_checkout_is_refused(case):
+    root, *_ = case
+    (root / "caller-data.txt").write_text("VALUE = 1\n")
+    with pytest.raises(order.PlanError, match="outside the base"):
+        check(case, {GOOD: f"VALUE = open({str(root / 'caller-data.txt')!r}).read()\n"})
+
+
+def test_ordinary_data_outside_the_checkout_is_no_leak(case, caller_only):
+    (caller_only / "data.txt").write_text("x\n")
+    assert check(case, {GOOD: f"VALUE = open({str(caller_only / 'data.txt')!r}).read()\n"}) is not None
+
+
+@pytest.mark.parametrize("assignment", [True, False], ids=["own-pythonpath", "inherited"])
+def test_a_plugin_that_loads_a_helper_and_forgets_it_is_refused(case, caller_only, assignment):
+    """The plugin runs before any conftest, so only an audit from interpreter startup sees it."""
+    root, _, git, history, _ = case
+    plugin = f"import sys\nsys.path.append({str(caller_only)!r})\nimport collect_helper\ndel sys.modules['collect_helper']\n"
+    history.update({"src/base_plugin.py": plugin})
+    git.update_base("main")
+    prefix = "PYTHONPATH=src " if assignment else ""
+    (root / "unused").write_text("")
+    command = f"{prefix}{sys.executable} -m pytest -p base_plugin"
+    with pytest.raises(order.PlanError, match="outside the base|base_plugin"):
+        check(case, {GOOD: "VALUE = 1\n"}, command=command)
+
+
+def test_a_path_on_the_search_list_but_never_used_is_no_leak(case, caller_only):
+    assert check(case, {GOOD: "VALUE = 1\n"}, command=f"PYTHONPATH={caller_only} {sys.executable} -m pytest")
 
 
 def test_a_helper_from_the_bases_committed_pythonpath_is_refused(case, caller_only):
@@ -366,9 +419,16 @@ def test_detected_command_comes_from_the_base(case, monkeypatch):
     assert "PYTEST_ADDOPTS= uv run pytest " in seen[0] and "--collect-only" in seen[0]
 
 
-def test_non_python_acceptance_files_have_nothing_to_collect(case, monkeypatch):
-    monkeypatch.setattr(processes, "run_logged", lambda *a, **k: pytest.fail("nothing to collect"))
+def test_a_data_file_no_collector_knows_passes(case):
     assert check(case, {"tests/acceptance/data.json": "{}\n"}) is not None
+
+
+def test_a_published_text_file_is_collected_by_pytest_as_a_doctest(case):
+    """pytest collects a named .txt, and this one raises ValueError while it does."""
+    spec = "tests/acceptance/spec.txt"
+    with pytest.raises(order.PlanError) as refusal:
+        check(case, {spec: ">>>not_space\n"})
+    assert spec in str(refusal.value) and "ValueError" in str(refusal.value)
 
 
 def test_same_base_is_not_collected_twice_and_a_new_one_is(case, monkeypatch):
@@ -479,6 +539,221 @@ def test_publication_lands_on_the_checked_commit_and_the_push_refuses_a_later_mo
     assert git.is_ancestor(checked, "HEAD")
     assert git_command(origin, "rev-parse", "refs/heads/main") == git_history.tip
     assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+
+
+def _move_checkout_when(git, git_history, monkeypatch, step):
+    """Another process fast-forwards this checkout onto a main without the helper at ``step``."""
+    original, update_base = getattr(git, step), git.update_base
+
+    def moved(*args, **kwargs):
+        git_history.update({HELPER: None})
+        update_base("main")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(git, step, moved)
+
+
+@pytest.mark.parametrize("step", ["ensure_tracked", "commit_paths"])
+def test_a_concurrent_checkout_move_is_refused_before_the_push(  # noqa: F811
+        offline_publication, git_history, monkeypatch, step):
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    _move_checkout_when(git, git_history, monkeypatch, step)
+    with pytest.raises(order.PlanError, match="moved away") as refusal:
+        order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
+    assert HELPER in str(refusal.value)
+    assert not [args for args in calls if args[:1] == ["push"]]
+    assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+    assert tracker.list_issues() == []
+
+
+def test_a_move_after_the_lock_opens_is_refused_before_anything_is_written(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    opening = order_landing.Landing.open
+
+    def moved(self):
+        git_history.update({HELPER: None})
+        git.update_base("main")
+        return opening(self)
+
+    monkeypatch.setattr(order_landing.Landing, "open", moved)
+    with pytest.raises(order.PlanError, match="moved away"):
+        order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
+    assert _writes(calls) == [] and not (root / GOOD).exists()
+
+
+@pytest.mark.parametrize("step", ["ensure_tracked", "commit_paths"])
+def test_a_refused_publication_restores_the_callers_file_index_and_labels(  # noqa: F811
+        offline_publication, git_history, monkeypatch, step):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    (root / GOOD).write_text("mine, not yet committed\n")
+    other = root / "staged.txt"
+    other.write_text("staged\n")
+    git_command(root, "update-index", "--add", "staged.txt")
+    index = git_command(root, "ls-files", "--stage", "--", "staged.txt", GOOD)
+    labels = []
+    monkeypatch.setattr(tracker, "ensure_labels", lambda specs: labels.append(specs))
+    _move_checkout_when(git, git_history, monkeypatch, step)
+    with pytest.raises(order.PlanError, match="moved away"):
+        order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
+    assert (root / GOOD).read_text() == "mine, not yet committed\n"
+    assert git_command(root, "ls-files", "--stage", "--", "staged.txt", GOOD) == index
+    assert labels == [] and not [args for args in calls if args[:1] == ["push"]]
+    assert git.head_sha() == git_history.tip, "only the other process's move remains"
+
+
+def _local_commit(root, git, path, content):
+    git_command(root, "fast-import", "--quiet", input=(
+        "commit refs/heads/main\ncommitter T <t@example.com> 1792483200 +0000\ndata 5\nother\n"
+        f"from {git.head_sha()}\nD {path}\n\ndone\n" if content is None else
+        "commit refs/heads/main\ncommitter T <t@example.com> 1792483200 +0000\ndata 5\nother\n"
+        f"from {git.head_sha()}\nM 100644 inline {path}\ndata {len(content)}\n{content}\n\ndone\n"))
+
+
+def test_a_commit_on_top_replacing_the_published_file_is_not_pushed(  # noqa: F811
+        offline_publication, monkeypatch):
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    commit = git.commit_paths
+
+    def replaced(paths, title):
+        commit(paths, title)
+        _local_commit(root, git, GOOD, "import no_such_module_anywhere\n")
+
+    monkeypatch.setattr(git, "commit_paths", replaced)
+    with pytest.raises(order.PlanError, match="moved away"):
+        order.publish(plan_with({GOOD: "VALUE = 1\n"}), root, config, tracker, repo="owner/repo", git=git)
+    assert not [args for args in calls if args[:1] == ["push"]]
+    assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+
+
+def test_a_branch_advance_after_the_last_check_is_left_out_of_the_push(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, _, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    finish = order_landing.Landing.finish
+
+    def advanced(self):
+        sha = finish(self)
+        _local_commit(root, git, HELPER, None)
+        return sha
+
+    monkeypatch.setattr(order_landing.Landing, "finish", advanced)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git)
+    published = git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+    assert GOOD in published and HELPER in published
+
+
+def test_a_concurrent_checkout_move_is_refused_in_flush(offline_publication, git_history, monkeypatch):  # noqa: F811
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    _move_checkout_when(git, git_history, monkeypatch, "ensure_tracked")
+    with pytest.raises(order.PlanError, match="moved away"):
+        order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), **FLUSH)
+    assert not [args for args in calls if args[:1] == ["push"]] and tracker.list_issues() == []
+    assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+
+
+def test_a_checkout_move_before_the_batch_starts_writes_no_commit_or_journal(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    preflight = order_flush._preflight
+
+    def moved(*args, **kwargs):
+        result = preflight(*args, **kwargs)
+        git_history.update({HELPER: None})
+        git.update_base("main")
+        return result
+
+    monkeypatch.setattr(order_flush, "_preflight", moved)
+    store = StateStore.for_repo("owner/repo")
+    with pytest.raises(order.PlanError, match="moved away"):
+        order_flush.flush(root, config, tracker, git, store, **FLUSH)
+    assert _writes(calls) == [] and order_flush.journal.entries(store) == []
+
+
+def test_a_branch_advance_after_the_last_check_is_left_out_of_the_flush_push(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, _, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    finish = order_landing.Landing.finish
+
+    def advanced(self):
+        sha = finish(self)
+        _local_commit(root, git, HELPER, None)
+        return sha
+
+    monkeypatch.setattr(order_landing.Landing, "finish", advanced)
+    order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), **FLUSH)
+    published = git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+    assert GOOD in published and HELPER in published
+
+
+def test_a_batch_refused_after_its_commit_is_not_published_by_the_next_flush(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    store = StateStore.for_repo("owner/repo")
+    _move_checkout_when(git, git_history, monkeypatch, "commit_paths")
+    with pytest.raises(order.PlanError, match="moved away"):
+        order_flush.flush(root, config, tracker, git, store, **FLUSH)
+    monkeypatch.undo()
+    monkeypatch.setattr(order, "require_clean_preread", lambda *a, **k: None)
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        order_flush.flush(root, config, tracker, git, store, **FLUSH)
+    assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+
+
+def test_a_crashed_unpushed_batch_is_collected_again_before_its_push(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    store = StateStore.for_repo("owner/repo")
+    push = order_flush_recovery.push
+
+    def crash(*args, **kwargs):
+        raise OSError("crashed before the push")
+
+    monkeypatch.setattr(order_flush_recovery, "push", crash)
+    with pytest.raises(OSError):
+        order_flush.flush(root, config, tracker, git, store, **FLUSH)
+    monkeypatch.setattr(order_flush_recovery, "push", push)
+    git_history.update({HELPER: None})
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        order_flush.flush(root, config, tracker, git, store, **FLUSH)
+    assert GOOD not in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
+
+
+def test_a_stale_symlink_the_refresh_would_cure_cannot_skip_a_retained_order(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    """The local link fails plan validation, so the order used to go uncollected until after the move."""
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _helper_on_main(git_history, git)
+    order.publish(plan_with({GOOD: IMPORTS}), root, config, tracker, repo="owner/repo", git=git, defer="b")
+    git_history.update({HELPER: None})
+    (root / GOOD).symlink_to("/nonexistent")
+    before = _checkout(root, git)
+    with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
+        order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), **FLUSH)
+    assert _checkout(root, git) == before and _writes(calls) == []
+
+
+def test_a_new_lanes_files_are_part_of_what_the_commit_may_change(  # noqa: F811
+        offline_publication, monkeypatch):
+    root, config, tracker, git, calls, origin = _publish_case(offline_publication, monkeypatch)
+    plan = plan_with({GOOD: "VALUE = 1\n"})
+    plan["new_lanes"] = [{"name": "extra", "paths": ["extra/**"], "skills": []}]
+    (root / "extra").mkdir()
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert GOOD in git_command(origin, "ls-tree", "-r", "--name-only", "refs/heads/main")
 
 
 def test_a_move_before_the_lock_that_still_collects_lands_and_publishes(  # noqa: F811

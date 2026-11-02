@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_collect, order_notes, order_references, order_reviewed
+from foragent import order_collect, order_landing, order_notes, order_references, order_reviewed
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_files import check_destinations, check_write
@@ -50,19 +50,16 @@ def _note_files(root, notes, language):
     return files
 
 
-def _collect(rows, root, config, git):
+def _collect(rows, root, config, git, base=None):
     """Each order's collection on one fetched base, alone with its retained files.
 
-    A plan that no longer validates is left for the preflight to report.
+    Retained bytes need no checkout, so a local state the refresh would cure skips no order.
     """
-    results, base = {}, None
+    results = {}
     for row in rows:
         try:
-            files = order.validate_plan(row["plan"], root, config, retained_files=row.get("files"))
-        except (ValueError, OSError):
-            continue
-        try:
-            results[row["entry_id"]] = order_collect.check(row["plan"], files, root, config, git, base=base)
+            results[row["entry_id"]] = order_collect.check(row["plan"], row.get("files") or {}, root, config, git,
+                                                           base=base)
         except order.PlanError as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
         base = results[row["entry_id"]].commit if results[row["entry_id"]] else base
@@ -108,7 +105,7 @@ def _refuse_affected(prepared, files, config, tracker, repo, git):
                                    owners="\n".join(order._owner_lines(affected))))
 
 
-def _write(root, git, files, roots, title):
+def _write(root, git, files, roots, title, landing):
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
@@ -125,8 +122,8 @@ def _write(root, git, files, roots, title):
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
-        git.commit_paths(changed, title)
-    return git.head_sha()
+        landing.commit(changed, title)
+    return landing.finish()
 
 
 def _members(store, batch):
@@ -147,16 +144,25 @@ def _require_base(git, config):
         raise order.PlanError(text("order_flush_branch", config.language, branch=config.base_branch))
 
 
-def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None):
+def _land_and_check(rows, notes, root, config, tracker, repo, git):
+    """Collect every order, move the checkout only onto that base, then run the other gates there."""
+    collected, base = _collect(rows, root, config, git)
+    order_collect.land(git, config.base_branch, base)
+    prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git, collected)
+    return prepared, files, roots, order_landing.Landing(git, root, base, config, files).open(), base
+
+
+def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None, exact=False):
     resuming = sha is None
     if resuming:
         sha = recovery.committed(root, config, git, store, batch, records)
         if sha is None:
             rows, notes = _members(store, batch)
-            prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git)
+            prepared, files, roots, landing, base = _land_and_check(rows, notes, root, config, tracker, repo, git)
             if set(files) != set(batch["paths"]):
                 raise order.PlanError(text("order_flush_paths_changed", config.language))
-            sha = _write(root, git, files, roots, recovery.title(batch))
+            sha = _write(root, git, files, roots, recovery.title(batch), landing)
+            exact = base is not None
             journal.append(store, "committed", batch["batch"], sha=sha)
     completed = {row.get("entry", row.get("order")) for row in records
                  if row["batch"] == batch["batch"] and row["kind"] == "issues"}
@@ -168,9 +174,14 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
             retained_files=row.get("files"), landed=True)) for row in rows
             if row["entry_id"] not in completed and row["id"] not in completed]
         # An owner approved since the commit may lock bytes this retried push would move.
-        if not git.is_ancestor(sha, f"origin/{config.base_branch}"):
+        remote = f"origin/{config.base_branch}"
+        if not git.is_ancestor(sha, remote):
             _refuse_affected(prepared, {}, config, tracker, repo, git)
-    sha = recovery.push(config, git, store, batch, sha, recovering=resuming)
+            # This commit was never pushed: what would land is it, or it rebuilt on the moved remote.
+            pending = [row for row, _publication in prepared]
+            collected, _base = _collect(pending, root, config, git, base=sha if git.is_ancestor(remote, sha) else remote)
+            exact = any(collected.values())
+    sha = recovery.push(config, git, store, batch, sha, recovering=resuming, exact=exact)
     for row, publication in prepared:
         if row["entry_id"] in completed or row["id"] in completed:
             continue
@@ -210,17 +221,14 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         effective = [row for row in orders if row is latest[row["id"]]]
         with git.publish_lock():
             # Every order is collected before the checkout moves, and it moves only onto that base.
-            collected, base = _collect(effective, root, config, git)
-            order_collect.land(git, config.base_branch, base)
-            # Validate against the refreshed base before starting a durable batch.
-            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collected)
+            prepared, files, roots, landing, base = _land_and_check(effective, notes, root, config, tracker, repo, git)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
             journal.append(store, **batch)
-            sha = _write(root, git, files, roots, recovery.title(batch))
+            sha = _write(root, git, files, roots, recovery.title(batch), landing)
             journal.append(store, "committed", batch["batch"], sha=sha)
-            return _finish(root, config, tracker, git, store, repo, batch, records, prepared, sha)
+            return _finish(root, config, tracker, git, store, repo, batch, records, prepared, sha, base is not None)
 
 
 def run(args, root):

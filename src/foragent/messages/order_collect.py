@@ -14,6 +14,10 @@ MESSAGES = {
         "order_collect_no_command_name": "(none)",
         "order_collect_unsupported": "the project's test command is not a pytest command, so it cannot collect",
         "order_collect_slot_timeout": "no machine test slot became free before the collection deadline",
+        "order_collect_base_moved": (
+            "Refused: the checkout moved away from base {base} after collection, so the commit would not be "
+            "the checked tree. Changed: {paths}. Publish again."
+        ),
         "order_collect_leak": "module {name} was imported from outside the base and this order",
         "order_collect_timeout": "collection did not finish within {seconds} seconds",
         "order_collect_exit": "the collection command exited with code {code} and no collection result: {output}",
@@ -31,6 +35,10 @@ MESSAGES = {
         "order_collect_no_command_name": "(없음)",
         "order_collect_unsupported": "프로젝트의 시험 명령이 pytest 명령이 아니라서 수집할 수 없어요",
         "order_collect_slot_timeout": "수집 마감 전에 기계 시험 칸이 비지 않았어요",
+        "order_collect_base_moved": (
+            "거절했어요: 수집한 뒤 체크아웃이 기준 {base}에서 움직여서, 커밋이 확인한 트리와 달라져요. "
+            "바뀐 경로: {paths}. 다시 발행해 주세요."
+        ),
         "order_collect_leak": "모듈 {name}을 기준과 이 주문 밖에서 가져왔어요",
         "order_collect_timeout": "수집이 {seconds}초 안에 끝나지 않았어요",
         "order_collect_exit": "수집 명령이 코드 {code}로 끝났고 수집 결과가 없어요: {output}",

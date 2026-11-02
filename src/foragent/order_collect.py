@@ -21,7 +21,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, order_scratch, processes
+from foragent import capacity, order_collect_audit, order_scratch, processes
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -31,28 +31,7 @@ from foragent.issue import acceptance_paths
 LIMIT_S = 30.0
 _OUTPUT_CHARS = 1500
 # Inherited settings that add import paths or choose another project; the command may set its own.
-_CALLER_SETTINGS = "unset PYTHONPATH PYTHONUSERBASE PYTEST_PLUGINS UV_PROJECT UV_WORKING_DIRECTORY; "
-_AUDIT = """import json, os, sys
-
-
-def pytest_sessionfinish(session):
-    def inside(path, roots):
-        return any(path == root or path.startswith(root + os.sep) for root in roots)
-
-    real = os.path.realpath
-    clean = [real(os.environ["FORAGENT_COLLECT_TREE"]), real(os.path.dirname(__file__))]
-    python = [real(p) for p in (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)]
-    caller = [real(os.environ["FORAGENT_COLLECT_CALLER"])]
-    outside = {}
-    for name, module in list(sys.modules.items()):
-        path = getattr(module, "__file__", None)
-        # __main__ is the launcher itself, which the project chose and which imports nothing by being run.
-        if name != "__main__" and isinstance(path, str) and os.path.isabs(path):
-            if not inside(real(path), clean) and (inside(real(path), caller) or not inside(real(path), python)):
-                outside[name] = path
-    with open(os.environ["FORAGENT_COLLECT_AUDIT"], "w", encoding="utf-8") as stream:
-        json.dump(outside, stream)
-"""
+_CALLER_SETTINGS = "unset PYTHONPATH PYTHONUSERBASE PYTHONPYCACHEPREFIX PYTEST_PLUGINS UV_PROJECT UV_WORKING_DIRECTORY; "
 
 
 @dataclass(frozen=True)
@@ -148,13 +127,12 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     pytest = _pytest_command(command)
     if pytest is None:
         raise _Unavailable(text("order_collect_unsupported", language), command)
-    targets = [name for name in selected if name.endswith(".py")]
+    # Every file is named: pytest's own collectors decide what each is, a text file's doctests included.
+    targets = list(selected)
     attempted = f"{pytest} --collect-only {shlex.join(targets)}"
-    if not targets:
-        return []
-    guard.mkdir()
-    (guard / "conftest.py").write_text(_AUDIT, encoding="utf-8")
-    invocation = (f"{_CALLER_SETTINGS}{pytest} --collect-only {shlex.quote(str(guard))} {shlex.join(targets)} "
+    site = order_collect_audit.install(guard)
+    invocation = (f"{_CALLER_SETTINGS}{order_collect_audit.started_first(pytest, site)} --collect-only "
+                  f"{shlex.quote(str(guard))} {shlex.join(targets)} "
                   f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report))}")
     try:
         with capacity.hold_test_slot(config.test_slots, deadline=deadline,
@@ -176,8 +154,8 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     # 5 is a successful collection without test functions, as for a helper module.
     if errors is None or code not in {0, 5} or not audit.exists():
         raise _Unavailable(text("order_collect_exit", language, code=code, output=_output(log, tree)), attempted)
-    outside = json.loads(audit.read_text(encoding="utf-8"))
-    return [(path, text("order_collect_leak", language, name=name)) for name, path in sorted(outside.items())]
+    return [(path, text("order_collect_leak", language, name=Path(path).stem))
+            for path in json.loads(audit.read_text(encoding="utf-8"))]
 
 
 def check(plan: dict, files: dict[str, str | bytes], root: Path, config: Config, git: GitRepo | None = None, *,
