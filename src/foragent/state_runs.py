@@ -216,14 +216,13 @@ class RunRecordsMixin:
             self._write_json(self.root / "github-pause.json", {"until": until.isoformat(), "cause": cause})
             return until
 
-    def github_wait_until(self, now: datetime, *, cause: bool = False):
-        """The pause's end while it lasts (with ``cause``: and its outage text, None for a rate limit)."""
+    def github_wait_until(self, now: datetime) -> datetime | None:
         try:
-            data = _state.json.loads((self.root / "github-pause.json").read_text(encoding="utf-8"))
+            value = (self.root / "github-pause.json").read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        until = _state.datetime.fromisoformat(data["until"])
-        return None if now >= until else (until, data.get("cause")) if cause else until
+        until = _state.datetime.fromisoformat(_state.json.loads(value)["until"])
+        return until if now < until else None
 
     def finish_run(self, number: int | str, outcome: str, detail: str = "") -> Run:
         if isinstance(number, str):  # A dream record (dream-<lane>) never enters runs.jsonl.

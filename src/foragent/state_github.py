@@ -5,6 +5,13 @@ from typing import Any
 
 
 class GithubCallsMixin:
+    def github_pause_cause(self) -> str | None:
+        """The outage text the shared GitHub pause recorded; None for a rate limit or no pause."""
+        try:
+            return _state.json.loads((self.root / "github-pause.json").read_text(encoding="utf-8")).get("cause")
+        except FileNotFoundError:
+            return None
+
     def count_github_call(self, at: datetime) -> None:
         """Add one gh attempt to its UTC hour; keep only the last 30 days of hours."""
         hour = at.astimezone(_state.UTC).strftime("%Y-%m-%dT%H")

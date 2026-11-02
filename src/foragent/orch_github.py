@@ -46,9 +46,9 @@ def _line(until: datetime, outage: str | None) -> str:
 def wait_text(store: StateStore, now: datetime, error: TrackerError | None = None) -> str | None:
     """What a wait is for. A caller's own failure names it; another writer may replace the shared
     pause's cause meanwhile. Only a run or tick that merely meets the pause reads that record."""
-    if (paused := store.github_wait_until(now, cause=True)) is None:
+    if (until := store.github_wait_until(now)) is None:
         return None
-    until, outage = paused
+    outage = store.github_pause_cause() if error is None else None
     return _line(until, outage if error is None else None if error.is_rate_limit else cause(error))
 
 
