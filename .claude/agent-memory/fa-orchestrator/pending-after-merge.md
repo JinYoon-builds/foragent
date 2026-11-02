@@ -214,3 +214,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - r347 docs: r334 decision text must use #1652's final license scope (drafts/r347-docs.txt).
 - batch-2026-11-02o flushed faf8e59e 22:32Z: #1696 size signal, #1469 edit, #1699 role memory (approved). Size thresholds: check wrong-estimate share ~11-10. Next card: #1651 review procedure (scratchpad rproc), then UX (uxfix).
 - b4 approved f6620d4f: #1208 #1160 #1484 #1491 #1492. Pending: #1489 and #1490 lock rewrites (Codex), help-doctor preread, README (#1477) waits Jin via PM.
+- r352 conditions (text drafts/r352.txt): #1696 if round 5 FAILs on estimate binding → store expected_size on the run record at run start, merge reads only that. #1469 if round 5 FAILs on waiting_on_person → remove that alarm from #1469 (Goal edit at retry boundary) and order it separately with its own lock.
