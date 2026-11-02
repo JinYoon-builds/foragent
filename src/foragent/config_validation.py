@@ -103,6 +103,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("view_glyphs must be emoji, ascii, or auto")
     if type(values["animation"]) is not bool:
         raise ConfigError("animation must be true or false")
+    if type(values["review_pass_scope"]) is not bool:
+        raise ConfigError("review_pass_scope must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     presence = values["presence"]
