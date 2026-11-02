@@ -342,6 +342,27 @@ RESTRICTED_TEXTS = {
     "name-cut-from-a-longer-holder": "Attribution: Jane Doe\n" + BANNED_HOLDER_MIT,
     "part-of-a-holder": "Attribution: Doe\n" + JANE_MIT,
     "part-of-a-url-part": "Source: pst\nhttps://example.org/pstack\n" + JANE_MIT,
+    # #1652 review 5: a URL with any part that names a license is no notice, on every label and alone.
+    "license-in-url-and-label": "Source: Jane,GPL-3.0-only\nhttps://example.org/Jane,GPL-3.0-only\n"
+    + STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane"),
+    "license-url-alone": "https://example.org/Jane,GPL-3.0-only\n" + JANE_MIT,
+    "upstream-copyleft-url": "Upstream: https://example.org/GPL-3.0-only\n" + JANE_MIT,
+    "homepage-noncommercial-url": "Homepage: https://example.org/CC-BY-NC/home\n" + JANE_MIT,
+    "origin-license-query": "Origin: https://example.org/get?license=nc\n" + JANE_MIT,
+    "repository-capitals-identifier": "Repository: https://example.org/AGPL\n" + JANE_MIT,
+    "identifier-as-work": "GPL-3.0-only by Jane Doe\nhttps://example.org/GPL-3.0-only\n" + JANE_MIT,
+    # #1652 review 6: escapes and case cannot hide a license in a URL, alone, on a label or as a work.
+    "escaped-license-label": "Attribution: https://creativecommons.org/%6cicenses/by-nc/4.0/\n" + JANE_MIT,
+    "escaped-license-alone": "https://creativecommons.org/%6cicenses/by-nc/4.0/\n" + JANE_MIT,
+    "lowercase-cc-terms": "Upstream: https://creativecommons.org/by-nc/4.0/\n" + JANE_MIT,
+    "mixed-case-family": "Homepage: https://example.org/Gpl\n" + JANE_MIT,
+    "fullwidth-letters": "Source: https://example.org/\uff4cicense\n" + JANE_MIT,
+    "escaped-work": "nebula by Jane Doe\nhttps://example.org/%6cicenses/nebula\n" + JANE_MIT,
+    "family-word-work": "polyform-noncommercial by Jane Doe\nhttps://example.org/polyform-noncommercial\n" + JANE_MIT,
+    # Anything but a plain URL or an exact holder fails safe (NOTE records, not restrictions).
+    "label-holder-with-license-name": "Attribution: Jane Doe, MIT License\n" + JANE_MIT,
+    "label-holder-with-mail": "Author: Jane Doe <jane@example.org>\n" + JANE_MIT,
+    "label-work-name": "Source: pstack\nUpstream: https://github.com/example/pstack\n" + JANE_MIT,
 }
 
 # Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
@@ -393,14 +414,12 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
     "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
     # #1652: attribution and source notices around a complete permissive text.
-    # Names in notices repeat what the file's copyright lines or URLs already name.
-    "Attribution: Jane Doe\nSource: example-project\nhttps://example.org/example-project\n" + JANE_MIT,
+    # A label value is a plain URL or exactly a name this file's copyright line writes (#1652).
+    "Attribution: Jane Doe\nSource: https://example.org/example-project\n" + JANE_MIT,
     "example-project by Jane Doe, MIT License, Copyright (c) 2026 Jane Doe\n"
     "Upstream: https://example.org/example-project\n" + STANDARD_LICENSES["MIT"],
-    JANE_MIT + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe <jane@example.org>\n"
-    "https://example.org/tool\n",
-    "Attribution: Jane Doe, MIT License\n" + JANE_MIT,
-    "Source: pstack\nUpstream: https://github.com/example/pstack\n" + JANE_MIT,
+    JANE_MIT + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe\nhttps://example.org/tool\n",
+    "Source: https://github.com/example/pstack\nMaintainer: Jane Doe\n" + JANE_MIT,
     "Attribution: Jane van Doe\n" + STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane van Doe"),
 ])
 def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
@@ -618,7 +637,7 @@ def test_a_license_entry_that_is_not_a_readable_file_is_unknown(tmp_path):
 NOTICED_TEXTS = {
     "attribution-prefix": "Attribution: Jane Doe\nSource: https://example.org/noticed\n" + JANE_MIT,
     "attribution-suffix": JANE_MIT + "\nnoticed by Jane Doe, MIT License\nhttps://example.org/noticed\n",
-    "spdx-and-license-name": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe, MIT License\n" + JANE_MIT,
+    "spdx-and-holder": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe\n" + JANE_MIT,
 }
 
 

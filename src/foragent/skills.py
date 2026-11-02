@@ -151,81 +151,90 @@ _LICENSE_NAMES = {
     )},
 }
 _LABEL = re.compile(
-    r"(?:(Source|Upstream|Origin|Homepage|Repository)|Attribution|Credits?|Authors?|Maintainers?)[ \t]*:[ \t]*(.+)",
-    re.I)
+    r"(?:Source|Upstream|Origin|Homepage|Repository|Attribution|Credits?|Authors?|Maintainers?)[ \t]*:[ \t]*(.+)", re.I)
 _BY = re.compile(r"(.+?) by (.+?)(?:, *((?:Copyright\b|©).*))?")
-
-
-def _backed(name: str, facts: set[str]) -> bool:
-    """Whether ``name`` is, as a whole, one of the names the file's own facts carry (see `_facts`).
-
-    A person is not judged by the spelling of the name (Jin's rule for copyright lines): a notice may
-    only repeat a whole holder that a copyright line names, or a whole path part of one of the file's
-    URLs. A part of a copyright line is not a name. Anything else is unsure, and an unsure notice
-    fails safe (#1652 review standard, option 1).
-    """
-    return " ".join(name.split()) in facts
-
-
-def _person(value: str, holders: set[str]) -> bool:
-    """`<holder>`, `<holder> <e-mail>` or `<e-mail>`, the holder being one a copyright line names."""
-    words = value.split()
-    while words and re.fullmatch(r"<[^\s<>@]+@[^\s<>@]+>", words[-1]):
-        words.pop()
-    return (not words and bool(value.split())) or _backed(" ".join(words), holders)
-
-
-def _named_license(value: str, holders: set[str]) -> bool:
-    """`<holder>` or `<holder>, <exact permissive license name>`: anything after the comma must be one."""
-    name, comma, license_name = value.partition(",")
-    return _person(name, holders) and (
-        not comma or _LICENSE_NAMES.get(license_name.strip().casefold()) in OPEN_SOURCE_LICENSES)
-
-
-def _attribution(line: str, holders: set[str], works: set[str]) -> bool:
-    """`<work> by <holder>[, <permissive license name>][, Copyright …]`; the copyright part is not judged."""
-    if (match := _BY.fullmatch(line)) is None:
-        return False
-    work, rest, _ = match.groups()
-    return _backed(work, works) and _named_license(rest, holders)
-
-
 _HOLDER = re.compile(
     r"(?:Copyright\b|©)[ \t]*(?:\(c\)|©)?[ \t]*(?:\d{4}(?:[ \t]*[-–][ \t]*(?:\d{4}|present)?)?[ \t]*,?[ \t]*)+(.+)",
     re.I)
 
 
-def _facts(lines: list[str]) -> tuple[set[str], set[str]]:
-    """The names a LICENSE file carries itself: whole copyright holders, and the path parts of its URLs.
+# Words that make up license identifiers outside the permissive set (SPDX families and Creative
+# Commons terms). A URL holding one of them, in any case, could name a license; the URL fails safe.
+_LICENSE_WORDS = frozenset({
+    "gpl", "agpl", "lgpl", "fdl", "gfdl", "mpl", "epl", "eupl", "cddl", "cpl", "osl", "afl", "sspl", "busl",
+    "bsl", "polyform", "elastic", "cc", "by", "nc", "nd", "sa", "noncommercial", "commercial", "nonfree",
+    "proprietary", "commons", "copyleft", "unlicense", "wtfpl", "artistic", "eula", "spdx",
+})
 
-    A holder is all of a copyright line after `Copyright`, `(c)` and the years, and it backs a notice
-    only when it is one name: a holder that goes on into another sentence (`Jane Doe. Redistribution
-    is prohibited.`) or clause (`;`, `:`) is no name a notice can repeat. Copyright lines themselves
-    stay unjudged.
+
+def _license_part(part: str) -> bool:
+    """Whether one part of a URL could name a license, in any case: a word starting `licen`, a word of
+    `_LICENSE_WORDS`, a known license name, an identifier with a version (`GPL-3.0-only`) or an
+    all-capitals identifier (`AGPL`). Unsure counts as yes: the URL then fails safe."""
+    words = re.split(r"[^a-z0-9]+", part.casefold())
+    return bool(any(word.startswith("licen") or word in _LICENSE_WORDS for word in words)
+                or _LICENSE_NAMES.get(part.casefold())
+                or re.fullmatch(r"[a-z][\w.+]*(?:-[a-z][\w.+]*)*-v?\d+(?:\.\d+)*(?:-[\w.+]+)*", part, re.I)
+                or re.fullmatch(r"(?=(?:[^A-Z]*[A-Z]){2})[A-Z][A-Z0-9.+]*(?:-[A-Z0-9.+]+)*", part))
+
+
+def _url_parts(value: str) -> list[str] | None:
+    """The parts of ``value`` when it is one plain URL and none of its parts names a license, else None.
+
+    A URL with an escape (`%6c`), a backslash or any non-ASCII letter can spell a license in a way
+    this check does not read, so it is unsure and fails safe.
+    """
+    if _URL.fullmatch(value) is None:
+        return None
+    url = value.strip("<>")
+    if not url.isascii() or "%" in url or "\\" in url:
+        return None
+    parts = [part for part in re.split(r"[/?#=&,;:@]", url.split("://", 1)[-1]) if part]
+    return None if any(_license_part(part) for part in parts) else parts
+
+
+def _facts(lines: list[str]) -> tuple[set[str], set[str]]:
+    """The names a LICENSE file carries itself: whole copyright holders, and the parts of its plain URLs.
+
+    A holder is all of a copyright line after `Copyright`, `(c)` and the years. Copyright lines stay
+    unjudged (Jin's rule); a holder that runs on into another sentence or clause (`. ` and more,
+    `;`, `:`, `!`, `?`) is not one name and backs nothing.
     """
     clauses = [line for line in lines if _copyright_line(line)]
     clauses += [match[3] for line in lines if (match := _BY.fullmatch(line)) and match[3]]
     holders = {" ".join(match[1].split()) for clause in clauses if (match := _HOLDER.fullmatch(clause.strip()))}
     holders = {holder for holder in holders if not re.search(r"[.!?][ \t]+\S|[;:!?]", holder)}
-    urls = [url.strip("<>") for line in lines for url in _URL.findall(line)]
-    works = {part for url in urls for part in re.split(r"[/?#=&]", url.split("://", 1)[-1]) if part}
+    works = {part for line in lines for url in _URL.findall(line) for part in (_url_parts(url) or ())}
     return holders, works
 
 
-def _notice(line: str, holders: set[str], works: set[str]) -> bool:
-    """A line allowed around a complete license text: permissive SPDX, copyright, attribution, source or URL.
+def _attribution(line: str, holders: set[str], works: set[str]) -> bool:
+    """`<work> by <holder>[, <exact permissive license name>][, Copyright …]`.
 
-    Names in attribution and source notices must be ones the file's copyright lines (``holders``) or
-    URLs (``works``) already carry; see `_facts`.
+    The holder is exactly a name a copyright line of this file writes, and the work exactly a part
+    of one of its plain URLs; the trailing copyright part is a copyright clause and is not judged.
+    """
+    if (match := _BY.fullmatch(line)) is None:
+        return False
+    work, rest, _ = match.groups()
+    holder, comma, license_name = rest.partition(",")
+    return (" ".join(work.split()) in works and " ".join(holder.split()) in holders
+            and (not comma or _LICENSE_NAMES.get(license_name.strip().casefold()) in OPEN_SOURCE_LICENSES))
+
+
+def _notice(line: str, holders: set[str], works: set[str]) -> bool:
+    """A line allowed around a complete license text, by definition and nothing else (#1652):
+
+    a permissive SPDX line; a copyright line (not judged); a URL none of whose parts names a license;
+    a label line (`Source:`, `Upstream:`, `Attribution:`, …) whose value is such a URL or exactly a
+    name a copyright line of this file writes; or `_attribution`. Anything else fails, and an unsure
+    file is simply not a default (review standard, option 1).
     """
     line = line.strip()
-    if _copyright_line(line) or _spdx(line) in OPEN_SOURCE_LICENSES or _URL.fullmatch(line):
+    if _copyright_line(line) or _spdx(line) in OPEN_SOURCE_LICENSES or _url_parts(line) is not None:
         return True
     if (label := _LABEL.fullmatch(line)) is not None:
-        value = label[2]
-        return (_URL.fullmatch(value) is not None or _named_license(value, holders)
-                or _attribution(value, holders, works)
-                or (label[1] is not None and _backed(value, works)))  # `Source: pstack`, with pstack in a URL.
+        return _url_parts(label[1].strip()) is not None or " ".join(label[1].split()) in holders
     return _attribution(line, holders, works)
 
 
