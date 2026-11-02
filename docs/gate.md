@@ -129,6 +129,7 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
+review_pass_scope: true   # 같은 이슈 본문이면 PASS 뒤 리뷰는 PASS 뒤에 바뀐 코드(main에서 들어온 코드 포함)로만 막고, 안 바뀐 코드의 지적은 NOTE로 남김. false면 저장된 PASS가 있어도 예전 리뷰로 돌아감. 위험 지도 항목의 `pass_scope_exempt: true`(`fa risk add --pass-scope-exempt`)와 경로가 맞는 변경은 예전 범위를 유지
 review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 4개(goal-fidelity·concurrency·interruption-rollback·test-quality)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
 review_reviewers: 1      # 1 이상 정수; 동시에 도는 관점 리뷰어 수의 상한. 1이면 하나씩 차례로 돌고, 관점은 줄지 않음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
