@@ -84,13 +84,22 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             follow_base(attempt)
         if conflicts is None:
             conflicts = _merge_moved_base(attempt, move.target_sha)
+        changed = False
         if conflicts:
             _resolve_conflicts(attempt, conflicts)
         elif not neutral:
+            merged_tree = git.staged_tree_sha()
             check_failure = _verify_implementation(attempt)
             if check_failure:
                 raise run_publish.AttemptFailure(check_failure)
+            # A check that edited tracked files left contents no review has seen.
+            changed = git.staged_tree_sha() != merged_tree
         finish_base()
+        if changed and ctx.config.reviewer != "none":
+            run_publish._append(log, "Checks on the moved base changed the contents: reviewing them")
+            _review_implementation(attempt)
+            if attempt.failure and not attempt.review_hold:
+                raise run_publish.AttemptFailure(attempt.failure)
         # A resolution rewrites code after the PASS, so it gets one review of that later change.
         # A hold returns through the publication path; other findings go back to the lane.
         if conflicts and ctx.config.reviewer != "none" and review_pass_scope.applies(n, ctx, git):
@@ -277,7 +286,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
-                    if exc.is_rate_limit:
+                    if exc.waits:
                         raise
                     if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
                         inputs.stop = lambda: run_publish._hold_changed_head(n, ctx, link)
@@ -295,7 +304,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         else:
                             ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
-                        if exc.is_rate_limit:
+                        if exc.waits:
                             raise
                         if ctx.tracker.current_issue(n).state != "closed":
                             raise
@@ -305,7 +314,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         try:
                             run_publish._batch_pr(attempt.parent, ctx)
                         except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+                            if isinstance(exc, run_publish.TrackerError) and exc.waits:
                                 raise
                             run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     run_publish._progress(n, ctx)
