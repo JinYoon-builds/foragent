@@ -209,11 +209,11 @@ class RunRecordsMixin:
     def executor_paused(self, executor: str, now: datetime) -> bool:
         return self.executor_pause_until(executor, now) is not None
 
-    def pause_github(self, until: datetime) -> datetime:
-        """Share a reset deadline across runners and ticks without shortening it."""
+    def pause_github(self, until: datetime, cause: str | None = None) -> datetime:
+        """Share a reset deadline across runners and ticks without shortening it; ``cause`` names an outage."""
         with self._state_lock():
             until = (self.github_wait_until(until) or until).astimezone(_state.UTC)
-            self._write_json(self.root / "github-pause.json", {"until": until.isoformat()})
+            self._write_json(self.root / "github-pause.json", {"until": until.isoformat(), "cause": cause})
             return until
 
     def github_wait_until(self, now: datetime) -> datetime | None:

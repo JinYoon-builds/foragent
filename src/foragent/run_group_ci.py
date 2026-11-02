@@ -124,7 +124,7 @@ class GroupComparisonEvidence:
             return ("regression", ", ".join(lost)) if lost else None
         except (GitError, OSError, KeyError, TypeError, ValueError, RecursionError, OverflowError,
                 AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if isinstance(exc, TrackerError) and exc.waits:
                 raise
             return ci_mode._refusal(exc), str(exc)
 
