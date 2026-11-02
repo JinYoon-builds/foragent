@@ -29,12 +29,13 @@ def next_review_round(n: int, ctx: RunContext) -> int:
     return max((number for number, _ in _saved_rounds(ctx.store, n)), default=0) + 1
 
 
-def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
+def first_review_findings(store: StateStore, n: int, round_number: int, body_sha: str | None = None) -> str:
     """Read the earliest usable defect review, excluding individual panel members.
 
     Failed or finding-free rounds leave the full review in charge until it produces findings.
     Those first usable findings remain the confirmation scope for every later round.
     Legacy native Claude artifacts may lack a VERDICT line, so recognize their findings format too.
+    `body_sha` skips rounds journaled under another issue body.
     """
     from foragent.run_review import code_review_findings, parse_review
 
@@ -46,6 +47,10 @@ def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
         # Failed calls and incomplete panels save raw findings, but cannot define the confirmation scope.
         if (orch_events.has_event(store, n, "review", round=number, verdict="UNUSABLE")
                 or orch_events.has_event(store, n, "review", round=number, review_verdict="UNUSABLE")):
+            continue
+        if body_sha and any(event.get("issue") == n and event.get("round") == number
+                            and event.get("body_sha", body_sha) != body_sha
+                            for event in orch_events.events(store, "review")):
             continue
         raw = path.read_text(encoding="utf-8", errors="replace")
         review = parse_review(raw)
@@ -60,14 +65,16 @@ def first_review_findings(store: StateStore, n: int, round_number: int) -> str:
 
 def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
                   reviewer: str, rebuttals: str, decisions: str, *, round_number: int,
-                  pr: int | None = None, first_review: str = "") -> ReviewResult:
+                  pr: int | None = None, first_review: str = "", pass_scope: str = "",
+                  diff: str | None = None) -> ReviewResult:
     from foragent import runner
     from foragent.run_review import (
         ReviewResult, _append, _available_executor, _claude_review_scope, _finish_review,
         _raw_text, _save_review, notes_of, parse_code_review, parse_review, spec_conflicts,
     )
 
-    native = reviewer == "claude" and not first_review
+    # A review after a PASS needs its facts and diff in the prompt, so it uses the prompt path.
+    native = reviewer == "claude" and not first_review and not pass_scope
     options = {"review_level": ctx.config.review_level} if native else {}
     if native and pr is not None:
         options["review_pr"] = pr
@@ -76,8 +83,8 @@ def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     prompt = ""
     if not native:
         context = dict(rebuttals=rebuttals, full_text_dir=cuts.issue_dir(ctx.store.root, n),
-                       lane_decisions=decisions)
-        diff = git.staged_diff(base_ref)
+                       lane_decisions=decisions, pass_scope=pass_scope)
+        diff = git.staged_diff(base_ref) if diff is None else diff
         prompt = (build_confirm_prompt(parsed, diff, ctx.config.acceptance_dir, first_review=first_review, **context)
                   if first_review else build_review_prompt(parsed, diff, ctx.config.acceptance_dir, **context))
     edited = False
@@ -116,4 +123,4 @@ def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     if edited:
         review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=result.timed_out, conflicts=spec_conflicts(raw)),
-                          round_number, (raw,))
+                          round_number, (raw,), git=git)

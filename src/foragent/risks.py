@@ -3,7 +3,7 @@
 The map is a root YAML sequence. Each entry names repo-relative review-policy
 globs (`paths`), why they are risky, the incident that showed it, guidance for
 the reviewer, and an `added` trace. `always_human`, `fixed_by` and
-`guard_tests` are optional. Entries are only ever appended by `fa risk add`;
+`guard_tests` and `pass_scope_exempt` are optional. Entries are only ever appended by `fa risk add`;
 candidate discovery reads source statically and never writes the map.
 """
 
@@ -112,7 +112,8 @@ def review_options(config: Config, reviewer: str, model: str | None) -> dict[str
 
 
 def entry(*, paths: list[str], why: str, incident_date: str, incident: str, guidance: str, by: str,
-          always_human: bool = False, event: str | None = None, fixed_by: str | None = None,
+          always_human: bool = False, pass_scope_exempt: bool = False, event: str | None = None,
+          fixed_by: str | None = None,
           guard_tests: list[str] | None = None, root: Path | None = None,
           now: datetime | None = None) -> dict[str, Any]:
     values = {"why": why, "incident": incident, "guidance": guidance, "by": by}
@@ -135,6 +136,8 @@ def entry(*, paths: list[str], why: str, incident_date: str, incident: str, guid
     }
     if always_human:
         risk["always_human"] = True
+    if pass_scope_exempt:
+        risk["pass_scope_exempt"] = True
     if fixed_by:
         risk["fixed_by"] = fixed_by
     if guard_tests:

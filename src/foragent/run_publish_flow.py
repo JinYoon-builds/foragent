@@ -36,7 +36,8 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import harness_guard, run_group_check, run_group_ci, run_group_evidence, runner
+    from foragent import harness_guard, review_pass_scope, run_group_check, run_group_ci, run_group_evidence, runner
+    from foragent.run_review import _review_implementation
     from foragent.run_waits import activity
 
     # Only metadata is read live; instructions and checks always use the snapshot.
@@ -49,6 +50,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     run_publish.commit_exclusions(attempt, title)
     run_publish._progress(n, ctx)
     verified_head_sha = git.head_sha()
+    review_pass_scope.bind(n, ctx, git)
     ci_cause = "initial"
 
     def finish_base() -> None:
@@ -89,6 +91,12 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             if check_failure:
                 raise run_publish.AttemptFailure(check_failure)
         finish_base()
+        # A resolution rewrites code after the PASS, so it gets one review of that later change.
+        # A hold returns through the publication path; other findings go back to the lane.
+        if conflicts and ctx.config.reviewer != "none" and review_pass_scope.applies(n, ctx, git):
+            _review_implementation(attempt)
+            if attempt.failure and not attempt.review_hold:
+                raise run_publish.AttemptFailure(attempt.failure)
         return move.target_sha
 
     target_sha = None
@@ -124,7 +132,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
         return run_publish._hold_changed_head(n, ctx, link)
-    if attempt.review_hold:
+
+    def review_held() -> str:
         summary = (
             "Reviewer repeated a disputed finding after implementer rebuttals"
             if attempt.review_hold_reason == run_publish.Reason.REVIEW_DISPUTE
@@ -133,6 +142,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         details = f"{attempt.failure}\n\n{link}"
         run_publish.flag(ctx, n, attempt.review_hold_reason, summary, details)
         return "held"
+
+    if attempt.review_hold:
+        return review_held()
 
     def policy_hold(decision: Decision, batch_branch: str | None = attempt.batch_branch) -> str | None:
         if decision.kind == "hold":
@@ -161,6 +173,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         verified_base_sha = target_sha
         if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
             return run_publish._hold_changed_head(n, ctx, link)
+        if attempt.review_hold:
+            return review_held()
         decision = run_publish._merge_decision(n, ctx, git, git.changed_paths(target_sha), ctx.tracker.get_issue(n).labels)
         return policy_hold(decision)
 
