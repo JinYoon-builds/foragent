@@ -243,7 +243,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     work["idle_while_waiting"] = work["free_run_slots"] > 0 and "structure" in held
     # Executors the waiting work needs: startable waiting issues and runs waiting in flight.
     lanes = {item.lane for item in waiting if item.startable}
-    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait")}
+    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait", "run-slot-wait")}
     needed = set().union(*(lane_executors(config, lane) for lane in lanes)) if lanes else set()
     quota = _quota(store, now)
     for name, value in quota.items():

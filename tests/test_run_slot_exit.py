@@ -96,6 +96,50 @@ def test_holds_run_turn_follows_priority(case):
     assert not turn.holds_run_turn(case.store, 90)
 
 
+def legacy_row(case, n, event="ready", **fields):
+    turn._append(case.store, {"n": n, "event": event, **fields})
+
+
+def started(case, n):
+    return case.store.get_run(n).started_at
+
+
+def test_a_row_that_names_no_target_holds_the_turn_like_its_named_rows(case):
+    legacy_row(case, 1, started_at=started(case, 1))
+    assert turn.holds_turn(case.store, turn.seat(case.ctx, 1, "main"))
+    assert turn.holds_run_turn(case.store, 1)
+    run_waits._set_phase(1, case.ctx, {"phase": "checking"})
+    assert case.sleeps == [] and exits(case) == [] and case.store.get_run(1).phase == "checking"
+    assert capacity.machine_runs(case.store, case.ctx.now()) == 2
+
+
+def test_a_row_that_names_no_target_still_queues_and_withdraws(case):
+    seat_in(case, 90)
+    legacy_row(case, 90, started_at=started(case, 90))
+    turn.withdraw(case.ctx, turn.seat(case.ctx, 90, "main"))
+    legacy_row(case, 90, started_at=started(case, 90))
+    legacy_row(case, 1, started_at=started(case, 1))
+    assert not turn.holds_run_turn(case.store, 1), "Behind a live row that also names no target"
+    legacy_row(case, 1, "withdrawn", started_at=started(case, 1))
+    case.store.finish_run(90, outcome="merged")
+    assert not turn.holds_run_turn(case.store, 1), "Withdrawn"
+
+
+def test_a_row_of_another_run_that_names_no_target_keeps_a_named_seat_behind_it(case):
+    seat_in(case, 90)
+    legacy_row(case, 90, started_at=started(case, 90))
+    seat_in(case, 1, "main")
+    assert not turn.holds_turn(case.store, turn.seat(case.ctx, 1, "main"))
+    assert not turn.holds_run_turn(case.store, 1)
+
+
+def test_a_row_without_an_execution_follows_the_turn_reader(case):
+    """Such a row is live yet is not this run's seat: both readers must give the same answer."""
+    legacy_row(case, 1)
+    assert not turn.holds_turn(case.store, turn.seat(case.ctx, 1, "main"))
+    assert not turn.holds_run_turn(case.store, 1)
+
+
 def test_finished_run_never_holds_a_turn(case):
     seat_in(case, 1)
     assert turn.holds_run_turn(case.store, 1)
