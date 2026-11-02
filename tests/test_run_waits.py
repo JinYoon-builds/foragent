@@ -291,7 +291,7 @@ def test_successful_wait_inside_an_exception_handler_still_reacquires_capacity(s
         c.clock[0] += timedelta(seconds=3)
 
     def sleep(seconds):
-        assert c.store.get_run(1).phase == "overlap-wait"
+        assert c.store.get_run(1).phase == capacity.RUN_SLOT_WAIT_PHASE
         c.sleeps.append(seconds)
         c.clock[0] += timedelta(seconds=seconds)
         c.other.finish_run(9, outcome="merged")
@@ -572,7 +572,7 @@ def test_idle_exit_queues_before_restoring_work_and_credits_queue_time(tmp_path,
     sleeps = []
 
     def sleep(seconds):
-        assert store.get_run(1).phase == idle
+        assert store.get_run(1).phase == capacity.RUN_SLOT_WAIT_PHASE
         assert capacity.machine_runs(store, clock[0]) == 1
         sleeps.append(seconds)
         clock[0] += timedelta(seconds=seconds)
@@ -617,15 +617,15 @@ def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_c
     identity = run_waits.phase_identity(c.store.get_run(1))
     wait = run_waits.WaitPhase(1, c.ctx, "ci")
     wait.open()
-    c.clock[0] += timedelta(seconds=57)
-    assert runner._remaining(1, c.ctx) == 3
+    c.clock[0] += timedelta(seconds=40)
+    assert runner._remaining(1, c.ctx) == 20
     released = []
     c.occupy()
     monkeypatch.setattr(runner, "_timeout", lambda *args: pytest.fail("Paused queue time cannot exhaust runtime"))
 
     def sleep(seconds):
-        assert c.store.get_run(1).phase == "ci"
-        assert runner._remaining(1, c.ctx) == 3
+        assert c.store.get_run(1).phase == capacity.RUN_SLOT_WAIT_PHASE
+        assert runner._remaining(1, c.ctx) == 20
         assert capacity.machine_runs(c.store, c.ctx.now()) == 1
         c.sleeps.append(seconds)
         c.clock[0] += timedelta(seconds=seconds)
@@ -638,8 +638,8 @@ def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_c
     def work():
         assert released and sum(c.sleeps) == 10
         assert capacity.machine_runs(c.store, c.ctx.now()) == 1
-        assert runner._remaining(1, c.ctx) == 3
-        c.clock[0] += timedelta(seconds=3)
+        assert runner._remaining(1, c.ctx) == 20
+        c.clock[0] += timedelta(seconds=20)
         assert runner._remaining(1, c.ctx) == 0, "Real work still spends the original runtime budget"
 
     if transition == "phase":

@@ -111,7 +111,7 @@ def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(t
         tracker.set_pr_head_sha(number, local_head[0])
 
     def sleep(seconds):
-        assert effects == [] and store.get_run(1).phase == idle
+        assert effects == [] and store.get_run(1).phase == capacity.RUN_SLOT_WAIT_PHASE
         assert capacity.machine_runs(store, clock[0]) == 1
         sleeps.append(seconds)
         clock[0] += timedelta(seconds=seconds)

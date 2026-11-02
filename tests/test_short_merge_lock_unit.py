@@ -93,8 +93,10 @@ def test_final_conflict_is_resolved_outside_the_lock(short_case):
 
     case.before_lock = move_once
     case.implementer.steps.append(resolve)
+    case.reviewer.steps.append(case.review)  # A resolution after a PASS gets one review of that later change.
     assert run(case) == "merged"
     assert len(case.implementer.calls) == 2
+    assert len(case.reviewer.calls) == 2
     assert len(case.holds) == 2
     assert_short_holds(case)
     assert_merge_facts(case)

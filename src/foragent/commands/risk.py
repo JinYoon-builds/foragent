@@ -16,6 +16,8 @@ def add(commands) -> None:
     add_risk.add_argument("--incident", required=True, help="What happened")
     add_risk.add_argument("--guidance", required=True, help="What the reviewer must do for these paths")
     add_risk.add_argument("--always-human", action="store_true", help="Hold matching PRs for a person")
+    add_risk.add_argument("--pass-scope-exempt", action="store_true",
+                          help="Keep the full review scope after a PASS for changes touching these paths")
     add_risk.add_argument("--event", help="Event that led to this entry")
     add_risk.add_argument("--fixed-by", help="Issue reference of the fix")
     add_risk.add_argument("--guard-test", action="append", default=[], help="Test guarding the incident (repeatable)")
@@ -46,7 +48,7 @@ def _run(args, root, language: str) -> None:
         risk = risks.entry(
             paths=args.path, why=args.why, incident_date=args.incident_date, incident=args.incident,
             guidance=args.guidance, by=args.by if args.by is not None else getpass.getuser(),
-            always_human=args.always_human, event=args.event, fixed_by=args.fixed_by,
+            always_human=args.always_human, pass_scope_exempt=args.pass_scope_exempt, event=args.event, fixed_by=args.fixed_by,
             guard_tests=args.guard_test, root=root,
         )
         risks.append(root, risk)
@@ -61,7 +63,8 @@ def _run(args, root, language: str) -> None:
             print(cli.text("risk_empty", language, file=risks.RISK_FILE))
         for risk in entries:
             human = cli.text("risk_always_human", language) if risk.get("always_human") else ""
-            print(f"- {', '.join(risk['paths'])}{human}: {risk.get('why', '')}")
+            exempt = cli.text("risk_pass_scope_exempt", language) if risk.get("pass_scope_exempt") is True else ""
+            print(f"- {', '.join(risk['paths'])}{human}{exempt}: {risk.get('why', '')}")
         return
     files = [name for name in cli.GitRepo(root)._call(["ls-files", "--cached", "-z"]).split("\0") if name]
     report = risks.candidates(root, files)
