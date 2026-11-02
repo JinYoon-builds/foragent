@@ -23,6 +23,14 @@ CONFLICT = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires a closed talk; the finding w
 QUESTION = "<!-- foragent:blocked reason=spec-question -->"
 
 
+@pytest.fixture(autouse=True)
+def calm_machine(monkeypatch):
+    """Panel ordering here uses short barriers; live machine load must not hold admission."""
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "_sensor_block", lambda: None)
+
+
 def review_events(store):
     path = store.root / "orch-events.jsonl"
     return [event for event in map(json.loads, path.read_text().splitlines()) if event["kind"] == "review"]
