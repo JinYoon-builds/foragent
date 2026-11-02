@@ -222,7 +222,7 @@ def test_prompts_add_other_content_only_when_the_issue_has_some():
     plain, extra = parse_body(PLAIN_BODY), parse_body(EXTRA_BODY)
     section = f"Other approved issue content (verbatim):\n{EXTRA}\n"
     plain_prompt, extra_prompt = build_prompt(1, plain, "tests/acceptance/"), build_prompt(1, extra, "tests/acceptance/")
-    assert section not in plain_prompt and "Other approved" not in plain_prompt
+    assert "Other approved" not in plain_prompt
     assert extra_prompt.replace(section, "", 1) == plain_prompt
     assert extra_prompt.index("```\n" + section) < extra_prompt.index("Rules:")
     plain_review, extra_review = build_review_prompt(plain, "diff"), build_review_prompt(extra, "diff")
@@ -234,23 +234,25 @@ def test_prompts_add_other_content_only_when_the_issue_has_some():
 def test_review_cuts_a_long_diff_but_never_long_authored_content():
     padding = "".join(f"Requirement {number}.\n" for number in range(8000))
     assert len(padding) > 60000
-    prompt = build_review_prompt(parse_body(PLAIN_BODY + "## Contracts\n" + padding), "x" * 70000)
+    parsed = parse_body(PLAIN_BODY + "## Contracts\n" + padding)
+    prompt = build_review_prompt(parsed, "x" * 70000)
     assert padding.strip() in prompt and "x" * 70000 not in prompt
-    assert "Requirement 7999." in build_prompt(1, parse_body(PLAIN_BODY + "## Contracts\n" + padding), "tests/acceptance/")
+    assert "Requirement 7999." in build_prompt(1, parsed, "tests/acceptance/")
 
 
 def updates(prompt):
     return [part for part in prompt.split("\n\n") if part.startswith("Specification update")]
 
 
-@pytest.mark.parametrize("gate", [
-    "\n\n## Waiting\nReason: a boundary\n\n",
-    "<!-- foragent:write id=" + "a" * 32 + " -->\n",
-    "<!-- foragent:waiting-prior sha256=" + "b" * 64 + " id=" + "c" * 32 + " -->\n",
-])
-def test_resume_treats_a_change_in_gate_writing_alone_as_no_update(gate):
-    assert updates(build_resume_prompt(1, EXTRA_BODY, EXTRA_BODY + gate)) == []
-    assert updates(build_resume_prompt(1, EXTRA_BODY + gate, EXTRA_BODY)) == []
+@pytest.mark.parametrize("trailing", ["", "  "])
+def test_resume_treats_what_the_real_gate_writes_as_no_update(trailing):
+    body = EXTRA_BODY.rstrip("\n") + trailing
+    stamped = order_waiting.stamp(body, order_waiting.replace_section(body, "A wait"))
+    written = order_waiting.mark_write(body, stamped)
+    assert "foragent:write" in written and "foragent:waiting-prior" in written
+    assert updates(build_resume_prompt(1, body, written)) == []
+    assert updates(build_resume_prompt(1, written, body)) == []
+    assert "foragent:" not in parse_body(written).other_content
 
 
 def test_resume_states_each_changed_authored_line_once_without_repeating_the_rest():
@@ -276,77 +278,40 @@ def test_resume_without_a_recorded_body_has_no_update():
     assert updates(build_resume_prompt(1, EXTRA_BODY, EXTRA_BODY)) == []
 
 
-@pytest.mark.parametrize("opening,closing", [("`````", "`````"), ("~~~", "~~~")])
-def test_prompts_and_resume_carry_requirements_inside_every_code_fence(opening, closing):
-    def body(example):
-        return PLAIN_BODY + f"\n## Example\n{opening}\n## Waiting\n{example}\n{closing}\n"
-
-    assert "kept example" in build_prompt(1, parse_body(body("kept example")), "tests/acceptance/")
-    assert "kept example" in build_review_prompt(parse_body(body("kept example")), "diff")
-    assert updates(build_resume_prompt(1, body("kept example"), body("new example"))) == [
-        "Specification update at previous issue body lines 15-15:\nnew example",
-    ]
-
-
-def test_prompts_scope_and_resume_keep_a_marker_literal_on_a_fence_line():
-    marker = "<!-- foragent:write id=" + "a" * 32 + " -->"
-    edited = marker.replace("a" * 32, "e" * 32)
-
-    def body(literal):
-        return PLAIN_BODY + f"\n## Example\n~~~sh{literal}\n~~~{literal}\n## Waiting\nkept example\n~~~\nEnd.\n"
-
-    parsed = parse_body(body(marker))
-    for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
-        assert f"~~~sh{marker}\n~~~{marker}\n## Waiting\nkept example\n~~~\nEnd." in prompt
-    assert len(updates(build_resume_prompt(1, body(marker), body(edited)))) == 1
-
-
-@pytest.mark.parametrize("trailing", ["", "  "])
-def test_resume_treats_what_the_real_gate_writes_as_no_update(trailing):
-    body = EXTRA_BODY.rstrip("\n") + trailing
-    stamped = order_waiting.stamp(body, order_waiting.replace_section(body, "A wait"))
-    written = order_waiting.mark_write(body, stamped)
-    assert "foragent:write" in written and "foragent:waiting-prior" in written
-    assert updates(build_resume_prompt(1, body, written)) == []
-    assert "foragent:" not in parse_body(written).other_content
-
-
-def test_resume_reports_an_edit_to_marker_text_inside_an_unclosed_fence():
-    marker = "<!-- foragent:write id=a -->"
-    body = PLAIN_BODY + f"\n## Example\n~~~\nvalue{marker}\n"
-    assert marker in build_prompt(1, parse_body(body), "tests/acceptance/")
-    assert marker in build_review_prompt(parse_body(body), "diff")
-    assert len(updates(build_resume_prompt(1, body, body.replace("id=a", "id=b")))) == 1
-
-
-@pytest.mark.parametrize("fence", ["```", "~~~", "`````"])
-def test_gate_writes_after_an_unfinished_fence_stay_out_of_prompts_and_resume(fence):
-    body = PLAIN_BODY + f"\n## Example\n{fence}\ncode\n"
+def test_gate_writes_after_an_unfinished_fence_stay_out_of_prompts_and_resume():
+    body = PLAIN_BODY + "\n## Example\n```\ncode\n"
     written = order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(body, "A wait")))
     parsed = parse_body(written)
     for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
-        assert f"## Example\n{fence}\ncode" in prompt
+        assert "## Example\n```\ncode" in prompt
         assert "A wait" not in prompt and "foragent:write" not in prompt and "waiting-prior" not in prompt
     assert updates(build_resume_prompt(1, body, written)) == []
 
 
-@pytest.mark.parametrize("opening", ["~~~", "`````"])
-def test_prompts_keep_a_fenced_section_example_inside_the_goal(opening):
-    goal = f"Ship.\n{opening}\n## Out of scope\nExample exclusion\n{opening}"
-    parsed = parse_body(f"## Goal\n{goal}\n\n## Out of scope\nReal exclusion\n\n## Done when\n```sh\ntrue\n```\n")
-    prompt = build_prompt(1, parsed, "tests/acceptance/")
-    assert goal in prompt and "Out of scope (do not do these): Real exclusion\n" in prompt
-
-
-@pytest.mark.parametrize("fence", ["~~~", "```"])
-def test_prompts_and_resume_keep_requirements_after_waiting_text_with_a_fence_line(fence):
-    def body(required):
-        return (f"<!-- foragent:v1 -->\n## Goal\nShip.\n## Waiting\n{fence}\ngate\n## Contracts\n{fence}\n"
-                f"## Waiting\n{required}\n{fence}\n## Done when\n```sh\ntrue\n```\n")
-
-    parsed = parse_body(body("required text"))
+@pytest.mark.parametrize("trailing", ["", "  "])
+def test_a_snapshot_with_a_glued_marker_stays_clean_and_a_rewrite_is_no_update(trailing):
+    marker = "<!-- foragent:write id=" + "a" * 32 + " -->"
+    clean = EXTRA_BODY.rstrip("\n") + trailing
+    snapshot = clean + marker + "\n"
+    rewritten = order_waiting.mark_write(snapshot, clean + "\n")
+    assert marker not in rewritten.replace(f"\n{marker}\n", "\n") and marker in rewritten
+    parsed = parse_body(snapshot)
     for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
-        assert "required text" in prompt and "\ngate\n" not in prompt
-    assert parsed.done_when_commands == ["true"]
-    assert "gate\n" not in parsed.other_content and "required text" in parsed.other_content
-    assert len(updates(build_resume_prompt(1, body("required text"), body("edited text")))) == 1
+        assert "The API stays." in prompt and "foragent:" not in prompt
+    assert updates(build_resume_prompt(1, snapshot, rewritten)) == []
+    assert updates(build_resume_prompt(1, snapshot, clean)) == []
+    edited = updates(build_resume_prompt(1, snapshot, rewritten.replace("The API stays.", "The API moves.")))
+    assert len(edited) == 1 and "The API moves." in edited[0] and "foragent:" not in edited[0]
+
+
+def test_a_marker_glued_to_a_closing_fence_stays_out_when_approved_content_adds_a_block():
+    marker = "<!-- foragent:write id=" + "a" * 32 + " -->"
+    clean = PLAIN_BODY + "\n## Example\n```\nfirst-block\n```"
+    snapshot = clean + marker + "\n"
+    reapproved = snapshot + "\n## More\n```\nsecond-block\n```\n"
+    parsed = parse_body(reapproved)
+    for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
+        assert "```\nfirst-block\n```\n\n## More\n```\nsecond-block\n```" in prompt and "foragent:" not in prompt
+    resume = build_resume_prompt(1, snapshot, reapproved)
+    assert resume.count("Specification update") == 1 and "second-block" in resume
+    assert "first-block" not in resume and "foragent:" not in resume

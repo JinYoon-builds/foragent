@@ -13,48 +13,17 @@ import re
 import uuid
 
 from foragent import i18n
-from foragent.issue import closed_fence_lines
 
 HEADING = re.compile(r"^##\s+Waiting\s*$", re.MULTILINE)
 _END = re.compile(r"^(?:#{1,2}\s|<!--\s*foragent:)", re.MULTILINE)
 _MARKER = re.compile(r"<!-- foragent:waiting from=[0-9a-f]{64} sha256=[0-9a-f]{64} id=([0-9a-f]{32}) -->")
-_PRIOR = re.compile(r"<!-- foragent:waiting-prior sha256=([0-9a-f]{64}) id=([0-9a-f]{32}) -->")
-_WRITE = re.compile(r"<!-- foragent:write id=([0-9a-f]{32}) -->")
-
-
-def _is_marker(pattern: re.Pattern, line: str, fenced: bool) -> re.Match | None:
-    """A marker the gate wrote fills its own line outside a closed fence; other text is the author's."""
-    return None if fenced else pattern.fullmatch(line.rstrip("\r\n"))
-
-
-def _marker(body: str | None, pattern: re.Pattern) -> re.Match | None:
-    lines = (body or "").splitlines(keepends=True)
-    fenced = closed_fence_lines(lines)
-    return next((match for index, line in enumerate(lines)
-                 if (match := _is_marker(pattern, line, index in fenced))), None)
-
-
-def _without(body: str, pattern: re.Pattern) -> str:
-    lines = body.splitlines(keepends=True)
-    fenced = closed_fence_lines(lines)
-    return "".join(line for index, line in enumerate(lines) if not _is_marker(pattern, line, index in fenced))
-
-
-def _waiting_heading(body: str) -> re.Match | None:
-    """The first `## Waiting` heading outside a closed fence: a fenced one is an authored example."""
-    lines = body.splitlines(keepends=True)
-    fenced = closed_fence_lines(lines)
-    start = 0
-    for index, line in enumerate(lines):
-        if index not in fenced and (match := HEADING.match(body, start)):
-            return match
-        start += len(line)
-    return None
+_PRIOR = re.compile(r"<!-- foragent:waiting-prior sha256=([0-9a-f]{64}) id=([0-9a-f]{32}) -->\n?")
+_WRITE = re.compile(r"<!-- foragent:write id=([0-9a-f]{32}) -->\n?")
 
 
 def section(body: str | None) -> str | None:
     """The trimmed text under the first `## Waiting` heading, or None without one."""
-    match = _waiting_heading(body or "")
+    match = HEADING.search(body or "")
     if match is None:
         return None
     rest = body[match.end():]
@@ -87,7 +56,7 @@ def read_waiting(body: str | None) -> dict[str, str] | None:
 def replace_section(body: str, text: str | None) -> str:
     """Replace or clear this issue's wait, preserving everything outside its section."""
     replacement = f"## Waiting\n{text.strip()}\n\n" if text is not None else ""
-    match = _waiting_heading(body)
+    match = HEADING.search(body)
     if match is None:
         return body + ("\n\n" if body else "") + replacement if replacement else body
     end = _END.search(body, match.end())
@@ -105,7 +74,7 @@ def _digest(text: str | None) -> str:
 
 
 def _prior(body: str | None) -> tuple[str, str] | None:
-    match = _marker(body, _PRIOR)
+    match = _PRIOR.search(body or "")
     return (match[1], match[2]) if match else None
 
 
@@ -124,7 +93,7 @@ def stamp(before: str | None, after: str) -> str:
     An unchanged section keeps `before`'s record; bodies whose wait never changed get
     nothing, so they stay byte for byte the same.
     """
-    after = _without(after, _PRIOR)
+    after = _PRIOR.sub("", after)
     old, new = section(before), section(after)
     if old != new:
         prior, ident = _digest(old), uuid.uuid4().hex
@@ -141,9 +110,9 @@ def mark_write(before: str, after: str) -> str:
     A record keyed by the id (the edit revision comment) then names this write, not an
     earlier identical one: rewriting a body back over a hand edit is a new write.
     """
-    after = _without(after, _WRITE)
-    kept = _marker(before, _WRITE)
-    if on_own_line(_without(before or "", _WRITE)) == on_own_line(after):
+    after = _WRITE.sub("", after)
+    kept = _WRITE.search(before or "")
+    if on_own_line(_WRITE.sub("", before or "")) == on_own_line(after):
         return f"{on_own_line(after)}<!-- foragent:write id={kept[1]} -->\n" if kept else after
     return f"{on_own_line(after)}<!-- foragent:write id={uuid.uuid4().hex} -->\n"
 

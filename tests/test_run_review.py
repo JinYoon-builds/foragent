@@ -596,6 +596,11 @@ def test_claude_review_scope_carries_authored_content_without_gate_writing(revie
         scope = (git.root / "CLAUDE.local.md").read_text()
     assert "## Goal\nShip it.\n\n## Contracts\nThe API stays." in scope
     assert "Gate bookkeeping" not in scope and "<!-- foragent:" not in scope
+    glued = "<!-- foragent:write id=" + "a" * 32 + " -->"
+    with run_review._claude_review_scope(git, f"## Goal\nShip it.\n\n## Contracts\nThe API stays.{glued}\n", "tests/acceptance/"):
+        assert glued not in (git.root / "CLAUDE.local.md").read_text()
+    with run_review._claude_review_scope(git, f"## Example\n```\none\n```{glued}\n\n```\ntwo\n```\n", "tests/acceptance/"):
+        assert glued not in (git.root / "CLAUDE.local.md").read_text()
 
 
 def test_claude_review_scope_does_not_accumulate_between_reviews(review_context):

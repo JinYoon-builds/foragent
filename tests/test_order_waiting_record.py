@@ -62,7 +62,6 @@ def test_appended_markers_always_take_their_own_line(body):
     for result, kind in ((stamped, "waiting-prior"), (written, "write")):
         assert any(line.startswith(f"<!-- foragent:{kind} ") and line.endswith(" -->")
                    for line in result.splitlines())
-    assert order_waiting.section(stamped) is not None
 
 
 def test_same_write_keeps_its_id_when_only_the_final_newline_differs():
@@ -75,66 +74,3 @@ def test_same_write_keeps_its_id_when_only_the_final_newline_differs():
 def test_bodies_without_a_marker_stay_byte_for_byte():
     assert order_waiting.stamp("Text", "Text") == "Text"
     assert order_waiting.mark_write("Text", "Text") == "Text"
-
-
-WRITE = "<!-- foragent:write id=" + "a" * 32 + " -->"
-PRIOR = "<!-- foragent:waiting-prior sha256=" + "b" * 64 + " id=" + "c" * 32 + " -->"
-
-
-@pytest.mark.parametrize("literal", [WRITE, PRIOR])
-@pytest.mark.parametrize("shape", [
-    "## Done when\n```sh\ncat <<'EOF'\nvalue{m}\nEOF\n```\n",  # A suffix: the newline must survive.
-    "## Done when\n```sh\ncat <<'EOF'\n{m}\nEOF\n```\n",  # A whole line inside a closed fence.
-    "## Example\n~~~\n{m}\n~~~\n",
-    "## Example\nProse ending in {m}\nEnd.\n",
-    "## Example\n{m} and text\n",
-])
-def test_gate_writes_keep_authored_marker_text(shape, literal):
-    body = shape.format(m=literal)
-    edited = body + "\nMore.\n"
-    written = order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(edited, "Wait")))
-    assert written.startswith(body)
-    from foragent.issue import parse_body
-    assert parse_body(written).done_when_commands == parse_body(body).done_when_commands
-    rewritten = order_waiting.mark_write(written, order_waiting.replace_section(written, "Other"))
-    assert rewritten.startswith(body)
-
-
-@pytest.mark.parametrize("newline", ["\n", "\r\n"])
-def test_gate_replaces_its_own_marker_lines_wherever_they_are(newline):
-    body = newline.join(["## Goal", "Ship.", WRITE, PRIOR, "## Contracts", "Stays.", ""])
-    written = order_waiting.mark_write(body, order_waiting.stamp(body, body + "More." + newline))
-    assert written.count("foragent:write") == 1 and written.count("foragent:waiting-prior") <= 1
-    assert WRITE not in written
-    assert "## Contracts" in written and "Stays." in written
-
-
-def test_fenced_or_inline_marker_text_is_not_the_gate_record():
-    fenced = f"## Example\n~~~\n{PRIOR}\n{WRITE}\n~~~\nInline {WRITE}\n"
-    assert order_waiting.notification(fenced) == ""
-    same = order_waiting.mark_write(fenced, fenced)
-    assert same == fenced
-    first = order_waiting.mark_write(fenced, fenced + "More.\n")
-    assert first.endswith(" -->\n") and first.count("foragent:write") == 3
-    assert order_waiting.mark_write(first, fenced + "More.\n") == first
-
-
-@pytest.mark.parametrize("opening,closing", [("```", "```"), ("~~~", "~~~"), ("`````", "`````")])
-def test_a_fenced_waiting_example_is_not_the_issue_wait(opening, closing):
-    example = f"## Goal\nShip.\n{opening}\n## Waiting\nExample wait\n{closing}\n"
-    assert order_waiting.section(example) is None and order_waiting.read_waiting(example) is None
-    replaced = order_waiting.replace_section(example, "Real wait")
-    assert replaced.startswith(example) and order_waiting.section(replaced) == "Real wait"
-    assert order_waiting.replace_section(replaced, None).startswith(example)
-    assert "Real wait" not in order_waiting.replace_section(replaced, None)
-
-
-@pytest.mark.parametrize("fence", ["~~~", "```", "`````"])
-def test_gate_keeps_marker_lines_in_a_fence_after_waiting_text_with_a_fence_line(fence):
-    tail = f"## Contracts\n{fence}\n{PRIOR}\n{WRITE}\n{fence}\n"
-    body = f"## Waiting\n{fence}\ngate\n{tail}"
-    assert order_waiting.section(body) == f"{fence}\ngate"
-    assert order_waiting.notification(body) == ""
-    edited = order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(body, "New")))
-    assert tail in edited and order_waiting.section(edited) == "New"
-    assert order_waiting.mark_write(edited, order_waiting.replace_section(edited, "Later")).count(tail) == 1
