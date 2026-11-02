@@ -1113,22 +1113,35 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Pat
     ) + (f"\n{references}" if references else "") + order_done_when.prompt_section(item)
 
 
+def _lane_instructions(config: Config, lane: str, root: Path) -> list[str | None]:
+    """What the lane tells its implementer apart from memory: agent file, writer contract, skill list."""
+    from foragent.run_lane_skills import _agent_text, _writer_contract, lane_skills
+
+    agent, text = _agent_text(config, lane, root)
+    return [text, _writer_contract(config, lane, text), lane_skills(config, lane, root, agent)[0]]
+
+
 def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: Path | None = None):
     """The implementer the runner would start for this issue, its prompt and the evidence key.
 
     Executor, model, lane agent, lane notes and skills come from the same function the
-    runner's first implementation attempt uses, so preread cannot differ from it.
+    runner's first implementation attempt uses, so the work and the way it is run cannot
+    differ from that attempt. Lane memory can: it is read as it stands now, here and again
+    in the first attempt, so a lesson merged after preread reaches that attempt but not this
+    reader. The key therefore holds no lane memory, and lane learning leaves a clean preread valid.
     With a reader directory the prompt points images there; the digest always uses the
     reader-free prompt, so each reader's own directory never changes the evidence key.
     """
     from foragent.run_implementation import implementer_setup, lane_config
 
-    setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
-    prompt = setup.notes + preread_prompt(plan, item, root) + setup.memory_notice
-    sent = prompt if reader is None else setup.notes + preread_prompt(plan, item, root, reader) + setup.memory_notice
+    run_config = lane_config(config, item["lane"])
+    setup = implementer_setup(run_config, item["lane"], item["size"], root)
+    prompt = preread_prompt(plan, item, root)
+    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
-        [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
+        [setup.executor, setup.model, setup.options, prompt, plan, _lane_instructions(run_config, item["lane"], root)],
+        ensure_ascii=False, sort_keys=True,
     ).encode("utf-8")).hexdigest()
     return setup, sent, digest
 
