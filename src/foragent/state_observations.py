@@ -61,6 +61,8 @@ def effect(facts: dict[str, Any], intent: dict[str, Any]) -> dict[str, Any]:
         result.update(title=intent["title"], body=intent["body"])
     elif action == "close_issue":
         result["state"] = "closed"
+        if intent.get("reason") is not None:
+            result["state_reason"] = intent["reason"]
     return result
 
 
