@@ -300,12 +300,14 @@ def test_a_library_skill_reached_through_a_symlinked_folder_is_no_default_but_st
 
 from foragent.license_texts import STANDARD_LICENSES  # noqa: E402
 
+JANE_MIT = STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane Doe")
+BANNED_HOLDER_MIT = STANDARD_LICENSES["MIT"].replace(
+    "<year> <copyright holders>", "2026 Jane Doe. Redistribution is prohibited.")
+
 RESTRICTED_TEXTS = {
     "standard-then-ban": STANDARD_LICENSES["MIT"] + "\nRedistribution of this skill is prohibited.\n",
     "spdx-then-ban": "SPDX-License-Identifier: MIT\nRedistribution of this skill is prohibited.\n",
     "two-spdx": "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: LicenseRef-Private\n",
-    "spdx-other-text": "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
-    "spdx-then-standard": "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
     "spdx-then-author": "SPDX-License-Identifier: MIT\nAuthor: Example\n",
     "heading-variant": STANDARD_LICENSES["MIT"].replace("MIT License", "The MIT License (MIT)", 1),
     "missing-words": STANDARD_LICENSES["MIT"].replace("free of charge, ", ""),
@@ -315,7 +317,52 @@ RESTRICTED_TEXTS = {
     "copyleft": "SPDX-License-Identifier: GPL-3.0-only\n",
     "non-commercial": "SPDX-License-Identifier: CC-BY-NC-4.0\nCopyright 2026 Example\n",
     "only-copyright": "Copyright 2026 Example\n",
+    # #1652 scope (2026-11-02): an unlabelled sentence around the text is judged and fails.
+    "sentence-as-work": "Redistribution is prohibited by Jane Doe\n" + STANDARD_LICENSES["MIT"],
+    "title-case-work-ban": "No Commercial Use by Jane Doe, MIT License\n" + JANE_MIT,
+    "sentence-after-url": "https://example.org/x Redistribution is prohibited.\n" + JANE_MIT,
+    "unlabelled-condition-after": JANE_MIT + "\nNo commercial use without written permission.\n",
+    "copyleft-spdx-beside-notices": "SPDX-License-Identifier: GPL-3.0-only\nSource: https://example.org/x\n" + JANE_MIT,
+    # #1652 review 8: every spelling of a license declaration is judged as an SPDX expression.
+    "spdx-tab": "SPDX-License-Identifier:\tGPL-3.0-only\n" + JANE_MIT,
+    "spdx-and-ref": "SPDX-License-Identifier: MIT AND LicenseRef-NonCommercial\n" + JANE_MIT,
+    "spdx-lowercase": JANE_MIT + "\nspdx-license-identifier: gpl-3.0-only\n",
+    "spdx-comment-mark": "# SPDX-License-Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "spdx-space-before-colon": "SPDX-License-Identifier : GPL-3.0-only\n" + JANE_MIT,
+    "spdx-with-exception": "SPDX-License-Identifier: MIT WITH Commons-Clause\n" + JANE_MIT,
+    "licence-spelling": "SPDX-Licence-Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "license-label": "License: GPL-3.0-only\n" + JANE_MIT,
+    "empty-declaration": "SPDX-License-Identifier:\n" + JANE_MIT,
+    # #1652 review 9: a declaration is always judged, whatever other form it also fits.
+    "declaration-shaped-as-by": "SPDX-License-Identifier: by LicenseRef-NonCommercial\n" + JANE_MIT,
+    "declaration-words-label": "SPDX License Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "declaration-label-with-url": JANE_MIT + "\nUpstream License: https://example.org/gpl\n",
+    # The short form is one `SPDX-License-Identifier:` line; no other declaration replaces the terms.
+    "short-license-label": "License: MIT\n",
+    "short-spdx-label": "SPDX: MIT\n",
+    "short-spaced-label": "SPDX License Identifier: MIT\n",
 }
+
+# #1652 scope (2026-11-02): labelled notice lines, `<work> by …` and URLs are not judged; their content
+# is a NOTE for the person who approves the table or a library.
+LABELLED_NOTES = {
+    "attribution-sentence": "Attribution: Redistribution is prohibited.\n" + JANE_MIT,
+    "source-url-then-sentence": JANE_MIT + "\nSource: https://example.org/source Redistribution is prohibited.\n",
+    "linked-terms": "Attribution: https://commonsclause.com/\n" + JANE_MIT,
+    "upstream-identifier-url": "Upstream: https://example.org/GPL-3.0-only\n" + JANE_MIT,
+    "work-by-anyone": "pstack by Someone Else, MIT License\nhttps://example.org/pstack\n" + JANE_MIT,
+}
+
+
+@pytest.mark.parametrize("text", LABELLED_NOTES.values(), ids=LABELLED_NOTES)
+def test_labelled_notices_and_urls_are_not_judged(tmp_path, text):
+    root = tmp_path / "root"
+    write_skill(root / ".claude", "noted", license=None)
+    (root / ".claude/skills/noted/LICENSE").write_text(text)
+    config = Config(skill_libraries=[], default_skills={"docs": ["noted"]})
+    assert ".claude/skills/noted/SKILL.md" in section(config, "docs", root)
+    assert SkillManager(config).check_default("noted", root) is None
+
 
 # Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
 COPYRIGHT_NAME_NOTES = {
@@ -362,6 +409,20 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     STANDARD_LICENSES["MIT"].replace("\n", "  \n\n"),  # Only whitespace differs.
     STANDARD_LICENSES["ISC"].replace("<year> <owner>", "2026 Example"),
     STANDARD_LICENSES["Apache-2.0"],
+    # #1652 superseded the old rejection: a permissive SPDX line beside a complete permissive text passes.
+    "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
+    "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    # #1652 review 8: an SPDX expression of permissive identifiers only.
+    "SPDX-License-Identifier: MIT OR Apache-2.0\n" + STANDARD_LICENSES["MIT"],
+    "// SPDX-License-Identifier:\t(MIT AND ISC)\n" + STANDARD_LICENSES["MIT"],
+    # #1652: attribution and source notices around a complete permissive text.
+    # A label value is a plain URL or exactly a name this file's copyright line writes (#1652).
+    "Attribution: Jane Doe\nSource: https://example.org/example-project\n" + JANE_MIT,
+    "example-project by Jane Doe, MIT License, Copyright (c) 2026 Jane Doe\n"
+    "Upstream: https://example.org/example-project\n" + STANDARD_LICENSES["MIT"],
+    JANE_MIT + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe\nhttps://example.org/tool\n",
+    "Source: https://github.com/example/pstack\nMaintainer: Jane Doe\n" + JANE_MIT,
+    "Attribution: Jane van Doe\n" + STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane van Doe"),
 ])
 def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
     root = tmp_path / "root"
@@ -573,3 +634,32 @@ def test_a_license_entry_that_is_not_a_readable_file_is_unknown(tmp_path):
     (folder / "LICENSES").mkdir()
     (folder / "LICENSES/MIT.txt").write_text(STANDARD_LICENSES["MIT"])
     assert redistributable_license(folder, tmp_path)[0] == "unknown"
+
+
+NOTICED_TEXTS = {
+    "attribution-prefix": "Attribution: Jane Doe\nSource: https://example.org/noticed\n" + JANE_MIT,
+    "attribution-suffix": JANE_MIT + "\nnoticed by Jane Doe, MIT License\nhttps://example.org/noticed\n",
+    "spdx-and-holder": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe\n" + JANE_MIT,
+}
+
+
+@pytest.mark.parametrize("text", NOTICED_TEXTS.values(), ids=NOTICED_TEXTS)
+@pytest.mark.parametrize("where", ["library", "repository"])
+def test_a_license_the_default_judge_accepts_installs_without_another_veto_or_warning(tmp_path, capsys, text, where):
+    """#1652: the section, the install check and the install all follow one license judge."""
+    library, project = tmp_path / "library", tmp_path / "project"
+    project.mkdir()
+    base = library if where == "library" else project
+    write_skill(base, "noticed", license=None)
+    (base / "skills/noticed/LICENSE").write_text(text)
+    entry = {"name": "lib", "repo": "https://example.com/lib.git", "path": str(library), "revision": "pinned",
+             "skills": ["noticed"]}
+    manager = SkillManager(Config(skill_libraries=[entry] if where == "library" else []))
+    skill = manager.check_default("noticed", project)
+    assert skill is not None and skill.license == "MIT"
+    manager.install_default("noticed", skill, project)
+    assert "installing locally only" not in capsys.readouterr().err
+    copy = project / ".claude/skills/noticed"
+    assert (copy / "LICENSE").read_text() == text
+    config = Config(skill_libraries=[entry] if where == "library" else [], default_skills={"docs": ["noticed"]})
+    assert ".claude/skills/noticed/SKILL.md" in section(config, "docs", project)
