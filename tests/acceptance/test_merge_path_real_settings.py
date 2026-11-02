@@ -550,3 +550,70 @@ def test_h_one_ci_round_covers_multiple_member_merges(world):
                if m["pr"] == next(p.number for p in case.tracker.created_prs
                                  if p.head == f"foragent/issue-{n}")) == ready(case, n)[0]["head_sha"]]
     assert len(reused) >= 2, f"Only {reused} merged their original CI-ready head; one round must cover >=2"
+
+
+@pytest.mark.parametrize("maximum", [1, 4], ids=["individual-refresh", "group-check-and-return"])
+def test_i_full_machine_budget_cannot_deadlock_the_merge_turn(world, monkeypatch, maximum):
+    """Real settings, CI measurements, moved main and all four public runners progress.
+
+    Only the external machine sensors and occupancy are supplied. The watchdog
+    releases external workers on broken source so a failure cannot hang pytest;
+    needing that release is itself a failure. No production admission, queue,
+    check, merge or phase function is replaced.
+    """
+    from threading import Thread
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    case = world(maximum=maximum)
+    # The predecessor is an idle, live turn owner, not local machine work.
+    case.store.update_run(BLOCKER, phase="ci", pid=os.getpid())
+    monkeypatch.setattr(capacity, "machine_root", lambda: case.store.root.parent)
+    (case.store.root.parent / "machine.yml").write_text("max_parallel: 2\ntest_slots: 4\n")
+    capacity.write_state(case.store, 2, case.clock[0])
+    busy = StateStore(case.store.root.parent / "busy", now=lambda: case.clock[0])
+    stop, forced = Event(), Event()
+    watchdogs = []
+
+    def release():
+        for n in range(9101, 9105):
+            if busy.get_run(n) is not None:
+                busy.finish_run(n, outcome="merged")
+
+    def after_all_ready(c):
+        c.history.update({"src/neighbor.py": "VALUE = 'new main'\n"})
+        for n in range(9101, 9105):
+            busy.start_run(n, branch=f"busy-{n}", worktree=busy.worktree_path(n), pid=os.getpid())
+            busy.update_run(n, phase="implementing")
+
+        def watch():
+            # Give real small-repository checks a generous wall allowance.
+            # This is test cleanup, not the product's admission deadline.
+            if not stop.wait(45):
+                forced.set()
+                release()
+
+        thread = Thread(target=watch, daemon=True)
+        thread.start()
+        watchdogs.append(thread)
+        assert capacity.machine_runs(case.store, case.clock[0]) == 4
+
+    try:
+        exercise(case, after_all_ready)
+        stop.set()
+        assert not forced.is_set(), "The merge path needed an external slot release to escape its deadlock"
+        assert_merged(case)
+        assert git_command(case.history.origin, "show", "main:src/neighbor.py") == "VALUE = 'new main'"
+        assert all(busy.get_run(n).status == "running" for n in range(9101, 9105))
+        assert capacity.machine_runs(case.store, case.clock[0]) == 4, "Finished runners release all their capacity"
+        if maximum == 4:
+            groups = [pr for pr in case.tracker.created_prs if pr.head.startswith("foragent/group-")]
+            assert groups, "Actually exercise joint verification while holding the turn"
+            assert all(case.tracker.get_issue(pr.number).state == "closed" for pr in groups)
+    finally:
+        stop.set()
+        release()
+        for thread in watchdogs:
+            thread.join(timeout=2)
+    assert capacity.machine_runs(case.store, case.clock[0]) == 0

@@ -88,4 +88,5 @@ def _publish(ctx: RunContext, git, lane: str, memory: str, count: int,
             "is unchanged.\n\n"
             "Only the lane's memory directory changes. The orchestrator merges it when CI passes "
             "(skills/fa-orchestrator/references/dreams.md).")
-    return ctx.tracker.create_pr(head=branch, base=base, title=title, body=body)
+    from foragent.run_pr_body import compose
+    return ctx.tracker.create_pr(head=branch, base=base, title=title, body=compose([body]))

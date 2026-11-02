@@ -236,20 +236,36 @@ class IssueSnapshotMixin:
         """Record local fields. Issue facts among them are an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+            at = observed_at or self._now()
+            if _observations.tombstoned(snapshot, number, at):
                 return  # The issue was observed missing; a local change does not bring it back.
+            before, edges = _observations.history_baseline(snapshot), None
             row = self._local_issue(snapshot, number)
             facts = {key: fields.pop(key) for key in _observations.FACTS if key in fields}
+            # Without facts, edges are accepted by the same rule: never behind the stored observation.
+            seen = _observations.stamp(row.get("observed_at"))
+            accepted = seen is None or seen <= at
             if facts:
-                outcome = self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
-                                        observed_at or self._now(), None, by_person=False)
-                if outcome == "stale" and not fields:
+                accepted = self._observe(snapshot, number, {**_observations.observed_facts(row), **facts},
+                                         at, None, by_person=False) != "stale"
+                if not accepted and not fields:
                     return  # An older observation persists nothing.
                 row = self._local_issue(snapshot, number)
+            if "blocked_by" in fields:
+                if not accepted or _observations.edges_after(snapshot, number, at):
+                    del fields["blocked_by"]  # An older edge read replaces nothing, here or in the history.
+                    if not fields and not (facts and accepted):
+                        return
+                else:
+                    snapshot.setdefault("edges_at", {})[str(number)] = {
+                        "at": at.isoformat(), "revision": snapshot.get("revision", 0) + 1}
+                    edges = {number: fields["blocked_by"]}
             if any(row.get(key) != value for key, value in fields.items()):
                 _state._forget_reads(row)
             row.update(fields)
             self._save_local_issue(snapshot, row)
+            if accepted and (facts or edges):
+                self._record_issue_states(snapshot, before, at, {number}, edges=edges)
 
     def record_issue(self, issue: Any, lanes: dict, *, observed_at: datetime | None = None) -> None:
         """Record an issue as an observation at its time (default now)."""
@@ -261,18 +277,21 @@ class IssueSnapshotMixin:
         """A local label change, recorded as an observation at its time (default now)."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            if _observations.tombstoned(snapshot, number, observed_at or self._now()):
+            at = observed_at or self._now()
+            if _observations.tombstoned(snapshot, number, at):
                 return  # The issue was observed missing; a local change does not bring it back.
+            before = _observations.history_baseline(snapshot)
             row = self._local_issue(snapshot, number)
             changed = dict(row, labels=list(row["labels"]))
             self._record_labels(changed, labels, remove=remove, lanes=lanes, ready_approval=ready_approval)
-            if self._observe(snapshot, number, _observations.observed_facts(changed), observed_at or self._now(),
+            if self._observe(snapshot, number, _observations.observed_facts(changed), at,
                              lanes, by_person=False) == "stale":
                 return  # An older observation persists nothing, not even its ready approval.
             row = self._local_issue(snapshot, number)
             if "ready_approval" in changed:
                 row["ready_approval"] = changed["ready_approval"]
             self._save_local_issue(snapshot, row)
+            self._record_issue_states(snapshot, before, at, {number})
 
     def _record_labels(self, row: dict[str, Any], labels: list[str], *, remove: bool, lanes: dict,
                        ready_approval: Any = _observations._UNSET) -> None:

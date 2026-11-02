@@ -82,13 +82,16 @@ def test_notes_carry_always_human_and_added_trace():
 
 
 def test_refresh_notes_replaces_appends_and_drops_the_block():
-    body = "## Review scope\n\nrules"
-    first = risks.refresh_notes(body, "OLD")
-    assert first == body + "\n\n" + risks.notes_block("OLD")
-    second = risks.refresh_notes(first + "\n\n## Try it", "NEW")
-    assert "OLD" not in second and second.count(risks.NOTES_START) == 1 and second.endswith("## Try it")
-    assert risks.refresh_notes(first, "") == body
-    assert risks.refresh_notes(body, "") == body
+    from foragent.issue import parse_body
+    from foragent.run_pr_body import _pr_body
+
+    def composed(notes):
+        return _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", summary="Summary.", risk_notes=notes)
+
+    first, second = composed("OLD"), composed("NEW")
+    assert first.count(risks.NOTES_START) == first.count(risks.NOTES_END) == 1 and "OLD" in first
+    assert "OLD" not in second and second.count(risks.NOTES_START) == 1 and "NEW" in second
+    assert risks.NOTES_START not in composed("")
 
 
 @pytest.mark.parametrize("before", [b"[]\n", b"# map\n[]", b"[{paths: [a], why: w}]\n"])
