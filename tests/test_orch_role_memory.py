@@ -36,7 +36,9 @@ def case(git_history):
             paths = [path for path in args[args.index("--") + 1:] if not path.startswith(":!")]
             title = args[args.index("-m") + 1]
             parent = git_command(root, "rev-parse", "HEAD")
-            staged = git_command(root, "ls-files", "--stage", "-z", "--", *paths)
+            # Bytes, not text: text mode turns a "\r" inside a file name into "\n".
+            staged = subprocess.run(["git", "ls-files", "--stage", "-z", "--", *paths], cwd=root, check=True,
+                                    capture_output=True).stdout.decode()
             stream = ["commit refs/heads/main\n", "committer Tests <tests@example.com> 1793620800 +0000\n",
                       f"data {len(title.encode())}\n{title}\n", f"from {parent}\n"]
             stream += [f"D {json.dumps(path, ensure_ascii=False)}\n" for path in paths]
@@ -146,3 +148,16 @@ def test_a_tick_whose_base_fetch_fails_still_commits_role_memory_first(case, tmp
     case.offline.clear()
     assert "role memory published to main" in tick(context).actions
     assert origin_file(case, f"{FOLDER}/새-교훈.md") == b"Learned offline.\n"
+
+
+@pytest.mark.parametrize("name", ["carriage\rreturn.md", "line\nbreak.md", "tab\tand \"quote\".md"])
+def test_any_byte_in_a_memory_file_name_reaches_the_commit_and_the_retry(case, name):
+    path = f"{FOLDER}/{name}"
+    (case.root / path).write_text("A lesson with an unusual name.\n")
+    case.offline.append(True)
+    assert "delivery failed" in " ".join(publish(case))
+    assert head_file(case, path) == b"A lesson with an unusual name.\n"
+    case.offline.clear()
+    assert publish(case) == ["role memory published to main"]
+    assert origin_file(case, path) == b"A lesson with an unusual name.\n"
+    assert publish(case) == []

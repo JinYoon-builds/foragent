@@ -6,7 +6,8 @@ new files of every role's memory directory, ignored ones too, under the one main
 checkout cleanup cannot lose it. Delivery fetches, rebuilds the unpushed role-memory commits on
 a moved remote base (the way a note flush does) and pushes the base branch. A failed delivery
 keeps the local commit; the retry is derived from Git (local base ahead of origin by
-role-memory commits only), so no state is stored. Paths are read NUL-separated, never quoted.
+role-memory commits only), so no state is stored. No file name is parsed from Git output: Git
+receives the directories as arguments and answers with exit codes and commit IDs.
 Lane memory stays with the dream: a lane that shares a role's directory does not dream.
 """
 
@@ -31,47 +32,52 @@ def _directories(ctx: TickContext) -> dict[str, list[str]]:
     return dict(sorted(folders.items()))
 
 
-def _paths(output: str) -> list[str]:
-    """Paths from Git's ``-z`` output, byte-exact (no quoting of non-ASCII names)."""
-    return [path for path in output.split("\0") if path]
+def _differs(ctx: TickContext, *args: str) -> bool:
+    """Whether ``git diff --quiet <args>`` finds a change: its exit code, no path is read back."""
+    try:
+        ctx.git._call(["diff", "--quiet", *args])
+    except GitError as exc:
+        if getattr(exc.__cause__, "returncode", None) == 1:
+            return True
+        raise
+    return False
 
 
-def _within(path: str, folder: str) -> bool:
-    return path == folder or path.startswith(folder + "/")
-
-
-def _title(folders: dict[str, list[str]], paths: list[str]) -> str:
+def _title(ctx: TickContext, folders: dict[str, list[str]], *revisions: str) -> str:
+    """Name the roles whose directory ``git diff <revisions>`` changes."""
     roles = sorted({role for folder, names in folders.items()
-                    if any(_within(path, folder) for path in paths) for role in names})
+                    if _differs(ctx, *revisions, "--", folder) for role in names})
     return f"Foragent role memory: {', '.join(roles)}"
 
 
-def _unpushed(ctx: TickContext, base: str) -> list[str] | None:
-    """Paths the local base's unpushed commits change; None when origin's base is unknown."""
+def _owed(ctx: TickContext, base: str, folders: dict[str, list[str]]) -> bool:
+    """Whether local base holds unpushed commits, none of which changes anything outside role memory.
+
+    Git answers by pathspec and returns commit IDs only, so no file name is parsed here.
+    """
     remote = f"refs/remotes/origin/{base}"
     try:
         ctx.git._call(["rev-parse", "--verify", "--quiet", remote])
     except GitError:
-        return None
+        return False
     if not ctx.git._call(["rev-list", f"{remote}..HEAD"]).split():
-        return []
-    return _paths(ctx.git._call(["log", "-z", "--format=", "--name-only", f"{remote}..HEAD"]))
-
-
-def _owed(ctx: TickContext, base: str, folders: dict[str, list[str]]) -> bool:
-    """Whether local base holds unpushed commits that change only role memory."""
-    paths = _unpushed(ctx, base)
-    return bool(paths) and all(any(_within(path, folder) for folder in folders) for path in paths)
+        return False
+    outside = ctx.git._call(["log", "--format=%H", "--full-history", "-m", f"{remote}..HEAD", "--",
+                             ":(top)", *(f":(top,exclude,literal){folder}" for folder in folders)])
+    return not outside.split()
 
 
 def _commit(ctx: TickContext, folders: dict[str, list[str]]) -> bool:
-    """Commit the role memory changes locally; no remote is read before this."""
+    """Commit the role memory changes locally; no remote is read before this.
+
+    The directories themselves go to Git as separate arguments, so no file name inside them is
+    ever read back and re-sent: any byte a name holds reaches the commit unchanged.
+    """
     names = list(folders)
     ctx.git._call(["add", "-A", "-f", "--", *names])
-    paths = _paths(ctx.git._call(["diff", "-z", "--cached", "--name-only", "HEAD", "--", *names]))
-    if not paths:
+    if not _differs(ctx, "--cached", "HEAD", "--", *names):
         return False
-    ctx.git.commit_paths(paths, _title(folders, paths))
+    ctx.git.commit_paths(names, _title(ctx, folders, "--cached", "HEAD"))
     return True
 
 
@@ -79,14 +85,13 @@ def _rebuild(ctx: TickContext, base: str, folders: dict[str, list[str]]) -> None
     """Put the unpushed role-memory commits on origin's moved base, keeping staged and unstaged work."""
     remote = f"refs/remotes/origin/{base}"
     old = ctx.git._call(["rev-parse", "HEAD"]).strip()
-    paths = _unpushed(ctx, base) or []
+    title = _title(ctx, folders, f"{remote}...{old}")
     tree = ctx.git._call(["merge-tree", "--write-tree", remote, old]).splitlines()[0]
     identity = []
     for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
         value = ctx.git._call(["config", "--default", fallback, "--get", key]).strip()
         identity.extend(["-c", f"{key}={value or fallback}"])
-    new = ctx.git._call([*identity, "commit-tree", tree, "-p", remote, "-m",
-                         _title(folders, paths)]).strip()
+    new = ctx.git._call([*identity, "commit-tree", tree, "-p", remote, "-m", title]).strip()
     # Two-tree read-tree keeps staged and unstaged changes on paths the rebuild leaves alone.
     ctx.git._call(["read-tree", "-m", "-u", old, new])
     ctx.git._call(["update-ref", f"refs/heads/{base}", new, old])
@@ -111,8 +116,9 @@ def publish(ctx: TickContext, report: TickReport) -> None:
     try:
         if ctx.git._call(["symbolic-ref", "--quiet", "--short", "HEAD"]).strip() != base:
             return  # The checkout is on another branch; its base is published when it returns.
+        # Only emptiness is read: any entry, ignored files included, means work to commit.
         changed = bool(ctx.git._call(["status", "--porcelain", "-z", "--ignored", "--untracked-files=all",
-                                      "--", *folders]).strip("\0"))
+                                      "--", *folders]))
         if not changed and not _owed(ctx, base, folders):
             return
         with ctx.git.publish_lock():
