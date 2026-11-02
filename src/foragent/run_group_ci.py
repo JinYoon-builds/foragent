@@ -36,8 +36,9 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
         published = True  # Even a lost push response may have published the ref.
         ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:",
                        "origin", f"{combined}:refs/heads/{branch}"])
+        from foragent.run_pr_body import compose
         pr = ctx.tracker.create_pr(head=branch, base=target, title=f"Foragent group check: {n}",
-                                   body=f"Temporary acceptance comparison on {base_sha}.")
+                                   body=compose([f"Temporary acceptance comparison on {base_sha}."]))
         metadata["pr"] = pr
         with in_phase(n, ctx, "ci"):
             while True:

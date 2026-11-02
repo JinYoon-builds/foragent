@@ -4291,3 +4291,39 @@ def test_preread_proposal_reaches_the_implementer_of_an_edit_with_a_removal_reco
     recorded = order.order_done_when.with_record(head.removesuffix("\n"), None, [{"line": "old", "reason": "Why."}])
     assert _handover(root, 7, recorded + "\n<!-- foragent:plan-child" + marker, API_FILES) == _handover(root, 7, body, API_FILES)
     assert _handover(root, 7, body, API_FILES) is not None
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_preread_reader_gets_current_memory_while_only_lane_instructions_move_the_key(
+    publishing, plan, tmp_path, executor,
+):
+    repo = tmp_path / "repo"
+    agent = repo / ".claude/agents/fa-api.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules.\n")
+    memory = repo / ".claude/agent-memory/fa-api"
+    memory.mkdir(parents=True)
+    skill = repo / ".claude/skills/polish/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
+    config = replace(publishing[1], executor=executor,
+                     lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["polish"]}})
+    item = plan["issues"][0]
+
+    def target():
+        return order.preread_target(plan, item, config, repo)
+
+    (memory / "MEMORY.md").write_text("Curated before.\n")
+    _, prompt, digest = target()
+    assert "Curated before." in prompt
+    (memory / "MEMORY.md").write_text("Curated after.\n")
+    (memory / "MEMORY.new.md").write_text("- [id:after] Pending after.\n")
+    _, prompt, same = target()
+    assert "Curated after." in prompt and "Pending after." in prompt and "Curated before." not in prompt
+    assert same == digest
+
+    skill.write_text("---\nname: polish\ndescription: Polish every text\n---\nBody\n")
+    skilled = target()[2]
+    assert skilled != digest
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules changed.\n")
+    assert target()[2] not in (digest, skilled)

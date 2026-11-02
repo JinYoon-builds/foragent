@@ -930,15 +930,17 @@ def test_pr_head_launch_error_keeps_the_previously_saved_failures(run_case, monk
 
 
 def test_lane_decisions_block_is_appended_replaced_and_dropped_once():
-    from foragent.run_prompts import lane_decisions_section, refresh_lane_decisions
+    from foragent.issue import parse_body
+    from foragent.run_pr_body import _pr_body
+    from foragent.run_prompts import DECISIONS_START, lane_decisions_section
 
-    old, new = lane_decisions_section(["Old choice."]), lane_decisions_section(["New choice."])
-    body = refresh_lane_decisions("Closes #1", old)
-    assert body.startswith("Closes #1\n\n") and body.count("- Old choice.") == 1
-    replaced = refresh_lane_decisions(body + "\n\nTail.", new)
-    assert "Old choice." not in replaced and replaced.count("- New choice.") == 1 and replaced.endswith("Tail.")
-    assert refresh_lane_decisions(replaced, new) == replaced
-    assert refresh_lane_decisions(body, "") == "Closes #1"
+    def composed(section):
+        return _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", summary="Summary.", lane_decisions=section)
+
+    old, new = composed(lane_decisions_section(["Old choice."])), composed(lane_decisions_section(["New choice."]))
+    assert old.count("- Old choice.") == 1 and old.count(DECISIONS_START) == 1
+    assert "Old choice." not in new and new.count("- New choice.") == 1 and new.count(DECISIONS_START) == 1
+    assert DECISIONS_START not in composed("")
 
 
 def _native_pr_reviewer(c, seen):
@@ -966,7 +968,8 @@ def test_pr_body_review_receives_the_lanes_decide_lines(run_case, monkeypatch):
 
 def test_pr_body_re_review_refreshes_the_lanes_decide_lines(run_case, monkeypatch):
     from foragent import run_review
-    from foragent.run_prompts import lane_decisions_section, refresh_lane_decisions
+    from foragent.run_pr_body import save_values
+    from foragent.run_prompts import lane_decisions_section
     from foragent.runner import review_only
 
     c = run_case
@@ -976,8 +979,9 @@ def test_pr_body_re_review_refreshes_the_lanes_decide_lines(run_case, monkeypatc
     base = c.history.tip
     c.history.update({"feature.txt": "done"})
     head = c.history.tip
-    old = refresh_lane_decisions("Review", lane_decisions_section(["Obsolete choice."]))
-    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body=old)
+    save_values(1, c.ctx, {"summary": "Summary.", "checks": [], "attempt": 1, "reviews": [],
+                           "lane_decisions": lane_decisions_section(["Obsolete choice."])})
+    pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing PR", body="Old body")
     c.tracker.set_pr_head_sha(pr, head)
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", head)
     git_command(c.history.origin, "update-ref", "refs/heads/main", base)
