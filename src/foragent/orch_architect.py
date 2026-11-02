@@ -1,8 +1,8 @@
 """Standing-role sessions the orchestrator starts with `fa orch role <name> --why`.
 
-`fa orch architect --why` is the architect instance of the same command. Only that
-command starts a role session; no tick, merge or schedule does. The command is the
-only writer of ``<state>/<name>.json`` (pid, process start time, started_at, why)
+`fa orch architect --why` is the architect instance of the same command. A tick also
+calls it when an order finishes (``orch_role_schedule``, D99); no other path starts a role
+session. ``call`` is the only writer of ``<state>/<name>.json`` (pid, process start time, started_at, why)
 and of the ``<name>-call`` event. The session itself, started as the hidden
 ``fa gate run-architect --role <name>``, is the only writer of its ``<name>-done``
 event. Roles never message a person: proposals reach the orchestrator through
@@ -251,9 +251,11 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
     finally:
         first = message.splitlines()[0][:200] if message else ""
         try:
+            # A success covers the input from before the session started; arrivals during it stay due.
             append_event(store, now(), None, f"{role}-done",
                          f"exit code {code}" + (f": {first}" if first else ""),
-                         started_at=started_at, exit_code=code, message=message)
+                         started_at=started_at, exit_code=code, message=message,
+                         **({"covered_until": started_at} if code == 0 else {}))
         finally:
             record = read_record(store, role)
             if record is not None and record.get("started_at") == started_at:
