@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
+from foragent import order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -350,7 +351,7 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references", "statements", "decisions"} if kind == "issues"
+                                     "references", "statements", "decisions", "replaces"} if kind == "issues"
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
                           "statements", "decisions", "done_when_removals"}, label)
             if "done_when_removals" in item:
@@ -373,6 +374,10 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
             if kind == "issues":
+                try:
+                    order_replaces.validate(item, label, config.language)
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
                 if type(item.get("interactive", False)) is not bool:
                     raise PlanError(f"{label}.interactive must be a boolean")
                 _text(item["key"], f"{label}.key")
@@ -484,6 +489,7 @@ class PublishReport:
     affected: dict[int, list[str]] = field(default_factory=dict)
     language: str = "en"
     waiting_for: str | None = None
+    closures: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.waiting_for is not None:
@@ -491,6 +497,7 @@ class PublishReport:
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
+        lines.extend(self.closures)
         lines.append("Files: " + ", ".join(self.paths))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
@@ -682,6 +689,7 @@ class _Publication:
     rows: list[dict]
     owner: str | None
     reviewed_bases: dict[str, dict]
+    closures: dict[int, list[str]] = field(default_factory=dict)
 
     @property
     def own(self) -> set[int]:
@@ -802,16 +810,20 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
+    try:
+        closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None, {})
+                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures)
     if landed:
         # A resumed batch commit passed the gates below before its intent was recorded, and later
         # commits (its own too) must not reopen them: only its issue effects remain.
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows,
                             _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
-                                         [by_number[n] for n in mapping.values()]), {})
+                                         [by_number[n] for n in mapping.values()]), {}, closures)
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)
@@ -841,7 +853,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -858,7 +870,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                 repo, config, lambda: git or GitRepo(root), fetch=True)
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
-                             sorted(publication.files), True, affected=affected, language=config.language)
+                             sorted(publication.files), True, affected=affected, language=config.language,
+                             closures=order_replaces.preview(publication.closures, config.language))
     if affected:
         raise PlanError(text("order_locks_refused", config.language, owners="\n".join(_owner_lines(affected))))
     if waiting:
@@ -1036,6 +1049,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
+    order_replaces.close_replaced(plan, publication.closures, tracker, mapping, approved_numbers, config.language)
     if approved_numbers:
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
