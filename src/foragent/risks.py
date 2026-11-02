@@ -103,19 +103,6 @@ def review_notes(matched: list[dict[str, Any]], paths: list[str]) -> str:
 NOTES_START, NOTES_END = "<!-- foragent:risk-notes -->", "<!-- /foragent:risk-notes -->"
 
 
-def notes_block(notes: str) -> str:
-    return f"{NOTES_START}\n{notes}\n{NOTES_END}" if notes else ""
-
-
-def refresh_notes(body: str, notes: str) -> str:
-    """Replace the PR body's risk-notes block with current notes (append, or drop when none)."""
-    block = notes_block(notes)
-    pattern = re.compile(rf"(?:\n\n)?{re.escape(NOTES_START)}.*?{re.escape(NOTES_END)}", re.S)
-    if pattern.search(body):
-        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
-    return f"{body}\n\n{block}" if block else body
-
-
 def review_options(config: Config, reviewer: str, model: str | None) -> dict[str, Any]:
     """Matched reviews run at tier l: effort for Codex, the tier model for Claude."""
     tier = config.tiers["l"]
