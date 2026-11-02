@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,6 +40,28 @@ def _preserve_failed_implementation(
             pushed_head=pushed_head, tracker_available=tracker_available, push_branch=push_branch,
             owned_deletions=owned_deletions or push_branch is not None,
         )
+
+
+def record_wip_locks(store, n: int, commit: str, locks: dict[str, str]) -> None:
+    """Append which approved lock bytes a WIP commit carries. The runner is this file's only writer."""
+    path = store.root / "wip-locks" / f"{n}.jsonl"
+    with store._state_lock():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"commit": commit, "locks": locks}, sort_keys=True) + "\n")
+
+
+def wip_locks(store, n: int) -> dict[str, dict[str, str]]:
+    """The approved lock bytes of each WIP commit this runner saved for issue ``n``."""
+    try:
+        lines = (store.root / "wip-locks" / f"{n}.jsonl").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for line in filter(None, lines):
+        entry = json.loads(line)
+        records[entry["commit"]] = entry["locks"]
+    return records
 
 
 def _check_wip_deletions(ctx: FlagContext, git: GitRepo, run: Run | None) -> list[str]:
@@ -82,6 +106,8 @@ def _preserve_locked_implementation(
     refused = [] if owned_deletions else run_publish._check_wip_deletions(ctx, git, run)
     if git.has_staged_changes():
         git.commit(f"WIP: {title or 'Issue'} (#{n}) [{reason}]")
+        if approval is not None:  # The locks above came from the verified approved_ref, not from the branch.
+            record_wip_locks(ctx.store, n, git.head_sha(), git.blob_shas("HEAD", approval.acceptance_blobs))
     if refused:
         detail = "WIP preservation refused: deletions outside allowed paths: " + ", ".join(map(repr, refused[:10]))
         run_publish._append(ctx.store.log_path(n), detail)
