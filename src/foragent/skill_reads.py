@@ -10,7 +10,7 @@ counts are evidence, not security. This module is the only writer of ``Run.skill
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-import re
+import posixpath
 import shlex
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -20,17 +20,36 @@ from foragent.executors import _events
 if TYPE_CHECKING:
     from foragent.state import StateStore
 
-_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+# A skill folder name is any name a shell would not expand: no glob, variable or home marks.
+_EXPANDS = frozenset("*?[]{}$`~\\")
 # Each plain reader's flags, then its options that take a value.
-_OPTIONS = {"cat": ("benstuvAET", ""), "head": ("qv", "nc"), "tail": ("qvr", "nc"),
-            "sed": ("nEr", "ef"), "nl": ("p", "bdfhilnsvw")}
+# Short and long options of GNU and BSD alike; `sed -i`/`-I` edit, so they are absent.
+_OPTIONS = {"cat": ("AbeEnstTuvl", ""), "head": ("qvz", "nc"), "tail": ("fFqvzr", "ncbs"),
+            "sed": ("nErsuzla", "ef"), "nl": ("p", "bdfhilnsvw")}
+_LONG = {
+    "cat": ({"show-all", "number-nonblank", "show-ends", "number", "squeeze-blank", "show-tabs",
+             "show-nonprinting"}, set()),
+    "head": ({"quiet", "silent", "verbose", "zero-terminated"}, {"lines", "bytes"}),
+    "tail": ({"quiet", "silent", "verbose", "zero-terminated", "follow", "retry"},
+             {"lines", "bytes", "sleep-interval", "pid", "max-unchanged-stats"}),
+    "sed": ({"quiet", "silent", "regexp-extended", "separate", "unbuffered", "null-data", "posix", "debug",
+             "sandbox", "follow-symlinks"}, {"expression", "file", "line-length"}),
+    "nl": ({"no-renumber"}, {"body-numbering", "section-delimiter", "footer-numbering", "header-numbering",
+                             "line-increment", "join-blank-lines", "number-format", "number-separator",
+                             "starting-line-number", "number-width"}),
+}
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
 
 
 def _skill_name(path: str) -> str | None:
-    """The folder of ``.../skills/<name>/SKILL.md``; another file, a glob or a variable is no skill."""
-    parts = PurePosixPath(path).parts
-    if len(parts) >= 3 and parts[-1] == "SKILL.md" and parts[-3] == "skills" and _NAME.fullmatch(parts[-2]):
+    """The folder of ``.../skills/<name>/SKILL.md``; another file, a glob or a variable is no skill.
+
+    The path is first resolved as written (`.` and `..` steps), as the reader resolved it.
+    """
+    if not path or _EXPANDS.intersection(path):
+        return None
+    parts = PurePosixPath(posixpath.normpath(path)).parts
+    if len(parts) >= 3 and parts[-1] == "SKILL.md" and parts[-3] == "skills" and parts[-2] not in {".", ".."}:
         return parts[-2]
     return None
 
@@ -72,7 +91,14 @@ def _files(program: str, words: list[str]) -> list[str]:
         elif word == "--":
             only_files = True
         elif word.startswith("--"):
-            return []
+            name, separator, _ = word[2:].partition("=")
+            flags, takes_value = _LONG[program]
+            if name in takes_value:
+                if not separator:
+                    next(arguments, None)  # The value is the next word.
+                scripts += program == "sed" and name in {"expression", "file"}
+            elif name not in flags or separator:
+                return []
         elif program in {"head", "tail"} and word[1:].isdigit():
             continue
         else:

@@ -33,6 +33,17 @@ def codex_call(command, code=0, status="completed"):
 @pytest.mark.parametrize("command,expected", [
     # Plain read commands of a SKILL.md, as Codex runs them and as written by hand.
     (f"cat '{SKILL}'", ["tone"]),
+    # Paths are resolved as written; any folder name a shell leaves alone is a skill name.
+    ("cat /lib/skills/tone/../tone/SKILL.md", ["tone"]),
+    ("cat /lib/skills/./tone//SKILL.md", ["tone"]),
+    ("cat ./skills/tone/SKILL.md", ["tone"]),
+    ("cat /lib/skills/-tone/SKILL.md", ["-tone"]),
+    ("cat /lib/skills/.tone/SKILL.md", [".tone"]),
+    ("cat '/lib/skills/my tone/SKILL.md'", ["my tone"]),
+    ("cat /lib/skills/tön/SKILL.md", ["tön"]),
+    ("cat /lib/skills/tone/./SKILL.md", ["tone"]),
+    ("cat /lib/skills/../SKILL.md", []),
+    ("cat '~/skills/tone/SKILL.md'", []),
     (f"/bin/zsh -lc \"cat '{SKILL}'\"", ["tone"]),
     (f"bash -lc \"sed -n '1,200p' {SKILL}\"", ["tone"]),
     (f"head -n 80 {SKILL}", ["tone"]),
@@ -50,6 +61,21 @@ def codex_call(command, code=0, status="completed"):
     (f"cat -- {SKILL}", ["tone"]),
     (f"cat --help {SKILL}", []),
     (f"less {SKILL}", []),
+    # GNU and BSD options of ordinary reads still count.
+    (f"sed -l -n '1,80p' {SKILL}", ["tone"]),
+    (f"sed -u -s -n 1,80p {SKILL}", ["tone"]),
+    (f"sed --quiet -e 1,80p {SKILL}", ["tone"]),
+    (f"sed -n --expression=1,80p {SKILL}", ["tone"]),
+    (f"sed -n --expression /missing/skills/phantom/SKILL.md {SKILL}", ["tone"]),
+    (f"head --lines=80 {SKILL}", ["tone"]),
+    (f"head --lines 80 {SKILL}", ["tone"]),
+    (f"tail -n +1 -q {SKILL}", ["tone"]),
+    (f"cat --number -A {SKILL}", ["tone"]),
+    (f"nl --body-numbering=a {SKILL}", ["tone"]),
+    (f"sed --in-place s/a/b/ {SKILL}", []),
+    (f"sed -I '' s/a/b/ {SKILL}", []),
+    (f"head --help {SKILL}", []),
+    (f"cat --number=3 {SKILL}", []),
     (f"cat -Z {SKILL}", []),
     (f"sed -i.bak 1d {SKILL}", []),
     (f"sed -n 1p '' {SKILL}", ["tone"]),
@@ -123,3 +149,12 @@ def test_record_adds_to_earlier_attempts_and_says_nothing_without_reads(tmp_path
     record(store, 1, write_log(tmp_path / "two", codex_call("cat /lib/skills/voice/SKILL.md"), codex_call(f"cat {SKILL}")), 0)
     run = store.get_run(1)
     assert run.skills_reported and run.skills_used == ["tone", "voice"]
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/lib/skills/tone/../tone/SKILL.md", ["tone"]),
+    ("/lib/skills/-tone/SKILL.md", ["-tone"]),
+    ("/lib/skills/tone/../SKILL.md", []),
+])
+def test_claude_read_paths_resolve_as_written(tmp_path, path, expected):
+    assert skills_read(write_log(tmp_path / "log", *claude_call("Read", {"file_path": path}))) == expected

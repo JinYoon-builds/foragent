@@ -119,45 +119,72 @@ def _license(skill: Path, library: Path, *, nearest: bool = False, walk: bool = 
     return next((identity for identity, expected in standards.items() if normalized == expected), "unknown"), license_file
 
 
-# A copyright notice alone: a year (or the template's placeholder) and a holder, with no second
-# sentence after it. Anything further on that line stays in the text and must match a standard.
-_COPYRIGHT_ONLY = re.compile(
-    r"^[ \t]*Copyright[ \t]+(?:\(c\)[ \t]*|©[ \t]*)?"
-    r"(?:\d{4}(?:[ \t]*[-,][ \t]*\d{4})*|<year>|\[yyyy\])[^.\r\n]*\.?[ \t]*$",
-    re.I | re.M,
+# The one line a copy may change: `Copyright (c) <year> <name>`. A name is words joined by spaces or
+# commas, with dots only inside a word (`Apollo.io`) or at the very end; `;`, `:` or a sentence break fail.
+# Each word of a name starts with a capital or a digit, so lower-case wording cannot pass as a name;
+# brackets, `;` and `:` are never part of one.
+_NAME_WORD = r"[A-Z0-9][\w&'\-]*(?:\.[\w&'\-]+)*"
+_COPYRIGHT_LINE = re.compile(
+    r"Copyright (?:\([cC]\) |© )?\d{4}(?: ?[-,] ?(?:\d{4})?)*,? "
+    rf"{_NAME_WORD}(?:,? {_NAME_WORD})*\.?"
 )
 
 
-def _bare_license(text: str) -> str:
-    """License text without copyright notices, for a whole-text comparison that keeps every other word."""
-    return " ".join(_COPYRIGHT_ONLY.sub("", text).split())
+def _collapsed(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _permissive(text: str) -> str:
+    """The open-source license a whole LICENSE text is, else "unknown"; nothing is erased first.
+
+    Either the text is one `SPDX-License-Identifier: <id>` line, or its whitespace-collapsed text
+    equals a known original's, except that the original's copyright template line may hold one
+    real notice (`_COPYRIGHT_LINE`). Any other added or missing word fails.
+    """
+    whole = _collapsed(text)
+    if spdx := re.fullmatch(r"SPDX-License-Identifier: (\S+)", whole):
+        return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == spdx[1].casefold()), "unknown")
+    for identity, standard in STANDARD_LICENSES.items():
+        if whole == _collapsed(standard):
+            return identity
+        lines = standard.splitlines()
+        template = next((n for n, line in enumerate(lines) if re.search(r"<year>|\[yyyy\]", line)), None)
+        if template is None:
+            continue
+        before, after = _collapsed("\n".join(lines[:template])), _collapsed("\n".join(lines[template + 1:]))
+        if not (whole.startswith(before) and whole.endswith(after) and len(whole) > len(before) + len(after)):
+            continue
+        notice = whole[len(before):len(whole) - len(after)].strip()
+        # One line of the copy: the notice may not be stitched together from several lines.
+        if _COPYRIGHT_LINE.fullmatch(notice) and any(_collapsed(line) == notice for line in text.splitlines()):
+            return identity
+    return "unknown"
+
+
+_LICENSE_FILE = re.compile(r"(?:licen[cs]e|copying)", re.I)
 
 
 def redistributable_license(directory: Path, base: Path) -> tuple[str, Path | None]:
-    """The closest LICENSE over ``directory`` (up to ``base``), judged for default use.
+    """The license over ``directory``, judged for default use by `_permissive`.
 
-    Only a whole standard text, or SPDX lines with nothing else or with exactly that
-    standard text, names the license. Any added wording may restrict it, so it is "unknown".
+    The closest folder, from ``directory`` up to ``base``, that holds any license file decides:
+    every file there named LICENSE*, LICENCE* or COPYING* (LICENSE.md included) must be permissive.
     """
-    _, found = _license(directory, base, walk=True)
-    if found is None:
-        return "unknown", None
-    try:
-        text = found.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return "unknown", found
-    pattern = r"^[ \t]*(?:(?:#|//|/\*|\*)[ \t]*)?SPDX-License-Identifier:[ \t]*([^\r\n]*)"
-    declared = {value.strip().removesuffix("*/").strip().casefold() for value in re.findall(pattern, text, re.M)}
-    body = _bare_license(re.sub(pattern, "", text, flags=re.M))
-    standards = {identity: _bare_license(standard) for identity, standard in STANDARD_LICENSES.items()}
-    if not declared:
-        return next((identity for identity, expected in standards.items() if body == expected), "unknown"), found
-    if len(declared) != 1:
-        return "unknown", found
-    identity = next((known for known in OPEN_SOURCE_LICENSES if known.casefold() in declared), None)
-    if identity is None or (body and body != standards.get(identity)):
-        return "unknown", found
-    return identity, found
+    for folder in (directory, *(parent for parent in directory.parents if parent.is_relative_to(base))):
+        try:
+            found = sorted(path for path in folder.iterdir() if path.is_file() and _LICENSE_FILE.match(path.name))
+        except OSError:
+            return "unknown", None
+        if not found:
+            continue
+        verdicts = []
+        for path in found:
+            try:
+                verdicts.append((_permissive(path.read_text(encoding="utf-8")), path))
+            except (OSError, UnicodeError):
+                verdicts.append(("unknown", path))
+        return next((verdict for verdict in verdicts if verdict[0] not in OPEN_SOURCE_LICENSES), verdicts[0])
+    return "unknown", None
 
 
 def reached_through_symlink(path: Path) -> bool:

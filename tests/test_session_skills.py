@@ -308,6 +308,23 @@ RESTRICTED_TEXTS = {
     "copyright-then-ban": "SPDX-License-Identifier: MIT\nCopyright 2026 X. Redistribution is prohibited.\n",
     "standard-copyright-then-ban": STANDARD_LICENSES["MIT"].replace(
         "<year> <copyright holders>", "2026 X. Redistribution is prohibited"),
+    "spdx-copyright-semicolon": "SPDX-License-Identifier: MIT\nCopyright 2026 Example; redistribution is prohibited\n",
+    "standard-copyright-semicolon": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example; redistribution is prohibited"),
+    "standard-copyright-colon": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example: no redistribution"),
+    "spdx-then-standard": "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    "spdx-then-copyright": "SPDX-License-Identifier: MIT\nCopyright 2026 Example Inc.\n",
+    "heading-variant": STANDARD_LICENSES["MIT"].replace("MIT License", "The MIT License (MIT)", 1),
+    "missing-words": STANDARD_LICENSES["MIT"].replace("free of charge, ", ""),
+    "two-notices": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example\nCopyright 2026 Other"),
+    "name-in-brackets": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example (Redistribution prohibited)"),
+    "name-lower-case-words": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example, redistribution prohibited"),
+    "name-then-comma-words": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example, no copies"),
 }
 
 
@@ -334,11 +351,15 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
 
 
 @pytest.mark.parametrize("text", [
-    STANDARD_LICENSES["MIT"], "SPDX-License-Identifier: MIT\n",
-    "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    STANDARD_LICENSES["MIT"], "SPDX-License-Identifier: MIT\n", "  SPDX-License-Identifier:   mit  \n",
     STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2024-2026 Anthropic, PBC"),
-    "SPDX-License-Identifier: MIT\nCopyright 2026 Example Inc.\n",
+    STANDARD_LICENSES["MIT"].replace("Copyright (c) <year> <copyright holders>", "Copyright 2026 Anthropic, PBC."),
+    STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2025 Apollo.io"),
+    STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2020- Slack Technologies, LLC"),
+    STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2025 Zoom Video Communications, Inc."),
+    " ".join(STANDARD_LICENSES["MIT"].split()),  # Rewrapped: only whitespace differs.
     STANDARD_LICENSES["ISC"].replace("<year> <owner>", "2026 Example"),
+    STANDARD_LICENSES["Apache-2.0"],
 ])
 def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
     root = tmp_path / "root"
@@ -392,3 +413,40 @@ def test_a_linked_project_or_checkout_never_offers_its_copies_as_defaults(tmp_pa
     root, worktree = (other, base) if linked == "checkout" else (base, other)
     config = Config(skill_libraries=[], default_skills={"docs": ["local"]})
     assert "- local: not available here" in section(config, "docs", root, worktree)
+
+
+@pytest.mark.parametrize("name", ["LICENSE.md", "LICENCE", "COPYING", "license.txt", "LICENSE-THIRD-PARTY"])
+@pytest.mark.parametrize("where", ["checkout", "project-installed", "library"])
+def test_any_license_file_beside_the_skill_decides_before_a_parent_license(tmp_path, name, where):
+    root, worktree, library = tmp_path / "root", tmp_path / "worktree", tmp_path / "library"
+    root.mkdir()
+    restricted = "This skill is source-available. Redistribution is prohibited.\n"
+    entry = {"name": "lib", "repo": "unused", "path": str(library), "revision": "pinned", "skills": ["beside"]}
+    if where == "library":
+        (library / "skills/beside").mkdir(parents=True)
+        (library / "skills/beside/SKILL.md").write_text("---\nname: beside\ndescription: About it\n---\nBody\n")
+        (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+        folder = library / "skills/beside"
+    else:
+        base = worktree if where == "checkout" else root
+        write_skill(base / ".claude", "beside", license=None)
+        (base / ".claude/skills/LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+        folder = base / ".claude/skills/beside"
+    (folder / name).write_text(restricted)
+    config = Config(skill_libraries=[entry] if where == "library" else [], default_skills={"docs": ["beside"]})
+    assert "- beside: not available here" in section(config, "docs", root, worktree)
+    if where != "checkout":
+        with pytest.raises(SkillError, match="beside.*license"):
+            SkillManager(config).check_default("beside", root)
+    (folder / name).write_text("SPDX-License-Identifier: MIT\n")  # The same file, permissive: it may.
+    assert "beside/SKILL.md" in section(config, "docs", root, worktree)
+
+
+def test_every_license_file_in_the_closest_folder_must_be_permissive(tmp_path):
+    root = tmp_path / "root"
+    write_skill(root / ".claude", "dual")  # LICENSE: MIT.
+    (root / ".claude/skills/dual/LICENSE-APACHE").write_text(STANDARD_LICENSES["Apache-2.0"])
+    config = Config(skill_libraries=[], default_skills={"docs": ["dual"]})
+    assert ".claude/skills/dual/SKILL.md" in section(config, "docs", root)
+    (root / ".claude/skills/dual/LICENSE-EXTRA").write_text("No redistribution.\n")
+    assert "- dual: not available here" in section(config, "docs", root)
