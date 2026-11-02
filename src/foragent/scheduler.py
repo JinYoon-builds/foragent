@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -85,7 +85,7 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
@@ -285,6 +285,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     raise
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
+        scheduler_flow.considered(ctx, ready)
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
@@ -294,6 +295,8 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
     timed("order_finish_check", orch_role_schedule.observe, ctx)  # Facts only; a no-start tick records them too.
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        scheduler_flow.hold(ctx, (number for numbers in ready.values() for number in numbers),
+                            "outside-run-hours" if ctx.start_runs else "starts-off")
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
