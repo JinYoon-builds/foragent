@@ -7,7 +7,7 @@ about credits or spending; those are asked just in time elsewhere.
 
 Order:
 
-1. Ask merge mode: batch (recommended), fast or careful.
+1. Ask merge mode: fast (recommended) or careful.
 2. Run `fa init --review <mode>`. Leave `--executor` off so the config default applies, and never
    pass `--claude-quota`: the quota answer belongs to the person's own `me` scope, not to git.
 3. Only if Claude is available, ask quota mode: keep (recommended) or burn. Claude is available when
