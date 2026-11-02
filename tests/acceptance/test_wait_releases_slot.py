@@ -1,8 +1,9 @@
 """Locked acceptance for wait-releases-slot; do not edit during implementation.
 
 Reject counting idle live runners as machine load, releasing active work,
-resuming work before reacquiring a full budget, and keeping separate occupancy
-rules in admission, facts and historical scorecards. Only external Git, tracker,
+resuming nonholder work before admission, and keeping separate occupancy rules
+in admission, facts and historical scorecards. Turn owners must progress while
+counting their local work, without machine-budget waiting. Only external Git, tracker,
 executor, clock and sensor fakes are used; production admission stays real.
 """
 
@@ -138,7 +139,7 @@ def test_live_workload_still_counts_when_its_parent_run_is_waiting(tmp_path, mon
 def test_returning_waiter_queues_before_work_and_counts_after_slot_opens(
     git_history, tmp_path, monkeypatch, offline_acceptance, source, work,
 ):
-    """Reject phase-only filtering, checks-only reacquisition, conflict/retry bypasses, and leaked slots."""
+    """Turn holders progress; nonholders still reacquire before work; neither leaks capacity."""
     from foragent import run_merge_turn
 
     git_history.update({"src/work.py": "VALUE = 'base'\n"})
@@ -155,12 +156,18 @@ def test_returning_waiter_queues_before_work_and_counts_after_slot_opens(
     other = StateStore(case.store.root.parent / "other", now=case.ctx.now)
     armed, released, queued, effects = [], [], [], []
     initial_sleep = case.ctx.sleep
+    holder_work = source in {"ci", "turn"} and work != "retry"
 
     def assert_admitted(effect):
         if not armed:
             return
-        assert released, f"Resumed {effect} while another repository filled the machine budget"
-        assert capacity.machine_runs(case.store, case.ctx.now()) == 1, "Returning work counts again exactly once"
+        if holder_work:
+            assert run_merge_turn.holds_turn(case.store, run_merge_turn.seat(case.ctx, 1, "main"))
+            assert not released and not queued, "A turn holder must proceed without machine admission waiting"
+            assert capacity.machine_runs(case.store, case.ctx.now()) == 2, "Count the holder's local work exactly once"
+        else:
+            assert released, f"Resumed {effect} while another repository filled the machine budget"
+            assert capacity.machine_runs(case.store, case.ctx.now()) == 1, "Returning work counts again exactly once"
         assert case.store.get_run(1).phase not in WAITS, "Active work cannot retain an idle phase"
         effects.append(effect)
 
@@ -228,6 +235,7 @@ def test_returning_waiter_queues_before_work_and_counts_after_slot_opens(
             other.update_run(101, phase="implementing")
             armed.append(True)
         elif not released:
+            assert not holder_work, "Machine capacity must never block a run holding the merge turn"
             assert effects == [], "No resumed work may run before admission"
             assert capacity.machine_runs(case.store, case.ctx.now()) == 1, "Queued returner must not overshoot"
             queued.append(True)
@@ -253,7 +261,12 @@ def test_returning_waiter_queues_before_work_and_counts_after_slot_opens(
     monkeypatch.setattr(case.tracker, "pr_checks", ci)
     outcome = runner.run_issue(1, case.ctx)
     assert outcome == "merged", case.store.log_path(1).read_text()
-    assert armed and queued and released and effects, "Exercise wait, full-budget queue and resumed work"
+    assert armed and effects, "Exercise full-budget return and real local work"
+    if holder_work:
+        assert not queued and not released
+        other.finish_run(101, outcome="merged")
+    else:
+        assert queued and released, "A nonholder must still wait for admission"
     if work in {"conflict", "retry"}:
         assert len(case.implementer.calls) == 2, "Actually execute the new worker turn"
     assert capacity.machine_runs(case.store, case.ctx.now()) == 0, "Finishing releases the reacquired slot"
