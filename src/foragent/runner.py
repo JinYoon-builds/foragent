@@ -30,7 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
-from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
+from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -131,7 +131,6 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_publish_preserve import wip_locks
 from foragent.run_review import _review_implementation
 
 
@@ -197,13 +196,16 @@ def _restore_approved_base(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
     *, branch: str,
 ) -> bool:
-    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    """Bring the saved branch onto the approved base, then require the approved locked bytes.
+
+    After the base merge, a locked file that still differs from approval (or conflicts) can
+    only be the branch's own edit, so no history needs tracing: a WIP commit that saved an
+    earlier base merge as an ordinary commit merges cleanly and takes the approved bytes.
+    """
     locks = approval.acceptance_blobs
     if git.blob_shas("HEAD", locks) == locks:
         return True
     base = f"origin/{ctx.config.base_branch}"
-    if _own_lock_edits(git, locks, base, f"origin/{target_branch}", wip_locks(ctx.store, n)):
-        return _acceptance_matches(n, ctx, git, approval)
     if git.is_ancestor("HEAD", base):
         # No own commits: recreate at the approved base without a merge commit.
         ctx.git.remove_worktree(git.root)
@@ -215,54 +217,24 @@ def _restore_approved_base(
         conflicts = git.conflict_paths()
         if not conflicts:
             raise
+        if _staged_blobs(git, locks) != locks:
+            return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
         # Resume's resolver can finish this merge, including a stale batch's base update.
         pending = ctx.store.get_run(n).merge_conflicts
         ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    # A clean merge leaves only the branch's own lock edits; the check before implementation rejects them.
     return True
 
 
-def _own_lock_edits(
-    git: GitRepo, locks: dict[str, str], base: str, target: str, recorded: dict[str, dict[str, str]],
-) -> bool:
-    """A lock the branch touched is its own edit unless a fact outside the branch explains it.
-
-    A saved WIP commit can carry an earlier base merge as an ordinary commit, so ancestry
-    alone would blame inherited history on the branch. Bytes are no proof of origin, and
-    neither is anything the branch can write (messages, crafted merges). Two facts count:
-    the runner's own record of the approved bytes it saved in a WIP commit, and a merge
-    whose 3-way result took the upstream side while the branch side was unchanged.
-    """
-    # Walk the branch's own line commit by commit: path-limited history simplification hides a
-    # merge whose tree equals an upstream parent, and that hiding is decided by branch content.
-    line = git._call(["rev-list", "--first-parent", "--parents", "HEAD", f"^{target}", f"^{base}"]).splitlines()
-    for path in locks:  # Equal bytes prove nothing either: every branch change needs a fact.
-        for entry in line:
-            commit, *parents = entry.split()
-            blob = git.blob_shas(commit, [path])[path]
-            if parents and blob == git.blob_shas(parents[0], [path])[path]:
-                continue
-            if not _inherited_at(git, commit, path, blob, (base, target), recorded):
-                return True
-    return False
-
-
-def _inherited_at(
-    git: GitRepo, commit: str, path: str, blob: str, upstream: tuple[str, ...], recorded: dict[str, dict[str, str]],
-) -> bool:
-    parents = git._call(["rev-list", "--parents", "-n", "1", commit]).split()[1:]
-    if len(parents) < 2:  # A plain commit: only the runner's own WIP record explains it.
-        return recorded.get(commit, {}).get(path) == blob
-    branch_side = parents[0]
-    for parent in parents[1:]:
-        if git.blob_shas(parent, [path])[path] != blob or not any(git.is_ancestor(parent, ref) for ref in upstream):
-            continue
-        try:
-            merge_base = git._call(["merge-base", branch_side, parent]).strip()
-        except GitError:
-            continue  # Unknown history counts as an own edit.
-        if git.blob_shas(branch_side, [path])[path] == git.blob_shas(merge_base, [path])[path] != blob:
-            return True  # Git's own 3-way rule: the branch kept the shared version, upstream changed it.
-    return False
+def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
+    """Index blob of each path: ABSENT_BLOB when missing, None while it is still conflicted."""
+    staged: dict[str, str | None] = {path: ABSENT_BLOB for path in paths}
+    output = git._call(["--literal-pathspecs", "ls-files", "-s", "-z", "--", *paths])
+    for entry in filter(None, output.split("\0")):
+        meta, path = entry.split("\t", 1)
+        _mode, sha, stage = meta.split()
+        staged[path] = sha if stage == "0" else None
+    return staged
 
 
 def _implement_and_publish(
