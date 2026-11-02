@@ -243,7 +243,7 @@ def _ensure(repo_root: Path, store: StateStore, config: Config, now: datetime,
             return None
         reason = _live_reason(store, root, now)
         if reason is None:
-            planned = plan_launch(root, store, now)
+            planned = plan_launch(root, store, config, now)
             if planned is None or not launch(root, store, now, planned):
                 note_skip(store, "launch-unavailable" if planned is None else "launch-failed")
                 return None

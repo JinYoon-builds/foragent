@@ -16,7 +16,7 @@ from foragent.runner import REVIEW_PROMPT, _review, parse_code_review, run_issue
 
 from conftest import ACCEPTANCE, git_command
 from runner_support import (
-    BODY, COMMAND, REPORTED_JSON_FINDINGS, batch_setup, enable_native_reviewer, enable_reviewer,
+    BODY, COMMAND, REPORTED_JSON_FINDINGS, enable_native_reviewer, enable_reviewer,
     expected_review_rules, import_index, review_context, run_case,
 )
 
@@ -317,12 +317,8 @@ def test_reviewer_commit_is_detected_and_head_index_and_files_are_restored(run_c
     assert "Reviewer changes discarded" in c.tracker.created_prs[0].body
 
 
-@pytest.mark.parametrize("batch", [False, True])
-def test_latin1_source_reaches_review_and_pr_without_corruption(run_case, monkeypatch, batch):
+def test_latin1_source_reaches_review_and_pr_without_corruption(run_case, monkeypatch):
     c = run_case
-    if batch:
-        batch_setup(c)
-        c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"latin1.txt": "batch"})
     implement = c.executor.run
 
     def with_latin1(**kwargs):

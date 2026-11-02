@@ -27,11 +27,12 @@ def merge_case(git_history, tmp_path):
               "package.json": '{"scripts":{"test":"run-suite"}}',
               "pnpm-lock.yaml": "", "go.mod": "module sample\n"})
     head = h.tip
-    git_command(h.origin, "update-ref", "refs/heads/foragent/batch-1", head)
+    git_command(h.origin, "update-ref", "refs/heads/feature/person", head)
+    git_command(h.origin, "update-ref", "refs/heads/integration", head)
     h.update({"base.txt": "base advanced"})
     git = GitRepo(h.clone)
     tracker = FakeTracker(now=lambda: BASE_TIME)
-    pr = tracker.create_pr(head="foragent/batch-1", base="main", title="Batch", body="Keep this body")
+    pr = tracker.create_pr(head="feature/person", base="main", title="Feature", body="Keep this body")
     tracker.set_pr_head_sha(pr, head)
     tracker.set_pr_checks(pr, "pass")
     store = StateStore(tmp_path / "state", now=lambda: BASE_TIME)
@@ -91,7 +92,7 @@ def test_publication_checks_actual_pr_contents_before_direct_merge(merge_case, a
     base = c.history.tip
     c.history.update({"notes.md": content})
     c.head = c.history.tip
-    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", c.head)
+    git_command(c.history.origin, "update-ref", "refs/heads/feature/person", c.head)
     git_command(c.history.origin, "update-ref", "refs/heads/main", base)
     c.history.tip = base
     c.tracker.set_pr_head_sha(c.pr, c.head)
@@ -127,7 +128,7 @@ def test_changes_during_premerge_refuse_merge_before_attribution(merge_case, mon
                 c.history.update({"another.txt": "new base"})
             elif change == "retarget":
                 git_command(c.history.origin, "update-ref", "refs/heads/other", c.history.tip)
-                c.tracker.update_pr(pr, base="other", title="Batch", body="Keep this body")
+                c.tracker.update_pr(pr, base="other", title="Feature", body="Keep this body")
             elif change == "closed":
                 c.tracker.close_pr(pr)
             return "pass"
@@ -344,7 +345,7 @@ def test_premerge_head_only_pending_lock_exclusion_keeps_unowned_failures(merge_
     c.history.update({locked: '"""Locked by Foragent; do not edit."""\n'
                       'def test_pending():\n    assert False, "not implemented yet"\n'})
     head = c.history.tip
-    git_command(c.history.origin, "update-ref", "refs/heads/foragent/batch-1", head)
+    git_command(c.history.origin, "update-ref", "refs/heads/feature/person", head)
     git_command(c.history.origin, "update-ref", "refs/heads/main", base)
     c.history.tip = base
     c.tracker.set_pr_head_sha(c.pr, head)
@@ -833,7 +834,7 @@ def premerge_log(c, pr):
 
 def test_linked_pr_on_a_batch_branch_answers_to_the_configured_base(merge_case):
     c = merge_case
-    pr = linked_pr(c, base="foragent/batch-1")
+    pr = linked_pr(c, base="integration")
     c.history.update({"feature.txt": "changed on the configured base only"})
     main = c.history.tip
     report = orch.premerge(c.ctx, pr)
@@ -951,7 +952,7 @@ def test_issue_pr_without_a_snapshot_runs_no_approved_checks(merge_case):
 @pytest.mark.parametrize("moved", ["approval", "configured-base"])
 def test_merge_refuses_approved_inputs_that_moved_after_premerge(merge_case, monkeypatch, moved):
     c = merge_case
-    pr = linked_pr(c, base="foragent/batch-1")
+    pr = linked_pr(c, base="integration")
     checked = orch._premerge
 
     def then_move(ctx, number):

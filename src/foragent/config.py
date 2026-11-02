@@ -19,6 +19,8 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+# The sessions `default_skills` assigns to; one role never falls back to another (#1619).
+DEFAULT_SKILL_ROLES = ("workers", "reviewers", "orchestrator", "architect", "docs")
 PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
@@ -48,6 +50,8 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Session role -> skills it receives; written by a person, read through session_skills (#1619).
+    default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
