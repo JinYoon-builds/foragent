@@ -7,6 +7,13 @@ them. ``outbox`` is the append-only intent log: each intent records when it
 was queued, the facts it was queued against (``premise``) and its send
 ``attempts``. Only ingest removes intents, by one rule (``retirement``). The
 visible issue and the pending outbox are derived from the two, never stored.
+
+``issue-state`` flow records are the history of accepted observations. Only
+``_record_issue_states`` writes them, after an accepted observation is saved, so
+the acceptance rule stays in ``_observe``; the row keeps no second copy, and each
+record's predecessor is read from the history itself. An edge-only write leaves the
+row's ``observed_at`` alone, so ``edges_at`` keeps its time: no read older than it
+enters the history or replaces those edges.
 """
 
 from datetime import UTC, datetime
@@ -15,6 +22,8 @@ from typing import Any
 FACTS = ("title", "body", "labels", "state", "state_reason")
 _UNSET: Any = object()  # A recorded approval may itself be None.
 EARLIEST = datetime.min.replace(tzinfo=UTC)
+# Why an issue's history says it is gone: a complete listing left it out, or a read found no such issue.
+NOT_LISTED, NOT_FOUND = "not-listed", "not-found"
 
 
 def stamp(value: Any) -> datetime | None:
@@ -124,6 +133,31 @@ def observed_facts(row: dict[str, Any]) -> dict[str, Any]:
 def issue_facts(issue: Any) -> dict[str, Any]:
     return {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels), "state": issue.state,
             "state_reason": getattr(issue, "state_reason", None)}
+
+
+def edge_facts(edges: Any) -> list[dict[str, Any]]:
+    """Each known edge's number, state and repository (None: this repository), in one order."""
+    known = [{name: edge.get(name) for name in ("number", "state", "repository")} for edge in edges]
+    return sorted(known, key=lambda edge: (edge["repository"] or "", edge["number"]))
+
+
+def history_baseline(snapshot: dict[str, Any]) -> dict[str, tuple]:
+    """Observed issues as they stand before a write. Rows are changed in place, so take it first."""
+    return {key: (*person_fields(row), row.get("blocked_by")) for key, row in snapshot["issues"].items()
+            if row.get("observed_at") is not None and not row.get("is_pull_request")}
+
+
+def edges_after(snapshot: dict[str, Any], number: int, at: datetime, since_revision: int | None = None) -> bool:
+    """An accepted edge-only write is newer than a read that started at ``at``.
+
+    Equal times let the later ingest win, except a bulk refresh (``since_revision``)
+    against a write saved after the refresh began, as in ``_observe``.
+    """
+    entry = snapshot.get("edges_at", {}).get(str(number))
+    if entry is None:
+        return False
+    written = stamp(entry["at"]) or EARLIEST
+    return written > at or (written == at and since_revision is not None and entry["revision"] > since_revision)
 
 
 def known_numbers(snapshot: dict[str, Any]) -> set[int]:
@@ -260,6 +294,51 @@ class IssueObservationsMixin:
         row.update(facts, lane=lane, observed_at=at.isoformat())
         return "dropped" if self._retire(snapshot, number, facts, at, by_person=by_person) else "applied"
 
+    def _record_issue_states(self, snapshot: dict[str, Any], before: dict[str, tuple], at: datetime, seen: Any = (),
+                             *, edges: dict[int, Any] | None = None, gone: dict[int, str] | None = None,
+                             since_revision: int | None = None) -> None:
+        """The observation hook: append what this saved write changed in each issue's history.
+
+        ``seen`` holds issues whose observation that started at ``at`` was accepted, ``gone``
+        the accepted absences and their reason, ``edges`` the dependency reads this write
+        made. A read older than a recorded edge write adds nothing, whether it showed the
+        issue or omitted it (``edges_after``, the one check). An issue without
+        an edge read keeps its last recorded edges, or None: a row's empty list can also
+        mean "not read". A failed record is corrected by the next observation, because
+        each one compares with the history; recording never changes the write's result.
+        """
+        if not seen and not gone:
+            return
+        try:
+            history = {record["issue"]: record["data"] for record in self.flow_records()
+                       if record["kind"] == "issue-state"}
+            for number in sorted(seen):
+                row, last = snapshot["issues"].get(str(number)), history.get(number)
+                if (row is None or row.get("observed_at") is None or row.get("is_pull_request")
+                        or edges_after(snapshot, number, at, since_revision)):
+                    continue
+                labels, state = person_fields(row)
+                read = (edges or {}).get(number)
+                known = edge_facts(read) if read is not None else (last or {}).get("blocked_by")
+                was = before.get(str(number))
+                # Old or evicted closed issues would otherwise spend the retained history on no change.
+                if (last is None and was is not None and state == "closed" and was[:2] == (labels, state)
+                        and (read is None or edge_facts(was[2] or []) == known)):
+                    continue
+                facts = {"labels": labels, "blocked_by": known, "state": state}
+                if last is None or any(last.get(name) != value for name, value in facts.items()):
+                    self.record_flow("issue-state", issue=number, **facts)
+            for number, reason in sorted((gone or {}).items()):
+                last, was = history.get(number), before.get(str(number))
+                if ((last is None and was is None) or (last or {}).get("state") == "absent"
+                        or edges_after(snapshot, number, at, since_revision)):
+                    continue
+                labels = last.get("labels") if last is not None else was[0]
+                self.record_flow("issue-state", issue=number, labels=labels, state="absent", reason=reason,
+                                 blocked_by=(last or {}).get("blocked_by"))
+        except Exception:
+            return  # Observational: the write is already saved and its result must stand.
+
     def _new_row(self, number: int) -> dict[str, Any]:
         return {"number": number, "title": "", "body": "", "labels": [], "lane": "main",
                 "state": "open", "pr_number": None, "merged": False, "comments": []}
@@ -272,7 +351,8 @@ class IssueObservationsMixin:
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            dropped, seen, applied, changed = set(), set(), set(), False
+            before = history_baseline(snapshot)
+            dropped, seen, applied, changed, gone = set(), set(), set(), False, {}
             for issue in issues:
                 if issue.is_pull_request:
                     continue
@@ -289,20 +369,25 @@ class IssueObservationsMixin:
                 for number in sorted(known_numbers(snapshot) - seen):
                     outcome = self._observe(snapshot, number, None, started_at, lanes)
                     changed |= outcome != "stale"
+                    if outcome != "stale":
+                        gone[number] = NOT_LISTED
                     if outcome == "dropped":
                         dropped.add(number)
             if changed or applied:
                 # Only accepted observations are stamped; an older one persists nothing.
                 self._save_rows(snapshot, applied)
+                self._record_issue_states(snapshot, before, started_at, applied, gone=gone)
             return sorted(dropped)
 
     def ingest_absence(self, number: int, started_at: datetime) -> bool:
         """A read that started at ``started_at`` found the issue missing; returns whether intents were dropped."""
         with self._state_lock():
             snapshot = self._issue_snapshot()
+            before = history_baseline(snapshot)
             outcome = self._observe(snapshot, number, None, started_at, {})
             if outcome != "stale":
                 self._save_rows(snapshot, ())
+                self._record_issue_states(snapshot, before, started_at, gone={number: NOT_FOUND})
             return outcome == "dropped"
 
     def _save_rows(self, snapshot: dict[str, Any], numbers: Any) -> None:
