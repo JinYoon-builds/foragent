@@ -398,7 +398,7 @@ def review_only(
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome, detail = "limit-wait", orch_github.cause(exc)
+            outcome, detail = "limit-wait", ""
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
@@ -422,8 +422,7 @@ def review_only(
                 except TrackerError as exc:
                     if not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    detail = orch_github.cause(exc)
-                    outcome = "limit-wait"
+                    detail, outcome = "", "limit-wait"
                 finally:
                     try:
                         ctx.store.finish_run(n, outcome=outcome, detail=detail)
@@ -500,7 +499,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome, detail = "limit-wait", orch_github.cause(exc)
+            outcome, detail = "limit-wait", ""
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"

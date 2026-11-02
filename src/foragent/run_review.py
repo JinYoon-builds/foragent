@@ -454,12 +454,7 @@ def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_
 
 
 def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
-    """A reviewer already gave PASS to this exact commit for the approved body, and it is the open PR's head.
-
-    A run that resumes after a wait (a GitHub outage during CI, say) returns to its remaining
-    checks and publication instead of another implementation and review turn. Any other head,
-    a changed approval or an orchestrator verdict for some other head never qualifies.
-    """
+    """A reviewer PASS covers this clean commit for the approved body, and it is the open PR's head."""
     approval = ctx.store.load_approval(n)
     if approval is None or ctx.config.reviewer == "none":
         return False
@@ -476,11 +471,7 @@ def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
 
 
 def unchanged_since_pass(git: GitRepo, head: str) -> bool:
-    """After checks, the tree to publish is still exactly the commit a reused PASS covered.
-
-    Checks can change it: a Done when command edits tracked files, the base merges in
-    (follow_base) or a replay is resolved. Any such change needs its own review.
-    """
+    """Checks (a Done when edit, a base merge, a replay) left exactly the commit a reused PASS covered."""
     return git.head_sha() == head and git.staged_tree_sha() == git._call(["rev-parse", "HEAD^{tree}"]).strip()
 
 

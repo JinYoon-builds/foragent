@@ -15,11 +15,7 @@ class WaitContext(Protocol):
 
 
 def pause(ctx: WaitContext, error: TrackerError) -> datetime:
-    """Prefer response headers; probe once through the injected tracker otherwise.
-
-    An outage (no connection, HTTP 5xx) is not a rate limit: the probe would need the same
-    unreachable GitHub, so it waits the one-minute retry on the same shared pause.
-    """
+    """Prefer response headers; probe once otherwise. An outage waits a minute, unprobed, with its cause."""
     until = error.reset_at
     if until is None and error.is_rate_limit:
         try:
@@ -34,23 +30,35 @@ def pause(ctx: WaitContext, error: TrackerError) -> datetime:
     now = ctx.now()
     if until is None or until <= now:
         until = now + timedelta(minutes=1)
-    return ctx.store.pause_github(until)
+    return ctx.store.pause_github(until, None if error.is_rate_limit else cause(error))
 
 
 def cause(error: TrackerError) -> str:
     """One line of the actual failure for a wait's log and run detail."""
-    return " ".join(error.diagnostic.split())[:500]
+    return error.diagnostic[:500]
+
+
+def _line(until: datetime, outage: str | None) -> str:
+    return f"GitHub unavailable ({outage}) until {until.isoformat()}" if outage else (
+        f"GitHub rate limit until {until.isoformat()}")
+
+
+def wait_text(store: StateStore, now: datetime, error: TrackerError | None = None) -> str | None:
+    """What a wait is for. A caller's own failure names it; another writer may replace the shared
+    pause's cause meanwhile. Only a run or tick that merely meets the pause reads that record."""
+    if (paused := store.github_wait_until(now, cause=True)) is None:
+        return None
+    until, outage = paused
+    return _line(until, outage if error is None else None if error.is_rate_limit else cause(error))
 
 
 def wait_run(ctx: WaitContext, number: int, until: datetime, error: TrackerError | None = None) -> str:
-    """Record a resumable wait; an outage names its actual diagnostic, not a rate limit."""
-    ctx.store.update_run(number, waiting_until=until.isoformat(), outcome="limit-wait")
+    """Record a resumable wait, for ``error`` or for the pause it met, in the log and the run detail."""
+    line = wait_text(ctx.store, ctx.now(), error) or _line(until, None if error is None or error.is_rate_limit
+                                                           else cause(error))
+    ctx.store.update_run(number, waiting_until=until.isoformat(), outcome="limit-wait", detail=line)
     log = ctx.store.log_path(number)
     log.parent.mkdir(parents=True, exist_ok=True)
-    if error is not None and not error.is_rate_limit:
-        line = f"GitHub unavailable ({cause(error)}): waiting until {until.isoformat()}"
-    else:
-        line = f"GitHub rate limit: waiting until {until.isoformat()}"
     with log.open("a", encoding="utf-8") as stream:
-        stream.write(line + "\n")
+        stream.write(f"Waiting: {line}\n")
     return "limit-wait"

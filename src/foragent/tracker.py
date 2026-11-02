@@ -132,9 +132,7 @@ class TrackerError(RuntimeError):
         super().__init__(message)
         self.stdout = stdout
         self.returncode = returncode
-        # Set where gh's own failure is converted: gh could not run or finish, could not
-        # reach GitHub, or GitHub answered with a server error (HTTP 5xx).
-        self.transport = transport
+        self.transport = transport  # set only where gh's own failure is converted (see GhTracker._call)
 
     @property
     def is_unavailable(self) -> bool:
@@ -143,19 +141,12 @@ class TrackerError(RuntimeError):
 
     @property
     def diagnostic(self) -> str:
-        """gh's failure text: the outage evidence first, then stderr (the message) and any stdout.
-
-        A long message (a PR subject, a repository name) must not push the actual failure out of a
-        one-line, length-capped record, so the matched evidence leads.
-        """
-        text, out = str(self).strip(), self.stdout.strip()
-        full = f"{text}\n{out}" if out and out not in text else text
-        evidence = [] if not self.transport else list(dict.fromkeys(
-            line[max(0, match.start() - 60):match.end() + 60].strip()
-            for stream, pattern in ((text, _UNAVAILABLE), (out, _STATUS_LINE))
-            for line in stream.splitlines() for match in pattern.finditer(line)
-        ))
-        return full if not evidence or full in evidence else "\n".join([*evidence, full])
+        """One line of the failure; a long outage message leads with its evidence, so a cut keeps it."""
+        text = " ".join(str(self).split())
+        if not self.transport or len(text) <= 500:
+            return text
+        return " ... ".join([*dict.fromkeys(
+            text[max(0, match.start() - 60):match.end() + 60] for match in _UNAVAILABLE.finditer(text)), text])
 
     @property
     def waits(self) -> bool:
@@ -1082,13 +1073,21 @@ class GhTracker:
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
+            message = stderr or str(exc)
+            # A server error gh printed only on stdout is still the failure: it leads the message,
+            # so every reader of the error (logs, run details, waits) keeps it.
+            status = next((line.strip() for line in (stdout or "").splitlines() if _STATUS_LINE.search(line)), None)
+            if status and status not in message:
+                message = f"{status}\n{message}"
             raise TrackerError(
-                stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
-                transport=bool(_UNAVAILABLE.search(stderr or "")
-                               or any(_STATUS_LINE.search(line) for line in (stdout or "").splitlines())),
+                message, stdout=stdout or "", returncode=exc.returncode,
+                transport=bool(status or _UNAVAILABLE.search(stderr or "")),
             ) from exc
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise TrackerError(str(exc), transport=True) from exc
+        except subprocess.TimeoutExpired as exc:
+            # The failure leads; the argv (titles, bodies, repository names) follows and may be cut.
+            raise TrackerError(f"gh timed out after {exc.timeout:g} seconds: {exc}", transport=True) from exc
+        except OSError as exc:
+            raise TrackerError(f"gh could not run: {exc}", transport=True) from exc
         except gh.DeadlineExhausted as exc:
             raise TrackerError(str(exc)) from exc
 

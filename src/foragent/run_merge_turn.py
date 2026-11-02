@@ -244,7 +244,7 @@ def _remote_end(n: int, ctx: RunContext, credit, pr: int | None) -> str | None:
             if ctx.tracker.get_issue(number).state == "closed":
                 return f"{name} #{number}"
         except TrackerError as exc:
-            if exc.is_rate_limit:
+            if exc.waits:  # a rate limit or an outage takes the shared GitHub pause, like every run read
                 raise
             append_log(ctx.store.log_path(n), f"Merge wait could not read {name} #{number}; still waiting: {exc}")
         credit()
