@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
+from foragent import order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -350,7 +351,7 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             required = {"goal", "out_of_scope", "done_when"}
             required |= {"key", "title", "lane", "size"} if kind == "issues" else {"number"}
             _object(item, required, {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "interactive",
-                                     "references", "statements", "decisions"} if kind == "issues"
+                                     "references", "statements", "decisions", "replaces"} if kind == "issues"
                     else {"checklist", "acceptance_files", "blocked_by", "files", "exclusive", "references",
                           "statements", "decisions", "done_when_removals"}, label)
             if "done_when_removals" in item:
@@ -373,6 +374,10 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
             if any("\n" in line or "\r" in line for line in item.get("checklist", [])):
                 raise PlanError(f"{label}.checklist items must each be a single line")
             if kind == "issues":
+                try:
+                    order_replaces.validate(item, label, config.language)
+                except ValueError as exc:
+                    raise PlanError(str(exc)) from exc
                 if type(item.get("interactive", False)) is not bool:
                     raise PlanError(f"{label}.interactive must be a boolean")
                 _text(item["key"], f"{label}.key")
@@ -484,6 +489,7 @@ class PublishReport:
     affected: dict[int, list[str]] = field(default_factory=dict)
     language: str = "en"
     waiting_for: str | None = None
+    closures: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         if self.waiting_for is not None:
@@ -491,6 +497,7 @@ class PublishReport:
         lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
         if self.parent is not None:
             lines.append(f"Parent: #{self.parent}")
+        lines.extend(self.closures)
         lines.append("Files: " + ", ".join(self.paths))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
@@ -682,6 +689,7 @@ class _Publication:
     rows: list[dict]
     owner: str | None
     reviewed_bases: dict[str, dict]
+    closures: dict[int, list[str]] = field(default_factory=dict)
     collected: order_collect.Collected | None = None
 
     @property
@@ -804,20 +812,24 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
+    try:
+        closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
     # A commit that already landed has no write left to protect. Everything else, dry runs and
     # deferred orders included, must collect on the base it would land on.
     if not landed and collected is None:
         collected = order_collect.check(plan, files, root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None, {}, collected)
+                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected)
     if landed:
         # A resumed batch commit passed the gates below before its intent was recorded, and later
         # commits (its own too) must not reopen them: only its issue effects remain.
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows,
                             _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
-                                         [by_number[n] for n in mapping.values()]), {})
+                                         [by_number[n] for n in mapping.values()]), {}, closures)
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)
@@ -847,7 +859,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, collected)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures, collected)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -864,7 +876,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                 repo, config, lambda: git or GitRepo(root), fetch=True)
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
-                             sorted(publication.files), True, affected=affected, language=config.language)
+                             sorted(publication.files), True, affected=affected, language=config.language,
+                             closures=order_replaces.preview(publication.closures, config.language))
     if affected:
         raise PlanError(text("order_locks_refused", config.language, owners="\n".join(_owner_lines(affected))))
     if waiting:
@@ -1044,6 +1057,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
+    order_replaces.close_replaced(plan, publication.closures, tracker, mapping, approved_numbers, config.language)
     if approved_numbers:
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):
@@ -1107,22 +1121,35 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Pat
     ) + (f"\n{references}" if references else "") + order_done_when.prompt_section(item)
 
 
+def _lane_instructions(config: Config, lane: str, root: Path) -> list[str | None]:
+    """What the lane tells its implementer apart from memory: agent file, writer contract, skill list."""
+    from foragent.run_lane_skills import _agent_text, _writer_contract, lane_skills
+
+    agent, text = _agent_text(config, lane, root)
+    return [text, _writer_contract(config, lane, text), lane_skills(config, lane, root, agent)[0]]
+
+
 def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: Path | None = None):
     """The implementer the runner would start for this issue, its prompt and the evidence key.
 
     Executor, model, lane agent, lane notes and skills come from the same function the
-    runner's first implementation attempt uses, so preread cannot differ from it.
+    runner's first implementation attempt uses, so the work and the way it is run cannot
+    differ from that attempt. Lane memory can: it is read as it stands now, here and again
+    in the first attempt, so a lesson merged after preread reaches that attempt but not this
+    reader. The key therefore holds no lane memory, and lane learning leaves a clean preread valid.
     With a reader directory the prompt points images there; the digest always uses the
     reader-free prompt, so each reader's own directory never changes the evidence key.
     """
     from foragent.run_implementation import implementer_setup, lane_config
 
-    setup = implementer_setup(lane_config(config, item["lane"]), item["lane"], item["size"], root)
-    prompt = setup.notes + preread_prompt(plan, item, root) + setup.memory_notice
-    sent = prompt if reader is None else setup.notes + preread_prompt(plan, item, root, reader) + setup.memory_notice
+    run_config = lane_config(config, item["lane"])
+    setup = implementer_setup(run_config, item["lane"], item["size"], root)
+    prompt = preread_prompt(plan, item, root)
+    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
-        [setup.executor, setup.model, setup.options, prompt, plan], ensure_ascii=False, sort_keys=True,
+        [setup.executor, setup.model, setup.options, prompt, plan, _lane_instructions(run_config, item["lane"], root)],
+        ensure_ascii=False, sort_keys=True,
     ).encode("utf-8")).hexdigest()
     return setup, sent, digest
 

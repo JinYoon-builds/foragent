@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
+from itertools import count
 import json
 import re
 import subprocess
@@ -3481,6 +3482,126 @@ def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(pub
     assert len(revisions()) == 2
 
 
+@pytest.mark.parametrize("value", [None, 41, "41", [True], [0], [-1], [41, 41], [{}]])
+def test_replacements_reject_invalid_numbers_before_writes(publishing, plan, value):
+    plan["issues"][0]["replaces"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[0\].replaces"):
+        publish(publishing, plan, approve=True)
+    assert publishing[-1] == []
+
+
+@pytest.mark.parametrize("target", ["missing", "pr", "running", "edited"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_replacement_conflicts_are_checked_together_before_writes(publishing, plan, target, dry_run):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    if target != "missing":
+        tracker.add_issue(42, "Conflicting work", "body", ["running"] if target == "running" else [],
+                          is_pull_request=target == "pr")
+    if target == "edited":
+        plan["edits"] = [{"number": 42, "goal": "Edit it", "out_of_scope": "Other work",
+                          "done_when": ["true"]}]
+    plan["issues"][0]["replaces"] = [41, 42]
+    with pytest.raises(order.PlanError, match="#42"):
+        publish(publishing, plan, approve=True, dry_run=dry_run)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == []
+    assert publishing[-1] == []
+
+
+def test_replacement_partial_approval_links_every_successor_and_respects_reopen(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Shared old work", "body")
+    tracker.add_issue(42, "Client old work", "body")
+    plan["issues"][0]["replaces"] = [41]
+    plan["issues"][1]["replaces"] = [41, 42]
+    report = publish(publishing, plan, approve_keys=["api"])
+    children = {row["title"]: row["number"] for row in report.rows}
+    old = tracker.get_issue(41)
+    assert old.state == "closed" and old.state_reason == "not_planned"
+    comments = tracker.list_comments(41)
+    assert len(comments) == 1
+    assert all(f"#{number}" in comments[0].body for number in children.values())
+    assert tracker.get_issue(42).state == "open"
+    tracker.issues[41] = replace(old, state="open", state_reason=None)
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == comments
+    assert tracker.get_issue(42).state_reason == "not_planned"
+    assert len(tracker.list_comments(42)) == 1
+
+
+def test_replacement_leaves_an_issue_closed_before_this_order_alone(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    tracker.close_issue(41, reason="completed")
+    plan["issues"][0]["replaces"] = [41]
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state_reason == "completed" and tracker.list_comments(41) == []
+
+
+@pytest.mark.parametrize("route", ["immediate", "batch"])
+def test_replacement_published_twice_behind_a_queued_write_closes_once(publishing, plan, route):
+    from foragent.tracker import RecordingTracker
+
+    root, config, remote, git, events = publishing
+    remote.add_issue(41, "Old work", "body")
+    ticks = count()
+
+    def now():  # Store and context share one moving clock, so reads and writes keep their real order.
+        return BASE_TIME + timedelta(seconds=next(ticks))
+
+    store = StateStore.for_repo("owner/repo", now=now)
+    store.record_issue(remote.get_issue(41), {})
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=config, now=now))
+    case = (root, config, tracker, git, events)
+    plan["issues"][0]["replaces"] = [41]
+
+    def deliver():
+        if route == "immediate":
+            publish(case, plan, approve=True)
+        else:
+            plan["summary"] += " Revised."
+            publish(case, plan, defer="chosen", approve=True)
+            flush_waiting(case)
+
+    deliver()
+    deliver()
+    assert [entry["action"] for entry in store.github_outbox() if entry["issue"] == 41].count("close_issue") == 1
+    tracker.flush_outbox()
+    assert remote.get_issue(41).state_reason == "not_planned" and len(remote.list_comments(41)) == 1
+    remote.issues[41] = replace(remote.get_issue(41), state="open", state_reason=None)
+    tracker.flush_outbox()
+    deliver()
+    tracker.flush_outbox()
+    assert remote.get_issue(41).state == "open" and len(remote.list_comments(41)) == 1
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["whole", "resumed"])
+def test_replacement_closes_through_a_batch_flush_and_its_resume(publishing, plan, monkeypatch, interrupted):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    plan["issues"][0]["replaces"] = [41]
+    publish(publishing, plan, defer="chosen", approve=True)
+    assert tracker.get_issue(41).state == "open"
+    if interrupted:
+        create = tracker.create_issue
+
+        def interrupted_create(*args, **kwargs):
+            raise TrackerError("interrupted after the push")
+
+        monkeypatch.setattr(tracker, "create_issue", interrupted_create)
+        with pytest.raises(TrackerError):
+            flush_waiting(publishing)
+        assert tracker.get_issue(41).state == "open"
+        monkeypatch.setattr(tracker, "create_issue", create)
+    assert flush_waiting(publishing)["status"] == "published"
+    old = tracker.get_issue(41)
+    assert old.state == "closed" and old.state_reason == "not_planned"
+    assert len(tracker.list_comments(41)) == 1
+
+
 def test_planning_notes_replacement_and_interrupted_tail(tmp_path):
     from foragent import order_notes
     from foragent.state import StateStore
@@ -4279,3 +4400,39 @@ def test_preread_proposal_reaches_the_implementer_of_an_edit_with_a_removal_reco
     recorded = order.order_done_when.with_record(head.removesuffix("\n"), None, [{"line": "old", "reason": "Why."}])
     assert _handover(root, 7, recorded + "\n<!-- foragent:plan-child" + marker, API_FILES) == _handover(root, 7, body, API_FILES)
     assert _handover(root, 7, body, API_FILES) is not None
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_preread_reader_gets_current_memory_while_only_lane_instructions_move_the_key(
+    publishing, plan, tmp_path, executor,
+):
+    repo = tmp_path / "repo"
+    agent = repo / ".claude/agents/fa-api.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules.\n")
+    memory = repo / ".claude/agent-memory/fa-api"
+    memory.mkdir(parents=True)
+    skill = repo / ".claude/skills/polish/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
+    config = replace(publishing[1], executor=executor,
+                     lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["polish"]}})
+    item = plan["issues"][0]
+
+    def target():
+        return order.preread_target(plan, item, config, repo)
+
+    (memory / "MEMORY.md").write_text("Curated before.\n")
+    _, prompt, digest = target()
+    assert "Curated before." in prompt
+    (memory / "MEMORY.md").write_text("Curated after.\n")
+    (memory / "MEMORY.new.md").write_text("- [id:after] Pending after.\n")
+    _, prompt, same = target()
+    assert "Curated after." in prompt and "Pending after." in prompt and "Curated before." not in prompt
+    assert same == digest
+
+    skill.write_text("---\nname: polish\ndescription: Polish every text\n---\nBody\n")
+    skilled = target()[2]
+    assert skilled != digest
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules changed.\n")
+    assert target()[2] not in (digest, skilled)

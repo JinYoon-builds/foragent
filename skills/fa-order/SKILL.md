@@ -19,6 +19,8 @@ conversational English, active voice, positive phrasing, and one idea per senten
 Explain the result and the next action in the person's terms. Run the commands in this
 skill yourself; the person supplies requests, links and choices in conversation.
 
+List replaced issues in the plan's `issues[].replaces` instead of asking the person to close them.
+
 ## Talking to the person
 Record the decision ledger, chunk cells and source labels with `fa order progress`.
 These records are not shown to the person as lists unless the person asks for them.

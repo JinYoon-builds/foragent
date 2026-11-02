@@ -144,6 +144,8 @@ class IssueSnapshotMixin:
             row.update(title=entry["title"], body=entry["body"])
         elif action == "close_issue":
             row["state"] = "closed"
+            if entry.get("reason") is not None:
+                row["state_reason"] = entry["reason"]
 
     def queue_github_write(self, number: int, action: str, *, lanes: dict | None = None,
                            started_at: datetime | None = None, premise: dict[str, Any] | None = None,
