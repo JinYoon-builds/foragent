@@ -164,8 +164,10 @@ def _available_executor(
 
     errors = 0
     # A resumed session already holds its role's defaults, so only a full prompt carries them.
-    defaults = session_skills.section(ctx.config, "reviewers" if reviewer else "workers",
-                                      ctx.repo_root, kwargs["worktree"])
+    # An unset or empty role adds nothing and looks at nothing, so the launch stays as it was.
+    role = "reviewers" if reviewer else "workers"
+    defaults = (session_skills.section(ctx.config, role, ctx.repo_root, kwargs["worktree"])
+                if session_skills.role_entries(ctx.config, role) else "")
     if defaults and kwargs.get("review_level") is not None:
         kwargs["append_system_prompt"] = defaults.strip()
     else:
