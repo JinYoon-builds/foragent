@@ -113,6 +113,12 @@ def test_a_row_that_names_no_target_holds_the_turn_like_its_named_rows(case):
     assert capacity.machine_runs(case.store, case.ctx.now()) == 2
 
 
+def test_a_one_try_restore_admits_the_owner_of_a_row_that_names_no_target(case):
+    legacy_row(case, 1, started_at=started(case, 1))
+    assert run_waits._set_phase(1, case.ctx, {"phase": "checking"}, resume=False) is True
+    assert case.sleeps == [] and case.store.get_run(1).phase == "checking"
+
+
 def test_a_row_that_names_no_target_still_queues_and_withdraws(case):
     seat_in(case, 90)
     legacy_row(case, 90, started_at=started(case, 90))
