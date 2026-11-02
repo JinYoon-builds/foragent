@@ -88,24 +88,37 @@ class ComparisonEvidence:
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """One non-waiting read; changed evidence must be checked again unlocked."""
-        if (self.base_sha != base_sha or self.head_sha != head or self.status != status
-                or self.trusted_sha != _trusted_sha(git, ctx.tracker)):
-            return False
+        refused = self._refused(n, ctx, git, pr, head, base_sha, status)
+        _note_evidence(ctx, n, base_sha, head, *(refused or ()))
+        return refused is None
+
+    def _refused(self, n, ctx, git, pr, head, base_sha, status):
+        """Why this read no longer accepts the evidence, as (reason, detail), or None."""
+        if self.base_sha != base_sha or self.head_sha != head:
+            return "revision-moved", f"accepted {self.base_sha}/{self.head_sha}, now {base_sha}/{head}"
+        if self.status != status:
+            return "status-changed", f"accepted CI {self.status}, now {status}"
+        if self.trusted_sha != (trusted := _trusted_sha(git, ctx.tracker)):
+            return "trusted-moved", f"accepted default branch {self.trusted_sha}, now {trusted}"
         excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
         if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
-            return False
+            return "scope-changed", "the measurement scope no longer covers the current one"
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
                 if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
-                    return False
+                    return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
-                return True  # Local evidence is pinned to the same base/head and scope.
-            return self.reports == serialize_reports(ctx.tracker.pr_acceptance_reports(head))
+                return None  # Local evidence is pinned to the same base/head and scope.
+            reports = ctx.tracker.pr_acceptance_reports(head)
+            if self.reports == serialize_reports(reports):
+                return None
+            return ("reports-changed", "the reports differ from the accepted ones") if reports else (
+                "missing", "no acceptance reports at this read")
         except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
-            return False
+            return _refusal(exc), str(exc)
 
 
 def ci_protection(ctx):

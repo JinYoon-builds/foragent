@@ -446,3 +446,23 @@ def orch_stop_restore():
     from foragent import scheduler_stop
 
     return scheduler_stop
+
+
+def test_a_refusal_whose_flag_fails_is_one_transition_not_two(case, monkeypatch):
+    from foragent import scheduler_stop
+
+    def refuse(pid):
+        raise PermissionError("not ours")
+
+    def broken_flag(*args):
+        raise RuntimeError("board down")
+
+    monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw, kill_runner=refuse))
+    monkeypatch.setattr(scheduler_stop, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(scheduler, "flag", broken_flag)
+    monkeypatch.setattr(scheduler, "_kill_executor", lambda *args: None)
+    monkeypatch.setattr(scheduler, "_kill_run", lambda ctx, n, report, **kw: scheduler_stop._stop_run_processes(
+        ctx, ctx.store.get_run(n), report) == "stopped")
+    with pytest.raises(RuntimeError, match="board down"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store) == [(case.store.get_run(1).started_at, "skipped", "failed", "RuntimeError: board down")]

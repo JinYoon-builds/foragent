@@ -1630,3 +1630,75 @@ def test_failed_observation_never_replaces_the_comparison_result():
         raise OSError('state unreadable')
 
     ci_mode._note_evidence(SimpleNamespace(store=SimpleNamespace(get_run=broken)), 1, 'base', 'head', 'missing', 'x')
+
+
+def _read_case(tmp_path, monkeypatch):
+    """Evidence accepted unlocked, read again under the lock with real reports."""
+    from foragent import ci_mode
+
+    store = _evidence_store(tmp_path)
+    reads = []
+
+    def reports(head):
+        value = reads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    ctx = SimpleNamespace(store=store, config=Config(checks='ci', test_command='pytest'), repo_root=tmp_path,
+                          tracker=SimpleNamespace(pr_acceptance_reports=reports))
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': []})
+    accepted = ci_mode.ComparisonEvidence('base', 'head', {'excluded': []}, 'trusted', 'pass', '',
+                                          ci_mode.serialize_reports([{'shard': 0}]))
+    return ctx, accepted, reads
+
+
+def test_each_changed_refusal_at_a_read_keeps_its_own_cause_and_acceptance_closes(tmp_path, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    reads += [[{'shard': 0}], [], [], TrackerError('HTTP 500'), [{'shard': 9}], [{'shard': 0}]]
+    answers = [accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(6)]
+    assert answers == [True, False, False, False, False, True]
+    assert [(row['refused'], row['reason'], row['detail']) for row in _evidence_rows(ctx.store)] == [
+        (True, 'missing', 'no acceptance reports at this read'),
+        (True, 'unavailable', 'HTTP 500'),
+        (True, 'reports-changed', 'the reports differ from the accepted ones'),
+        (False, None, None),
+    ]
+    assert all(row['base_sha'] == 'base' and row['head_sha'] == 'head' for row in _evidence_rows(ctx.store))
+
+
+@pytest.mark.parametrize('change,reason', [
+    ({'base_sha': 'moved'}, 'revision-moved'), ({'head': 'moved'}, 'revision-moved'),
+    ({'status': 'fail'}, 'status-changed'),
+])
+def test_a_moved_read_names_what_moved_without_reading_reports(tmp_path, monkeypatch, change, reason):
+    ctx, accepted, _reads = _read_case(tmp_path, monkeypatch)
+    read = {'head': 'head', 'base_sha': 'base', 'status': 'pass', **change}
+    assert accepted.current(1, ctx, None, 2, **read) is False
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == [reason]
+
+
+def test_trusted_branch_and_scope_changes_are_named(tmp_path, monkeypatch):
+    from foragent import ci_mode
+
+    ctx, accepted, _reads = _read_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'other')
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': [], 'more': 1})
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['trusted-moved', 'scope-changed']
+
+
+def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    reads.append(TrackerError('API rate limit exceeded'))
+    with pytest.raises(TrackerError):
+        accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert _evidence_rows(ctx.store) == []

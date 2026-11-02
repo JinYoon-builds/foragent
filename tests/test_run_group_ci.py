@@ -494,3 +494,29 @@ def test_group_evidence_names_the_refused_branch(ci_case, monkeypatch, fault, re
     assert group_ci.check(5, c.ctx, "main", "base", "combined", excluded=[])[0] == "void"
     rows = _evidence(c)
     assert [(row["refused"], row["reason"]) for row in rows] == [(True, reason)]
+
+
+def test_reused_group_evidence_records_refusal_causes_and_the_repair(ci_case, monkeypatch):
+    c = ci_case
+    _, _, metadata = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    event = {**metadata, "mode": "ci", "base_sha": "base", "verdict": "passed"}
+    monkeypatch.setattr(run_group_evidence, "latest", lambda *args: (event, 0))
+    monkeypatch.setattr(run_group_evidence, "void_reason", lambda *args: None)
+    before = len(_evidence(c))
+    valid = deepcopy(c.reports)
+    reads = iter([valid, [], TrackerError("HTTP 500"), valid])
+
+    def reports(head):
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return deepcopy(value)
+
+    c.ctx.tracker.pr_acceptance_reports = reports
+    view = SimpleNamespace(n=5, ctx=c.ctx, git=c.ctx.git)
+    answers = [group_ci.evidence(view, "member", "base") is not None for _ in range(4)]
+    assert answers == [True, False, False, True]
+    rows = _evidence(c)[before:]
+    assert [(row["refused"], row["reason"]) for row in rows] == [
+        (True, "missing"), (True, "unavailable"), (False, None)]
+    assert all(row["base_sha"] == "base" and row["head_sha"] == "member" for row in rows)

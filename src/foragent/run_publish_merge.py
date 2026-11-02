@@ -123,11 +123,6 @@ def _final_merge_inputs(
     comparison_current = True
     if run_publish.enabled(ctx, base):
         comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
-        if comparison is not None:  # Accepted unlocked, then read again here: this read decides.
-            from foragent.ci_mode import _note_evidence
-
-            _note_evidence(ctx, n, target_sha, head, *(
-                () if comparison_current else ("changed-at-merge", "evidence no longer current at the final merge lock")))
         if comparison_current and comparison.infrastructure:
             # The unlocked comparison already handled this infrastructure state.
             status = "pass"
