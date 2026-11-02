@@ -933,3 +933,10 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D82 보강 5-4를 대체한 결정의 기록 (2026-10-30, Jin; 2026-11-01 기록)
 - D82 보강 5-4(5-④)는 Jin의 2026-10-30 결정(아키텍트가 프로젝트 전체를 독립적으로 검토한다)과 D99로 대체되었다. 지금 깨우는 계기는 D99가 정한다.
+
+## 2026-11-02
+
+### D105 보강. PASS 뒤 리뷰는 현재 main에 대한 이 PR의 변경만 본다 (2026-11-02, Jin)
+- 계기: #1644 8회차에서 PASS 뒤 main을 합쳐 head가 바뀌자, 이 PR이 건드리지 않은 config.py(#1638에서 머지한 코드)를 다시 리뷰해 막혔다.
+- 결정: PASS 뒤 head가 바뀌어 다시 리뷰할 때는 현재 main과의 merge-base diff를 기준으로 이 PR이 바꾼 코드만 입력으로 준다. main을 합치기만 해서 들어온 코드는 그 이슈에서 이미 리뷰했으므로 이번 리뷰 입력에서 뺀다. 충돌을 해결하며 바꾼 줄과 이 PR의 새 커밋은 리뷰한다. 같은 본문의 PASS, 본문 수정 시 전체 리뷰, 표시된 위험 예외의 전체 범위, review_pass_scope 설정은 그대로 둔다. 조합이 깨지는지는 CI가 확인하며 CI 규칙은 바꾸지 않는다.
+- 대체하는 규칙: #1599의 "including code integrated from main". [이전 주문](specs/2026-11-02-review-pass-scope.md)의 main 유입 포함 규칙만 이 결정으로 대체한다. 나머지 동작은 유지한다.

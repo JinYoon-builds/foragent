@@ -75,8 +75,8 @@ def test_conflict_finding_within_budget_returns_to_the_lane_then_merges(git_hist
     assert run_issue(1, case.ctx) == "merged"
     assert len(case.implementer.calls) == 3 and len(contexts) == 3
     assert NEW_FINDING in case.implementer.calls[2]["prompt"]
-    # The FAIL leaves the first boundary, and the repair's review sees it with main's merged code.
-    assert "-base = 0" in contexts[2] and "+retry = 3" in contexts[2]
+    # The FAIL leaves the first boundary; the repair's review sees this PR's work, not main's merged code.
+    assert "-base = 0" not in contexts[2] and "+base = 1" not in contexts[2] and "+retry = 3" in contexts[2]
 
 
 def test_conflict_at_a_later_base_move_can_still_hold(git_history, tmp_path, monkeypatch):
@@ -118,7 +118,8 @@ def test_clean_base_update_adds_no_review_and_never_moves_the_boundary(git_histo
                        config=replace(case.config, review="fast"))
     later = capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
     assert review_only(1, case.ctx) == "review-failed"
-    assert bound[0] in later[0] and "+from main" in later[0], "Main's merged code belongs to the later diff"
+    assert bound[0] in later[0], "The later review keeps the PASS head"
+    assert "upstream.txt" not in later[0] and "+from main" not in later[0], "Main's merged code stays out"
 
 
 def test_new_pass_after_a_body_edit_sets_a_new_boundary(git_history, tmp_path, monkeypatch):
@@ -251,7 +252,9 @@ def test_exemption_also_matches_a_path_brought_in_from_main(git_history, tmp_pat
     git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
                "merge", "--quiet", "--no-edit", "origin/main"])
     boundary = review_pass_scope.for_review(1, case.ctx, git, "origin/main")
-    assert boundary.diff is None and "upstream.txt" in boundary.section
+    # A file only main changed gains no PR scope, so its exempt mark does not apply (2026-11-02 decision).
+    assert boundary.diff is not None and "upstream.txt" not in boundary.diff
+    assert "upstream.txt" not in boundary.section
 
 
 def _at_head(case, tmp_path):
