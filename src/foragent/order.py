@@ -766,7 +766,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
             git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
-            collect: bool = True) -> "_Publication":
+            collected: order_collect.Collected | None = None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -818,7 +818,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         raise PlanError(str(exc)) from exc
     # A commit that already landed has no write left to protect. Everything else, dry runs and
     # deferred orders included, must collect on the base it would land on.
-    collected = order_collect.check(plan, files, root, config, git) if collect and not landed else None
+    if not landed and collected is None:
+        collected = order_collect.check(plan, files, root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected)

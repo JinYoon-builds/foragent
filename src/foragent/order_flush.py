@@ -51,19 +51,19 @@ def _note_files(root, notes, language):
 
 
 def _collect(rows, root, config, git):
-    """Each order's collection on one fetched base, alone with its retained files; returns that base."""
-    base = None
+    """Each order's collection on one fetched base, alone with its retained files."""
+    results, base = {}, None
     for row in rows:
         try:
-            result = order_collect.check(row["plan"], row.get("files") or {}, root, config, git,
-                                         base=base, retained=True)
+            results[row["entry_id"]] = order_collect.check(row["plan"], row.get("files") or {}, root, config, git,
+                                                           base=base)
         except order.PlanError as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
-        base = result.commit if result else base
-    return base
+        base = results[row["entry_id"]].commit if results[row["entry_id"]] else base
+    return results, base
 
 
-def _preflight(rows, notes, root, config, tracker, repo, git, collect=True):
+def _preflight(rows, notes, root, config, tracker, repo, git, collected=None):
     prepared, files, roots = [], {}, {}
     for row in rows:
         try:
@@ -71,7 +71,8 @@ def _preflight(rows, notes, root, config, tracker, repo, git, collect=True):
             publication = order._publication_checks(
                 plan, root, config, tracker, repo=repo, approve=row["approve"],
                 approve_keys=row["approve_keys"], approve_numbers=row["approve_numbers"],
-                retained_files=row.get("files"), git=git, refreshed=True, collect=collect)
+                retained_files=row.get("files"), git=git, refreshed=True,
+                collected=(collected or {}).get(row["entry_id"]))
             _merge(files, publication.files, config.language)
         except order.DoneWhenExecutableError:
             raise
@@ -203,9 +204,10 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         effective = [row for row in orders if row is latest[row["id"]]]
         with git.publish_lock():
             # Every order is collected before the checkout moves, and it moves only onto that base.
-            order_collect.land(git, config.base_branch, _collect(effective, root, config, git))
+            collected, base = _collect(effective, root, config, git)
+            order_collect.land(git, config.base_branch, base)
             # Validate against the refreshed base before starting a durable batch.
-            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collect=False)
+            prepared, files, roots = _preflight(effective, notes, root, config, tracker, repo, git, collected)
             batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
                      "orders": [row["entry_id"] for row in orders],
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
