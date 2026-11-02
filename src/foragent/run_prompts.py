@@ -98,15 +98,17 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
-    task: str = REVIEW_PROMPT,
+    task: str = REVIEW_PROMPT, pass_scope: str = "",
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
     `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    `pass_scope` is the earlier PASS's facts and scope (review_pass_scope); `diff` then matches it.
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{task}\n\n{review_scope_rules(acceptance_dir)}"
+        + (f"\n\n{pass_scope}" if pass_scope else "")
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
@@ -120,12 +122,12 @@ def build_review_prompt(
 
 def build_confirm_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
-    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "",
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "", pass_scope: str = "",
 ) -> str:
     """The complete first-round result and current change for one confirming reviewer."""
     return build_review_prompt(
         parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
-        lane_decisions=lane_decisions, task=CONFIRM_PROMPT,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT, pass_scope=pass_scope,
     ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
