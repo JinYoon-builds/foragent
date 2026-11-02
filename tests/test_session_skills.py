@@ -304,8 +304,6 @@ RESTRICTED_TEXTS = {
     "standard-then-ban": STANDARD_LICENSES["MIT"] + "\nRedistribution of this skill is prohibited.\n",
     "spdx-then-ban": "SPDX-License-Identifier: MIT\nRedistribution of this skill is prohibited.\n",
     "two-spdx": "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: LicenseRef-Private\n",
-    "spdx-other-text": "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
-    "spdx-then-standard": "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
     "spdx-then-author": "SPDX-License-Identifier: MIT\nAuthor: Example\n",
     "heading-variant": STANDARD_LICENSES["MIT"].replace("MIT License", "The MIT License (MIT)", 1),
     "missing-words": STANDARD_LICENSES["MIT"].replace("free of charge, ", ""),
@@ -315,6 +313,18 @@ RESTRICTED_TEXTS = {
     "copyleft": "SPDX-License-Identifier: GPL-3.0-only\n",
     "non-commercial": "SPDX-License-Identifier: CC-BY-NC-4.0\nCopyright 2026 Example\n",
     "only-copyright": "Copyright 2026 Example\n",
+    # #1652: an attribution or source notice never carries an unchecked license or a sentence.
+    "attribution-noncommercial-name": "example by Jane Doe, BSD-NonCommercial License, Copyright (c) 2026 Jane Doe\n"
+    + STANDARD_LICENSES["MIT"],
+    "attribution-license-in-author": "example by Jane Doe BSD-NonCommercial License\n" + STANDARD_LICENSES["MIT"],
+    "attribution-spdx-noncommercial": "example by Jane Doe, CC-BY-NC-4.0\n" + STANDARD_LICENSES["MIT"],
+    "labelled-license": "Attribution: BSD-NonCommercial License\n" + STANDARD_LICENSES["MIT"],
+    "labelled-sentence": "Source: Example Project\nAttribution: no commercial use\n" + STANDARD_LICENSES["MIT"],
+    "sentence-as-work": "Redistribution is prohibited by Jane Doe\n" + STANDARD_LICENSES["MIT"],
+    "labelled-copyleft-after-comma": "Attribution: Jane Doe, GPL-3.0-only\n" + STANDARD_LICENSES["MIT"],
+    "attribution-noncommercial-no-space": "example by Jane Doe,CC-BY-NC-4.0\n" + STANDARD_LICENSES["MIT"],
+    "identifier-as-name-word": "Attribution: Jane Doe GPL-3.0-only\n" + STANDARD_LICENSES["MIT"],
+    "one-word-attribution-is-no-work": "Attribution: noncommercial\n" + STANDARD_LICENSES["MIT"],
 }
 
 # Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
@@ -362,6 +372,15 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     STANDARD_LICENSES["MIT"].replace("\n", "  \n\n"),  # Only whitespace differs.
     STANDARD_LICENSES["ISC"].replace("<year> <owner>", "2026 Example"),
     STANDARD_LICENSES["Apache-2.0"],
+    # #1652 superseded the old rejection: a permissive SPDX line beside a complete permissive text passes.
+    "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
+    "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    # #1652: attribution and source notices around a complete permissive text.
+    "Attribution: Jane Doe\nSource: Example Project\n" + STANDARD_LICENSES["MIT"],
+    "Example Project by Jane Doe, MIT License, Copyright (c) 2026 Jane Doe\n" + STANDARD_LICENSES["MIT"],
+    STANDARD_LICENSES["MIT"] + "\ntool by Jane Doe, Apache License, Version 2.0\nAuthor: Jane Doe <jane@example.org>\n",
+    "Attribution: Jane Doe, MIT License\n" + STANDARD_LICENSES["MIT"],
+    "Source: pstack\n" + STANDARD_LICENSES["MIT"],
 ])
 def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
     root = tmp_path / "root"
@@ -573,3 +592,32 @@ def test_a_license_entry_that_is_not_a_readable_file_is_unknown(tmp_path):
     (folder / "LICENSES").mkdir()
     (folder / "LICENSES/MIT.txt").write_text(STANDARD_LICENSES["MIT"])
     assert redistributable_license(folder, tmp_path)[0] == "unknown"
+
+
+NOTICED_TEXTS = {
+    "attribution-prefix": "Attribution: Jane Doe\nSource: https://example.org/noticed\n" + STANDARD_LICENSES["MIT"],
+    "attribution-suffix": STANDARD_LICENSES["MIT"] + "\nExample Project by Jane Doe, MIT License\n",
+    "spdx-and-license-name": "SPDX-License-Identifier: MIT\nAttribution: Jane Doe, MIT License\n" + STANDARD_LICENSES["MIT"],
+}
+
+
+@pytest.mark.parametrize("text", NOTICED_TEXTS.values(), ids=NOTICED_TEXTS)
+@pytest.mark.parametrize("where", ["library", "repository"])
+def test_a_license_the_default_judge_accepts_installs_without_another_veto_or_warning(tmp_path, capsys, text, where):
+    """#1652: the section, the install check and the install all follow one license judge."""
+    library, project = tmp_path / "library", tmp_path / "project"
+    project.mkdir()
+    base = library if where == "library" else project
+    write_skill(base, "noticed", license=None)
+    (base / "skills/noticed/LICENSE").write_text(text)
+    entry = {"name": "lib", "repo": "https://example.com/lib.git", "path": str(library), "revision": "pinned",
+             "skills": ["noticed"]}
+    manager = SkillManager(Config(skill_libraries=[entry] if where == "library" else []))
+    skill = manager.check_default("noticed", project)
+    assert skill is not None and skill.license == "MIT"
+    manager.install_default("noticed", skill, project)
+    assert "installing locally only" not in capsys.readouterr().err
+    copy = project / ".claude/skills/noticed"
+    assert (copy / "LICENSE").read_text() == text
+    config = Config(skill_libraries=[entry] if where == "library" else [], default_skills={"docs": ["noticed"]})
+    assert ".claude/skills/noticed/SKILL.md" in section(config, "docs", project)
