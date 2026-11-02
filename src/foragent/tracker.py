@@ -490,11 +490,11 @@ class RecordingTracker:
         self._ingest([issue], started)
         return False
 
-    def _refused(self, n):
+    def _refused(self, n, *, queueing=False):
         """The sole write gate: the operation's frozen ownership decision (#1004)."""
         from foragent import orch_scope
 
-        return orch_scope.write_refusal(self._context, self._tracker, n)
+        return orch_scope.write_refusal(self._context, self._tracker, n, queueing=queueing)
 
     def board_write_refused(self, n):
         return self._refused(n) is not None
@@ -515,7 +515,7 @@ class RecordingTracker:
         result is appended as an attempt. A failure nobody retries is final.
         Comments stay direct sends: they change no labels or state.
         """
-        if self._refused(n) is not None:
+        if self._refused(n, queueing=self.queue_writes) is not None:
             return None, _REFUSED  # Neither sent nor queued, and no local effect.
         store = self._context.store
         premise = self._premise(n)

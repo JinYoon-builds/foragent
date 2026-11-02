@@ -218,3 +218,17 @@ def test_reverification_interruption_keeps_first_pass_failures(run_case, monkeyp
     monkeypatch.setattr(runner, "_check", check)
     run_issue(1, c.ctx)
     assert "first pass broke" in cuts.failures_path(c.store.root, 1).read_text()
+
+
+def test_a_question_without_a_nameable_orderer_is_not_posted(run_case):
+    """The run ends in a visible failure; the question waits in the log, never unaddressed on the issue."""
+    c = run_case
+    c.executor.steps = [{".foragent/QUESTION.md": "Choose A or B."}]
+    c.tracker.authenticated_login = lambda: (_ for _ in ()).throw(RuntimeError("signed out"))
+
+    assert run_issue(1, c.ctx) == "error"
+
+    bodies = [comment.body for comment in c.tracker.list_comments(1)]
+    assert not any("product decision" in body or "Choose A or B" in body for body in bodies)
+    assert any("Cannot name who to ask" in body for body in bodies)
+    assert "Choose A or B." in c.store.log_path(1).read_text()

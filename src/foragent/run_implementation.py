@@ -457,6 +457,6 @@ def _implement(
                             cuts.issue_dir(ctx.store.root, n), "QUESTION.md")
         from foragent.orch_scope import ask_orderer
 
-        flag(ctx, n, Reason.SPEC_QUESTION, ask_orderer(ctx, n, "The executor needs a product decision."), details)
+        flag(ctx, n, Reason.SPEC_QUESTION, ask_orderer(ctx, n, "The executor needs a product decision.", details), details)
         raise ExecutorStopped("spec-question")
     wait_for_overlap(attempt)

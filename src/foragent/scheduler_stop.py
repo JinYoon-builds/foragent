@@ -237,7 +237,8 @@ def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport
     from foragent.i18n import text
     from foragent import orch_scope
 
-    if orch_scope.current_refusal(ctx, number) is not None:  # An unavailable read fails here, like the repair.
+    # An unavailable read fails here, like the repair. Each repair write passes the write gate itself.
+    if orch_scope.current_refusal(ctx, number, queueing=True) is not None:
         return  # The issue changed hands during the stop: the work stays local, no label or comment (#1004).
     run = ctx.store.get_run(number)
     journal = ctx.store.root / "orch-events.jsonl"

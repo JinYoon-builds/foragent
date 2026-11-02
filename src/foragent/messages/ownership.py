@@ -10,6 +10,7 @@ MESSAGES = {
             "This factory does not know its GitHub account. Run fa init to sign in again, then try again."),
         "ownership_foreign": "#{number} is worked by {owner}; this factory is {factory}.",
         "ownership_unreadable": "Cannot confirm who works #{number}, so nothing was done: {error}",
+        "ownership_no_orderer": "Cannot name who to ask about #{number}, so no question was posted: {error}",
         "ownership_config_invalid": "The committed team setting cannot be read, so nothing was done for #{number}.",
         "ownership_unconfirmed": (
             "#{number} was published for an owner label it does not have, so no factory works it. "
@@ -42,6 +43,7 @@ MESSAGES = {
             "이 공장의 GitHub 계정을 몰라요. fa init으로 다시 로그인한 뒤 다시 해 보세요."),
         "ownership_foreign": "#{number}은 {owner}의 일이에요. 이 공장은 {factory}예요.",
         "ownership_unreadable": "#{number}을 누가 맡는지 확인하지 못해서 아무것도 하지 않았어요: {error}",
+        "ownership_no_orderer": "#{number}을 누구에게 물을지 알 수 없어서 질문을 올리지 않았어요: {error}",
         "ownership_config_invalid": "커밋된 팀 설정을 읽을 수 없어서 #{number}에 아무것도 하지 않았어요.",
         "ownership_unconfirmed": (
             "#{number}은 주인 라벨이 붙어야 하는데 없어서 어느 공장도 일하지 않아요. "

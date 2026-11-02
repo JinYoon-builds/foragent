@@ -181,11 +181,12 @@ def test_a_failed_entry_read_never_lets_a_stale_row_authorize_effects(git_histor
 
 
 @pytest.mark.parametrize("effect", ["HTTP 502", "exit"])
-def test_a_singleton_row_still_reports_a_failed_entry_read(git_history, tmp_path, monkeypatch, effect):
+def test_a_failed_entry_read_on_an_issue_cached_unlabelled_does_nothing(git_history, tmp_path, monkeypatch, effect):
     from foragent import orch_scope, runner
     from foragent.tracker import TrackerError
 
-    case = team_run_case(git_history, tmp_path, monkeypatch, [], [])
+    case = team_run_case(git_history, tmp_path, monkeypatch, [], ["by:bob"])  # Cached unlabelled; Bob's now.
+    before = shared_effects(case)
 
     def fails(_):
         if effect == "exit":
@@ -198,6 +199,39 @@ def test_a_singleton_row_still_reports_a_failed_entry_read(git_history, tmp_path
             runner.run_issue(1, case.ctx)
     else:
         assert runner.run_issue(1, case.ctx) == "error"
+    assert shared_effects(case) == before
+
+
+@pytest.mark.parametrize("actual, flagged", [(["by:bob"], False), (["by:alice"], True), ([], True)])
+@pytest.mark.parametrize("failure", ["HTTP 502", "HTTP 422 Validation Failed", "HTTP 404 Not Found"])
+def test_after_one_failed_entry_read_only_a_new_read_decides(git_history, tmp_path, monkeypatch, failure, actual, flagged):
+    """Nothing cached counts; a later read that answers decides, for a locked 422 too."""
+    from foragent import orch_scope, runner
+    from foragent.tracker import TrackerError
+
+    case = team_run_case(git_history, tmp_path, monkeypatch, [], actual)
+    real = orch_scope.observe
+    answers = iter([SimpleNamespace(get_issue=lambda n: (_ for _ in ()).throw(TrackerError(failure)))])
+    monkeypatch.setattr(orch_scope, "observe", lambda tracker: next(answers, None) or real(tracker))
+
+    assert runner.run_issue(1, case.ctx) == "error"
+    labels = case.tracker.get_issue(1).labels
+    assert ("blocked" in labels) is flagged
+    assert bool(case.tracker.list_comments(1)) is flagged
+
+
+def test_a_successful_entry_read_on_a_singleton_issue_still_reports_a_later_failure(
+    git_history, tmp_path, monkeypatch,
+):
+    from foragent import runner
+
+    case = team_run_case(git_history, tmp_path, monkeypatch, [], [])
+    case.store.finish_run(1, "blocked")
+    case.tracker.remove_labels(1, ["running"])
+    monkeypatch.setattr(runner, "kick_tick", lambda root: None)
+    monkeypatch.setattr(runner, "_execute", lambda n, ctx, worktree: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    assert runner.run_issue(1, case.ctx) == "error"
     assert "blocked" in case.tracker.get_issue(1).labels
 
 
@@ -545,3 +579,292 @@ def test_ownership_lost_during_a_run_prints_its_one_line(git_history, tmp_path, 
     assert runner.run_issue(1, case.ctx) == "refused"
 
     assert capsys.readouterr().err.splitlines() == ["#1 is Bob's now"]
+
+
+def pr_chain(tracker, owner_labels, links=2):
+    """Issue #1, then a chain of PRs where each one's branch names the previous number."""
+    tracker.add_issue(1, "Work", "", labels=owner_labels)
+    number = 1
+    for _ in range(links):
+        number = tracker.create_pr(head=f"foragent/issue-{number}", base="main", title="Link", body="")
+    return number
+
+
+@pytest.mark.parametrize("links", [1, 2, 3])
+@pytest.mark.parametrize("owner, allowed", [("bob", False), ("alice", True)])
+def test_an_uncached_pr_chain_is_judged_by_the_issue_at_its_end(tmp_path, links, owner, allowed):
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    head = pr_chain(tracker, [f"by:{owner}"], links)
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config())
+    recorder = RecordingTracker(tracker, context, queue_writes=True)
+    context.tracker = recorder
+    store.queue_github_write(head, "comment", body="Queued")
+
+    recorder.flush_outbox()
+
+    assert ([c.body for c in tracker.list_comments(head)] == ["Queued"]) is allowed
+    assert bool(store.refused_github_writes()) is not allowed
+
+    from foragent.tracker import WriteRefused
+
+    for operation in (lambda: recorder.update_pr(head, base="main", title="T", body="B"),
+                      lambda: recorder.close_pr(head),
+                      lambda: recorder.merge_pr(head, expected_head_sha="x")):
+        if allowed:
+            continue
+        with pytest.raises(WriteRefused):
+            operation()
+    if not allowed:
+        assert tracker.get_issue(head).state == "open" and tracker.merged_prs == []
+
+
+def test_a_pr_chain_with_a_missing_end_or_a_cycle_refuses(tmp_path):
+    from foragent import orch_scope
+    from foragent.tracker import TrackerError
+
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Work", "")
+    first = tracker.create_pr(head="foragent/issue-1", base="main", title="A", body="")
+    read = tracker.get_issue
+
+    def without_issue(n):
+        if n == 1:
+            raise TrackerError("HTTP 404 Not Found")
+        return read(n)
+
+    tracker.get_issue = without_issue
+    with pytest.raises(TrackerError, match="404"):
+        orch_scope._resolve_issue(None, tracker, first)
+
+    cycle = FakeTracker(login="alice")
+    a = cycle.create_pr(head="foragent/issue-2", base="main", title="A", body="")
+    b = cycle.create_pr(head=f"foragent/issue-{a}", base="main", title="B", body="")
+    assert b == 2
+    with pytest.raises(orch_scope.Unresolved):
+        orch_scope._resolve_issue(None, cycle, a)
+
+
+def test_entry_and_write_lookups_share_one_chain_resolver(tmp_path):
+    from foragent import orch_scope
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    head = pr_chain(tracker, ["by:bob"], 2)
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(), tracker=tracker)
+
+    assert orch_scope.current_issue(context, head).number == 1
+    assert "bob" in orch_scope.check(context, head, tracker.get_issue(head))  # The merge preflight's read of a PR.
+    context._scope = None
+    assert "bob" in orch_scope.merge_check(context, head, tracker.get_issue(head))
+    context._scope = None
+    assert "bob" in orch_scope.scope(context).refusal(tracker.get_issue(head))
+
+
+@pytest.mark.parametrize("labels, cached, mention", [
+    ([], True, "@alice"), ([], False, "@alice"), (["by:bob"], True, "@bob"), (["by:alice"], False, "@alice"),
+])
+def test_every_issue_question_mentions_its_effective_orderer(tmp_path, labels, cached, mention):
+    from foragent import orch_scope
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Work", "", labels=labels)
+    if cached:
+        store.record_issue(tracker.get_issue(1), {})
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(), tracker=tracker)
+
+    assert orch_scope.ask_orderer(context, 1, "Which one?") == f"{mention} Which one?"
+
+
+def signed_out(tracker):
+    tracker.authenticated_login = lambda: (_ for _ in ()).throw(RuntimeError("signed out"))
+
+
+def test_no_question_text_exists_without_an_orderer_and_its_details_stay_in_the_log(tmp_path):
+    from foragent import orch_scope
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Work", "")
+    store.record_issue(tracker.get_issue(1), {})
+    signed_out(tracker)
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(), tracker=tracker)
+
+    with pytest.raises(orch_scope.OrdererUnknown, match="#1"):
+        orch_scope.ask_orderer(context, 1, "Which one?", "The long question")
+    assert "The long question" in store.log_path(1).read_text()
+
+
+def test_a_tick_posts_no_question_until_it_can_name_the_orderer(git_history, tmp_path, monkeypatch):
+    from foragent import scheduler
+    from foragent.tracker import Issue
+    from test_orch_review_handoff import make_case, tick_context
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    case.store.finish_run(1, "blocked")
+    case.tracker.remove_labels(1, ["running"])
+    blocker = Issue(7, "Gone", "", frozenset(), "closed", state_reason="not_planned")
+    monkeypatch.setattr(scheduler, "_blockers", lambda ctx, n, confirmed=False: [blocker])
+    login = case.tracker.authenticated_login
+    signed_out(case.tracker)
+    ctx = tick_context(case)
+    issue, approval = case.tracker.get_issue(1), case.store.load_approval(1)
+    before = shared_effects(case)
+    report = scheduler.TickReport()
+
+    assert scheduler._check_prerequisites(ctx, issue, approval, report) is False
+    assert shared_effects(case) == before
+    assert any("#1" in action for action in report.actions)
+
+    case.tracker.authenticated_login = login
+    ctx._scope = None  # The next tick.
+    assert scheduler._check_prerequisites(ctx, issue, approval, scheduler.TickReport()) is False
+    assert any("#7" in c.body and c.body.count("@") for c in case.tracker.list_comments(1))
+
+
+@pytest.mark.parametrize("producer", ["executor", "reviewer"])
+def test_a_run_question_is_not_posted_without_an_orderer(git_history, tmp_path, monkeypatch, producer):
+    from foragent import run_review
+    from foragent.orch_scope import OrdererUnknown
+    from test_orch_review_handoff import make_case
+
+    case = make_case(git_history, tmp_path, monkeypatch)
+    signed_out(case.tracker)
+    before = shared_effects(case)
+    if producer == "reviewer":
+        review = SimpleNamespace(conflicts=("SPEC-CONFLICT: a locked test",))
+        with pytest.raises(OrdererUnknown):
+            run_review._stop_on_spec_conflict(1, case.ctx, review)
+        assert "SPEC-CONFLICT: a locked test" in case.store.log_path(1).read_text()
+    else:
+        from foragent.orch_scope import ask_orderer
+
+        with pytest.raises(OrdererUnknown):
+            ask_orderer(case.ctx, 1, "The executor needs a product decision.", "details")
+    assert shared_effects(case) == before
+
+
+def test_an_unread_number_during_a_github_wait_gets_no_unaddressed_question(tmp_path):
+    from datetime import timedelta
+    from foragent import orch_scope
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Work", "")
+    store.pause_github(NOW + timedelta(minutes=1))
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(), tracker=tracker)
+
+    with pytest.raises(orch_scope.OrdererUnknown):
+        orch_scope.ask_orderer(context, 1, "Which one?")
+
+
+def absent_read(tracker):
+    from foragent.tracker import TrackerError
+
+    read = tracker.get_issue
+
+    def missing(n):
+        if n == 1:
+            raise TrackerError("HTTP 404 Not Found")
+        return read(n)
+
+    tracker.get_issue = missing
+    return read
+
+
+def test_a_read_that_finds_nothing_decides_nothing(tmp_path):
+    from foragent import orch_scope
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Bob's", "", labels=["by:bob"])
+    read = absent_read(tracker)
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config())
+    context.tracker = RecordingTracker(tracker, context)
+
+    assert orch_scope.may_write(context, 1) is False
+    tracker.get_issue = read
+    assert orch_scope.may_write(context, 1) is False  # The earlier 404 left no permission behind.
+    assert tracker.list_comments(1) == []
+
+
+def waiting_case(tmp_path, *, queue_writes):
+    from datetime import timedelta
+
+    store = StateStore(tmp_path / "state", now=lambda: NOW)
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Bob's parent", "", labels=["by:bob"])
+    store.pause_github(NOW + timedelta(minutes=1))
+    context = SimpleNamespace(store=store, now=lambda: NOW, config=Config(), repo="owner/repo")
+    recorder = RecordingTracker(tracker, context, queue_writes=queue_writes)
+    context.tracker = recorder
+    return store, tracker, recorder, context
+
+
+def test_a_github_wait_lets_no_direct_write_reach_an_unread_target(tmp_path):
+    from foragent.tracker import WriteRefused
+
+    store, tracker, recorder, _ = waiting_case(tmp_path, queue_writes=False)
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="T", body="B")
+
+    recorder.comment(1, "Direct")
+    recorder.add_labels(1, ["blocked"])
+    for operation in (lambda: recorder.create_pr(head="foragent/batch-1", base="main", title="T", body="B"),
+                      lambda: recorder.update_pr(pr, base="main", title="X", body="Y"),
+                      lambda: recorder.close_pr(pr),
+                      lambda: recorder.merge_pr(pr, expected_head_sha="x"),
+                      lambda: recorder.add_sub_issue(1, 2)):
+        with pytest.raises(WriteRefused):
+            operation()
+
+    assert tracker.list_comments(1) == [] and "blocked" not in tracker.get_issue(1).labels
+    assert [p.number for p in tracker.created_prs] == [pr] and tracker.merged_prs == []
+    assert recorder.board_write_refused(1) is True
+    assert store.github_outbox() == []
+
+
+def test_a_wait_refusal_is_not_a_decision_and_a_queue_entry_waits_for_replay(tmp_path):
+    from datetime import timedelta
+    from foragent import orch_scope
+
+    clock = [NOW]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    tracker = FakeTracker(login="alice")
+    tracker.add_issue(1, "Mine", "", labels=["by:alice"])
+    context = SimpleNamespace(store=store, now=lambda: clock[0], config=Config())
+    recorder = RecordingTracker(tracker, context, queue_writes=True)
+    context.tracker = recorder
+    store.pause_github(NOW + timedelta(minutes=1))
+
+    assert orch_scope.may_write(context, 1) is False
+    recorder.comment(1, "Queued")
+    assert [entry["body"] for entry in store.github_outbox()] == ["Queued"]
+    assert tracker.list_comments(1) == [] and store.refused_github_writes() == []
+
+    clock[0] = NOW + timedelta(minutes=2)
+    assert orch_scope.may_write(context, 1) is True
+    recorder.flush_outbox()
+    assert [c.body for c in tracker.list_comments(1)] == ["Queued"]
+
+
+def test_a_replay_during_a_wait_reads_before_it_sends(tmp_path):
+    store, tracker, recorder, _ = waiting_case(tmp_path, queue_writes=True)
+    recorder.comment(1, "Queued on an unread target")
+
+    recorder.flush_outbox()
+
+    assert tracker.list_comments(1) == []
+    assert [entry["body"] for entry in store.refused_github_writes()] == ["Queued on an unread target"]
+
+
+def test_a_replay_during_a_wait_does_not_discard_an_owned_write_it_can_read(tmp_path):
+    store, tracker, recorder, _ = waiting_case(tmp_path, queue_writes=True)
+    tracker.remove_labels(1, ["by:bob"])
+    tracker.add_labels(1, ["by:alice"])
+    recorder.comment(1, "Mine")
+
+    recorder.flush_outbox()
+
+    assert [c.body for c in tracker.list_comments(1)] == ["Mine"]
+    assert store.refused_github_writes() == []

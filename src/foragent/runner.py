@@ -463,7 +463,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     try:
         orch_scope.begin_entry(ctx, n)  # A direct run is a new operation; a failed read authorizes nothing.
         until = ctx.store.github_wait_until(ctx.now())
-        issue = None if until else orch_scope.entry_issue(ctx, n)
+        issue = None if until else orch_scope.observe(ctx.tracker).get_issue(n)
         if (refusal := orch_scope.check(ctx, n, issue, read=until is None)) is not None:
             print(refusal, file=sys.stderr)
             entered = False

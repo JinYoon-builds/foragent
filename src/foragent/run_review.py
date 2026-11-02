@@ -63,8 +63,9 @@ def _stop_on_spec_conflict(n: int, ctx: RunContext, review: ReviewResult) -> Non
     if review.conflicts:
         from foragent.orch_scope import ask_orderer
 
+        details = "\n".join(review.conflicts)
         flag(ctx, n, Reason.SPEC_QUESTION, ask_orderer(
-            ctx, n, "The reviewer found a conflict with a locked acceptance test."), "\n".join(review.conflicts))
+            ctx, n, "The reviewer found a conflict with a locked acceptance test.", details), details)
         raise ExecutorStopped("spec-question")
 
 
