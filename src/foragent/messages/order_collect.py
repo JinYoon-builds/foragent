@@ -9,6 +9,8 @@ MESSAGES = {
         "order_collect_unavailable": (
             "Refused: the collection check is unavailable, so no result exists. Files: {files}. Command: {command}. Cause: {cause}"
         ),
+        "order_collect_missing": "Done when references missing acceptance file, on base {base} and in the checkout: {files}",
+        "order_collect_conflict": "conflicting file contents in the order's acceptance files: {file}",
         "order_collect_no_base": "cannot read the current base {branch} from origin: {error}",
         "order_collect_no_command": "the project has no test command",
         "order_collect_no_command_name": "(none)",
@@ -25,6 +27,8 @@ MESSAGES = {
         "order_collect_unavailable": (
             "거절했어요: 수집 검사를 할 수 없어서 결과가 없어요. 파일: {files}. 명령: {command}. 원인: {cause}"
         ),
+        "order_collect_missing": "Done when이 가리키는 인수 파일이 기준 {base}에도 체크아웃에도 없어요: {files}",
+        "order_collect_conflict": "주문의 인수 파일 내용이 서로 달라요: {file}",
         "order_collect_no_base": "origin에서 현재 기준 {branch}를 읽을 수 없어요: {error}",
         "order_collect_no_command": "프로젝트에 시험 명령이 없어요",
         "order_collect_no_command_name": "(없음)",

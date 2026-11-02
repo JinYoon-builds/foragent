@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from foragent import capacity, order, order_collect, order_flush, processes
+from foragent import capacity, order, order_collect, order_flush, order_submissions, processes
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.state import StateStore
@@ -549,6 +549,204 @@ def test_flush_collects_each_order_alone_with_its_retained_files(  # noqa: F811
         order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), **FLUSH)
     assert GOOD in str(refusal.value) and "ModuleNotFoundError" in str(refusal.value)
     assert _writes(calls) == [] and tracker.list_issues() == []
+
+
+def _retain_without_snapshot(plan, config):
+    order_submissions.retain(plan, "owner/repo", "b", approve=False, approve_keys=[], approve_numbers=[],
+                             language=config.language)
+
+
+def _base_moved_on(git_history):
+    """Origin is ahead, so any refresh before the refusal shows in the checkout."""
+    git_history.update({"moved.txt": "x\n"})
+
+
+def _flush(root, config, tracker, git):
+    return order_flush.flush(root, config, tracker, git, StateStore.for_repo("owner/repo"), **FLUSH)
+
+
+def _assert_refused_before_moving(root, config, tracker, git, calls, match, runs=1):
+    head, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    collections = []
+    real = processes.run_logged
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(processes, "run_logged", lambda *a, **k: (collections.append(a), real(*a, **k))[1])
+        with pytest.raises(order.PlanError, match=match):
+            _flush(root, config, tracker, git)
+    assert (git.head_sha(), git_command(root, "ls-files", "--stage")) == (head, index)
+    assert not (root / "moved.txt").exists() and _writes(calls) == [] and tracker.list_issues() == []
+    assert len(collections) == runs
+
+
+def test_a_retained_order_without_a_snapshot_is_collected_from_its_plan_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _retain_without_snapshot(plan_with({GOOD: IMPORTS}), config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_a_plans_own_bytes_beat_a_snapshot_for_the_same_file(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    order_submissions.retain(plan_with({GOOD: IMPORTS}), "owner/repo", "b", approve=False, approve_keys=[],
+                             approve_numbers=[], language=config.language, files={GOOD: "VALUE = 1\n"})
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def _done_when_only(name=GOOD):
+    plan = plan_with({})
+    plan["issues"][0]["done_when"] = [f"uv run pytest -q {name}"]
+    return plan
+
+
+def test_a_done_when_file_only_in_the_checkout_is_collected_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    (root / GOOD).parent.mkdir(parents=True, exist_ok=True)
+    (root / GOOD).write_text(IMPORTS)
+    _retain_without_snapshot(_done_when_only(), config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_a_done_when_file_only_on_the_new_base_is_collected_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _retain_without_snapshot(_done_when_only(), config)
+    git_history.update({GOOD: IMPORTS})
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_the_base_file_decides_over_a_stale_checkout_copy_without_a_snapshot(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    git_history.update({GOOD: "VALUE = 1\n"})
+    git.update_base("main")
+    _retain_without_snapshot(_done_when_only(), config)
+    git_history.update({GOOD: IMPORTS})
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_a_done_when_file_nothing_supplies_is_refused_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    _retain_without_snapshot(_done_when_only(), config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "missing acceptance file", runs=0)
+
+
+def test_an_unwritten_statement_file_still_lands_on_the_fetched_base_not_a_newer_one(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    plan = _done_when_only()
+    plan["issues"][0]["statements"] = ["The file exists."]
+    _retain_without_snapshot(plan, config)
+    _base_moved_on(git_history)
+    fetched = git_history.tip
+    refreshes, update_base = [], git.update_base
+    monkeypatch.setattr(git, "update_base", lambda branch: (refreshes.append(branch), update_base(branch))[1])
+    land = order_collect.land
+    # A later commit brings the file: the checkout must stay on the commit the check saw.
+    monkeypatch.setattr(order_collect, "land", lambda g, branch, commit: (
+        git_history.update({GOOD: IMPORTS}), land(g, branch, commit))[1])
+    with pytest.raises(order.PlanError):  # Its reviewed-tests gate, after the move.
+        _flush(root, config, tracker, git)
+    assert refreshes == [] and git.head_sha() == fetched
+
+
+def _edit_of(name, **extra):
+    return {"number": 900, "goal": "G", "out_of_scope": "O", "done_when": [f"uv run pytest -q {name}"], **extra}
+
+
+def _item_of(name, key="other", **extra):
+    return {"key": key, "title": "T", "lane": "main", "size": "s", "goal": "G", "out_of_scope": "O",
+            "done_when": [f"uv run pytest -q {name}"], **extra}
+
+
+SHARED_PATHS = {
+    "later issue reads earlier issue's file": lambda plan: plan["issues"].append(_item_of(GOOD)),
+    "edit reads an issue's file": lambda plan: plan.update(edits=[_edit_of(GOOD)]),
+    "earlier issue reads later issue's file": lambda plan: plan["issues"].insert(0, _item_of(GOOD)),
+    "issue reads an edit's file": lambda plan: (
+        plan.update(edits=[_edit_of(GOOD, acceptance_files=plan["issues"][0].pop("acceptance_files"))]),
+        plan["issues"][0].update(acceptance_files={})),
+}
+
+
+@pytest.mark.parametrize("shape", SHARED_PATHS)
+def test_a_file_shared_across_issues_and_edits_is_collected_with_the_plans_bytes(  # noqa: F811
+        offline_publication, git_history, monkeypatch, shape):
+    """The base holds good bytes under the same name, so only the plan's bytes can refuse."""
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    git_history.update({GOOD: "VALUE = 1\n"})
+    git.update_base("main")
+    plan = plan_with({GOOD: IMPORTS})
+    SHARED_PATHS[shape](plan)
+    _retain_without_snapshot(plan, config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_two_items_with_different_bytes_for_one_file_are_refused_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    plan = plan_with({GOOD: "VALUE = 1\n"})
+    plan["issues"].append(_item_of(GOOD, acceptance_files={GOOD: "VALUE = 2\n"}))
+    _retain_without_snapshot(plan, config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "conflicting file contents", runs=0)
+
+
+def test_a_local_change_to_a_tracked_done_when_file_is_what_gets_collected(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    """The base's copy is fine; publication would write the changed one, as it stays through the move."""
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    git_history.update({GOOD: "VALUE = 1\n"})
+    git.update_base("main")
+    (root / GOOD).write_text(IMPORTS)
+    _retain_without_snapshot(_done_when_only(), config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_an_ignored_done_when_file_is_what_gets_collected(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    git_history.update({".gitignore": "test_good.py\n", GOOD: None})
+    git.update_base("main")
+    (root / GOOD).parent.mkdir(parents=True, exist_ok=True)
+    (root / GOOD).write_text(IMPORTS)
+    _retain_without_snapshot(_done_when_only(), config)
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "ModuleNotFoundError")
+
+
+def test_a_done_when_file_the_base_deleted_is_refused_before_the_move(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    """A clean copy leaves with the move, so the checkout's bytes cannot stand in."""
+    root, config, tracker, git, calls, _ = _publish_case(offline_publication, monkeypatch)
+    git_history.update({GOOD: "VALUE = 1\n"})
+    git.update_base("main")
+    _retain_without_snapshot(_done_when_only(), config)
+    git_history.update({GOOD: None})
+    _base_moved_on(git_history)
+    _assert_refused_before_moving(root, config, tracker, git, calls, "missing acceptance file", runs=0)
+
+
+def test_a_valid_retained_order_without_a_snapshot_publishes_after_one_collection(  # noqa: F811
+        offline_publication, git_history, monkeypatch):
+    root, config, tracker, git, *_ = _publish_case(offline_publication, monkeypatch)
+    _retain_without_snapshot(plan_with({GOOD: "VALUE = 1\n"}), config)
+    _base_moved_on(git_history)
+    runs, real = [], processes.run_logged
+    monkeypatch.setattr(processes, "run_logged", lambda *a, **k: (runs.append(a), real(*a, **k))[1])
+    assert _flush(root, config, tracker, git)["status"] == "published"
+    assert len(runs) == 1 and (root / "moved.txt").exists()
+    assert git_command(git_history.origin, "show", f"main:{GOOD}") == "VALUE = 1"
 
 
 def test_preread_refusal_starts_no_reader_and_records_nothing(case, monkeypatch):

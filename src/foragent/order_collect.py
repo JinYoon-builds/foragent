@@ -22,6 +22,7 @@ from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths
+from foragent.paths import repo_path
 
 # Slot admission and execution share this budget, per order, however many bases it is checked on.
 LIMIT_S = 30.0
@@ -74,6 +75,45 @@ def acceptance_files(plan: dict, files: dict[str, str | bytes], config: Config) 
         names.update(acceptance_paths(item["done_when"], config.acceptance_dir))
     # A statement issue's tests may not be written yet; they are not in ``files`` then.
     return {name: files[name] for name in sorted(names) if name in files}
+
+
+def _retained(plan: dict, snapshot: dict[str, str | bytes], config: Config, language: str) -> dict[str, str | bytes | None]:
+    """A retained order's files in validate_plan's order: any item's plan bytes, the snapshot; None until read."""
+    from foragent.order import PlanError
+
+    items = [*plan["issues"], *plan.get("edits", [])]
+    named: dict[str, str | bytes | None] = {}
+    for item in items:
+        for name, content in item.get("acceptance_files", {}).items():
+            if named.get(name, content) != content:
+                raise PlanError(text("order_collect_conflict", language, file=name))
+            named[name] = content
+    for item in items:
+        for name in acceptance_paths(item["done_when"], config.acceptance_dir):
+            if name not in named:
+                named[name] = snapshot.get(name)
+    return dict(sorted(named.items()))
+
+
+def _settle(selected: dict[str, str | bytes | None], git: GitRepo, base: str, root: Path) -> dict[str, str | bytes | None]:
+    """What publication will read once the checkout is on this base.
+
+    A local change or a file Git does not track stays through the move, so its bytes decide;
+    otherwise the base's file does (None: it is in the copy already), and without one it is missing.
+    """
+    settled: dict[str, str | bytes | None] = {}
+    for name, content in selected.items():
+        if content is not None:  # Publication writes these bytes whatever the checkout holds there.
+            settled[name] = content
+        elif repo_path(root, name).is_file() and git._call(["status", "--porcelain", "--ignored", "--", name]).strip():
+            settled[name] = repo_path(root, name).read_bytes()
+        else:
+            try:
+                if git._call(["cat-file", "-t", f"{base}:{name}"]).strip() == "blob":
+                    settled[name] = None
+            except GitError:
+                pass
+    return settled
 
 
 def _has_origin(git: GitRepo) -> bool:
@@ -134,7 +174,7 @@ class _Unavailable(Exception):
     """The check established no result; the first argument is the cause, the second the command."""
 
 
-def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Path, config: Config,
+def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes | None], work: Path, config: Config,
              language: str, deadline: float) -> list[tuple[str, str]]:
     from foragent.order import detect_test_commands
     from foragent.run_checks import _pytest_command
@@ -142,7 +182,8 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     tree, report, log = work / "tree", work / "collect.xml", work / "collect.log"
     order_scratch.build(git, base, tree)
     for name, content in selected.items():
-        _write(tree, name, content)
+        if content is not None:  # None is already in the copy, from the base.
+            _write(tree, name, content)
     # The clean copy decides, so caller-only project files cannot select a command.
     command = config.test_command or next(iter(detect_test_commands(tree)), None)
     if command is None:
@@ -181,19 +222,22 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
 
 
 def check(plan: dict, files: dict[str, str | bytes], root: Path, config: Config, git: GitRepo | None = None, *,
-          base: str | None = None, earlier: Collected | None = None) -> Collected | None:
+          base: str | None = None, earlier: Collected | None = None, retained: bool = False) -> Collected | None:
     """Refuse unless this order's acceptance files collect on the base; None when it has none.
 
     ``base`` is a commit another order was just checked on, so one batch shares one base.
     ``earlier`` is this order's previous result: the same base is not collected twice and a
     new base gets only what remains of the budget.
+    ``retained`` marks ``files`` as a deferred order's optional snapshot, read before the checkout
+    moves: the rest of what publication will write comes from the plan, the base and the checkout.
+    A retained order with named files always answers with its base, so the checkout lands on that.
     """
     from foragent.order import PlanError
 
-    selected = acceptance_files(plan, files, config)
+    language = (getattr(config, "language", None) or "en").lower().split("-")[0]
+    selected = _retained(plan, files, config, language) if retained else acceptance_files(plan, files, config)
     if not selected:
         return None
-    language = (getattr(config, "language", None) or "en").lower().split("-")[0]
 
     def unavailable(cause: str, command: str | None) -> PlanError:
         return PlanError(text("order_collect_unavailable", language, files=", ".join(selected),
@@ -211,8 +255,20 @@ def check(plan: dict, files: dict[str, str | bytes], root: Path, config: Config,
     started = time.monotonic()
     work = None
     try:
+        if retained:
+            selected = _settle(selected, git, base, root)
+            for item in [*plan["issues"], *plan.get("edits", [])]:
+                # A statement issue's tests may not be written yet; its own gate refuses them.
+                missing = [] if "statements" in item else [
+                    name for name in acceptance_paths(item["done_when"], config.acceptance_dir) if name not in selected]
+                if missing:
+                    raise PlanError(text("order_collect_missing", language, base=base[:12], files=", ".join(missing)))
+            if not selected:
+                return Collected(base, spent)
         work = Path(tempfile.mkdtemp(prefix="foragent-collect-"))
         errors = _collect(git, base, selected, work, config, language, started + LIMIT_S - spent)
+    except PlanError:
+        raise
     except _Unavailable as exc:
         raise unavailable(exc.args[0], exc.args[1]) from exc
     except Exception as exc:  # Whatever stopped the check, it did not establish a pass.
