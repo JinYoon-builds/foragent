@@ -11,6 +11,10 @@ if TYPE_CHECKING:
     from foragent.run_base_move import BaseMove
 
 
+class _UnverifiedBase(Exception):
+    """CI failed on a later base that a source move reached; refresh, do not fail the lane."""
+
+
 def _publish(attempt: Implementation) -> str:
     run_publish.wait_for_overlap(attempt)
     return run_publish._publish_locked(attempt)
@@ -205,16 +209,42 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         decision = run_publish._merge_decision(n, ctx, git, git.changed_paths(target_sha), ctx.tracker.get_issue(n).labels)
         return policy_hold(decision)
 
-    def measured_later(sha: str) -> bool:
-        """Main can move between our fetch and a push; CI then measures that later
-        main. Accept it only as target history after the base we pushed against."""
+    def later_main(sha: str, after: str) -> bool:
+        """Whether ``sha`` is fetched target history after ``after``."""
         try:
-            return (git.is_ancestor(measured_base_sha, sha)
-                    and git.is_ancestor(sha, f"origin/{attempt.target_branch}"))
+            return git.is_ancestor(after, sha) and git.is_ancestor(sha, f"origin/{attempt.target_branch}")
         except run_publish.GitError:
             return False
 
+    def measured_later(sha: str) -> bool:
+        """Main can move between our fetch and a push; CI then measures that later
+        main. Its pass counts only inside the accepted base, which only a push or a
+        proved result-neutral move advances."""
+        return later_main(sha, measured_base_sha) and later_main(verified_base_sha, sha)
+
+    def unverified_measured_base() -> str | None:
+        """A later base CI measured this head on that a source move reached.
+
+        Its failure says nothing about this head; the move refreshes instead."""
+        if not run_publish.enabled(ctx, attempt.target_branch):
+            return None
+        from foragent.ci_mode import reported_base
+        try:
+            reported = reported_base(ctx.tracker.pr_acceptance_reports(verified_head_sha))
+        except (KeyError, TypeError, ValueError, run_publish.TrackerError) as exc:
+            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
+                raise
+            return None
+        if reported is None or reported == verified_base_sha:
+            return None
+        ctx.git.fetch("origin", attempt.target_branch)
+        if not later_main(reported, verified_base_sha):
+            return None
+        return None if run_publish.base_move_is_neutral(attempt, run_publish.capture_move(git, reported)) else reported
+
     def ci_failed() -> None:
+        if moved := unverified_measured_base():
+            raise _UnverifiedBase(moved)
         if attempt.rebuilt:
             logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
             run_publish._hold_if_not_started(n, ctx, pr, logs)
@@ -241,10 +271,18 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     # Base moves are bounded only by the run's time budget, which refresh_base checks.
     while True:
         run_publish._phase(n, ctx, "ci")
-        with activity(n, ctx, "ci", ci_cause):
-            stopped = run_publish._wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
-                                               ci_wait, ci_failed, queued_status,
-                                               comparison_mode=run_publish.enabled(ctx, attempt.target_branch))
+        try:
+            with activity(n, ctx, "ci", ci_cause):
+                stopped = run_publish._wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
+                                                   ci_wait, ci_failed, queued_status,
+                                                   comparison_mode=run_publish.enabled(ctx, attempt.target_branch))
+        except _UnverifiedBase as moved:
+            run_publish._append(log, f"CI measured an unverified source move: {moved}")
+            queued_status = None
+            target_sha = refresh_base(run_publish.capture_move(git, f"origin/{attempt.target_branch}"), neutral=False)
+            if stopped := publish_refresh(target_sha):
+                return stopped
+            continue
         if stopped:
             return stopped
         queued_status = None

@@ -351,7 +351,7 @@ def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
         return
 
 
-def _reported_base(reports):
+def reported_base(reports):
     """The one base every shard reports measuring, or None."""
     try:
         bases = {item["report"]["base_sha"] for item in reports}
@@ -414,7 +414,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 recorded_reports = serialize_reports(reports)
                 break
             except (MissingComparison, StaleComparison) as exc:
-                reported = _reported_base(reports) if isinstance(exc, StaleComparison) else None
+                reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
                 if (later_base is not None and reported is not None and reported != base_sha
                         and later_base(reported)):
                     base_sha = reported

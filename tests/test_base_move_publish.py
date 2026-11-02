@@ -145,3 +145,28 @@ def test_neutral_move_during_first_push_reads_ci_on_the_base_it_measured(neutral
     assert case.sleeps == [], "Passed CI on the later main needs no wait"
     assert case.landed[0][:2] == (moved[0], case.original_head)
 
+
+
+@pytest.mark.parametrize("files, refreshed", [
+    pytest.param({"src/widget.py": "VALUE = 1\n"}, True, id="source"),
+    pytest.param({"docs/raced.md": "Raced\n"}, False, id="neutral"),
+])
+def test_ci_failure_on_a_base_moved_during_push(neutral_case, monkeypatch, files, refreshed):
+    """A failure measured on an unverified source move refreshes; one on a neutral move fails (#1688)."""
+    from dataclasses import replace
+    from foragent import runner
+
+    case = neutral_case
+    case.ctx.config = replace(case.ctx.config, max_retries=0)
+    case.status = lambda head: "fail" if head == case.original_head else "pass"
+    moved = _move_during_push(case, monkeypatch, files, 0)
+    outcome = runner.run_issue(1, case.ctx)
+    assert moved and case.reports[case.original_head][0]["report"]["base_sha"] == moved[0]
+    if refreshed:
+        assert outcome == "merged", case.store.log_path(1).read_text()
+        assert len(case.publications) == 2
+        assert len(case.checked.read_text().splitlines()) == 2, "Re-verify the source move once"
+        assert case.landed[0][:2] == (moved[0], case.publications[-1])
+    else:
+        assert outcome != "merged" and case.publications == [case.original_head]
+        assert case.landed == []
