@@ -341,7 +341,8 @@ def _worker(phase, state="working"):
             "phase": phase, "state": state}
 
 
-WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait"})
+WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait",
+                        "run-slot-wait"})
 
 
 def test_the_source_scan_finds_the_phases_of_each_setter():

@@ -23,7 +23,7 @@ from foragent.status import issue_state, local_group
 # The recorded wait phases and the waiting kind each one establishes (None: cause unknown).
 PHASE_KINDS: dict[str, str | None] = {
     "overlap-wait": "file-overlap", "test-slot-wait": "capacity", "limit-wait": "quota",
-    "baseline-wait": None, "executor-wait": None,
+    "baseline-wait": None, "executor-wait": None, "run-slot-wait": "capacity",
 }
 HELD = {"waiting-human", "blocked"}
 
