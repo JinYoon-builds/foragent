@@ -640,6 +640,7 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
             assert (root / "latest.txt").read_text() == "latest\n"
             assert (root / ".foragent/TRY.md").read_text() == "Try the feature\n"
             assert (root / ".foragent/REBUTTAL.md").read_text() == "- A finding: explanation\n"
+            assert (root / ".foragent/PR.json").read_text() == '{"summary": "Kept."}'
             assert git_command(root, "rev-parse", "HEAD") == latest[0]
             assert not (root / git_command(root, "rev-parse", "--git-path", "MERGE_HEAD")).exists()
             assert "earlier attempt could not be merged onto the moved base" in kwargs["prompt"]
@@ -653,6 +654,7 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
             (root / ".foragent").mkdir(exist_ok=True)
             (root / ".foragent/TRY.md").write_text("Try the feature\n")
             (root / ".foragent/REBUTTAL.md").write_text("- A finding: explanation\n")
+            (root / ".foragent/PR.json").write_text('{"summary": "Kept."}')
             if before_push:
                 c.move_target()
         if index == 3:
