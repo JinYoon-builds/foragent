@@ -108,6 +108,8 @@ class Tracker(Protocol):
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
+    def reopen_issue(self, n: int) -> None: ...
+    def close_count(self, n: int) -> int: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
     def close_pr(self, pr: int, comment: str | None = None) -> None: ...
@@ -201,11 +203,10 @@ def local_issue_models(store) -> list[Issue]:
 class RecordingTracker:
     """Record writes locally, optionally deferring rate-limited gate/orchestrator writes."""
 
-    def __init__(self, tracker, context, *, queue_writes=False, direct=False):
+    def __init__(self, tracker, context, *, queue_writes=False):
         self._tracker = tracker._tracker if isinstance(tracker, RecordingTracker) else tracker
         self._context = context
         self.queue_writes = queue_writes
-        self._direct = direct
         # GitHub calls made for this context count in its own store and clock.
         store, now = getattr(context, "store", None), getattr(context, "now", None)
         if store is not None and now is not None:
@@ -278,8 +279,8 @@ class RecordingTracker:
                 if issue.number in pending}
 
     def unqueued(self):
-        """The same tracker for writes whose caller reconciles failures itself: they are sent now or raise."""
-        return RecordingTracker(self._tracker, self._context, direct=True)
+        """The tracker itself, for writes that must happen now or never: they leave no intent to replay."""
+        return self._tracker
 
     def pending_issue(self, n):
         """The issue as unsent writes will leave it, or None when no write waits."""
@@ -486,8 +487,8 @@ class RecordingTracker:
             preceding = [entry for entry in pending if entry.get("evidence")]
         else:
             preceding = store.github_blocking_outbox()
-        if not self._direct and (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
-                                 (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
+        if (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
+                (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
         # A direct combined close exposes only its field effect to concurrent flushes.
         # Its comment is send-only; the composite payload enters the retry queue only on failure.
@@ -558,8 +559,7 @@ class RecordingTracker:
                     store.record_github_attempt(entry["id"], started, True)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
-                    options = {"reason": entry["reason"]} if action == "close_issue" and entry.get("reason") else {}
-                    result = getattr(self._tracker, action)(number, payload, **options)
+                    result = getattr(self._tracker, action)(number, payload)
                     if action == "comment":
                         store.acknowledge_github_comment(entry, result)
                     else:
@@ -643,11 +643,10 @@ class RecordingTracker:
                                 started, title=title, body=body)
         del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
-    def close_issue(self, n, comment=None, *, reason=None):
+    def close_issue(self, n, comment=None):
         started = self._started()
-        options = {"reason": reason} if reason is not None else {}
-        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n, **options) if comment is None
-                               else self._tracker.close_issue(n, comment, **options), started, body=comment, **options)
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
+                               else self._tracker.close_issue(n, comment), started, body=comment)
         del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
@@ -728,6 +727,7 @@ class FakeTracker:
         self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
         self._events: dict[int, list[LabelEvent]] = {}
+        self._closes: dict[int, int] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
         self._parents: dict[int, int] = {}
@@ -877,9 +877,16 @@ class FakeTracker:
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         self._close(n, comment, reason=reason)
 
+    def reopen_issue(self, n: int) -> None:
+        self.issues[n] = replace(self.get_issue(n), state="open", state_reason="reopened", updated_at=self._timestamp())
+
+    def close_count(self, n: int) -> int:
+        return self._closes.get(n, 0)
+
     def _close(self, n: int, comment: str | None, *, reason: str | None = None) -> None:
         if comment is not None:
             self.comment(n, comment)
+        self._closes[n] = self._closes.get(n, 0) + 1
         self.issues[n] = replace(self.get_issue(n), state="closed", state_reason=reason, updated_at=self._timestamp())
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
@@ -1288,6 +1295,14 @@ class GhTracker:
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
+
+    def reopen_issue(self, n: int) -> None:
+        self._call(["issue", "reopen", str(n), "-R", self.repo])
+
+    def close_count(self, n: int) -> int:
+        """How many times the issue has been closed, from its event history."""
+        data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/events?per_page=100"]))
+        return sum(event.get("event") == "closed" for event in data)
 
     def search_issues(self, query: str) -> Any:
         """GitHub's issue search response for ``query``: ``items`` (up to 100), ``total_count``

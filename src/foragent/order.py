@@ -753,9 +753,10 @@ def _publication_targets(plan: dict, all_issues: list):
     return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
 
 
-def _replacement_closures(plan: dict, tracker: Tracker, parent: int | None, mapping: dict, config: Config) -> dict:
+def _replacement_closures(plan: dict, tracker: Tracker, parent: int | None, mapping: dict, config: Config,
+                          *, repair: bool = True) -> dict:
     try:
-        return order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+        return order_replaces.plan_closures(plan, tracker, parent, mapping, config.language, repair)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
 
@@ -809,7 +810,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "lane": issue_lane(issue.labels, config.lanes), "blocked_by": ([mapping.get(key, key) for key in item["blocked_by"]] if "blocked_by" in item
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
-    closures = _replacement_closures(plan, tracker, parent, mapping, config)
+    closures = _replacement_closures(plan, tracker, parent, mapping, config, repair=not dry_run)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows, None, {}, closures)
@@ -868,7 +869,7 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), True, affected=affected, language=config.language,
                              closures=order_replaces.preview(
-                                 plan, publication.closures, tracker,
+                                 plan, publication.closures, tracker, publication.parent,
                                  set(publication.keys) if approve else publication.selected_keys
                                  | {key for key, number in publication.mapping.items()
                                     if number in publication.selected_numbers}, config.language))
@@ -1047,7 +1048,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
     try:
-        order_replaces.close_replaced(plan, publication.closures, tracker, mapping, approved_numbers, config.language)
+        order_replaces.close_replaced(plan, publication.closures, tracker, mapping, approved_numbers, parent,
+                                      config.language)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     if approved_numbers:
