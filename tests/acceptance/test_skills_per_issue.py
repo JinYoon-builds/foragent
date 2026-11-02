@@ -35,7 +35,10 @@ def issue_skills_case(git_history, tmp_path, monkeypatch):
     }))
     case.ctx.config = load_config(case.root)
     # The Claude reviewer answers with a /code-review result event, as the real CLI does.
-    case.reviewer.steps = [json.dumps({"result": "(none)"})]
+    from foragent.executors import ExecResult
+    case.reviewer.run = lambda **call: ExecResult(0, False,
+        json.dumps({"result": "(none)"}) if call.get("review_level") is not None else "VERDICT: PASS",
+        call["log_path"])
     return case, library, descriptions
 
 
@@ -75,13 +78,24 @@ def test_skills_per_issue_final_report_is_recorded_in_state_and_pr(
 ):
     from foragent.runner import run_issue
 
-    case, _, _ = issue_skills_case(git_history, tmp_path, monkeypatch)
+    case, library, _ = issue_skills_case(git_history, tmp_path, monkeypatch)
 
     def execute(kwargs):
         case.implement(kwargs)
+        # Keep the legacy parameter values (names/body_line) to retain every node id.
+        # Read evidence is independent of all three possible final reports.
+        events = []
+        for name in ("tone", "polish-x"):
+            path = library / "skills" / name / "SKILL.md"
+            events.append({"type": "item.completed", "item": {
+                "type": "command_execution", "command": f"cat '{path}'",
+                "aggregated_output": path.read_text(), "exit_code": 0, "status": "completed",
+            }})
+        with kwargs["log_path"].open("a") as stream:
+            stream.write("\n".join(json.dumps(event) for event in events) + "\n")
         return "Implemented feature.\n" + report
 
     case.implementer.steps = [execute]
     assert run_issue(1, case.ctx) == "merged"
-    assert case.store.get_run(1).skills_used == names
-    assert body_line in case.tracker.created_prs[0].body.splitlines()
+    assert case.store.get_run(1).skills_used == ["tone", "polish-x"]
+    assert "Skills used: tone, polish-x" in case.tracker.created_prs[0].body.splitlines()

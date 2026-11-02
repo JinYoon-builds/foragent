@@ -17,6 +17,10 @@ MESSAGES = {
         "facts_review_rounds_none": "Review rounds per merged run (last {days} days): none",
         "facts_repeated_class": ("Most repeated finding class: {slug}, {within} repeats within runs, "
                                  "{across} across runs ({issues})"),
+        "facts_spend": "Spend against the size basis (last {days} days): {lanes}",
+        "facts_spend_lane": "{lane} {actual} s / typical {typical} s, rounds {rounds} / typical {typical_rounds}",
+        "facts_scope": ("Scope drift (last {days} days): {count} executions changed files outside declared Files "
+                        "({runs}); unknown {unknown}"),
         "facts_resources": ("Resources (sample age {age}): CPU busy {cpu}, load {load} per CPU, memory {memory}, "
                             "disk {disk}, GitHub API remaining {github}, test-slot queue {queue}, "
                             "executors {executors}"),
@@ -44,6 +48,10 @@ MESSAGES = {
         "facts_review_rounds_none": "머지된 실행의 리뷰 라운드 (최근 {days}일): 없음",
         "facts_repeated_class": ("가장 많이 반복된 지적 종류: {slug}, 실행 안에서 {within}회, "
                                  "실행 사이에서 {across}회 반복 ({issues})"),
+        "facts_spend": "크기 기준 대비 소비 (최근 {days}일): {lanes}",
+        "facts_spend_lane": "{lane} {actual} s / 보통 {typical} s, 라운드 {rounds} / 보통 {typical_rounds}",
+        "facts_scope": ("범위 이탈 (최근 {days}일): 선언한 Files 밖을 바꾼 실행 {count}건 "
+                        "({runs}); 모름 {unknown}건"),
         "facts_resources": ("자원 (시료 {age} 전): CPU 사용 {cpu}, CPU당 부하 {load}, 메모리 {memory}, "
                             "디스크 {disk}, GitHub API 남은 호출 {github}, 시험 자리 대기 {queue}, "
                             "실행기 {executors}"),
