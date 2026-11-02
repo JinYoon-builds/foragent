@@ -35,25 +35,46 @@ def _render_pr_body(attempt: Implementation, try_text: str | None = None) -> str
     pr_scope = ctx.config.review_scope == "pr-body"
     if pr_scope:
         from foragent.run_review import _lane_decisions
-    return run_publish._pr_body(
-        n, attempt.parsed, attempt.checks, ctx.store.get_run(n).attempts, attempt.reviews, try_text, outside_lane=outside,
+    from foragent.run_pr_body import check_values, render_values, review_values, save_values
+
+    opaque_try = attempt.worktree / ".foragent/TRY.md"
+    if try_text is None and opaque_try.is_file():
+        try_text = opaque_try.read_bytes().decode("utf-8", errors="replace")
+    values = dict(summary=_summary(attempt), checks=check_values(attempt.checks),
+        attempt=ctx.store.get_run(n).attempts, reviews=review_values(attempt.reviews),
+        try_text=try_text, outside_lane=outside,
         fallback_model=ctx.store.get_run(n).fallback_model,
         attempt_tiers=ctx.store.get_run(n).attempt_tiers,
         missing_skills=attempt.missing_skills,
         skills_line=run_publish._skills_line(ctx.store.get_run(n)),
-        rebuttals="\n\n".join(attempt.rebuttals),
-        searched=_searched(attempt),
+        rebuttals="\n\n".join(attempt.rebuttals), searched=_searched(attempt),
         review_scope=ctx.config.review_scope, acceptance_dir=ctx.config.acceptance_dir,
         language=ctx.config.language,
         risk_notes=run_publish.review_perspectives.with_checklist(run_publish._risk_notes(attempt), ctx.config) if pr_scope else "",
-        lane_decisions=_lane_decisions(n, ctx, attempt.worktree) if pr_scope else "",
-    )
+        lane_decisions=_lane_decisions(n, ctx, attempt.worktree) if pr_scope else "")
+    save_values(n, ctx, values)
+    return render_values(n, ctx, values)
+
+
+def _summary(attempt: Implementation) -> str:
+    """The implementer's `.foragent/PR.json` summary; without one, the issue title."""
+    import json
+
+    path = attempt.worktree / ".foragent/PR.json"
+    try:
+        summary = json.loads(path.read_bytes())["summary"]
+    except (OSError, ValueError, KeyError, TypeError):
+        summary = None
+    if isinstance(summary, str) and summary.strip():
+        return summary
+    run_publish._append(attempt.log, "No summary in .foragent/PR.json; the PR summary is the issue title.")
+    return attempt.ctx.tracker.get_issue(attempt.n).title
 
 
 def _searched(attempt: Implementation) -> str:
     """The latest `.foragent/SEARCHED.md` the lane wrote, if any."""
     path = attempt.worktree / ".foragent/SEARCHED.md"
-    return path.read_bytes().decode("utf-8", errors="replace").strip() if path.is_file() else ""
+    return path.read_bytes().decode("utf-8", errors="replace") if path.is_file() else ""
 
 
 def _risk_notes(attempt: Implementation) -> str:
@@ -74,11 +95,14 @@ def _risk_always_human(ctx: RunContext) -> list[str]:
 
 
 def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha: str | None = None) -> int:
+    from foragent.run_pr_body import publish_comments
+
     run_publish._check_publication(attempt.git, attempt.target_branch, base_sha)
     pr = attempt.ctx.tracker.find_pr(attempt.branch)
     if pr is None:
         pr = attempt.ctx.tracker.create_pr(head=attempt.branch, base=attempt.target_branch, title=title, body=body)
         attempt.pr_title = title
+        publish_comments(attempt.ctx, pr, body)
     else:
         run_publish._update_open_pr(attempt, pr, title, body)
     run_publish.board.sync_status(attempt.ctx, attempt.n, "PR open")
@@ -92,6 +116,8 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
     issue-derived subject (retitle_for_merge). A base that was not retargeted
     is caught by the final merge inputs, which compare the live PR base.
     """
+    from foragent.run_pr_body import publish_comments
+
     ctx = attempt.ctx
     try:
         ctx.tracker.update_pr(pr, base=attempt.target_branch, title=title, body=body)
@@ -107,12 +133,14 @@ def _update_open_pr(attempt: Implementation, pr: int, title: str, body: str) -> 
             if current is not None and current.title != title:
                 ctx.tracker.update_pr(pr, base=attempt.target_branch, title=current.title, body=body)
                 attempt.pr_title = current.title
+                publish_comments(ctx, pr, body)
         except run_publish.TrackerError as retry:
             if retry.is_rate_limit:
                 raise
             run_publish._append(attempt.log, f"PR #{pr} refresh under its current title failed: {retry}")
     else:
         attempt.pr_title = title
+        publish_comments(ctx, pr, body)
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
