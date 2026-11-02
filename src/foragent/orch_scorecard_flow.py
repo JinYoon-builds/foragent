@@ -93,7 +93,7 @@ def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[I
     """Approved, ready and open at ``moment``, not held by a label or a plan pause in ``pauses``.
 
     ``facts=True`` is facts' waiting list: no open-blocker rule and facts' labels."""
-    if not facts and any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
+    if not facts and any((a is None or a <= moment) and (b is None or moment < b) for a, b in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
         return False
     labels = (_facts_labels_at if facts else _labels_at)(issue, moment)
     return ({"approved", "ready"} <= labels and not labels & HOLDING
@@ -117,7 +117,7 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     for issue in issues.values():
         points.update(at for at, _, _ in issue["events"])
         points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"], issue["updated_at"],
-                                    *issue["blocked_until"]) if at is not None)
+                                    *(at for span in issue["blocked_until"] for at in span)) if at is not None)
     ordered = sorted(moment for moment in points if start <= moment <= now)
     idle, run_idle, test_idle = [0.0] * days, [0.0] * days, [0.0] * days
     for low, high in zip(ordered, ordered[1:]):

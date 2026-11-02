@@ -10,8 +10,9 @@ Facts and the part they name:
 
 * ``activity`` records, by their recorded cause: ``initial`` is work; ``base-changed``,
   ``group-failed`` and ``file-overlap`` are concurrency cost; ``queue`` is waste.
-* Phase events: the first implementing, reviewing, checking, ci or merging phase of the
-  interval is work (later ones need an activity cause); an overlap wait is concurrency cost.
+* Phase events, only where no recorded fact covers the time: the first implementing,
+  reviewing, checking, ci or merging phase of the interval is work (later ones need an
+  activity cause); an overlap wait is concurrency cost.
 * ``ready`` records, from each record to the issue's next ready record or run start:
   ``slots-full`` with merge waiters holding slots is waste, without them and with the
   measured occupancy at the limit it is machine limit; ``free-slot`` and ``held-no-retry``
@@ -25,6 +26,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+from foragent import orch_scorecard_history as history
 from foragent.orch_facts_resources import _time
 from foragent.orch_scorecard_records import Interval, approval_before
 from foragent.state import StateStore
@@ -66,16 +68,10 @@ def _ready_facts(records: list[dict[str, Any]], starts: list[datetime], end: dat
 
 
 def _ordering_facts(records: list[dict[str, Any]], end: datetime) -> list[tuple[Interval, str]]:
-    """Recorded open dependencies, each from its record until a later record shows none."""
+    """Recorded open dependencies, each until a later record read the edges again (one shared reader)."""
     rows = [(at, record["data"]) for record in records if record["kind"] == "issue-state"
             and (at := _time(record["at"])) is not None]
-    facts = []
-    for index, (at, data) in enumerate(rows):
-        edges = data.get("blocked_by")
-        if isinstance(edges, list) and any(isinstance(edge, dict) and edge.get("state") == "open" for edge in edges):
-            stop = rows[index + 1][0] if index + 1 < len(rows) else end
-            facts.append(((at, stop), "ordering"))
-    return facts
+    return [((start, end if stop is None else stop), "ordering") for start, stop in history.blocked_spans(rows)]
 
 
 def _activity_facts(records: list[dict[str, Any]]) -> list[tuple[Interval, str]]:
@@ -102,13 +98,18 @@ def _phase_facts(phases: list[tuple[str, Interval]], approved: datetime) -> list
     return facts
 
 
-def split(approved: datetime, merged: datetime, facts: list[tuple[Interval, str]]) -> dict[str, float]:
-    """Minutes of [approved, merged] per part; a piece covered by no part or several is unknown."""
-    points = sorted({approved, merged, *(moment for (a, b), _ in facts for moment in (a, b)
+def split(approved: datetime, merged: datetime, facts: list[tuple[Interval, str]],
+          inferred: list[tuple[Interval, str]] = ()) -> dict[str, float]:
+    """Minutes of [approved, merged] per part; a piece covered by no part or several is unknown.
+
+    ``inferred`` parts (from phase names alone) explain only pieces no recorded fact covers:
+    recorded provenance decides, so a recheck's cause is never contradicted by its phase name."""
+    points = sorted({approved, merged, *(moment for (a, b), _ in (*facts, *inferred) for moment in (a, b)
                                          if approved < moment < merged)})
     parts = dict.fromkeys((*PARTS, "unknown"), 0.0)
     for low, high in zip(points, points[1:]):
         named = {part for (a, b), part in facts if a <= low and high <= b}
+        named = named or {part for (a, b), part in inferred if a <= low and high <= b}
         parts[named.pop() if len(named) == 1 else "unknown"] += (high - low).total_seconds() / 60
     return parts
 
@@ -135,9 +136,9 @@ def windows(store: StateStore, now: datetime, days: int, issues: dict[int, dict[
             continue
         own = [record for record in records if record["issue"] == number]
         starts = [row["started"] for row in executions if row["number"] == number]
-        facts = (_activity_facts(own) + _ready_facts(own, starts, merged) + _ordering_facts(own, merged)
-                 + _phase_facts([(phase, span) for issue, phase, span in phases if issue == number], approved))
-        parts = split(approved, merged, facts)
+        facts = _activity_facts(own) + _ready_facts(own, starts, merged) + _ordering_facts(own, merged)
+        parts = split(approved, merged, facts,
+                      _phase_facts([(phase, span) for issue, phase, span in phases if issue == number], approved))
         window["merges"] += 1
         window["total_minutes"] += (merged - approved).total_seconds() / 60
         for part, minutes in parts.items():

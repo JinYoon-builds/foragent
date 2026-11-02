@@ -6,7 +6,7 @@ from datetime import datetime
 import json
 from typing import Any
 
-from foragent import capacity
+from foragent import capacity, orch_scorecard_history as history
 from foragent.labels import issue_lane
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.state import StateStore
@@ -204,7 +204,7 @@ def _inside(spans: list[Interval], moment: datetime) -> bool:
 
 
 def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
-                rows: dict[int, dict[str, Any]] | None = None) -> dict[str, Any] | None:
+                rows: dict[int, dict[str, Any]] | None = None, past: list | None = None) -> dict[str, Any] | None:
     """What the idle and lead-time rules need to know about one local issue."""
     events = sorted(((at, item.get("label"), item.get("action"))
                      for item in ((row.get("reads") or {}).get("label_events") or {}).get("value") or []
@@ -213,16 +213,20 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
     approval = store.load_approval(row["number"])
     approved_at = _time(approval.approved_at) if approval else None
     closed = row.get("state") != "open"
-    # A blocker blocks while open: an open one throughout (None), a merged one until its merge;
-    # a closed one with no recorded close time leaves no evidence that it blocked.
-    blocked_until = []
+    # A blocker blocks while open: an open one throughout, a merged one until its merge; a closed
+    # one with no recorded close time leaves no evidence. Retained edge history replaces these
+    # current edges from its first record, so a later edge never rewrites earlier minutes.
+    blocked_until: list[history.Span] = []
     for item in row.get("blocked_by") or []:
         if not isinstance(item, dict):
             continue
         if item.get("state") != "closed":
-            blocked_until.append(None)
+            blocked_until.append((None, None))
         elif (merged := _time(((rows or {}).get(item.get("number")) or {}).get("merged_at"))) is not None:
-            blocked_until.append(merged)
+            blocked_until.append((None, merged))
+    if (since := history.first_edges(past or [])) is not None:
+        blocked_until = [(None, since if until is None else min(until, since)) for _, until in blocked_until]
+        blocked_until += history.blocked_spans(past or [])
     flag = store.load_flag(row["number"])
     return {"events": events, "approved_at": approved_at, "labels": set(row.get("labels") or ()),
             "open_until": (_time(row.get("merged_at")) if closed else None), "closed": closed,
@@ -234,8 +238,11 @@ def _issue_view(store: StateStore, row: dict[str, Any], lanes: dict,
 def _issues(store: StateStore, lanes: dict) -> dict[int, dict[str, Any]]:
     rows = {row["number"]: row for row in store.local_issues()}
     running = {run.number for run in store.active_runs() if run.status == "running"}
+    past = history.records(store)
     views = {number: view for number, row in rows.items()
-             if (view := _issue_view(store, row, lanes, rows)) is not None}
+             if (view := _issue_view(store, row, lanes, rows, past.get(number))) is not None}
+    # An issue that closed and left the listing keeps the history it recorded.
+    views |= {number: history.view(store, number, facts, lanes) for number, facts in past.items() if number not in rows}
     for number, view in views.items():
         view["running"] = number in running  # An active run record, for the removed-approval rule.
     return views
