@@ -56,7 +56,7 @@ pnpm test -- auth
 init이 소유하고 까는 것:
 - 라벨 세트(3번 표)
 - **이슈 템플릿 / Issue Form** (1번 형식). 형식의 주인이 gate이므로 템플릿도 gate가 깐다. order은 이 템플릿을 읽어서 맞춰 쓴다.
-- `.foragent.yml` 기본값: `review`(fast|batch|careful, 경로별 덮어쓰기 가능), `always_human`, `executor`(codex|claude), `notify`(프로젝트 오케스트레이터의 창구), `run_hours`(기본 always)
+- `.foragent.yml` 기본값: `review`(fast|careful, 경로별 덮어쓰기 가능), `always_human`, `executor`(codex|claude), `notify`(프로젝트 오케스트레이터의 창구), `run_hours`(기본 always)
 - 그 프로젝트용 launchd 작업 하나 (프로젝트당 스케줄러 하나)
 
 order의 빈 폴더 셋업은 저장소·칸반을 만든 뒤 `foragent init` 한 번만 부르고, yml을 직접 쓰지 않는다. 설정을 바꾸고 싶으면 init 옵션으로 넘긴다.
@@ -145,5 +145,3 @@ nightshift 두 저장소 조사 결과는 [research/nightshift-scan-raw.md](rese
 | `always-human-path` / `acceptance-touched` / `risk-high` | 자동 머지 금지 경로·표시 | 검토 |
 | `retries-exceeded` / `stalled` / `timeout` | 기술 실패 (timeout = 너무 큼, 쪼개기 추천) | 기술 실패 (정보 + 추천) |
 | `no-machine-check` | Done when 코드 블록 없음 (승격 거부) | 결정 (order로 되돌림) |
-
-**8-5. batch 묶음 = 부모 이슈(Epic).** order가 부모 이슈로 묶은 자식들이 한 묶음이다. 브랜치 `foragent/batch-<부모#>`. 묶음 브랜치에 머지된 자식 이슈는 gate가 직접 닫는다(기본 브랜치가 아니라 `Closes #N`이 동작하지 않음). 자식이 다 닫히면 gate가 묶음 → main PR을 연다.

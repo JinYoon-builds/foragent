@@ -37,7 +37,7 @@ def test_merge_group_max_error_names_both_forms(repo, value):
 
 def test_exact_defaults(repo):
     expected = {
-        "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
+        "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
@@ -128,14 +128,14 @@ def test_merge_order_and_nested_mapping_replacement(repo, tmp_path):
         "review_paths": {"global/**": "careful"}, "approvers": ["global-user"],
     })
     write_settings(repo / ".foragent.yml", {
-        "review": "fast", "review_paths": {"local/**": "batch"},
+        "review": "fast", "review_paths": {"local/**": "fast"},
         "approvers": ["local-user"], "executor_model": None,
     })
     config = load_config(repo, global_path)
     assert config.review == "fast"
     assert config.executor == "claude"
     assert config.executor_model is None
-    assert config.review_paths == {"local/**": "batch"}
+    assert config.review_paths == {"local/**": "fast"}
     assert config.approvers == ["local-user"]
     assert config.max_retries == 2
 
@@ -287,7 +287,7 @@ def test_retired_floor_keys_are_accepted_and_ignored(repo, tmp_path, source, val
 
 def test_all_valid_overrides(repo):
     settings = {
-        "review": "careful", "review_paths": {"app/**": "fast", "lib/**": "batch"},
+        "review": "careful", "review_paths": {"app/**": "fast", "lib/**": "careful"},
         "always_human": ["auth/**"], "executor": "claude", "reviewer": "codex",
         "executor_model": "implementation-model", "reviewer_model": "review-model",
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],

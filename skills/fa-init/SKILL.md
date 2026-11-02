@@ -14,8 +14,7 @@ description: Set up a project folder for Foragent.
 
 2. At first use, ask only these configuration questions: merge (review) mode, then Claude quota
    mode. Use AskUserQuestion (or the available question tool), recommendation first:
-   - batch (recommended): group completed work for human review.
-   - fast: merge passing work automatically unless a human review rule applies.
+   - fast (recommended): merge passing work automatically unless a human review rule applies.
    - careful: require human review of each task before merging.
    On a re-run, skip a question whose key is already set in its own scope file
    ([settings](references/settings.md)). Leave the executor to the config default.
