@@ -10,7 +10,7 @@ def add(commands) -> None:
     init = commands.add_parser("init", help="Set up this repository for Foragent")
     init.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     init.add_argument("--approver", nargs="+", action="extend", dest="approvers")
-    init.add_argument("--review", choices=("fast", "batch", "careful"))
+    init.add_argument("--review", choices=("fast", "careful"))
     init.add_argument("--executor", choices=("codex", "claude"))
     init.add_argument("--run-hours")
     init.add_argument("--language")
