@@ -20,10 +20,10 @@ def test_note_journals_each_named_issue_once_and_keeps_earlier_responses(tmp_pat
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     assert acknowledged_at(store, 1) is None
     orch_inbox.write_note(store, "Diagnosed #1", "#2 reproduces on main; #1 waits", "Wait for #3", {})
-    events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
-    assert [(event["issue"], event["kind"]) for event in events] == [
-        (1, "acknowledged"), (2, "acknowledged"), (3, "acknowledged"),
-    ]
+    rows = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    events = [event for event in rows if event["kind"] == "acknowledged"]
+    assert [event["issue"] for event in events] == [1, 2, 3]
+    assert [event["kind"] for event in rows] == ["acknowledged"] * 3 + ["note"]
     assert all(event["summary"] == "Diagnosed #1 #2 reproduces on main; #1 waits Wait for #3"
                for event in events)
     first = clock[0]
@@ -35,7 +35,36 @@ def test_note_journals_each_named_issue_once_and_keeps_earlier_responses(tmp_pat
     assert acknowledged_at(store, 4) is None
     latest = orch_inbox.write_note(store, "General monitoring", None, None, {})
     assert orch_inbox.read_note(store) == latest
-    assert len((store.root / "orch-events.jsonl").read_text().splitlines()) == 4
+    rows = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert len([event for event in rows if event["kind"] == "acknowledged"]) == 4
+    assert len([event for event in rows if event["kind"] == "note"]) == 3
+
+
+def test_a_note_event_keeps_its_fields_as_given_on_one_journal_line(store):
+    text = "first\nsecond\u2028third\x85fourth\u2029fifth"
+    orch_inbox.write_note(store, text, "why\nit", "next", {"kind": "tmux", "pane": "%1"}, retrospective=True)
+    orch_inbox.write_note(store, "Status", None, None, {"kind": "terminal"})
+    raw = (store.root / "orch-events.jsonl").read_text(encoding="utf-8")
+    assert len(raw.splitlines()) == 2, "A separator in a note must not split the record for any reader"
+    marked, plain = [json.loads(line) for line in raw.splitlines()]
+    assert (marked["kind"], marked["now"], marked["why"], marked["next"], marked["where"], marked["retrospective"]) == (
+        "note", text, "why\nit", "next", {"kind": "tmux", "pane": "%1"}, True)
+    assert plain["kind"] == "note" and plain["why"] is None and "retrospective" not in plain
+    assert orch_inbox.read_note(store)["now"] == "Status", "The latest note stays the projection"
+
+
+def test_a_failed_note_appends_no_event(store, monkeypatch):
+    with pytest.raises(InboxError):
+        orch_inbox.write_note(store, " ", None, None, {}, retrospective=True)
+    assert not (store.root / "orch-events.jsonl").exists()
+
+    def broken(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_json", broken)
+    with pytest.raises(OSError):
+        orch_inbox.write_note(store, "Lessons", None, None, {}, retrospective=True)
+    assert not (store.root / "orch-events.jsonl").exists()
 
 
 def test_requests_keep_order_and_pending_hides_done(store):
