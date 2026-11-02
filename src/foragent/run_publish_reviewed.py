@@ -64,16 +64,20 @@ def _publish_reviewed_head(
 ) -> str:
     # The review-only merge takes the same FIFO turn as an implementation run (#712).
     place = run_publish.merge_turn.seat(ctx, n, pr.base)
-    outcome = None
+    outcome = error = None
     try:
         outcome = run_publish._publish_reviewed_in_turn(
             n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
             place, comparison_attempt=comparison_attempt, reverify=reverify,
         )
         return outcome
+    except BaseException as exc:
+        error = exc
+        raise
     finally:
         if outcome != "merged":
-            run_publish.merge_turn.withdraw(ctx, place)
+            run_publish.merge_turn.withdraw(ctx, place, reason="publish-stopped",
+                                            detail=run_publish.merge_turn.stopped_detail(outcome, error))
 
 
 def _publish_reviewed_in_turn(
@@ -88,6 +92,7 @@ def _publish_reviewed_in_turn(
     ``reverify`` or on a conflict it stops as base-changed.
     """
     from foragent import run_group_check, run_group_ci, run_group_evidence, runner
+    from foragent.run_waits import activity
 
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -110,10 +115,14 @@ def _publish_reviewed_in_turn(
     if stopped := unchanged():
         return stopped
 
-    def refresh(target_sha: str) -> str | None:
+    ci_cause = "initial"
+
+    def refresh(target_sha: str, cause: str | None = None) -> str | None:
         """Merge the moved base into the reviewed head, re-verify and push it."""
-        nonlocal head, base_sha, started, ci_wait, queued_status
-        head, stopped = run_publish._refresh_reviewed_head(n, ctx, git, pr, head, target_sha, reverify)
+        nonlocal head, base_sha, started, ci_wait, queued_status, ci_cause
+        ci_cause = cause or run_group_check.refresh_cause(ctx, n)
+        with activity(n, ctx, "base-refresh", ci_cause):
+            head, stopped = run_publish._refresh_reviewed_head(n, ctx, git, pr, head, target_sha, reverify)
         if stopped:
             return stopped
         base_sha = target_sha
@@ -157,11 +166,13 @@ def _publish_reviewed_in_turn(
 
     while True:
         run_publish._phase(n, ctx, "ci")
-        if stopped := run_publish._wait_for_ci(
-            n, ctx, git, pr.number, head, started, ci_wait,
-            lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
-            comparison_mode=comparison_attempt is not None,
-        ):
+        with activity(n, ctx, "ci", ci_cause):
+            stopped = run_publish._wait_for_ci(
+                n, ctx, git, pr.number, head, started, ci_wait,
+                lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,
+                comparison_mode=comparison_attempt is not None,
+            )
+        if stopped:
             return stopped
         waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number)
         if stopped:
@@ -182,7 +193,7 @@ def _publish_reviewed_in_turn(
             comparison = run_group_ci.evidence(view, head, base_sha)
             if comparison is None and reused_base == base_sha:
                 reused_base = None
-                if stopped := refresh(base_sha):
+                if stopped := refresh(base_sha, "group-failed"):
                     return stopped
                 continue
         if comparison is None and comparison_attempt is not None:

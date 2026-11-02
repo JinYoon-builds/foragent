@@ -739,3 +739,46 @@ def test_a_stopping_run_never_queues_for_a_machine_slot(tmp_path, monkeypatch, p
     run = ctx.store.get_run(2)
     assert run.status == "running" and run.waiting_until is None and run.pause_regions == {}
     assert [row["event"] for row in rows(ctx) if row["n"] == 2][-1] == "withdrawn"
+
+
+def _flow(ctx, kind):
+    return [row for row in ctx.store.flow_records() if row["kind"] == kind]
+
+
+def test_withdrawal_records_cause_once_and_legacy_callers_stay_unknown(tmp_path):
+    ctx = make_ctx(tmp_path, 1)
+    place = turn.seat(ctx, 1, "main")
+    turn.withdraw(ctx, place, reason="never-held")
+    assert _flow(ctx, "merge-withdrawal") == []
+
+    turn.join(ctx, place, "head")
+    turn.withdraw(ctx, place, reason="remote-ended", detail="PR #2 ended")
+    turn.withdraw(ctx, place, reason="remote-ended", detail="PR #2 ended")
+    turn.join(ctx, place, "head")
+    turn.withdraw(ctx, place)
+
+    rows = _flow(ctx, "merge-withdrawal")
+    assert [(row["data"]["reason"], row["data"]["detail"]) for row in rows] == [
+        ("remote-ended", "PR #2 ended"), ("unknown", None)]
+    assert all(row["issue"] == 1 and row["run_started_at"] == place.started_at for row in rows)
+
+
+def test_queue_standing_and_retry_spacing_are_separate_activities(tmp_path):
+    ctx = make_ctx(tmp_path, 1)
+    ctx.sleep = lambda seconds: ctx.clock.__setitem__(0, ctx.clock[0] + timedelta(seconds=seconds))
+    ctx.tracker = SimpleNamespace(get_issue=lambda n: SimpleNamespace(state="open"))
+    ctx.store.update_run(1, phase="ci")
+    with turn._merge_wait(1, ctx) as credit:
+        ctx.sleep(30)
+        credit()
+    place = turn.seat(ctx, 1, "main")
+    turn.join(ctx, place, "head")
+    turn.rejoin_after_failed_merge(1, ctx, place, RuntimeError("refused"))
+
+    rows = _flow(ctx, "activity")
+    assert [(row["data"]["activity"], row["data"]["cause"]) for row in rows] == [
+        ("merge-lock-wait", "queue"), ("merge-retry-pause", "merge-refused")]
+    first = rows[0]["data"]
+    assert first["started_at"] == NOW.isoformat()
+    assert first["finished_at"] == (NOW + timedelta(seconds=30)).isoformat()
+    assert rows[0]["run_started_at"] == ctx.store.get_run(1).started_at

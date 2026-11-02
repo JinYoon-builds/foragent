@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent import order_replaces
 from foragent.config import Config
@@ -690,6 +690,7 @@ class _Publication:
     owner: str | None
     reviewed_bases: dict[str, dict]
     closures: dict[int, list[str]] = field(default_factory=dict)
+    collected: order_collect.Collected | None = None
 
     @property
     def own(self) -> set[int]:
@@ -764,7 +765,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
             approve: bool = False, approve_keys: list[str] | None = None,
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             check_owner: bool = True, retained_files: dict[str, str] | None = None,
-            git: GitRepo | None = None, refreshed: bool = False, landed: bool = False) -> "_Publication":
+            git: GitRepo | None = None, refreshed: bool = False, landed: bool = False,
+            collected: order_collect.Collected | None = None) -> "_Publication":
     try:
         files = (validate_plan(plan, root, config) if retained_files is None else
                  validate_plan(plan, root, config, retained_files=retained_files))
@@ -814,9 +816,13 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
+    # A commit that already landed has no write left to protect. Everything else, dry runs and
+    # deferred orders included, must collect on the base it would land on.
+    if not landed and collected is None:
+        collected = order_collect.check(plan, files, root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures)
+                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected)
     if landed:
         # A resumed batch commit passed the gates below before its intent was recorded, and later
         # commits (its own too) must not reopen them: only its issue effects remain.
@@ -853,7 +859,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures, collected)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -887,7 +893,9 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     owner = publication.owner
     with order_reviewed.publication_gate(repo):
         with git.publish_lock():
-            git.update_base(config.base_branch)
+            # The base is collected before the checkout moves, and the checkout moves only onto it.
+            collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected)
+            order_collect.land(git, config.base_branch, collected.commit if collected else None)
             # A preparation that started or finished since the first checks is visible now, and none
             # can start until this publication's issues are written: it claims them under the gate.
             listed = tracker.list_issues()
@@ -1387,7 +1395,8 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
 
 def preread(plan: dict, root: Path, config: Config,
-            tracker: Callable[[], Tracker] | None = None, repo: str | None = None) -> list[dict]:
+            tracker: Callable[[], Tracker] | None = None, repo: str | None = None,
+            git: GitRepo | None = None) -> list[dict]:
     """Ask each issue's implementer, read-only, for its unknowns and record them by content.
 
     Existing children and edits expose their current GitHub fields to the reader.
@@ -1421,6 +1430,8 @@ def preread(plan: dict, root: Path, config: Config,
         # A generic reader is not the lane's implementer; record nothing rather than false evidence.
         raise PlanError(f"cannot preread issue(s) {', '.join(waiting)}: new lane(s) {', '.join(lanes)} "
                         f"do not exist yet; {NEW_LANE_STEPS}")
+    # An order that cannot publish gets no reader and no recorded answer.
+    order_collect.check(plan, published, root, config, git)
     # Local evidence stays in real directories; a planted symlink must not redirect writes.
     directory = order_references.real_directory(root, ".foragent")
     logs = order_references.real_directory(root, ".foragent/preread-logs")
