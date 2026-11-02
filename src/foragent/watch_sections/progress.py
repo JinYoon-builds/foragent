@@ -128,19 +128,24 @@ def machine_stores(store: Any) -> list[Any]:
     return stores
 
 
-def learned(stores: Iterable[Any], now: datetime) -> dict[str, list[float]]:
-    """Seconds from start to merge of each size's last runs merged within the window."""
-    samples: dict[str, list[tuple[datetime, float]]] = {size: [] for size in SIZES}
+def merged_samples(stores: Iterable[Any], now: datetime) -> dict[str, list[tuple[Any, int, datetime, float]]]:
+    """Each size's last runs merged within the window: (store, number, started, seconds), oldest first."""
+    samples: dict[str, list[tuple[datetime, Any, int, datetime, float]]] = {size: [] for size in SIZES}
     for store in stores:
         try:
             work = merged_work(store)
         except (OSError, ValueError, KeyError, TypeError):
             continue  # An unreadable repository must not take the estimate down.
-        for _, size, start, end in work:
+        for number, size, start, end in work:
             if now - LEARN_WINDOW <= end <= now and end >= start:
-                samples[size].append((end, (end - start).total_seconds()))
-    return {size: [seconds for _, seconds in sorted(items, key=lambda item: item[0])[-LEARN_LAST:]]
+                samples[size].append((end, store, number, start, (end - start).total_seconds()))
+    return {size: [item[1:] for item in sorted(items, key=lambda item: item[0])[-LEARN_LAST:]]
             for size, items in samples.items()}
+
+
+def learned(stores: Iterable[Any], now: datetime) -> dict[str, list[float]]:
+    """Seconds from start to merge of each size's last runs merged within the window."""
+    return {size: [item[3] for item in items] for size, items in merged_samples(stores, now).items()}
 
 
 def expected(seconds: list[float], size: str) -> tuple[float, float, float, int | None]:

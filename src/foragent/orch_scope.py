@@ -11,7 +11,6 @@ import re
 
 from foragent.i18n import text
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, parse_orderer, require_owned
-from foragent.scheduler_config import ownership_config
 from foragent.tracker import Issue, RecordingTracker, TrackerError, pr_issue_number
 
 ISSUE_VERBS = frozenset({"stop", "retry", "park", "unpark", "resolve", "rerun-review", "escalate"})
@@ -188,10 +187,8 @@ class Scope:
             return None
         if number not in self._decisions:
             issue = self._issues.get(number)
-            config = ownership_config(getattr(self._ctx, "store", None), self._ctx.config)
-            if config is None:  # None refuses: an invalid team config cannot authorize the singleton path.
-                self._decisions[number] = _unreadable(self._ctx, number, Unresolved("the committed team config is invalid"))
-            elif issue is None and getattr(config, "legacy_owner", None) is not None:
+            config = self._ctx.config
+            if issue is None and getattr(config, "legacy_owner", None) is not None:
                 self._decisions[number] = _unreadable(self._ctx, number, Unresolved("issue absent from snapshot"))
             elif (issue := issue or local_issue(getattr(self._ctx, "store", None), number)) is None or singleton(issue, config):
                 # No team setting keeps the singleton's path, unless a stored row names an owner.
@@ -352,6 +349,17 @@ def refuse_verb(ctx, action: str, number: int | None) -> str | None:
     # Stop has local entry facts. Other verbs supply _issue's existing read;
     # merge supplies its title read at the remote preflight, after its checks and wait.
     return check(ctx, number) if action == "stop" else None
+
+
+def push_refusal(ctx, number: int) -> str | None:
+    """Pushing an issue's branch changes it: refused without a snapshot (a failed read) or for another person."""
+    snapshot = scope(ctx)
+    if snapshot._unread:
+        return _unreadable(ctx, number, Unresolved("no ownership snapshot after a failed read"))
+    try:
+        return snapshot.for_effect(number, ctx.tracker)
+    except Exception as exc:
+        return _unreadable(ctx, number, exc)
 
 
 def may_change(ctx, number: int) -> bool:

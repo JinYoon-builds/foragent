@@ -76,12 +76,14 @@ def test_singleton_cli_stop_kills_and_keeps_wip_before_any_unavailable_read(
     run = case.store.get_run(1)
     assert (run.status, run.outcome, run.detail) == ("finished", "stopped", why)
     assert len([run for run in case.store.read_history() if run.outcome == "stopped"]) == 1
-    if paused:
-        # An existing GitHub wait deliberately leaves the WIP on the local branch.
+    if paused or not cached:
+        # A GitHub wait, or an unknown issue whose read failed, leaves the WIP on the local branch only:
+        # no push without a snapshot that shows the issue (#1004, the Split paragraph).
         head = git_command(case.root, "rev-parse", BRANCH)
         assert _tree(case.root, head) == _expected_tree(case)
         assert git_command(case.root, "rev-list", "--count", f"{case.base}..{head}") == "1"
         assert why in git_command(case.root, "log", "-1", "--format=%B", head)
+        assert git_command(case.history.origin, "branch", "--list", BRANCH) == "", "No push without a snapshot"
     else:
         _assert_saved(case, why)
     # Shared-label repair can still fail, as on main; the stop must already be complete.

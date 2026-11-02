@@ -137,6 +137,19 @@ def holds_turn(store: StateStore, place: Seat) -> bool:
     return False
 
 
+def holds_run_turn(store: StateStore, n: int) -> bool:
+    """Whether the running execution of issue ``n`` holds the merge turn of any target.
+
+    ``holds_turn`` alone reads each queue, so a row that names no target counts here as it does
+    there: ``None`` stands for every target no row names, where only such rows wait.
+    """
+    run = store.get_run(n)
+    if run is None:
+        return False
+    targets = {row.get("target") for row in _rows(store)}
+    return any(holds_turn(store, Seat(n, run.started_at, target)) for target in targets)
+
+
 def record_turn(ctx: RunContext, place: Seat, base_sha: str, result: str) -> None:
     """Only the turn holder writes this: one record per merge try."""
     with ctx.store._state_lock():

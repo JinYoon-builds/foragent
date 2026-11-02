@@ -184,12 +184,7 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
         other.start_run(90, branch="other", worktree="other", pid=os.getpid())
 
     def sleep(seconds):
-        assert ctx.store.get_run(5).phase == "ci"
-        assert captured == ran == []
-        assert capacity.machine_runs(ctx.store, ctx.now()) == 1
-        sleeps.append(seconds)
-        clock[0] += timedelta(seconds=seconds)
-        other.finish_run(90, outcome="merged")
+        pytest.fail("The leader holds the merge turn: a full machine must not queue it")
 
     monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
     monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
@@ -200,7 +195,7 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
         captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
     def combine(git, base, members):
         assert ctx.store.get_run(5).phase == "checking"
-        assert capacity.machine_runs(ctx.store, NOW) == 1
+        assert capacity.machine_runs(ctx.store, NOW) == (2 if blocked else 1), "Local work counts exactly once"
         return "combined"
 
     monkeypatch.setattr(group, "_combine", combine)
@@ -208,8 +203,8 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
 
     def check(command, worktree, log, limit, **kwargs):
-        assert ctx.store.get_run(5).phase == "checking", "Every joint command needs the leader's slot"
-        assert capacity.machine_runs(ctx.store, NOW) == 1
+        assert ctx.store.get_run(5).phase == "checking", "Every joint command counts as the leader's work"
+        assert capacity.machine_runs(ctx.store, NOW) == (2 if blocked else 1)
         ran.append((command, limit, kwargs.get("clock")))
         return CheckResult(command, 0, timed_out and "tests/acceptance/" in command, "")
 
@@ -231,8 +226,8 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
     assert orch_events.has_event(ctx.store, 5, "group-check", passed=not timed_out,
                                  verdict="void" if timed_out else "passed")
     assert ctx.store.get_run(5).phase == "ci"
-    assert capacity.machine_runs(ctx.store, NOW) == 0
-    assert sleeps == ([capacity.WORKLOAD_POLL_SECONDS] if blocked else [])
+    assert capacity.machine_runs(ctx.store, NOW) == (1 if blocked else 0), "The check gives its slot back"
+    assert sleeps == []
 
 
 @pytest.mark.parametrize("conflict_index", [0, 1, 2])

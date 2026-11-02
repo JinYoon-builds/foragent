@@ -1,24 +1,32 @@
-"""Review rounds and repeated finding classes for `fa orch facts`.
+"""Review rounds, repeated finding classes, spend and scope drift for `fa orch facts`.
 
 Reads the review artifacts the runner saved (``runs/issue-N/review-K.txt``) from the
 frozen snapshot. Each artifact belongs to the latest execution of its issue that had
 started by the file's modification time. Classes come only from the reviewer's
 ``class: <slug>`` line under a finding (or a ``class`` field of a JSON finding);
 nothing is inferred from the finding's wording.
+
+Spend compares each execution with the ETA's current size basis (progress.merged_samples),
+not an estimate stored at approval. Scope drift compares its captured file sets by the
+gate's own path rule. Both publish raw values and arithmetic only; unknown stays null.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from glob import escape
+from pathlib import Path
 import re
 from statistics import median
+from types import SimpleNamespace
 from typing import Any
 
-from foragent import review_notes
+from foragent import orch_facts_machine, review_notes
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_review
 from foragent.state import StateStore
+from foragent.watch_sections import progress
 
 UNCLASSIFIED = "unclassified"
 TOP_RUNS = 5
@@ -155,6 +163,151 @@ def attach(store: StateStore, executions: list, rows: list[dict[str, Any]]) -> d
                                         "review_rounds": row["review_rounds"]} for row in top]},
         "finding_classes": finding_classes,
     }
+
+
+def recorded_rounds(store: StateStore) -> dict[tuple[int, datetime], int]:
+    """Usable reviewer rounds per (issue, execution start). No reviewer record at all: absent, so unknown."""
+    starts: dict[int, list[datetime]] = {}
+    for run in [*store.read_history(), *store.active_runs()]:
+        if run.kind == "issue" and (at := _time(run.started_at)) is not None:
+            starts.setdefault(run.number, []).append(at)
+
+    def owner(number: int, at: datetime) -> tuple[int, datetime] | None:
+        start = max((item for item in starts.get(number, []) if item <= at), default=None)
+        return None if start is None else (number, start)
+
+    rounds: dict[tuple[int, datetime], int] = {}
+    for (number, _), events in _recorded(store).items():
+        for at, _ in events:
+            if (key := owner(number, at)) is not None:
+                rounds.setdefault(key, 0)
+    for number, artifacts in _artifacts(store).items():
+        for modified, _, _ in artifacts:
+            if (key := owner(number, modified)) is not None:
+                rounds[key] = rounds.get(key, 0) + 1
+    return rounds
+
+
+def _ratio(value: float | None, basis: float | None) -> float | None:
+    return value / basis if value is not None and basis else None
+
+
+def _size_basis(stores: list[StateStore], now: datetime) -> dict[str, dict[str, Any]]:
+    """Each size's typical seconds and rounds from one population of merged samples."""
+    rounds = {}
+    for store in stores:
+        try:
+            rounds[store.root] = recorded_rounds(store)
+        except (OSError, ValueError, KeyError, TypeError):
+            rounds[store.root] = {}  # As in the ETA: an unreadable repository adds no rounds.
+    basis = {}
+    for size, samples in progress.merged_samples(stores, now).items():
+        _, typical, _, runs = progress.expected([seconds for *_, seconds in samples], size)
+        known = [count for store, number, start, _ in samples
+                 if (count := rounds[store.root].get((number, start))) is not None]
+        enough = len(known) >= progress.LEARN_MIN
+        basis[size] = {"typical_seconds": typical, "basis_runs": runs,
+                       "typical_rounds": median(known) if enough else None,
+                       "rounds_basis_runs": len(known) if enough else None}
+    return basis
+
+
+def _spend(row: dict[str, Any], size: str | None, actual_rounds: int | None, basis: dict[str, dict[str, Any]],
+           as_of: str) -> dict[str, Any]:
+    typical = basis.get(size) or dict.fromkeys(("typical_seconds", "basis_runs", "typical_rounds", "rounds_basis_runs"))
+    return {
+        "size": size, "actual_seconds": row["runtime_seconds"], "actual_rounds": actual_rounds, **typical,
+        "runtime_ratio": _ratio(row["runtime_seconds"], typical["typical_seconds"]),
+        "rounds_ratio": _ratio(actual_rounds, typical["typical_rounds"]), "as_of": as_of,
+        "source": None if size is None else "merged_runs" if typical["basis_runs"] is not None else "size_default",
+    }
+
+
+def _scope_drift(run: Any, sensitive: bool | None) -> dict[str, Any]:
+    """Captured file sets; a set recorded before capture existed is unknown (null), never compliant."""
+    from foragent.overlap_files import any_overlap
+
+    declared = None if run.declared_files is None else list(dict.fromkeys(run.declared_files))
+    changed = None if run.changed_files is None else list(dict.fromkeys(run.changed_files))
+    outside = None
+    if declared is not None and changed is not None:
+        ctx = SimpleNamespace(case_sensitive=sensitive)
+        outside = [path for path in changed if not any_overlap(ctx, [escape(path)], declared)]
+    return {"declared": declared, "changed": changed, "outside_declared": outside}
+
+
+def _sum(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [row[key] for row in rows if row[key] is not None]
+    return sum(values) if values else None
+
+
+def _paired_ratio(rows: list[dict[str, Any]], value: str, basis: str) -> float | None:
+    """Only executions that know both sides, so an unknown side cannot move the ratio."""
+    pairs = [row for row in rows if row[value] is not None and row[basis] is not None]
+    return _ratio(_sum(pairs, value), _sum(pairs, basis))
+
+
+def _area(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """One lane's sums, unknown counts and per-execution detail; ``scope_drift`` holds each issue's latest."""
+    spends = [row["spend"] for row in rows]
+    sums = ("actual_seconds", "typical_seconds", "actual_rounds", "typical_rounds")
+    sources: dict[str, int] = {}
+    for spend in spends:
+        if spend["source"] is not None:
+            sources[spend["source"]] = sources.get(spend["source"], 0) + 1
+    return {
+        "executions": len(rows),
+        "spend": {**{key: _sum(spends, key) for key in sums},
+                  "runtime_ratio": _paired_ratio(spends, "actual_seconds", "typical_seconds"),
+                  "rounds_ratio": _paired_ratio(spends, "actual_rounds", "typical_rounds"),
+                  "unknown": {key: sum(spend[key] is None for spend in spends) for key in sums},
+                  "as_of": spends[-1]["as_of"], "sources": dict(sorted(sources.items()))},
+        "scope_drift": {str(row["issue"]): row["scope_drift"] for row in rows},
+        "scope_drift_unknown": sum(row["scope_drift"]["outside_declared"] is None for row in rows),
+        "runs": [{"issue": row["issue"], "started_at": row["started_at"], "spend": row["spend"],
+                  "scope_drift": row["scope_drift"]} for row in rows],
+    }
+
+
+def attach_project_review(store: StateStore, root: Any, executions: list, rows: list[dict[str, Any]],
+                          machine: dict[str, Any]) -> dict[str, Any]:
+    """Add spend and scope_drift to each row; return the lane-grouped areas. Arithmetic only."""
+    from foragent import scheduler
+
+    now = machine["now"]
+    basis = _size_basis([store, *orch_facts_machine.merge_stores(machine, now)], now)
+    rounds = recorded_rounds(store)
+    issues = {issue["number"]: issue for issue in store.local_issues()}
+    sensitive = scheduler._filesystem_case_sensitive(Path(root))
+    areas: dict[str, list[dict[str, Any]]] = {}
+    for execution, row in zip(executions, rows):
+        run = execution.run
+        issue = issues.get(run.number)
+        # The ETA's size rule; an issue with no local record has no known size.
+        size = None if issue is None else ((issue.get("run_sizes") or {}).get(run.started_at)
+                                           or progress.size_of(issue.get("labels", ())))
+        row["spend"] = _spend(row, size, rounds.get((run.number, execution.started)), basis, now.isoformat())
+        row["scope_drift"] = _scope_drift(run, sensitive)
+        areas.setdefault(row["lane"] or "main", []).append(row)
+    return {lane: _area(items) for lane, items in sorted(areas.items())}
+
+
+def project_review_lines(facts: dict[str, Any], language: str, items: int) -> list[str]:
+    """Spend per lane against its size basis, and the executions with files outside their declared set."""
+    unknown, days = text("facts_resources_unknown", language), facts["window_days"]
+
+    def shown(value: float | None) -> str:
+        return unknown if value is None else f"{value:.0f}"
+
+    areas = sorted(facts["areas"].items(), key=lambda item: -(item[1]["spend"]["actual_seconds"] or 0))
+    lanes = [text("facts_spend_lane", language, lane=lane, actual=shown(area["spend"]["actual_seconds"]),
+                  typical=shown(area["spend"]["typical_seconds"]), rounds=shown(area["spend"]["actual_rounds"]),
+                  typical_rounds=shown(area["spend"]["typical_rounds"])) for lane, area in areas[:items]]
+    drifted = [run for _, area in areas for run in area["runs"] if run["scope_drift"]["outside_declared"]]
+    listed = ", ".join(f"#{run['issue']} {run['scope_drift']['outside_declared'][0]}" for run in drifted[:items])
+    return [text("facts_spend", language, days=days, lanes="; ".join(lanes) or text("facts_schedule_unknown", language)),
+            text("facts_scope", language, days=days, count=len(drifted), runs=listed or text("facts_schedule_unknown", language),
+                 unknown=sum(area["scope_drift_unknown"] for area in facts["areas"].values()))]
 
 
 def most_repeated(finding_classes: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any]] | None:

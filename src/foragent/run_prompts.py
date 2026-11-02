@@ -96,15 +96,17 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
-    task: str = REVIEW_PROMPT,
+    task: str = REVIEW_PROMPT, pass_scope: str = "",
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
     `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    `pass_scope` is the earlier PASS's facts and scope (review_pass_scope); `diff` then matches it.
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{task}\n\n{review_scope_rules(acceptance_dir)}"
+        + (f"\n\n{pass_scope}" if pass_scope else "")
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
@@ -116,12 +118,12 @@ def build_review_prompt(
 
 def build_confirm_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
-    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "",
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "", pass_scope: str = "",
 ) -> str:
     """The complete first-round result and current change for one confirming reviewer."""
     return build_review_prompt(
         parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
-        lane_decisions=lane_decisions, task=CONFIRM_PROMPT,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT, pass_scope=pass_scope,
     ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
@@ -154,22 +156,6 @@ def lane_decisions_section(decisions: list[str]) -> str:
 
 DECISIONS_START = "<!-- foragent:lane-decisions -->"
 DECISIONS_END = "<!-- /foragent:lane-decisions -->"
-
-
-def lane_decisions_block(section: str) -> str:
-    """`section` between markers, so a later review of the same PR can replace it."""
-    return f"{DECISIONS_START}\n{section}\n{DECISIONS_END}" if section else ""
-
-
-def refresh_lane_decisions(body: str, section: str) -> str:
-    """Replace a PR body's lane-decisions block with `section` (append, or drop when empty)."""
-    import re
-
-    block = lane_decisions_block(section)
-    pattern = re.compile(rf"(?:\n\n)?{re.escape(DECISIONS_START)}.*?{re.escape(DECISIONS_END)}", re.S)
-    if pattern.search(body):
-        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
-    return f"{body}\n\n{block}" if block else body
 
 
 def moved_files_section(moved_files: list[str]) -> str:
@@ -267,6 +253,7 @@ def build_prompt(
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
         "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
         "with `- <point>: <why it is out of scope or not a defect>`.\n"
+        '- Write the short change summary as JSON in .foragent/PR.json: {"summary": "one or two complete sentences"}.\n'
         "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
         f"  Write the prose in {language}. Keep these English headings exactly:\n"
         "  ## What changed\n"

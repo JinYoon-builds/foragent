@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
-from foragent import orch_scope, runner, scheduler, scheduler_config, scheduler_stop  # noqa: E402
+from foragent import orch_scope, runner, scheduler, scheduler_stop  # noqa: E402
 from foragent.config import Config  # noqa: E402
 from foragent.run_attempt import OwnershipLost  # noqa: E402
 from foragent.state import StateStore  # noqa: E402
@@ -32,7 +32,7 @@ def fake_processes(monkeypatch, tmp_path, no_forbidden_git_commands):
     return stop_fakes.fake_processes.__wrapped__(monkeypatch, tmp_path, no_forbidden_git_commands)
 
 
-def queue_case(tmp_path, *issues, legacy="alice", committed=None):
+def queue_case(tmp_path, *issues, legacy="alice"):
     store = StateStore(tmp_path / "state", now=lambda: NOW)
     tracker = FakeTracker(login="alice")
     for number, labels in issues:
@@ -41,8 +41,6 @@ def queue_case(tmp_path, *issues, legacy="alice", committed=None):
     recorder = RecordingTracker(tracker, context, queue_writes=True)
     context.tracker = recorder
     store.refresh_local_issues([tracker.get_issue(n) for n, _ in issues], [], {}, NOW)
-    if committed is not None:
-        scheduler_config.record_tick_config(store, "origin/main:.foragent.yml", committed)
     return store, tracker, recorder, context
 
 
@@ -182,63 +180,6 @@ def test_a_persons_other_label_edit_still_drops_the_write(tmp_path):
     assert store.github_outbox() == [] and store.refused_github_writes() == []
 
 
-def test_a_pre_upgrade_foreign_entry_is_refused_and_lets_owned_writes_through(tmp_path):
-    store, tracker, recorder, _ = queue_case(tmp_path, (1, ["by:bob"]), (2, ["by:alice"]))
-    snapshot = json.loads((store.root / "issues.json").read_text())
-    snapshot.setdefault("outbox", []).extend([  # The shape before intents had a premise or attempts.
-        {"id": 1, "issue": 1, "action": "comment", "body": "Old foreign", "queued_at": NOW.isoformat()},
-        {"id": 2, "issue": 2, "action": "comment", "body": "Old owned", "queued_at": NOW.isoformat()},
-    ])
-    snapshot["outbox_sequence"] = 2
-    (store.root / "issues.json").write_text(json.dumps(snapshot))
-    recorder.flush_outbox()
-    assert tracker.list_comments(1) == []
-    assert [c.body for c in tracker.list_comments(2)] == ["Old owned"]
-    assert store.github_outbox() == [] and store.github_blocking_outbox() == []
-    [refused] = store.refused_github_writes()
-    assert refused["body"] == "Old foreign" and "bob" in refused["refused"]
-
-
-def test_a_listing_keeps_a_queued_write_on_a_known_pr(tmp_path):
-    store, tracker, recorder, _ = queue_case(tmp_path, (1, ["by:alice"]))
-    store.update_local_issue(1, pr_number=50)
-    store.queue_github_write(50, "comment", body="On the PR")
-    store.refresh_local_issues([tracker.get_issue(1)], [], {}, NOW)
-    recorder.list_issues()
-    assert [entry["issue"] for entry in store.github_outbox()] == [50]
-
-
-def test_a_known_issue_missing_from_a_listing_still_drops_its_writes(tmp_path):
-    store, tracker, _, _ = queue_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]))
-    store.queue_github_write(2, "comment", body="Gone")
-    store.refresh_local_issues([tracker.get_issue(1)], [], {}, NOW)
-    assert store.github_outbox() == []
-
-
-@pytest.mark.parametrize("content, legacy", [("broken: [\n", "alice"), ("legacy_owner: [\n", None)])
-def test_an_invalid_team_config_authorizes_nothing(tmp_path, content, legacy):
-    store, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=legacy, committed=content)
-    assert orch_scope.may_write(context, 1) is False
-    recorder.comment(1, "Refused")
-    recorder.add_labels(1, ["blocked"])
-    assert tracker.list_comments(1) == [] and "blocked" not in tracker.get_issue(1).labels
-
-
-def test_a_broken_config_without_a_team_keeps_the_singleton(tmp_path):
-    _, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=None, committed="broken: [\n")
-    assert orch_scope.may_write(context, 1) is True
-    recorder.comment(1, "Mine")
-    assert [c.body for c in tracker.list_comments(1)] == ["Mine"]
-
-
-def test_a_valid_committed_team_setting_decides_over_the_local_config(tmp_path):
-    _, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=None, committed="legacy_owner: bob\n")
-    assert context.config.legacy_owner is None
-    assert orch_scope.may_write(context, 1) is False
-    recorder.comment(1, "Refused")
-    assert tracker.list_comments(1) == []
-
-
 def batch_case(git_history, tmp_path, monkeypatch, parent_owner):
     case = team_case(git_history, tmp_path, monkeypatch, "alice", "alice")
     object.__setattr__(case.ctx.config, "review", "batch")
@@ -273,29 +214,6 @@ def test_foreign_run_issue_takes_no_machine_slot(git_history, tmp_path, monkeypa
     assert held == []
 
 
-@pytest.mark.parametrize("record", ["{broken", "[]", '{"content": "x"}'])
-def test_a_broken_config_record_authorizes_nothing(tmp_path, record):
-    store, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=None)
-    (store.root / scheduler_config.TICK_CONFIG_FILE).write_text(record)
-    assert orch_scope.may_write(context, 1) is False
-    recorder.comment(1, "Refused")
-    assert tracker.list_comments(1) == []
-
-
-def test_a_failed_config_read_keeps_the_last_record(tmp_path):
-    from foragent.git import GitError
-
-    store, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=None, committed="legacy_owner: bob\n")
-
-    def unreadable(*a, **kw):
-        raise GitError("cannot read")
-
-    context.git = SimpleNamespace(fetch=lambda *a: None, blob_sha=unreadable)
-    context.committed_config = True
-    scheduler_config.fetch_base(context)
-    assert orch_scope.may_write(context, 1) is False
-
-
 def test_a_failed_read_uses_no_cached_row_but_the_owner_it_names_still_refuses(tmp_path):
     store, tracker, recorder, context = queue_case(tmp_path, (1, ["by:bob"]), (2, []), legacy=None)
     context._scope = orch_scope.no_snapshot(context)
@@ -308,15 +226,6 @@ def test_no_snapshot_ignores_a_callers_cached_row_on_a_team_repo(tmp_path):
     context._scope = orch_scope.no_snapshot(context)
     assert context._scope.owns(tracker.get_issue(1)) is False
     assert orch_scope.may_write(context, 1) is False
-
-
-def test_a_write_to_an_unseen_target_keeps_its_payload_and_reason(tmp_path):
-    store, tracker, recorder, _ = queue_case(tmp_path, (1, ["by:alice"]))
-    store.queue_github_write(50, "comment", body="On a closed PR")
-    store.refresh_local_issues([tracker.get_issue(1)], [], {}, NOW)
-    assert store.github_outbox() == []
-    [kept] = store.refused_github_writes()
-    assert kept["body"] == "On a closed PR" and "not found" in kept["refused"]
 
 
 @pytest.mark.parametrize("labels, legacy, mention", [
@@ -547,3 +456,57 @@ def test_an_unseen_batch_parent_of_another_person_is_not_used(tmp_path):
     tracker.add_issue(99, "Bob's parent", "", labels=["by:bob"])
     tracker.set_parent(1, 99)
     assert orch_scope.batch_parent(context, 1) is None
+
+
+class FakeGit:
+    """Only what WIP preservation calls; it records pushes."""
+
+    def __init__(self):
+        self.local_skill_paths, self.pushed = set(), []
+
+    def conflict_paths(self):
+        return []
+
+    def stage_changes(self):
+        pass
+
+    def has_staged_changes(self):
+        return False
+
+    def head_sha(self):
+        return "wip"
+
+    def push(self, branch, **kw):
+        self.pushed.append(branch)
+
+
+@pytest.mark.parametrize("snapshot, pushed", [("none", []), ("own", ["foragent/issue-1"])])
+def test_wip_is_pushed_only_with_this_persons_snapshot(tmp_path, snapshot, pushed):
+    from foragent import run_publish
+
+    store, tracker, recorder, context = queue_case(tmp_path, (1, []), legacy=None)
+    tracker.add_labels(1, ["by:bob"])  # Bob's on GitHub now; the stored row is still unlabelled.
+    context._scope = orch_scope.no_snapshot(context) if snapshot == "none" else orch_scope.Scope(context)
+    git = FakeGit()
+    run_publish._preserve_locked_implementation(
+        1, context, git, "crashed", approval=None, approved_ref="origin/main", title="T", pushed_head=None,
+        tracker_available=True, push_branch=None, owned_deletions=True)
+    assert git.pushed == pushed
+    if not pushed:
+        assert "WIP kept on local branch" in store.log_path(1).read_text()
+
+
+def test_a_run_never_pushes_a_branch_without_a_snapshot(tmp_path):
+    from foragent import run_publish
+    from foragent.run_attempt import OwnershipLost
+
+    _, _, _, context = queue_case(tmp_path, (1, []), legacy=None)
+    context._scope = orch_scope.no_snapshot(context)
+    git = FakeGit()
+    attempt = SimpleNamespace(ctx=context, n=1, rebuilt=False, git=git, branch="foragent/issue-1")
+    with pytest.raises(OwnershipLost):
+        run_publish._push_branch(attempt)
+    assert git.pushed == []
+    context._scope = orch_scope.Scope(context)
+    run_publish._push_branch(attempt)
+    assert git.pushed == ["foragent/issue-1"]

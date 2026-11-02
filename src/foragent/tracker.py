@@ -107,9 +107,10 @@ class Tracker(Protocol):
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
-    def close_issue(self, n: int, comment: str | None = None) -> None: ...
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
+    def retitle_pr(self, pr: int, *, title: str) -> None: ...
     def close_pr(self, pr: int, comment: str | None = None) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
@@ -616,7 +617,8 @@ class RecordingTracker:
                     store.record_github_attempt(entry["id"], started, True)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
-                    result = getattr(self._tracker, action)(number, payload)
+                    options = {"reason": entry["reason"]} if action == "close_issue" and entry.get("reason") else {}
+                    result = getattr(self._tracker, action)(number, payload, **options)
                     if action == "comment":
                         store.acknowledge_github_comment(entry, result)
                     else:
@@ -678,6 +680,11 @@ class RecordingTracker:
         self._context.store.record_comments(n, [asdict(comment) for comment in comments])
         return comments
 
+    def close_queued(self, n):
+        """Whether a close of this issue waits to be sent, which a read of the issue cannot show."""
+        return any(entry["issue"] == n and entry["action"] == "close_issue"
+                   for entry in self._context.store.github_outbox())
+
     def comment(self, n, body, *, evidence=False):
         identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
                                        body=body, **({"evidence": True} if evidence else {}))
@@ -704,10 +711,11 @@ class RecordingTracker:
                                 started, title=title, body=body)
         del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
-    def close_issue(self, n, comment=None):
+    def close_issue(self, n, comment=None, *, reason=None):
         started = self._started()
-        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), started, body=comment)
+        options = {"reason": reason} if reason is not None else {}
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n, **options) if comment is None
+                               else self._tracker.close_issue(n, comment, **options), started, body=comment, **options)
         del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
@@ -767,6 +775,9 @@ class RecordingTracker:
         self._require_effect(pr, base=base)
         self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
+
+    def retitle_pr(self, pr, *, title):
+        self._tracker.retitle_pr(pr, title=title)
 
     def _record_pr_state(self, pr, **fields):
         for row in self._context.store.local_issues():
@@ -960,13 +971,13 @@ class FakeTracker:
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         self.labels.update((spec.name, spec) for spec in specs)
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
-        self._close(n, comment)
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
+        self._close(n, comment, reason=reason)
 
-    def _close(self, n: int, comment: str | None) -> None:
+    def _close(self, n: int, comment: str | None, *, reason: str | None = None) -> None:
         if comment is not None:
             self.comment(n, comment)
-        self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
+        self.issues[n] = replace(self.get_issue(n), state="closed", state_reason=reason, updated_at=self._timestamp())
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
@@ -983,6 +994,10 @@ class FakeTracker:
         self.created_prs = [replace(item, base=base, title=title, body=body) if item.number == pr else item
                             for item in self.created_prs]
         self.issues[pr] = replace(self.get_issue(pr), title=title, body=body)
+
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self.created_prs = [replace(item, title=title) if item.number == pr else item for item in self.created_prs]
+        self.issues[pr] = replace(self.get_issue(pr), title=title)
 
     def find_pr(self, head: str) -> int | None:
         return next((pr.number for pr in self.created_prs
@@ -1367,8 +1382,10 @@ class GhTracker:
                     input=payload,
                 )
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         args = ["issue", "close", str(n), "-R", self.repo]
+        if reason is not None:
+            args.extend(["--reason", reason.replace("_", " ")])
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
@@ -1452,6 +1469,9 @@ class GhTracker:
             ["pr", "edit", str(pr), "-R", self.repo, "--base", base,
              "--title", title, "--body-file", "-"], input=body,
         )
+
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self._call(["pr", "edit", str(pr), "-R", self.repo, "--title", title])
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))

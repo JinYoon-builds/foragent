@@ -149,7 +149,8 @@ def test_recovery_keeps_the_work_when_the_owner_read_is_malformed(tmp_path, monk
     ctx = SimpleNamespace(tracker=Malformed(login="alice"), config=Config(legacy_owner="alice"), store=store,
                           git=git, now=lambda: None)
     scheduler_recovery._remove_run_worktree(ctx, 1, worktree, SimpleNamespace(actions=[]), outcome="killed")
-    assert preserved == [False], "The work is kept locally before removal, without pushing it"
+    # The work is kept before removal; whether it is pushed is decided at the push (orch_scope.push_refusal).
+    assert len(preserved) == 1
     assert removed == [worktree]
 
 

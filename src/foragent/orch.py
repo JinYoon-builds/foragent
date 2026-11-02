@@ -1,7 +1,7 @@
 """Orchestrator actions, with GitHub evidence and a local event journal."""
 
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,7 +28,7 @@ from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
 from foragent.run_baseline import pending_acceptance_exclusions
-from foragent.run_checks import CheckResult, trusts_ci
+from foragent.run_checks import CheckResult, _passing_acceptance_ids, trusts_ci
 from foragent.run_checks_approved import acceptance_refusal, done_when_refusal
 from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
@@ -362,6 +362,58 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     return _SuiteRun(passed, failing)
 
 
+def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: bool, directory: Path,
+                      log_path: Path, slot: Callable[[], AbstractContextManager], wait,
+                      baseline=None) -> list[str]:
+    """#1105: the run baseline's passing acceptance tests that do not pass on the merge result.
+
+    The protected set is what implementation runs protect: the base's passing acceptance ids
+    from the shared baseline cache (or one capture), minus the current exclusions. It is
+    re-run with the runs' fixed invocation on a fresh merge result; a protected test that
+    fails, is skipped or is missing there is broken, and an unreadable report breaks them all.
+    The user's own command is never rewritten or replayed on the base.
+    """
+    from foragent.run_implementation import _detect_test_command_at
+
+    if baseline is None:  # The acceptance-only comparison may already hold this base's baseline.
+        test_command = ctx.config.test_command or _detect_test_command_at(ctx.git, base)
+        label = f"protected baseline base={base}"
+        baseline = _capture_baseline(
+            ctx, test_command, base, log=log_path, report=directory / "protected-baseline.xml",
+            check=lambda selection, root: _suite_process(ctx, n, selection, root, log_path, label, slot()),
+            prepare=lambda: None, wait=wait, required_ids=frozenset(),
+        )
+    if baseline is None:
+        return []
+    owned = set(_baseline_exclusions(ctx, base, log_path))  # Approvals may have changed since capture.
+    protected = sorted({node for node in baseline.node_ids if node.split("::", 1)[0] not in owned})
+    if not protected:
+        return []
+    worktree, junit = directory / "protected", directory / "protected.xml"
+    ctx.git.add_detached_worktree(worktree, head)
+    try:
+        if merged:
+            ctx.git.at(worktree)._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                        "merge", "--no-commit", "--no-ff", base])
+        # The protected tests' files, not their ids: a removed test id would make pytest reject the
+        # whole selection, so the report would lose every other protected result. A file the merge
+        # result no longer has leaves its ids absent from the report, which breaks them.
+        files = sorted({node.split("::", 1)[0] for node in protected
+                        if (worktree / node.split("::", 1)[0]).is_file()})
+        if files:
+            command = (f"{baseline.command} {shlex.join(files)} -o junit_family=legacy --junit-prefix= "
+                       f"--junitxml={shlex.quote(str(junit.resolve()))}")
+            _suite_process(ctx, n, command, worktree, log_path, f"protected baseline head={head}"
+                           + (f" merged with base={base}" if merged else ""), slot())
+    finally:
+        ctx.git.remove_worktree(worktree)
+    try:
+        passing = set(_passing_acceptance_ids(junit))
+    except (OSError, ET.ParseError):
+        passing = set()
+    return [node for node in protected if node not in passing]
+
+
 def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
     """The approval of a linked issue's PR and the configured base SHA its locks must match.
 
@@ -468,6 +520,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
         finally:
             ctx.git.remove_worktree(worktree)
         tests = "not run" if refused else "pass"
+        captured = None
         for i, (command, run, acceptance_only) in enumerate(runs):
             if run.passed and not acceptance_only:
                 continue
@@ -492,6 +545,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                     continue
                 if baseline is not None:
                     base_failing = frozenset(baseline.failing_ids)
+                    captured = captured or baseline
             else:
                 selection = command
                 if _pytest_command(command) is not None:
@@ -512,6 +566,18 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             failing_on_base.extend(sorted(head_failing & base_failing))
             if head_failing - base_failing:
                 tests = "fail"
+        # A previously passing acceptance test must keep passing on the merge result (#1105).
+        # A refused PR cannot merge whatever the tests say (#1559): no run, and the lock is freed early.
+        lost = []
+        try:
+            if not refused:
+                lost = _protected_broken(ctx, n, head, base, merged, Path(directory), log_path, test_slot, wait,
+                                         captured)
+        except AttemptFailure:
+            tests = "fail"  # No usable base baseline: the protected set cannot be shown to still pass.
+        if lost:
+            tests = "fail"
+        broken = sorted(set(broken) | set(lost))
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
               "broken": broken, "failing_on_base": failing_on_base,
@@ -604,9 +670,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
                 n, f"Approved by {approved_by} in the orchestrator ({at}). "
                    f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
+            from foragent.run_pr_body import merge_retitle_body
             subject = retitle_for_merge(
                 ctx, n, title=title, current_title=current.title, base=current.base,
-                body=lambda: current.body, note=print,
+                body=lambda: merge_retitle_body(current.head, ctx), note=print,
             )
             merge_turn.record_turn(ctx, place, checked.base, "merged")
             try:

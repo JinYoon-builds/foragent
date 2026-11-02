@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -596,3 +597,421 @@ def test_a_stored_write_without_a_premise_is_judged_by_its_recorded_base(case):
     case.reader.get_issue(7)
     assert case.store.github_outbox() == []
     assert case.events == [(7, "remote change")]
+
+
+# --- issue-state history: what each accepted observation adds, beyond the locked flow tests ---
+
+OPEN_DEP = {"number": 40, "state": "open", "repository": None}
+
+
+@pytest.fixture
+def history(tmp_path):
+    clock = [T0]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+
+    def tick():
+        clock[0] += timedelta(seconds=1)
+        return clock[0]
+
+    return SimpleNamespace(store=store, clock=clock, tick=tick)
+
+
+def task(number=41, labels=("approved",), state="open"):
+    return Issue(number, "Task", "", frozenset(labels), state)
+
+
+def states(store, number=41):
+    return [row["data"] for row in store.flow_records() if row["kind"] == "issue-state" and row["issue"] == number]
+
+
+def facts(store, number=41):
+    return [(data["labels"], data["blocked_by"], data["state"]) for data in states(store, number)]
+
+
+def forget_history(store):
+    """The state before this history existed, or after retention evicted it."""
+    for path in store.root.glob("flow-records*.jsonl"):
+        path.unlink()
+
+
+def test_an_edge_only_change_is_a_transition_with_each_edge_state_and_repository(history):
+    store, now = history.store, history.tick
+    store.refresh_local_issues([task()], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    store.refresh_local_issues([task()], [], {}, now(), blocked_by={41: [{**OPEN_DEP, "state": "closed"}]})
+    other = {"number": 40, "state": "closed", "state_reason": "completed", "repository": "other/repo"}
+    store.refresh_local_issues([task()], [], {}, now(), blocked_by={41: [
+        other, {"number": 40, "state": "closed", "state_reason": "completed"}]})
+    assert [data["blocked_by"] for data in states(store)] == [
+        [OPEN_DEP],
+        [{**OPEN_DEP, "state": "closed"}],
+        [{**OPEN_DEP, "state": "closed"}, {"number": 40, "state": "closed", "repository": "other/repo"}],
+    ]
+
+
+def test_edges_not_read_keep_the_last_known_edges_and_never_claim_no_blockers(history):
+    store, now = history.store, history.tick
+    store.refresh_local_issues([task(labels=["idea"])], [], {}, now(), blocked_by={})
+    assert facts(store) == [(["idea"], None, "open")], "Never read is unknown, not an empty list"
+    assert store.local_issues()[0]["blocked_by"] == [], "The row keeps its existing value"
+    store.refresh_local_issues([task()], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    store.refresh_local_issues([task(labels=["idea"])], [], {}, now(), blocked_by={})
+    store.ingest([task(labels=["idea", "x"])], now(), {})
+    store.record_labels(41, ["y"], remove=False, lanes={})
+    assert [row[1] for row in facts(store)] == [None, [OPEN_DEP], [OPEN_DEP], [OPEN_DEP], [OPEN_DEP]]
+
+
+def test_a_title_or_state_reason_change_alone_adds_nothing(history):
+    store, now = history.store, history.tick
+    store.ingest([task()], now(), {})
+    store.update_local_issue(41, title="Renamed", state_reason="completed", observed_at=now())
+    store.ingest([Issue(41, "Again", "New body", frozenset({"approved"}), "open")], now(), {})
+    assert len(states(store)) == 1
+
+
+def test_labels_are_sorted_and_a_local_label_write_is_recorded_once(history):
+    store, now = history.store, history.tick
+    store.ingest([task(labels=["z", "a", "m"])], now(), {})
+    now()
+    store.record_labels(41, ["b"], remove=False, lanes={})
+    store.record_labels(41, ["b"], remove=False, lanes={})
+    now()
+    store.record_labels(41, ["z"], remove=True, lanes={})
+    assert [row[0] for row in facts(store)] == [["a", "m", "z"], ["a", "b", "m", "z"], ["a", "b", "m"]]
+
+
+def test_a_local_edge_only_write_is_recorded_with_the_row_facts(history):
+    store, now = history.store, history.tick
+    store.ingest([task()], now(), {})
+    now()
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    assert facts(store) == [(["approved"], None, "open"), (["approved"], [OPEN_DEP], "open")]
+    forget_history(store)
+    store.update_local_issue(41, pr_number=9)
+    assert states(store) == [], "A field that is not an issue fact is not an observation"
+
+
+def test_stale_local_writes_add_nothing_and_never_rewrite(history):
+    store, now = history.store, history.tick
+    late = now()
+    store.ingest([task()], now(), {})
+    expected = store.flow_records()
+    store.update_local_issue(41, labels=["old"], observed_at=late)
+    store.update_local_issue(41, labels=["old"], blocked_by=[OPEN_DEP], observed_at=late)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP], observed_at=late)
+    store.record_labels(41, ["old"], remove=False, lanes={}, observed_at=late)
+    store.ingest([task(labels=["old"])], late, {})
+    store.refresh_local_issues([task(labels=["old"])], [], {}, late, blocked_by={41: [OPEN_DEP]})
+    assert store.flow_records() == expected
+
+
+def edge_write_at_ten(history, edges=(OPEN_DEP,)):
+    """A read at T0+1, then an edge-only write at T0+10: the row's observed_at stays at T0+1."""
+    store = history.store
+    store.ingest([task()], at(1), {})
+    history.clock[0] = at(10)
+    store.update_local_issue(41, blocked_by=list(edges))
+    return store, store.flow_records()
+
+
+def test_a_refresh_older_than_an_edge_write_adds_nothing_and_keeps_those_edges(history):
+    store, expected = edge_write_at_ten(history)
+    store.refresh_local_issues([task(labels=["late"])], [], {}, at(11), observed_at=at(5), blocked_by={41: []})
+    assert store.flow_records() == expected
+    row = store.local_issues()[0]
+    assert row["blocked_by"] == [OPEN_DEP], "The next refresh reuses this list as its read"
+    assert row["labels"] == ["late"], "The row's observation rule is unchanged"
+    store.refresh_local_issues([task(labels=["late"])], [], {}, at(12), blocked_by={41: row["blocked_by"]})
+    assert facts(store)[-1] == (["late"], [OPEN_DEP], "open"), "A newer read carries the labels"
+    assert len(states(store)) == len(expected) + 1
+
+
+def test_a_refresh_tied_with_an_edge_write_it_began_before_keeps_the_write(history):
+    store = history.store
+    store.ingest([task()], at(1), {})
+    revision = store.issues_revision()
+    history.clock[0] = at(10)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    expected = store.flow_records()
+    store.refresh_local_issues([task()], [], {}, at(10), since_revision=revision, blocked_by={41: []})
+    assert store.flow_records() == expected
+    assert store.local_issues()[0]["blocked_by"] == [OPEN_DEP]
+    store.refresh_local_issues([task()], [], {}, at(10), since_revision=store.issues_revision(), blocked_by={41: []})
+    assert facts(store)[-1][1] == [], "A refresh that began after the write wins the tie, as with facts"
+
+
+def test_a_refresh_tied_with_an_edge_write_it_began_before_leaves_no_absence(history):
+    store = history.store
+    store.ingest([task()], at(1), {})
+    revision = store.issues_revision()
+    history.clock[0] = at(10)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    expected = store.flow_records()
+    store.refresh_local_issues([], [], {}, at(10), since_revision=revision, blocked_by={})
+    assert store.flow_records() == expected
+    store.refresh_local_issues([], [], {}, at(11), since_revision=store.issues_revision(), blocked_by={})
+    assert states(store)[-1]["state"] == "absent", "A later refresh still ends the issue"
+
+
+def test_a_refresh_that_began_after_a_tied_edge_write_records_its_absence(history):
+    store, expected = edge_write_at_ten(history)
+    store.refresh_local_issues([], [], {}, at(10), since_revision=store.issues_revision(), blocked_by={})
+    assert states(store)[-1]["state"] == "absent"
+    assert len(store.flow_records()) == len(expected) + 1
+
+
+def test_a_tie_needs_no_row_because_the_write_keeps_its_own_revision(history):
+    store = history.store
+    store.ingest([task()], at(1), {})
+    revision = store.issues_revision()
+    history.clock[0] = at(10)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    expected = store.flow_records()
+    store.ingest_absence(41, at(5))  # Late: this pops the row, and its revision goes with it.
+    assert store.local_issues() == []
+    store.refresh_local_issues([], [], {}, at(10), since_revision=revision, blocked_by={})
+    assert store.flow_records() == expected
+
+
+def test_another_write_during_a_refresh_does_not_hold_back_a_tied_edge_write_from_before_it(history):
+    store, expected = edge_write_at_ten(history)
+    revision = store.issues_revision()  # The refresh begins after the edge write.
+    store.update_local_issue(41, pr_number=3)  # This bumps the row, not the edge write.
+    store.refresh_local_issues([task()], [], {}, at(10), since_revision=revision, blocked_by={41: []})
+    assert store.local_issues()[0]["blocked_by"] == []
+    assert facts(store)[-1][1] == [] and len(store.flow_records()) == len(expected) + 1
+
+
+@pytest.mark.parametrize("read", [
+    lambda store: store.ingest([task(labels=["later"])], at(10), {}),
+    lambda store: store.ingest_absence(41, at(10)),
+    lambda store: store.ingest([], at(10), {}, complete=True),
+    lambda store: store.record_labels(41, ["later"], remove=False, lanes={}, observed_at=at(10)),
+], ids=["ingest", "absence", "listing", "label"])
+def test_outside_a_bulk_refresh_a_tie_lets_the_later_ingest_win_as_observe_does(history, read):
+    store, expected = edge_write_at_ten(history)
+    read(store)
+    assert len(store.flow_records()) == len(expected) + 1
+
+
+def test_an_edge_write_older_than_an_edge_write_adds_nothing_and_replaces_nothing(history):
+    store, expected = edge_write_at_ten(history)
+    store.update_local_issue(41, blocked_by=[], observed_at=at(5))
+    assert store.flow_records() == expected
+    assert store.local_issues()[0]["blocked_by"] == [OPEN_DEP]
+    store.update_local_issue(41, blocked_by=[], pr_number=3, observed_at=at(5))
+    row = store.local_issues()[0]
+    assert (row["blocked_by"], row["pr_number"]) == ([OPEN_DEP], 3), "Other fields stay as they were written"
+    assert store.flow_records() == expected
+
+
+def test_an_unchanged_edge_write_still_moves_the_acceptance_time(history):
+    store, expected = edge_write_at_ten(history)
+    history.clock[0] = at(20)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    assert store.flow_records() == expected, "No change, no record"
+    store.refresh_local_issues([task()], [], {}, at(21), observed_at=at(15), blocked_by={41: []})
+    assert store.flow_records() == expected
+
+
+@pytest.mark.parametrize("late", [
+    lambda store: store.ingest([task(labels=["late"])], at(5), {}),
+    lambda store: store.record_labels(41, ["late"], remove=False, lanes={}, observed_at=at(5)),
+    lambda store: store.update_local_issue(41, labels=["late"], observed_at=at(5)),
+    lambda store: store.update_local_issue(41, labels=["late"], blocked_by=[], observed_at=at(5)),
+    lambda store: store.ingest_absence(41, at(5)),
+    lambda store: store.ingest([], at(5), {}, complete=True),
+    lambda store: store.refresh_local_issues([], [], {}, at(11), observed_at=at(5)),
+], ids=["ingest", "label", "update", "update-edges", "absence", "listing", "refresh-omission"])
+def test_every_late_read_stays_behind_an_edge_write(history, late):
+    store, expected = edge_write_at_ten(history)
+    late(store)
+    assert store.flow_records() == expected
+
+
+def test_an_absence_newer_than_an_edge_write_is_recorded_and_the_time_survives_it(history):
+    store, expected = edge_write_at_ten(history)
+    store.ingest_absence(41, at(5))  # Late: the row goes by the old rule, the history stays.
+    store.ingest([task(labels=["late"])], at(6), {})
+    assert store.flow_records() == expected, "The time outlives the row"
+    store.ingest_absence(41, at(11))
+    assert states(store)[-1]["state"] == "absent"
+    store.ingest([task()], at(12), {})
+    assert states(store)[-1]["state"] == "open"
+
+
+def test_a_refused_edge_write_does_not_move_the_acceptance_time(history):
+    store = history.store
+    store.ingest([task()], at(10), {})
+    history.clock[0] = at(20)
+    store.update_local_issue(41, blocked_by=[OPEN_DEP], observed_at=at(5))
+    assert "edges_at" not in store._issue_snapshot()
+    store.ingest([task(labels=["new"])], at(11), {})
+    assert facts(store)[-1] == (["new"], None, "open")
+
+
+def test_absence_leaves_one_reason_per_kind_of_evidence_and_a_return_is_recorded(history):
+    store, now = history.store, history.tick
+    store.refresh_local_issues([task()], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    for _ in range(2):
+        store.ingest([], now(), {}, complete=True)
+    store.ingest_absence(41, now())
+    assert states(store)[1:] == [{"labels": ["approved"], "blocked_by": [OPEN_DEP], "state": "absent",
+                                  "reason": "not-listed"}]
+    store.ingest([task()], history.clock[0] - timedelta(seconds=5), {})
+    assert len(states(store)) == 2, "A read that started before the absence is stale"
+    store.ingest([task()], now(), {})
+    assert states(store)[2:] == [{"labels": ["approved"], "blocked_by": [OPEN_DEP], "state": "open"}]
+
+
+def test_a_confirmed_missing_issue_has_its_own_reason_and_uses_the_row_without_history(history):
+    store, now = history.store, history.tick
+    store.ingest([task(labels=["b", "a"])], now(), {})
+    forget_history(store)
+    store.ingest_absence(41, now())
+    assert states(store) == [{"labels": ["a", "b"], "blocked_by": None, "state": "absent", "reason": "not-found"}]
+
+
+def test_a_refresh_omission_is_recorded_once_and_an_unknown_absence_adds_nothing(history):
+    store, now = history.store, history.tick
+    store.ingest([task()], now(), {})
+    store.ingest_absence(9, now())  # Comes first in the listing's omissions; must not stop the next.
+    for _ in range(2):
+        store.refresh_local_issues([], [], {}, now())
+    assert [data["state"] for data in states(store)] == ["open", "absent"]
+    assert states(store)[-1]["reason"] == "not-listed"
+    assert states(store, 9) == [], "No row and no history: nothing to explain"
+
+
+def test_old_or_evicted_closed_rows_spend_no_history_until_they_change(history):
+    store, now = history.store, history.tick
+    store.ingest([task(state="closed")], now(), {})
+    forget_history(store)
+    store.refresh_local_issues([task(state="closed")], [], {}, now(), blocked_by={})
+    store.ingest([task(state="closed")], now(), {})
+    assert states(store) == []
+    store.ingest([task(labels=["approved", "x"], state="closed")], now(), {})
+    assert facts(store) == [(["approved", "x"], None, "closed")]
+
+
+@pytest.mark.parametrize("change", [
+    lambda store, at: store.refresh_local_issues([task(labels=["x"], state="closed")], [], {}, at, blocked_by={}),
+    lambda store, at: store.ingest([task(labels=["x"], state="closed")], at, {}),
+    lambda store, at: store.update_local_issue(41, labels=["x"], observed_at=at),
+    lambda store, at: store.record_labels(41, ["x"], remove=False, lanes={}, observed_at=at),
+], ids=["refresh", "ingest", "update", "label"])
+def test_each_writer_sees_an_old_closed_row_as_it_stood_before_the_write(history, change):
+    store, now = history.store, history.tick
+    store.ingest([task(labels=[], state="closed")], now(), {})
+    forget_history(store)
+    change(store, now())
+    assert [row[0] for row in facts(store)] == [["x"]]
+
+
+def test_an_explicit_edge_change_on_an_old_closed_row_is_recorded(history):
+    store, now = history.store, history.tick
+    store.refresh_local_issues([task(state="closed")], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    forget_history(store)
+    store.refresh_local_issues([task(state="closed")], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    assert states(store) == []
+    store.update_local_issue(41, blocked_by=[])
+    assert facts(store) == [(["approved"], [], "closed")]
+
+
+def test_an_old_open_row_without_history_gets_its_first_record(history):
+    store, now = history.store, history.tick
+    store.ingest([task()], now(), {})
+    forget_history(store)
+    store.ingest([task()], now(), {})
+    assert facts(store) == [(["approved"], None, "open")]
+
+
+def test_queued_intents_and_placeholders_wait_for_an_accepted_observation(history):
+    store, now = history.store, history.tick
+    store.queue_github_write(41, "add_labels", labels=["mine"], lanes={})
+    store.update_local_issue(41, blocked_by=[OPEN_DEP])
+    store.update_local_issue(42, pr_number=3)
+    assert store.flow_records() == []
+    store.ingest_absence(42, now())
+    assert states(store, 42) == [], "A placeholder never observed has no history to end"
+    store.ingest([task(labels=["mine"])], now(), {})
+    assert facts(store) == [(["mine"], None, "open")]
+
+
+def test_pull_request_rows_have_no_issue_history(history):
+    store, now = history.store, history.tick
+    store.ingest([Issue(41, "PR", "", frozenset({"x"}), "open", is_pull_request=True)], now(), {})
+    store.ingest([task()], now(), {})
+    forget_history(store)
+    store.update_local_issue(41, is_pull_request=True)
+    store.update_local_issue(41, labels=["y"], blocked_by=[OPEN_DEP], observed_at=now())
+    store.ingest_absence(41, now())
+    assert states(store) == []
+
+
+def test_a_failed_record_changes_no_result_and_the_next_observation_repairs_it(history, monkeypatch):
+    store, now = history.store, history.tick
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StateStore, "flow_records", broken)
+        store.ingest([task()], now(), {})
+        store.update_local_issue(41, blocked_by=[OPEN_DEP])
+        store.record_labels(41, ["a"], remove=False, lanes={})
+        assert store.refresh_local_issues([task(labels=["a"])], [], {}, now()) == []
+        assert store.ingest_absence(77, now()) is False
+    assert store.flow_records() == []
+    assert store.local_issues()[0]["labels"] == ["a"]
+    store.ingest([task(labels=["a"])], now(), {})
+    assert facts(store) == [(["a"], None, "open")]
+
+
+def test_a_write_that_cannot_be_saved_leaves_no_history(history, monkeypatch):
+    store, now = history.store, history.tick
+
+    def refused(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_json", refused)
+    with pytest.raises(OSError):
+        store.ingest([task()], now(), {})
+    with pytest.raises(OSError):
+        store.record_labels(41, ["a"], remove=False, lanes={})
+    assert store.flow_records() == []
+
+
+def test_one_refresh_reads_history_once_and_a_stale_observation_reads_none(history, monkeypatch):
+    store, now = history.store, history.tick
+    late = now()
+    store.refresh_local_issues([task(), task(42)], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    reads = []
+    original = StateStore.flow_records
+    monkeypatch.setattr(StateStore, "flow_records", lambda self, **kw: reads.append(1) or original(self, **kw))
+    store.ingest([task()], late, {})
+    assert reads == []
+    store.refresh_local_issues([task(), task(42)], [], {}, now(), blocked_by={41: [OPEN_DEP]})
+    assert reads == [1]
+    assert (len(states(store)), len(states(store, 42))) == (1, 1), "One refresh gives one record, edges included"
+
+
+def test_concurrent_writers_lose_no_record_and_never_repeat_one(tmp_path):
+    root, clock = tmp_path / "state", [T0 + timedelta(seconds=1)]
+    start = threading.Barrier(8)
+
+    def writer(number):
+        store = StateStore(root, now=lambda: clock[0])
+        start.wait()
+        for _ in range(3):
+            store.ingest([task(number)], clock[0], {})
+            store.record_labels(number, ["mine"], remove=False, lanes={})
+
+    threads = [threading.Thread(target=writer, args=(number,)) for number in range(1, 9)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    store = StateStore(root, now=lambda: clock[0])
+    for number in range(1, 9):
+        assert [data["labels"] for data in states(store, number)] == [["approved"], ["approved", "mine"]] * 3

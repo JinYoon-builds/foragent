@@ -1845,6 +1845,87 @@ def test_bounded_gh_caps_each_call_and_starts_none_once_the_shared_budget_is_spe
     assert timeouts == [4, 2, 120]
 
 
+def test_close_not_planned_gh_and_fake():
+    run = ScriptedRun("")
+    GhTracker(REPO, run).close_issue(41, "Replaced by #42", reason="not_planned")
+    assert run.calls == [(["issue", "close", "41", "-R", REPO,
+                           "--reason", "not planned", "--comment", "Replaced by #42"], None)]
+    tracker = FakeTracker()
+    tracker.add_issue(41, "Old work", "body")
+    tracker.close_issue(41, "Replaced by #42", reason="not_planned")
+    assert tracker.get_issue(41).state == "closed"
+    assert tracker.get_issue(41).state_reason == "not_planned"
+    assert [c.body for c in tracker.list_comments(41)] == ["Replaced by #42"]
+
+
+def test_close_not_planned_survives_recording_and_outbox(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    remote = FakeTracker()
+    remote.add_issue(41, "Old work", "body")
+    store.record_issue(remote.get_issue(41), {})
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+    # Force the same FIFO route that a rate-limited close takes, without an external service.
+    store.queue_github_write(41, "close_issue", body="Replaced by #42", reason="not_planned")
+    assert store.local_issues()[0]["state_reason"] == "not_planned"
+    tracker.flush_outbox()
+    assert store.github_outbox() == []
+    assert remote.get_issue(41).state_reason == "not_planned"
+    assert [c.body for c in remote.list_comments(41)] == ["Replaced by #42"]
+    remote.add_issue(42, "Other old work", "body")
+    store.record_issue(remote.get_issue(42), {})
+    tracker.close_issue(42, reason="not_planned")
+    assert next(row for row in store.local_issues() if row["number"] == 42)["state_reason"] == "not_planned"
+
+
+def test_replacement_by_another_order_does_not_queue_a_second_close(tmp_path):
+    from types import SimpleNamespace
+    from foragent import order_replaces
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    remote = FakeTracker()
+    remote.add_issue(41, "Old work", "body")
+    store.record_issue(remote.get_issue(41), {})
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: NOW))
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    for plan_id in ("first-order", "second-order"):
+        order_replaces.close_replaced({"id": plan_id}, {41: ["new"]}, tracker, {"new": 7}, {7}, "en")
+    assert [entry["action"] for entry in store.github_outbox()] == ["add_labels", "close_issue"]
+
+
+def test_pending_close_reason_waits_for_the_matching_observation(tmp_path):
+    from types import SimpleNamespace
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import RecordingTracker
+
+    clock = [NOW]
+    store = StateStore(tmp_path, now=lambda: clock[0])
+    remote = FakeTracker(now=lambda: clock[0])
+    remote.add_issue(41, "Old work", "body", state="closed")
+    remote.issues[41] = replace(remote.get_issue(41), state_reason="completed")
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=Config(), now=lambda: clock[0]))
+    tracker.get_issue(41)
+    store.queue_github_write(41, "close_issue", body=None, reason="not_planned")
+    clock[0] += timedelta(seconds=1)
+    tracker.get_issue(41)
+    # Merely seeing closed does not confirm the requested close reason was delivered.
+    assert [entry["reason"] for entry in store.github_outbox()] == ["not_planned"]
+    assert store.local_issues()[0]["state_reason"] == "not_planned"
+    clock[0] += timedelta(seconds=1)
+    tracker.flush_outbox()
+    clock[0] += timedelta(seconds=1)
+    assert tracker.get_issue(41).state_reason == "not_planned"
+    assert store.github_outbox() == []
+
+
 @pytest.mark.parametrize("error", ["HTTP 403 Issue is locked", "HTTP 422 Body is too long"])
 def test_refused_evidence_does_not_block_workflow_or_later_evidence(outbox_context, monkeypatch, error):
     ctx = outbox_context

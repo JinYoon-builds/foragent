@@ -34,8 +34,7 @@ def _remove_run_worktree(
             try:
                 scheduler._preserve_failed_implementation(
                     number, ctx, ctx.git.at(worktree), f"{outcome}: {why}" if why else outcome, approval=ctx.store.load_approval(number),
-                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None and orch_scope.shares(ctx, number),
-                    owned_deletions=bool(why),
+                    tracker_available=ctx.store.github_wait_until(ctx.now()) is None, owned_deletions=bool(why),
                 )
             except Exception as exc:
                 detail = f"WIP preservation failed before worktree cleanup: {exc}"

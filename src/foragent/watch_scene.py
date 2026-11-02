@@ -15,7 +15,8 @@ from foragent.watch_data import Snapshot
 from foragent.watch_layout import _clones
 
 # Recorded wait phases: the run waits for a turn, a slot, a baseline, a limit or the model.
-WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait"})
+WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait",
+                        "run-slot-wait"})
 # The step word (and click phrase) of each working phase.
 STEPS = {"baseline": "baseline", "implementing": "implementing", "resolving": "implementing",
          "checking": "checking", "reviewing": "reviewing", "ci": "ci", "merging": "merging",
