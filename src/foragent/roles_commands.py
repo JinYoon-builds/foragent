@@ -119,6 +119,11 @@ class _Edit:
         Nothing to commit is no error: the orch event never depends on a commit.
         """
         owned = [*owned, *(path for path in self.derived if path not in owned)]
+        # A role-memory commit advances local main: it waits for a merge between its final check and merge.
+        with self.git.publish_lock():
+            return self._commit(owned, title)
+
+    def _commit(self, owned: list[str], title: str) -> list[str]:
         def listed(args: list[str]) -> list[str]:
             return [path for path in self.git._call([*args, "-z", "--", *owned]).split("\0") if path]
 
