@@ -6,8 +6,9 @@ from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 import threading
-from typing import TYPE_CHECKING
+from typing import NoReturn, TYPE_CHECKING
 from uuid import uuid4
 
 from foragent import capacity, orch_github
@@ -17,6 +18,10 @@ from foragent.tracker import TrackerError
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
+
+# A returning run that holds no merge turn gives up its slot wait after this long, or sooner
+# when its work allowance ends. The run is handed back to the queue and keeps its open PR.
+RUN_SLOT_WAIT_SECONDS = 600
 
 
 def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
@@ -152,11 +157,15 @@ def restore_phase(n: int, ctx: RunContext, identity: dict, *, resume: bool = Tru
 def _set_phase(
     n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None, resume: bool = True,
 ) -> bool:
-    """Every exit from an idle phase must acquire capacity before doing work.
+    """Every exit from an idle phase must acquire capacity before doing work, unless it holds a merge turn.
 
     ``resume=False`` tries once, for an exit that must not block, and reports whether it took the phase.
+    Otherwise the wait is bounded: when no slot opens, this attempt stops recoverably.
     """
+    from foragent import run_merge_turn
+
     run = ctx.store.get_run(n)
+    owner = partial(run_merge_turn.holds_run_turn, ctx.store, n)
     if capacity.phase_holds_slot(run.phase) or not capacity.phase_holds_slot(identity["phase"]):
         ctx.store.update_run(n, **identity, phase_started_at=(started or ctx.now()).astimezone(UTC).isoformat())
         return True
@@ -164,13 +173,14 @@ def _set_phase(
         try:
             capacity.admit_run(
                 ctx.store, n, identity, deadline=capacity.time.monotonic(),
-                now=lambda: started or ctx.now(), waiting=lambda: None,
+                now=lambda: started or ctx.now(), waiting=lambda: None, owner=owner,
             )
         except Exception:  # Full or unreadable: another exception may be unwinding, so never replace it.
             return False
         return True
     began, mono = ctx.now(), ctx.monotonic()
     key = f"run-slot-{uuid4().hex}"
+    limit = min(RUN_SLOT_WAIT_SECONDS, _remaining(n, ctx))
     queued = False
 
     def credit(close: bool = False) -> None:
@@ -183,16 +193,35 @@ def _set_phase(
 
     def waiting() -> None:
         nonlocal queued
+        if not queued:
+            ctx.store.update_run(n, phase=capacity.RUN_SLOT_WAIT_PHASE,
+                                 phase_started_at=ctx.now().astimezone(UTC).isoformat())
         queued = True
         credit()
 
+    admitted = False
     try:
         # Queue time is paused runtime, not a separate wall-clock time budget.
-        capacity.admit_run(ctx.store, n, identity, deadline=None, now=ctx.now, waiting=waiting)
+        capacity.admit_run(ctx.store, n, identity, deadline=capacity.time.monotonic() + limit,
+                           now=ctx.now, waiting=waiting, owner=owner)
+        admitted = True
+    except TimeoutError:
+        pass
     finally:
         if queued:
             credit(close=True)
+    if not admitted:
+        _leave_without_slot(n, ctx, max(0, ctx.monotonic() - mono), limit)
     return True
+
+
+def _leave_without_slot(n: int, ctx: RunContext, waited: float, limit: int) -> NoReturn:
+    """End this attempt for a later retry: unwinding releases its waits, claims and queue position."""
+    from foragent.run_execution import _limit_wait
+
+    ctx.store.record_flow("run-slot-exit", issue=n, run_started_at=ctx.store.get_run(n).started_at,
+                          waited_seconds=waited, limit_seconds=limit)
+    _limit_wait(n, ctx, f"No machine run slot opened within {limit}s; the issue goes back to the queue.")
 
 
 class WaitPhase:

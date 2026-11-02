@@ -56,7 +56,7 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
 
     def git(args):
         assert c.ctx.store.get_run(5).phase == "checking"
-        assert capacity.machine_runs(c.ctx.store, c.ctx.now()) == 1
+        assert capacity.machine_runs(c.ctx.store, c.ctx.now()) == (2 if polls else 1), "Counted exactly once"
         return transport(args)
 
     def reports(head):
@@ -74,12 +74,8 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
         other.start_run(90, branch="other", worktree="other", pid=os.getpid())
 
     def slot_sleep(seconds):
-        assert c.ctx.store.get_run(5).phase == "ci"
-        assert ("close", 99) not in c.calls
-        assert len([call for call in c.calls if call[0] == "push"]) == 1
         sleeps.append(seconds)
-        c.clock[0] += timedelta(seconds=seconds)
-        other.finish_run(90, outcome="merged")
+        pytest.fail("The leader holds the merge turn: its cleanup must not queue for a machine slot")
 
     monkeypatch.setattr(c.ctx.git, "_call", git)
     monkeypatch.setattr(c.ctx.tracker, "pr_acceptance_reports", reports)
@@ -91,8 +87,8 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
         assert reason is None
     else:
         assert reason == "reports unavailable"
-    assert polls == ["head", "head"] and sleeps == [capacity.WORKLOAD_POLL_SECONDS]
-    assert c.ctx.store.get_run(5).waited_seconds == sum(sleeps)
+    assert polls == ["head", "head"] and sleeps == []
+    assert c.ctx.store.get_run(5).waited_seconds == 0
     assert ("close", 99) in c.calls
     assert len([call for call in c.calls if call[0] == "push"]) == 2
 
@@ -100,7 +96,7 @@ def test_group_ci_releases_wait_slot_and_reacquires_before_cleanup(ci_case, tmp_
 @pytest.mark.parametrize("damage", ["full", "lock", "free"])
 @pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit, RuntimeError])
 def test_interrupted_group_ci_cleans_up_without_queueing_or_replacing_the_interruption(
-    ci_case, tmp_path, monkeypatch, exception, damage,
+    ci_case, tmp_path, monkeypatch, exception, damage, holder=True,
 ):
     import os
 
@@ -130,11 +126,23 @@ def test_interrupted_group_ci_cleans_up_without_queueing_or_replacing_the_interr
     monkeypatch.setattr(c.ctx.tracker, "pr_acceptance_reports", reports)
     monkeypatch.setattr(c.ctx.tracker, "close_pr", lambda pr: closed.append(c.ctx.store.get_run(5).phase))
     monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=c.ctx.monotonic, sleep=slot_sleep))
+    if not holder:
+        run_merge_turn.withdraw(c.ctx, run_merge_turn.seat(c.ctx, 5, "main"))
     with pytest.raises(exception) as caught:
         group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
     assert caught.value is error
-    assert closed == ["checking" if damage == "free" else "ci"]
+    assert closed == ["checking" if holder or damage == "free" else "ci"]
     assert len([call for call in c.calls if call[0] == "push"]) == 2
+
+
+@pytest.mark.parametrize("damage", ["full", "lock", "free"])
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, SystemExit, RuntimeError])
+def test_interrupted_group_ci_of_a_nonholder_stays_idle_when_no_slot_is_free(
+    ci_case, tmp_path, monkeypatch, exception, damage,
+):
+    test_interrupted_group_ci_cleans_up_without_queueing_or_replacing_the_interruption(
+        ci_case, tmp_path, monkeypatch, exception, damage, holder=False,
+    )
 
 
 @pytest.mark.parametrize("result", ["passed", "failed", "void", "timeout", "transport", "create"])

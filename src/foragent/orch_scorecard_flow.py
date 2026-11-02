@@ -23,7 +23,7 @@ from foragent.state import StateStore
 DAY = timedelta(hours=24)
 # Wait phases by cause; the runner's phase names stay the source of truth.
 CAUSES = {"test-slot-wait": "slot", "overlap-wait": "overlap", "merge-turn-wait": "merge",
-          "merge-lock-wait": "merge", "executor-wait": "quota", "limit-wait": "quota"}
+          "merge-lock-wait": "merge", "executor-wait": "quota", "limit-wait": "quota", "run-slot-wait": "slot"}
 CAUSE_ORDER = ("slot", "overlap", "merge", "quota")
 INTERVENTIONS = {"ask", "escalate", "person-found"}
 HOLDING = {"blocked", "needs-human", "running"}  # Labels that keep an approved issue from starting.
