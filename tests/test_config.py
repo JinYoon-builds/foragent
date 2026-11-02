@@ -56,7 +56,7 @@ def test_exact_defaults(repo):
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
-        "skill_roles": {},
+        "skill_roles": {}, "default_skills": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,
@@ -538,3 +538,23 @@ def test_legacy_owner_is_optional_and_kept_as_written(repo, tmp_path):
     assert load_config(repo, tmp_path / "global.yml").legacy_owner is None
     write_settings(repo / ".foragent.yml", {"legacy_owner": "Jin-Yoon"})
     assert load_config(repo, tmp_path / "global.yml").legacy_owner == "Jin-Yoon"
+
+
+@pytest.mark.parametrize("table", [
+    ["one"], "one", {"workers": "one"}, {"workers": [3]}, {"testers": ["one"]},
+    {"workers": ["../outside"]}, {"workers": ["a/../b"]}, {"workers": ["one two"]},
+])
+def test_default_skills_refuses_anything_but_a_role_table(tmp_path, table):
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"default_skills": table}))
+    with pytest.raises(ConfigError, match="default_skills"):
+        load_config(tmp_path, global_path=tmp_path / "missing.yml")
+
+
+def test_default_skills_local_table_replaces_the_global_one_and_blank_means_empty(tmp_path):
+    other = tmp_path / "global.yml"
+    other.write_text(yaml.safe_dump({"default_skills": {"docs": ["kwp:engineering/one"], "workers": ["two"]}}))
+    (tmp_path / ".foragent.yml").write_text("repo: o/r\n")
+    assert load_config(tmp_path, global_path=other).default_skills == {
+        "docs": ["kwp:engineering/one"], "workers": ["two"]}
+    (tmp_path / ".foragent.yml").write_text("default_skills:\n  architect: [three]\n  docs:\n")
+    assert load_config(tmp_path, global_path=other).default_skills == {"architect": ["three"], "docs": None}
