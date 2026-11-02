@@ -91,14 +91,14 @@ def scoped(context, passed_head, *, changed, main_changed=False):
         "The reviewer must classify unchanged-code findings as nonblocking NOTE records"
     )
     assert re.search(r"main.{0,140}(?:count|includ|chang)", flat), (
-        "Explain that code integrated from main after the PASS counts as later change"
+        "Explain the scope of changes integrated from main after the PASS"
     )
     assert "+accepted = 'reviewed'" not in context, "Do not present pre-PASS additions as new work"
     if main_changed:
-        assert "-base = 0" in context and "+base = 1" in context, "Include main's same-file post-PASS edit"
+        assert "-base = 0" not in context and "+base = 1" not in context, "Exclude main-only edits even in a PR file"
     if changed:
         assert "-retry = 1" in context and "+retry = 2" in context, "Supply the actual post-PASS diff"
-    elif not main_changed:
+    else:
         assert "diff --git" not in context, "An unchanged issue has no post-PASS code diff"
 
 
@@ -243,15 +243,17 @@ def test_main_integration_after_pass_counts_as_changed_code(
     assert git_command(case.history.origin, "show", f"{integrated}:feature.txt") == text.strip()
     case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now),
                        config=replace(case.config, review="fast"))
-    # PM follow-up replaces the old point (e). Keep these existing node IDs;
-    # both upstream code and the issue's own later code can now block.
+    # Jin's 2026-11-02 decision supersedes #1599's main-integration rule.
+    # Keep every node ID. Main-only changes cannot enter this review; new own code can block.
     defect = UPSTREAM_FINDING if finding == "upstream" else NEW_FINDING
-    reply = "VERDICT: FAIL\n" + defect
+    reply = ("VERDICT: PASS\nNOTE: " if finding == "upstream" else "VERDICT: FAIL\n") + defect
     contexts = capture_review(case, [reply])
     outcome = review_only(1, case.ctx)
     assert len(contexts) == 1
     scoped(contexts[0], head, changed=finding == "changed", main_changed=True)
-    assert outcome == "review-failed" and not case.tracker.merged_prs
+    assert "upstream.txt" not in contexts[0] and "+from main" not in contexts[0]
+    assert outcome == ("merged" if finding == "upstream" else "review-failed")
+    assert bool(case.tracker.merged_prs) is (finding == "upstream")
     assert defect in case.ctx.store.log_path(1).read_text()
 
 

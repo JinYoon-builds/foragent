@@ -651,9 +651,9 @@ def test_setup_waiting_for_a_merge_commits_and_pushes_on_the_merged_base(setup, 
     real_lock, held = init_module.main_write_lock, []
 
     @contextmanager
-    def lock(root):
+    def lock(git):
         history.update({"merged.txt": "landed\n"}, message="Merged PR")  # The merge the lock waited for.
-        with real_lock(root):
+        with real_lock(git):
             held.append(True)
             yield
             held.pop()
@@ -689,9 +689,9 @@ def test_unpushed_setup_recovery_refuses_a_merge_that_landed_while_waiting(setup
     real_lock = init_module.main_write_lock
 
     @contextmanager
-    def lock(root):
+    def lock(git):
         history.update({"merged.txt": "landed\n"}, message="Merged PR")
-        with real_lock(root):
+        with real_lock(git):
             yield
 
     monkeypatch.setattr(init_module, "main_write_lock", lock)
@@ -715,9 +715,9 @@ def test_setup_lock_wait_keeps_staged_and_unstaged_versions_of_an_unrelated_file
     real_lock = init_module.main_write_lock
 
     @contextmanager
-    def lock(root):
+    def lock(git):
         history.update({"merged.txt": "landed\n"}, message="Merged PR")
-        with real_lock(root):
+        with real_lock(git):
             yield
 
     monkeypatch.setattr(init_module, "main_write_lock", lock)

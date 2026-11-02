@@ -734,6 +734,7 @@ def _layouts(git_history, tmp_path):
     shared.mkdir()
     (shared / ".git").symlink_to(clone / ".git", target_is_directory=True)
     return {
+        "bare-repository": (clone / ".git", {}),
         "symlinked-linked-worktree": (symlinked, {}),
         "symlinked-git-dir": (shared, {}),
         "clone": (clone, {}),
@@ -745,23 +746,21 @@ def _layouts(git_history, tmp_path):
 
 
 LAYOUTS = ["clone", "linked-worktree", "git-dir-env", "relative-git-dir-env", "work-tree-below-the-repository",
-           "symlinked-linked-worktree", "symlinked-git-dir"]
+           "symlinked-linked-worktree", "symlinked-git-dir", "bare-repository"]
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
 def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_path, monkeypatch, layout):
-    from foragent.git import main_write_dir
-
     root, env = _layouts(git_history, tmp_path)[layout]
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     expected = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root,
                               check=True, capture_output=True, text=True).stdout.strip()
-    assert main_write_dir(root) == Path(expected).resolve() == (git_history.clone / ".git").resolve()
+    assert GitRepo(root).common_dir() == Path(expected).resolve() == (git_history.clone / ".git").resolve()
 
 
 @pytest.mark.parametrize("writer", ["setup", "publisher"])
-@pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir"])
+@pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir", "bare-repository"])
 def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(git_history, tmp_path,
                                                                                monkeypatch, layout, writer):
     import fcntl
@@ -798,7 +797,7 @@ def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(g
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
-        lock = main_write_lock(root) if writer == "setup" else GitRepo(root).publish_lock()
+        lock = main_write_lock(GitRepo(root)) if writer == "setup" else GitRepo(root).publish_lock()
         with lock:
             assert contended == [True], "This checkout must wait for the lock the primary checkout holds"
     finally:
@@ -843,7 +842,7 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
             return real_flock(fd, operation)
 
         monkeypatch.setattr(fcntl, "flock", probe)
-        with main_write_lock(root):
+        with main_write_lock(GitRepo(root)):
             assert contended == [True], "Setup must wait for the merge holding this repository's lock"
     finally:
         release.set()
@@ -852,17 +851,27 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
 
 
 
-def test_main_write_lock_needs_only_the_checkout_path(git_history, tmp_path, monkeypatch):
-    """No Git process is started for the lock, so an injected Git boundary is never bypassed."""
-    import subprocess as process
-    from foragent.git import main_write_dir, main_write_lock
+@pytest.mark.parametrize("answer", ["not-a-repository", "empty", "relative"])
+def test_main_write_is_refused_when_git_cannot_report_the_lock_directory(tmp_path, answer):
+    """Fail closed: without the repository's lock directory no main write runs."""
+    from foragent.git import main_write_lock
 
-    def no_process(*args, **kwargs):
-        raise AssertionError(f"The lock started a process: {args}")
+    if answer == "not-a-repository":
+        git = GitRepo(tmp_path)
+    else:
+        git = GitRepo(tmp_path, lambda args: "" if answer == "empty" else ".git\n")
+    entered = []
+    with pytest.raises(GitError, match="main is not written without it"):
+        with main_write_lock(git):
+            entered.append(True)
+    assert entered == [] and not list(tmp_path.rglob("foragent-publish.lock"))
 
-    monkeypatch.setattr(process, "run", no_process)
-    monkeypatch.setattr(process, "Popen", no_process)
-    assert main_write_dir(git_history.clone) == (git_history.clone / ".git").resolve()
-    with main_write_lock(git_history.clone):
-        assert (git_history.clone / ".git" / "foragent-publish.lock").exists()
-    assert main_write_dir(tmp_path / "no-repository") is None, "A directory Git would not use is not locked"
+
+def test_an_injected_git_double_writes_no_history_and_takes_no_lock(tmp_path):
+    from types import SimpleNamespace
+    from foragent.git import main_write_lock
+
+    entered = []
+    with main_write_lock(SimpleNamespace(root=tmp_path, commit_paths=lambda *args: None)):
+        entered.append(True)
+    assert entered == [True] and not list(tmp_path.rglob("foragent-publish.lock"))

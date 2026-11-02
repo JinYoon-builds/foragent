@@ -31,8 +31,8 @@ def _merge_lock(n: int, ctx: RunContext):
                 nonlocal started
                 stack.enter_context(ctx.store.merge_lock())
                 # Main writers (order/note flush, role memory, lanes) wait from the final check to the merge.
-                from foragent import git as git_files  # Only the checkout path: any injected Git works.
-                stack.enter_context(git_files.main_write_lock(ctx.git.root))
+                from foragent import git as git_files
+                stack.enter_context(git_files.main_write_lock(ctx.git))
                 started = ctx.now()
 
             try:

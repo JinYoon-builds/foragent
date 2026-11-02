@@ -236,8 +236,8 @@ def test_free_merge_lock_keeps_the_slot_and_adds_no_wait_phase(slot_case, monkey
     lock, order = c.store.merge_lock, []
 
     @contextmanager
-    def main_write_lock(root):
-        assert root == c.ctx.git.root
+    def main_write_lock(git):
+        assert git is c.ctx.git
         order.append("main-write")
         yield
         order.append("main-write released")

@@ -89,7 +89,7 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
             why.append("raced")
             return None
         if reason is None:
-            planned = orch_spawn.plan_launch(root, store, now)
+            planned = orch_spawn.plan_launch(root, store, config, now)
             # The same record as the gate writes, so the gate's spacing also covers this spawn.
             if planned is None or not orch_spawn.launch(root, store, now, planned):
                 orch_spawn.note_skip(store, "launch-unavailable" if planned is None else "launch-failed")

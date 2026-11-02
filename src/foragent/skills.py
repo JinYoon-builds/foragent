@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from foragent.config import Config, SKILL_ROLES, load_global_config, register_skill_library
+from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_global_config, register_skill_library
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 
@@ -57,6 +57,22 @@ OPEN_SOURCE_LICENSES = {
 }
 
 
+def _source_key(repo: str) -> str:
+    """The same repository however its URL is spelled; a library's name says nothing about its source."""
+    key = re.sub(r"^(?:ssh://)?git@github\.com[:/]", "https://github.com/", repo.strip())
+    return key.rstrip("/").removesuffix(".git").casefold()
+
+
+def trusted_source(repo: str) -> bool:
+    """Whether a library comes from one of the repositories Foragent ships as its defaults."""
+    return _source_key(repo) in {_source_key(entry["repo"]) for entry in DEFAULTS["skill_libraries"]}
+
+
+def entry_directory(entry: str) -> str:
+    """The installed directory name a `default_skills` entry (`library:folder/name`) points to."""
+    return entry.rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+
+
 def _normalized_license(text: str) -> str:
     text = re.sub(
         r"^[ \t]*Copyright[ \t]+(?:\(c\)[ \t]*|©[ \t]*)?(?:\d{4}|<year>|\[yyyy\])[^\r\n]*$",
@@ -65,14 +81,15 @@ def _normalized_license(text: str) -> str:
     return " ".join(text.split())
 
 
-def _license(skill: Path, library: Path, *, nearest: bool = False) -> tuple[str, Path | None]:
+def _license(skill: Path, library: Path, *, nearest: bool = False, walk: bool = False) -> tuple[str, Path | None]:
     """Identify a skill's license from its own LICENSE, else the library's.
 
     With ``nearest`` (library catalog skills), every folder between the skill and the library root is
     tried in turn, and a standard text followed by unrelated appended text still counts as that license.
+    ``walk`` tries those folders too but keeps exact matching (a project's own skills).
     """
     directories = [skill, library]
-    if nearest:
+    if nearest or walk:
         directories = [skill, *(parent for parent in skill.parents if parent.is_relative_to(library))]
     license_file = next((directory / name for directory in directories for name in ("LICENSE", "LICENSE.txt")
                          if (directory / name).is_file()), None)
@@ -100,6 +117,91 @@ def _license(skill: Path, library: Path, *, nearest: bool = False) -> tuple[str,
         identity = spdx[0].strip().removesuffix("*/").strip()
         return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == identity.casefold()), identity), license_file
     return next((identity for identity, expected in standards.items() if normalized == expected), "unknown"), license_file
+
+
+def _copyright_line(line: str) -> bool:
+    """A copyright or attribution line: it starts with `Copyright` or `©`. What follows is not judged."""
+    return re.match(r"(?:Copyright\b|©)", line.strip()) is not None
+
+
+def _terms(text: str) -> str:
+    """The license text apart from its copyright lines, with whitespace collapsed."""
+    return " ".join(" ".join(line for line in text.splitlines() if not _copyright_line(line)).split())
+
+
+def _permissive(text: str) -> str:
+    """The permissive license a whole LICENSE text is, else "unknown" (Jin's rule, 2026-11-02).
+
+    It passes when its text apart from the copyright lines equals a known permissive license word
+    for word, or when it is one `SPDX-License-Identifier:` line naming one, plus copyright lines
+    and nothing else. Everything else, no text included, fails; the copyright names are not judged.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    declarations = [line for line in lines if not _copyright_line(line)]
+    if len(declarations) == 1 and (spdx := re.fullmatch(r"SPDX-License-Identifier: *(\S+)", declarations[0])):
+        return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == spdx[1].casefold()), "unknown")
+    terms = _terms(text)
+    return next((identity for identity, standard in STANDARD_LICENSES.items()
+                 if terms and terms == _terms(standard)), "unknown")
+
+
+_LICENSE_FILE = re.compile(r"(?:licen[cs]e|copying)", re.I)
+# Where an installed default records its library, path, revision and license.
+SOURCE_FILE = "SOURCE"
+
+
+def redistributable_license(directory: Path, base: Path) -> tuple[str, Path | None]:
+    """The license over ``directory``, judged for default use by `_permissive`.
+
+    The closest folder, from ``directory`` up to ``base``, that holds any license file decides:
+    every file there named LICENSE*, LICENCE* or COPYING* (LICENSE.md included) must be permissive.
+    """
+    for folder in (directory, *(parent for parent in directory.parents if parent.is_relative_to(base))):
+        # A folder or license file that cannot be looked at hides its facts: that is "unknown", never "none".
+        try:
+            found = sorted(folder / name for name in os.listdir(folder) if _LICENSE_FILE.match(name))
+        except OSError:
+            return "unknown", folder
+        if not found:
+            continue
+        verdicts = []
+        for path in found:
+            try:
+                verdicts.append((_permissive(path.read_text(encoding="utf-8")), path))
+            except (OSError, UnicodeError):
+                verdicts.append(("unknown", path))
+        return next((verdict for verdict in verdicts if verdict[0] not in OPEN_SOURCE_LICENSES), verdicts[0])
+    return "unknown", None
+
+
+def reached_through_symlink(path: Path) -> bool:
+    """Whether any folder on ``path``'s way, ``path`` itself, or anything inside it is a symlink.
+
+    A default must be the files its license facts describe; a link may lead anywhere. That
+    includes a linked library root, project or checkout, and any folder above them.
+    """
+    if os.path.realpath(path) != os.path.abspath(path):
+        return True
+    unreadable = []  # A folder that cannot be listed could hold a link: count it as one.
+    for directory, folders, files in os.walk(path, onerror=unreadable.append):
+        if any(os.path.islink(os.path.join(directory, name)) for name in (*folders, *files)):
+            return True
+    return bool(unreadable)
+
+
+def copy_license(directory: Path, base: Path, origin: Skill | None) -> str:
+    """The license facts of a skill copy under ``base``; every fact that applies must allow it.
+
+    The nearest license over the copy always applies, up to and including ``base`` (the project's
+    own LICENSE); so does the library an installed ``.claude/skills`` copy came from. Another copy's
+    license never stands in for this one. Returns the first restrictive fact, else an open one.
+    """
+    local, found = redistributable_license(directory, base)
+    facts = [local] if found is not None else []
+    if origin is not None and directory.parent.parent.name == ".claude":
+        facts.append(redistributable_license(origin.path, origin.library.path)[0])
+    facts = facts or [local]
+    return next((fact for fact in facts if fact not in OPEN_SOURCE_LICENSES), facts[0])
 
 
 def _skill_files(library: Path) -> list[Path]:
@@ -153,6 +255,12 @@ def _frontmatter(path: Path) -> dict[str, Any]:
     if not isinstance(meta, dict) or any(not isinstance(meta.get(key), str) for key in ("name", "description")):
         raise SkillError("skill requires name and description frontmatter")
     return meta
+
+
+def skill_summary(path: Path) -> tuple[str, str]:
+    """A SKILL.md's name and description."""
+    meta = _frontmatter(path)
+    return meta["name"], meta["description"]
 
 
 class SkillManager:
@@ -335,7 +443,8 @@ class SkillManager:
             return None
         meta = _frontmatter(path / "SKILL.md")
         library = Library("repo", str(root), root)
-        license_id, license_file = _license(path, root)
+        # The closest LICENSE governs: a skills/LICENSE overrides the project's root one.
+        license_id, license_file = _license(path, root, walk=True)
         skill_id = f"repo:{identity}"
         return Skill(skill_id, meta["name"], meta["description"], library, path, license_id, license_file,
                      (path,), _runs_scripts(path), self.config.skill_roles.get(skill_id))
@@ -344,20 +453,97 @@ class SkillManager:
         skill = self._repo_skill(identity, root) or self._select(identity)
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
             raise SkillError(f"skill contains a symlink: {identity}")
-        if commit and skill.license not in OPEN_SOURCE_LICENSES:
-            location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
-            raise SkillError(f"refusing to install {skill.id}: cannot confirm an open-source license "
-                             f"({skill.license}; {location})")
+        if commit:
+            self._require_open_license(skill)
         destination = repo_path(root, f".claude/skills/{skill.path.name}")
         if destination.exists() and (destination.is_symlink() or not destination.is_dir()
-                                     or self._contents(destination) != self._contents(skill.path)):
+                                     or not self._same_copy(destination, skill.path)):
             raise SkillError(f"refusing to overwrite different existing skill: {destination}")
         repo_path(root, "THIRD_PARTY_NOTICES.md" if commit else ".gitignore")
         return skill
 
     @staticmethod
+    def _require_open_license(skill: Skill) -> None:
+        if skill.license not in OPEN_SOURCE_LICENSES:
+            location = str(skill.license_file) if skill.license_file else "no LICENSE or LICENSE.txt"
+            raise SkillError(f"refusing to install {skill.id}: cannot confirm an open-source license "
+                             f"({skill.license}; {location})")
+
+    def check_default(self, identity: str, root: Path) -> Skill | None:
+        """A default skill's license facts, checked before `fa init` changes anything.
+
+        Returns the skill to install, or None when a permitted copy stays in .claude/skills as the
+        person left it, even when the library moved on or no longer has it.
+        """
+        try:
+            skill, failure = self._repo_skill(identity, root) or self._select(identity), None
+        except SkillError as exc:
+            skill, failure = None, exc
+        directory = root / ".claude/skills" / (skill.path.name if skill else entry_directory(identity))
+        if directory.exists() or directory.is_symlink():
+            if reached_through_symlink(directory):
+                raise SkillError(f"refusing to keep {identity} as a default: {directory} is reached through a symlink")
+            license_id = copy_license(directory, root, skill)
+            if license_id not in OPEN_SOURCE_LICENSES:
+                raise SkillError(f"refusing to keep {identity} as a default: {directory} has no open-source "
+                                 f"license ({license_id})")
+            return None
+        if failure is not None:
+            raise failure
+        if reached_through_symlink(skill.path):
+            raise SkillError(f"refusing to install {identity} as a default: {skill.path} is reached through a symlink")
+        license_id, found = redistributable_license(skill.path, skill.library.path)
+        if license_id not in OPEN_SOURCE_LICENSES:
+            raise SkillError(f"refusing to install {identity} as a default: cannot confirm an open-source license "
+                             f"({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
+        return self.check_install(identity, root, commit=True)
+
+    def default_needs_ignore(self, skill: Skill, root: Path) -> bool:
+        """Whether installing this default adds a line to .gitignore."""
+        ignore = repo_path(root, ".gitignore")
+        return self._ignore_rule(skill) not in (ignore.read_bytes().splitlines() if ignore.exists() else ())
+
+    @staticmethod
+    def _ignore_rule(skill: Skill) -> bytes:
+        return f"/.claude/skills/{skill.path.name}/".encode()
+
+    @staticmethod
     def _contents(path: Path) -> dict[str, bytes]:
         return {file.relative_to(path).as_posix(): file.read_bytes() for file in path.rglob("*") if file.is_file()}
+
+    def _same_copy(self, copy: Path, source: Path) -> bool:
+        """The copy holds the source's files unchanged; only a default's kept license and SOURCE may be added."""
+        theirs, ours = self._contents(source), self._contents(copy)
+        added = ours.keys() - theirs.keys()
+        return (all(ours.get(name) == data for name, data in theirs.items())
+                and all(name == SOURCE_FILE or _LICENSE_FILE.match(name) for name in added))
+
+    def install_default(self, identity: str, skill: Skill, root: Path) -> None:
+        """Install a checked default locally, keeping its original license and its source with the copy.
+
+        The license files that decided its eligibility are copied in when they sit above the skill
+        folder (a library often licenses its skills in one root file), and SOURCE records where it came from.
+        """
+        self.install(identity, root)
+        destination = repo_path(root, f".claude/skills/{skill.path.name}")
+        license_id, found = redistributable_license(skill.path, skill.library.path)
+        kept = []
+        if found is not None:
+            for path in sorted(found.parent.iterdir()):
+                if path.is_file() and _LICENSE_FILE.match(path.name):
+                    kept.append(path)
+                    if not (destination / path.name).exists():
+                        shutil.copyfile(path, destination / path.name)
+        revision = skill.library.revision
+        if revision is None and (skill.library.path / ".git").exists():
+            try:
+                revision = self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
+            except (OSError, subprocess.SubprocessError):
+                revision = None
+        licenses = ", ".join(path.relative_to(skill.library.path).as_posix() for path in kept)
+        (destination / SOURCE_FILE).write_text(
+            f"Source: {skill.library.repo}\nPath: {skill.path.relative_to(skill.library.path).as_posix()}\n"
+            f"Revision: {revision or 'unknown'}\nLicense: {license_id} ({licenses})\n", encoding="utf-8")
 
     def install(self, identity: str, root: Path, *, commit: bool = False) -> str:
         skill = self.check_install(identity, root, commit=commit)
@@ -372,7 +558,7 @@ class SkillManager:
         if not commit:
             ignore = repo_path(root, ".gitignore")
             original = ignore.read_bytes() if ignore.exists() else b""
-            rule = f"/.claude/skills/{skill.path.name}/".encode()
+            rule = self._ignore_rule(skill)
             if rule not in original.splitlines():
                 ignore.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"")
                                    + rule + b"\n")

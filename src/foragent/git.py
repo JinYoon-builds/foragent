@@ -654,7 +654,20 @@ class GitRepo:
 
     def publish_lock(self) -> AbstractContextManager[None]:
         """The one main-write lock for this repository; see ``main_write_lock``."""
-        return main_write_lock(self.root)
+        return main_write_lock(self)
+
+    def common_dir(self) -> Path:
+        """The repository's common Git directory, as Git itself reports it; GitError when it cannot."""
+        try:
+            answer = self._call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+        except GitError as exc:
+            raise GitError(f"cannot find the Git directory of {self.root} for the main-write lock; "
+                           f"main is not written without it: {exc}") from exc
+        path = Path(answer)
+        if not answer or not path.is_absolute() or not path.is_dir():
+            raise GitError(f"cannot find the Git directory of {self.root} for the main-write lock "
+                           f"(git reported {answer!r}); main is not written without it")
+        return path.resolve()
 
     def update_base(self, branch: str) -> None:
         """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
@@ -710,20 +723,21 @@ _MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by 
 
 
 @contextmanager
-def main_write_lock(root: Path) -> Iterator[None]:
+def main_write_lock(git: object) -> Iterator[None]:
     """The one main-write lock: every Foragent write that advances local or remote main holds it.
 
     Merges take it after the store merge lock and keep it from their final check through the
     merge; publishers take it after their own gates and refresh the base once they hold it.
-    Every checkout of a repository shares it through its common Git directory
-    (``main_write_dir``). It needs only the checkout's path, so an injected Git boundary is
-    never bypassed. A writer nested in another main write of the same thread reuses the hold.
-    With no repository at ``root`` there is no main to exclude, and nothing is locked.
+    It lives in the common Git directory that Git reports for the repository being written, so
+    every checkout of it (linked, bare, ``GIT_DIR``) shares one lock; when Git cannot report it,
+    the write is refused (``GitRepo.common_dir``). An injected Git double that is not a
+    ``GitRepo`` writes no Git history, so there is no main to exclude. A writer nested in another
+    main write of the same thread reuses the hold.
     """
-    common = main_write_dir(root)
-    if common is None:
+    if not isinstance(git, GitRepo):
         yield
         return
+    common = git.common_dir()
     key = os.path.realpath(common / "foragent-publish.lock")
     held = _MAIN_WRITES.__dict__.setdefault("held", Counter())
     if held[key]:
@@ -752,45 +766,19 @@ def slug_from_url(url: str) -> str | None:
     return None if match is None else f"{match[1]}/{match[2]}"
 
 
-def main_write_dir(root: Path) -> Path | None:
-    """The common Git directory that Git commands run at ``root`` use, read from Git's files.
-
-    Git's order: ``GIT_COMMON_DIR``, then ``GIT_DIR`` (relative to ``root``, where ``GitRepo``
-    runs Git), then the nearest ``.git`` from ``root`` up. A ``.git`` file, directory or symlink
-    is resolved and its ``commondir`` followed, as Git does for linked worktrees. Tests compare
-    each checkout layout with ``git rev-parse --git-common-dir``. None when Git would find no repository.
-    """
-    root = Path(root).absolute()
-    try:
-        if common := os.environ.get("GIT_COMMON_DIR"):
-            return (root / common).resolve()
-        if gitdir := os.environ.get("GIT_DIR"):
-            return _common_of((root / gitdir).resolve())
-        for directory in (root, *root.parents):
-            if (directory / ".git").exists():
-                return _common_git_dir(directory)
-    except (OSError, UnicodeDecodeError) as exc:
-        raise GitError(f"cannot find the Git directory of {root} for the main-write lock: {exc}") from exc
-    return None
-
-
-def _common_of(gitdir: Path) -> Path:
-    """A git dir's common directory: a linked worktree's git dir names it in ``commondir``."""
+def _common_git_dir(root: Path) -> Path:
+    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
+    dot_git = root / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    line = dot_git.read_text(encoding="utf-8").strip()
+    if not line.startswith("gitdir:"):
+        raise OSError(f"not a git dir file: {dot_git}")
+    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
     commondir = gitdir / "commondir"
     if commondir.is_file():
         return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
     return gitdir
-
-
-def _common_git_dir(root: Path) -> Path:
-    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
-    dot_git = root / ".git"
-    if dot_git.is_dir():  # Possibly a symlink to a linked worktree's git dir, which names its common dir.
-        return _common_of(dot_git.resolve())
-    line = dot_git.read_text(encoding="utf-8").strip()
-    if not line.startswith("gitdir:"):
-        raise OSError(f"not a git dir file: {dot_git}")
-    return _common_of((root / line.removeprefix("gitdir:").strip()).resolve())
 
 
 def origin_slug_from_files(root: Path, remote: str = "origin") -> str | None:

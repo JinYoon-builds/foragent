@@ -626,8 +626,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                                 f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
             # Premerge and its tests ran unlocked; main writers wait from this re-check to the merge.
-            from foragent import git as git_files  # Only the checkout path: any injected Git works.
-            stack.enter_context(git_files.main_write_lock(ctx.git.root))
+            from foragent import git as git_files
+            stack.enter_context(git_files.main_write_lock(ctx.git))
             current = _open_pr(ctx, n)
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head
