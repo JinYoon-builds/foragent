@@ -174,21 +174,43 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - Batch flushed 11-02 01:35Z: #1597 turn fix, #1599 5A, #1158, #1004 edits, #1602 follow-up unapproved. Next: review procedure after #1040 first part; resume rproc and sk1040 drafts (cxdo fix with rproc-fix.txt, sk1040-fix.txt); publish prekey draft; docs order.
 - After #1597 merges: tell PM, then fa settings set max_parallel 4 for half a day (8+ merges); watch the merge turn is not blocked; compare merges per hour, time per issue, review failures, CPU, memory warnings. Token script drafts/subtraction-survey/tokens_merged.py.
 - Review procedure order also updates docs/gate.md's review section (r279).
-- S2 rebuilt from main in scratchpad s2 (v4); publish by flush after #1597 #1599 #1570. Then S5.
 - skill-layer-1: defaults per role (PM); after Codex: copy to drafts/skill-layer-1, QA on clean main, preread, flush, approve.
 - #1599: hint to shrink first; if it does not shrink from +804, restart from main (PM). .claude/skills root listing is on the MacBook test list.
 - r302 docs items (text in scratchpad r302.txt; copy into the r264 docs order draft, gate.md:74 beside r279 in the review procedure order).
-- r295 drafts/github-drop: my QA passed (16 fail on main, 29 pass with prototype, +55 -17); preread, then flush and approve.
 - r305: if #1570's next FAIL is again a marker stuck mid-line, reduce that handling and make it NOTE by Goal edit (0 in 400 bodies, 0 in 405 snapshots). r306: if #1523's next FAIL is again a retained entry with no files, NOTE by Goal edit (orders.jsonl 9 of 9 have files). Do not touch the current round.
 - r306 extra: before lowering, read how land treats a dirty checkout; if work can be lost, cancel the proposal. r305 hint: remove _GLUED_MARKERS and its unit tests, re-verify locks (not yet proven to pass).
 - r309 docs: gate.md §8 text in drafts/r309-docs.txt goes into the r264 docs order. Rule exception question (D60, merge-turn run) sent to the PM with r266.
 - r309 answer A (PM; Jin told in one line): the docs order adds a decision in decisions.md and after rules.md:35 'A run holding the merge turn does not wait for machine admission; its work still counts. (Dnn)'. Same order as 6A, r264, r302 items, r309 gate.md.
 - #1004 split published and retried 07:03Z. Held again: tell the PM at once; with no basis to redraw, propose B (park). If it does not shrink, restart from #1401's PASS head (PM ok). #1629 is the unapproved follow-up: after #1004 merges, write locks from merged code, re-preread (its first preread question: invalid committed file with no team trace, recommend A, keep today's warning for a single user), approve.
-- max_parallel 4 experiment started 2026-11-02 07:03Z, machine scope. Half a day, 8+ merges. Compare with ~/.cache/fsev-watch/baseline-2026-11-02.txt: merges per hour, time per issue, review failures, CPU and memory warnings; watch the merge turn. Then tell the PM.
+- max_parallel 4 experiment 11-02 07:03Z..18:34:39Z, ended by unset (PM: merges dropped). 11-03 ~09:00Z: #1527 24h split, unknown share (fix first if still high), then #1635 Done when + preread.
 - size signal order (Jin approved through PM, 11-02): draft in scratchpad sizegate; show the PM a card, then preread, flush, approve. No automatic redesign, no retry instruction change.
 - Experiment measure (architect r313): read review results as ratios, not counts (FAIL after PASS 50% to 25%, rejections per run, 4th+ FAIL before first PASS 140/509). #1597's effect cannot be separated; read with the experiment. Check that the next PASS event carries head and body_sha (r261).
 - #1469 edit (Jin: gate calls architect directly; re-call when a number worsens after an answer): draft in scratchpad w1469; publish after the review procedure order, approve. Signals: an open (unanswered) one does not re-raise (orch_role_raise.py:163-206), so lane_concentration can be left open.
 - #1523: std3 published 07:18Z, PR +1,160. Held again on a new class: consider split or redesign (D106), not another sentence.
 - #1635 (self-sizing slots by machine and work weight; published unapproved by the PM, Jin's decision): write locks from #1527's per-step weight data, then approve. Order after review procedure, #1469, size signal.
 - r315 docs: decision for #1599's review standard (after a PASS with the same body, block only on code changed since PASS or a failing locked test; body edit restores full review; exempt risk entries keep full scope; review_pass_scope false restores old) + one rules.md line under Review; text in drafts/r315-docs.txt. Docs order.
-- Role memory: backed up to backups/agent-memory-<time>; commit the current .claude/agent-memory changes once at the next publish window (temp worktree of main, named paths only); defect order draft in scratchpad rolemem (choice-free: publish+approve after clean preread).
+- Role memory committed b0d551fa (2026-11-02); defect order draft in scratchpad rolemem still to QA/publish.
+- UX pass 1: draft in scratchpad uxfix. Publish only README (#1477 edit) and help/doctor small issue. The fa init setup-help part (A, with #1475) stays a draft: Jin is choosing the entry point (/fa conversation vs fa init); the PM will send the scope again.
+- #1499 #1500 #1501 (decisions not buried): must-have before launch; order after review procedure and #1469. Tell the PM when their turn to write locks and approve comes.
+- Launch bundles (Jin, 11-02): 1 speed fixes (#1526 #1527 #1644 S2 S5), 2 review quality (review procedure, #1619 and table, size signal), 3 self-watch (#1469, #1499-#1501, role memory commit, promise list), 4 first impression (#1475, /fa first run, #1477, terms, help/doctor, #1208, #1491, #1492, #1160, #1489, #1490), 5 UX researcher and MacBook dogfooding (#1503). After launch: merge owner, team mode (#1004 #1007 #1008), rest of PM single entry, subtraction.
+- #1005 question: architect call refused (machine budget 4/4 full); asked via cxdo scan (scratchpad q1005.out). Possible: bundle 1; blocked: after launch. Relay short to the PM.
+- Cost seen 11-02: my lone #1619 order commit (08:08) moved main, restarting #1526's CI while it held the merge queue head; #1523 waited behind it. Lone publishes cost a CI round for the queue head; keep them for real emergencies.
+- #1005 answer (11-02): POSSIBLE. GitHub merge passes only --match-head-commit (tracker.py:1591); order publish uses foragent-publish.lock, merges use merge.lock; main has no branch protection. Recommended bundle 1 or the smaller fix (publish takes the merge lock). PM decides.
+- Draft QA queue, one at a time with nice (PM 11-02): sizegate, w1469 (#1469), rolemem, uxfix (README #1477 edit + help/doctor issue only; init-help part held), then #1499-#1501, then first impression (#1489 #1490 /fa first run #1475 #1477). Send the PM one card for the batch.
+- #1469 draft lacks "a role call is not refused or delayed by full lane slots" (architect call refused 08:18Z at 4/4). After mainlock, cxdo fix w1469 to add it with a lock, then QA.
+- PM boundary flushed ef419f9c (6 unapproved placeholders). Review procedure draft (rproc) becomes an edit of its issue.
+- r320: #1526's r281 review standard stays order-only (no rules line); r315's D109 covers only #1599's review scope.
+- #1619 r319 hint applied 09:31Z. Held again on the same class: tell the PM (tonight's test).
+1004 PM: 09:39 proposed B; waiting.
+- r324 docs (order.md: publication refuses an order whose locked files cannot collect, #1523): drafts/r324-docs.txt, docs order.
+- Approval-record defect order: drafts/approval-record, my QA passed (A 6 + B 4 locks fail on main, 90 pass with prototype, +21 -9); preread, publish+approve at a merge window.
+- Main-write lock is #1662 (approved 10:10Z, skills lane).
+- #1640 Done when narrowed (drafts/1640-dw, preread); publish at next merge, then retry.
+- MacBook first-user test (11-02): no deadline tonight any more. Jin moved it after bundle 4 (npx install, /fa first run, README, terms, help and doctor), with the UX researcher (#1654) going first. #1619 publishes with the merge batches like any other issue.
+- r330 for #1619: round 10 FAILed in class (a) at 12:58Z; apply at its next hold, retry hint (text in drafts/r330.txt): file-tool reads are literal, only single-operand cat/head/tail/sed -n of one SKILL.md counts from shell; the nearest LICENSE walking up to the checkout or project root alone decides and is copied, a same-name library skill never substitutes; other shell forms and licenses above are NOTE.
+- r334 docs: #1619's license rule becomes a decision + rules.md line (A, already Jin's). Docs order.
+- r338 docs (gate.md:129 review_pass_scope comment, rules.md line for D105 보강): drafts/r338-docs.txt, docs order.
+- Budget after unset stays 4 and climbs 1/h (was 8): goes into #1635 Done when as "removing or raising the cap restores the pre-cap budget on the next tick" (comment on #1635). Mark 18:34Z..~22:30Z in the 11-03 measurement.
+- r347 docs: r334 decision text must use #1652's final license scope (drafts/r347-docs.txt).
+- batch-2026-11-02o flushed faf8e59e 22:32Z: #1696 size signal, #1469 edit, #1699 role memory (approved). Size thresholds: check wrong-estimate share ~11-10. Next card: #1651 review procedure (scratchpad rproc), then UX (uxfix).
+- b4 approved f6620d4f: #1208 #1160 #1484 #1491 #1492. Pending: #1489 and #1490 lock rewrites (Codex), help-doctor preread, README (#1477) waits Jin via PM.
