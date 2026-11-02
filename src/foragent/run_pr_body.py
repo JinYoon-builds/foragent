@@ -87,7 +87,7 @@ def publish_comments(ctx, pr: int, body: str) -> None:
                 if header not in posted:
                     ctx.tracker.comment(pr, f"{header}\n{text[start:start + COMMENT_CHUNK]}")
     except TrackerError as exc:
-        if exc.is_rate_limit:
+        if exc.waits:
             raise
         from foragent.orch_events import append_event
 

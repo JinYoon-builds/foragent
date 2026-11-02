@@ -2,7 +2,7 @@
 
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -614,7 +614,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
                         "run again after it finishes")
     try:
-        with ctx.store.merge_lock():
+        with ExitStack() as stack:
+            stack.enter_context(ctx.store.merge_lock())
             checked = _premerge(ctx, n)
             report = checked.report
             if checked.refused:
@@ -623,6 +624,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
                 raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
                                 f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
+            # Premerge and its tests ran unlocked; main writers wait from this re-check to the merge.
+            from foragent import git as git_files
+            stack.enter_context(git_files.main_write_lock(ctx.git))
             current = _open_pr(ctx, n)
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head

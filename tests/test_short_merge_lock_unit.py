@@ -262,7 +262,7 @@ def test_lock_hold_includes_bookkeeping_after_acquisition(tmp_path, monkeypatch)
     clock = [BASE_TIME]
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     store.start_run(1, branch="branch", worktree="worktree")
-    ctx = SimpleNamespace(store=store, now=lambda: clock[0])
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], git=SimpleNamespace(root=tmp_path / "checkout"))
 
     def credited_wait(number, context, acquire, phase, **options):
         acquire()

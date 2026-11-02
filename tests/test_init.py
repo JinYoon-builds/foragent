@@ -1,5 +1,6 @@
 """Offline setup tests: Git mutations forbidden for this run are recorded only."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -639,6 +640,93 @@ def test_existing_config_selects_base_branch(setup):
     (setup.root / PATHS[0]).write_text("base_branch: trunk\n")
     setup.init()
     assert ["push", "origin", "refs/heads/trunk:refs/heads/trunk"] in setup.git_calls
+
+
+def test_setup_waiting_for_a_merge_commits_and_pushes_on_the_merged_base(setup, monkeypatch):
+    """A merge that lands while setup waits for the main-write lock is kept, not refused by the push."""
+    import foragent.init as init_module
+
+    origin = setup.root.parent / "origin.git"
+    history = GitHistory(origin, setup.root, git_command(origin, "rev-parse", "refs/heads/main"))
+    real_lock, held = init_module.main_write_lock, []
+
+    @contextmanager
+    def lock(git):
+        history.update({"merged.txt": "landed\n"}, message="Merged PR")  # The merge the lock waited for.
+        with real_lock(git):
+            held.append(True)
+            yield
+            held.pop()
+
+    pushes = []
+    run_git = setup.run_git
+
+    def run(args):
+        if args[:1] == ["push"]:
+            pushes.append(bool(held))
+        return run_git(args)
+
+    setup.run_git = run
+    monkeypatch.setattr(init_module, "main_write_lock", lock)
+    report = setup.init()
+    assert report.committed and report.pushed and pushes == [True]
+    assert git_command(origin, "show", "main:merged.txt") == "landed"
+    assert git_command(origin, "log", "-1", "--format=%s", "main") == "Set up Foragent"
+    assert git_command(origin, "rev-parse", "main~1") == history.tip
+
+
+def test_unpushed_setup_recovery_refuses_a_merge_that_landed_while_waiting(setup, monkeypatch):
+    """An earlier run's setup commit cannot fast-forward onto the merge; it is refused, never rewritten."""
+    import foragent.init as init_module
+
+    setup.push_fails = True
+    with pytest.raises(GitError, match="push rejected"):
+        setup.init()
+    setup.push_fails = False
+    local = git_command(setup.root, "rev-parse", "HEAD")
+    origin = setup.root.parent / "origin.git"
+    history = GitHistory(origin, setup.root, git_command(origin, "rev-parse", "refs/heads/main"))
+    real_lock = init_module.main_write_lock
+
+    @contextmanager
+    def lock(git):
+        history.update({"merged.txt": "landed\n"}, message="Merged PR")
+        with real_lock(git):
+            yield
+
+    monkeypatch.setattr(init_module, "main_write_lock", lock)
+    with pytest.raises(GitError, match="cannot fast-forward main to origin/main"):
+        setup.init()
+    assert git_command(setup.root, "rev-parse", "HEAD") == local, "The setup commit is kept as it was"
+    assert git_command(origin, "rev-parse", "main") == history.tip, "Nothing is pushed over the merge"
+    assert not any(args[:1] == ["rebase"] or "rebase" in args for args in setup.git_calls)
+
+
+def test_setup_lock_wait_keeps_staged_and_unstaged_versions_of_an_unrelated_file(setup, monkeypatch):
+    """Bringing the checkout forward after the lock wait never rewrites a person's index."""
+    import foragent.init as init_module
+
+    (setup.root / "README.md").write_text("Staged\n")
+    git_command(setup.root, "add", "README.md")
+    (setup.root / "README.md").write_text("Unstaged\n")
+    staged = git_command(setup.root, "rev-parse", ":README.md")
+    origin = setup.root.parent / "origin.git"
+    history = GitHistory(origin, setup.root, git_command(origin, "rev-parse", "refs/heads/main"))
+    real_lock = init_module.main_write_lock
+
+    @contextmanager
+    def lock(git):
+        history.update({"merged.txt": "landed\n"}, message="Merged PR")
+        with real_lock(git):
+            yield
+
+    monkeypatch.setattr(init_module, "main_write_lock", lock)
+    report = setup.init()
+    assert report.committed and report.pushed
+    assert git_command(origin, "show", "main:merged.txt") == "landed"
+    assert git_command(setup.root, "rev-parse", ":README.md") == staged, "The staged version is kept"
+    assert (setup.root / "README.md").read_text() == "Unstaged\n", "The unstaged version is kept"
+    assert git_command(origin, "show", "main:README.md") == "Original", "Unrelated staged work is not published"
 
 
 def test_default_gh_tracker_uses_injected_runner_for_labels(setup):

@@ -30,6 +30,9 @@ def _merge_lock(n: int, ctx: RunContext):
             def acquire():
                 nonlocal started
                 stack.enter_context(ctx.store.merge_lock())
+                # Main writers (order/note flush, role memory, lanes) wait from the final check to the merge.
+                from foragent import git as git_files
+                stack.enter_context(git_files.main_write_lock(ctx.git))
                 started = ctx.now()
 
             try:
@@ -143,7 +146,7 @@ def retitle_for_merge(
             ctx.tracker.update_pr(pr, base=base, title=title, body=rendered)
             publish_comments(ctx, pr, rendered)
         except run_publish.TrackerError as exc:
-            if exc.is_rate_limit:
+            if exc.waits:
                 raise
             note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
             return {"subject": title}
