@@ -769,6 +769,7 @@ def test_ci_head_without_exclusions_and_reports_holds_or_falls_back(tmp_path, mo
     else:
         evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
         assert evidence.reports is None and local == ['base']
+        assert evidence.fallback_reports == ci_mode.serialize_reports([])  # what the fallback replaced
         assert not flags
     assert reads
     assert not any(update.get('comparison', {}).get('source') == 'ci' for update in updates)
@@ -1664,6 +1665,23 @@ def test_trusted_branch_and_scope_changes_are_named(tmp_path, monkeypatch):
     monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': [], 'more': 1})
     assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
     assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['trusted-moved', 'scope-changed']
+
+
+def test_reports_that_appear_after_a_local_fallback_refuse_it_at_the_locked_read(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from foragent import ci_mode
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    local = replace(accepted, reports=None, fallback_reports=ci_mode.serialize_reports([]))
+    reads += [[], TrackerError('HTTP 500'), [{'shard': 0}]]
+    answers = [local.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(3)]
+    # Same (empty) reports and a failed read keep the local measurement; new CI reports must be compared.
+    assert answers == [True, True, False]
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed']
+    # A fallback forced by a changed workflow pins nothing: untrusted artifacts never replace it.
+    reads.append([{'shard': 0}])
+    assert replace(local, fallback_reports=None).current(1, ctx, None, 2, 'head', 'base', 'pass')
 
 
 def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, monkeypatch):

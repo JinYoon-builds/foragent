@@ -1,6 +1,6 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from math import isfinite
 
@@ -85,6 +85,8 @@ class ComparisonEvidence:
     status: str
     infrastructure: str
     reports: str | None = None
+    # A local fallback pins the CI reports it saw; new reports must be compared again.
+    fallback_reports: str | None = None
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """One non-waiting read; changed evidence must be checked again unlocked."""
@@ -109,7 +111,7 @@ class ComparisonEvidence:
                 if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
-                return None  # Local evidence is pinned to the same base/head and scope.
+                return self._fallback_refused(ctx, head)  # Local evidence is pinned to base/head and scope.
             reports = ctx.tracker.pr_acceptance_reports(head)
             if self.reports == serialize_reports(reports):
                 return None
@@ -119,6 +121,30 @@ class ComparisonEvidence:
             if isinstance(exc, TrackerError) and exc.waits:
                 raise
             return _refusal(exc), str(exc)
+
+
+    def _fallback_refused(self, ctx, head):
+        """CI reports that appeared after a local fallback replace it; a failed read adds nothing."""
+        if self.fallback_reports is None:
+            return None
+        try:
+            current = serialize_reports(ctx.tracker.pr_acceptance_reports(head) or [])
+        except (UnusableComparison, TrackerError) as exc:
+            if isinstance(exc, TrackerError) and exc.waits:
+                raise
+            return None
+        if current == self.fallback_reports:
+            return None
+        return "reports-changed", "CI reports changed after the local fallback"
+
+
+def _fallback_evidence(evidence, reports):
+    """The local fallback's evidence, pinned to the CI reports it fell back from."""
+    try:
+        seen = serialize_reports(reports or [])
+    except UnusableComparison:
+        seen = None
+    return replace(evidence, fallback_reports=seen)
 
 
 def enabled(ctx):
@@ -362,6 +388,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
+    reports = None
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
@@ -396,7 +423,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return evidence
+                return _fallback_evidence(evidence, reports)
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
@@ -413,7 +440,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                return evidence
+                return _fallback_evidence(evidence, reports)
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
