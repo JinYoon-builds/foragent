@@ -368,14 +368,23 @@ def test_init_cli_keeps_explicit_default_options(tmp_path, monkeypatch):
 
     def init(root, **kwargs):
         assert kwargs["executor"] == "codex" and kwargs["run_hours"] == "always"
-        assert kwargs["review"] == "batch" and kwargs["approvers"] == ["human"]
+        assert kwargs["review"] == "fast" and kwargs["approvers"] == ["human"]
         return InitReport([], [], False)
 
     monkeypatch.setattr(cli, "init_repo", init)
     assert cli.main([
         "init", "--repo-root", str(tmp_path), "--executor", "codex", "--run-hours", "always",
-        "--review", "batch", "--approver", "human",
+        "--review", "fast", "--approver", "human",
     ]) == 0
+
+
+def test_init_cli_rejects_batch_review(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "init_repo", lambda *a, **kw: pytest.fail("init must not run"))
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["init", "--repo-root", str(tmp_path), "--review", "batch"])
+    assert raised.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice: 'batch'" in err and "fast, careful" in err
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
