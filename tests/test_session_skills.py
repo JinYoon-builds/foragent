@@ -305,26 +305,28 @@ RESTRICTED_TEXTS = {
     "spdx-then-ban": "SPDX-License-Identifier: MIT\nRedistribution of this skill is prohibited.\n",
     "two-spdx": "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: LicenseRef-Private\n",
     "spdx-other-text": "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
-    "copyright-then-ban": "SPDX-License-Identifier: MIT\nCopyright 2026 X. Redistribution is prohibited.\n",
-    "standard-copyright-then-ban": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 X. Redistribution is prohibited"),
-    "spdx-copyright-semicolon": "SPDX-License-Identifier: MIT\nCopyright 2026 Example; redistribution is prohibited\n",
-    "standard-copyright-semicolon": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 Example; redistribution is prohibited"),
-    "standard-copyright-colon": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 Example: no redistribution"),
     "spdx-then-standard": "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
-    "spdx-then-copyright": "SPDX-License-Identifier: MIT\nCopyright 2026 Example Inc.\n",
+    "spdx-then-author": "SPDX-License-Identifier: MIT\nAuthor: Example\n",
     "heading-variant": STANDARD_LICENSES["MIT"].replace("MIT License", "The MIT License (MIT)", 1),
     "missing-words": STANDARD_LICENSES["MIT"].replace("free of charge, ", ""),
-    "two-notices": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 Example\nCopyright 2026 Other"),
+    "cut-short": STANDARD_LICENSES["MIT"].split("THE SOFTWARE IS PROVIDED")[0],
+    "ban-on-the-next-line": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example\nRedistribution is prohibited."),
+    "copyleft": "SPDX-License-Identifier: GPL-3.0-only\n",
+    "non-commercial": "SPDX-License-Identifier: CC-BY-NC-4.0\nCopyright 2026 Example\n",
+    "only-copyright": "Copyright 2026 Example\n",
+}
+
+# Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
+COPYRIGHT_NAME_NOTES = {
+    "spdx-name-ban": "SPDX-License-Identifier: MIT\nCopyright 2026 X. Redistribution is prohibited.\n",
+    "standard-name-ban": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example, REDISTRIBUTION IS PROHIBITED"),
     "name-in-brackets": STANDARD_LICENSES["MIT"].replace(
         "<year> <copyright holders>", "2026 Example (Redistribution prohibited)"),
-    "name-lower-case-words": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 Example, redistribution prohibited"),
-    "name-then-comma-words": STANDARD_LICENSES["MIT"].replace(
-        "<year> <copyright holders>", "2026 Example, no copies"),
+    "two-notices": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 Example\nCopyright 2026 Other"),
+    "spdx-then-copyright": "SPDX-License-Identifier: MIT\nCopyright 2026 Example Inc.\n© 2026 Other\n",
 }
 
 
@@ -357,7 +359,7 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2025 Apollo.io"),
     STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2020- Slack Technologies, LLC"),
     STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2025 Zoom Video Communications, Inc."),
-    " ".join(STANDARD_LICENSES["MIT"].split()),  # Rewrapped: only whitespace differs.
+    STANDARD_LICENSES["MIT"].replace("\n", "  \n\n"),  # Only whitespace differs.
     STANDARD_LICENSES["ISC"].replace("<year> <owner>", "2026 Example"),
     STANDARD_LICENSES["Apache-2.0"],
 ])
@@ -450,3 +452,124 @@ def test_every_license_file_in_the_closest_folder_must_be_permissive(tmp_path):
     assert ".claude/skills/dual/SKILL.md" in section(config, "docs", root)
     (root / ".claude/skills/dual/LICENSE-EXTRA").write_text("No redistribution.\n")
     assert "- dual: not available here" in section(config, "docs", root)
+
+
+@pytest.mark.parametrize("text", COPYRIGHT_NAME_NOTES.values(), ids=COPYRIGHT_NAME_NOTES)
+def test_the_copyright_name_is_never_judged(tmp_path, text):
+    root = tmp_path / "root"
+    write_skill(root / ".claude", "named", license=None)
+    (root / ".claude/skills/named/LICENSE").write_text(text)
+    config = Config(skill_libraries=[], default_skills={"docs": ["named"]})
+    assert ".claude/skills/named/SKILL.md" in section(config, "docs", root)
+    assert SkillManager(config).check_default("named", root) is None
+
+
+@pytest.mark.parametrize("revision", ["pinned", None])
+def test_an_installed_default_keeps_its_original_license_and_source(tmp_path, revision):
+    library, project = tmp_path / "library", tmp_path / "project"
+    project.mkdir()
+    write_skill(library, "rooted", license=None)
+    (library / "LICENSE").write_text(STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Lib"))
+    entry = {"name": "lib", "repo": "https://example.com/lib.git", "path": str(library)}
+    if revision:
+        entry.update(revision=revision, skills=["rooted"])
+    manager = SkillManager(Config(skill_libraries=[entry]))
+    skill = manager.check_default("rooted", project)
+    manager.install_default("rooted", skill, project)
+    copy = project / ".claude/skills/rooted"
+    assert (copy / "LICENSE").read_text() == (library / "LICENSE").read_text()
+    assert (copy / "SOURCE").read_text() == (
+        "Source: https://example.com/lib.git\nPath: skills/rooted\n"
+        f"Revision: {revision or 'unknown'}\nLicense: MIT (LICENSE)\n")
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["rooted"]})
+    assert ".claude/skills/rooted/SKILL.md" in section(config, "docs", project)
+    # The kept files do not make the copy a different skill for a later lane install...
+    assert manager.check_install("rooted", project).path == skill.path
+    # ...but a changed skill file, or any other added file, still does.
+    (copy / "notes.md").write_text("mine\n")
+    with pytest.raises(SkillError, match="different existing skill"):
+        manager.check_install("rooted", project)
+    (copy / "notes.md").unlink()
+    (copy / "SKILL.md").write_text("changed\n")
+    with pytest.raises(SkillError, match="different existing skill"):
+        manager.check_install("rooted", project)
+
+
+def test_a_default_with_its_own_license_keeps_that_file_unchanged(tmp_path):
+    library, project = tmp_path / "library", tmp_path / "project"
+    project.mkdir()
+    write_skill(library, "own")  # LICENSE inside the skill folder: SPDX MIT.
+    (library / "LICENSE").write_text(STANDARD_LICENSES["ISC"])
+    entry = {"name": "lib", "repo": "unused", "path": str(library), "revision": "r1", "skills": ["own"]}
+    manager = SkillManager(Config(skill_libraries=[entry]))
+    manager.install_default("own", manager.check_default("own", project), project)
+    copy = project / ".claude/skills/own"
+    assert (copy / "LICENSE").read_text() == "SPDX-License-Identifier: MIT\n"
+    assert (copy / "SOURCE").read_text().endswith("License: MIT (skills/own/LICENSE)\n")
+
+
+@pytest.mark.parametrize("where", ["checkout", "project"])
+@pytest.mark.parametrize("folder", [".claude/skills", "skills"])
+def test_the_project_license_over_a_copy_applies_even_beside_a_same_name_mit_library(tmp_path, where, folder):
+    root, worktree, library = tmp_path / "root", tmp_path / "worktree", tmp_path / "library"
+    write_skill(library, "example")  # MIT in a library, under the same name.
+    base = worktree if where == "checkout" else root
+    write_skill(base / folder.removesuffix("skills").rstrip("/"), "example", license=None)
+    (base / folder / "example/SKILL.md").write_text("---\nname: example\ndescription: Changed\n---\nMine\n")
+    (base / "LICENSE").write_text("All rights reserved. Redistribution is prohibited.\n")
+    root.mkdir(exist_ok=True)
+    entry = {"name": "lib", "repo": "unused", "path": str(library)}
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["example"]})
+    shown = f"({folder}/example/SKILL.md)" if where == "checkout" else str(base / folder / "example/SKILL.md")
+    value = section(config, "docs", root, worktree)
+    assert shown not in value, "The banned copy never reaches a session"
+    assert str((library / "skills/example/SKILL.md").resolve()) in value, "The MIT original itself still may"
+    if where == "project" and folder == ".claude/skills":
+        with pytest.raises(SkillError, match="example.*license"):
+            SkillManager(config).check_default("example", root)
+    (base / "LICENSE").write_text(STANDARD_LICENSES["MIT"])  # A permissive project license: the copy may.
+    assert shown in section(config, "docs", root, worktree)
+
+
+@pytest.mark.parametrize("mode", [0o111, 0o444])
+@pytest.mark.parametrize("where", ["checkout", "project"])
+def test_a_copy_whose_license_facts_cannot_be_read_never_makes_a_default(tmp_path, mode, where):
+    root, worktree, library = tmp_path / "root", tmp_path / "worktree", tmp_path / "library"
+    write_skill(library, "example")  # MIT in the library.
+    root.mkdir()
+    base = worktree if where == "checkout" else root
+    write_skill(base / ".claude", "example", license="LicenseRef-No-Redistribution")
+    folder = base / ".claude/skills/example"
+    entry = {"name": "lib", "repo": "unused", "path": str(library)}
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["example"]})
+    folder.chmod(mode)
+    try:
+        value = section(config, "docs", root, worktree)
+        assert ".claude/skills/example/SKILL.md" not in value.replace(str(library), "")
+        if where == "project":
+            with pytest.raises(SkillError, match="example"):
+                SkillManager(config).check_default("example", root)
+    finally:
+        folder.chmod(0o755)
+
+
+def test_an_unreadable_folder_inside_a_skill_counts_as_a_link(tmp_path):
+    from foragent.skills import reached_through_symlink
+    write_skill(tmp_path, "example")
+    hidden = tmp_path / "skills/example/inner"
+    hidden.mkdir()
+    assert not reached_through_symlink(tmp_path / "skills/example")
+    hidden.chmod(0o000)
+    try:
+        assert reached_through_symlink(tmp_path / "skills/example")
+    finally:
+        hidden.chmod(0o755)
+
+
+def test_a_license_entry_that_is_not_a_readable_file_is_unknown(tmp_path):
+    from foragent.skills import redistributable_license
+    write_skill(tmp_path, "example", license=None)
+    folder = tmp_path / "skills/example"
+    (folder / "LICENSES").mkdir()
+    (folder / "LICENSES/MIT.txt").write_text(STANDARD_LICENSES["MIT"])
+    assert redistributable_license(folder, tmp_path)[0] == "unknown"

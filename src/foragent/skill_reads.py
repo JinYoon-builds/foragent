@@ -9,9 +9,8 @@ counts are evidence, not security. This module is the only writer of ``Run.skill
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-import posixpath
-import shlex
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -20,8 +19,9 @@ from foragent.executors import _events
 if TYPE_CHECKING:
     from foragent.state import StateStore
 
-# A skill folder name is any name a shell would not expand: no glob, variable or home marks.
-_EXPANDS = frozenset("*?[]{}$`~\\")
+# Shell characters that expand when unquoted; a skill name holding one could stand for any skill.
+_EXPANDS = frozenset("*?[]{}$`")
+_OPERATORS = frozenset(";&|<>()\n")
 # Each plain reader's flags, then its options that take a value.
 # Short and long options of GNU and BSD alike; `sed -i`/`-I` edit, so they are absent.
 _OPTIONS = {"cat": ("AbeEnstTuvl", ""), "head": ("qvz", "nc"), "tail": ("fFqvzr", "ncbs"),
@@ -41,17 +41,96 @@ _LONG = {
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
 
 
-def _skill_name(path: str) -> str | None:
-    """The folder of ``.../skills/<name>/SKILL.md``; another file, a glob or a variable is no skill.
+@dataclass(frozen=True)
+class _Word:
+    """One shell word after quoting, with the positions of its characters that stayed unquoted."""
 
-    The path is first resolved as written (`.` and `..` steps), as the reader resolved it.
+    text: str
+    open: frozenset[int] = frozenset()
+
+
+def _words(command: str) -> list[_Word] | None:
+    """Split one simple shell command as POSIX shells do; None for any operator or unbalanced quote.
+
+    Quotes and backslashes are removed but remembered per character, so a quoted `#`, `;` or `[`
+    stays an ordinary character, and only an unquoted `#` at a word's start begins a comment.
     """
-    if not path or _EXPANDS.intersection(path):
+    words: list[_Word] = []
+    text: list[str] = []
+    open_: set[int] = set()
+    in_word, quote, index = False, None, 0
+
+    def end() -> None:
+        nonlocal text, open_, in_word
+        if in_word:
+            words.append(_Word("".join(text), frozenset(open_)))
+        text, open_, in_word = [], set(), False
+
+    source = command.strip()
+    while index < len(source):
+        char = source[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            else:
+                text.append(char)
+        elif quote == '"':
+            if char == '"':
+                quote = None
+            elif char == "\\" and index + 1 < len(source) and source[index + 1] in '$`"\\\n':
+                index += 1
+                if source[index] != "\n":
+                    text.append(source[index])
+            else:
+                if char in "$`":
+                    open_.add(len(text))
+                text.append(char)
+        elif char in " \t":
+            end()
+        elif char == "\\":
+            in_word = True
+            if index + 1 < len(source):
+                index += 1
+                if source[index] != "\n":
+                    text.append(source[index])
+        elif char in "'\"":
+            quote, in_word = char, True
+        elif char == "#" and not in_word:
+            break
+        elif char in _OPERATORS:
+            return None
+        else:
+            open_.add(len(text))
+            text.append(char)
+            in_word = True
+        index += 1
+    if quote is not None:
         return None
-    parts = PurePosixPath(posixpath.normpath(path)).parts
-    if len(parts) >= 3 and parts[-1] == "SKILL.md" and parts[-3] == "skills" and parts[-2] not in {".", ".."}:
-        return parts[-2]
-    return None
+    end()
+    return words
+
+
+def _skill_name(word: _Word) -> str | None:
+    """The folder of ``.../skills/<name>/SKILL.md``; another file is no skill.
+
+    The path is resolved as written (`.` and `..` steps), as the reader resolved it. The recorded
+    name must be literal: unquoted glob or variable characters there could stand for any skill,
+    while ones in a parent folder cannot change which skill folder was read.
+    """
+    stack: list[tuple[str, int]] = []
+    start = 0
+    for segment in word.text.split("/"):
+        if segment == "..":
+            if stack:
+                stack.pop()
+        elif segment not in {"", "."}:
+            stack.append((segment, start))
+        start += len(segment) + 1
+    if len(stack) < 3 or stack[-1][0] != "SKILL.md" or stack[-3][0] != "skills":
+        return None
+    name, begin = stack[-2]
+    expanded = any(index in word.open and word.text[index] in _EXPANDS for index in range(begin, begin + len(name)))
+    return None if expanded else name
 
 
 def _plain_reads(command: Any) -> list[str]:
@@ -61,33 +140,31 @@ def _plain_reads(command: Any) -> list[str]:
     """
     if not isinstance(command, str):
         return []
-    try:
-        lexer = shlex.shlex(command.strip(), posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        words = list(lexer)
-    except ValueError:
+    words = _words(command)
+    if not words:
         return []
-    if len(words) == 3 and PurePosixPath(words[0]).name in _SHELLS and words[1] in {"-c", "-lc"}:
-        return _plain_reads(words[2])
-    program = PurePosixPath(words[0]).name if words else ""
-    if program not in _OPTIONS or any(word and set(word) <= set("();<>|&") for word in words):
+    if len(words) == 3 and PurePosixPath(words[0].text).name in _SHELLS and words[1].text in {"-c", "-lc"}:
+        return _plain_reads(words[2].text)
+    program = PurePosixPath(words[0].text).name
+    if program not in _OPTIONS:
         return []
-    return [name for word in _files(program, words[1:]) if (name := _skill_name(word))]
+    return [name for index in _files(program, [word.text for word in words[1:]])
+            if (name := _skill_name(words[1 + index]))]
 
 
-def _files(program: str, words: list[str]) -> list[str]:
-    """The file operands of one reader; option values and a `sed` script are not files.
+def _files(program: str, words: list[str]) -> list[int]:
+    """The positions of one reader's file operands; option values and a `sed` script are not files.
 
     An option outside the reader's table (`sed -i`, `--help`) leaves the files in doubt: no read.
     """
     plain, valued = _OPTIONS[program]
-    files: list[str] = []
+    files: list[int] = []
     scripts = 0
-    arguments = iter(words)
+    arguments = iter(enumerate(words))
     only_files = False
-    for word in arguments:
+    for position, word in arguments:
         if only_files or word == "-" or not word.startswith("-"):
-            files.append(word)
+            files.append(position)
         elif word == "--":
             only_files = True
         elif word.startswith("--"):
@@ -123,7 +200,7 @@ def _tool_reads(block: dict) -> list[str]:
     if not isinstance(values, dict):
         return []
     if tool == "Read" and isinstance(values.get("file_path"), str):
-        name = _skill_name(values["file_path"])
+        name = _skill_name(_Word(values["file_path"]))  # A read tool expands nothing.
         return [name] if name else []
     if tool == "Bash":
         return _plain_reads(values.get("command"))

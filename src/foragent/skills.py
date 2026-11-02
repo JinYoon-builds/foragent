@@ -119,49 +119,35 @@ def _license(skill: Path, library: Path, *, nearest: bool = False, walk: bool = 
     return next((identity for identity, expected in standards.items() if normalized == expected), "unknown"), license_file
 
 
-# The one line a copy may change: `Copyright (c) <year> <name>`. A name is words joined by spaces or
-# commas, with dots only inside a word (`Apollo.io`) or at the very end; `;`, `:` or a sentence break fail.
-# Each word of a name starts with a capital or a digit, so lower-case wording cannot pass as a name;
-# brackets, `;` and `:` are never part of one.
-_NAME_WORD = r"[A-Z0-9][\w&'\-]*(?:\.[\w&'\-]+)*"
-_COPYRIGHT_LINE = re.compile(
-    r"Copyright (?:\([cC]\) |© )?\d{4}(?: ?[-,] ?(?:\d{4})?)*,? "
-    rf"{_NAME_WORD}(?:,? {_NAME_WORD})*\.?"
-)
+def _copyright_line(line: str) -> bool:
+    """A copyright or attribution line: it starts with `Copyright` or `©`. What follows is not judged."""
+    return re.match(r"(?:Copyright\b|©)", line.strip()) is not None
 
 
-def _collapsed(text: str) -> str:
-    return " ".join(text.split())
+def _terms(text: str) -> str:
+    """The license text apart from its copyright lines, with whitespace collapsed."""
+    return " ".join(" ".join(line for line in text.splitlines() if not _copyright_line(line)).split())
 
 
 def _permissive(text: str) -> str:
-    """The open-source license a whole LICENSE text is, else "unknown"; nothing is erased first.
+    """The permissive license a whole LICENSE text is, else "unknown" (Jin's rule, 2026-11-02).
 
-    Either the text is one `SPDX-License-Identifier: <id>` line, or its whitespace-collapsed text
-    equals a known original's, except that the original's copyright template line may hold one
-    real notice (`_COPYRIGHT_LINE`). Any other added or missing word fails.
+    It passes when its text apart from the copyright lines equals a known permissive license word
+    for word, or when it is one `SPDX-License-Identifier:` line naming one, plus copyright lines
+    and nothing else. Everything else, no text included, fails; the copyright names are not judged.
     """
-    whole = _collapsed(text)
-    if spdx := re.fullmatch(r"SPDX-License-Identifier: (\S+)", whole):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    declarations = [line for line in lines if not _copyright_line(line)]
+    if len(declarations) == 1 and (spdx := re.fullmatch(r"SPDX-License-Identifier: *(\S+)", declarations[0])):
         return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == spdx[1].casefold()), "unknown")
-    for identity, standard in STANDARD_LICENSES.items():
-        if whole == _collapsed(standard):
-            return identity
-        lines = standard.splitlines()
-        template = next((n for n, line in enumerate(lines) if re.search(r"<year>|\[yyyy\]", line)), None)
-        if template is None:
-            continue
-        before, after = _collapsed("\n".join(lines[:template])), _collapsed("\n".join(lines[template + 1:]))
-        if not (whole.startswith(before) and whole.endswith(after) and len(whole) > len(before) + len(after)):
-            continue
-        notice = whole[len(before):len(whole) - len(after)].strip()
-        # One line of the copy: the notice may not be stitched together from several lines.
-        if _COPYRIGHT_LINE.fullmatch(notice) and any(_collapsed(line) == notice for line in text.splitlines()):
-            return identity
-    return "unknown"
+    terms = _terms(text)
+    return next((identity for identity, standard in STANDARD_LICENSES.items()
+                 if terms and terms == _terms(standard)), "unknown")
 
 
 _LICENSE_FILE = re.compile(r"(?:licen[cs]e|copying)", re.I)
+# Where an installed default records its library, path, revision and license.
+SOURCE_FILE = "SOURCE"
 
 
 def redistributable_license(directory: Path, base: Path) -> tuple[str, Path | None]:
@@ -171,10 +157,11 @@ def redistributable_license(directory: Path, base: Path) -> tuple[str, Path | No
     every file there named LICENSE*, LICENCE* or COPYING* (LICENSE.md included) must be permissive.
     """
     for folder in (directory, *(parent for parent in directory.parents if parent.is_relative_to(base))):
+        # A folder or license file that cannot be looked at hides its facts: that is "unknown", never "none".
         try:
-            found = sorted(path for path in folder.iterdir() if path.is_file() and _LICENSE_FILE.match(path.name))
+            found = sorted(folder / name for name in os.listdir(folder) if _LICENSE_FILE.match(name))
         except OSError:
-            return "unknown", None
+            return "unknown", folder
         if not found:
             continue
         verdicts = []
@@ -195,21 +182,22 @@ def reached_through_symlink(path: Path) -> bool:
     """
     if os.path.realpath(path) != os.path.abspath(path):
         return True
-    try:
-        return any(item.is_symlink() for item in path.rglob("*"))
-    except OSError:
-        return True
+    unreadable = []  # A folder that cannot be listed could hold a link: count it as one.
+    for directory, folders, files in os.walk(path, onerror=unreadable.append):
+        if any(os.path.islink(os.path.join(directory, name)) for name in (*folders, *files)):
+            return True
+    return bool(unreadable)
 
 
 def copy_license(directory: Path, base: Path, origin: Skill | None) -> str:
     """The license facts of a skill copy under ``base``; every fact that applies must allow it.
 
-    The closest LICENSE between the copy and ``base`` applies, and so does the library an
-    installed ``.claude/skills`` copy came from. Only when neither exists does the project's own
-    LICENSE in ``base`` speak for the copy. Returns the first restrictive fact, else an open one.
+    The nearest license over the copy always applies, up to and including ``base`` (the project's
+    own LICENSE); so does the library an installed ``.claude/skills`` copy came from. Another copy's
+    license never stands in for this one. Returns the first restrictive fact, else an open one.
     """
     local, found = redistributable_license(directory, base)
-    facts = [local] if found is not None and found.parent != base else []
+    facts = [local] if found is not None else []
     if origin is not None and directory.parent.parent.name == ".claude":
         facts.append(redistributable_license(origin.path, origin.library.path)[0])
     facts = facts or [local]
@@ -469,7 +457,7 @@ class SkillManager:
             self._require_open_license(skill)
         destination = repo_path(root, f".claude/skills/{skill.path.name}")
         if destination.exists() and (destination.is_symlink() or not destination.is_dir()
-                                     or self._contents(destination) != self._contents(skill.path)):
+                                     or not self._same_copy(destination, skill.path)):
             raise SkillError(f"refusing to overwrite different existing skill: {destination}")
         repo_path(root, "THIRD_PARTY_NOTICES.md" if commit else ".gitignore")
         return skill
@@ -522,6 +510,40 @@ class SkillManager:
     @staticmethod
     def _contents(path: Path) -> dict[str, bytes]:
         return {file.relative_to(path).as_posix(): file.read_bytes() for file in path.rglob("*") if file.is_file()}
+
+    def _same_copy(self, copy: Path, source: Path) -> bool:
+        """The copy holds the source's files unchanged; only a default's kept license and SOURCE may be added."""
+        theirs, ours = self._contents(source), self._contents(copy)
+        added = ours.keys() - theirs.keys()
+        return (all(ours.get(name) == data for name, data in theirs.items())
+                and all(name == SOURCE_FILE or _LICENSE_FILE.match(name) for name in added))
+
+    def install_default(self, identity: str, skill: Skill, root: Path) -> None:
+        """Install a checked default locally, keeping its original license and its source with the copy.
+
+        The license files that decided its eligibility are copied in when they sit above the skill
+        folder (a library often licenses its skills in one root file), and SOURCE records where it came from.
+        """
+        self.install(identity, root)
+        destination = repo_path(root, f".claude/skills/{skill.path.name}")
+        license_id, found = redistributable_license(skill.path, skill.library.path)
+        kept = []
+        if found is not None:
+            for path in sorted(found.parent.iterdir()):
+                if path.is_file() and _LICENSE_FILE.match(path.name):
+                    kept.append(path)
+                    if not (destination / path.name).exists():
+                        shutil.copyfile(path, destination / path.name)
+        revision = skill.library.revision
+        if revision is None and (skill.library.path / ".git").exists():
+            try:
+                revision = self.run(["git", "-C", str(skill.library.path), "rev-parse", "HEAD"]).strip()
+            except (OSError, subprocess.SubprocessError):
+                revision = None
+        licenses = ", ".join(path.relative_to(skill.library.path).as_posix() for path in kept)
+        (destination / SOURCE_FILE).write_text(
+            f"Source: {skill.library.repo}\nPath: {skill.path.relative_to(skill.library.path).as_posix()}\n"
+            f"Revision: {revision or 'unknown'}\nLicense: {license_id} ({licenses})\n", encoding="utf-8")
 
     def install(self, identity: str, root: Path, *, commit: bool = False) -> str:
         skill = self.check_install(identity, root, commit=commit)

@@ -461,7 +461,7 @@ def init_repo(
     lane_memory.apply(root, migrated)
     for identity, skill in default_skills.items():
         if skill is not None:  # None: a permitted copy is already there and stays.
-            skill_manager.install(identity, root)
+            skill_manager.install_default(identity, skill, root)
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:

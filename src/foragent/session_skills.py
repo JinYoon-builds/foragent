@@ -53,8 +53,12 @@ class _Finder:
         for base, relative in ((self.worktree, True), (self.root, False)):
             for folder in (f".claude/skills/{directory}", f"skills/{directory}"):
                 path = base / folder / "SKILL.md"
-                if (path.is_file() and not reached_through_symlink(base / folder)
-                        and copy_license(base / folder, base, origin) in OPEN_SOURCE_LICENSES):
+                try:  # A copy that cannot be looked at is not offered.
+                    usable = (path.is_file() and not reached_through_symlink(base / folder)
+                              and copy_license(base / folder, base, origin) in OPEN_SOURCE_LICENSES)
+                except OSError:
+                    usable = False
+                if usable:
                     return path, f"{folder}/SKILL.md" if relative else str(path.absolute())
         return None
 

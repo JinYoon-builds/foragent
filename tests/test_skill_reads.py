@@ -5,6 +5,7 @@ commands, redirections and early exits are notes, not holds, so only their plain
 """
 
 import json
+import shlex
 
 import pytest
 
@@ -43,7 +44,7 @@ def codex_call(command, code=0, status="completed"):
     ("cat /lib/skills/tön/SKILL.md", ["tön"]),
     ("cat /lib/skills/tone/./SKILL.md", ["tone"]),
     ("cat /lib/skills/../SKILL.md", []),
-    ("cat '~/skills/tone/SKILL.md'", []),
+    ("cat '~/skills/tone/SKILL.md'", ["tone"]),  # A literal folder named ~; the name is literal.
     (f"/bin/zsh -lc \"cat '{SKILL}'\"", ["tone"]),
     (f"bash -lc \"sed -n '1,200p' {SKILL}\"", ["tone"]),
     (f"head -n 80 {SKILL}", ["tone"]),
@@ -158,3 +159,55 @@ def test_record_adds_to_earlier_attempts_and_says_nothing_without_reads(tmp_path
 ])
 def test_claude_read_paths_resolve_as_written(tmp_path, path, expected):
     assert skills_read(write_log(tmp_path / "log", *claude_call("Read", {"file_path": path}))) == expected
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/project [2026]/skills/example/SKILL.md", ["example"]),
+    ("/home/*me*/skills/example/SKILL.md", ["example"]),
+    ("/lib/skills/[x]/SKILL.md", ["[x]"]),
+    ("/lib/skills/$name/SKILL.md", ["$name"]),
+])
+def test_the_read_tool_takes_its_path_literally(tmp_path, path, expected):
+    assert skills_read(write_log(tmp_path / "log", *claude_call("Read", {"file_path": path}))) == expected
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("cat '/project [2026]/skills/example/SKILL.md'", ["example"]),
+    ("sed -n 1,80p \"/project [2026]/skills/example/SKILL.md\"", ["example"]),
+    ("/bin/zsh -lc \"cat '/project [2026]/skills/example/SKILL.md'\"", ["example"]),
+    ("cat /project*/skills/example/SKILL.md", ["example"]),
+    ("cat /lib/skills/*/SKILL.md", []),
+    ("cat /lib/skills/$NAME/SKILL.md", []),
+])
+def test_shell_reads_need_only_a_literal_skill_name(tmp_path, command, expected):
+    log = write_log(tmp_path / "log", codex_call(command),
+                    *claude_call("Bash", {"command": command}, identity="b"))
+    assert skills_read(log) == expected
+
+
+@pytest.mark.parametrize("command,expected", [
+    # Quotes and escapes keep characters ordinary, as the shell does.
+    ("cat /project#2026/skills/example/SKILL.md", ["example"]),
+    ("cat '/lib/skills/[example]/SKILL.md'", ["[example]"]),
+    ('cat "/lib/skills/[example]/SKILL.md"', ["[example]"]),
+    ("cat /lib/skills/\\[example\\]/SKILL.md", ["[example]"]),
+    ("sed ';' skills/example/SKILL.md", ["example"]),
+    ("sed -e '1,80p;q' -n skills/example/SKILL.md", ["example"]),
+    ('sed "s/a/b/" "skills/ex ample/SKILL.md"', ["ex ample"]),
+    ('cat "$HOME/skills/example/SKILL.md"', ["example"]),
+    ("cat skills/example/SKILL.md # read it", ["example"]),
+    ("cat 'skills/example/SKILL.md' '#2'", ["example"]),
+    # Unquoted, the shell would expand the name or join commands: no plain read of one skill.
+    ("cat /lib/skills/[example]/SKILL.md", []),
+    ('cat "/lib/skills/$NAME/SKILL.md"', []),
+    ("cat /lib/skills/{a,b}/SKILL.md", []),
+    ("cat skills/example/SKILL.md;", []),
+    ("cat skills/example/SKILL.md\ncat x", []),
+    ("cat 'skills/example/SKILL.md", []),
+    ("# cat skills/example/SKILL.md", []),
+])
+def test_quoting_decides_what_the_shell_sees(tmp_path, command, expected):
+    log = write_log(tmp_path / "log", codex_call(command),
+                    *claude_call("Bash", {"command": command}, identity="b"),
+                    codex_call(f"/bin/bash -lc {shlex.quote(command)}"))
+    assert skills_read(log) == expected
