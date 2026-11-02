@@ -176,10 +176,16 @@ class TrackerError(RuntimeError):
         return None
 
 
+# gh (Go) prints the network error it met, wrapped or bare. Each shape below means no complete
+# answer arrived: a request with no response (`<Method> "<url>": <cause>`), a socket error
+# (`dial|read|write tcp ...`), a body read cut short (a line ending in `EOF` / `unexpected EOF`),
+# an http2 stream, TLS record or net/http transport error, or an HTTP 5xx answer.
 _UNAVAILABLE = re.compile(
-    r"(?:error connecting to|\bdial tcp\b|connection (?:refused|reset)|\bi/o timeout\b"
-    r"|TLS handshake timeout|\bHTTP(?:/\S+)?\s+5\d\d\b)",
-    re.I,
+    r"(?:error connecting to|\b(?:dial|read|write) (?:tcp|udp)\b|connection (?:refused|reset)"
+    r"|\bi/o timeout\b|\bnet/http: |\bhttp2: |\bstream error: stream ID\b|\b(?:local|remote) error: tls: "
+    r"|(?:^|: )(?:unexpected )?EOF[ \t]*$|\bHTTP(?:/\S+)?\s+5\d\d\b"
+    r"|\b(?:GET|HEAD|POST|PUT|PATCH|DELETE) \"https?://[^\"\s]*\": )",
+    re.I | re.M,
 )
 # On stdout only gh's own response status line counts: stdout otherwise carries data
 # (checks JSON, error bodies with user text) that may mention any status.

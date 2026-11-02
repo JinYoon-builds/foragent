@@ -38,6 +38,18 @@ def gh_failure(error, read=lambda tracker: tracker.list_prs()):
 @pytest.mark.parametrize("error,waits", [
     (called("error connecting to api.github.com: dial tcp: connection refused"), True),
     (called("read tcp 10.0.0.2:5000->140.82.112.6:443: read: connection reset by peer"), True),
+    # Any request that got no response, whatever Go's cause text (#1644 review 9).
+    *[(called(f'Post "https://api.github.com/graphql": {cause}'), True) for cause in (
+        "EOF", "unexpected EOF", "dial tcp: lookup api.github.com: no such host",
+        "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+        "http2: client connection lost", "net/http: TLS handshake timeout")],
+    (called('Get "https://api.github.com/repos/o/r/pulls?per_page=100": read: EOF'), True),
+    # A body read cut short: gh returns Go's bare network error (#1644 review 10).
+    *[(called(f"{text}\n"), True) for text in (
+        "unexpected EOF", "EOF", "read tcp 10.0.0.2:5000->140.82.112.6:443: read: operation timed out",
+        "stream error: stream ID 3; INTERNAL_ERROR; received from peer",
+        "http2: server sent GOAWAY and closed the connection", "local error: tls: bad record MAC",
+        "net/http: request canceled")],
     *[(called(f"gh: HTTP {code} server error"), True) for code in (500, 502, 503, 504)],
     (called("", stdout=STDOUT_503), True),
     (OSError("gh: No such file or directory"), True),
@@ -47,12 +59,21 @@ def gh_failure(error, read=lambda tracker: tracker.list_prs()):
     (called("gh: HTTP 403 Resource not accessible by integration"), False),
     # stdout is data elsewhere: a failing command's JSON may name any status.
     (called("gh: HTTP 422 Validation Failed", stdout='{"message": "title HTTP 503 handling"}'), False),
+    (called("gh: HTTP 422 Validation Failed: unexpected EOF in body"), False),
+    (called("gh: HTTP 422 Validation Failed", stdout='Post "https://api.github.com/graphql": EOF'), False),
 ])
 def test_only_unreachable_or_server_errors_from_gh_wait(error, waits):
     exc = gh_failure(error)
     assert exc.waits is waits and not exc.is_rate_limit
     # Code that builds its own message never claims gh's diagnosis.
     assert not TrackerError(str(exc)).waits
+
+
+@pytest.mark.parametrize("read", [
+    lambda tracker: tracker.get_issue(7), lambda tracker: tracker.pr_head_sha(7),
+    lambda tracker: tracker.list_prs()], ids=["issue", "pr-head", "pr-list"])
+def test_a_body_read_cut_short_waits_for_issue_and_pr_reads(read):
+    assert gh_failure(called("unexpected EOF\n"), read).waits
 
 
 def test_a_stdout_only_server_error_is_part_of_the_error_message():
@@ -218,7 +239,7 @@ def test_a_reused_pass_that_then_fails_ci_gets_a_new_implementation_and_review(g
 
 
 @pytest.mark.parametrize("entry", ["run", "reviewed"])
-@pytest.mark.parametrize("where", ["stderr", "stdout"])
+@pytest.mark.parametrize("where", ["stderr", "stdout", "eof", "bare-eof"])
 def test_a_server_error_from_the_merge_waits_once_and_merges_once_later(
     git_history, tmp_path, monkeypatch, entry, where,
 ):
@@ -228,12 +249,13 @@ def test_a_server_error_from_the_merge_waits_once_and_merges_once_later(
     case = resumed(git_history, tmp_path, monkeypatch) if entry == "run" else outage_case(
         git_history, tmp_path, monkeypatch, "review")
     recovered = case.clock[0] + timedelta(minutes=4)
-    diagnostic = "HTTP/2.0 503 Service Unavailable (merge)"
+    diagnostic = {"eof": 'Put "https://api.github.com/repos/o/r/pulls/1/merge": unexpected EOF',
+                  "bare-eof": "unexpected EOF"}.get(where, "HTTP/2.0 503 Service Unavailable (merge)")
     original, attempts = case.tracker.merge_pr, []
 
     def transport(argv, input=None):
         attempts.append(argv)
-        raise called(diagnostic) if where == "stderr" else called("", stdout=diagnostic)
+        raise called("", stdout=diagnostic) if where == "stdout" else called(diagnostic)
 
     github = GhTracker("owner/repo", run=transport)
     monkeypatch.setattr(case.tracker, "merge_pr", lambda pr, **kw: (
@@ -278,18 +300,19 @@ def test_a_wait_keeps_its_own_failure_when_another_writer_pauses_first(tmp_path,
 
 
 @pytest.mark.parametrize("family", ["issue", "pr"])
-@pytest.mark.parametrize("stream", ["stderr", "stdout"])
+@pytest.mark.parametrize("stream", ["stderr", "stdout", "bare-eof"])
 def test_a_merge_wait_read_that_meets_an_outage_takes_the_shared_pause(waiting_case, family, stream):
     from test_merge_wait_limit import exercise
 
     case = waiting_case
     case.facts.fail_family = family
-    case.facts.error = gh_failure(called("gh: HTTP 503 Service Unavailable") if stream == "stderr"
-                                  else called("", stdout=STDOUT_503))
+    case.facts.error = gh_failure({"stderr": called("gh: HTTP 503 Service Unavailable"),
+                                   "bare-eof": called("unexpected EOF\n")}.get(stream) or called("", stdout=STDOUT_503))
     assert exercise(case) == "limit-wait" and len(case.facts.failed) == 1
     store = StateStore(case.store.root, now=lambda: case.now[0])
     assert store.github_wait_until(case.now[0]) is not None, "an outage waits on the shared pause"
-    assert "503" in store.get_run(1).detail and "rate limit" not in store.get_run(1).detail
+    detail = store.get_run(1).detail
+    assert ("unexpected EOF" if stream == "bare-eof" else "503") in detail and "rate limit" not in detail
     assert case.merge_calls == []
 
 
