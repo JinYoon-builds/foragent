@@ -131,7 +131,7 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_review import _review_implementation
+from foragent.run_review import _review_implementation, passed_head, unchanged_since_pass
 
 
 @dataclass
@@ -235,19 +235,29 @@ def _implement_and_publish(
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 raise ExecutorStopped("hash-mismatch")
             attempt.approved_ref = git.head_sha()
+            # A resumed head that already passed review returns to its checks and publication.
+            reviewed = not resume_verified and not failure and passed_head(n, ctx, git)
+            passed = git.head_sha() if reviewed else None
             while True:
+                reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
                     attempt.failure = ""
                     resume_verified = False
                 else:
-                    _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    if not reuse:
+                        _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:
                         attempt.failure = _recover_replay(attempt, exc)
                 attempt.reviewer_text = None
                 run = ctx.store.get_run(n)
-                if not attempt.failure and ctx.config.reviewer != "none":
+                if reuse and not attempt.failure and not unchanged_since_pass(git, passed):
+                    _append(attempt.log, f"Checks changed head {passed} after its PASS: reviewing the new contents")
+                    reuse = False
+                if reuse and not attempt.failure:
+                    _append(attempt.log, f"Head {passed} already passed review: resuming its publication")
+                elif not attempt.failure and ctx.config.reviewer != "none":
                     if _remaining(n, ctx) <= 0:
                         outcome = _timeout(n, ctx)
                         return outcome
@@ -300,7 +310,7 @@ def _implement_and_publish(
         raise
     except TrackerError as exc:
         attempt.tracker_available = False
-        outcome = "limit-wait" if exc.is_rate_limit else "error"
+        outcome = "limit-wait" if exc.waits else "error"
         raise
     except (SystemExit, KeyboardInterrupt):
         outcome = "killed"
@@ -381,14 +391,14 @@ def review_only(
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
-            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+            if not isinstance(exc, TrackerError) or not exc.waits:
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
+            outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
@@ -412,7 +422,7 @@ def review_only(
                 except TrackerError as exc:
                     if not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    detail = str(exc) or type(exc).__name__
+                    detail = orch_github.cause(exc)
                     outcome = "limit-wait"
                 finally:
                     try:
@@ -490,7 +500,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
+            outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"

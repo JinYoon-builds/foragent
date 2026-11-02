@@ -453,6 +453,37 @@ def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_
                              **({} if review_verdict is None else {"review_verdict": review_verdict}), **facts)
 
 
+def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
+    """A reviewer already gave PASS to this exact commit for the approved body, and it is the open PR's head.
+
+    A run that resumes after a wait (a GitHub outage during CI, say) returns to its remaining
+    checks and publication instead of another implementation and review turn. Any other head,
+    a changed approval or an orchestrator verdict for some other head never qualifies.
+    """
+    approval = ctx.store.load_approval(n)
+    if approval is None or ctx.config.reviewer == "none":
+        return False
+    head = git.head_sha()
+    if git._call(["status", "--porcelain", "--untracked-files=no"]).strip():
+        return False  # uncommitted edits are not the reviewed commit
+    heads = review_pass_scope._heads(n, ctx)
+    if not any((event.get("head") or heads.get(event["tree"])) == head
+               and event.get("body_sha") == approval.body_sha for event in review_pass_scope._passes(n, ctx)):
+        return False
+    branch = f"foragent/issue-{n}"
+    pr = next((pr for pr in ctx.tracker.list_prs("open", branch) if pr.head == branch), None)
+    return pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
+
+
+def unchanged_since_pass(git: GitRepo, head: str) -> bool:
+    """After checks, the tree to publish is still exactly the commit a reused PASS covered.
+
+    Checks can change it: a Done when command edits tracked files, the base merges in
+    (follow_base) or a replay is resolved. Any such change needs its own review.
+    """
+    return git.head_sha() == head and git.staged_tree_sha() == git._call(["rev-parse", "HEAD^{tree}"]).strip()
+
+
 def _is_limit(error: BaseException) -> bool:
     return isinstance(error, ExecutorStopped) and error.outcome == "limit-wait"
 

@@ -127,10 +127,40 @@ class Tracker(Protocol):
 class TrackerError(RuntimeError):
     """A gh operation failed; the message contains its stderr."""
 
-    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None):
+    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None,
+                 transport: bool = False):
         super().__init__(message)
         self.stdout = stdout
         self.returncode = returncode
+        # Set where gh's own failure is converted: gh could not run or finish, could not
+        # reach GitHub, or GitHub answered with a server error (HTTP 5xx).
+        self.transport = transport
+
+    @property
+    def is_unavailable(self) -> bool:
+        """GitHub was briefly unavailable to this gh call; the diagnosis is gh's own output."""
+        return self.transport
+
+    @property
+    def diagnostic(self) -> str:
+        """gh's failure text: the outage evidence first, then stderr (the message) and any stdout.
+
+        A long message (a PR subject, a repository name) must not push the actual failure out of a
+        one-line, length-capped record, so the matched evidence leads.
+        """
+        text, out = str(self).strip(), self.stdout.strip()
+        full = f"{text}\n{out}" if out and out not in text else text
+        evidence = [] if not self.transport else list(dict.fromkeys(
+            line[max(0, match.start() - 60):match.end() + 60].strip()
+            for stream, pattern in ((text, _UNAVAILABLE), (out, _STATUS_LINE))
+            for line in stream.splitlines() for match in pattern.finditer(line)
+        ))
+        return full if not evidence or full in evidence else "\n".join([*evidence, full])
+
+    @property
+    def waits(self) -> bool:
+        """A run waits and resumes for this error instead of failing."""
+        return self.is_rate_limit or self.is_unavailable
 
     @property
     def is_rate_limit(self) -> bool:
@@ -155,6 +185,14 @@ class TrackerError(RuntimeError):
         return None
 
 
+_UNAVAILABLE = re.compile(
+    r"(?:error connecting to|\bdial tcp\b|connection (?:refused|reset)|\bi/o timeout\b"
+    r"|TLS handshake timeout|\bHTTP(?:/\S+)?\s+5\d\d\b)",
+    re.I,
+)
+# On stdout only gh's own response status line counts: stdout otherwise carries data
+# (checks JSON, error bodies with user text) that may mention any status.
+_STATUS_LINE = re.compile(r"^HTTP/\S+\s+5\d\d\b", re.I)
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
 # Colour codes and any other terminal control a CI log printed; tabs and newlines stay.
@@ -1046,8 +1084,12 @@ class GhTracker:
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
             raise TrackerError(
                 stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
+                transport=bool(_UNAVAILABLE.search(stderr or "")
+                               or any(_STATUS_LINE.search(line) for line in (stdout or "").splitlines())),
             ) from exc
-        except (OSError, subprocess.TimeoutExpired, gh.DeadlineExhausted) as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise TrackerError(str(exc), transport=True) from exc
+        except gh.DeadlineExhausted as exc:
             raise TrackerError(str(exc)) from exc
 
     def authenticated_login(self, *, refresh: bool = False) -> str:
@@ -1395,8 +1437,9 @@ class GhTracker:
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
-            # gh uses exit 1 for failed checks and exit 8 for pending checks.
-            if exc.returncode not in {1, 8} or not exc.stdout.strip():
+            # gh uses exit 1 for failed checks and exit 8 for pending checks. An outage's
+            # output is not a checks listing: it waits like any other unreachable read.
+            if exc.is_unavailable or exc.returncode not in {1, 8} or not exc.stdout.strip():
                 raise
             output = exc.stdout
         buckets = {item["bucket"] for item in _items(output)}

@@ -114,7 +114,7 @@ class GroupComparisonEvidence:
             return not lost
         except (GitError, OSError, KeyError, TypeError, ValueError, RecursionError, OverflowError,
                 AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if isinstance(exc, TrackerError) and exc.waits:
                 raise
             return False
 

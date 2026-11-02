@@ -244,10 +244,13 @@ def _phase(n: int, ctx: RunContext, phase: str, *, resume: bool = True) -> None:
 
 
 def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:
-    """Persist a resumable wait through the shared GitHub availability mechanism."""
-    if not error.is_rate_limit:
+    """Persist a resumable wait through the shared GitHub availability mechanism.
+
+    A rate limit and a brief outage (no connection, HTTP 5xx) both wait; other errors fail.
+    """
+    if not error.waits:
         return False
-    orch_github.wait_run(ctx, n, orch_github.pause(ctx, error))
+    orch_github.wait_run(ctx, n, orch_github.pause(ctx, error), error)
     return True
 
 

@@ -187,7 +187,7 @@ def retitle_for_merge(
             ctx.tracker.update_pr(pr, base=base, title=title, body=rendered)
             publish_comments(ctx, pr, rendered)
         except run_publish.TrackerError as exc:
-            if exc.is_rate_limit:
+            if exc.waits:
                 raise
             note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
             return {"subject": title}
