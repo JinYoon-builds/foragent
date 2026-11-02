@@ -215,7 +215,7 @@ def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, n
             return None
         reason = _live_reason(store, root, now)
         if reason is None:
-            planned = plan_launch(root, store, now)
+            planned = plan_launch(root, store, config, now)
             if planned is None or not launch(root, store, now, planned):
                 return None
             adopt(store, planned, now)

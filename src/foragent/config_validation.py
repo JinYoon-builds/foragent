@@ -8,9 +8,29 @@ from foragent import review_perspectives
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
+_SKILL_ENTRY = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:[:/][A-Za-z0-9_-][A-Za-z0-9_.-]*)*")
+
+
+def _validate_default_skills(table: Any) -> None:
+    from foragent.config import ConfigError, DEFAULT_SKILL_ROLES
+
+    if table is None:
+        return
+    if not isinstance(table, dict):
+        raise ConfigError(f"default_skills must map {', '.join(DEFAULT_SKILL_ROLES)} to lists of skill names")
+    for role, names in table.items():
+        if role not in DEFAULT_SKILL_ROLES:
+            raise ConfigError(f"unknown default_skills role: {role} (use {', '.join(DEFAULT_SKILL_ROLES)})")
+        if names is not None and (not isinstance(names, list) or any(
+            not isinstance(name, str) or not _SKILL_ENTRY.fullmatch(name) for name in names
+        )):
+            raise ConfigError(f"default_skills.{role} must be a list of skill names")
+
+
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
 
+    _validate_default_skills(values["default_skills"])
     if values["notify_filter"] not in ("decisions", "all"):
         raise ConfigError("notify_filter must be decisions or all")
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:

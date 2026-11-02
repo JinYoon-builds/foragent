@@ -1,0 +1,247 @@
+"""Role-scoped default skill sections, and the install and license checks behind them (#1619)."""
+
+from pathlib import Path
+
+import pytest
+
+from foragent.config import Config
+from foragent.executors import claude_review_command
+from foragent.run_skill_catalog import CATALOG_INLINE_BYTES, available_skills, catalog_section
+from foragent.session_skills import SECTION_BYTES, assigned_names, section
+from foragent.skills import SkillError, SkillManager, trusted_source
+
+
+def write_skill(base: Path, name: str, description: str = "About it", license: str | None = "MIT") -> Path:
+    skill = base / "skills" / name / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(f"---\nname: {name}\ndescription: {description}\n---\nBody\n")
+    if license:
+        (skill.parent / "LICENSE").write_text(f"SPDX-License-Identifier: {license}\n")
+    return skill
+
+
+def test_unset_empty_and_null_roles_add_nothing_and_never_borrow(tmp_path):
+    write_skill(tmp_path, "theirs")
+    for table in ({}, None, {"workers": ["theirs"]}, {"workers": ["theirs"], "docs": []},
+                  {"workers": ["theirs"], "docs": None}):
+        assert section(Config(default_skills=table), "docs", tmp_path) == ""
+
+
+def test_section_names_the_skill_description_and_a_path_the_session_can_read(tmp_path):
+    root, worktree = tmp_path / "root", tmp_path / "worktree"
+    write_skill(worktree, "in-checkout")
+    write_skill(root, "in-project")
+    config = Config(default_skills={"docs": ["in-checkout", "in-project", "in-checkout"]}, skill_libraries=[])
+    value = section(config, "docs", root, worktree)
+    assert value.startswith("\n\n## Default skills") and value.endswith("\n")
+    assert "- in-checkout: About it (skills/in-checkout/SKILL.md)" in value
+    assert f"- in-project: About it ({root}/skills/in-project/SKILL.md)" in value
+    assert value.count("in-checkout:") == 1, "A repeated entry lists once"
+
+
+def test_section_says_when_a_skill_is_unavailable_and_never_substitutes(tmp_path):
+    write_skill(tmp_path, "other")
+    config = Config(default_skills={"docs": ["gone"], "workers": ["other"]}, skill_libraries=[])
+    value = section(config, "docs", tmp_path)
+    assert "- gone: not available here" in value and "other" not in value
+
+
+def test_a_cached_library_copy_needs_license_facts_but_a_full_id_reaches_a_permitted_one(tmp_path):
+    library = tmp_path / "library"
+    allowed = write_skill(library, "allowed")
+    write_skill(library, "restricted", license="LicenseRef-Source-Available")
+    config = Config(skill_libraries=[{"name": "lib", "repo": "unused", "path": str(library)}],
+                    default_skills={"docs": ["lib:allowed", "restricted"]})
+    value = section(config, "docs", tmp_path / "project")
+    assert str(allowed.resolve()) in value
+    assert "- restricted: not available here" in value and "Source-Available" not in value
+
+
+def test_twelve_long_descriptions_stay_within_the_bound_and_all_remain_listed(tmp_path):
+    names = [f"skill-{n:02d}" for n in range(12)]
+    for name in names:
+        write_skill(tmp_path, name, description="가" * 3000)  # A multibyte cut must stay valid text.
+    value = section(Config(default_skills={"docs": names}, skill_libraries=[]), "docs", tmp_path)
+    assert len(value.encode("utf-8")) <= SECTION_BYTES
+    assert len(value.encode("utf-8")) > SECTION_BYTES - 200, "Descriptions use the room they are given"
+    assert all(f"skills/{name}/SKILL.md" in value for name in names)
+
+
+def test_short_descriptions_are_never_cut(tmp_path):
+    write_skill(tmp_path, "short", description="Whole sentence stays.")
+    value = section(Config(default_skills={"docs": ["short"]}, skill_libraries=[]), "docs", tmp_path)
+    assert "Whole sentence stays." in value and "..." not in value
+
+
+def test_assigned_names_use_the_installed_directory_of_a_full_id():
+    config = Config(default_skills={"docs": ["kwp:engineering/one"], "workers": ["two"], "architect": []})
+    assert assigned_names(config) == {"one", "two"}
+
+
+@pytest.mark.parametrize("repo,trusted", [
+    ("https://github.com/anthropics/skills", True),
+    ("https://github.com/anthropics/skills.git", True),
+    ("https://github.com/Anthropics/Skills/", True),
+    ("git@github.com:anthropics/knowledge-work-plugins.git", True),
+    ("https://github.com/unknown-publisher/skills.git", False),
+    ("https://github.com/anthropics/skills-extra", False),
+])
+def test_trust_follows_the_repository_address(repo, trusted):
+    assert trusted_source(repo) is trusted
+
+
+def catalog_config(tmp_path, repo, **values):
+    library = tmp_path / "library"
+    write_skill(library, "open-skill")
+    write_skill(library, "restricted", license="LicenseRef-Source-Available")
+    write_skill(library, "assigned")
+    return Config(skill_libraries=[{"name": "any-name", "repo": repo, "path": str(library)}], **values)
+
+
+def test_a_trusted_source_offers_only_skills_under_a_redistributable_license(tmp_path):
+    config = catalog_config(tmp_path, "https://github.com/anthropics/skills.git")
+    assert [name for name, _, _ in available_skills(config, [])] == ["assigned", "open-skill"]
+
+
+def test_an_unfamiliar_source_needs_a_person_to_confirm_a_role(tmp_path):
+    config = catalog_config(tmp_path, "https://github.com/unknown-publisher/skills.git",
+                            skill_roles={"any-name:restricted": "tool"})
+    assert [name for name, _, _ in available_skills(config, [])] == ["restricted"]
+
+
+def test_any_roles_default_leaves_the_catalog_even_when_a_person_confirmed_a_role(tmp_path):
+    config = catalog_config(tmp_path, "https://github.com/anthropics/skills", default_skills={"docs": ["assigned"]},
+                            skill_roles={"any-name:assigned": "tool"})
+    assert [name for name, _, _ in available_skills(config, [])] == ["open-skill"]
+
+
+def test_a_long_catalog_moves_to_a_file_and_a_short_one_stays_inline(tmp_path):
+    long = [(f"name-{n}", "x" * 200, f"/s/{n}/SKILL.md") for n in range(CATALOG_INLINE_BYTES // 200)]
+    value = catalog_section(long, tmp_path)
+    saved = tmp_path / "available-skills.md"
+    assert str(saved) in value and "name-0:" not in value and "Skills used: <names>" in value
+    assert all(f"- {name}: {description} ({path})" in saved.read_text() for name, description, path in long)
+    short = catalog_section(long[:2], tmp_path / "other")
+    assert "- name-0:" in short and not (tmp_path / "other").exists()
+
+
+def manager_for(tmp_path, **licenses) -> SkillManager:
+    library = tmp_path / "library"
+    for name, license in licenses.items():
+        write_skill(library, name, license=license)
+    return SkillManager(Config(skill_libraries=[{"name": "lib", "repo": "unused", "path": str(library),
+                                                  "revision": "pinned", "skills": list(licenses)}]))
+
+
+def test_check_default_refuses_missing_license_facts_without_changing_the_project(tmp_path):
+    manager = manager_for(tmp_path, none=None, restricted="LicenseRef-Restricted")
+    project = tmp_path / "project"
+    project.mkdir()
+    for name in ("none", "restricted"):
+        with pytest.raises(SkillError, match=f"{name}.*license"):
+            manager.check_default(name, project)
+    assert list(project.iterdir()) == []
+
+
+def test_install_default_keeps_a_persons_changed_copy_on_a_second_setup(tmp_path):
+    manager = manager_for(tmp_path, kept="MIT")
+    project = tmp_path / "project"
+    project.mkdir()
+    skill = manager.check_default("kept", project)
+    assert manager.default_needs_ignore(skill, project)
+    manager.install("kept", project)
+    copy = project / ".claude/skills/kept/SKILL.md"
+    assert copy.is_file() and (project / ".gitignore").read_text() == "/.claude/skills/kept/\n"
+    assert not manager.default_needs_ignore(skill, project)
+    copy.write_text("edited\n")
+    assert manager.check_default("kept", project) is None, "A differing copy stays and does not stop setup"
+    assert copy.read_text() == "edited\n"
+
+
+def test_check_default_judges_the_copy_that_stays_not_the_library(tmp_path):
+    manager = manager_for(tmp_path, listed="MIT")
+    project = tmp_path / "project"
+    write_skill(project / ".claude", "listed", license="LicenseRef-Source-Available")
+    with pytest.raises(SkillError, match="listed.*license"):
+        manager.check_default("listed", project)
+    write_skill(project / ".claude", "own-copy")
+    assert manager.check_default("own-copy", project) is None, "A permitted copy needs no library entry"
+    with pytest.raises(SkillError, match="unknown skill"):
+        manager.check_default("nowhere", project)
+
+
+@pytest.mark.parametrize("folder", [".claude/skills", "skills"])
+@pytest.mark.parametrize("where", ["checkout", "project"])
+def test_a_local_copy_without_redistributable_license_facts_never_reaches_a_session(tmp_path, folder, where):
+    root, worktree = tmp_path / "root", tmp_path / "worktree"
+    base = (worktree if where == "checkout" else root) / folder.removesuffix("skills").rstrip("/")
+    write_skill(base, "restricted", license="LicenseRef-Source-Available")
+    write_skill(base, "silent", license=None)
+    write_skill(base, "open-one")
+    config = Config(default_skills={"docs": ["restricted", "silent", "open-one"]}, skill_libraries=[])
+    value = section(config, "docs", root, worktree)
+    assert "- restricted: not available here" in value and "- silent: not available here" in value
+    assert "restricted/SKILL.md" not in value and "silent/SKILL.md" not in value
+    assert "open-one/SKILL.md" in value
+
+
+def test_a_restricted_copy_does_not_hide_a_permitted_one_further_along(tmp_path):
+    root, worktree = tmp_path / "root", tmp_path / "worktree"
+    write_skill(worktree, "both", license="LicenseRef-Source-Available")
+    write_skill(root, "both")
+    value = section(Config(default_skills={"docs": ["both"]}, skill_libraries=[]), "docs", root, worktree)
+    assert f"({root}/skills/both/SKILL.md)" in value
+
+
+def test_an_installed_copy_without_its_own_file_keeps_its_librarys_license_facts(tmp_path):
+    root = tmp_path / "root"
+    library = tmp_path / "library"
+    write_skill(library, "borrowed", license=None)
+    (library / "LICENSE").write_text("SPDX-License-Identifier: LicenseRef-Source-Available\n")
+    write_skill(root / ".claude", "borrowed", license=None)
+    (root / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")  # The project's MIT cannot relicense it.
+    entry = {"name": "lib", "repo": "unused", "path": str(library)}
+    config = Config(default_skills={"docs": ["borrowed"]}, skill_libraries=[entry])
+    assert "- borrowed: not available here" in section(config, "docs", root)
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    assert ".claude/skills/borrowed/SKILL.md" in section(config, "docs", root)
+
+
+def test_native_review_gets_added_text_only_when_there_is_some():
+    assert "--append-system-prompt" not in claude_review_command("low")
+    assert "--append-system-prompt" not in claude_review_command("low", append_system_prompt="")
+    args = claude_review_command("low", pr=7, append_system_prompt="Added")
+    assert args[args.index("--append-system-prompt") + 1] == "Added" and "/code-review 7 low" in args
+
+
+def test_a_closer_restrictive_license_wins_over_the_project_license(tmp_path):
+    root = tmp_path / "root"
+    write_skill(root, "product", license=None)
+    (root / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    (root / "skills/LICENSE").write_text("SPDX-License-Identifier: LicenseRef-Source-Available\n")
+    config = Config(default_skills={"docs": ["product"]}, skill_libraries=[])
+    assert "- product: not available here" in section(config, "docs", root)
+    with pytest.raises(SkillError, match="product.*license"):
+        SkillManager(config).check_default("product", root)
+    assert not (root / ".claude").exists()
+    (root / "skills/LICENSE").unlink()
+    assert "skills/product/SKILL.md" in section(config, "docs", root)
+    assert SkillManager(config).check_default("product", root) is not None
+
+
+@pytest.mark.parametrize("where", ["checkout", "project"])
+def test_a_library_license_never_overrides_a_restrictive_license_beside_the_copy(tmp_path, where):
+    root, worktree = tmp_path / "root", tmp_path / "worktree"
+    library = tmp_path / "library"
+    write_skill(library, "shared")  # The same name, MIT, in a library.
+    base = worktree if where == "checkout" else root
+    write_skill(base / ".claude", "shared", license=None)
+    (base / ".claude/skills/LICENSE").write_text("SPDX-License-Identifier: LicenseRef-Source-Available\n")
+    config = Config(default_skills={"docs": ["shared"]},
+                    skill_libraries=[{"name": "lib", "repo": "unused", "path": str(library)}])
+    value = section(config, "docs", root, worktree)
+    assert ".claude/skills/shared" not in value, "The restricted copy never reaches a session"
+    assert str((library / "skills/shared/SKILL.md").resolve()) in value, "The MIT original still may"
+    if where == "project":
+        with pytest.raises(SkillError, match="shared.*license"):
+            SkillManager(config).check_default("shared", root)

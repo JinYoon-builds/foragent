@@ -12,7 +12,7 @@ import shlex
 import sys
 from typing import TYPE_CHECKING
 
-from foragent import board, cuts, quota_reviewer, run_check_slot, usage_events, usage_recheck
+from foragent import board, cuts, quota_reviewer, run_check_slot, session_skills, skill_reads, usage_events, usage_recheck
 from foragent.actions import flag
 from foragent.config import resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, stream_session_id
@@ -101,6 +101,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str |
         poll()
         # Executors report plan usage in their own output; keep the latest numbers.
         usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
+        skill_reads.record(ctx.store, n, log, offset, kwargs.get("worktree"))
         _progress(n, ctx)
 
 
@@ -162,6 +163,13 @@ def _available_executor(
     from foragent.scheduler_quota import credits
 
     errors = 0
+    # A resumed session already holds its role's defaults, so only a full prompt carries them.
+    defaults = session_skills.section(ctx.config, "reviewers" if reviewer else "workers",
+                                      ctx.repo_root, kwargs["worktree"])
+    if defaults and kwargs.get("review_level") is not None:
+        kwargs["append_system_prompt"] = defaults.strip()
+    else:
+        kwargs["prompt"] += defaults
     full_prompt = kwargs["prompt"]
 
     def record_session(identity: str) -> None:
