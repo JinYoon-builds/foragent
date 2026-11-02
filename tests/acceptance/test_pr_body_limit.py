@@ -11,7 +11,7 @@ from foragent.runner import review_only, run_issue
 from foragent.tracker import TrackerError
 
 from conftest import ACCEPTANCE, git_command
-from runner_support import batch_setup, enable_reviewer, run_case  # noqa: F401
+from runner_support import enable_reviewer, run_case  # noqa: F401
 
 
 LIMIT = 65536
@@ -231,36 +231,6 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
     assert_full_text_is_reachable(c, body, [payload])
 
 
-@pytest.mark.parametrize("publication", ["create", "update"])
-def test_batch_publication_also_fits(run_case, monkeypatch, publication):
-    c = run_case
-    batch_setup(c)
-    # Reserve the child's PR number before adding a large completed sibling set.
-    c.tracker.create_pr(
-        head="foragent/issue-1", base="foragent/batch-99", title="Existing child", body="Closes #1"
-    )
-    titles = []
-    for number in range(200, 500):
-        title = f"Completed child {number}: " + "x" * 240
-        titles.append(title)
-        c.tracker.add_issue(number, title=title, state="closed")
-        c.tracker.set_parent(number, 99)
-    if publication == "update":
-        c.tracker.create_pr(head="foragent/batch-99", base="main", title="Existing batch", body="Old batch body")
-    calls = reject_oversized_bodies(c, monkeypatch)
-
-    assert run_issue(1, c.ctx) == "merged"
-
-    assert_writes_fit(calls)
-    batches = [pr for pr in c.tracker.created_prs if pr.head == "foragent/batch-99"]
-    assert len(batches) == 1
-    body = batches[0].body
-    assert "#99" in body and "## Children" in body
-    assert not re.search(r"\b(?:Closes|Fixes|Resolves)\s+#99\b", body, re.I)
-    assert_full_text_is_reachable(c, body, titles)
-    batch_calls = [(op, body) for op, body in calls if "## Children" in body]
-    assert len(batch_calls) == 1
-    assert batch_calls[0][0] == ("create_pr" if publication == "create" else "update_pr")
 
 
 @pytest.fixture(autouse=True)

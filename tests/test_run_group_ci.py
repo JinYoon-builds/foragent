@@ -461,3 +461,70 @@ def test_malformed_group_reports_at_locked_read_reject_reuse(ci_case, monkeypatc
     assert evidence.current(5, c.ctx, c.ctx.git, 99, "h5", "base", "pass") is False
     assert [call for call in c.calls if call[0] in {"push", "create", "close"}] == [
         call for call in writes if call[0] in {"push", "create", "close"}]
+
+
+def _evidence(c):
+    return [row["data"] for row in c.ctx.store.flow_records() if row["kind"] == "ci-evidence"]
+
+
+def test_group_evidence_records_each_changed_refusal_and_the_repair_with_requested_revisions(ci_case):
+    c = ci_case
+    reads = iter([[], [], deepcopy(c.reports)[:1], deepcopy(c.reports)])
+    c.ctx.tracker.pr_acceptance_reports = lambda head: next(reads)
+    verdict, _, _ = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    assert verdict == "passed"
+    rows = _evidence(c)
+    assert [(row["refused"], row["reason"]) for row in rows] == [
+        (True, "missing"), (True, "missing"), (False, None)], "A repeated poll adds nothing; a changed refusal does"
+    assert rows[0]["detail"] != rows[1]["detail"]
+    assert all(row["base_sha"] == "base" and row["head_sha"] == "head" for row in rows)
+    assert c.ctx.store.flow_records()[-1]["run_started_at"] == c.ctx.store.get_run(5).started_at
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ("workflow", "workflow-changed"), ("transport", "unavailable"), ("create", "unavailable"),
+    ("malformed", "unusable"),
+])
+def test_group_evidence_names_the_refused_branch(ci_case, monkeypatch, fault, reason):
+    c = ci_case
+
+    def unavailable(*args, **kwargs):
+        raise TrackerError("unavailable")
+
+    if fault == "workflow":
+        monkeypatch.setattr(ci_mode, "changed_workflows", lambda *args: "workflow.yml\0")
+    elif fault == "transport":
+        c.ctx.tracker.pr_acceptance_reports = unavailable
+    elif fault == "create":
+        c.ctx.tracker.create_pr = unavailable
+    else:
+        c.reports[0]["report"]["schema_version"] = 99
+    assert group_ci.check(5, c.ctx, "main", "base", "combined", excluded=[])[0] == "void"
+    rows = _evidence(c)
+    assert [(row["refused"], row["reason"]) for row in rows] == [(True, reason)]
+
+
+def test_reused_group_evidence_records_refusal_causes_and_the_repair(ci_case, monkeypatch):
+    c = ci_case
+    _, _, metadata = group_ci.check(5, c.ctx, "main", "base", "head", excluded=[])
+    event = {**metadata, "mode": "ci", "base_sha": "base", "verdict": "passed"}
+    monkeypatch.setattr(run_group_evidence, "latest", lambda *args: (event, 0))
+    monkeypatch.setattr(run_group_evidence, "void_reason", lambda *args: None)
+    before = len(_evidence(c))
+    valid = deepcopy(c.reports)
+    reads = iter([valid, [], TrackerError("HTTP 500"), valid])
+
+    def reports(head):
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return deepcopy(value)
+
+    c.ctx.tracker.pr_acceptance_reports = reports
+    view = SimpleNamespace(n=5, ctx=c.ctx, git=c.ctx.git)
+    answers = [group_ci.evidence(view, "member", "base") is not None for _ in range(4)]
+    assert answers == [True, False, False, True]
+    rows = _evidence(c)[before:]
+    assert [(row["refused"], row["reason"]) for row in rows] == [
+        (True, "missing"), (True, "unavailable"), (False, None)]
+    assert all(row["base_sha"] == "base" and row["head_sha"] == "member" for row in rows)

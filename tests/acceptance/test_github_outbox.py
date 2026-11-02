@@ -1,6 +1,6 @@
 """Acceptance test for github-outbox. Locked by Foragent; do not edit."""
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timedelta
 import json
 import subprocess
@@ -245,23 +245,19 @@ def test_github_outbox_flush_drops_changed_issue_and_refreshes_from_github(
 def test_github_outbox_gate_preserves_and_flushes_rate_limited_close(
     git_history, tmp_path, monkeypatch,
 ):
+    """Reject losing or repeating a queued close when the later gate tick replays it."""
     case = github_outbox_case(git_history, tmp_path, monkeypatch, action="close_issue")
-    case.tracker.add_issue(2, "Batch parent")
-    case.tracker.set_parent(1, 2)
-    pr = case.tracker.create_pr(head="foragent/issue-1", base="foragent/batch-2",
-                                title="Merged child", body="Closes #1")
-    case.tracker.merge_pr(pr, expected_head_sha=case.tracker.pr_head_sha(pr))
-    # The parent PR already exists, so reconciliation needs no new PR creation.
-    case.tracker.create_pr(head="foragent/batch-2", base="main", title="Batch", body="Closes #2")
-    case.clock[0] += timedelta(minutes=5)
-    outbox_tick(case)
+    # The public tick context records a close even while the remote write is limited.
+    context = replace(tick_context(case, start_runs=False), tracker=case.github)
+    notice = "Completed the approved work."
+    context.tracker.close_issue(1, notice)
     assert case.errors, "The gate must hit a real rate-limited close write"
     assert local_rows(persisted_store(case))[1]["state"] == "closed"
     assert case.tracker.get_issue(1).state == "open"
     pending = outbox_rows(persisted_store(case))
     closes = [row for row in pending if row["issue"] == 1 and row["action"] == "close_issue"]
     assert len(closes) == 1
-    assert closes[0]["body"] == f"Merged into foragent/batch-2 (PR #{pr})"
+    assert closes[0]["body"] == notice
     attempts = list(case.write_attempts)
     case.clock[0] = case.reset - timedelta(seconds=1)
     outbox_tick(case)

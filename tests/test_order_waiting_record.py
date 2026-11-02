@@ -53,3 +53,24 @@ def test_projection_reads_owner_replacements_and_their_notification():
     cleared = order_waiting.replace_section(changed, None)
     assert order_waiting.read_waiting(cleared) is None
     assert cleared.startswith("## Goal\nKeep the goal.\n\n## Done when\nKeep the checks.\n")
+
+
+@pytest.mark.parametrize("body", ["Text", "Text  ", "Text\t", "Text\n", "## Waiting\nA wait"])
+def test_appended_markers_always_take_their_own_line(body):
+    stamped = order_waiting.stamp("", body if "Waiting" in body else body + "\n\n## Waiting\nNew")
+    written = order_waiting.mark_write(body, body + "\nMore")
+    for result, kind in ((stamped, "waiting-prior"), (written, "write")):
+        assert any(line.startswith(f"<!-- foragent:{kind} ") and line.endswith(" -->")
+                   for line in result.splitlines())
+
+
+def test_same_write_keeps_its_id_when_only_the_final_newline_differs():
+    first = order_waiting.mark_write("Old", "Text")
+    assert order_waiting.mark_write(first, "Text") == first
+    assert order_waiting.mark_write(first, "Text\n") == first
+    assert order_waiting.mark_write(first, "Other") != first
+
+
+def test_bodies_without_a_marker_stay_byte_for_byte():
+    assert order_waiting.stamp("Text", "Text") == "Text"
+    assert order_waiting.mark_write("Text", "Text") == "Text"

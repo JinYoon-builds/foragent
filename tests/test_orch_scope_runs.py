@@ -42,8 +42,10 @@ def test_stop_refused_on_another_persons_issue_is_recorded_locally_only(monkeypa
     tracker = FakeTracker(login="alice")
     tracker.add_issue(1, "Bob's", "", labels=["by:bob", "running"])
     flags, events = {}, []
+    flows = []
     store = SimpleNamespace(
         load_flag=lambda n: flags.get(n), local_issues=lambda: [],
+        record_flow_change=lambda kind, **fields: flows.append((kind, fields["issue"], fields["reason"])),
         save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason, flagged_at=flagged_at)))
     monkeypatch.setattr(scheduler_stop.scheduler, "append_event", lambda *args: events.append(args))
     now = datetime(2026, 10, 31, tzinfo=UTC)
@@ -54,6 +56,7 @@ def test_stop_refused_on_another_persons_issue_is_recorded_locally_only(monkeypa
     scheduler_stop._flag_stop_refused(ctx, run, report, PermissionError("EPERM"))
     assert tracker.list_comments(1) == [] and "blocked" not in tracker.get_issue(1).labels
     assert flags[1].reason == Reason.STOP_REFUSED and len(events) == 1
+    assert flows == [("stop", 1, "refused")]  # The local flow record stays, once.
 
 
 def test_batch_reconcile_leaves_another_persons_children_open(monkeypatch):

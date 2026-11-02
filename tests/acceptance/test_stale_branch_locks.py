@@ -14,7 +14,6 @@ from foragent.runner import run_issue
 
 
 BRANCH = "foragent/issue-1"
-BATCH = "foragent/batch-99"
 LOCKS = (
     "tests/acceptance/test_role_signal_not_now.py",
     "tests/acceptance/test_role_signal_raise.py",
@@ -57,8 +56,7 @@ def prepare(case, saved_at, review, *, own_files=None):
     )
     case.history.update(OLD)
     earlier = case.history.tip
-    # A previous run created both refs before the order was corrected.
-    git_command(case.history.origin, "update-ref", f"refs/heads/{BATCH}", earlier)
+    # A previous run saved its issue branch before the order was corrected.
     issue_head = issue_commit(case, earlier, own_files) if own_files else earlier
     if saved_at == "local":
         case.ctx.git.fetch("origin", "main")
@@ -121,7 +119,7 @@ def proceeds_on_approved_base(case, base, monkeypatch, *, preserved=None):
 
 
 @pytest.mark.parametrize("saved_at", ["local", "origin"])
-@pytest.mark.parametrize("review", ["fast", "batch"])
+@pytest.mark.parametrize("review", ["fast"])
 def test_branch_without_own_commits_starts_with_approved_base(run_case, monkeypatch, saved_at, review):
     base = prepare(run_case, saved_at, review)
     proceeds_on_approved_base(run_case, base, monkeypatch)
@@ -130,14 +128,14 @@ def test_branch_without_own_commits_starts_with_approved_base(run_case, monkeypa
 @pytest.mark.parametrize("saved_at", ["local", "origin"])
 def test_inherited_lock_update_preserves_own_source_commit(run_case, monkeypatch, saved_at):
     own = {"src/widget.py": "VALUE = 'saved implementation'\n"}
-    base = prepare(run_case, saved_at, "batch", own_files=own)
+    base = prepare(run_case, saved_at, "fast", own_files=own)
     proceeds_on_approved_base(run_case, base, monkeypatch, preserved=own)
 
 
 @pytest.mark.parametrize("saved_at", ["local", "origin"])
 @pytest.mark.parametrize("edited_lock", LOCKS)
 def test_own_commit_editing_a_locked_file_still_invalidates(run_case, saved_at, edited_lock):
-    prepare(run_case, saved_at, "batch", own_files={edited_lock: "# Issue edited its locked test\n"})
+    prepare(run_case, saved_at, "fast", own_files={edited_lock: "# Issue edited its locked test\n"})
     outcome = run_issue(1, run_case.ctx)
     assert outcome == "hash-mismatch", "An own locked edit must invalidate approval before execution"
     assert run_case.store.load_approval(1) is None

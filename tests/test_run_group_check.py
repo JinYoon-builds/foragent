@@ -276,3 +276,20 @@ def test_combine_does_not_swallow_merge_tree_infrastructure_error():
 
     with pytest.raises(GitError, match="unreadable CONFLICT object"):
         group._combine(SimpleNamespace(_call=call), "base", [group.Member(5, "head", ())])
+
+
+@pytest.mark.parametrize("verdict,fresh,cause", [
+    ("failed", True, "group-failed"), ("void", True, "group-failed"), ("passed", True, "base-changed"),
+    ("failed", False, "base-changed"), (None, True, "base-changed"),
+])
+def test_refresh_cause_reads_this_executions_group_verdict(tmp_path, verdict, fresh, cause):
+    from datetime import timedelta
+
+    from foragent import orch_events
+
+    ctx = make_ctx(tmp_path, [1, 2])
+    if verdict is not None:
+        offset = timedelta(seconds=1 if fresh else -1)
+        at = datetime.fromisoformat(ctx.store.get_run(1).started_at) + offset
+        orch_events.append_event(ctx.store, at, 1, "group-check", "fixture", members=[{"n": 1}], verdict=verdict)
+    assert group.refresh_cause(ctx, 1) == cause
