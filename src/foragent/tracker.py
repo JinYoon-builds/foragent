@@ -141,12 +141,9 @@ class TrackerError(RuntimeError):
 
     @property
     def diagnostic(self) -> str:
-        """One line of the failure; a long outage message leads with its evidence, so a cut keeps it."""
+        """One line of the failure, at most 500 characters: its start and its end, where gh's error is."""
         text = " ".join(str(self).split())
-        if not self.transport or len(text) <= 500:
-            return text
-        return " ... ".join([*dict.fromkeys(
-            text[max(0, match.start() - 60):match.end() + 60] for match in _UNAVAILABLE.finditer(text)), text])
+        return text if len(text) <= 500 else f"{text[:200]} ... {text[-295:]}"
 
     @property
     def waits(self) -> bool:
@@ -176,20 +173,14 @@ class TrackerError(RuntimeError):
         return None
 
 
-# gh (Go) prints the network error it met, wrapped or bare. Each shape below means no complete
-# answer arrived: a request with no response (`<Method> "<url>": <cause>`), a socket error
-# (`dial|read|write tcp ...`), a body read cut short (a line ending in `EOF` / `unexpected EOF`),
-# an http2 stream, TLS record or net/http transport error, or an HTTP 5xx answer.
-_UNAVAILABLE = re.compile(
-    r"(?:error connecting to|\b(?:dial|read|write) (?:tcp|udp)\b|connection (?:refused|reset)"
-    r"|\bi/o timeout\b|\bnet/http: |\bhttp2: |\bstream error: stream ID\b|\b(?:local|remote) error: tls: "
-    r"|(?:^|: )(?:unexpected )?EOF[ \t]*$|\bHTTP(?:/\S+)?\s+5\d\d\b"
-    r"|\b(?:GET|HEAD|POST|PUT|PATCH|DELETE) \"https?://[^\"\s]*\": )",
-    re.I | re.M,
-)
+# A definite request error: GitHub answered and refused this request, either with an HTTP 4xx
+# status or with a GraphQL error answer. Every other gh failure (5xx, a cut connection, a
+# timeout, any text gh prints) is GitHub being unavailable, and the run waits. A rate limit
+# is a 4xx too; it waits through ``is_rate_limit``.
+_REQUEST_ERROR = re.compile(r"\bHTTP(?:/\S+)?\s+4\d\d\b|^GraphQL: ", re.I | re.M)
 # On stdout only gh's own response status line counts: stdout otherwise carries data
 # (checks JSON, error bodies with user text) that may mention any status.
-_STATUS_LINE = re.compile(r"^HTTP/\S+\s+5\d\d\b", re.I)
+_STATUS_LINE = re.compile(r"^HTTP/\S+\s+\d\d\d\b", re.I)
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
 # Colour codes and any other terminal control a CI log printed; tabs and newlines stay.
@@ -1080,14 +1071,14 @@ class GhTracker:
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
             message = stderr or str(exc)
-            # A server error gh printed only on stdout is still the failure: it leads the message,
+            # A response status gh printed only on stdout is still the failure: it leads the message,
             # so every reader of the error (logs, run details, waits) keeps it.
             status = next((line.strip() for line in (stdout or "").splitlines() if _STATUS_LINE.search(line)), None)
             if status and status not in message:
                 message = f"{status}\n{message}"
             raise TrackerError(
                 message, stdout=stdout or "", returncode=exc.returncode,
-                transport=bool(status or _UNAVAILABLE.search(stderr or "")),
+                transport=not _REQUEST_ERROR.search(message),
             ) from exc
         except subprocess.TimeoutExpired as exc:
             # The failure leads; the argv (titles, bodies, repository names) follows and may be cut.
@@ -1442,12 +1433,16 @@ class GhTracker:
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
-            # gh uses exit 1 for failed checks and exit 8 for pending checks. An outage's
-            # output is not a checks listing: it waits like any other unreachable read.
-            if exc.is_unavailable or exc.returncode not in {1, 8} or not exc.stdout.strip():
-                raise
-            output = exc.stdout
-        buckets = {item["bucket"] for item in _items(output)}
+            # gh uses exit 1 for failed checks and exit 8 for pending checks; only a checks
+            # listing on stdout is that answer. Any other output is the failure itself.
+            try:
+                if exc.returncode not in {1, 8} or not exc.stdout.strip():
+                    raise ValueError("not a checks exit")
+                buckets = {item["bucket"] for item in _items(exc.stdout)}
+            except (TrackerError, ValueError, TypeError, KeyError):
+                raise exc from exc.__cause__
+        else:
+            buckets = {item["bucket"] for item in _items(output)}
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
