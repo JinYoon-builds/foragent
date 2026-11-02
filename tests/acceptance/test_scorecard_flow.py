@@ -310,7 +310,8 @@ def test_lead_time_uses_latest_approval_and_actual_merge_time(flow, capsys, sour
                                (approval, "approved", "labeled")])
     _approved(flow, 20, NOW - timedelta(hours=10))
     completed_run(flow, 20, finished=NOW - timedelta(hours=1), outcome="checks-failed")
-    completed_run(flow, 21, finished=NOW - timedelta(hours=1))  # Missing approval is unknown, not zero.
+    completed_run(flow, 21, finished=NOW - timedelta(hours=1))
+    flow.store.clear_approval(21)  # Missing approval is unknown, not zero (the shared fixture saves one).
     assert _metric(_card(flow, capsys), "lead_time_minutes") == pytest.approx(90), (
         "Median approval-to-merge is 90; run duration is 10 and completion is 20 minutes after merge")
 

@@ -82,9 +82,6 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 | `review` | 머지 | 사람이 보는 것 |
 |---|---|---|
 | `fast` | CI + Done when 통과 시 main에 자동 머지 | 묶음 끝에 결과물을 써 보기만 |
-| `batch` | 묶음 브랜치에 자동 머지, 사람이 묶음째 main에 넣음 | 묶음 단위 검토 |
-
-**`batch`의 묶음 = order의 부모 이슈(Epic) 하나.** 묶음 브랜치는 `foragent/batch-<부모#>`. 자식 PR은 이 브랜치로 머지한다. 주의: GitHub는 기본 브랜치가 아닌 곳에 머지된 PR의 `Closes #N`으로 이슈를 닫지 않는다. 그래서 gate가 자식 이슈를 직접 닫고(“묶음 브랜치에 머지됨” 댓글), 자식이 모두 닫히면 묶음 브랜치 → main PR을 연다. 그 PR은 inspect의 "검토" 항목이 된다.
 | `careful` | PR만 열어 둠, 사람이 머지 | PR 하나씩 |
 
 검수 강도와 무관하게 **자동 머지하지 않고 needs-human으로 보내는 경우:**
@@ -95,7 +92,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 `review`는 저장소 단위 기본값에 경로별 덮어쓰기를 허용한다. 예: 한 저장소 안에서 `app/`은 fast, `pipeline/`은 careful.
 
-사용자가 많아질수록 진짜 안전장치는 사람의 PR 검토보다 배포 쪽 장치(기능 플래그, 단계적 배포, 빠른 롤백)다. 이건 gate 밖이지만, 이 장치가 있으면 `batch`를 유지할 수 있다.
+사용자가 많아질수록 진짜 안전장치는 사람의 PR 검토보다 배포 쪽 장치(기능 플래그, 단계적 배포, 빠른 롤백)다. 이건 gate 밖이지만, 이 장치가 있으면 `fast`를 유지할 수 있다.
 
 ## 7. 예외와 알림
 
@@ -115,7 +112,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 `.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 반영된다. gate tick은 fetch 뒤 `origin/<base>`의 파일을 읽는다(공유 checkout은 당기지 않는다). 그 파일이 없거나 잘못되면 로컬 파일을 쓰고 stderr에 한 줄 알린다.
 
 ```yaml
-review: batch            # fast | batch | careful
+review: fast             # fast | careful
 review_paths:            # 경로별 덮어쓰기 (선택)
   app/**: fast
   pipeline/**: careful

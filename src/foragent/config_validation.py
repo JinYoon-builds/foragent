@@ -60,13 +60,13 @@ def _validate(values: dict[str, Any]) -> None:
     ):
         raise ConfigError("language must be a short language tag, such as en, ko, or ja")
     if not isinstance(values["review"], str) or values["review"] not in _REVIEW_LEVELS:
-        raise ConfigError("review must be fast, batch, or careful")
+        raise ConfigError("review must be fast or careful")
     paths = values["review_paths"]
     if not isinstance(paths, dict):
         raise ConfigError("review_paths must be a mapping")
     for path, review in paths.items():
         if not isinstance(path, str) or not isinstance(review, str) or review not in _REVIEW_LEVELS:
-            raise ConfigError(f"invalid review_paths entry: {path}")
+            raise ConfigError(f"invalid review_paths entry: {path} (review must be fast or careful)")
     listed = _validate_executors(values.get("executor_list"))
     for key in ("executor", "reviewer"):
         value = values[key]
