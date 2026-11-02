@@ -22,7 +22,7 @@ def _push_branch(attempt: Implementation) -> None:
 
 
 def _skills_line(run: Run) -> str:
-    """The implementer's own `Skills used:` report; every implementer is asked for one."""
+    """The skills the executor log shows were read; `not reported` only without reads or a report line."""
     return run_publish.report_line(run.skills_used, run.skills_reported)
 
 

@@ -12,13 +12,14 @@ import sys
 
 import yaml
 
-from foragent import board, gh, lane_memory, launchd, role_agents, roles
+from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
-from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config
+from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
+from foragent.skills import Skill, SkillManager, with_vendored_library
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -363,6 +364,11 @@ def init_repo(
         print(f"Warning: kept {', '.join(invalid_agents)} unchanged; its frontmatter needs name, "
               "memory: project and the skills of its roles entry.", file=sys.stderr)
 
+    # Before anything is written: one default without license facts stops the whole setup.
+    skill_manager, default_skills = _checked_default_skills(root, config if config_path.exists() else None)
+    default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
+                         for skill in default_skills.values())
+
     # Re-running init moves lane memory to its two writers (D95); a second run changes nothing.
     migrated = lane_memory.migrate(root, config)
 
@@ -384,6 +390,7 @@ def init_repo(
     legacy_paths = [LEGACY_PUBLISH_WORKFLOW] if not (root / LEGACY_PUBLISH_WORKFLOW).exists() else []
     pending = list(dict.fromkeys([
         *created, *tracked_removals, *([".foragent.yml"] if updated_config is not None else []), *migrated,
+        *([".gitignore"] if default_ignore else []),
         # Files an interrupted earlier run migrated but never committed are found by their state.
         *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
@@ -452,6 +459,9 @@ def init_repo(
     for path in removed:
         (root / path).unlink()
     lane_memory.apply(root, migrated)
+    for identity, skill in default_skills.items():
+        if skill is not None:  # None: a permitted copy is already there and stays.
+            skill_manager.install_default(identity, skill, root)
     if WORKFLOW in created:
         write_workflow(root, config, repo=repo, run=run, missing_only=True)
     if updated_config is not None:
@@ -470,6 +480,19 @@ def init_repo(
     return InitReport(created, existed, False, bool(pending), push_planned, label,
                       normalized_root=normalized_root, added_keys=_report_keys(added, role_source, updated_config), board_id=board_id, removed=removed,
                       notes=notes, tracker=tracker)
+
+
+def _checked_default_skills(root: Path, config: Config | None) -> tuple[SkillManager | None, dict[str, Skill | None]]:
+    """Every role's default skills, each with license facts that allow redistribution.
+
+    A new project has no settings file yet, so its table and libraries come from the person's global config.
+    """
+    scope = config if config is not None else load_global_config()
+    names = session_skills.assigned_entries(scope)
+    if not names:
+        return None, {}
+    manager = SkillManager(with_vendored_library(scope, root))
+    return manager, {name: manager.check_default(name, root) for name in names}
 
 
 FA_ALLOW_RULE = "Bash(fa:*)"

@@ -154,13 +154,10 @@ def implementer_setup(
 
 
 def _record_skills_used(n: int, ctx: RunContext, result: ExecResult) -> None:
-    """Keep every skill the implementer reported across attempts."""
+    """Note that the implementer reported; which skills it used comes only from its reads (skill_reads)."""
     message = result.full_message if result.full_message is not None else result.last_message
-    used = parse_skills_used(message or "")
-    if used is None:
-        return
-    run = ctx.store.get_run(n)
-    ctx.store.update_run(n, skills_reported=True, skills_used=list(dict.fromkeys([*run.skills_used, *used])))
+    if parse_skills_used(message or "") is not None:
+        ctx.store.update_run(n, skills_reported=True)
 
 
 _DETECTION_FILES = ("pyproject.toml", "package.json", "pnpm-lock.yaml", "go.mod")
@@ -401,7 +398,7 @@ def _implement(
         parent_context=attempt.approval.parent_context or "",
         full_text_dir=full_text_dir,
         moved_files=moved_files,
-        skill_catalog=catalog_section(available_skills(ctx.config, fixed)),
+        skill_catalog=catalog_section(available_skills(ctx.config, fixed), full_text_dir),
         previous_attempt=(previous_attempt_summary(attempt, failure_context)
                           if failure_context or reviewer_text is not None or saved_feedback else ""),
         review_feedback=review_feedback,
