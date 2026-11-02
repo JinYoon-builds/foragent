@@ -173,7 +173,7 @@ def retitle_for_merge(
     Branch commit messages (WIP checkpoints) never decide the title. The squash
     subject is the PR title, so it is passed only when retitling failed (other
     than a rate limit): the merge then still uses the issue-derived subject. A PR with
-    no composition record takes the same path, since its body cannot be written.
+    no composition record changes its title alone, so the subject is right and no body is written.
     """
     from foragent.run_pr_body import publish_comments
 
@@ -182,7 +182,8 @@ def retitle_for_merge(
             rendered = body()
             if rendered is None:
                 note(f"PR #{pr} has no composition record; merging with subject {title!r} and no body write.")
-                return {"subject": title}
+                ctx.tracker.retitle_pr(pr, title=title)
+                return {}
             ctx.tracker.update_pr(pr, base=base, title=title, body=rendered)
             publish_comments(ctx, pr, rendered)
         except run_publish.TrackerError as exc:

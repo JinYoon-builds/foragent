@@ -280,12 +280,46 @@ def _with_pr(tmp_path):
     return ctx
 
 
-def test_retitle_without_a_record_writes_nothing_and_merges_with_the_subject(tmp_path):
+def test_retitle_without_a_record_changes_the_title_and_writes_no_body(tmp_path):
     ctx = _with_pr(tmp_path)
     subject, notes = _retitle(ctx, lambda: None)
-    assert subject == {'subject': 'New (#1)'} and 'no composition record' in notes[0]
+    assert subject == {} and 'no composition record' in notes[0]
     pr = ctx.tracker.created_prs[0]
-    assert pr.title == 'Old' and pr.body == 'Old body'
+    assert pr.title == 'New (#1)' and pr.body == 'Old body'
+
+
+def test_a_failed_title_change_without_a_record_merges_with_the_subject(tmp_path, monkeypatch):
+    ctx = _with_pr(tmp_path)
+
+    def refuse(*_args, **_kwargs):
+        raise TrackerError('title rejected')
+
+    monkeypatch.setattr(ctx.tracker, 'retitle_pr', refuse)
+    subject, notes = _retitle(ctx, lambda: None)
+    assert subject == {'subject': 'New (#1)'} and 'title rejected' in notes[-1]
+    assert ctx.tracker.created_prs[0].body == 'Old body'
+
+
+def test_no_record_merge_sends_the_issue_title_as_subject_and_no_body_at_gh():
+    """At the gh boundary: the title edit carries no body, and the squash subject is that title."""
+    from foragent.tracker import GhTracker
+
+    commands = []
+
+    def command(argv, **kwargs):
+        commands.append((argv, kwargs))
+        if argv[:2] == ['pr', 'view']:
+            return json.dumps({'title': 'New (#1)'})
+        return ''
+
+    github = GhTracker('o/r', command)
+    github.retitle_pr(1, title='New (#1)')
+    edit, kwargs = commands[0]
+    assert edit[:2] == ['pr', 'edit'] and edit[edit.index('--title') + 1] == 'New (#1)'
+    assert '--body-file' not in edit and '--body' not in edit and kwargs.get('input') is None
+    github.merge_pr(1, expected_head_sha='a' * 40)
+    merge = commands[-1][0]
+    assert merge[:2] == ['pr', 'merge'] and merge[merge.index('--subject') + 1] == 'New (#1)'
 
 
 def test_retitle_with_a_record_sends_the_composition_and_its_comments(tmp_path):
