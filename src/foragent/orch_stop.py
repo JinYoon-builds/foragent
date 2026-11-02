@@ -80,14 +80,17 @@ def _note_not_stopped(ctx: RunContext, tick_ctx, n: int, report) -> None:
     """Why the kill path returned without stopping; a refusal it already recorded is not said again."""
     from foragent.scheduler_stop import _stop_already_refused
 
-    run = ctx.store.get_run(n)
-    running = run is not None and run.status == "running"
-    if running and _stop_already_refused(tick_ctx, run):
+    try:
+        run = ctx.store.get_run(n)
+        running = run is not None and run.status == "running"
+        if running and _stop_already_refused(tick_ctx, run):
+            return
+        if report.actions:
+            _note(ctx, n, run, "skipped", "failed", "; ".join(report.actions))
+        else:
+            _note(ctx, n, run, "skipped", "run-changed" if running else "not-running")
+    except Exception:  # noqa: BLE001 - an observation never replaces the stop's own error
         return
-    if report.actions:
-        _note(ctx, n, run, "skipped", "failed", "; ".join(report.actions))
-    else:
-        _note(ctx, n, run, "skipped", "run-changed" if running else "not-running")
 
 
 def stop(ctx: RunContext, n: int, why: str) -> str:

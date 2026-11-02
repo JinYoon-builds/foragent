@@ -120,7 +120,10 @@ def wait_for_overlap(attempt) -> None:
         for peer in peers:
             _record_peers(ctx, peer, [owner], union=union)
         blockers = _late_blockers(ctx, owner, peers, union)
-        note_holds(ctx, n, run.started_at, _late_holds(ctx, owner, peers, list(blockers), union))
+        try:
+            note_holds(ctx, n, run.started_at, _late_holds(ctx, owner, peers, list(blockers), union))
+        except Exception:  # noqa: BLE001 - an observation never replaces this wait's own answer
+            pass
         return blockers
 
     blockers = blocked()

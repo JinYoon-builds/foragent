@@ -466,3 +466,15 @@ def test_a_refusal_whose_flag_fails_is_one_transition_not_two(case, monkeypatch)
     with pytest.raises(RuntimeError, match="board down"):
         orch.stop(case.ctx, 1, "reprioritize")
     assert _stop_rows(case.store) == [(case.store.get_run(1).started_at, "skipped", "failed", "RuntimeError: board down")]
+
+
+def test_a_failed_observation_keeps_the_stops_own_error(case, monkeypatch):
+    from foragent import scheduler_stop
+
+    def unreadable(*args):
+        raise OSError("flag unreadable")
+
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: False)
+    monkeypatch.setattr(scheduler_stop, "_stop_already_refused", unreadable)
+    with pytest.raises(orch.OrchError, match="not running"):
+        orch.stop(case.ctx, 1, "reprioritize")

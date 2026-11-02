@@ -678,3 +678,34 @@ def test_activity_keeps_one_interval_through_failure_and_ignores_an_instant(slot
     assert rows[0]["data"]["cause"] == "base-changed"
     assert rows[0]["run_started_at"] == ctx.store.get_run(1).started_at
     assert rows[0]["data"]["finished_at"] == clock[0].isoformat()
+
+
+def test_activity_never_replaces_the_works_result_or_exception(slot_case):
+    from foragent.run_waits import activity, note_activity
+
+    class Stop(Exception):
+        pass
+
+    def broken():
+        raise OSError("clock unreadable")
+
+    no_clock = SimpleNamespace(now=broken, store=slot_case.ctx.store)
+    with activity(1, no_clock, "checking", "initial"):
+        done = True
+    assert done
+    with pytest.raises(Stop):
+        with activity(1, no_clock, "checking", "initial"):
+            raise Stop
+
+    ticks = iter([BASE_TIME])  # The clock fails only when the interval ends.
+
+    def ends_broken():
+        return next(ticks)
+
+    with pytest.raises(Stop):
+        with activity(1, SimpleNamespace(now=ends_broken, store=slot_case.ctx.store), "checking", "initial"):
+            raise Stop
+
+    no_store = SimpleNamespace(store=SimpleNamespace(get_run=broken))
+    note_activity(1, no_store, "checking", "initial", BASE_TIME, BASE_TIME + timedelta(seconds=1))
+    assert not [row for row in slot_case.ctx.store.flow_records() if row["kind"] == "activity"]

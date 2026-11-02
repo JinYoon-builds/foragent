@@ -305,3 +305,28 @@ def test_late_exclusive_hold_keeps_its_cause_without_a_numeric_limit(context):
     first = _late_rows(context, 1)[0]['data']['holds'][0]
     assert first['file'] == 'shared.py' and first['limit'] is None and first['cause'] == 'exclusive'
     assert _late_rows(context, 1)[-1]['data']['holds'] == []
+
+
+def test_a_failed_hold_observation_keeps_the_waits_answer(context, monkeypatch):
+    from foragent import run_overlap
+
+    def broken(*args, **kwargs):
+        raise OSError("plan unreadable")
+
+    context.config = replace(context.config, overlap_per_file=1)
+    now = clock(context)
+    reserve(context, 1, ['own.py'])
+    reserve(context, 2, ['shared.py'], lane='peer')
+    edit(context, 1, {'own.py': 'own\n'}, commit=True)
+    edit(context, 1, {'shared.py': 'late\n'})
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += timedelta(seconds=7)
+        context.store.finish_run(2, 'merged')
+
+    context.sleep = sleep
+    monkeypatch.setattr(run_overlap, '_late_holds', broken)
+    wait_for_overlap(attempt(context, 1))
+    assert waits == [OVERLAP_POLL_SECONDS], 'The hold still waits exactly as long'
