@@ -27,23 +27,19 @@ class ParsedIssue:
     files: list[str] = field(default_factory=list)
     exclusive: list[str] = field(default_factory=list)
     # Authored content beside the first Goal, Out of scope and closed Done when commands, verbatim.
-    other_content: str = ""
+    # For prompts only: two bodies parse equal as long as the values the gate acts on are equal.
+    other_content: str = field(default="", compare=False)
 
 
-# The gate writes a marker from the first column; an indented one, prose or a fenced example is authored.
-_MARKER_LINE = re.compile(r"<!--\s*/?foragent:(?:(?!-->).)*-->[ \t]*")
-# order_waiting removes these and appends them after the last line of every body it writes. Without
-# a final newline they share that line, so only the body's tail can hold gate writing on an authored
-# line; the same text anywhere else is the author's.
-_GLUED_TAIL = re.compile(
-    r"(?<=\S)(?:<!-- foragent:(?:waiting-prior sha256=[0-9a-f]{64}|write) id=[0-9a-f]* -->\s*)+\Z",
-)
+# The gate writes each marker on its own line (order_waiting.on_own_line). Only such a line, outside
+# a closed fence, is gate writing: marker text sharing a line or inside that fence is the author's.
+_MARKER_LINE = re.compile(r"<!-- /?foragent:(?:(?!-->).)*-->")
 _WAITING_HEADING = re.compile(r"##[ \t]+Waiting[ \t]*")
 _WAITING_END = re.compile(r"#{1,2}(?:\s|$)|<!--\s*foragent:")
 
 
 def _script_fence(line: str, fence: str | None) -> tuple[str | None, bool]:
-    """The fence state after `line`, under the rule that decides sections and executable commands.
+    """The fence state after `line` under the rule for executable commands in a Done when section.
 
     Only backtick fences of three or four open here. Returns the state and whether `line` closed a fence.
     """
@@ -54,8 +50,45 @@ def _script_fence(line: str, fence: str | None) -> tuple[str | None, bool]:
     return (opening[1] if opening else None), False
 
 
-def _closes_block(block: str, line: str) -> bool:
-    return re.fullmatch(rf"[ \t]*{re.escape(block[0])}{{{len(block)},}}[ \t]*", line) is not None
+def _fence_opening(line: str) -> str | None:
+    """The Markdown fence `line` opens: backticks or tildes of any length."""
+    opening = re.fullmatch(r"[ \t]*(?:(`{3,})[^`]*|(~{3,}).*)", line)
+    return (opening[1] or opening[2]) if opening else None
+
+
+def _closes_fence(fence: str, line: str) -> bool:
+    return re.fullmatch(rf"[ \t]*{re.escape(fence[0])}{{{len(fence)},}}[ \t]*", line) is not None
+
+
+def closed_fence_lines(lines: list[str]) -> set[int]:
+    """Indexes of the lines inside a fence that closes, its fence lines included.
+
+    A fence that never closes holds nothing here: gate writing is appended after whatever the
+    body ends with, so it must stay recognisable after an unfinished fence. Waiting text is the
+    gate's and ends where order_waiting ends it, so a fence line in it pairs with nothing later.
+    """
+    texts = [line.rstrip("\r\n") for line in lines]
+    fenced: set[int] = set()
+    never_closed: dict[str, int] = {}  # Shortest fence of each character known to have no closer.
+    waiting = False
+    index = 0
+    while index < len(texts):
+        text = texts[index]
+        if waiting and not _WAITING_END.match(text):
+            index += 1
+            continue
+        waiting = False
+        fence = _fence_opening(text)
+        if fence is not None and len(fence) < never_closed.get(fence[0], len(fence) + 1):
+            closer = next((later for later in range(index + 1, len(texts)) if _closes_fence(fence, texts[later])), None)
+            if closer is not None:
+                fenced.update(range(index, closer + 1))
+                index = closer + 1
+                continue
+            never_closed[fence[0]] = len(fence)
+        waiting = _WAITING_HEADING.fullmatch(text) is not None
+        index += 1
+    return fenced
 
 
 @dataclass(frozen=True)
@@ -69,53 +102,46 @@ class _Line:
 def _lines(body: str) -> list[_Line]:
     """Every line with its known section and authored text; line endings are already normalised.
 
-    Gate writing is the Waiting section and machine markers outside any Markdown code fence: a
-    backtick or tilde fence of any length. Waiting ends as order_waiting ends it, at the next
-    `#`/`##` heading or foragent marker, whatever fence its own text holds: that text is the
-    gate's, so a fence left open in it cannot hide the authored sections after it.
+    Headings inside any Markdown fence belong to the fence; a fence never closed runs to the end.
+    Gate writing is the Waiting section and machine marker lines outside a closed fence. Waiting
+    ends as order_waiting ends it, at the next `#`/`##` heading or foragent marker. Its text takes
+    no part in fences (see closed_fence_lines), so it cannot hide what the author wrote after it.
     """
     lines: list[_Line] = []
+    sources = body.splitlines(keepends=True)
+    fenced = closed_fence_lines(sources)
     seen: set[str] = set()
     current: str | None = None
     fence: str | None = None
-    block: str | None = None
     waiting = False
-    tail = _GLUED_TAIL.search(body)
-    authored_end = tail.start() if tail else len(body)
-    start = 0
-    for source in body.splitlines(keepends=True):
+    for index, source in enumerate(sources):
         line = source.removesuffix("\n")
-        bare = line[:max(authored_end - start, 0)]
-        start += len(source)
         gate = False
-        if block is not None:
-            if _closes_block(block, bare):
-                block = None
-        else:
-            if waiting and _WAITING_END.match(bare):
-                waiting = False
-            if not waiting:
-                opening = re.fullmatch(r"[ \t]*(?:(`{3,})[^`]*|(~{3,}).*)", bare)
-                if opening:
-                    block = opening[1] or opening[2]
-                elif _MARKER_LINE.fullmatch(bare):
-                    gate = True
-                elif _WAITING_HEADING.fullmatch(bare):
-                    waiting = True
+        if waiting and _WAITING_END.match(line):
+            waiting = False
+        waiting_text = waiting
+        if not waiting and index not in fenced:
+            if _MARKER_LINE.fullmatch(line):
+                gate = True
+            elif _WAITING_HEADING.fullmatch(line):
+                waiting = True
         heading = False
-        was_open = fence is not None
-        fence, _ = _script_fence(line, fence)
-        if not was_open and fence is None and line.startswith("## "):
-            known = re.fullmatch(r"## (Goal|Behaviour|Out of scope|Files|Done when)[ \t]*", line)
-            current = known[1] if known and known[1] not in seen else None
-            seen.add(current or "")
-            heading = True
-        authored = "" if gate or waiting else bare + source[len(line):]
-        lines.append(_Line(source, authored, current, heading))
+        if not waiting_text:
+            if fence is not None:
+                if _closes_fence(fence, line):
+                    fence = None
+            else:
+                fence = _fence_opening(line)
+                if fence is None and line.startswith("## "):
+                    known = re.fullmatch(r"## (Goal|Behaviour|Out of scope|Files|Done when)[ \t]*", line)
+                    current = known[1] if known and known[1] not in seen else None
+                    seen.add(current or "")
+                    heading = True
+        lines.append(_Line(source, "" if gate or waiting else source, current, heading))
     return lines
 
 
-def _sections(lines: list[_Line]) -> dict[str, list[_Line]]:
+def _section_lines(lines: list[_Line]) -> dict[str, list[_Line]]:
     """The known sections' lines, without their headings."""
     sections: dict[str, list[_Line]] = {}
     for line in lines:
@@ -124,6 +150,11 @@ def _sections(lines: list[_Line]) -> dict[str, list[_Line]]:
             if not line.heading:
                 content.append(line)
     return sections
+
+
+def _sections(body: str) -> dict[str, list[str]]:
+    """The known sections' authored text, by line; line endings are already normalised."""
+    return {name: [line.authored for line in lines] for name, lines in _section_lines(_lines(body)).items()}
 
 
 def authored_body(body: str) -> str:
@@ -173,13 +204,13 @@ def _text(lines: list[_Line]) -> str:
 
 def has_behaviour(body: str) -> bool:
     """Whether the body was published with behaviour statements (a real heading, not fenced text)."""
-    return "Behaviour" in _sections(_lines(body.replace("\r\n", "\n")))
+    return "Behaviour" in _sections(body.replace("\r\n", "\n"))
 
 
 def parse_body(body: str) -> ParsedIssue:
     body = body.replace("\r\n", "\n")
     lines = _lines(body)
-    sections = _sections(lines)
+    sections = _section_lines(lines)
     commands, checklist, done_when_rest = _done_when(sections.get("Done when", []))
 
     return ParsedIssue(

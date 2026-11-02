@@ -2642,6 +2642,18 @@ def test_done_when_executable_uv_suggestion_from_dependency_groups(tmp_path, mon
     assert "찾을 수 없어요" in caught.value.lines[0]
 
 
+def test_observed_change_outside_known_fields_shows_the_raw_body_once():
+    from foragent import order_observed
+
+    base = "## Goal\nKeep.\n\n## Contracts\nThe API stays.\n"
+    assert list(order_observed._changes({"title": "T", "body": base},
+                                        {"title": "T", "body": base + "More.\n"})) == [
+        ("body", base, base + "More.\n")]
+    changed = list(order_observed._changes({"title": "T", "body": base},
+                                           {"title": "T", "body": base.replace("Keep.", "Move.") + "More.\n"}))
+    assert [field for field, _, _ in changed] == ["goal", "other_content"]
+
+
 def test_observed_fields_preserve_raw_changes_and_keep_plans_separate(tmp_path):
     from types import SimpleNamespace
 

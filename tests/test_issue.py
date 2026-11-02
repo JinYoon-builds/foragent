@@ -3,11 +3,15 @@ from pathlib import Path
 
 import pytest
 
+from foragent import order_waiting
 from foragent.issue import (
     ChecklistItem,
+    _sections,
     acceptance_paths,
     authored_body,
     body_hash,
+    closed_fence_lines,
+    has_behaviour,
     has_machine_check,
     parse_body,
 )
@@ -293,29 +297,47 @@ def test_commands_keep_gate_text_exactly_as_they_will_execute():
     assert parsed.other_content == "## Contracts\nThe API stays."
 
 
-@pytest.mark.parametrize("marker", [WRITE, PRIOR, PRIOR + "\n" + WRITE])
-def test_marker_stamped_after_a_body_without_final_newline_leaves_the_authored_line(marker):
-    body = f"## Goal\nShip it.\n## Contracts\nThe API stays.{marker}\n"
-    assert authored_body(body) == "## Goal\nShip it.\n## Contracts\nThe API stays."
+@pytest.mark.parametrize("trailing", ["", "  ", "\t"])
+@pytest.mark.parametrize("wait", [None, "A wait"])
+def test_what_the_gate_writes_after_a_body_without_final_newline_is_not_authored(trailing, wait):
+    original = f"## Goal\nShip it.\n## Contracts\nThe API stays.{trailing}"
+    edited = order_waiting.replace_section(original, wait) if wait else original + "\nMore."
+    written = order_waiting.mark_write(original, order_waiting.stamp(original, edited))
+    assert "foragent:write" in written
+    assert "<!--" not in authored_body(written) and "A wait" not in authored_body(written)
+    assert authored_body(written).startswith(original.rstrip())
+    assert authored_body(written) == (original.strip() if wait else edited)
+    assert order_waiting.mark_write(written, order_waiting.stamp(written, edited)) == written
 
 
-def test_marker_stamped_after_a_closing_fence_changes_no_command_and_does_not_leak():
+def test_own_line_markers_are_removed_but_suffixes_keep_the_command_rule():
     parsed = parse_body(f"## Done when\n```sh\ntrue\n```{WRITE}\n")
     assert parsed.done_when_commands == []
-    assert parsed.other_content == "## Done when\n```sh\ntrue\n```"
-    assert authored_body(f"## Example\n~~~\nx\n~~~{WRITE}\n") == "## Example\n~~~\nx\n~~~"
+    assert parsed.other_content == f"## Done when\n```sh\ntrue\n```{WRITE}"
+    assert authored_body(f"## Example\nText\n{WRITE}\n{PRIOR}\n") == "## Example\nText"
 
 
-@pytest.mark.parametrize("marker", [WRITE, PRIOR])
-def test_marker_text_before_the_body_tail_is_authored_and_its_edits_are_seen(marker):
-    other = marker.replace("a" * 32, "d" * 32).replace("c" * 32, "d" * 32)
-    for shape in ("## Example\n```md{m}\ncode\n```\nEnd.\n",     # fence opening info string
-                  "## Example\n~~~sh{m}\ncode\n~~~\nEnd.\n",
-                  "## Example\nProse ending in {m}\nEnd.\n",      # prose suffix
-                  "## Example\n- [ ] item {m}\nEnd.\n"):
-        body = shape.format(m=marker)
-        assert authored_body(body) == body.strip()
-        assert authored_body(shape.format(m=other)) != authored_body(body)
+@pytest.mark.parametrize("marker", [WRITE, PRIOR, "<!-- foragent:write id=a -->", "<!-- foragent:v1 -->"])
+@pytest.mark.parametrize("shape", [
+    "## Example\n```md{m}\ncode\n```\nEnd.\n",  # Fence opening info string.
+    "## Example\n~~~sh{m}\ncode\n~~~\nEnd.\n",
+    "## Example\nProse ending in {m}\nEnd.\n",
+    "## Example\n- [ ] item {m}\nEnd.\n",
+    "## Example\nProse ending in{m}\n",  # The last line of the body.
+    "## Example\nProse ending in{m}",
+    "## Example\n- [ ] item{m}\n",
+    "## Example\n~~~\nvalue{m}\n",  # Fences never closed.
+    "## Example\n`````\nvalue{m}\n",
+    "## Example\n```\nvalue{m}",
+    "## Example\n~~~\n~~~{m}\n",
+    "## Example\n~~~\nvalue\n~~~{m}\n",
+    "## Example\n`````\n`````{m}\n",
+])
+def test_marker_text_sharing_a_line_is_authored_and_its_edits_are_seen(shape, marker):
+    body = shape.format(m=marker)
+    assert authored_body(body) == body.strip()
+    edited = shape.format(m=marker.replace("<!-- ", "<!-- x"))
+    assert authored_body(edited) != authored_body(body)
 
 
 @pytest.mark.parametrize("marker", [WRITE, PRIOR])
@@ -327,16 +349,91 @@ def test_marker_suffix_inside_a_fence_does_not_close_it(closing, marker):
     assert parse_body(body).other_content == body.strip()
 
 
-def test_only_markers_the_gate_appends_are_removed_from_the_body_tail():
-    body = "## Example\nThe header is<!-- foragent:v1 -->\n"
+def test_marker_line_must_be_exactly_a_marker():
+    body = "## Example\n<!-- foragent:v1 --> and text\n<!-- foragent:v1 --> \n<!--foragent:v1-->\n"
     assert authored_body(body) == body.strip()
-
-
-def test_gate_tail_is_removed_only_where_the_gate_writes_it():
-    body = f"## Contracts\nLiteral {WRITE}\nThe API stays.{PRIOR}\n\n{WRITE}\n\n"
-    assert authored_body(body) == f"## Contracts\nLiteral {WRITE}\nThe API stays."
 
 
 def test_authored_body_ignores_where_the_gate_appended_and_line_endings():
     assert authored_body(PLAIN + "\n\n## Waiting\nA wait\n\n" + PRIOR + "\n" + WRITE + "\n") == authored_body(PLAIN)
     assert authored_body(PLAIN.replace("\n", "\r\n")) == authored_body(PLAIN)
+
+
+def test_other_content_does_not_change_whether_two_bodies_parse_equal():
+    assert parse_body(PLAIN + "## Contracts\nThe API stays.\n") == parse_body(PLAIN)
+    assert parse_body(PLAIN + "## Contracts\nThe API stays.\n").other_content != parse_body(PLAIN).other_content
+    assert parse_body(PLAIN.replace("Ship it.", "Ship more.")) != parse_body(PLAIN)
+
+
+def test_sections_reader_gives_authored_lines_without_marker_lines():
+    body = f"## Behaviour\nIt runs.\n{WRITE}\n## Waiting\nA wait\n"
+    assert "".join(_sections(body)["Behaviour"]) == "It runs.\n"
+
+
+@pytest.mark.parametrize("opening,closing", [("~~~", "~~~"), ("`````", "`````"), ("~~~~md", "~~~~")])
+@pytest.mark.parametrize("heading", ["## Goal", "## Out of scope", "## Behaviour", "## Files", "## Done when"])
+def test_headings_in_any_fence_are_examples_not_sections(opening, closing, heading):
+    example = f"{opening}\n{heading}\n- example.py\n```\nfalse\n```\n{closing}"
+    parsed = parse_body(f"## Goal\nShip.\n{example}\n\n## Out of scope\nOthers.\n\n## Behaviour\nRuns.\n\n"
+                        "## Files\n- a.py\n\n## Done when\n```sh\ntrue\n```\n")
+    assert parsed.goal == f"Ship.\n{example}"
+    assert parsed.out_of_scope == "Others." and parsed.files == ["a.py"] and parsed.done_when_commands == ["true"]
+    assert parsed.other_content == "## Behaviour\nRuns.\n\n## Files\n- a.py"
+    assert has_behaviour(f"## Goal\n{opening}\n## Behaviour\n{closing}\n") is False
+
+
+@pytest.mark.parametrize("fence", ["```", "````", "`````", "~~~", "~~~~sh"])
+def test_a_body_ending_in_an_unfinished_fence_keeps_gate_writing_recognisable(fence):
+    original = f"## Goal\nShip.\n\n## Example\n{fence}\ncode\n"
+    stamped = order_waiting.stamp(original, order_waiting.replace_section(original, "A wait"))
+    written = order_waiting.mark_write(original, stamped)
+    assert "A wait" in written and "foragent:write" in written and "foragent:waiting-prior" in written
+    assert authored_body(written) == original.strip()
+    assert parse_body(written).other_content == f"## Example\n{fence}\ncode"
+    assert order_waiting.section(written) == "A wait"
+
+
+def test_an_unfinished_fence_still_runs_to_the_end_for_sections():
+    parsed = parse_body("## Goal\nShip.\n~~~\n## Done when\n```sh\nfalse\n```\n")
+    assert parsed.done_when_commands == [] and "false" in parsed.goal
+
+
+@pytest.mark.parametrize("lines,expected", [
+    (["~~~", "x", "~~~", "y"], {0, 1, 2}),
+    (["~~~", "a", "~~~", "## Waiting", "b", "~~~", "c"], {0, 1, 2}),  # A closing line opens nothing.
+    (["```", "~~~", "```"], {0, 1, 2}),
+    (["```sh", "x"], set()),
+    (["````", "```", "`````", "```", "y"], {0, 1, 2}),
+    (["```sh", "```sh", "~~~", "a", "~~~\n"], {2, 3, 4}),
+    (["````", "```", "```"], {1, 2}),
+    (["```", "x\r\n", "```\r\n"], {0, 1, 2}),
+])
+def test_closed_fence_lines(lines, expected):
+    assert closed_fence_lines(lines) == expected
+
+
+@pytest.mark.parametrize("fence", ["~~~", "```", "`````"])
+def test_a_fence_line_in_waiting_text_pairs_with_nothing_the_author_wrote(fence):
+    contracts = f"## Contracts\n{fence}\n## Waiting\nrequired\n{WRITE}\n{PRIOR}\n{fence}"
+    body = f"## Goal\nShip.\n## Waiting\n{fence}\ngate\n{contracts}\n## Done when\n```sh\ntrue\n```\n- [ ] Checked\n"
+    assert authored_body(body) == f"## Goal\nShip.\n{contracts}\n## Done when\n```sh\ntrue\n```\n- [ ] Checked"
+    parsed = parse_body(body)
+    assert parsed.goal == "Ship." and parsed.done_when_commands == ["true"]
+    assert parsed.other_content == f"{contracts}\n## Done when\n- [ ] Checked"
+    assert authored_body(body.replace("required", "edited")) != authored_body(body)
+    assert authored_body(body.replace("gate\n", "other gate\n")) == authored_body(body)
+
+
+@pytest.mark.parametrize("fence", ["~~~", "```"])
+def test_waiting_text_fence_does_not_hide_a_real_section_after_it(fence):
+    parsed = parse_body(f"## Goal\nShip.\n## Waiting\n{fence}\nA wait\n## Out of scope\nOthers.\n"
+                        "## Behaviour\nRuns.\n## Files\n- a.py\n## Done when\n```sh\ntrue\n```\n")
+    assert (parsed.goal, parsed.out_of_scope, parsed.files, parsed.done_when_commands) == (
+        "Ship.", "Others.", ["a.py"], ["true"])
+    assert parsed.other_content == "## Behaviour\nRuns.\n## Files\n- a.py"
+
+
+def test_closed_fence_lines_skip_waiting_text():
+    assert closed_fence_lines(["## Waiting", "~~~", "gate", "## Next", "~~~", "x", "~~~"]) == {4, 5, 6}
+    assert closed_fence_lines(["## Waiting", "~~~", "<!-- foragent:v1 -->", "~~~", "x", "~~~"]) == {3, 4, 5}
+    assert closed_fence_lines(["~~~", "## Waiting", "~~~", "~~~", "x", "~~~"]) == {0, 1, 2, 3, 4, 5}
