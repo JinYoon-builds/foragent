@@ -517,6 +517,9 @@ class RecordingTracker:
         """
         if self._refused(n) is not None:
             return None, _REFUSED  # Neither sent nor queued, and no local effect.
+        if action == "close_issue" and self._context.store.github_wait_until(self._context.now()) is None:
+            if self._effect_refused(n, pr=False) is not None:  # Replay reads it when a wait holds this write.
+                return None, _REFUSED
         store = self._context.store
         premise = self._premise(n)
         pending = store.github_outbox()
@@ -592,7 +595,8 @@ class RecordingTracker:
             started = None
             try:
                 # Every target uses this replay's latest observed ownership snapshot.
-                if (refusal := self._replay_refusal(number)) is not None:
+                if (refusal := self._replay_refusal(number) or (
+                        self._effect_refused(number, pr=False) if action == "close_issue" else None)) is not None:
                     # Moved aside with its reason; later entries for other issues still go out.
                     store.refuse_github_writes(number, refusal)
                     self._outbox_refused(number, refusal, action)
@@ -739,14 +743,28 @@ class RecordingTracker:
         if n is not None and (refusal := self._refused(n)) is not None:
             raise WriteRefused(refusal)
 
+    def _effect_refused(self, n, *, pr):
+        from foragent import orch_scope
+
+        return orch_scope.scope(self._context).for_effect(n, self._tracker, pr=pr)
+
+    def _require_effect(self, n, *, pr=True, base=None):
+        """Changing a PR or its branch: an unseen target is read first, and a batch base has its own owner."""
+        from foragent import orch_scope
+
+        if n is not None and (refusal := self._effect_refused(n, pr=pr)) is not None:
+            raise WriteRefused(refusal)
+        if (refusal := orch_scope.branch_refusal(self._context, base, self._tracker)) is not None:
+            raise WriteRefused(refusal)
+
     def create_pr(self, *, head, base, title, body):
-        self._require(pr_issue_number(head))
+        self._require_effect(pr_issue_number(head), pr=False, base=base)
         pr = self._tracker.create_pr(head=head, base=base, title=title, body=body)
         self._record_pr(pr, head, base)
         return pr
 
     def update_pr(self, pr, *, base, title, body):
-        self._require(pr)
+        self._require_effect(pr, base=base)
         self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
 
@@ -756,12 +774,13 @@ class RecordingTracker:
                 self._context.store.update_local_issue(row["number"], **fields)
 
     def close_pr(self, pr, comment=None):
-        self._require(pr)
+        self._require_effect(pr)
         self._tracker.close_pr(pr, comment)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
     def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
-        self._require(pr)
+        known = next((row for row in self._context.store.local_issues() if row.get("pr_number") == pr), {})
+        self._require_effect(pr, base=known.get("pr_base"))
         if subject is None:
             self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
         else:

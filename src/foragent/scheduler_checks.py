@@ -95,11 +95,14 @@ def _check_prerequisites(
          if dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
     )
     if cancelled is not None:
-        scheduler.flag(
-            ctx, issue.number, scheduler.Reason.SPEC_QUESTION, scheduler.orch_scope.ask_orderer(
+        try:
+            question = scheduler.orch_scope.ask_orderer(
                 ctx, issue.number,
-                f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency."),
-        )
+                f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency.")
+        except scheduler.orch_scope.OrdererUnknown as exc:
+            report.actions.append(str(exc))  # Not posted unaddressed; the next tick asks again.
+            return False
+        scheduler.flag(ctx, issue.number, scheduler.Reason.SPEC_QUESTION, question)
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
     if any(dependency.state == "open" for dependency in dependencies):

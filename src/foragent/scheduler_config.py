@@ -42,15 +42,22 @@ def tick_config(store, local, global_path=None):
 def ownership_config(store, local):
     """The config ownership is decided with: the fetched committed file when valid (#1004).
 
-    None means an invalid committed file may hide a team setting, so the singleton path cannot stand in for it.
+    None means a broken record or invalid committed file may hide a team setting, so the singleton
+    path cannot stand in for it. A failed fetch keeps the last record (fetch_base).
     """
     import json
 
     try:
-        value = json.loads((store.root / TICK_CONFIG_FILE).read_text(encoding="utf-8"))
-        content, source = value["content"], value["source"]
-    except (AttributeError, TypeError, OSError, ValueError, KeyError):
+        path = store.root / TICK_CONFIG_FILE
+    except (AttributeError, TypeError):  # A context without a state directory has no record.
         return local
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        content, source = value["content"], value["source"]
+    except FileNotFoundError:
+        return local
+    except (OSError, ValueError, KeyError, TypeError):
+        return None  # A broken record may hide a committed team setting.
     config, _ = load_committed_config(local, content, source)
     if config is not None or content is None:
         return config or local
@@ -70,8 +77,9 @@ def fetch_base(ctx) -> None:
     try:
         sha = ctx.git.blob_sha(base_ref, ".foragent.yml")
         content = None if sha is None else ctx.git._call(["cat-file", "blob", sha])
-    except GitError:
-        content = None
+    except GitError:  # Unknown is not "no file": the last record keeps deciding ownership.
+        print(text("tick_config_fallback", ctx.config.language, ref=base_ref), file=sys.stderr)
+        return
     config, ignored = load_committed_config(ctx.config, content, f"{base_ref}:.foragent.yml")
     record_tick_config(ctx.store, f"{base_ref}:.foragent.yml", content)
     language = ctx.config.language

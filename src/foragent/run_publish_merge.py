@@ -101,7 +101,7 @@ def _final_merge_inputs(
     current = next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None)
     if current is None or current.head != branch or current.base != base:
         return run_publish._MergeInputs(stop=changed_base)
-    parent = ctx.tracker.parent_of(n)
+    parent = run_publish.orch_scope.batch_parent(ctx, n)
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     if base not in {ctx.config.base_branch, batch_branch}:
         return run_publish._MergeInputs(stop=changed_base)
@@ -142,7 +142,7 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
         return
     from foragent import orch_scope
 
-    if not orch_scope.may_write(ctx, parent):
+    if not orch_scope.may_change(ctx, parent):
         return  # Another person's order (or its owner is unknown): their factory finalizes it (#1004).
     ctx.git.fetch("origin", ctx.config.base_branch)
     ctx.git.fetch("origin", branch)

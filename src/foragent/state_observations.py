@@ -211,6 +211,8 @@ class IssueObservationsMixin:
                 self._refuse_for_owner(snapshot, intent, owners(expected))
             elif reason in ("absent", "dropped") and sent_at(intent) is None and not abandoned(intent):
                 dropped = True
+                if reason == "absent" and row is None:  # A target with no facts: its payload stays inspectable.
+                    self._refuse_intent(snapshot, intent, "target not found in the issue listing")
             elif row is not None and reason in {"shown", "sent"}:
                 self._keep_ready_approval(row, intent)
         snapshot["outbox"] = [intent for intent in snapshot.get("outbox", []) if intent["id"] not in gone]
@@ -223,10 +225,13 @@ class IssueObservationsMixin:
 
         reason = (f"owner label changed from {', '.join(owners(intent['premise'])) or 'none'} "
                   f"to {', '.join(owner) or 'none'} while the write was queued")
-        snapshot.setdefault("outbox_refused", []).append({**intent, "refused": reason, "refused_at": self._timestamp()})
+        self._refuse_intent(snapshot, intent, reason)
         append_event(self, self._now(), intent["issue"], "ownership-refused",
                      f"#{intent['issue']}: skipped queued {intent['action']}: {reason}", locked=True,
                      action=intent["action"], owner=owner[0][3:] if owner else None)
+
+    def _refuse_intent(self, snapshot: dict[str, Any], intent: dict[str, Any], reason: str) -> None:
+        snapshot.setdefault("outbox_refused", []).append({**intent, "refused": reason, "refused_at": self._timestamp()})
 
     def _keep_ready_approval(self, row: dict[str, Any], intent: dict[str, Any]) -> None:
         """Keep attribution only for a confirmed ready-label effect, never a failed write."""

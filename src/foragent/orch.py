@@ -578,6 +578,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             # Reuse the current-title read for ownership at this remote preflight (#1004).
             title = _merge_title(ctx, current)
+            from foragent import orch_scope
+
+            if (refusal := orch_scope.branch_refusal(ctx, current.base)) is not None:
+                raise OrchError(refusal)  # A batch base is its parent owner's branch (#1004).
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event, stale_for_redo
                 from foragent.orch_dream_publish import memory_moved

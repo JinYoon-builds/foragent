@@ -555,7 +555,9 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return "no-pr"
     head = ctx.tracker.pr_head_sha(pr.number)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
+    from foragent.orch_scope import batch_parent
+
+    parent = batch_parent(ctx, n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     if pr.base not in {ctx.config.base_branch, batch_branch}:
         flag(ctx, n, Reason.RISK_HIGH, "PR targets an unexpected base; retry implementation.", link)

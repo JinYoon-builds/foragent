@@ -7,6 +7,7 @@ RecordingTracker gates sending and queueing. Local process/WIP cleanup stays out
 from __future__ import annotations
 
 from contextlib import contextmanager
+import re
 
 from foragent.i18n import text
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, parse_orderer, require_owned
@@ -62,6 +63,10 @@ class Unresolved(TrackerError):
     """The linked issue of a PR is unknown."""
 
 
+class OrdererUnknown(TrackerError):
+    """Nobody can be named, so a question is not posted (#1004)."""
+
+
 def _linked_issue(store, tracker, pr: int):
     for row in _rows(store):
         if row.get("pr_number") == pr:
@@ -83,6 +88,22 @@ def current_issue(ctx, number: int, tracker=None):
     return None if linked is None else tracker.get_issue(linked)
 
 
+def _read_target(store, tracker, number: int, pr: bool):
+    """The issue behind an unseen target; None for a PR that works no issue."""
+    if pr:
+        try:
+            number = _linked_issue(store, tracker, number)
+        except Unresolved:
+            pass  # Not listed as a PR: it may still be an issue number.
+        if number is None:
+            return None
+    issue = tracker.get_issue(number)
+    if not getattr(issue, "is_pull_request", False):
+        return issue
+    linked = _linked_issue(store, tracker, number)
+    return None if linked is None else tracker.get_issue(linked)
+
+
 def _unreadable(ctx, number: int, exc: Exception) -> str:
     return text("ownership_unreadable", getattr(ctx.config, "language", "en"),
                 number=number, error=" ".join(str(exc).split())[:200])
@@ -97,7 +118,7 @@ class Scope:
 
     def __init__(self, ctx, issue=None, *, issues=None):
         self._ctx, self._login, self._read = ctx, None, False
-        self.entry = False
+        self.entry, self._unread = False, False
         self._issues, self._prs, self._decisions = None, {}, {}
         if issues is not None or issue is not None:
             self._capture()
@@ -150,7 +171,8 @@ class Scope:
 
     def refusal(self, issue) -> str | None:
         self._capture()
-        self._issues.setdefault(issue.number, issue)
+        if not self._unread:  # Without a read, a caller's cached row is not evidence.
+            self._issues.setdefault(issue.number, issue)
         return self.for_number(issue.number)
 
     def for_number(self, number) -> str | None:
@@ -169,11 +191,10 @@ class Scope:
             config = ownership_config(getattr(self._ctx, "store", None), self._ctx.config)
             if config is None:  # None refuses: an invalid team config cannot authorize the singleton path.
                 self._decisions[number] = _unreadable(self._ctx, number, Unresolved("the committed team config is invalid"))
-            elif issue is None:
-                # No team setting preserves the existing singleton's unknown-target path.
-                self._decisions[number] = (None if getattr(config, "legacy_owner", None) is None else
-                                          _unreadable(self._ctx, number, Unresolved("issue absent from snapshot")))
-            elif singleton(issue, config):
+            elif issue is None and getattr(config, "legacy_owner", None) is not None:
+                self._decisions[number] = _unreadable(self._ctx, number, Unresolved("issue absent from snapshot"))
+            elif (issue := issue or local_issue(getattr(self._ctx, "store", None), number)) is None or singleton(issue, config):
+                # No team setting keeps the singleton's path, unless a stored row names an owner.
                 self._decisions[number] = None
             else:
                 try:
@@ -187,11 +208,40 @@ class Scope:
     def owns(self, issue) -> bool:
         return self.refusal(issue) is None
 
+    def for_effect(self, number, tracker, *, pr=False) -> str | None:
+        """Closing an issue or changing a branch or PR is refused regardless of the snapshot.
+
+        A target no read has shown is read once. No such target has no owner to protect (the
+        effect fails by itself); any other failed read refuses; a rate limit propagates.
+        """
+        if (refusal := self.for_number(number)) is not None or number is None:
+            return refusal
+        target = self._target(number)
+        if target is None or target in self._issues or any(
+                row["number"] == target and (row.get("observed") or row.get("title") or row.get("labels"))
+                for row in _rows(getattr(self._ctx, "store", None))):
+            return None
+        try:
+            issue = _read_target(getattr(self._ctx, "store", None), observe(tracker), target, pr)
+        except KeyError:
+            return None  # FakeTracker's missing number.
+        except Exception as exc:
+            if isinstance(exc, TrackerError) and exc.is_not_found:
+                return None
+            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                raise
+            return _unreadable(self._ctx, target, exc)
+        if issue is None:
+            return None
+        self._issues[target] = issue
+        self._decisions.pop(target, None)
+        return self.for_number(number)
+
 
 def no_snapshot(ctx) -> Scope:
     """Before a tick's read or after a failed one: nothing is written to team issues; the next tick decides."""
     empty = Scope(ctx)
-    empty._issues = {}
+    empty._issues, empty._unread = {}, True
     return empty
 
 
@@ -304,11 +354,36 @@ def refuse_verb(ctx, action: str, number: int | None) -> str | None:
     return check(ctx, number) if action == "stop" else None
 
 
-def ask_orderer(ctx, number: int, summary: str) -> str:
-    issue = scope(ctx).issue(number)
-    if issue is None or singleton(issue, ctx.config):
-        return summary
+def may_change(ctx, number: int) -> bool:
+    """Whether this factory may close the issue or change its branch or PR."""
     try:
-        return f"@{effective_orderer(issue, ctx.config, scope(ctx).login())} {summary}"
-    except OwnershipError:
-        return summary
+        return scope(ctx).for_effect(number, ctx.tracker) is None
+    except Exception:
+        return False
+
+
+def batch_parent(ctx, number: int):
+    """The parent whose batch branch this work may use; another person's branch stays theirs."""
+    parent = ctx.tracker.parent_of(number)
+    return None if parent is None or not may_change(ctx, parent) else parent
+
+
+def branch_refusal(ctx, branch: str | None, tracker=None) -> str | None:
+    """A batch branch belongs to the owner of its parent issue."""
+    found = re.fullmatch(r"foragent/batch-(\d+)", branch or "")
+    return None if found is None else scope(ctx).for_effect(int(found[1]), tracker or ctx.tracker)
+
+
+def ask_orderer(ctx, number: int, summary: str) -> str:
+    """The question text, naming its orderer; OrdererUnknown when nobody can be named."""
+    issue = scope(ctx).issue(number)
+    try:
+        if issue is None or singleton(issue, ctx.config):
+            orderer = scope(ctx).login()  # The singleton's orderer is the signed-in person.
+        else:
+            orderer = effective_orderer(issue, ctx.config, scope(ctx).login())
+    except OwnershipError as exc:
+        raise OrdererUnknown(f"Cannot name who to ask on #{number}: {exc}") from exc
+    if not orderer:
+        raise OrdererUnknown(f"Cannot name who to ask on #{number}: the signed-in person is unknown")
+    return f"@{orderer} {summary}"

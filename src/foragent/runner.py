@@ -164,7 +164,7 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
 
     branch = f"foragent/issue-{n}"
     base_ref = f"origin/{ctx.config.base_branch}"
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
+    parent = orch_scope.batch_parent(ctx, n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     target_branch = ctx.config.base_branch
     ctx.git.remove_worktree(worktree)
@@ -449,8 +449,6 @@ def run_issue(n: int, ctx: RunContext) -> str:
     and the temporary admission is released.
     """
     with ExitStack() as admission:
-        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
-                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         return _run_issue(n, ctx, admission)
 
 
@@ -470,6 +468,8 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
             return "refused"
         if issue is not None:
             ctx.store.record_issue(issue, ctx.config.lanes)
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         run = ctx.store.get_run(n)
         if run is not None and run.status == "finished":
             # update_run deliberately leaves finished records untouched. A direct retry needs

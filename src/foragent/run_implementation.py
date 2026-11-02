@@ -295,7 +295,9 @@ def _prepare_implementation(
     worktree = git.root
     branch = f"foragent/issue-{n}"
     base_ref = f"origin/{ctx.config.base_branch}"
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
+    from foragent.orch_scope import batch_parent
+
+    parent = batch_parent(ctx, n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     start_ref = f"origin/{target_branch}"
     approved_ref = start_ref
@@ -457,6 +459,7 @@ def _implement(
                             cuts.issue_dir(ctx.store.root, n), "QUESTION.md")
         from foragent.orch_scope import ask_orderer
 
+        _append(attempt.log, details)  # Kept when nobody can be named and the question is not posted.
         flag(ctx, n, Reason.SPEC_QUESTION, ask_orderer(ctx, n, "The executor needs a product decision."), details)
         raise ExecutorStopped("spec-question")
     wait_for_overlap(attempt)
