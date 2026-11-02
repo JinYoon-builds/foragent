@@ -119,11 +119,12 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
     published = lane_files(root, name, installed)
     git.ensure_tracked(published)
     with git.publish_lock():  # The lane commit and its push are one main write.
+        if push and git.remote_branch_sha(config.base_branch) is not None:
+            # A merge may have landed while this waited. Fast-forward onto it the way order
+            # publication does; local commits or edits in the way refuse with update_base's message.
+            git.update_base(config.base_branch)
         git.commit_paths(published, f"Foragent lane {name}")
         if push:
-            # A merge may have landed while this waited: the commit moves onto it before the push.
-            if git.remote_branch_sha(config.base_branch) is not None:
-                git.rebase_onto_base(config.base_branch)
             git.push_base(config.base_branch)
     return lane
 

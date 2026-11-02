@@ -632,19 +632,6 @@ class GitRepo:
         if not paths:
             self._exclude_artifacts()
             return
-        identity = self._identity()
-        # Already-staged deletions belong in the commit, but git add cannot
-        # match them once they are absent from both the worktree and index.
-        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
-        stage = [path for path in paths if path in indexed or (self.root / path).exists()
-                 or (self.root / path).is_symlink()]
-        if stage:
-            self._call(["add", "-f", "--", *stage])
-        self._exclude_artifacts()
-        self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
-
-    def _identity(self) -> list[str]:
-        """``-c`` options naming the configured committer, with Foragent's fallback."""
         identity = []
         for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
             try:
@@ -655,32 +642,19 @@ class GitRepo:
                     raise
                 value = ""
             identity.extend(["-c", f"{key}={value or fallback}"])
-        return identity
-
-    def rebase_onto_base(self, branch: str) -> None:
-        """Put the local commits not yet on ``origin/<branch>`` on top of its fetched tip.
-
-        A setup publisher calls this under the main-write lock: a merge may have landed while it
-        waited, so its own unpushed commits move onto that merge instead of being refused by the push.
-        Unrelated local edits are kept (``--autostash``); a conflicting rebase is undone and reported.
-        """
-        self.fetch("origin", branch)
-        remote = f"refs/remotes/origin/{branch}"
-        if self.is_ancestor(remote, "HEAD"):
-            return
-        try:
-            self._call([*self._identity(), "rebase", "--autostash", remote])
-        except GitError as exc:
-            try:
-                self._call(["rebase", "--abort"])
-            except GitError:
-                pass  # Nothing was started, so nothing is left to undo.
-            raise GitError(f"cannot move the local {branch} commits onto origin/{branch}; "
-                           f"they conflict with the latest {branch}: {exc}") from exc
+        # Already-staged deletions belong in the commit, but git add cannot
+        # match them once they are absent from both the worktree and index.
+        indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
+        stage = [path for path in paths if path in indexed or (self.root / path).exists()
+                 or (self.root / path).is_symlink()]
+        if stage:
+            self._call(["add", "-f", "--", *stage])
+        self._exclude_artifacts()
+        self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 
     def publish_lock(self) -> AbstractContextManager[None]:
         """The one main-write lock for this repository; see ``main_write_lock``."""
-        return main_write_lock(self.root, lambda: self._call(["rev-parse", "--git-common-dir"]))
+        return main_write_lock(self.root, self._call)
 
     def update_base(self, branch: str) -> None:
         """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
@@ -736,22 +710,16 @@ _MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by 
 
 
 @contextmanager
-def main_write_lock(root: Path, common_dir: Callable[[], str] | None = None) -> Iterator[None]:
+def main_write_lock(root: Path, call: Callable[[list[str]], str] | None = None) -> Iterator[None]:
     """The one main-write lock: every Foragent write that advances local or remote main holds it.
 
     Merges take it after the store merge lock and keep it from their final check through the
     merge; publishers take it after their own gates and refresh the base once they hold it.
-    Linked worktrees share it through the Git common directory. A writer nested in another
-    main write of the same thread reuses the hold.
-
-    The lock lives in the common Git directory that Git itself would use for ``root``
-    (``main_write_dir``). ``common_dir`` asks Git when those rules find none. With no answer
-    there is no repository for Git to write at ``root``, so there is no main to exclude.
+    Every checkout of a repository shares it through the common Git directory that Git reports
+    (``main_write_dir``). A writer nested in another main write of the same thread reuses the hold.
+    With no repository at ``root`` there is no main to exclude, and nothing is locked.
     """
-    common = main_write_dir(root)
-    if common is None and common_dir is not None:
-        common = Path(common_dir().strip())
-        common = common if common.is_absolute() else root / common
+    common = main_write_dir(root, call)
     if common is None:
         yield
         return
@@ -783,15 +751,33 @@ def slug_from_url(url: str) -> str | None:
     return None if match is None else f"{match[1]}/{match[2]}"
 
 
-def main_write_dir(root: Path) -> Path | None:
-    """The common Git directory that Git commands run at ``root`` use, found by Git's own rules.
+def main_write_dir(root: Path, call: Callable[[list[str]], str] | None = None) -> Path | None:
+    """The common Git directory of the repository that Git commands run at ``root`` write.
 
-    ``GIT_COMMON_DIR`` and ``GIT_DIR`` win over discovery (a ``GIT_DIR``/``GIT_WORK_TREE``
-    checkout has no ``.git`` at its root); relative values are relative to ``root``, where
-    ``GitRepo`` runs Git. Otherwise the nearest ``.git`` from ``root`` up, as Git discovers it.
-    None when Git would find no repository there.
+    Git's own answer decides (``rev-parse --git-common-dir``), so every checkout layout Git
+    supports (symlinked or linked ``.git``, ``GIT_DIR``/``GIT_WORK_TREE``) shares one lock.
+    ``call`` runs Git; without it Git is asked only when the files show a repository, so a
+    directory Git would not treat as a checkout is never locked. The file reading is the answer
+    only for an injected Git that cannot report it.
     """
     root = Path(root).absolute()
+    found = _discovered_common_dir(root)
+    if call is None:
+        if found is None:
+            return None
+        call = GitRepo(root)._call
+    try:
+        answer = call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+    except GitError:
+        answer = ""
+    reported = Path(answer) if answer else None
+    if reported is not None and reported.is_absolute() and reported.is_dir():
+        return reported.resolve()
+    return found
+
+
+def _discovered_common_dir(root: Path) -> Path | None:
+    """The common Git directory the files show for ``root`` (environment, then the nearest ``.git``)."""
     try:
         if common := os.environ.get("GIT_COMMON_DIR"):
             return (root / common).resolve()
@@ -816,8 +802,8 @@ def _common_of(gitdir: Path) -> Path:
 def _common_git_dir(root: Path) -> Path:
     """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
     dot_git = root / ".git"
-    if dot_git.is_dir():
-        return dot_git
+    if dot_git.is_dir():  # Possibly a symlink to a linked worktree's git dir, which names its common dir.
+        return _common_of(dot_git.resolve())
     line = dot_git.read_text(encoding="utf-8").strip()
     if not line.startswith("gitdir:"):
         raise OSError(f"not a git dir file: {dot_git}")

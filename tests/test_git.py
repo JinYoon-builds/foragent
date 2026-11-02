@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -715,44 +716,6 @@ def test_publication_conflict_language_falls_back_to_english_silently(tmp_path, 
     assert capsys.readouterr() == ("", "")
 
 
-def _local_commit(root, files, message):
-    """A local main commit made without running ``git commit`` (forbidden in tests)."""
-    for path, content in files.items():
-        (root / path).write_text(content)
-    git_command(root, "add", "--", *files)
-    tree = git_command(root, "write-tree")
-    sha = git_command(root, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit-tree", tree,
-                      "-p", "HEAD", input=f"{message}\n")
-    git_command(root, "update-ref", "HEAD", sha)
-    return sha
-
-
-def test_rebase_onto_base_moves_unpushed_commits_onto_a_newer_remote_base(git_history):
-    root = git_history.clone
-    _local_commit(root, {"setup.txt": "setup\n"}, "Set up Foragent")
-    (root / "notes.txt").write_text("unrelated edit\n")
-    git_history.update({"merged.txt": "landed\n"}, message="Merged PR")
-    git = GitRepo(root)
-    git.rebase_onto_base("main")
-    assert git_command(root, "rev-parse", "HEAD~1") == git_history.tip
-    assert git_command(root, "log", "-1", "--format=%s") == "Set up Foragent"
-    assert git_command(root, "show", "HEAD:merged.txt") == "landed"
-    assert (root / "notes.txt").read_text() == "unrelated edit\n", "Unrelated edits are kept"
-    head = git_command(root, "rev-parse", "HEAD")
-    git.rebase_onto_base("main")  # Already on the latest base: nothing moves.
-    assert git_command(root, "rev-parse", "HEAD") == head
-
-
-def test_rebase_onto_base_conflict_is_undone_and_reported(git_history):
-    root = git_history.clone
-    local = _local_commit(root, {"same.txt": "local\n"}, "Set up Foragent")
-    git_history.update({"same.txt": "remote\n"}, message="Merged PR")
-    with pytest.raises(GitError, match="cannot move the local main commits onto origin/main"):
-        GitRepo(root).rebase_onto_base("main")
-    assert git_command(root, "rev-parse", "HEAD") == local
-    assert git_command(root, "symbolic-ref", "HEAD") == "refs/heads/main", "No rebase is left in progress"
-
-
 def _layouts(git_history, tmp_path):
     """Checkout layouts by name: (worktree root, env) for one repository's git dir."""
     clone = git_history.clone
@@ -762,7 +725,17 @@ def _layouts(git_history, tmp_path):
     separate.mkdir()
     sub = clone / "sub"
     sub.mkdir()
+    symlinked = tmp_path / "symlinked-worktree"  # A linked worktree whose .git is a symlink to its git dir.
+    git_command(clone, "worktree", "add", "--detach", str(symlinked), "HEAD")
+    gitdir = Path(git_command(symlinked, "rev-parse", "--path-format=absolute", "--git-dir"))
+    (symlinked / ".git").unlink()
+    (symlinked / ".git").symlink_to(gitdir, target_is_directory=True)
+    shared = tmp_path / "symlinked-repository"  # A checkout whose .git is a symlink to the repository's.
+    shared.mkdir()
+    (shared / ".git").symlink_to(clone / ".git", target_is_directory=True)
     return {
+        "symlinked-linked-worktree": (symlinked, {}),
+        "symlinked-git-dir": (shared, {}),
         "clone": (clone, {}),
         "linked-worktree": (linked, {}),
         "git-dir-env": (separate, {"GIT_DIR": str(clone / ".git"), "GIT_WORK_TREE": str(separate)}),
@@ -771,10 +744,12 @@ def _layouts(git_history, tmp_path):
     }
 
 
-@pytest.mark.parametrize("layout", ["clone", "linked-worktree", "git-dir-env", "relative-git-dir-env",
-                                    "work-tree-below-the-repository"])
+LAYOUTS = ["clone", "linked-worktree", "git-dir-env", "relative-git-dir-env", "work-tree-below-the-repository",
+           "symlinked-linked-worktree", "symlinked-git-dir"]
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
 def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_path, monkeypatch, layout):
-    from pathlib import Path
     from foragent.git import main_write_dir
 
     root, env = _layouts(git_history, tmp_path)[layout]
@@ -783,6 +758,69 @@ def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_p
     expected = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root,
                               check=True, capture_output=True, text=True).stdout.strip()
     assert main_write_dir(root) == Path(expected).resolve() == (git_history.clone / ".git").resolve()
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_main_write_lock_file_reading_agrees_with_git_for_an_injected_git(git_history, tmp_path, monkeypatch,
+                                                                          layout):
+    """An injected Git that cannot answer rev-parse still finds the lock every real checkout uses."""
+    from foragent.git import main_write_dir
+
+    root, env = _layouts(git_history, tmp_path)[layout]
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    def no_rev_parse(args):
+        raise GitError("unknown command in this fake")
+
+    assert main_write_dir(root, no_rev_parse) == (git_history.clone / ".git").resolve()
+
+
+@pytest.mark.parametrize("writer", ["setup", "publisher"])
+@pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir"])
+def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(git_history, tmp_path,
+                                                                               monkeypatch, layout, writer):
+    import fcntl
+    from threading import Event, Thread
+    from foragent.git import main_write_lock
+
+    root, env = _layouts(git_history, tmp_path)[layout]
+    held, release, failures = Event(), Event(), []
+
+    def merger():  # The gate's primary checkout, without any environment.
+        try:
+            with GitRepo(git_history.clone).publish_lock():
+                held.set()
+                release.wait(10)
+        except BaseException as exc:
+            failures.append(exc)
+            held.set()
+
+    thread = Thread(target=merger)
+    thread.start()
+    try:
+        assert held.wait(10) and not failures
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        real_flock, contended = fcntl.flock, []
+
+        def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
+            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+                try:
+                    return real_flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    contended.append(True)
+                    release.set()
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", probe)
+        lock = main_write_lock(root) if writer == "setup" else GitRepo(root).publish_lock()
+        with lock:
+            assert contended == [True], "This checkout must wait for the lock the primary checkout holds"
+    finally:
+        release.set()
+        thread.join(10)
+    assert not failures
 
 
 def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_repository(git_history, tmp_path,
@@ -827,3 +865,19 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
         release.set()
         thread.join(10)
     assert not failures
+
+
+def test_git_reported_common_dir_decides_over_the_file_reading(git_history, tmp_path):
+    from foragent.git import main_write_dir
+
+    reported = tmp_path / "reported-common-dir"
+    reported.mkdir()
+    calls = []
+
+    def git(args):
+        calls.append(args)
+        return f"{reported}\n"
+
+    assert main_write_dir(git_history.clone, git) == reported.resolve()
+    assert calls == [["rev-parse", "--path-format=absolute", "--git-common-dir"]]
+    assert main_write_dir(tmp_path / "no-repository") is None, "A directory Git would not use is not locked"

@@ -396,8 +396,8 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
         def remote_branch_sha(self, branch):
             return "remote-main"
 
-        def rebase_onto_base(self, branch):
-            events.append(f"onto origin/{branch}")
+        def update_base(self, branch):
+            events.append(f"fast-forward {branch}")
 
         def push_base(self, branch):
             assert commits
@@ -420,8 +420,8 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore", ".gitattributes"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]
-    # A merge may land while the lock waits: the commit moves onto it before the push, all under the lock.
-    assert events == ["lock", "commit", "onto origin/main", "push", "unlock"]
+    # A merge may land while the lock waits: fast-forward onto it before the commit, all under the lock.
+    assert events == ["lock", "fast-forward main", "commit", "push", "unlock"]
     before = (root / ".foragent.yml").read_text()
     with pytest.raises(LaneError, match="already exists"):
         add_lane(root, "api", ["different/**"], git=Git())

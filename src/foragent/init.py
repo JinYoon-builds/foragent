@@ -460,14 +460,15 @@ def init_repo(
         if role_source is not None:
             roles.report_dropped_comments(original)
     if pending or push_planned:
-        # Setup advances main like any other main write. A merge may land while this waits, so
-        # this commit and an earlier run's unpushed setup commit move onto it before the push.
+        # Setup advances main like any other main write. A merge may land while this waits:
+        # fast-forward onto it before committing, the way order publication does. An earlier
+        # run's unpushed setup commit cannot fast-forward, so update_base refuses with its message.
         with main_write_lock(root):
+            if push_planned and git.remote_branch_sha(base_branch) is not None:  # A first push has no remote base.
+                git.update_base(base_branch)
             if pending:
                 git.commit_paths(pending, "Set up Foragent")
             if push_planned:
-                if git.remote_branch_sha(base_branch) is not None:  # A first push has no remote base.
-                    git.rebase_onto_base(base_branch)
                 git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
