@@ -110,6 +110,7 @@ class Tracker(Protocol):
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
+    def retitle_pr(self, pr: int, *, title: str) -> None: ...
     def close_pr(self, pr: int, comment: str | None = None) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
@@ -681,6 +682,9 @@ class RecordingTracker:
         self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
 
+    def retitle_pr(self, pr, *, title):
+        self._tracker.retitle_pr(pr, title=title)
+
     def _record_pr_state(self, pr, **fields):
         for row in self._context.store.local_issues():
             if row["pr_number"] == pr:
@@ -893,6 +897,10 @@ class FakeTracker:
         self.created_prs = [replace(item, base=base, title=title, body=body) if item.number == pr else item
                             for item in self.created_prs]
         self.issues[pr] = replace(self.get_issue(pr), title=title, body=body)
+
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self.created_prs = [replace(item, title=title) if item.number == pr else item for item in self.created_prs]
+        self.issues[pr] = replace(self.get_issue(pr), title=title)
 
     def find_pr(self, head: str) -> int | None:
         return next((pr.number for pr in self.created_prs
@@ -1364,6 +1372,9 @@ class GhTracker:
             ["pr", "edit", str(pr), "-R", self.repo, "--base", base,
              "--title", title, "--body-file", "-"], input=body,
         )
+
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self._call(["pr", "edit", str(pr), "-R", self.repo, "--title", title])
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))

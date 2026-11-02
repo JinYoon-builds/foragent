@@ -82,19 +82,15 @@ def _previous_rules(acceptance_dir, question):
 
 
 def test_older_pr_scope_gains_the_spec_conflict_rule_once():
-    from foragent.i18n import text
+    from foragent.issue import parse_body
+    from foragent.run_pr_body import _pr_body
     from foragent.run_prompts import review_scope_rules
-    from foragent.run_review import with_review_scope
 
     rules = review_scope_rules("tests/acceptance/")
-    for question in (text("review_class_question", "en"), ""):
-        older = "Closes #1\n\n## Review scope\n\n" + _previous_rules("tests/acceptance/", question) + "\nTail."
-        refreshed = with_review_scope(older, "tests/acceptance/", "en")
-        assert rules in refreshed and refreshed.count("SPEC-CONFLICT:") == 1, refreshed
-        assert refreshed.endswith("\nTail.")
-        assert with_review_scope(refreshed, "tests/acceptance/", "en") == refreshed
-    custom = with_review_scope("Closes #1\n\n## Review scope\n\nOnly the API.\n", "tests/acceptance/", "en")
-    assert "SPEC-CONFLICT:" in custom and "locked acceptance test" in custom and "Only the API." in custom
+    # A body update composes the current rules from configuration, whatever an older body held.
+    composed = _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", summary="Summary.")
+    assert rules in composed and composed.count("SPEC-CONFLICT:") == 1
+    assert "Only the API." not in composed
 
 
 class ConflictThenLimitPanel(PanelExecutor):
