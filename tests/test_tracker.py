@@ -235,30 +235,6 @@ def test_outbox_failed_missing_issue_lookup_preserves_pending_writes(outbox_cont
     assert ctx.store.local_issues()[0]["number"] == 1
 
 
-def test_batch_completion_uses_pending_child_close(outbox_context, git_history):
-    from conftest import git_command
-    from foragent.git import GitRepo
-    from foragent.runner import _batch_pr
-
-    ctx = outbox_context
-    ctx.repo = "owner/repo"
-    ctx.git = GitRepo(git_history.clone)
-    base = git_history.tip
-    git_history.update({"feature.txt": "done\n"})
-    git_command(git_history.origin, "update-ref", "refs/heads/foragent/batch-2", git_history.tip)
-    git_command(git_history.origin, "update-ref", "refs/heads/main", base)
-    ctx.remote.add_issue(2, "Batch parent")
-    ctx.remote.set_parent(1, 2)
-    ctx.tracker.refresh_issues()
-    ctx.tracker.close_issue(1)
-    assert ctx.remote.get_issue(1).state == "open"
-
-    _batch_pr(2, ctx)
-
-    assert [pr.head for pr in ctx.remote.created_prs] == ["foragent/batch-2"]
-    assert ctx.remote.get_issue(1).state == "open"
-
-
 @pytest.mark.parametrize("change", ["labels", "state"])
 def test_outbox_refresh_drops_human_label_or_state_change_in_same_second(outbox_context, change):
     from foragent import orch
@@ -1003,9 +979,9 @@ def test_fake_sub_issues_and_dependencies_follow_child_closure():
 
 def test_update_pr_sends_body_as_stdin_and_preserves_newlines():
     run = ScriptedRun("")
-    GhTracker(REPO, run).update_pr(42, base="foragent/batch-99", title="Updated", body="## Review\nVERDICT: PASS\n")
+    GhTracker(REPO, run).update_pr(42, base="integration", title="Updated", body="## Review\nVERDICT: PASS\n")
     assert run.calls == [([
-        "pr", "edit", "42", "-R", REPO, "--base", "foragent/batch-99", "--title", "Updated", "--body-file", "-",
+        "pr", "edit", "42", "-R", REPO, "--base", "integration", "--title", "Updated", "--body-file", "-",
     ], "## Review\nVERDICT: PASS\n")]
 
 

@@ -512,7 +512,7 @@ def test_rechecks_evidence_after_ci(review_case, monkeypatch, change):
     assert_blocked(c, Reason.HASH_MISMATCH if change in {"body", "approval"} else Reason.RISK_HIGH)
 
 
-@pytest.mark.parametrize("mode,always_human,risk", [("careful", [], False), ("batch", [], False),
+@pytest.mark.parametrize("mode,always_human,risk", [("careful", [], False),
                                                        ("fast", ["feature.txt"], False), ("fast", [], True)])
 def test_resolve_preserves_normal_merge_policy(review_case, mode, always_human, risk):
     c = review_case

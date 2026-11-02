@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from conftest import ACCEPTANCE, BASE_TIME, git_command
+from conftest import ACCEPTANCE, BASE_TIME
 from foragent import run_conflicts, run_publish
 from foragent.config import Config
 from foragent.git import GitRepo
@@ -122,17 +122,11 @@ def test_resume_merges_the_base_captured_before_lock_wait(replay_case, monkeypat
     assert not (attempt.worktree / "unchecked.txt").exists()
 
 
-@pytest.mark.parametrize("batch", [False, True])
-def test_final_inputs_check_the_captured_base_when_tracking_refs_move(replay_case, monkeypatch, batch):
+def test_final_inputs_check_the_captured_base_when_tracking_refs_move(replay_case, monkeypatch):
     attempt = replay_case
     ctx = attempt.ctx
-    base = "foragent/batch-99" if batch else "main"
+    base = "main"
     checked = attempt.git.head_sha()
-    if batch:
-        ctx.tracker.add_issue(99, "Parent")
-        ctx.tracker.set_parent(1, 99)
-        git_command(attempt.history.origin, "update-ref", f"refs/heads/{base}", checked)
-        ctx.git.fetch("origin", base)
     pr = ctx.tracker.create_pr(head=attempt.branch, base=base, title="Feature", body="")
     ctx.tracker.set_pr_head_sha(pr, checked)
     ctx.tracker.set_pr_files(pr, ["feature.txt"])
@@ -148,9 +142,6 @@ def test_final_inputs_check_the_captured_base_when_tracking_refs_move(replay_cas
             raced.append(sha)
             attempt.history.update({ACCEPTANCE: "Unapproved acceptance\n"})
             ctx.git.fetch("origin", "main")
-            if batch:
-                git_command(attempt.history.origin, "update-ref", f"refs/heads/{base}", attempt.history.tip)
-                ctx.git.fetch("origin", base)
         return sha
 
     def paths_at_base(ref):

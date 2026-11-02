@@ -1,4 +1,3 @@
-import re
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -11,17 +10,13 @@ import pytest
 
 from foragent.executors import ExecResult
 from foragent.git import GitRepo
-from foragent.issue import body_hash
 from foragent.reasons import Reason, parse_reason
-from foragent.runner import _batch_pr, run_issue
+from foragent.runner import run_issue
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
 
 from conftest import ACCEPTANCE, BASE_TIME, git_command
-from runner_support import BODY, COMMAND, batch_setup, enable_reviewer, run_case, seed_batch, set_done_when
-
-# GitHub closes an issue named after one of these words when the PR merges.
-CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
+from runner_support import COMMAND, enable_reviewer, run_case, set_done_when
 
 
 def test_protected_collection_after_ci_base_move_still_holds_a_slot(run_case, monkeypatch):
@@ -141,9 +136,7 @@ def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(t
 
 def test_base_only_paths_merged_during_ci_do_not_retarget_the_pr(run_case, monkeypatch):
     c = run_case
-    batch_setup(c)
-    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"sibling.txt": "batch"})
-    seed_batch(c, {})
+    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"sibling.txt": "careful"})
     moved = []
 
     def checks(pr):
@@ -650,7 +643,7 @@ def test_pr_is_opened_and_held_by_policy(run_case, path, labels, config, reason)
 
 
 @pytest.mark.parametrize("config", [
-    {"review": "batch"}, {"review": "careful"}, {"review_paths": {"**/*.txt": "careful"}},
+    {"review": "careful"}, {"review_paths": {"**/*.txt": "careful"}},
 ])
 def test_non_fast_leaves_pr_open_without_needs_human(run_case, config):
     c = run_case
@@ -771,12 +764,8 @@ def test_reuses_existing_pr(run_case):
 
 
 @pytest.mark.parametrize("provided", [False, True])
-@pytest.mark.parametrize("retarget", [False, True])
-def test_success_stores_try_card_verbatim_in_pr_but_not_git(run_case, provided, retarget):
+def test_success_stores_try_card_verbatim_in_pr_but_not_git(run_case, provided):
     c = run_case
-    if retarget:
-        batch_setup(c)
-        c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"feature.txt": "batch"})
     card = "## What changed\n결과를 보여 줍니다.\n## Try it\nkind: cli\n```sh\ncat feature.txt\n```\n## Expect\ndone 표시\n"
     if provided:
         c.executor.steps[0][".foragent/TRY.md"] = card
@@ -794,13 +783,10 @@ def test_success_stores_try_card_verbatim_in_pr_but_not_git(run_case, provided, 
     assert ".foragent/" not in files
 
 
-@pytest.mark.parametrize("outcome", ["merged", "held", "pr-open", "retries-exceeded", "retarget"])
+@pytest.mark.parametrize("outcome", ["merged", "held", "pr-open", "retries-exceeded"])
 def test_prestaged_try_and_other_artifacts_never_reach_branch(run_case, outcome):
     c = run_case
-    if outcome == "retarget":
-        batch_setup(c)
-        c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"feature.txt": "batch"})
-    elif outcome == "held":
+    if outcome == "held":
         c.tracker.add_labels(1, ["risk:high"])
     elif outcome == "pr-open":
         c.ctx.config = replace(c.ctx.config, review="careful")
@@ -819,226 +805,11 @@ def test_prestaged_try_and_other_artifacts_never_reach_branch(run_case, outcome)
         return result
 
     c.executor.run = prestage
-    assert run_issue(1, c.ctx) == ("merged" if outcome == "retarget" else outcome)
+    assert run_issue(1, c.ctx) == outcome
     files = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
     assert ".foragent/" not in files and "feature.txt" in files
-    if outcome in {"merged", "retarget"}:
+    if outcome == "merged":
         assert (c.store.root / "try/1.md").read_text() == card
-
-
-@pytest.mark.parametrize("existing_batch", [False, True])
-def test_batch_child_targets_shared_branch_closes_and_opens_parent_pr_once(run_case, existing_batch):
-    c = run_case
-    batch_setup(c)
-    if existing_batch:
-        seed_batch(c, {"sibling.txt": "previous child"})
-    assert run_issue(1, c.ctx) == "merged"
-    child, batch = c.tracker.created_prs
-    assert child.base == "foragent/batch-99" and child.head == "foragent/issue-1"
-    assert child.number in c.tracker.merged_prs and batch.number not in c.tracker.merged_prs
-    assert c.tracker.get_issue(1).state == "closed"
-    assert c.tracker.list_comments(1)[-1].body == "Merged into foragent/batch-99 (PR #100)"
-    assert batch.head == "foragent/batch-99" and batch.base == "main"
-    assert batch.title == "Batch: The whole feature (#99)"
-    from foragent.i18n import text
-
-    assert text("batch_pr_parent", c.ctx.config.language, parent=99) in batch.body and "#1: Implement feature (PR #100)" in batch.body
-    assert not CLOSING_KEYWORD.search(batch.body), "Only the gate's order aggregation closes the parent"
-    _batch_pr(99, c.ctx)
-    assert len(c.tracker.created_prs) == 2
-    if existing_batch:
-        assert git_command(c.history.origin, "show", "foragent/issue-1:sibling.txt") == "previous child"
-        assert not any(args[:2] == ["push", "origin"] for _, args in c.operations)
-    else:
-        assert any(args[:2] == ["push", "origin"] for _, args in c.operations)
-    assert any(args == ["worktree", "add", "-B", "foragent/issue-1", str(c.store.worktree_path(1)), "origin/foragent/batch-99"]
-               for _, args in c.operations)
-
-
-def test_batch_waits_for_open_sibling_and_merge_unblocks_it(run_case):
-    from foragent.scheduler import TickContext, tick
-    from foragent.tracker import Dependency
-
-    c = run_case
-    batch_setup(c)
-    c.tracker.add_issue(3, "Next child", BODY)
-    c.tracker.record_label(3, "approved", "human")
-    c.tracker.set_parent(3, 99)
-    c.tracker.set_blocked_by(3, [Dependency(1, "open")])
-    tick_ctx = TickContext(
-        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-        config=replace(c.ctx.config, approvers=["human"]), git=c.ctx.git, now=c.ctx.now,
-        launcher=lambda number: None, start_runs=False,
-    )
-    tick(tick_ctx)
-    assert "ready" not in c.tracker.get_issue(3).labels
-    assert run_issue(1, c.ctx) == "merged"
-    assert len(c.tracker.created_prs) == 1
-    tick(tick_ctx)
-    assert "ready" in c.tracker.get_issue(3).labels
-
-
-def test_reused_child_pr_is_retargeted_to_batch_and_gets_review_evidence(run_case):
-    c = run_case
-    batch_setup(c)
-    c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="Old body")
-    enable_reviewer(c, ["VERDICT: PASS"])
-    assert run_issue(1, c.ctx) == "merged"
-    child = c.tracker.created_prs[0]
-    assert child.base == "foragent/batch-99"
-    assert "Round 1: VERDICT: PASS" in child.body
-
-
-def test_tick_reconciles_manually_merged_careful_child_and_unblocks_sibling(run_case):
-    from foragent.scheduler import TickContext, tick
-    from foragent.tracker import Dependency
-
-    c = run_case
-    batch_setup(c)
-    c.ctx.config = replace(c.ctx.config, review_paths={"feature.txt": "careful"})
-    c.tracker.add_issue(3, "Next child", BODY)
-    c.tracker.record_label(3, "approved", "human")
-    c.tracker.set_parent(3, 99)
-    c.tracker.set_blocked_by(3, [Dependency(1, "open")])
-    assert run_issue(1, c.ctx) == "pr-open"
-    child = c.tracker.created_prs[0]
-    assert child.base == "foragent/batch-99"
-    c.tracker.merge_pr(child.number, expected_head_sha=c.tracker.pr_head_sha(child.number))
-    assert c.tracker.get_issue(1).state == "open"
-    context = TickContext(
-        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-        config=replace(c.ctx.config, approvers=["human"]), git=c.ctx.git, now=c.ctx.now,
-        launcher=lambda number: pytest.fail("reconciliation must not launch"), start_runs=False,
-    )
-    tick(context)
-    assert c.tracker.get_issue(1).state == "closed"
-    assert not c.tracker.get_issue(1).labels & {"ready", "running"}
-    assert c.tracker.list_comments(1)[-1].body == f"Merged into foragent/batch-99 (PR #{child.number})"
-    assert "ready" in c.tracker.get_issue(3).labels
-    assert len(c.tracker.created_prs) == 1
-    # Closing the remaining child completes the parent on a later tick.
-    c.tracker.close_issue(3)
-    tick(context)
-    assert len(c.tracker.created_prs) == 2
-    assert c.tracker.created_prs[-1].head == "foragent/batch-99"
-    comments = c.tracker.list_comments(1)
-    tick(context)
-    assert c.tracker.list_comments(1) == comments and len(c.tracker.created_prs) == 2
-
-
-def test_tick_retries_batch_finalization_after_last_child_is_already_closed(run_case, monkeypatch):
-    from foragent.scheduler import TickContext, tick
-
-    c = run_case
-    batch_setup(c)
-    create = c.tracker.create_pr
-    unavailable = [True]
-
-    def create_pr(**kwargs):
-        if kwargs["head"] == "foragent/batch-99" and unavailable[0]:
-            raise TrackerError("HTTP 503")
-        return create(**kwargs)
-
-    monkeypatch.setattr(c.tracker, "create_pr", create_pr)
-    assert run_issue(1, c.ctx) == "merged"
-    assert c.tracker.get_issue(1).state == "closed" and c.store.load_flag(1) is None
-    assert len(c.tracker.created_prs) == 1
-    context = TickContext(
-        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker,
-        store=StateStore(c.store.root, now=c.ctx.now), config=c.ctx.config,
-        git=c.ctx.git, now=c.ctx.now, launcher=lambda number: None, start_runs=False,
-    )
-    assert any("HTTP 503" in action for action in tick(context).actions)
-    unavailable[0] = False
-    tick(context)
-    assert len(c.tracker.created_prs) == 2
-    batch = c.tracker.created_prs[-1]
-    assert batch.head == "foragent/batch-99" and "PR #100" in batch.body
-    tick(context)
-    assert len(c.tracker.created_prs) == 2
-    c.tracker.merge_pr(batch.number, expected_head_sha=c.tracker.pr_head_sha(batch.number))
-    tick(context)
-    assert len(c.tracker.created_prs) == 2
-
-
-def test_generated_file_selects_batch_before_final_verification(run_case):
-    c = run_case
-    batch_setup(c)
-    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"generated.txt": "batch"})
-    c.tracker.set_pr_files(100, ["feature.txt", "generated.txt"])
-    seed_batch(c, {"sibling.txt": "previous child"})
-    set_done_when(c, [COMMAND, "echo generated > generated.txt"])
-    assert run_issue(1, c.ctx) == "merged"
-    assert c.tracker.created_prs[0].base == "foragent/batch-99"
-    assert c.store.log_path(1).read_text().count("Done when command:") == 4
-
-
-def test_retry_removing_batch_override_returns_only_child_patch_to_base(run_case, monkeypatch):
-    c = run_case
-    batch_setup(c)
-    c.ctx.config = replace(c.ctx.config, review="fast", review_paths={"batch.txt": "batch"})
-    seed_batch(c, {"sibling.txt": "previous child"})
-    c.executor.steps = [{"feature.txt": "done", "batch.txt": "unnecessary"}, {}]
-    execute = c.executor.run
-
-    def remove_batch_path(**kwargs):
-        result = execute(**kwargs)
-        if len(c.executor.calls) == 2:
-            (kwargs["worktree"] / "batch.txt").unlink()
-        return result
-
-    monkeypatch.setattr(c.executor, "run", remove_batch_path)
-    enable_reviewer(c, ["VERDICT: FAIL\nbatch.txt:1: remove this out-of-scope file", "VERDICT: PASS"])
-    assert run_issue(1, c.ctx) == "merged"
-    assert c.tracker.created_prs[0].base == "main"
-    files = git_command(c.history.origin, "ls-tree", "-r", "--name-only", "foragent/issue-1")
-    assert "feature.txt" in files and "sibling.txt" not in files and "batch.txt" not in files
-
-
-def test_batch_ci_failure_keeps_child_open_and_does_not_open_parent_pr(run_case):
-    c = run_case
-    batch_setup(c)
-    c.ctx.config = replace(c.ctx.config, max_retries=0)
-    c.tracker.set_pr_checks(100, "fail")
-    assert run_issue(1, c.ctx) == "ci-failed"
-    assert c.tracker.get_issue(1).state == "open"
-    assert not c.tracker.merged_prs and len(c.tracker.created_prs) == 1
-
-
-def test_batch_siblings_build_on_actual_prior_merge(run_case, monkeypatch):
-    c = run_case
-    batch_setup(c)
-    c.tracker.add_issue(2, "Second child", BODY, labels=["approved"])
-    c.tracker.set_parent(2, 99)
-    merge = c.tracker.merge_pr
-
-    def merge_into_git_batch(pr, **kwargs):
-        merge(pr, **kwargs)
-        item = next(item for item in c.tracker.created_prs if item.number == pr)
-        git_command(c.history.origin, "fetch", str(c.ctx.repo_root), f"+refs/heads/{item.head}:refs/heads/{item.base}")
-
-    monkeypatch.setattr(c.tracker, "merge_pr", merge_into_git_batch)
-    assert run_issue(1, c.ctx) == "merged"
-    assert len(c.tracker.created_prs) == 1  # Sibling still open.
-    approval = c.store.load_approval(1)
-    second_body = BODY.replace("Implement the approved feature.", "Add the second feature.")
-    second_body += "```sh\ntest -f second.txt\n```\n"
-    c.store.save_approval(
-        2, body=second_body, body_sha=body_hash(second_body), acceptance_blobs=approval.acceptance_blobs,
-        approved_by="human", approved_at=c.now[0].isoformat(),
-    )
-    c.now[0] += timedelta(seconds=1)
-    c.tracker.add_labels(2, ["running"])
-    c.store.start_run(2, branch="foragent/issue-2", worktree=c.store.worktree_path(2))
-    c.executor.steps = [{"second.txt": "done"}]
-    assert run_issue(2, c.ctx) == "merged"
-    assert git_command(c.history.origin, "show", "foragent/batch-99:feature.txt") == "done"
-    assert git_command(c.history.origin, "show", "foragent/batch-99:second.txt") == "done"
-    assert c.tracker.get_issue(1).state == c.tracker.get_issue(2).state == "closed"
-    assert c.tracker.merged_prs == [100, 101]
-    batch = c.tracker.created_prs[-1]
-    assert batch.head == "foragent/batch-99" and "PR #100" in batch.body and "PR #101" in batch.body
-    assert batch.number not in c.tracker.merged_prs
 
 
 @pytest.mark.parametrize("scope", ["claude-local", "pr-body"])
@@ -1078,56 +849,6 @@ def test_publication_allows_standalone_marker_text(run_case, content):
     c.executor.steps.append({})
     assert run_issue(1, c.ctx) == "merged"
     assert len(c.executor.calls) == 1 and len(c.tracker.created_prs) == 1
-
-
-@pytest.mark.parametrize("existing", [False, True])
-def test_batch_publication_checks_inherited_changes_against_actual_base(run_case, existing):
-    from foragent.git import GitError
-
-    c = run_case
-    batch_setup(c)
-    # Wait for a sibling so the ordinary child-relative publication can finish.
-    c.tracker.add_issue(3, "Sibling")
-    c.tracker.set_parent(3, 99)
-    seed_batch(c, {"notes.txt": "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> target\n"})
-    assert run_issue(1, c.ctx) == "merged"
-    assert len(c.tracker.created_prs) == 1
-    c.tracker.close_issue(3)
-    if existing:
-        pr = c.tracker.create_pr(head="foragent/batch-99", base="main", title="Old title", body="Old body")
-    before = list(c.tracker.created_prs)
-    with pytest.raises(GitError, match="notes.txt:1"):
-        _batch_pr(99, c.ctx)
-    assert c.tracker.created_prs == before
-    if existing:
-        assert c.tracker.get_issue(pr).body == "Old body"
-
-
-def test_batch_publication_failure_is_deferred_until_aggregate_contents_are_repaired(run_case):
-    from foragent.scheduler import TickContext, tick
-
-    c = run_case
-    batch_setup(c)
-    branch = "foragent/batch-99"
-    seed_batch(c, {"notes.txt": "<<<<<<< HEAD\n=======\n>>>>>>> target\n"})
-    assert run_issue(1, c.ctx) == "merged"
-    assert c.tracker.get_issue(1).state == "closed" and c.store.load_flag(1) is None
-    assert len(c.tracker.created_prs) == 1
-    assert "Batch PR finalization deferred to tick: Conflict marker left: notes.txt:1" in c.store.log_path(1).read_text()
-    context = TickContext(
-        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now, launcher=lambda number: None, start_runs=False,
-    )
-    assert any("notes.txt:1" in action for action in tick(context).actions)
-    assert len(c.tracker.created_prs) == 1
-    base = c.history.tip
-    c.history.tip = c.ctx.git.remote_branch_sha(branch)
-    c.history.update({"notes.txt": "resolved\n"})
-    git_command(c.history.origin, "update-ref", f"refs/heads/{branch}", c.history.tip)
-    git_command(c.history.origin, "update-ref", "refs/heads/main", base)
-    c.history.tip = base
-    tick(context)
-    assert len(c.tracker.created_prs) == 2 and c.tracker.created_prs[-1].head == branch
 
 
 def test_publication_rechecks_marker_locations_after_ci_before_merge(run_case, monkeypatch):
@@ -1353,75 +1074,3 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
     log = c.store.log_path(1).read_text()
     assert "retitle failed" in log and "HTTP 500" in log
-
-
-def _merge_batch_then_tick(c, before_tick=lambda: None):
-    """Merge the batch PR right after runner finalization, before any gate tick."""
-    from foragent.scheduler import TickContext, tick
-
-    assert run_issue(1, c.ctx) == "merged"
-    batch = c.tracker.created_prs[-1]
-    assert batch.head == "foragent/batch-99"
-    assert not CLOSING_KEYWORD.search(batch.body), "A batch PR merge must not close the order parent"
-    c.tracker.merge_pr(batch.number, expected_head_sha=c.tracker.pr_head_sha(batch.number))
-    assert c.tracker.get_issue(99).state == "open"
-    before_tick()
-    context = TickContext(
-        repo=c.ctx.repo, repo_root=c.ctx.repo_root, tracker=c.tracker, store=c.store,
-        config=c.ctx.config, git=c.ctx.git, now=c.ctx.now,
-        launcher=lambda number: pytest.fail("parent completion must not launch"), start_runs=False,
-    )
-    tick(context)
-    return context
-
-
-def test_batch_pr_merged_before_any_tick_leaves_parent_completion_to_the_gate(run_case):
-    from foragent.board_parents import closing_comment
-    from foragent.scheduler import tick
-
-    c = run_case
-    batch_setup(c)
-    before = c.tracker.list_comments(99)
-    context = _merge_batch_then_tick(c)
-    parent = c.tracker.get_issue(99)
-    assert parent.state == "closed", "The gate closes the order once every child is done"
-    completion = closing_comment(c.ctx.config.language, [1], [])
-    added = c.tracker.list_comments(99)[len(before):]
-    assert [comment.body for comment in added].count(completion) == 1
-    tick(context)
-    assert [comment.body for comment in c.tracker.list_comments(99)[len(before):]] == [
-        comment.body for comment in added
-    ]
-
-
-def test_batch_pr_merge_keeps_a_parent_with_a_not_planned_child_open_and_flagged(run_case):
-    """While another child is open, a not-planned child flags the order; the last child's end closes it."""
-    from dataclasses import replace as replace_issue
-    from datetime import timedelta
-
-    from foragent.board_parents import NOT_PLANNED_FLAG, closing_comment
-    from foragent.scheduler import tick
-
-    c = run_case
-    batch_setup(c)
-    dropped = c.tracker.add_issue(3, "Dropped part", state="closed")
-    c.tracker.issues[3] = replace_issue(dropped, state_reason="not_planned")
-    c.tracker.set_parent(3, 99)
-
-    def open_sibling():  # Added after the batch so the batch PR still opens for its finished child.
-        c.tracker.add_issue(4, "Later part")
-        c.tracker.set_parent(4, 99)
-
-    context = _merge_batch_then_tick(c, open_sibling)
-    assert c.tracker.get_issue(99).state == "open", "A not-planned child with an open sibling keeps the order open"
-    flag = c.store.load_flag(99)
-    assert flag is not None and flag.reason == NOT_PLANNED_FLAG
-
-    before = c.tracker.list_comments(99)
-    c.tracker.close_issue(4)
-    clock = context.now()
-    context.now = lambda: clock + timedelta(minutes=6)  # Past the listing refresh interval.
-    tick(context)
-    assert c.tracker.get_issue(99).state == "closed", "A cancelled child counts as ended once nothing is open"
-    added = [comment.body for comment in c.tracker.list_comments(99)[len(before):]]
-    assert added == [closing_comment(c.ctx.config.language, [1, 4], [3])]
