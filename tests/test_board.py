@@ -81,6 +81,8 @@ def snapshot(tracker, project_id):
       items(first: 100) { nodes { content { ... on Issue { number } }
         fieldValues(first: 100) { nodes { ... on ProjectV2ItemFieldSingleSelectValue {
           name field { ... on ProjectV2SingleSelectField { name } }
+        } ... on ProjectV2ItemFieldTextValue {
+          text field { ... on ProjectV2Field { name } }
         } } }
       } }
     } } }""", {"id": project_id})["data"]["node"]
@@ -463,3 +465,135 @@ def test_sync_status_shows_person_waits_in_your_turn_except_final_states(tmp_pat
     for number, status in ((1, "Running"), (2, "Ready"), (3, "Ready"), (1, "Done"), (2, "closed")):
         board.sync_status(ctx, number, status)
     assert written == [(1, "Needs human"), (2, "Needs human"), (3, "Ready"), (1, "Done"), (2, "closed")]
+
+
+WAITING = ("Reason: Locale choice pending\nNext condition: Record the locale on this issue\n"
+           "Responsible role: orchestrator")
+
+
+def waiting_value(remote, project_id, number=1):
+    item = next(item for item in snapshot(remote, project_id)["items"]["nodes"]
+                if item["content"]["number"] == number)
+    return next((entry["text"] for entry in item["fieldValues"]["nodes"]
+                 if entry["field"]["name"] == "Waiting"), None)
+
+
+def record_wait(ctx, remote, body, *, closed=False):
+    remote.update_issue(1, title="Feature", body=body)
+    if closed:
+        remote.close_issue(1)
+    ctx.store.record_issue(remote.get_issue(1), {})
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_waiting_card_projects_current_section_and_clears_when_removed_or_closed(recording_board, closed):
+    ctx, remote, _ = recording_board
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+    record_wait(ctx, remote, "## Goal\nShip\n## Waiting\n" + WAITING + "\n## Files\nsrc/app.py\n")
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, ctx.config.board) == WAITING
+    assert ctx.tracker.board_value(1, ctx.config.board, "Waiting") == WAITING
+    changed = WAITING.replace("Locale choice pending", "Catalog owner deciding")
+    record_wait(ctx, remote, "## Waiting\n" + changed)
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, ctx.config.board) == changed
+    record_wait(ctx, remote, "## Waiting\n" + changed if closed else "## Goal\nReady", closed=closed)
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, ctx.config.board) is None
+    assert ctx.tracker.board_value(1, ctx.config.board, "Waiting") == ""
+
+
+def test_waiting_projection_is_lazy_existing_only_and_unchanged_read_costs_one_call(recording_board, monkeypatch):
+    ctx, remote, _ = recording_board
+    record_wait(ctx, remote, "## Waiting\n" + WAITING)
+    board.refresh_cards(ctx)  # A wait alone never adds a card or field.
+    assert snapshot(remote, ctx.config.board)["items"]["nodes"] == []
+    assert "Waiting" not in board.Project(remote, ctx.repo, ctx.config.board).fields()
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+    other = remote.add_issue(2, "Other", "## Waiting\n" + WAITING)
+    ctx.store.record_issue(other, {})
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 2)
+    calls = []
+    graphql = remote.graphql
+
+    def counted(query, variables):
+        calls.append(query)
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", counted)
+    board.refresh_cards(ctx)
+    assert sum("ForagentCreateBoardField" in query for query in calls) == 1
+    assert sum("ForagentBoardFields" in query for query in calls) == 1
+    assert sum("ForagentSetBoardValue" in query for query in calls) == 2
+    calls.clear()
+    board.refresh_cards(ctx)
+    assert len(calls) == 1 and "ForagentBoardCards" in calls[0]
+    assert waiting_value(remote, ctx.config.board) == WAITING
+    assert waiting_value(remote, ctx.config.board, 2) == WAITING
+
+
+@pytest.mark.parametrize("rate_limited", [False, True])
+@pytest.mark.parametrize("clear", [False, True])
+def test_waiting_failed_writes_are_not_recorded_and_other_cards_continue(
+    recording_board, monkeypatch, caplog, rate_limited, clear,
+):
+    ctx, remote, _ = recording_board
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+    record_wait(ctx, remote, "## Waiting\n" + WAITING)
+    if clear:
+        board.refresh_cards(ctx)
+        record_wait(ctx, remote, "## Goal\nReady")
+    other = remote.add_issue(2, "Other", "## Waiting\n" + WAITING)
+    ctx.store.record_issue(other, {})
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 2)
+    graphql = remote.graphql
+    error = TrackerError("API rate limit exceeded" if rate_limited else "Field update failed")
+
+    def fail(query, variables):
+        if ("ForagentClearBoardValue" if clear else "ForagentSetBoardValue") in query:
+            raise error
+        return graphql(query, variables)
+
+    monkeypatch.setattr(remote, "graphql", fail)
+    if rate_limited:
+        with pytest.raises(TrackerError):
+            board.refresh_cards(ctx)
+    else:
+        board.refresh_cards(ctx)
+        assert "Could not set board Waiting" in caplog.text
+    assert ctx.tracker.board_value(1, ctx.config.board, "Waiting") == (WAITING if clear else None)
+    assert waiting_value(remote, ctx.config.board) == (WAITING if clear else None)
+    if clear and not rate_limited:
+        assert waiting_value(remote, ctx.config.board, 2) == WAITING
+    monkeypatch.setattr(remote, "graphql", graphql)
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, ctx.config.board) == (None if clear else WAITING)
+
+
+def test_waiting_refresh_repairs_stale_board_after_projection_cache_is_lost(recording_board):
+    ctx, remote, _ = recording_board
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+    record_wait(ctx, remote, "## Waiting\n" + WAITING)
+    board.refresh_cards(ctx)
+    record_wait(ctx, remote, "## Goal\nReady")
+    ctx.store.update_local_issue(1, board_values={})
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, ctx.config.board) is None
+    assert ctx.tracker.board_value(1, ctx.config.board, "Waiting") == ""
+
+
+def test_waiting_refresh_uses_issue_body_to_repair_a_manual_board_edit(recording_board):
+    ctx, remote, _ = recording_board
+    board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+    record_wait(ctx, remote, "## Waiting\n" + WAITING)
+    board.refresh_cards(ctx)
+    project = board.Project(remote, ctx.repo, ctx.config.board)
+    field = project.fields()["Waiting"]
+    item, = snapshot(remote, ctx.config.board)["items"]["nodes"]
+    remote.graphql("""mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
+      updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+    }""", {"input": {"projectId": project.id, "itemId": item["id"], "fieldId": field["id"],
+                     "value": {"text": "obsolete board-only reason"}}})
+    assert ctx.tracker.board_value(1, project.id, "Waiting") == WAITING
+    board.refresh_cards(ctx)
+    assert waiting_value(remote, project.id) == WAITING

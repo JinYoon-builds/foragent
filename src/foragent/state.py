@@ -26,11 +26,12 @@ from foragent.state_issues import (  # noqa: F401
     observed_issue_facts,
 )
 from foragent.state_local import LocalRecordsMixin
+from foragent.state_observations import IssueObservationsMixin
 from foragent.state_locks import _TICK_LOCKS_HELD, StateLocksMixin, _held_tick_locks  # noqa: F401
 from foragent.state_records import Approval, Flag, InspectState, Run  # noqa: F401
 from foragent.state_refresh import IssueRefreshMixin
 from foragent.state_github import GithubCallsMixin
-from foragent.state_logs import LogRetentionMixin
+from foragent.state_logs import FlowRecordsMixin, LogRetentionMixin
 from foragent.state_runs import RunRecordsMixin
 from foragent.state_talk import TalkRecordsMixin
 
@@ -39,8 +40,8 @@ LOG_LIMIT_BYTES = 500 * 1024 * 1024
 
 
 class StateStore(
-    IssueSnapshotMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
-    LogRetentionMixin, StateLocksMixin, StateBase,
+    IssueSnapshotMixin, IssueObservationsMixin, IssueRefreshMixin, RunRecordsMixin, TalkRecordsMixin, GithubCallsMixin, LocalRecordsMixin,
+    LogRetentionMixin, FlowRecordsMixin, StateLocksMixin, StateBase,
 ):
     @classmethod
     def for_repo(cls, repo: str, *, now: Callable[[], datetime] | None = None) -> "StateStore":

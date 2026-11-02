@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from foragent.state_phases import close_phase, work_event  # noqa: F401
-from foragent.state_records import Run
+from foragent.state_records import Run, carried_contract
 
 
 # Updates passing any of these change or attest process ownership, so they
@@ -28,17 +28,15 @@ class RunRecordsMixin:
             timestamp = self._timestamp()
             approval = self.load_approval(number)
             previous = self.get_run(number)
-            # A gate restart (stall, crash) or limit-wait resume continues the run: its restarts and
-            # turn tiers survive, so the next turn is counted after them (#238). Only a limit-wait
-            # keeps the attempt number.
+            # A gate restart (stall, crash) or limit-wait resume continues the run: its restarts, turn tiers
+            # (#238) and first parent text of the same approval (#1184) survive. Only a limit-wait keeps attempts.
             restarted = previous is not None and previous.outcome in {"stalled-restart", "crashed", "limit-wait"}
             restarts = previous.restarts if restarted else 0
+            contract = carried_contract(previous, restarted, timestamp)
             attempts = previous.attempts if previous is not None and previous.outcome == "limit-wait" else 1
             session = {}
             if previous is not None:
-                reason = "\n".join(value for value in (
-                    previous.outcome, previous.detail, previous.resume_reason,
-                ) if value)
+                reason = "\n".join(v for v in (previous.outcome, previous.detail, previous.resume_reason) if v)
                 session = {
                     "session_id": previous.session_id, "session_executor": previous.session_executor,
                     "session_ids": previous.session_ids, "session_body": previous.session_body,
@@ -59,7 +57,7 @@ class RunRecordsMixin:
                       attempt_tiers=previous.attempt_tiers if restarted else {},
                       approval_body_sha=approval.body_sha if approval is not None else None,
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer,
-                      executor=executor, reviewer=reviewer, executor_model=executor_model, **session)
+                      executor=executor, reviewer=reviewer, executor_model=executor_model, **session, **contract)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
             if journal is not None:  # The audit event of this record (#107), under the same lock.

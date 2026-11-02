@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from foragent import order_waiting
 from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN, RUNNING, WAITING_PERSON, issue_lane
 from foragent.state import StateStore
@@ -285,7 +286,8 @@ def waiting_facts(
 
     Open dependencies come first, then the recorded wait phase, then concrete overlap with
     active recorded claims (only under a known checkout root), then the meter's full slots
-    for queued work. Held people and blocked issues are left out.
+    for queued work. Authored waits also include unapproved and held issues, alongside
+    (rather than in place of) the existing recorded evidence.
     """
     states = {number: row["state"] for number, row in rows.items()}
     runs = {run["number"]: run for run in status.get("active_runs", [])}
@@ -307,6 +309,11 @@ def waiting_facts(
         if row["state"] != "open":
             continue
         run = runs.get(number)
+        lane = (run or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
+        authored = order_waiting.read_waiting(row.get("body") or "")
+        if authored is not None:
+            found[number] = {"authored": authored, "lane": lane,
+                             "title": row.get("title") or ""}
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
         if state in HELD or (run is None and {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & labels):
@@ -335,7 +342,6 @@ def waiting_facts(
                 if approval is not None:
                     from foragent.issue import parse_body
 
-                    lane = (run or {}).get("lane") or issue_lane(labels, config.lanes)
                     held, shared = _overlap(ctx, number, lane, parse_body(approval.body))
                     paths |= shared
             except Exception:  # noqa: BLE001, S110 - optional evidence; the entry and its dependencies stay.
@@ -351,7 +357,8 @@ def waiting_facts(
             if machine is None:
                 machine = [_held_by_machine(store, config, meter, starts)]
             kind = machine[0]
-        found[number] = {"kind": kind, "blocking_issues": sorted(blocking), "overlapping_files": sorted(paths)}
+        found.setdefault(number, {}).update(
+            kind=kind, blocking_issues=sorted(blocking), overlapping_files=sorted(paths))
     return found
 
 

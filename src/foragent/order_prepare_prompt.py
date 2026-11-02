@@ -31,7 +31,6 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
     blocked = "\n".join(
         f"- {key}: {titles[key]['title']}: {titles[key]['goal']}" if key in titles else f"- {key}"
         for key in item.get("blocked_by", [])) or "(none)"
-    from foragent.order_prepare_cycle import other_issues
 
     statements = "\n".join(f"- {line}" for line in item["statements"])
     files = "\n".join(f"- {path}" for path in item.get("files", [])) or "(not listed)"
@@ -74,3 +73,31 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         f"statements and goal are its public contract.\n\n{other_issues(plan, item)}\n\n"
         f"## Risk guidance\n{notes}\n"
     ) + (f"\n{references}" if references else "")
+
+
+def _lines(values) -> str:
+    return "".join(f"  - {value}\n" for value in values or []) or "  (none)\n"
+
+
+def other_issues(plan: dict, item: dict) -> str:
+    """Every other issue and edit of the order as the writer and reviewer read them: the same
+    ``contracts`` the cycle binds, so a contract declared only in another issue's words reaches both."""
+    from foragent.order_prepare_cycle import contracts
+
+    blocks = []
+    for key, other in contracts(plan, item).items():
+        tests = "".join(f"\n#### {path} (locked)\n```\n{content}\n```\n"
+                        for path, content in (other["acceptance_files"] or {}).items())
+        commands = "" if other["done_when"] is None else f"Done when:\n{_lines(other['done_when'])}"
+        blocks.append(
+            f"### {'Edit of existing issue ' if other['number'] is not None else 'Issue '}{key}"
+            f"{': ' + other['title'] if other.get('title') else ''}\n"
+            f"Lane: {other.get('lane') or '(from the tracker)'}\n"
+            f"Goal: {other.get('goal') or '(unchanged)'}\n"
+            f"Behaviour statements:\n{_lines(other.get('statements'))}"
+            f"Out of scope: {other.get('out_of_scope') or '(unchanged)'}\n"
+            f"Checklist:\n{_lines(other.get('checklist'))}"
+            f"Blocked by: {', '.join(other.get('blocked_by') or []) or '(none)'}\n"
+            f"Files expected to change: {', '.join(other.get('files') or []) or '(not listed)'}\n"
+            f"{commands}{tests}")
+    return "\n".join(blocks) or "No other issue in this order."

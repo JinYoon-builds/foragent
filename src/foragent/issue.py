@@ -28,8 +28,8 @@ class ParsedIssue:
     exclusive: list[str] = field(default_factory=list)
 
 
-def parse_body(body: str) -> ParsedIssue:
-    body = body.replace("\r\n", "\n")
+def _sections(body: str) -> dict[str, list[str]]:
+    """The body's known sections, outside code fences; line endings are already normalised."""
     sections: dict[str, list[str]] = {}
     current: list[str] | None = None
     fence: str | None = None
@@ -43,13 +43,24 @@ def parse_body(body: str) -> ParsedIssue:
             if opening:
                 fence = opening[1]
             elif line.startswith("## "):
-                heading = re.fullmatch(r"## (Goal|Out of scope|Files|Done when)[ \t]*", line)
+                heading = re.fullmatch(r"## (Goal|Behaviour|Out of scope|Files|Done when)[ \t]*", line)
                 current = None
                 if heading and heading[1] not in sections:
                     current = sections[heading[1]] = []
                 continue
         if current is not None:
             current.append(raw_line)
+    return sections
+
+
+def has_behaviour(body: str) -> bool:
+    """Whether the body was published with behaviour statements (a real heading, not fenced text)."""
+    return "Behaviour" in _sections(body.replace("\r\n", "\n"))
+
+
+def parse_body(body: str) -> ParsedIssue:
+    body = body.replace("\r\n", "\n")
+    sections = _sections(body)
 
     commands: list[str] = []
     checklist: list[ChecklistItem] = []

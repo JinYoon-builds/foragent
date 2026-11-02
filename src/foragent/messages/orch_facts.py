@@ -2,6 +2,16 @@
 
 MESSAGES = {
     "en": {
+        "facts_schedule_role": ("Scheduled {role}: {state}; orders {orders}; input cutoff {cutoff}; last attempt {attempt}; "
+                                "last error {error}; next retry {retry}; pending age {age}"),
+        "facts_schedule_unknown": "none",
+        "facts_schedule_unavailable": "unavailable (role not configured)",
+        "facts_schedule_held": "due, held ({reason})",
+        "facts_schedule_order_finished": "due (order finished)",
+        "facts_schedule_no_new_input": "not due (no new merge or run records)",
+        "facts_schedule_no_finished_order": "not due (no newly finished order)",
+        "facts_schedule_pending_request": "waiting for its pending request",
+        "facts_schedule_running": "session running",
         "facts_review_rounds": ("Review rounds per merged run (last {days} days): median {median}; "
                                 "most: #{issue} with {rounds} review rounds"),
         "facts_review_rounds_none": "Review rounds per merged run (last {days} days): none",
@@ -19,6 +29,16 @@ MESSAGES = {
         "facts_baseline_none": "Baseline capture: no measured capture yet (limit {limit} s)",
     },
     "ko": {
+        "facts_schedule_role": ("예약 {role}: {state}; 주문 {orders}; 입력 기준 {cutoff}; 마지막 시도 {attempt}; "
+                                "마지막 오류 {error}; 다음 재시도 {retry}; 대기 시간 {age}"),
+        "facts_schedule_unknown": "없음",
+        "facts_schedule_unavailable": "쓸 수 없음 (역할이 설정되지 않음)",
+        "facts_schedule_held": "차례, 보류됨 ({reason})",
+        "facts_schedule_order_finished": "차례 (주문 끝남)",
+        "facts_schedule_no_new_input": "차례 아님 (새 머지나 실행 기록 없음)",
+        "facts_schedule_no_finished_order": "차례 아님 (새로 끝난 주문 없음)",
+        "facts_schedule_pending_request": "대기 중인 요청을 기다리는 중",
+        "facts_schedule_running": "세션 실행 중",
         "facts_review_rounds": ("머지된 실행의 리뷰 라운드 (최근 {days}일): 중앙값 {median}; "
                                 "가장 많음: #{issue}, 리뷰 라운드 {rounds}회"),
         "facts_review_rounds_none": "머지된 실행의 리뷰 라운드 (최근 {days}일): 없음",

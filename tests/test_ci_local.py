@@ -1,10 +1,14 @@
 """Optional local-only discovery shares the normal check runner and failure boundary."""
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
 import shlex
 import sys
 from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -17,6 +21,56 @@ from foragent.run_checks import CheckResult, _pytest_command
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker
 from runner_support import run_case
+
+
+def test_ci_local_capture_excludes_slot_wait_and_protected_check_runs_once(git_history, tmp_path, monkeypatch):
+    from foragent import capacity, run_checks
+    from foragent.ci_local import capture_local_only
+
+    now = [datetime.now(UTC)]
+    store = StateStore(tmp_path / 'state', now=lambda: now[0])
+    root = git_history.clone
+    store.start_run(1, branch='test', worktree=root)
+    ctx = runner.RunContext('owner/repo', root, FakeTracker(), store, Config(checks='ci'), GitRepo(root),
+                            lambda: now[0], monotonic=lambda: now[0].timestamp())
+    node = 'tests/acceptance/test_machine.py::test_machine'
+    calls = []
+
+    @contextmanager
+    def slot(*args, **kwargs):
+        now[0] += timedelta(seconds=500)
+        yield
+
+    def process(argv, **kwargs):
+        calls.append((argv, kwargs['timeout_s']))
+        words = shlex.split(argv[-1])
+        if node in words:
+            limit = kwargs['timeout_s']
+            now[0] += timedelta(seconds=min(1000, limit))
+            return (143, True, '') if limit < 1000 else (0, False, '')
+        assert words[words.index('-m') + 1] == 'local_only'
+        report = next(word.split('=', 1)[1] for word in words if word.startswith('--junitxml='))
+        evidence = next(word.split('=', 1)[1] for word in words if word.startswith('FA_REPORT='))
+        suite = ET.Element('testsuite')
+        ET.SubElement(suite, 'testcase', file=node.split('::')[0], name='test_machine')
+        ET.ElementTree(suite).write(report, encoding='unicode')
+        Path(evidence).write_text(json.dumps({'complete': True, 'exit_code': 0,
+                                             'collected_ids': [node], 'passing_ids': [node]}))
+        now[0] += timedelta(seconds=736)
+        return 0, False, ''
+
+    monkeypatch.setattr(capacity, 'hold_test_slot', slot)
+    monkeypatch.setattr(runner, 'run_logged', process)
+    baseline = capture_local_only(1, ctx, ctx.git, 'pytest -q', ctx.git.head_sha(), [])
+
+    assert baseline.node_ids == baseline.collected_ids == (node,)
+    assert baseline.duration_seconds == 736
+    assert len(calls) == 1
+    attempt = SimpleNamespace(n=1, ctx=ctx, baseline=baseline, worktree=root,
+                              log=store.log_path(1), checks=[])
+    assert run_checks._check_protected(attempt).exit_code == 0
+    assert len(calls) == 2
+    assert calls[-1][1] == 1472
 
 
 @pytest.fixture

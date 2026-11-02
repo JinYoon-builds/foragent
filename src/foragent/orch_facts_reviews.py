@@ -10,7 +10,6 @@ nothing is inferred from the finding's wording.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-import json
 import re
 from statistics import median
 from typing import Any
@@ -18,7 +17,7 @@ from typing import Any
 from foragent import review_notes
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
-from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_code_review, parse_review
+from foragent.run_review import FINDING_LINE, SPEC_CONFLICT, code_review_findings, parse_review
 from foragent.state import StateStore
 
 UNCLASSIFIED = "unclassified"
@@ -58,13 +57,14 @@ def round_classes(text: str, recorded: str | None = None) -> set[str] | None:
     whether the round counts: a timed-out reviewer or a failed panel can leave a VERDICT line in
     the raw text of an UNUSABLE round. A review the journal never recorded (written before
     review events), or a SPEC-CONFLICT round journaled before the reviewer's own verdict was
-    kept beside it, is judged by the runner's parsers. Findings count whatever the verdict;
-    a FAIL with no recognisable finding is one unclassified round.
+    kept beside it, is judged by the text protocol and legacy findings format. Findings count
+    whatever the verdict; a FAIL with no recognisable finding is one unclassified round.
     """
     if recorded in (None, "SPEC-CONFLICT"):
         recorded = parse_review(text).verdict
         if recorded == "UNUSABLE":
-            recorded = parse_code_review(json.dumps({"result": text})).verdict
+            # These old artifacts predate the verdict contract; current rounds use their journal.
+            recorded = code_review_findings(text)[0]
     if recorded not in ("PASS", "FAIL"):
         return None
     classes = finding_classes(text)

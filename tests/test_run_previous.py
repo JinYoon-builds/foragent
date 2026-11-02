@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from foragent.executors import ExecResult
 from foragent.run_attempt import ConflictBudgetExhausted
 from foragent.run_conflicts import _rebuild_reason
-from foragent.run_previous import consume_hint, pending_hint, record_stop_point, retry_marker, stop_path
+from foragent.run_previous import add_hint, consume_hint, pending_hint, record_stop_point, retry_marker, stop_path
 from foragent.run_prompts import DEFAULT_RETRY_HINT, build_resume_prompt
 
 
@@ -23,6 +23,22 @@ def test_retry_marker_adds_default_before_hint_and_is_consumed_with_it(tmp_path)
     assert prompt.index(DEFAULT_RETRY_HINT) < prompt.index("Keep the locale")
     consume_hint(tmp_path, 1, "Keep the locale")
     assert pending_hint(tmp_path, 1) == (False, None)
+
+
+def test_producers_only_append_and_delivery_removes_only_what_the_prompt_held(tmp_path):
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path)
+    add_hint(store, 1, "Use the selected locale")
+    add_hint(store, 1, "  ")  # Blank advice adds nothing.
+    add_hint(store, 1, "Preserve the receipt timezone")
+    _, delivered = pending_hint(tmp_path, 1)
+    assert delivered == "Use the selected locale\n\nPreserve the receipt timezone"
+    add_hint(store, 1, "Keep the second receipt field")  # Accepted after the prompt was read.
+    consume_hint(tmp_path, 1, delivered)
+    assert pending_hint(tmp_path, 1) == (False, "Keep the second receipt field")
+    consume_hint(tmp_path, 1, "Keep the second receipt field")
+    assert not (tmp_path / "hints/1.txt").exists()
 
 
 def test_stop_point_prefers_final_message_then_this_turns_log_tail(tmp_path):
@@ -131,17 +147,12 @@ def test_rebuild_judges_conflicts_still_unresolved_after_partial_resolution(tmp_
 
 def test_rerun_review_adds_the_class_question_to_an_older_pr_scope():
     from foragent.i18n import text
+    from foragent.issue import parse_body
+    from foragent.run_pr_body import _pr_body
     from foragent.run_prompts import review_scope_rules
-    from foragent.run_review import with_review_scope
 
-    question = text("review_class_question", "en")
-    rules = review_scope_rules("tests/acceptance/")
-    older = "Closes #1\n\n## Review scope\n\n" + rules.removesuffix("\n" + question) + "\nThe acceptance tests are locked."
-    refreshed = with_review_scope(older, "tests/acceptance/", "en")
-    assert rules in refreshed and refreshed.count(question) == 1
-    assert with_review_scope(refreshed, "tests/acceptance/", "en") == refreshed
-    assert with_review_scope("Closes #1", "tests/acceptance/", "en") == "Closes #1\n\n## Review scope\n\n" + rules
-    custom = "Closes #1\n\n## Review scope\n\nOnly the API.\n"
-    assert question in with_review_scope(custom, "tests/acceptance/", "en")
-    korean = with_review_scope(older, "tests/acceptance/", "ko")
-    assert text("review_class_question", "ko") in korean
+    for language in ("en", "ko"):
+        rules = review_scope_rules("tests/acceptance/", language)
+        composed = _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", language=language, summary="Summary.")
+        question = text("review_class_question", language)
+        assert rules in composed and composed.count(question) == 1

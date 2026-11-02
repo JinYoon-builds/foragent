@@ -21,12 +21,26 @@ def write_settings(path, settings):
     path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
 
+@pytest.mark.parametrize("value", ["auto", 1, 3, 12])
+def test_merge_group_max_accepts_auto_or_positive_integer(repo, value):
+    write_settings(repo / ".foragent.yml", {"merge_group_max": value})
+    assert load_config(repo).merge_group_max == value
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "4", "Auto", " auto", "auto ", None, [], {}])
+def test_merge_group_max_error_names_both_forms(repo, value):
+    write_settings(repo / ".foragent.yml", {"merge_group_max": value})
+    with pytest.raises(ConfigError) as error:
+        load_config(repo)
+    assert str(error.value) == "merge_group_max must be auto or a positive integer (1 turns merge groups off)"
+
+
 def test_exact_defaults(repo):
     expected = {
         "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
-        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always",
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": 4, "base_branch": "main",
+        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
@@ -188,6 +202,7 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("approvers", "user"), ("approvers", [None]),
     ("executor_model", 42), ("reviewer_model", []),
     ("acceptance_dir", ""), ("acceptance_dir", None), ("base_branch", "  "),
+    ("scheduled_roles", "sometimes"), ("scheduled_roles", 1), ("scheduled_roles", None),
     ("run_hours", "24-08"), ("run_hours", "09-24"), ("run_hours", "9-18"),
     ("run_hours", "09:00-18:00"), ("run_hours", "Always"), ("run_hours", None),
     ("run_hours", 1), ("run_hours", "09-18\n"),

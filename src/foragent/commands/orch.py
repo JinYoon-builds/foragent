@@ -151,7 +151,8 @@ def run(args) -> int:
         else:
             print(f"PR #{report['pr']}: tests {report['tests']}; "
                   f"conflicts: {', '.join(report['conflicts']) or 'none'}; "
-                  f"CI {report['ci']}; ready: {str(report['ready']).lower()}")
+                  f"CI {report['ci']}; ready: {str(report['ready']).lower()}"
+                  + (f"; {report['approved_inputs']}" if report["approved_inputs"] else ""))
         return 0 if report["ready"] else 1
     elif args.action == "merge":
         print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))

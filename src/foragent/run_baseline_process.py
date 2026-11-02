@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+from time import monotonic
 from types import SimpleNamespace
 
 from foragent import capacity
@@ -26,6 +27,6 @@ def main(argv: list[str]) -> None:
         repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
         config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"],
                       repo=request.get("repo")),
-        now=lambda: datetime.now(UTC),
+        now=lambda: datetime.now(UTC), monotonic=monotonic,
     )
     _build_baseline(context, load_record(BaselineBuild, request["build"]), os.fdopen(int(argv[2]), "a"))

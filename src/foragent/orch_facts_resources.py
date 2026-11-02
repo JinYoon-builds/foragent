@@ -122,8 +122,9 @@ def _alive(run: Run, now: datetime, alive: dict[int, bool]) -> bool:
 def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: dict[int, bool]) -> int:
     """capacity.machine_runs without its signal probe: this store's runs and live sibling runs."""
     numbers = {run.number for run in running}
-    count = len(running) + sum(1 for number, prepared in store.run_starts().items()
-                               if number not in numbers and capacity._within_grace(prepared, now))
+    count = sum(capacity.phase_holds_slot(run.phase) for run in running)
+    count += sum(1 for number, prepared in store.run_starts().items()
+                 if number not in numbers and capacity._within_grace(prepared, now))
     try:
         siblings = [root for root in store.root.parent.iterdir()
                     if root != store.root and ((root / "runs").is_dir() or (root / "run-starts").is_dir())]
@@ -134,7 +135,7 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: d
             sibling = StateStore(root, now=lambda: now)
             runs = _still_running(sibling, sibling.active_runs())
             running = {run.number for run in runs}
-            count += sum(_alive(run, now, alive) for run in runs) + sum(
+            count += sum(capacity.phase_holds_slot(run.phase) and _alive(run, now, alive) for run in runs) + sum(
                 1 for number, prepared in sibling.run_starts().items()
                 if number not in running and capacity._within_grace(prepared, now))
         except (OSError, ValueError, TypeError, KeyError):

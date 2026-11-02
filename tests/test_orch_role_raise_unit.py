@@ -345,7 +345,8 @@ def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, t
     measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
     store.clock[0] = NOW + timedelta(hours=13)
     assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
-    measured["numbers"] = {kind: {"n": 2}}
+    field = orch_facts_kinds.ENTITY_FACTS.get(kind, ("n",))[0]
+    measured["numbers"] = {kind: {field: {"new-entity": 3}}}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
 
 
@@ -361,3 +362,68 @@ def test_a_binding_change_rearms_the_kinds_that_declare_it(store, tmp_path, meas
     assert orch_role_raise.raise_due(store, tmp_path, NOW) == [], "The detail text is not a fact change"
     measured["binding"] = {"kind": "quota", "normal": True, "detail": "pause"}
     assert len(orch_role_raise.raise_due(store, tmp_path, NOW)) == 1
+
+
+@pytest.mark.parametrize("kind,initial,drift,new", [
+    ("hot_overlap_files", {"runs_by_file": {"a": 3, "b": 4}},
+     {"runs_by_file": {"a": 8}}, {"runs_by_file": {"a": 8, "c": 3}}),
+    ("files_over_limit", {"limit": 500, "lines_by_file": {"a": 501, "b": 600}},
+     {"limit": 500, "lines_by_file": {"a": 550}},
+     {"limit": 500, "lines_by_file": {"a": 550, "c": 501}}),
+    ("repeated_design_holds", {"holds_by_issue": {"#1": 2, "#2": 3}},
+     {"holds_by_issue": {"#1": 5}}, {"holds_by_issue": {"#1": 5, "#3": 2}}),
+    ("idle_lanes_with_backlog", {"idle_lanes": ["a", "b"], "ready_by_lane": {"c": 3}},
+     {"idle_lanes": ["a"], "ready_by_lane": {"c": 9}},
+     {"idle_lanes": ["a"], "ready_by_lane": {"c": 9, "d": 3}}),
+])
+@pytest.mark.parametrize("how", ["called", "not-now", None])
+def test_new_entities_rearm_but_counts_shrinking_and_returning_members_do_not(
+        store, tmp_path, measured, kind, initial, drift, new, how):
+    measured["signals"] = [{"paths": [], "kinds": [kind]}]
+    measured["kinds"], measured["numbers"] = {kind}, {kind: initial}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    assert first["facts"]["kinds"][kind]["numbers"] == initial, "Keep full raw facts"
+    if how:
+        orch_role_raise.answer(store, first["id"], how, "considered")
+    else:
+        orch_inbox.set_request_status(store, first["id"], "done")
+    store.clock[0] = NOW + timedelta(days=31)
+    reopened = StateStore(store.root, now=lambda: store.clock[0])
+    for numbers in (drift, initial):
+        measured["numbers"][kind] = numbers
+        assert orch_role_raise.raise_due(reopened, tmp_path, store.clock[0]) == []
+    measured["numbers"][kind] = new
+    assert len(orch_role_raise.raise_due(reopened, tmp_path, store.clock[0])) == 1
+    assert orch_role_raise.raise_due(reopened, tmp_path, store.clock[0]) == []
+
+
+def test_projection_preserves_constraints_paths_and_unprojected_kind_numbers():
+    def facts(kind, numbers, **shared):
+        return {"files": ["b", "a"], "kinds": {kind: {"numbers": numbers, **shared}}}
+
+    old = facts("files_over_limit", {"limit": 500, "lines_by_file": {"a": 600}})
+    assert orch_role_raise.new_evidence(old, facts(
+        "files_over_limit", {"limit": 550, "lines_by_file": {"a": 600}}))
+    idle = {"idle_lanes": ["a", "b"], "ready_by_lane": {"c": 3}}
+    old = facts("idle_lanes_with_backlog", idle, binding={"kind": "cap", "normal": False})
+    assert not orch_role_raise.new_evidence(old, facts(
+        "idle_lanes_with_backlog", {**idle, "idle_lanes": ["b", "a"]},
+        binding={"kind": "cap", "normal": False}))
+    assert orch_role_raise.new_evidence(old, facts(
+        "idle_lanes_with_backlog", idle, binding={"kind": "cap", "normal": True}))
+    assert orch_role_raise.new_evidence(old, facts(
+        "idle_lanes_with_backlog", {**idle, "idle_lanes": ["a", "b", "d"]},
+        binding={"kind": "cap", "normal": False}))
+    assert not orch_role_raise.new_evidence({"files": ["a", "b"]}, {"files": ["b"]})
+    assert orch_role_raise.new_evidence({"files": ["a"]}, {"files": ["b"]})
+    assert orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 8}),
+                                        facts("lane_concentration", {"runs": 9}))
+
+
+def test_only_legacy_requests_without_facts_use_the_cooldown(store, tmp_path, measured):
+    measured["kinds"] = {"hot_overlap_files"}
+    legacy = orch_inbox.add_request(store, "gate", "old signal", {"role": "security", "signal": SIGNAL})
+    orch_role_raise.answer(store, legacy["id"], "called", "considered")
+    assert orch_role_raise.raise_due(store, tmp_path, NOW) == []
+    store.clock[0] = NOW + timedelta(hours=13)
+    assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1

@@ -33,6 +33,21 @@ def pending_hint(root: Path, n: int) -> tuple[bool, str | None]:
     return retry_marker(root, n).is_file(), hint
 
 
+def add_hint(store, n: int, message: str) -> None:
+    """Append ``message`` to issue ``n``'s undelivered advice, one blank line apart.
+
+    Every producer (``fa orch retry --hint``, ``fa lanes talk --message``) only adds
+    text under the state lock, so no producer can overwrite or drop another's
+    undelivered message; only ``consume_hint`` removes text, after delivery.
+    """
+    if not message.strip():
+        return
+    path = hint_path(store.root, n)
+    with store._state_lock():
+        unused = path.read_text(encoding="utf-8") if path.is_file() else ""
+        store._atomic_write(path, f"{unused.rstrip()}\n\n{message}" if unused.strip() else message)
+
+
 def consume_hint(root: Path, n: int, used: str | None) -> None:
     """Acknowledge the delivered hint ``used``; text added after it was read stays for the next attempt.
 
@@ -56,7 +71,7 @@ def consume_hint(root: Path, n: int, used: str | None) -> None:
                     temporary.replace(path)
                 else:
                     path.unlink(missing_ok=True)
-            # Otherwise someone replaced the hint (orch retry); it was not delivered.
+            # Producers only append, so a hint not starting with the delivered text was not delivered.
         retry_marker(root, n).unlink(missing_ok=True)
 
 

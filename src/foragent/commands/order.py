@@ -21,11 +21,16 @@ PUBLISH_EPILOG = '''PLAN.json schema (unknown fields are rejected):
       "base64": "<encoded image bytes>"}}
 }
 new_lanes, edits, checklist, blocked_by, files, and acceptance_files default to empty collections.
+An edit keeps every existing Done when command and checklist text, on open and closed issues, unless
+edits[].done_when_removals names each removed line: [{"line": "exact text", "reason": "why"}]. The
+line and reason stay readable on the issue. `fa order edit NUMBER --json` prints an edit to start from.
 edits[].blocked_by names this plan's issue keys and replaces the edited issue's native
 dependencies ([] clears them); omit it to keep them.
 A "## Waiting" section in a goal is the issue's wait (reason, next condition, responsible role);
 publication comments one line when it changes and nothing when it is unchanged.
 issues[].interactive is an optional boolean (default false); true adds the interactive label.
+decisions (issues and edits) optionally lists ledger IDs such as ["D79"]; publication writes one
+decision marker. Omitted keeps an issue's existing marker; [] clears its links.
 issues[].statements and edits[].statements are optional nonempty lists of one-line, plain-language
 behaviour statements, shown under "## Behaviour". Their presence selects the reviewed-tests route
 for good: a real publish (with or without approval) refuses the issue until its lane has written
@@ -105,6 +110,22 @@ def add(commands) -> None:
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
+    note = order_actions.add_parser("note", help=say("order_notes_help"))
+    note.add_argument("--defer", required=True, help=say("order_notes_defer_help"))
+    note.add_argument("--kind", choices=("decision", "idea", "rule"), required=True, help=say("order_notes_kind_help"))
+    note.add_argument("--text", required=True, help=say("order_notes_text_help"))
+    note.add_argument("--replaces", help=say("order_notes_replaces_help"))
+    note.add_argument("--replace", help=say("order_flush_replace_help"))
+    pending = order_actions.add_parser("pending", help=say("order_notes_pending_help"))
+    flush = order_actions.add_parser("flush", help=say("order_flush_help"))
+    flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
+    for command in (note, pending, flush):
+        command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+        command.add_argument("--json", action="store_true")
+    edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
+    edit.add_argument("number", type=int)
+    edit.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    edit.add_argument("--json", action="store_true")
     prepare = order_actions.add_parser("prepare", help=say("prepare_help"), description=say("prepare_help"))
     prepare.add_argument("plan", type=cli.Path)
     prepare.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -125,6 +146,8 @@ def add(commands) -> None:
     publish.add_argument("--approve-keys", type=cli._comma_keys, default=[])
     publish.add_argument("--approve-numbers", type=cli._comma_numbers, default=[])
     publish.add_argument("--dry-run", action="store_true")
+    publish.add_argument("--defer", help=say("order_submission_defer_help"))
+    publish.add_argument("--urgent", action="store_true", help=say("order_submission_urgent_help"))
 
 
 def _preread(args, root) -> int:
@@ -145,6 +168,8 @@ def _preread(args, root) -> int:
                                           f"{len(result['unknowns'])} unknown(s)"))
             for unknown in result["unknowns"]:
                 print(f"  - {unknown}")
+            if "current" in result:
+                print(result["current"])
     return 0
 
 
@@ -211,6 +236,12 @@ def _perspectives(args, root) -> int:
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if args.action == "flush":
+        from foragent import order_flush
+        return order_flush.run(args, root)
+    if args.action in {"note", "pending"}:
+        from foragent import order_notes
+        return order_notes.run(args, root)
     if args.action == "progress":
         _config, _repo, store = repo_store(root)
         fields = {name: getattr(args, name) for name in
@@ -231,15 +262,21 @@ def run(args) -> int:
     if args.action == "context":
         print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
         return 0
+    if args.action == "edit":
+        from foragent import order_done_when
+        # A read like context: it records nothing and leaves the issue as it is.
+        print(cli.json.dumps(order_done_when.seed(tracker.get_issue(args.number)), ensure_ascii=False))
+        return 0
     tracker = cli.RunContext(repo=repo, repo_root=root, tracker=tracker,
                              store=cli.StateStore.for_repo(repo), config=config, git=git,
                              now=lambda: cli.datetime.now(cli.UTC)).tracker
     plan = cli.order.read_plan(args.plan)
-    print(cli.order.publish(
+    report = cli.order.publish(
         plan, root, config, tracker, repo=repo, git=git,
         approve=args.approve, approve_keys=args.approve_keys,
-        approve_numbers=args.approve_numbers, dry_run=args.dry_run,
-    ).summary())
-    if not args.dry_run:
+        approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
+    )
+    print(report.summary())
+    if not args.dry_run and report.waiting_for is None:
         cli._open_lane_view(root)
     return 0

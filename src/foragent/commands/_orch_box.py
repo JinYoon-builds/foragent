@@ -17,6 +17,7 @@ def _add_inbox(orch_actions) -> None:
     request_status.add_argument("id")
     request_status.add_argument("status", choices=cli.orch_inbox.REQUEST_STATUSES)
     request_status.add_argument("--note")
+    request_status.add_argument("--answer", help="What was done to complete the request")
     ask = orch_actions.add_parser("ask", help="Record a D71 human question in the box")
     ask.add_argument("--question", required=True)
     ask.add_argument("--option", action="append", default=[])
@@ -35,6 +36,8 @@ def _add_inbox(orch_actions) -> None:
     note.add_argument("--now")
     note.add_argument("--person-found", dest="person_found",
                       help="Record one problem the person found before the retrospective")
+    note.add_argument("--retrospective", action="store_true",
+                      help="Mark this note as the record of a finished retrospective")
     note.add_argument("--why")
     note.add_argument("--next", dest="next_step")
     note.add_argument("--where-title", "--orca-title", dest="where_title", help="Orca tab title, e.g. orch: <project>")
@@ -164,19 +167,28 @@ def _orch_inbox(args, store, config, repo: str) -> None:
         orch_plan_cli.lane_queue(args, store, config)
         return
     if args.action == "request":
-        record = box.add_request(store, args.source, args.text)
+        from foragent import orch_role_decisions
+
+        record = orch_role_decisions.add_request(store, config, args.source, args.text)
         print(f"Request {record['id']} saved ({record['status']}).")
     elif args.action == "request-status":
-        record = box.set_request_status(store, args.id, args.status, args.note)
+        from foragent import orch_role_decisions
+
+        record = orch_role_decisions.request_status(store, config, args.id, args.status, args.note, args.answer)
         print(f"Request {record['id']}: {record['status']}.")
     elif args.action == "note":
+        writes_note = args.now is not None or args.person_found is None or args.retrospective
+        if writes_note:  # Refuse before the person-found event below, so a refused command writes nothing.
+            box.require_note_text(args.now or "")
         if args.person_found is not None:
             event = box.person_found(store, args.person_found)
             print(f"Person-found event recorded at {event['at']}.")
-        if args.now is not None or args.person_found is None:
+        if writes_note:
             where = box.note_location(dict(cli.os.environ), args.where_title, args.tmux_pane)
-            record = box.write_note(store, args.now or "", args.why, args.next_step, where)
-            print(f"Note saved at {record['at']} ({where['kind']}).")
+            record = box.write_note(store, args.now or "", args.why, args.next_step, where,
+                                    retrospective=args.retrospective)
+            label = "Retrospective note" if args.retrospective else "Note"
+            print(f"{label} saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
         record = box.ask(store, args.question, args.option, args.recommend, args.issues, args.kind)
         pushed = box.route_question(store, config, repo, record)

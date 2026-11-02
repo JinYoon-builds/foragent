@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
 def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent.run_checks import _verify_implementation
     from foragent.run_conflicts import _block_rebuild, _merge_moved_base, _resolve_conflicts
-    from foragent import harness_guard, run_group_check, run_group_evidence, runner
+    from foragent import harness_guard, run_group_check, run_group_ci, run_group_evidence, runner
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -54,6 +54,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
     def refresh_base(move: BaseMove, conflicts: list[str] | None = None) -> str:
         # Only the run's time budget (finish_base) bounds repeated base moves (#712).
+        run_publish._phase(n, ctx, "checking")
         neutral = conflicts is None and run_publish.base_move_is_neutral(attempt, move)
         run_publish._append(log, f"{run_publish.REUSED if neutral else run_publish.REVERIFY}: {move.target_sha}")
         # Exclude the merged base's paths from policy and patch replay. The
@@ -154,9 +155,23 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             raise run_publish.ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         run_publish._ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
 
+    def reuse(target: str) -> bool:
+        """Every base-move point asks this: does the joint pass verify this exact head on ``target``?"""
+        nonlocal verified_base_sha, reused_base
+        if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
+            return False
+        if (run_publish.enabled(ctx, attempt.target_branch)
+                and run_group_ci.evidence(attempt, verified_head_sha, target) is None):
+            return False
+        if run_group_evidence.note(n, ctx, verified_head_sha, target, run_group_evidence.neutral_rule(attempt)):
+            return False
+        verified_base_sha = reused_base = target  # group-reuse: no refresh, recheck or push
+        return True
+
     ci_wait = run_publish._CIWait(pr_ready_at)
     queued_status = None
     group_checked: set = set()
+    reused_base = None
     # Base moves are bounded only by the run's time budget, which refresh_base checks.
     while True:
         run_publish._phase(n, ctx, "ci")
@@ -166,7 +181,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             return stopped
         queued_status = None
         # Wait for the FIFO turn without re-verifying; CI is checked again on getting it (#712).
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr)
         if stopped:
             return stopped
         if waited:
@@ -177,17 +192,24 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         # The final snapshot still detects changes during lock acquisition.
         ctx.git.fetch("origin", attempt.target_branch)
         target_sha = git.ref_sha(f"origin/{attempt.target_branch}")
-        if target_sha != verified_base_sha:
-            run_group_evidence.note(n, ctx, verified_head_sha, target_sha)  # recorded only; no reuse yet
+        if target_sha != verified_base_sha and not reuse(target_sha):
             target_sha = refresh_base(run_publish.capture_move(git, target_sha))
             if stopped := publish_refresh(target_sha):
                 return stopped
             continue
-        # Consecutive ready FIFO runs share one complete check on this main, outside the merge lock.
-        run_group_check.check(n, ctx, place, verified_head_sha, verified_base_sha, group_checked)
+        if reused_base != verified_base_sha:  # Consecutive ready FIFO runs share one check, outside the lock.
+            run_group_check.check(n, ctx, place, verified_head_sha, verified_base_sha, group_checked)
 
         comparison = None
         if run_publish.enabled(ctx, attempt.target_branch):
+            comparison = run_group_ci.evidence(attempt, verified_head_sha, verified_base_sha)
+            if comparison is None and reused_base == verified_base_sha:
+                target_sha = refresh_base(run_publish.capture_move(git, verified_base_sha))
+                reused_base = None
+                if stopped := publish_refresh(target_sha):
+                    return stopped
+                continue
+        if comparison is None and run_publish.enabled(ctx, attempt.target_branch):
             comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
                                                         base_sha=verified_base_sha, status=ci_wait.status,
                                                         deadline=ci_wait.deadline)
@@ -211,7 +233,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 move = run_publish.capture_move(git, inputs.base_sha)
             if continue_merge and move is None and inputs.comparison_current:
                 run_publish._check_publication(git, attempt.target_branch, inputs.base_sha)
-                run_publish._phase(n, ctx, "merging")
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
                 subject = run_publish.retitle_for_merge(
                     ctx, pr, title=title, current_title=attempt.pr_title,
@@ -259,7 +280,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
-            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge)
+            run_publish.merge_turn.rejoin_after_failed_merge(n, ctx, place, failed_merge, pr)
             queued_status = None
             continue
         if inputs.stop is not None:
@@ -270,6 +291,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             queued_status = inputs.status
             continue
         if move is not None:
+            if reuse(move.target_sha):
+                continue
             # Pin the observed base; all merging/rechecks/pushes run unlocked.
             target_sha = refresh_base(move)
             if stopped := publish_refresh(target_sha):

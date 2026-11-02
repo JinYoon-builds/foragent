@@ -59,5 +59,5 @@ from foragent.run_publish_flow import (  # noqa: E402
     _publish, _publish_in_turn, _publish_locked,
 )
 from foragent.run_publish_reviewed import (  # noqa: E402
-    _publish_reviewed_head, _publish_reviewed_in_turn,
+    _publish_reviewed_head, _publish_reviewed_in_turn, _refresh_reviewed_head, _reviewed_base_changed,
 )

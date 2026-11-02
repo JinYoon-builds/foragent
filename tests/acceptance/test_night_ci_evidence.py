@@ -62,6 +62,14 @@ def test_shard_rejection_names_the_field_and_expected_and_observed_values(path, 
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = actual
+    if path == ("run", "conclusion"):
+        # Preserve this parameter's original ID and every following auto ID.
+        # Complete trusted evidence is accepted; the passing set still decides
+        # regression rather than the measurement run's conclusion.
+        assert compare([value])[0] == []
+        value["report"]["head"]["passing_ids"] = []
+        assert compare([value])[0] == sorted(value["report"]["base"]["passing_ids"])
+        return
     with pytest.raises(UnusableComparison) as caught:
         compare([value])
     message = str(caught.value)
