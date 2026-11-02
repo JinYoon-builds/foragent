@@ -121,28 +121,16 @@ class ComparisonEvidence:
             return _refusal(exc), str(exc)
 
 
-def ci_protection(ctx):
-    """CI owns portable protection even when a target cannot produce evidence."""
-    return (ctx.config.checks == "ci" and ctx.config.checks_fallback != "local"
-            and acceptance_command(ctx.config, ctx.repo_root) is not None)
-
-
-def ci_evidence_target(ctx, target_branch):
-    """The generated acceptance workflow runs only against the configured base."""
-    return target_branch == ctx.config.base_branch
-
-
-def enabled(ctx, target_branch):
-    return (ci_protection(ctx)
-            or (ctx.config.checks == "ci" and ci_evidence_target(ctx, target_branch)
-                and acceptance_command(ctx.config, ctx.repo_root) is not None))
+def enabled(ctx):
+    """CI mode is a project setting; every run targets the configured base."""
+    return ctx.config.checks == "ci" and acceptance_command(ctx.config, ctx.repo_root) is not None
 
 
 def commit_exclusions(attempt, title):
     """Carry the current selection on a content/merge commit, or one empty commit."""
     git = attempt.git
     committing = git.has_staged_changes() or git.merge_in_progress()
-    if enabled(attempt.ctx, attempt.target_branch):
+    if enabled(attempt.ctx):
         excluded = _baseline_exclusions(attempt.ctx, git.ref_sha(attempt.start_ref), attempt.log)
         excluded = sorted(set(excluded))
         if not committing:
@@ -374,12 +362,6 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
-    if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
-        detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
-                  "(checks: ci, no local fallback)")
-        _note_evidence(ctx, n, base_sha, head, "target-unsupported", detail)
-        flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
-        raise ExecutorStopped("held", detail)
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
@@ -465,7 +447,7 @@ def review_checks(n, ctx, git, target_branch):
         changed = git.changed_paths(base)
         own = _related_unit_tests(git.root, changed, ctx.config.acceptance_dir,
                                   own_only=ctx.config.runner_unit_tests != "all"
-                                  and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
+                                  and (enabled(ctx) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
             harness_guard.guard_comparison(attempt, git.head_sha())  # as the head is after the local-only run
             checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))

@@ -146,11 +146,11 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     if attempt.review_hold:
         return review_held()
 
-    def policy_hold(decision: Decision, batch_branch: str | None = attempt.batch_branch) -> str | None:
+    def policy_hold(decision: Decision) -> str | None:
         if decision.kind == "hold":
             run_publish.flag(ctx, n, decision.reason, decision.summary, link)
             return "held"
-        if not run_publish._policy_allows(decision, attempt.target_branch, batch_branch):
+        if not run_publish._policy_allows(decision):
             ctx.store.update_run(n, detail=f"PR #{pr} is waiting for your review.")
             ctx.tracker.comment(n, f"PR #{pr} is waiting for your review\n\n{link}")
             ctx.tracker.remove_labels(n, [run_publish.RUNNING])
@@ -190,7 +190,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         nonlocal verified_base_sha, reused_base
         if run_group_check.group_limit(ctx.store, ctx.config)[0] <= 1:
             return False
-        if (run_publish.enabled(ctx, attempt.target_branch)
+        if (run_publish.enabled(ctx)
                 and run_group_ci.evidence(attempt, verified_head_sha, target) is None):
             return False
         if run_group_evidence.note(n, ctx, verified_head_sha, target, run_group_evidence.neutral_rule(attempt)):
@@ -208,7 +208,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         with activity(n, ctx, "ci", ci_cause):
             stopped = run_publish._wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
                                                ci_wait, ci_failed, queued_status,
-                                               comparison_mode=run_publish.enabled(ctx, attempt.target_branch))
+                                               comparison_mode=run_publish.enabled(ctx))
         if stopped:
             return stopped
         queued_status = None
@@ -233,7 +233,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             run_group_check.check(n, ctx, place, verified_head_sha, verified_base_sha, group_checked)
 
         comparison = None
-        if run_publish.enabled(ctx, attempt.target_branch):
+        if run_publish.enabled(ctx):
             comparison = run_group_ci.evidence(attempt, verified_head_sha, verified_base_sha)
             if comparison is None and reused_base == verified_base_sha:
                 target_sha = refresh_base(run_publish.capture_move(git, verified_base_sha), cause="group-failed")
@@ -241,7 +241,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 if stopped := publish_refresh(target_sha):
                     return stopped
                 continue
-        if comparison is None and run_publish.enabled(ctx, attempt.target_branch):
+        if comparison is None and run_publish.enabled(ctx):
             comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
                                                         base_sha=verified_base_sha, status=ci_wait.status,
                                                         deadline=ci_wait.deadline)
@@ -258,7 +258,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             move = None
             continue_merge = (
                 inputs.stop is None
-                and run_publish._policy_allows(inputs.decision, attempt.target_branch, inputs.batch_branch)
+                and run_publish._policy_allows(inputs.decision)
                 and inputs.status in {"pass", "none"}
             )
             if continue_merge and inputs.base_sha != verified_base_sha:
@@ -290,10 +290,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         runner.after_merge(ctx, pr, attempt.target_branch)
                     run_publish._progress(n, ctx)
                     try:
-                        if attempt.target_branch == attempt.batch_branch:
-                            ctx.tracker.close_issue(n, f"Merged into {attempt.batch_branch} (PR #{pr})")
-                        else:
-                            ctx.tracker.close_issue(n)
+                        ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
                         if exc.is_rate_limit:
                             raise
@@ -301,13 +298,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                             raise
                     ctx.tracker.remove_labels(n, [run_publish.READY, run_publish.RUNNING])
                     run_publish.board.sync_status(ctx, n, "Done")
-                    if attempt.target_branch == attempt.batch_branch and attempt.parent is not None:
-                        try:
-                            run_publish._batch_pr(attempt.parent, ctx)
-                        except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
-                                raise
-                            run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     run_publish._progress(n, ctx)
                     return "merged"
         if failed_merge is not None:
@@ -317,7 +307,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             continue
         if inputs.stop is not None:
             return inputs.stop()
-        if stopped := policy_hold(inputs.decision, inputs.batch_branch):
+        if stopped := policy_hold(inputs.decision):
             return stopped
         if not continue_merge or (move is None and not inputs.comparison_current):
             queued_status = inputs.status

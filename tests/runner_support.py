@@ -190,26 +190,6 @@ def enable_reviewer(case, messages, edit=None):
     return calls
 
 
-def seed_batch(case, files):
-    branch = "foragent/batch-99"
-    stream = [
-        f"commit refs/heads/{branch}\n",
-        "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-        f"data 7\nSibling\nfrom {case.history.tip}\n",
-    ]
-    for path, content in files.items():
-        stream.append(f"M 100644 inline {path}\ndata {len(content.encode())}\n{content}\n")
-    git_command(case.history.origin, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
-
-
-def batch_setup(case):
-    case.ctx.config = replace(case.ctx.config, review="batch")
-    case.tracker.add_issue(99, "The whole feature")
-    case.tracker.set_parent(1, 99)
-    case.tracker.set_pr_files(100, ["feature.txt"])
-    case.tracker.set_pr_checks(100, "pass")
-
-
 REPORTED_JSON_FINDINGS = [
     {"file": "src/foragent/runner.py", "line": 121, "summary": "JSON 배열 지적이 판정 불가로 처리됨",
      "failure_scenario": '리뷰가 [{"file": "src/file.py"}] 형식이면 수정 대신 보류됨'},

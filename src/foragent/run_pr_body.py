@@ -225,8 +225,6 @@ def merge_retitle_body(head: str, ctx) -> Body | None:
     number = pr_issue_number(head)
     if number is None:
         return None
-    if head.startswith("foragent/batch-"):
-        return batch_body(number, ctx)
     values = read_values(number, ctx)
     if values is None:
         return None
@@ -234,18 +232,3 @@ def merge_retitle_body(head: str, ctx) -> Body | None:
         return _compose_values(number, ctx, values)
     except ExecutorStopped:
         return None
-
-
-def batch_body(parent: int, ctx) -> Body:
-    """Children and merged PRs come from the tracker; no closing keyword, so completion stays with
-    the gate's order aggregation (board_parents)."""
-    from foragent.i18n import text
-
-    branch = f"foragent/batch-{parent}"
-    prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    children = []
-    for child in sorted(ctx.tracker.sub_issues(parent), key=lambda c: c.number):
-        pr = prs.get(f"foragent/issue-{child.number}")
-        children.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
-    return compose([text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", "",
-                    Block("children", "\n".join(children))])

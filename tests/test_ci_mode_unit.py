@@ -21,48 +21,20 @@ from foragent.config import Config, ConfigError, load_config
 from runner_support import run_case
 
 
-@pytest.mark.parametrize('checks,command,fallback,protected', [
+@pytest.mark.parametrize('checks,command,fallback,expected', [
     ('ci', 'pytest', None, True),
-    ('ci', 'pytest', 'local', False),
+    ('ci', 'pytest', 'local', True),
     ('ci', 'npm test', None, False),
     ('local', 'pytest', None, False),
 ])
-@pytest.mark.parametrize('target', ['trunk', 'foragent/batch-20'])
-def test_ci_protection_is_independent_of_evidence_target(tmp_path, checks, command, fallback, protected, target):
+def test_ci_protection_is_independent_of_evidence_target(tmp_path, checks, command, fallback, expected):
+    """CI mode follows checks alone: runs always target the configured base."""
     from foragent import ci_mode
 
     ctx = SimpleNamespace(repo_root=tmp_path, config=Config(
         checks=checks, test_command=command, checks_fallback=fallback, base_branch='trunk'))
-    assert ci_mode.ci_protection(ctx) is protected
-    assert ci_mode.ci_evidence_target(ctx, target) is (target == 'trunk')
-    expected = protected or (checks == 'ci' and command == 'pytest' and target == 'trunk')
-    assert ci_mode.enabled(ctx, target) is expected
-
-
-def test_ci_batch_target_holds_without_polling_or_local_comparison(tmp_path, monkeypatch):
-    from conftest import BASE_TIME
-    from foragent import ci_local, ci_mode
-    from foragent.reasons import Reason
-    from foragent.run_attempt import ExecutorStopped
-
-    def unexpected(*args):
-        pytest.fail('An unsupported CI target must neither poll nor fall back locally')
-
-    ctx = SimpleNamespace(repo='owner/repo', repo_root=tmp_path, now=lambda: BASE_TIME,
-                          config=Config(checks='ci', test_command='pytest'), sleep=unexpected,
-                          tracker=SimpleNamespace(pr_default_branch=lambda: 'main',
-                                                  pr_acceptance_reports=unexpected))
-    attempt = SimpleNamespace(n=1, ctx=ctx, target_branch='foragent/batch-20', log=tmp_path / 'log',
-                              git=SimpleNamespace(ref_sha=lambda ref: 'trusted', _call=lambda args: ''))
-    flags = []
-    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
-    monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
-    monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
-    with pytest.raises(ExecutorStopped, match='target foragent/batch-20 cannot obtain.*CI evidence') as exc:
-        ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
-    assert exc.value.outcome == 'held'
-    assert len(flags) == 1
-    assert flags[0][2] == Reason.ACCEPTANCE_BASELINE_UNAVAILABLE
+    assert ci_mode.enabled(ctx) is expected
+    assert not hasattr(ci_mode, 'ci_protection') and not hasattr(ci_mode, 'ci_evidence_target')
 
 
 def report(index=0, count=2):

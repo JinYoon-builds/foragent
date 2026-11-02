@@ -148,7 +148,7 @@ def check(
 
     if group_limit(ctx.store, ctx.config)[0] <= 1:
         return
-    ci = enabled(ctx, place.target)
+    ci = enabled(ctx)
     if ci:
         from foragent.run_group_evidence import latest
 

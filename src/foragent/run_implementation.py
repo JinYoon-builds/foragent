@@ -198,7 +198,7 @@ def capture_acceptance_baseline(
         test_command = next(iter(runner.detect_test_commands(git.root)), None)
     try:
         started = ctx.monotonic()
-        if enabled(ctx, target_branch):
+        if enabled(ctx):
             from foragent.run_baseline import _baseline_exclusions
             base_sha = git.ref_sha(ref)
             baseline = capture_local_only(n, ctx, git, test_command, base_sha,
@@ -226,12 +226,11 @@ EMPTIED = "Acceptance baseline verification skipped (count=0): no protected node
 def follow_base(attempt: Implementation) -> None:
     """Keep the protected set on the base the branch is built on (#483).
 
-    Every step that adopts a newer base (a result-affecting move, a rebuild,
-    a switch between batch and base targets) changes ``start_ref``. Checks
-    call this before verifying, so none of them can verify against the
-    protected set and exclusions of an older base. The command is the one the
-    protected set was captured with: the branch may have changed the files
-    test-command detection reads.
+    Every step that adopts a newer base (a result-affecting move or a
+    rebuild) changes ``start_ref``. Checks call this before verifying, so
+    none of them can verify against the protected set and exclusions of an
+    older base. The command is the one the protected set was captured with:
+    the branch may have changed the files test-command detection reads.
     """
     if attempt.baseline_sha is None:
         return
@@ -276,7 +275,7 @@ def follow_base(attempt: Implementation) -> None:
         from foragent.ci_mode import enabled
         from foragent.run_baseline import log_dropped_ids
         log_dropped_ids(attempt.log, previous, baseline.node_ids, owned, missing, baseline,
-                        enabled(attempt.ctx, attempt.target_branch))
+                        enabled(attempt.ctx))
         if not baseline.node_ids:
             # Every survivor fails on the new base: as final as protection lost by collection.
             _append(attempt.log, EMPTIED)
@@ -295,8 +294,6 @@ def _prepare_implementation(
     worktree = git.root
     branch = f"foragent/issue-{n}"
     base_ref = f"origin/{ctx.config.base_branch}"
-    parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
-    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     start_ref = f"origin/{target_branch}"
     approved_ref = start_ref
     executor = ctx.executor_factory(ctx.config.executor)
@@ -324,8 +321,6 @@ def _prepare_implementation(
         worktree=worktree,
         branch=branch,
         base_ref=base_ref,
-        parent=parent,
-        batch_branch=batch_branch,
         target_branch=target_branch,
         start_ref=start_ref,
         approved_ref=approved_ref,

@@ -411,10 +411,10 @@ def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: boo
 def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
     """The approval of a linked issue's PR and the configured base SHA its locks must match.
 
-    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    Dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
     """
     number = pr_issue_number(pr.head)
-    if number is None or pr.head.startswith("foragent/batch-"):
+    if number is None:
         return None
     if (approval := ctx.store.load_approval(number)) is None:
         return None
@@ -594,8 +594,7 @@ def _merge_title(ctx: RunContext, pr: PullRequest) -> str:
     """The issue's current title decides the squash subject; unlinked PRs keep theirs."""
     if (number := pr_issue_number(pr.head)) is None:
         return pr.title
-    title = f"{ctx.tracker.get_issue(number).title} (#{number})"
-    return f"Batch: {title}" if pr.head.startswith("foragent/batch-") else title
+    return f"{ctx.tracker.get_issue(number).title} (#{number})"
 
 
 def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -> str:

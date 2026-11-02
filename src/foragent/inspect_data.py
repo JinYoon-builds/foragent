@@ -181,7 +181,7 @@ def collect(ctx: InspectContext) -> Inbox:
     open_prs = sorted(ctx.tracker.list_prs("open", "foragent/"), key=lambda pr: pr.number)
     linked = {}
     for pr in open_prs:
-        if match := re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head):
+        if match := re.fullmatch(r"foragent/issue-(\d+)", pr.head):
             linked.setdefault(int(match[1]), pr)
     items = []
     for issue in issues.values():
@@ -212,7 +212,7 @@ def collect(ctx: InspectContext) -> Inbox:
         ))
 
     for pr in open_prs:
-        match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", pr.head)
+        match = re.fullmatch(r"foragent/issue-(\d+)", pr.head)
         if not match:
             continue
         number = int(match[1])

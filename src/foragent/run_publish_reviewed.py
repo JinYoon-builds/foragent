@@ -59,7 +59,7 @@ def _refresh_reviewed_head(
 
 def _publish_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
-    approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    approval: Approval, approved: Callable[[], bool],
     *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
 ) -> str:
     # The review-only merge takes the same FIFO turn as an implementation run (#712).
@@ -67,7 +67,7 @@ def _publish_reviewed_head(
     outcome = error = None
     try:
         outcome = run_publish._publish_reviewed_in_turn(
-            n, ctx, git, pr, head, base_ref, base_sha, approval, approved, batch_branch, parent,
+            n, ctx, git, pr, head, base_ref, base_sha, approval, approved,
             place, comparison_attempt=comparison_attempt, reverify=reverify,
         )
         return outcome
@@ -82,7 +82,7 @@ def _publish_reviewed_head(
 
 def _publish_reviewed_in_turn(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, base_ref: str, base_sha: str,
-    approval: Approval, approved: Callable[[], bool], batch_branch: str | None, parent: int | None,
+    approval: Approval, approved: Callable[[], bool],
     place: merge_turn.Seat, *, comparison_attempt=None, reverify: Callable[[str], str | None] | None = None,
 ) -> str:
     """Merge a reviewed head on its turn; ``reverify`` re-runs its checks after a base merge.
@@ -130,11 +130,11 @@ def _publish_reviewed_in_turn(
         ci_wait, queued_status = run_publish._CIWait(started), None
         return None
 
-    def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
+    def policy_hold(decision: Decision) -> str | None:
         if decision.kind == "hold":
             run_publish.flag(ctx, n, decision.reason, decision.summary, link)
             return "held"
-        if not run_publish._policy_allows(decision, pr.base, current_batch):
+        if not run_publish._policy_allows(decision):
             run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR is waiting for your review.", link)
             return "pr-open"
         return None
@@ -209,7 +209,7 @@ def _publish_reviewed_in_turn(
                 approved_body_sha=approval.body_sha,
                 comparison=comparison,
             )
-            continue_merge = (inputs.stop is None and run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch)
+            continue_merge = (inputs.stop is None and run_publish._policy_allows(inputs.decision)
                               and inputs.status in {"pass", "none"} and inputs.comparison_current)
             # A base that moved during lock acquisition is refreshed unlocked, like the implementation path.
             moved = continue_merge and inputs.base_sha != base_sha
@@ -239,23 +239,13 @@ def _publish_reviewed_in_turn(
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:
-                        if pr.base == batch_branch:
-                            ctx.tracker.close_issue(n, f"Merged into {batch_branch} (PR #{pr.number})")
-                        else:
-                            ctx.tracker.close_issue(n)
+                        ctx.tracker.close_issue(n)
                     except run_publish.TrackerError as exc:
                         if exc.is_rate_limit:
                             raise
                         if ctx.tracker.current_issue(n).state != "closed":
                             raise
                     ctx.tracker.remove_labels(n, [run_publish.READY, run_publish.RUNNING, run_publish.BLOCKED])
-                    if pr.base == batch_branch and parent is not None:
-                        try:
-                            run_publish._batch_pr(parent, ctx)
-                        except (run_publish.GitError, run_publish.TrackerError) as exc:
-                            if isinstance(exc, run_publish.TrackerError) and exc.is_rate_limit:
-                                raise
-                            run_publish._append(log, f"Batch PR finalization deferred to tick: {exc}")
                     return "merged"
         if failed_merge is not None:
             # Re-enter at the FIFO tail for a later turn instead of ending the run (#712).
@@ -264,7 +254,7 @@ def _publish_reviewed_in_turn(
             continue
         if inputs.stop is not None:
             return inputs.stop()
-        if stopped := policy_hold(inputs.decision, inputs.batch_branch):
+        if stopped := policy_hold(inputs.decision):
             return stopped
         if moved:
             if reuse(inputs.base_sha):

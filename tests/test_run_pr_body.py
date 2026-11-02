@@ -14,7 +14,6 @@ from foragent.run_pr_body import (
     LIMIT,
     Block,
     _pr_body,
-    batch_body,
     compose,
     load_values,
     merge_retitle_body,
@@ -357,16 +356,17 @@ def test_merge_retitle_writes_nothing_when_its_record_cannot_be_composed(run_cas
 
 
 def test_merge_retitle_body_of_a_batch_comes_from_the_tracker(run_case):  # noqa: F811
-    from runner_support import batch_setup
-
+    """A retired foragent/batch-N head gets no aggregate body; a parented run merges on the base."""
     from foragent.runner import run_issue
 
     c = run_case
-    batch_setup(c)
+    c.tracker.add_issue(99, "The whole feature")
+    c.tracker.set_parent(1, 99)
+    c.tracker.set_pr_files(100, ["feature.txt"])
+    c.tracker.set_pr_checks(100, "pass")
     assert run_issue(1, c.ctx) == 'merged'
-    assert merge_retitle_body('foragent/batch-99', c.ctx) == batch_body(99, c.ctx)
-    body = batch_body(99, c.ctx)
-    assert body.startswith('Sub-issues of #99') and 'Closes #99' not in body and '## Children' in body
+    assert [pr.base for pr in c.tracker.created_prs] == [c.ctx.config.base_branch]
+    assert merge_retitle_body('foragent/batch-99', c.ctx) is None
 
 
 def test_an_update_after_a_review_also_posts_its_comments(tmp_path):

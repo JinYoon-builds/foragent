@@ -509,7 +509,6 @@ def _check_protected(attempt: Implementation) -> CheckResult:
 
 def _verify_contents(attempt: Implementation) -> str:
     from foragent import runner
-    from foragent.run_conflicts import _prepare_target
     from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
@@ -518,8 +517,6 @@ def _verify_contents(attempt: Implementation) -> str:
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "checking")
     git.stage_changes()
-    if not _prepare_target(attempt):
-        raise ExecutorStopped("hash-mismatch")
     attempt.paths = git.changed_paths(attempt.start_ref)
     _progress(n, ctx)
     attempt.checks = []
@@ -544,7 +541,7 @@ def _verify_contents(attempt: Implementation) -> str:
             _append(log, f"Acceptance baseline verification count={len(attempt.baseline.node_ids)}, "
                     f"exit_code={result.exit_code}, timed_out={result.timed_out}")
             _progress(n, ctx)
-            if not enabled(ctx, attempt.target_branch):
+            if not enabled(ctx):
                 previous = ctx.store.get_run(n).comparison or {}
                 ctx.store.update_run(n, comparison={"source": "local", "duration_seconds":
                     previous.get("duration_seconds", 0) + max(0, ctx.monotonic() - started)})
@@ -554,7 +551,7 @@ def _verify_contents(attempt: Implementation) -> str:
         unit_command = _pytest_command(test_command) if test_command else None
         unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
                                          own_only=ctx.config.runner_unit_tests != "all"
-                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+                                         and (enabled(ctx) or trusts_ci(worktree, ctx.config)))
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
@@ -575,8 +572,6 @@ def _verify_contents(attempt: Implementation) -> str:
         elif unit_tests:
             _append(log, "Related unit tests skipped: no supported pytest command is known")
         git.stage_changes()
-        if not _prepare_target(attempt):
-            raise ExecutorStopped("hash-mismatch")
         attempt.paths = git.changed_paths(attempt.start_ref)
         harness_guard.guard_staged(attempt)  # a command committed a harness change: that, not the result, decides
         checked_tree = git.staged_tree_sha()

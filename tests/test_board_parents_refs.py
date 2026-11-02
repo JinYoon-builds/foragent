@@ -367,7 +367,8 @@ def test_batch_step_gets_the_budget_again_once_parents_are_done(parent_case, mon
         tick(tick_context(case, start_runs=False))
         spent.append([call[0] for call in latency.calls if call[2] and call[3] == 4.0])
     assert all(case.tracker.issues[number].state == "closed" for number in (10, 20, 30))
-    assert "issues_closed_since" in spent[-1] and "find_pr" in spent[-1], f"The batch step runs again: {spent}"
+    # Batch PR reconciliation is retired; the closed-issue observation keeps its budget share.
+    assert "issues_closed_since" in spent[-1] and "find_pr" not in spent[-1], f"The step runs again: {spent}"
 
 
 def test_a_record_waiting_on_an_unlisted_reference_leaves_the_batch_step_running(parent_case, monkeypatch):  # noqa: F811

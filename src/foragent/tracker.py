@@ -190,7 +190,7 @@ class CIEvidence(str):
 
 
 def pr_issue_number(head: str) -> int | None:
-    match = re.fullmatch(r"foragent/(?:issue|batch)-(\d+)", head)
+    match = re.fullmatch(r"foragent/issue-(\d+)", head)
     return int(match[1]) if match else None
 
 

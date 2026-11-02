@@ -25,7 +25,7 @@ from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
 from foragent.scheduler_stop import runner_process_exists, tick_processes
-from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
+from foragent.runner import _append, _preserve_failed_implementation
 from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
     _machine_budget, _reopen_view, _reserve_slot, _start_ready, append_budget_history, append_memory_hold,
@@ -75,8 +75,8 @@ from foragent.scheduler_recovery import (  # noqa: E402
     _restore_after_crash, _restore_stalled, _reap_inactive_runs,
 )
 from foragent.scheduler_checks import (  # noqa: E402
-    _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _open_pr,
-    _reconcile_batches,
+    _blockers, _check_prerequisites, _confirmed_read, _escalate_overdue_blocker, _label_events, _observe_closed_issues,
+    _open_pr,
 )
 from foragent.scheduler_config import fetch_base  # noqa: E402
 from foragent.scheduler_lanes import (  # noqa: E402
@@ -171,12 +171,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             recovered = before - {run.number for run in ctx.store.active_runs()}
     else:
         recovered = set()
-    optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
-    if listing_current:  # Parents first: batch reads repeat every tick, while parent work ends.
+    optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Parent and closed-issue reads share it.
+    if listing_current:  # Parents first: the closed-issue read repeats every tick, while parent work ends.
         with step("parent_sync"):
             _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
-    with step("batch_reconcile"):
-        _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
+    with step("closed_observation"):
+        _optional_step(ctx, report, optional, "closed_observation", lambda: _observe_closed_issues(ctx))
     ready: dict[str, list[int]] = {}
     unknown: set[str] = set()
 
@@ -324,7 +324,7 @@ def _one_line(exc: Exception) -> str:
 
 
 def _optional_step(ctx: TickContext, report: TickReport, budget: gh.Budget, name: str, call: Callable[[], None]) -> None:
-    """Run batch or parent work within the tick's shared gh budget; a failure defers it, not the starts.
+    """Run optional gh work within the tick's shared budget; a failure defers it, not the starts.
 
     A GitHub rate limit still pauses the tick. The deferral stays visible in the
     report and the orchestrator journal; the next tick runs the step again.

@@ -31,7 +31,7 @@ def touched(paths: list[str], globs: list[str]) -> list[str]:
 
 
 def review_mode_for(paths: list[str], config: Config) -> str:
-    levels = {"fast": 0, "batch": 1, "careful": 2}
+    levels = {"fast": 0, "careful": 1}
     modes = [config.review, *(mode for glob, mode in config.review_paths.items() if touched(paths, [glob]))]
     return max(modes, key=levels.__getitem__)
 

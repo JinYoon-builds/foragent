@@ -1,4 +1,4 @@
-"""The final merge lock, its re-read inputs and the batch PR."""
+"""The final merge lock, its re-read inputs and the merge retitle."""
 
 from __future__ import annotations
 
@@ -45,10 +45,8 @@ def _merge_lock(n: int, ctx: RunContext):
                     ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
-def _policy_allows(decision: Decision, base: str, batch_branch: str | None) -> bool:
-    return decision.kind == "merge" or (
-        decision.kind == "hold_mode" and decision.mode != "careful" and base == batch_branch
-    )
+def _policy_allows(decision: Decision) -> bool:
+    return decision.kind == "merge"
 
 
 @dataclass
@@ -59,7 +57,6 @@ class _MergeInputs:
     paths: list[str] = field(default_factory=list)
     decision: Decision = Decision("merge")
     status: str = "pending"
-    batch_branch: str | None = None
     comparison_current: bool = True
 
 
@@ -73,7 +70,7 @@ def _final_merge_inputs(
 
     Re-read approval/labels (and live body for review-only), PR state/branches, local and remote head,
     fetched target SHA, approved acceptance blobs on head and configured base,
-    local and tracker paths, current policy config and batch parent, comparison evidence,
+    local and tracker paths, current policy config, comparison evidence,
     CI (including workflow registration grace), and the remaining run budget. Verification/review
     evidence stays pinned to the supplied head and approval snapshot.
     """
@@ -96,21 +93,14 @@ def _final_merge_inputs(
             or saved.acceptance_blobs != approval.acceptance_blobs):
         return run_publish._MergeInputs(stop=invalid_approval)
     current = next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None)
-    if current is None or current.head != branch or current.base != base:
-        return run_publish._MergeInputs(stop=changed_base)
-    parent = ctx.tracker.parent_of(n)
-    batch_branch = f"foragent/batch-{parent}" if parent is not None else None
-    if base not in {ctx.config.base_branch, batch_branch}:
+    if (current is None or current.head != branch or current.base != base
+            or base != ctx.config.base_branch):
         return run_publish._MergeInputs(stop=changed_base)
     ctx.git.fetch("origin", base)
     target_sha = git.ref_sha(f"origin/{base}")
     if base_sha is not None and target_sha != base_sha:
         return run_publish._MergeInputs(stop=changed_base)
-    configured_base_sha = target_sha
-    if base != ctx.config.base_branch:
-        ctx.git.fetch("origin", ctx.config.base_branch)
-        configured_base_sha = git.ref_sha(f"origin/{ctx.config.base_branch}")
-    if any(acceptance_mismatches(git, approval, ref) for ref in (head, configured_base_sha)):
+    if any(acceptance_mismatches(git, approval, ref) for ref in (head, target_sha)):
         return run_publish._MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
     decision = run_publish._merge_decision(n, ctx, git, paths, issue.labels)
@@ -121,49 +111,13 @@ def _final_merge_inputs(
     if runner._remaining(n, ctx) <= 0:
         return run_publish._MergeInputs(stop=lambda: run_publish._timeout(n, ctx))
     comparison_current = True
-    if run_publish.enabled(ctx, base):
+    if run_publish.enabled(ctx):
         comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
         if comparison_current and comparison.infrastructure:
             # The unlocked comparison already handled this infrastructure state.
             status = "pass"
     return run_publish._MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status,
-                                    batch_branch=batch_branch, comparison_current=comparison_current)
-
-
-def _batch_pr(parent: int, ctx: RunContext) -> None:
-    from foragent.run_pr_body import batch_body, publish_comments
-
-    children = ctx.tracker.sub_issues(parent)
-    if not children or any(child.state != "closed" for child in children):
-        return
-    branch = f"foragent/batch-{parent}"
-    if any(pr.head == branch for pr in ctx.tracker.list_prs("merged", branch)):
-        return
-    ctx.git.fetch("origin", ctx.config.base_branch)
-    ctx.git.fetch("origin", branch)
-    base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-    head = ctx.git.ref_sha(f"origin/{branch}")
-    with run_publish.tempfile.TemporaryDirectory(prefix=f"foragent-batch-{parent}-", dir=ctx.store.root) as directory:
-        worktree = run_publish.Path(directory) / "worktree"
-        ctx.git.add_detached_worktree(worktree, head)
-        try:
-            ctx.git.at(worktree).check_publication(base)
-        finally:
-            ctx.git.remove_worktree(worktree)
-    issue = ctx.tracker.get_issue(parent)
-    title = f"Batch: {issue.title} (#{parent})"
-    body = batch_body(parent, ctx)
-    if (pr := ctx.tracker.find_pr(branch)) is not None:
-        ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
-        publish_comments(ctx, pr, body)
-        if issue.state == "open":  # A completed order (#411) stays in Done.
-            run_publish.board.sync_status(ctx, parent, "PR open")
-        return
-    pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
-    publish_comments(ctx, pr, body)
-    if issue.state == "open":
-        run_publish.board.sync_status(ctx, parent, "PR open")
-    ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
+                                    comparison_current=comparison_current)
 
 
 def retitle_for_merge(

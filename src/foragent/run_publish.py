@@ -47,7 +47,7 @@ from foragent.run_publish_ci import (  # noqa: E402
     _CIWait, _ci_failure, _ci_status, _hold_changed_head, _hold_if_not_started, _wait_for_ci,
 )
 from foragent.run_publish_merge import (  # noqa: E402
-    _MergeInputs, _batch_pr, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,
+    _MergeInputs, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,
 )
 from foragent.run_publish_preserve import (  # noqa: E402
     _check_wip_deletions, _preserve_failed_implementation, _preserve_locked_implementation,
