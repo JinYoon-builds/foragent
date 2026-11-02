@@ -42,7 +42,7 @@ class Setting:
 
 
 SETTINGS = (
-    Setting("review", "team", "batch", ("fast", "batch", "careful")),
+    Setting("review", "team", "fast", ("fast", "careful")),
     Setting("always_human", "team", [], kind="list"),
     Setting("executor", "team", "codex", ("claude", "codex")),
     Setting("reviewer", "team", None, ("claude", "codex", "none")),

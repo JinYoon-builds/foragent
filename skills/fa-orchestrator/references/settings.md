@@ -4,7 +4,7 @@ When the person states a setting in words ("turn off automatic merge", "use code
 quota"), change it with the same writer the settings window uses: `fa settings set KEY VALUE`.
 
 - Valid keys are exactly the ones `fa settings list` returns, with their scope (team, me, machine).
-  "Turn off automatic merge" maps to `fa settings set review batch`.
+  "Turn off automatic merge" maps to `fa settings set review careful`.
 - Do not ask for an extra confirmation; the person's words are the decision.
 - Report the change to the person in the chat in one line. Say "whole team" only for team-scope keys,
   because those apply to everyone who uses the repository; me and machine keys affect only this person
@@ -20,7 +20,7 @@ touching the current checkout's branch or its other edits:
 1. `git fetch origin <default>` and `git worktree add --detach <tmp> origin/<default>`.
 2. In the temporary worktree run `fa settings set KEY VALUE --repo-root <tmp>`, so only that key in
    `.foragent.yml` changes.
-3. Commit only `.foragent.yml` with a one-line message (for example `settings: review batch`) and
+3. Commit only `.foragent.yml` with a one-line message (for example `settings: review careful`) and
    `git push origin HEAD:<default>`.
 4. Remove the temporary worktree after the push result is known.
 
