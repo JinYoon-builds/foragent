@@ -522,13 +522,46 @@ def test_recording_failure_leaves_the_tick_unchanged(lane, monkeypatch, broken):
     assert lane.store.get_run(1).status == "running"
 
 
-def test_a_busy_tick_records_nothing_and_a_direct_call_needs_no_tick(lane):
-    _add(lane, 1)
+def test_a_busy_tick_records_nothing_and_a_direct_call_needs_no_tick(lane, monkeypatch):
+    with monkeypatch.context() as setup:  # The fixture's own observation is issue history, not this tick's.
+        setup.setattr(StateStore, "record_flow", lambda *args, **kwargs: None)
+        _add(lane, 1)
     with lane.store.tick_lock() as acquired:
         assert acquired
         assert scheduler.tick(lane).skipped == scheduler.BUSY_TICK
     scheduler_flow.note(lane, 1, "file-overlap")
     assert lane.store.flow_records() == []
+
+
+def _issue_history(context, number):
+    return [row["data"]["labels"] for row in context.store.flow_records()
+            if row["kind"] == "issue-state" and row["issue"] == number]
+
+
+def _relabel(context, number, *labels):
+    context.tracker.issues[number] = replace(context.tracker.issues[number],
+                                             labels=context.tracker.issues[number].labels | set(labels))
+
+
+def test_a_tick_skipped_before_it_reads_adds_no_issue_history(lane):
+    _add(lane, 1)
+    before = _issue_history(lane, 1)
+    _relabel(lane, 1, "seen-by-a-read")
+    with lane.store.tick_lock() as acquired:
+        assert acquired
+        assert scheduler.tick(lane).skipped == scheduler.BUSY_TICK
+    assert _issue_history(lane, 1) == before
+    lane.store.pause_github(NOW + timedelta(minutes=30))
+    assert "GitHub rate limit" in scheduler.tick(lane).skipped
+    assert _issue_history(lane, 1) == before
+
+
+def test_a_tick_that_reads_records_what_it_saw_in_the_issue_history(lane):
+    _add(lane, 1)
+    before = _issue_history(lane, 1)
+    _relabel(lane, 1, "seen-by-a-read")
+    assert scheduler.tick(lane).skipped != scheduler.BUSY_TICK
+    assert "seen-by-a-read" in _issue_history(lane, 1)[len(before)]
 
 
 def test_recording_stays_local_and_does_not_read_the_tracker(lane, monkeypatch):
