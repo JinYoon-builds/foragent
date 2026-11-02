@@ -22,7 +22,7 @@ class IssueRefreshMixin:
         equal start times, and keeps the PR and comment records of a row
         written during the refresh. Returns issues whose intents were dropped.
         """
-        from foragent.state_observations import EARLIEST, issue_facts, stamp
+        from foragent.state_observations import EARLIEST, issue_facts, pr_numbers, stamp
         from foragent.tracker import pr_issue_number
 
         at = observed_at or now
@@ -33,6 +33,8 @@ class IssueRefreshMixin:
             if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
                 snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
+            observed |= ({pr.number for pr in prs} | {issue.number for issue in issues if issue.is_pull_request}
+                         | pr_numbers(snapshot))
             dropped, facts, fresh, local = set(), {}, set(), set()
             for issue in issues:
                 if issue.is_pull_request:
@@ -54,9 +56,9 @@ class IssueRefreshMixin:
                     row.update(pr_number=None, merged=False, merged_at=None)
                 if issue.number in comments:
                     row["comments"] = comments[issue.number]
-            from foragent.state_observations import missing_from_listing
+            from foragent.state_observations import known_numbers
 
-            for number in missing_from_listing(snapshot, observed):
+            for number in sorted(known_numbers(snapshot) - observed):
                 if self._observe(snapshot, number, None, at, lanes, since_revision=since_revision) == "dropped":
                     dropped.add(number)
             rows = snapshot["issues"]

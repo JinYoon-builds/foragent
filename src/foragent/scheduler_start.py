@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, quota_events, resource_sample, scheduler, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, quota_events, resource_sample, scheduler, scheduler_flow, scheduler_quota
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -74,8 +74,9 @@ def _machine_budget(
     """Update the machine-wide AIMD value once per tick and return this tick's machine budget."""
     now = ctx.now()
     # Every ready issue in an unpaused lane may start; the file-overlap check runs at start time.
-    waiting = sum(1 for lane, numbers in ready.items() for number in numbers
-                  if not _lane_held(ctx, lane, now, number))
+    held = [number for lane, numbers in ready.items() for number in numbers if _lane_held(ctx, lane, now, number)]
+    scheduler_flow.hold(ctx, held, "lane-held")
+    waiting = sum(len(numbers) for numbers in ready.values()) - len(held)
     waiting += getattr(ctx, "_dream_demand", 0)  # A due dream asks for one worker too.
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
@@ -132,9 +133,16 @@ def _memory_holds(pressure: str) -> bool:
 
 def _has_slot(ctx: TickContext, budget: int) -> bool:
     """Machine-wide runs stay under the shared budget; this project's under its ceiling."""
-    if scheduler.machine_runs(ctx.store, ctx.now()) >= budget:
+    occupied = scheduler.machine_runs(ctx.store, ctx.now())
+    if occupied >= budget:
+        scheduler_flow.slots_measured(ctx, budget, occupied, free=False, machine=True)
         return False
-    return ctx.config.max_parallel is None or len(ctx.store.active_runs()) < ctx.config.max_parallel
+    ceiling = ctx.config.max_parallel
+    if ceiling is not None and (active := len(ctx.store.active_runs())) >= ceiling:
+        scheduler_flow.slots_measured(ctx, ceiling, active, free=False, machine=False)
+        return False
+    scheduler_flow.slots_measured(ctx, budget, occupied, free=True, machine=True)
+    return True
 
 
 def _reserve_slot(ctx: TickContext, number: int, budget: int) -> bool:
@@ -190,16 +198,21 @@ def _start_checks(
     if (scope := getattr(ctx, "_scope", None)) is not None and not scope.owns(issue):
         return None  # Ownership is fixed by this tick's snapshot (#1004).
     if not eligible(issue, lane):
+        scheduler_flow.note_ineligible(ctx, number, issue.labels)
         return None
     if not scheduler._can_start_in_lane(ctx, lane, issue):
+        scheduler_flow.note(ctx, number, "file-overlap")
         return None
     approval = ctx.store.load_approval(number)
     event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
     if approval is None or event is None or event.created_at != approval.approved_at:
+        scheduler_flow.note(ctx, number, "approval-changed")
         return None
     if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
+        scheduler_flow.note_checked(ctx, number, "integrity-check")
         return None
     if not scheduler._check_prerequisites(ctx, issue, approval, report):
+        scheduler_flow.note_checked(ctx, number, "prerequisite")
         return None
     return issue
 
@@ -219,20 +232,27 @@ def _start_ready(
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
     started = False
+    candidates = [number for numbers in ready.values() for number in numbers]
     if ctx.store.github_blocking_outbox():
         # Undelivered workflow writes queue later workflow writes, so READY/RUNNING would change locally while
         # GitHub still shows the issue ready: a runner must not start on a queued write.
         report.actions.append(scheduler.text("tick_starts_wait_outbox", ctx.config.language))
+        for number in candidates:
+            scheduler_flow.note(ctx, number, "outbox-wait")
         return started
     for lane, number in _ranked(ctx, ready):
         if not scheduler._has_slot(ctx, budget):
+            scheduler_flow.hold_slots(ctx, candidates)
             break
         if _lane_held(ctx, lane, ctx.now(), number):
+            scheduler_flow.note(ctx, number, "lane-held")
             continue
         if _at_plan_width(ctx, lane):
+            scheduler_flow.note_free_slot(ctx, number)  # The check above measured a free slot.
             continue
         local = scheduler._local_issue(ctx, number)
         if local is not None and not eligible(local, lane):
+            scheduler_flow.note_ineligible(ctx, number, local.labels)
             continue
         try:
             issue = _start_checks(ctx, number, lane, eligible, base_ref, report)
@@ -242,15 +262,19 @@ def _start_ready(
                 raise
             report.actions.append(scheduler.text("tick_issue_deferred", ctx.config.language,
                                                  number=number, error=scheduler._one_line(exc)))
+            scheduler_flow.note(ctx, number, "issue-deferred")
             continue
         if issue is None:
             continue
 
-        if not eligible(scheduler._local_issue(ctx, number) or issue, lane):
+        current = scheduler._local_issue(ctx, number) or issue
+        if not eligible(current, lane):
+            scheduler_flow.note_ineligible(ctx, number, current.labels)
             continue
         # Chosen once per start; a continued run keeps its stored implementer and waits on its own pair (#107).
         start = scheduler_quota.decide(ctx.store, ctx.config, lane, ctx.now(), number)
         if start.held:
+            scheduler_flow.note(ctx, number, "lane-held")
             continue
         executor, reviewer = quota_events.pair(start.config)  # Stored once per start (#186).
         if _memory_holds(sample[0]):
@@ -262,8 +286,10 @@ def _start_ready(
                 load_average_per_cpu=getattr(sample, "load_average_per_cpu", None),
                 cpu_busy=getattr(sample, "cpu_busy", None),
             )
+            scheduler_flow.hold(ctx, candidates, "memory-held")
             return False
         if not scheduler._reserve_slot(ctx, number, budget):
+            scheduler_flow.hold_slots(ctx, candidates)
             return started
         try:
             ctx.tracker.remove_labels(number, [scheduler.READY])
@@ -276,7 +302,7 @@ def _start_ready(
                 raise
             until, detail = scheduler.orch_github.pause(ctx, exc), str(exc)
         # Every start, also one a GitHub limit stops, stores its pair and journals its switch (#186).
-        ctx.store.start_run(
+        run = ctx.store.start_run(
             number, branch=f"foragent/issue-{number}", worktree=ctx.store.worktree_path(number), lane=lane,
             executor=executor, reviewer=reviewer, executor_model=start.model,  # The runner's first turn writes the tier (#238).
             journal=scheduler_quota.start_journal(ctx.store, ctx.now(), number, start.switch,
@@ -287,6 +313,7 @@ def _start_ready(
             scheduler.orch_github.wait_run(ctx, number, until)
             ctx.store.finish_run(number, "limit-wait", detail=detail)
             report.skipped = f"GitHub rate limit until {until.isoformat()}"
+            scheduler_flow.hold(ctx, candidates, "github-wait")
             return None
         if start.switch is not None:  # Claude is held back: this run implements with Codex (#107).
             report.actions.append(scheduler_quota.switch_line(number, start.switch, ctx.config.language))
@@ -294,8 +321,10 @@ def _start_ready(
         pid = ctx.launcher(number)
         ctx.store.update_run(number, pid=pid)
         report.actions.append(f"#{number} started running (pid={pid})")
+        scheduler_flow.started(ctx, number, run.started_at)  # Kept from before the launch: the run may end at once.
         started = True
         if not scheduler._has_slot(ctx, budget):
+            scheduler_flow.hold_slots(ctx, candidates)
             return started
     return started
 
@@ -314,6 +343,7 @@ def _github_wait(ctx: TickContext, ready: dict[str, list[int]], name: str) -> st
     """One timed check of the GitHub pause; budgets still apply while it lasts."""
     with step(name):
         if until := ctx.store.github_wait_until(ctx.now()):
+            scheduler_flow.hold_stored(ctx, "github-wait")
             scheduler._apply_budgets(ctx, ready)
             return f"GitHub rate limit until {until.isoformat()}"
     return None
@@ -323,6 +353,7 @@ def _github_pause(ctx: TickContext, exc: Exception) -> str:
     """Record a GitHub rate limit as one timed step and apply this tick's budgets."""
     ctx._push_ready = False  # #129: a tick that hits a rate limit after its wait check sends no push.
     with step("github_pause"):
+        scheduler_flow.hold_stored(ctx, "github-wait")
         until = scheduler.orch_github.pause(ctx, exc)
         scheduler._apply_budgets(ctx, {})
     return f"GitHub rate limit until {until.isoformat()}"

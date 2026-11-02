@@ -437,7 +437,11 @@ acceptance files and the spec in the checkout itself: it takes a publish lock, f
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
 it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
-existing issues go into `edits`. Record `progress publish --issue <number>` for each
+existing issues go into `edits`: start each from `fa order edit NUMBER --json`, the issue's
+current sections as one `edits[]` entry. An edit keeps every current Done when command and
+checklist text. To drop a line, name it exactly in `done_when_removals` with the reason
+(`{"line": "...", "reason": "..."}`); publication keeps both readable on the issue, and refuses
+any other loss. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
 `fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the

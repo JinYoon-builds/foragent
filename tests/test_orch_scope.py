@@ -213,6 +213,7 @@ def test_parent_reads_foreign_children_but_writes_only_owned_parents(tmp_path, m
     tracker.issues[2] = Issue(2, 'Child', '', frozenset(['by:bob']), 'closed', state_reason='not_planned')
     tracker.set_parent(2, 1)
     tracker.set_parent(2, 3)
+    store.refresh_local_issues([tracker.get_issue(n) for n in (1, 2, 3)], [], {}, now)  # The listing is the fact source.
     store.update_local_issue(1, children=[2])
     store.update_local_issue(3, children=[2])
     monkeypatch.setattr(tracker, 'sub_issues', lambda n: [tracker.get_issue(2)])

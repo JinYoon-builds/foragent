@@ -96,6 +96,7 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
             repo=ctx.repo, repo_root=ctx.repo_root, tracker=ctx.tracker, store=ctx.store,
             config=ctx.config, git=ctx.git, now=ctx.now, launcher=lambda number: None,
         )
+        tick_ctx._scope = ctx._scope  # Inner paths judge from this command's one snapshot (#1004).
         report = scheduler.TickReport()
         if not scheduler._kill_run(tick_ctx, n, report, outcome="stopped", detail=why):
             # The kill path's own changes (a refused stop, a dead run's recovery) stand.

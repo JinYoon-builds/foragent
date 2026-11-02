@@ -104,11 +104,6 @@ class IssueSnapshotMixin:
         record = self._issue_record()
         return [self._visible(record, row) for row in sorted(record["issues"].values(), key=lambda row: row["number"])]
 
-    def observed_issues(self) -> list[dict[str, Any]]:
-        """Each issue's latest observation, without its pending intents: what ownership is judged by."""
-        record = self._issue_record()
-        return [_copy(row) for row in sorted(record["issues"].values(), key=lambda row: row["number"])]
-
     def github_outbox(self) -> list[dict[str, Any]]:
         """Pending GitHub writes, derived from the intent log, in queue order."""
         return self._pending(self._issue_record())
@@ -185,9 +180,8 @@ class IssueSnapshotMixin:
             facts, seen = _observations.latest(snapshot, number)
             # Only a read that started after the write judges it now; one stored at the same
             # instant was ingested before the write began.
-            lost = (started_at is not None and seen is not None and seen > started_at
-                    and (facts is not None or _observations.seen_as_issue(snapshot, number))
-                    and self._retire(snapshot, number, facts, seen))
+            lost = started_at is not None and seen is not None and seen > started_at and self._retire(
+                snapshot, number, facts, seen)
             if dropped is not None:
                 dropped.append(bool(lost))
             if action != "comment" and not _observations.tombstoned(snapshot, number, when) and any(
@@ -197,24 +191,23 @@ class IssueSnapshotMixin:
             return entry
 
     def refuse_github_writes(self, number: int, reason: str) -> int:
-        """Move every unsent write for ``#number`` out of delivery, kept with its reason (#1004).
+        """Move every queued write for ``#number`` out of delivery, kept with its reason (#1004).
 
-        Refused writes are never delivered or discarded silently; they leave the log so they
-        hold back no other issue's writes or starts, and the visible issue loses their effect.
-        Returns how many moved.
+        Refused writes are never delivered or discarded silently; they leave the FIFO so
+        they hold back no other issue's writes or starts. Returns how many moved.
         """
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            moved = [intent for intent in snapshot.get("outbox", []) if intent["issue"] == number
-                     and _observations.sent_at(intent) is None and not _observations.abandoned(intent)]
-            for intent in moved:
-                self._refuse_intent(snapshot, intent, reason)
+            pending = snapshot.get("outbox", [])
+            moved = [{**entry, "refused": reason, "refused_at": self._timestamp()} for entry in pending
+                     if entry["issue"] == number and _observations.sent_at(entry) is None and not _observations.abandoned(entry)]
             if moved:
-                gone = {intent["id"] for intent in moved}
-                snapshot["outbox"] = [item for item in snapshot["outbox"] if item["id"] not in gone]
-                if not any(item["issue"] == number for item in snapshot["outbox"]):
+                gone = {entry["id"] for entry in moved}
+                snapshot["outbox"] = [entry for entry in pending if entry["id"] not in gone]
+                snapshot.setdefault("outbox_refused", []).extend(moved)
+                if not any(entry["issue"] == number for entry in snapshot["outbox"]):
                     snapshot.get("outbox_base", {}).pop(str(number), None)
-                self._save_rows(snapshot, (number,))
+                self._save_rows(snapshot, ())
             return len(moved)
 
     def refused_github_writes(self) -> list[dict[str, Any]]:

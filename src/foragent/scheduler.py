@@ -13,14 +13,14 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_scope, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_scope, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
-from foragent.orch_dream import DREAM_EVERY_MERGES, dream_due  # noqa: F401
+from foragent.orch_dream import dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
@@ -85,15 +85,15 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
-            ctx._scope = None  # A new tick: cleanup never reuses an earlier tick's ownership decisions.
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
             with tick_processes(ctx.store) as snapshot:
                 cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                ctx._scope = orch_scope.no_snapshot(ctx)  # Nothing is read yet this tick (#1004).
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
@@ -123,7 +123,7 @@ def _tick_locked(ctx: TickContext) -> TickReport:
 
 def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
-    orch_scope.renew(ctx)  # #1004: one identity read per tick, shared by recovery and admission.
+    ctx._scope = orch_scope.Scope(ctx)  # #1004: one identity read per tick, shared by recovery and admission.
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
     base_ref = f"origin/{ctx.config.base_branch}"
@@ -144,6 +144,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 # The failure and the old as_of stay recorded; admission works from stored issues
                 # and re-reads each one just before its start.
                 ctx._refresh_failed, listing_current = True, False
+                ctx._scope = orch_scope.no_snapshot(ctx)  # A failed read writes nothing; each fresh read still judges itself.
                 # GitHub is failing: no later gh subprocess of this tick may wait longer than one fallback read.
                 ctx._fallback.enter_context(gh.bounded(float("inf"), GH_CALL_SECONDS))
                 report.actions.append(text("tick_refresh_failed", ctx.config.language,
@@ -174,6 +175,9 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     else:
         recovered = set()
     optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
+    if listing_current:  # Parents first: batch reads repeat every tick, while parent work ends.
+        with step("parent_sync"):
+            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     with step("batch_reconcile"):
         _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
     ready: dict[str, list[int]] = {}
@@ -287,8 +291,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     raise
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
-        if listing_current:  # Children change only through observed facts and this tick's writes.
-            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
+        scheduler_flow.considered(ctx, ready)
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
@@ -296,12 +299,18 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
+    timed("order_finish_check", orch_role_schedule.observe, ctx)  # Facts only; a no-start tick records them too.
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        scheduler_flow.hold(ctx, (number for numbers in ready.values() for number in numbers),
+                            "outside-run-hours" if ctx.start_runs else "starts-off")
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
+    roles = timed("role_check", orch_role_schedule.startable, ctx, sample)  # So is a due role session.
     if not ready:
-        orch_dream.start(ctx, dreams, timed("machine_budget", _machine_budget, ctx, ready, sample), report)
+        budget = timed("machine_budget", _machine_budget, ctx, ready, sample)
+        orch_dream.start(ctx, dreams, budget, report)
+        orch_role_schedule.dispatch(ctx, roles, budget, report)
         _reopen_view(ctx, report)
         return report
 
@@ -311,6 +320,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     if started is None:
         return report
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
+    orch_role_schedule.dispatch(ctx, roles, ctx._tick_budget, report)  # Then what the dream left.
     _reopen_view(ctx, report)
     return report
 

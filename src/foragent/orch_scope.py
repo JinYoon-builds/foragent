@@ -48,20 +48,6 @@ def _rows(store) -> list[dict]:
         return []
 
 
-def _stored_rows(store) -> list[dict]:
-    """Each issue's latest observation (any read), never a pending intent's effect."""
-    return store.observed_issues() if hasattr(store, "observed_issues") else _rows(store)
-
-
-def _observed_rows(store) -> list[dict]:
-    """The stored rows a read has shown, without placeholder rows that only hold a link or a queued write."""
-    return [row for row in _stored_rows(store) if not row.get("is_pull_request") and (row.get("observed_at") or row.get("observed") or row.get("title") or row.get("labels"))]
-
-
-def _is_pr(issue) -> bool:
-    return bool(getattr(issue, "is_pull_request", False))
-
-
 def _model(number: int, facts: dict) -> Issue:
     return Issue(number, facts.get("title", ""), facts.get("body", ""), frozenset(facts.get("labels", ())),
                  facts.get("state", "open"))
@@ -76,10 +62,6 @@ class Unresolved(TrackerError):
     """The linked issue of a PR is unknown."""
 
 
-class OrdererUnknown(TrackerError):
-    """A question has no effective orderer to mention, so it is not posted."""
-
-
 def _linked_issue(store, tracker, pr: int):
     for row in _rows(store):
         if row.get("pr_number") == pr:
@@ -91,36 +73,14 @@ def _linked_issue(store, tracker, pr: int):
     raise Unresolved(f"cannot tell which issue PR #{pr} works")
 
 
-def _resolve_issue(store, tracker, number: int):
-    """The one lookup of the issue a number works: PR links are followed to their end.
-
-    A PR is never owner evidence; only the issue at the end of its chain is. Returns None only when
-    the chain ends at a PR that works no issue. A read that fails or finds nothing raises: no answer
-    authorizes nothing. A link that cannot be followed is Unresolved.
-    """
-    tracker, seen = observe(tracker), set()
-    while True:
-        if number in seen:
-            raise Unresolved("cyclic PR links")
-        seen.add(number)
-        issue = tracker.get_issue(number)
-        if not getattr(issue, "is_pull_request", False):
-            return issue
-        number = _linked_issue(store, tracker, number)
-        if number is None:
-            return None
-
-
 def current_issue(ctx, number: int, tracker=None):
     """The command/run entry read; a PR resolves to the issue it works."""
-    return _resolve_issue(ctx.store, tracker if tracker is not None else ctx.tracker, number)
-
-
-def _waiting(ctx) -> bool:
-    try:
-        return ctx.store.github_wait_until(ctx.now()) is not None
-    except AttributeError:
-        return False
+    tracker = observe(tracker if tracker is not None else ctx.tracker)
+    issue = tracker.get_issue(number)
+    if not getattr(issue, "is_pull_request", False):
+        return issue
+    linked = _linked_issue(ctx.store, tracker, number)
+    return None if linked is None else tracker.get_issue(linked)
 
 
 def _unreadable(ctx, number: int, exc: Exception) -> str:
@@ -137,46 +97,21 @@ class Scope:
 
     def __init__(self, ctx, issue=None, *, issues=None):
         self._ctx, self._login, self._read = ctx, None, False
-        self.reader = getattr(ctx, "tracker", None)
-        self._config = None
-        self._unconfirmed = set()
-        self.sending = False  # A replay sends now, wait or not, so it always needs an answer.
         self.entry = False
         self._issues, self._prs, self._decisions = None, {}, {}
         if issues is not None or issue is not None:
             self._capture()
-            self._issues.update((item.number, item) for item in issues or () if not _is_pr(item))
-            if issue is not None and not _is_pr(issue):
+            self._issues.update((item.number, item) for item in issues or ())
+            if issue is not None:
                 self._issues[issue.number] = issue
 
     def _capture(self):
         if self._issues is not None:
             return
-        store = getattr(self._ctx, "store", None)
-        rows = _stored_rows(store)
-        self._issues = {row["number"]: _model(row["number"], row) for row in _observed_rows(store)}
+        rows = _rows(getattr(self._ctx, "store", None))
+        self._issues = {row["number"]: _model(row["number"], row.get("observed") or row) for row in rows
+                        if row.get("observed") or row.get("title") or row.get("labels")}
         self._prs = {row["pr_number"]: row["number"] for row in rows if row.get("pr_number")}
-
-    def unconfirmed(self, number) -> None:
-        """Stored facts about this number no longer count; only a new read can decide it."""
-        self._capture()
-        self._issues.pop(number, None)
-        self._unconfirmed.add(number)
-
-    def _read_config(self):
-        local = self._ctx.config  # A tick swaps it for origin's config after its fetch.
-        if self._config is None or self._config[0] is not local:
-            self._config = (local, ownership_config(getattr(self._ctx, "store", None), local))
-        return self._config[1]
-
-    @property
-    def config(self):
-        """The config this operation decides ownership with, read once (#1004)."""
-        return self._read_config()[0]
-
-    @property
-    def usable(self) -> bool:
-        return self._read_config()[1]
 
     def login(self) -> str | None:
         if not self._read:
@@ -188,8 +123,8 @@ class Scope:
         seen = set()
         while number in self._prs:
             target = self._prs[number]
-            if target == number and number in self._issues:
-                return number  # An observed issue can be its own canonical target.
+            if target == number:
+                return number  # A number can be its own canonical target; absence decides below.
             if number in seen:
                 raise Unresolved("cyclic PR links in snapshot")
             seen.add(number)
@@ -215,14 +150,10 @@ class Scope:
 
     def refusal(self, issue) -> str | None:
         self._capture()
-        if not _is_pr(issue):
-            self._issues.setdefault(issue.number, issue)
+        self._issues.setdefault(issue.number, issue)
         return self.for_number(issue.number)
 
-    def for_number(self, number, *, queueing: bool = False) -> str | None:
-        """Why this number may not be written. ``queueing``: the write only enters the outbox."""
-        if not self.usable:
-            return text("ownership_config_invalid", getattr(self.config, "language", "en"), number=number)
+    def for_number(self, number) -> str | None:
         try:
             target = self._target(number)
         except Unresolved as exc:
@@ -235,63 +166,42 @@ class Scope:
             return None
         if number not in self._decisions:
             issue = self._issues.get(number)
-            if issue is None:
-                if self._observed_later(number) is not None:
-                    self._decisions[number] = self._judge(self._issues[number])
-                elif _waiting(self._ctx) and not self.sending:
-                    # No read now, so no decision: only a queue entry may wait for its replay.
-                    return None if queueing else _unreadable(self._ctx, number, Unresolved("GitHub wait"))
-                else:
-                    self._decisions[number] = self._outside_snapshot(number)
+            config = ownership_config(getattr(self._ctx, "store", None), self._ctx.config)
+            if config is None:  # None refuses: an invalid team config cannot authorize the singleton path.
+                self._decisions[number] = _unreadable(self._ctx, number, Unresolved("the committed team config is invalid"))
+            elif issue is None:
+                # No team setting preserves the existing singleton's unknown-target path.
+                self._decisions[number] = (None if getattr(config, "legacy_owner", None) is None else
+                                          _unreadable(self._ctx, number, Unresolved("issue absent from snapshot")))
+            elif singleton(issue, config):
+                self._decisions[number] = None
             else:
-                self._decisions[number] = self._judge(issue)
+                try:
+                    require_owned(issue, config, self.login())
+                except OwnershipError as exc:
+                    self._decisions[number] = str(exc)
+                else:
+                    self._decisions[number] = None
         return self._decisions[number]
-
-    def _observed_later(self, number):
-        """A read since the snapshot may show this number; stored facts of an unconfirmed one do not count."""
-        if number in self._unconfirmed:
-            return None
-        row = next((row for row in _observed_rows(getattr(self._ctx, "store", None)) if row["number"] == number), None)
-        if row is not None:
-            self._issues[number] = _model(number, row)
-        return row
-
-    def _outside_snapshot(self, number) -> str | None:
-        """A target outside the snapshot: a later observation decides, else read it once."""
-        if number not in self._unconfirmed and getattr(self.config, "legacy_owner", None) is not None:
-            return _unreadable(self._ctx, number, Unresolved("issue absent from snapshot"))
-        try:
-            issue = _resolve_issue(getattr(self._ctx, "store", None), self.reader, number)
-        except Unresolved as exc:
-            return _unreadable(self._ctx, number, exc)
-        except TrackerError:
-            raise  # No decision: the caller's effect fails like a failed send.
-        except Exception as exc:
-            return _unreadable(self._ctx, number, exc)
-        if issue is None:
-            return None
-        self._issues[issue.number] = issue
-        if issue.number != number:
-            self._prs[number] = issue.number
-        return self.for_number(issue.number) if issue.number != number else self._judge(issue)
-
-    def _judge(self, issue) -> str | None:
-        if singleton(issue, self.config):
-            return None
-        try:
-            require_owned(issue, self.config, self.login())
-        except OwnershipError as exc:
-            return str(exc)
-        return None
-
-    def unseen(self, number) -> bool:
-        """No team setting and no read has shown this number: entry has nothing to judge yet."""
-        self._capture()
-        return (self.usable and getattr(self.config, "legacy_owner", None) is None
-                and number not in self._issues and number not in self._prs)
 
     def owns(self, issue) -> bool:
         return self.refusal(issue) is None
+
+
+def no_snapshot(ctx) -> Scope:
+    """Before a tick's read or after a failed one: nothing is written to team issues; the next tick decides."""
+    empty = Scope(ctx)
+    empty._issues = {}
+    return empty
+
+
+def entry_read(ctx, number: int):
+    """A run's entry read; when it fails the run's cleanup has no snapshot either."""
+    try:
+        return observe(ctx.tracker).get_issue(number)
+    except BaseException:
+        ctx._scope = no_snapshot(ctx)
+        raise
 
 
 def scope(ctx) -> Scope:
@@ -315,17 +225,15 @@ def stored_singleton(store, config, number: int) -> bool:
 
 def check(ctx, number: int, issue=None, *, read=True) -> str | None:
     """Check once at entry, before any shared effect, and retain that snapshot."""
+    if getattr(ctx, "_scope", None) is not None and ctx._scope.entry:
+        return ctx._scope.for_number(number)
     try:
-        if getattr(ctx, "_scope", None) is None or not ctx._scope.entry:
-            config, usable = ownership_config(ctx.store, ctx.config)
-            if read and usable and issue is None and not stored_singleton(ctx.store, config, number):
-                issue = current_issue(ctx, number)
-            ctx._scope = Scope(ctx, issue)
-            ctx._scope.entry = True
-            if issue is not None and issue.number != number:
-                ctx._scope._prs[number] = issue.number
-        if issue is None and ctx._scope.unseen(number):
-            return None  # Entry adds no read here; the first shared effect needs the evidence.
+        if read and issue is None and not stored_singleton(ctx.store, ctx.config, number):
+            issue = current_issue(ctx, number)
+        ctx._scope = Scope(ctx, issue)
+        ctx._scope.entry = True
+        if issue is not None and issue.number != number:
+            ctx._scope._prs[number] = issue.number
         return ctx._scope.for_number(number)
     except Exception as exc:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
@@ -335,38 +243,12 @@ def check(ctx, number: int, issue=None, *, read=True) -> str | None:
 
 # Compatibility names for cleanup/publication callers: all use the same decision,
 # never another ownership read. Cleanup itself remains outside the tracker gate.
-def current_refusal(ctx, number: int, *, queueing: bool = False) -> str | None:
-    return scope(ctx).for_number(number, queueing=queueing)
+def current_refusal(ctx, number: int) -> str | None:
+    return scope(ctx).for_number(number)
 
 
-def begin_entry(ctx, number: int) -> None:
-    """Until the entry read answers, nothing stored authorizes a shared effect on this issue.
-
-    If it never answers, the first shared effect needs a read of its own; when that read
-    fails too, nothing happens, whatever an earlier operation stored about the issue.
-    """
-    ctx._scope = Scope(ctx)
-    ctx._scope.unconfirmed(number)
-
-
-def renew(ctx) -> None:
-    """A new snapshot within one tick, keeping the tick's one identity read."""
-    previous = getattr(ctx, "_scope", None)
-    ctx._scope = Scope(ctx)
-    if previous is not None and previous._read:
-        ctx._scope._login, ctx._scope._read = previous._login, True
-
-
-def end_entry(ctx) -> None:
-    """An entry's read ends with its run or review; decisions stay, a later entry reads again."""
-    if getattr(ctx, "_scope", None) is not None:
-        ctx._scope.entry = False
-
-
-def write_refusal(context, tracker, number: int, *, queueing: bool = False) -> str | None:
-    snapshot = scope(context)
-    snapshot.reader = tracker  # The tracker this write goes to shows the evidence it needs.
-    return snapshot.for_number(number, queueing=queueing)
+def write_refusal(context, tracker, number: int) -> str | None:
+    return scope(context).for_number(number)
 
 
 def may_write(ctx, number) -> bool:
@@ -404,11 +286,10 @@ def replaying(ctx):
     """Replay uses the latest observed rows, frozen once for the whole FIFO."""
     previous = getattr(ctx, "_scope", None)
     issues = None
-    if (getattr(ownership_config(ctx.store, ctx.config)[0], "legacy_owner", None) is not None
+    if (getattr(ctx.config, "legacy_owner", None) is not None
             and not any(row.get("observed") or row.get("title") or row.get("labels") for row in _rows(ctx.store))):
         issues = observe(ctx.tracker).list_issues()  # A direct replay has no preceding tick's listing.
     ctx._scope = Scope(ctx, issues=issues)
-    ctx._scope.sending = True
     if previous is not None and previous._read:
         ctx._scope._login, ctx._scope._read = previous._login, True
     yield  # The rest of this tick uses this same snapshot and identity.
@@ -423,27 +304,11 @@ def refuse_verb(ctx, action: str, number: int | None) -> str | None:
     return check(ctx, number) if action == "stop" else None
 
 
-def ask_orderer(ctx, number: int, summary: str, details: str = "") -> str:
-    """The question text, mentioning its effective orderer; a singleton's is the factory's account.
-
-    Without an orderer to name no question is posted: OrdererUnknown stops the caller, and the
-    question's ``details`` stay in the run log until a later attempt can ask it.
-    """
-    snapshot = scope(ctx)
+def ask_orderer(ctx, number: int, summary: str) -> str:
+    issue = scope(ctx).issue(number)
+    if issue is None or singleton(issue, ctx.config):
+        return summary
     try:
-        snapshot.for_number(number)  # Brings a number outside the snapshot, or a PR's issue, into it.
-        issue = snapshot.issue(number)
-        if issue is None:
-            raise OwnershipError(f"#{number} was not read")
-        return f"@{effective_orderer(issue, snapshot.config, snapshot.login())} {summary}"
-    except (OwnershipError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
-            raise
-        reason = " ".join(str(exc).split())[:200]
-        if details:
-            path = ctx.store.log_path(number)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as log:
-                log.write(f"{summary}\n{details}\n")
-        raise OrdererUnknown(text("ownership_no_orderer", getattr(snapshot.config, "language", "en"),
-                                  number=number, error=reason)) from exc
+        return f"@{effective_orderer(issue, ctx.config, scope(ctx).login())} {summary}"
+    except OwnershipError:
+        return summary

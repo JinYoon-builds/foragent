@@ -423,7 +423,7 @@ def test_runner_extends_every_command_timeout_by_the_runs_pause(store, monkeypat
     talk_event(store, NOW)  # Open since the run began; the run's clock is 30 s later.
     later = NOW + timedelta(seconds=30)
     tracker = FakeTracker(now=lambda: later)
-    tracker.add_issue(1, "Work")  # A run's entry reads its issue (#1004).
+    tracker.add_issue(1, "Work")  # The run's entry read judges ownership (#1004).
     ctx = runner.RunContext("owner/repo", Path("."), tracker, store, config(),
                             SimpleNamespace(remove_worktree=lambda path: None), now=lambda: later)
     monkeypatch.setattr("foragent.run_implementation.lane_config", lambda config, lane: config)

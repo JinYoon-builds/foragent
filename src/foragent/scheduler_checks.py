@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from foragent import orch_park, scheduler
+from foragent import orch_park, scheduler, scheduler_flow
 from foragent.orch_events import acknowledged_at
 from foragent.records import load_record
 from foragent.state import Approval
@@ -95,17 +95,15 @@ def _check_prerequisites(
          if dependency.state == "closed" and dependency.state_reason == "not_planned"), None,
     )
     if cancelled is not None:
-        try:
-            question = scheduler.orch_scope.ask_orderer(
+        scheduler.flag(
+            ctx, issue.number, scheduler.Reason.SPEC_QUESTION, scheduler.orch_scope.ask_orderer(
                 ctx, issue.number,
-                f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency.")
-        except scheduler.orch_scope.OrdererUnknown as exc:
-            report.actions.append(str(exc))  # Nothing recorded: the next tick asks again.
-            return False
-        scheduler.flag(ctx, issue.number, scheduler.Reason.SPEC_QUESTION, question)
+                f"Cannot promote: blocker #{cancelled.number} was closed as not planned. Clarify the dependency."),
+        )
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
     if any(dependency.state == "open" for dependency in dependencies):
+        scheduler_flow.note_blockers(ctx, issue.number, dependencies)
         if scheduler.READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
             report.actions.append(f"#{issue.number} returned to approved waiting for open blockers")

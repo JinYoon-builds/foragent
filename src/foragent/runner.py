@@ -347,7 +347,7 @@ def review_only(
         until = ctx.store.github_wait_until(ctx.now())
         issue = (orch_scope.scope(ctx).issue(n) if getattr(getattr(ctx, "_scope", None), "entry", False) else None)
         if issue is None and until is None:
-            issue = orch_scope.observe(ctx.tracker).get_issue(n)
+            issue = orch_scope.entry_read(ctx, n)
         orch_scope.require(ctx, n, issue, read=until is None)  # One entry decision, before records or label writes.
         if issue is not None:
             ctx.store.record_issue(issue, ctx.config.lanes)
@@ -359,9 +359,8 @@ def review_only(
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
-        # The shared machine budget admits this review after its ownership check and before any
-        # label or run-record change; a start the tick reserved reuses its slot. Once the run
-        # records this pid, the run holds it.
+        # The shared machine budget admits this review before any label or run-record change; a
+        # start the tick reserved reuses its slot. Once the run records this pid, the run holds it.
         admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
                                                        kind="review", issue=n, now=ctx.now))
         if issue.state != "open" or issue.is_pull_request:
@@ -410,7 +409,6 @@ def review_only(
         raise
     finally:
         admission.close()
-        orch_scope.end_entry(ctx)
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
@@ -451,6 +449,8 @@ def run_issue(n: int, ctx: RunContext) -> str:
     and the temporary admission is released.
     """
     with ExitStack() as admission:
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         return _run_issue(n, ctx, admission)
 
 
@@ -461,18 +461,15 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     log = ctx.store.log_path(n)
     entered = True
     try:
-        orch_scope.begin_entry(ctx, n)  # A direct run is a new operation; a failed read authorizes nothing.
+        ctx._scope = None  # A direct run is a new operation, including a reused test context.
         until = ctx.store.github_wait_until(ctx.now())
-        issue = None if until else orch_scope.observe(ctx.tracker).get_issue(n)
+        issue = None if until else orch_scope.entry_read(ctx, n)
         if (refusal := orch_scope.check(ctx, n, issue, read=until is None)) is not None:
             print(refusal, file=sys.stderr)
             entered = False
             return "refused"
         if issue is not None:
             ctx.store.record_issue(issue, ctx.config.lanes)
-        # Ownership first: a refused run takes no machine slot and leaves no state.
-        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
-                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
         run = ctx.store.get_run(n)
         if run is not None and run.status == "finished":
             # update_run deliberately leaves finished records untouched. A direct retry needs
@@ -512,7 +509,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     except ExecutorStopped as exc:
         outcome = exc.outcome
         detail = str(exc)
-        if outcome == "refused":  # Ownership lost during the run: its one line, like an entry refusal.
+        if outcome == "refused":
             print(detail, file=sys.stderr)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
@@ -536,7 +533,6 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
         # restart decision (ready, or blocked with an open PR), so keep labels.
         raise
     finally:
-        orch_scope.end_entry(ctx)
         # A tick may already have finished the record while terminating this runner.
         try:
             run = ctx.store.get_run(n)

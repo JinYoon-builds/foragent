@@ -80,22 +80,9 @@ def owners(facts: dict[str, Any] | None) -> list[str]:
     return sorted({label.lower() for label in (facts or {}).get("labels", []) if label.lower().startswith("by:")})
 
 
-def _judged_by_person(premise: dict[str, Any], expected: dict[str, Any]) -> str:
-    """A person changed the issue under the intent: an owner edit refuses it (#1004), else it is dropped."""
+def _judged_by_person(premise: dict[str, Any], expected: dict[str, Any] | None) -> str:
+    """A person's change drops an intent; an owner change refuses it, kept with its reason (#1004)."""
     return "refused" if owners(premise) != owners(expected) else "dropped"
-
-
-def seen_as_issue(snapshot: dict[str, Any], number: int) -> bool:
-    """A read showed this number as an issue. A number known only through a queued write may be a PR,
-    which an issue listing never shows, so a listing's silence says nothing about it (#1004)."""
-    row = snapshot["issues"].get(str(number)) or {}
-    return (str(number) in snapshot.get("absent", {})
-            or any(row.get(key) for key in ("observed_at", "observed", "title", "labels")))
-
-
-def missing_from_listing(snapshot: dict[str, Any], listed: set[int]) -> list[int]:
-    """The known issues a complete listing's omission observes as missing."""
-    return sorted(number for number in known_numbers(snapshot) - listed if seen_as_issue(snapshot, number))
 
 
 def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any],
@@ -118,8 +105,9 @@ def retirement(facts: dict[str, Any] | None, at: datetime, intent: dict[str, Any
             return None
         # Ordinary send-only entries may also end with a workflow supersession.
         premise = intent.get("premise")
-        return (_judged_by_person(premise, expected)
-                if by_person and premise is not None and person_fields(premise) != person_fields(expected) else None)
+        if by_person and premise is not None and person_fields(premise) != person_fields(expected):
+            return _judged_by_person(premise, expected)
+        return None
     if abandoned(intent):
         return "abandoned"
     if shows(expected, intent):
@@ -145,6 +133,11 @@ def observed_facts(row: dict[str, Any]) -> dict[str, Any]:
 def issue_facts(issue: Any) -> dict[str, Any]:
     return {"title": issue.title, "body": issue.body, "labels": sorted(issue.labels), "state": issue.state,
             "state_reason": getattr(issue, "state_reason", None)}
+
+
+def pr_numbers(snapshot: dict[str, Any]) -> set[int]:
+    """A queued PR write targets a PR, which an issue listing never shows: not a missing issue (#1004)."""
+    return {row["pr_number"] for row in snapshot["issues"].values() if row.get("pr_number")}
 
 
 def known_numbers(snapshot: dict[str, Any]) -> set[int]:
@@ -226,19 +219,14 @@ class IssueObservationsMixin:
         return dropped
 
     def _refuse_for_owner(self, snapshot: dict[str, Any], intent: dict[str, Any], owner: list[str]) -> None:
-        """An observation showed a new owner: refuse the unsent write, inspectably (#1004)."""
         from foragent.orch_events import append_event
 
         reason = (f"owner label changed from {', '.join(owners(intent['premise'])) or 'none'} "
                   f"to {', '.join(owner) or 'none'} while the write was queued")
-        self._refuse_intent(snapshot, intent, reason)
+        snapshot.setdefault("outbox_refused", []).append({**intent, "refused": reason, "refused_at": self._timestamp()})
         append_event(self, self._now(), intent["issue"], "ownership-refused",
                      f"#{intent['issue']}: skipped queued {intent['action']}: {reason}", locked=True,
                      action=intent["action"], owner=owner[0][3:] if owner else None)
-
-    def _refuse_intent(self, snapshot: dict[str, Any], intent: dict[str, Any], reason: str) -> None:
-        """Keep a refused intent with its reason (the caller takes it out of the log)."""
-        snapshot.setdefault("outbox_refused", []).append({**intent, "refused": reason, "refused_at": self._timestamp()})
 
     def _keep_ready_approval(self, row: dict[str, Any], intent: dict[str, Any]) -> None:
         """Keep attribution only for a confirmed ready-label effect, never a failed write."""
@@ -324,7 +312,7 @@ class IssueObservationsMixin:
                 if (stamp(snapshot.get("complete_at")) or EARLIEST) <= started_at:
                     snapshot["complete_at"] = started_at.isoformat()
                     changed = True
-                for number in missing_from_listing(snapshot, seen):
+                for number in sorted(known_numbers(snapshot) - seen - pr_numbers(snapshot)):
                     outcome = self._observe(snapshot, number, None, started_at, lanes)
                     changed |= outcome != "stale"
                     if outcome == "dropped":
@@ -368,7 +356,7 @@ class IssueObservationsMixin:
                 attempt["final"] = True
             intent.setdefault("attempts", []).append(attempt)
             facts, seen = latest(snapshot, intent["issue"])
-            if ok and seen is not None and seen > started_at and (facts is not None or seen_as_issue(snapshot, intent["issue"])):
+            if ok and seen is not None and seen > started_at:
                 # A read that started during this send was stored before the send completed:
                 # it judges the now sent intent by the same rule as a later read.
                 self._retire(snapshot, intent["issue"], facts, seen)
