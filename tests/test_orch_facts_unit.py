@@ -482,6 +482,17 @@ def test_a_running_overlap_wait_is_a_structure_hold(env):
     assert facts["binding"]["kind"] == "structure"
 
 
+@pytest.mark.parametrize("phase,needed", [("run-slot-wait", True), ("ci", False)])
+def test_a_run_waiting_for_a_machine_slot_needs_its_lane_executor(env, phase, needed):
+    store, root = env
+    capacity.write_state(store, 4, NOW)
+    approve(store, 1, ["src/a.py"], labels=("approved", "running"), active=True)
+    store.update_run(1, phase=phase, phase_started_at=NOW.isoformat())
+    store.record_usage("codex", [{"name": "week", "used_percent": 40, "resets_at": (NOW + timedelta(hours=1)).isoformat()}])
+    quota = collect(store, root)["resources"]["quota"]["codex"]
+    assert quota["idle_while_waiting"] is needed
+
+
 def test_a_half_written_finish_is_finished_not_queued(env):
     store, root = env
     store.start_run(3, branch="b", worktree=store.worktree_path(3))
