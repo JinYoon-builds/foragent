@@ -108,7 +108,7 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
     measured["kinds"] = {"k0", "k1", "k2"}
     for day, count in ((3, 0), (2, 2), (1, 2)):  # Oldest first.
         store.clock[0] = NOW - timedelta(days=day, hours=1)
-        measured["numbers"] = {f"k{n}": {"day": day} for n in range(3)}  # New facts re-arm not-now (#1155).
+        measured["numbers"] = {f"k{n}": {"day": -day} for n in range(3)}  # Worse facts re-arm not-now (#1155, #1469).
         rows = orch_role_raise.raise_due(store, tmp_path, store.clock[0])[:count]
         for row in rows:
             orch_role_raise.answer(store, row["id"], "not-now", "later")
@@ -416,8 +416,11 @@ def test_projection_preserves_constraints_paths_and_unprojected_kind_numbers():
         binding={"kind": "cap", "normal": False}))
     assert not orch_role_raise.new_evidence({"files": ["a", "b"]}, {"files": ["b"]})
     assert orch_role_raise.new_evidence({"files": ["a"]}, {"files": ["b"]})
-    assert orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 8}),
-                                        facts("lane_concentration", {"runs": 9}))
+    # Lane concentration is the busy lane's share (#1469): a larger total alone dilutes it.
+    assert orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 8, "lane_runs": 5}),
+                                        facts("lane_concentration", {"runs": 9, "lane_runs": 6}))
+    assert not orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 18, "lane_runs": 16}),
+                                            facts("lane_concentration", {"runs": 19, "lane_runs": 16}))
 
 
 def test_only_legacy_requests_without_facts_use_the_cooldown(store, tmp_path, measured):
