@@ -29,6 +29,9 @@ def store(tmp_path):
 
 def finish(store, number, *, at, minutes=10, outcome="merged", detail="", merged_at=None):
     store.clock[0] = at - timedelta(minutes=minutes)
+    if store.load_approval(number) is None:  # Approval at run start, as the locked seed helper does.
+        store.save_approval(number, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                            approved_at=store.clock[0].isoformat())
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     store.clock[0] = at
     if merged_at is not None:
@@ -74,7 +77,7 @@ def test_pr_open_counts_as_merged_only_after_a_merge_and_otherwise_is_no_failure
     card = orch_scorecard.collect(store)
     today = card["window"]["today"]
     assert today["runs"] == 2 and today["merge_rate"] == 0.5
-    assert today["median_minutes_to_merge"] == 20  # Start to finish, not to merge.
+    assert today["median_minutes_to_merge"] == 80  # Approval (run start) to the actual merge, not to finish.
     assert card["unexplained_failures"] == [] and card["repeated_failures"] == []
 
 
@@ -109,8 +112,10 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["repeated_failures"] == [{"reason": "Boom", "count": 2, "issues": [1, 2]}]
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
-    # Today, its flow line, the previous days, their flow line, the verdict, failures, then main tests.
-    assert len(lines) == 8 and "Main tests" in lines[7] and "flow" in lines[1] and "Boom" in lines[5] and "#3" in lines[6]
+    # Today, its flow line, the previous days, their flow line, both approval-to-merge splits,
+    # the verdict, failures, then main tests.
+    assert len(lines) == 10 and "Main tests" in lines[9] and "flow" in lines[1] and "Boom" in lines[7] and "#3" in lines[8]
+    assert "approval to merge" in lines[4] and "previous-days total" in lines[5]
 
 
 @pytest.mark.parametrize("value", ["1", "0", "x", "2.5"])
@@ -172,7 +177,7 @@ def test_missing_optional_machine_records_keep_scorecard_consumers_working(store
     today = result["window"]["today"]
     assert today["idle_minutes"] == 0  # No capacity observation: unknown, never idle.
     assert today["waste_share"] == 0
-    assert today["lead_time_minutes"] is None  # No approval record.
+    assert today["lead_time_minutes"] == 30  # The approval snapshot (run start) to the merge (finish).
     assert today["person_interventions"] == 0
     assert today["wait_minutes_by_cause"] == dict.fromkeys(("slot", "overlap", "merge", "quota"), 0)
     assert orch_scorecard.binding(store, Config(), tmp_path, result) == {"today": "none", "previous": "none"}
@@ -384,9 +389,13 @@ def test_flow_idle_a_current_label_change_never_rewrites_earlier_days(tmp_path, 
     store.update_local_issue(2, title="t2", body=body, labels=["approved", "ready"], state="open", blocked_by=[])
     store.save_approval(2, body=body, body_sha=body_hash(body), acceptance_blobs={},
                         approved_by="human", approved_at=clock[0].isoformat())
+    clock[0] = NOW - timedelta(hours=1)
+    store.update_local_issue(2, labels=["approved", "docs", "ready"])  # Observed unheld an hour ago.
     clock[0] = NOW - timedelta(minutes=30)
-    store.update_local_issue(2, labels=["approved", "ready", "blocked"])  # No flag record.
-    assert idle() == (pytest.approx(1440), pytest.approx(1410)), "The hold counts from its update, not all along"
+    store.update_local_issue(2, labels=["approved", "blocked", "docs", "ready"])  # No flag record.
+    # The hold began at an unrecorded time after the unheld observation: only that gap and the
+    # hold itself are not idle demand, never the earlier days.
+    assert idle() == (pytest.approx(1440), pytest.approx(1380)), "The hold counts from its update, not all along"
 
 
 def test_flow_idle_reads_the_parallel_state_file_from_its_changed_at(tmp_path, monkeypatch):
@@ -741,3 +750,253 @@ def test_human_output_says_unknown_on_both_window_lines(store, language, unknown
     moments = [NOW - timedelta(hours=1), NOW - timedelta(days=1, hours=1)]
     lines = orch_scorecard.human(orch_scorecard.collect(store, 2, revert_times=moments), language).splitlines()
     assert known in lines[0] and known in lines[2] and unknown not in "\n".join(lines)
+
+
+def _flow_split(store, number, approved, merged, records=(), phases=()):
+    """Run the real split for one merge after writing ``records`` as (minute, kind, data)."""
+    from foragent import orch_scorecard_split as split
+
+    for minute, kind, data in records:
+        store.clock[0] = approved + timedelta(minutes=minute)
+        store.record_flow(kind, issue=number, **data)
+    store.clock[0] = NOW
+    executions = [{"number": number, "started": approved, "finished": merged, "merged": True,
+                   "merged_at": merged}]
+    issues = {number: {"events": [], "approved_at": approved}}
+    spans = [(number, phase, (approved + timedelta(minutes=a), approved + timedelta(minutes=b)))
+             for phase, a, b in phases]
+    return split.windows(store, NOW, 2, issues, executions, spans)
+
+
+def _activity(approved, cause, a, b):
+    return (b, "activity", {"activity": "checking", "cause": cause,
+                            "started_at": (approved + timedelta(minutes=a)).isoformat(),
+                            "finished_at": (approved + timedelta(minutes=b)).isoformat()})
+
+
+def test_split_contradiction_is_unknown_and_duplicates_count_once(store):
+    approved = NOW - timedelta(hours=1)
+    today = _flow_split(store, 7, approved, approved + timedelta(minutes=10), [
+        _activity(approved, "initial", 0, 4), _activity(approved, "initial", 0, 4),  # Replayed: once.
+        _activity(approved, "queue", 2, 6),  # Overlaps work for 2 minutes: unknown there.
+    ])[0]
+    assert today["total_minutes"] == 10 and today["merges"] == 1
+    assert today["parts"] == {"work": 2, "concurrency_cost": 0, "machine_limit": 0, "ordering": 0,
+                              "waste": 2, "unknown": 6}
+
+
+@pytest.mark.parametrize(("slots", "part"), [
+    ({"limit": 2, "occupied": 2, "merge_waiters": 0}, "machine_limit"),
+    ({"limit": 2, "occupied": 2, "merge_waiters": 1}, "waste"),
+    ({"limit": 2, "occupied": 1, "merge_waiters": 0}, "unknown"),  # Not full: no proof.
+    ({"limit": 2, "occupied": None, "merge_waiters": 0}, "unknown"),  # Unmeasured holders.
+    (None, "unknown"),
+])
+def test_split_slots_full_needs_a_measured_full_slot(store, slots, part):
+    approved = NOW - timedelta(hours=1)
+    data = {"reason": "slots-full", "outcome": "waiting", "run_slots": slots}
+    parts = _flow_split(store, 7, approved, approved + timedelta(minutes=5), [(0, "ready", data)])[0]["parts"]
+    assert parts[part] == 5 and sum(parts.values()) == 5
+
+
+def test_split_phases_alone_name_only_first_work_and_overlap_waits(store):
+    approved = NOW - timedelta(hours=1)
+    parts = _flow_split(store, 7, approved, approved + timedelta(minutes=12), phases=[
+        ("implementing", 0, 3), ("overlap-wait", 3, 5), ("implementing", 5, 8), ("merge-lock-wait", 8, 10),
+        ("merging", 10, 12)])[0]["parts"]
+    # A second implementing and a merge-lock wait without a recorded cause stay unknown.
+    assert parts == {"work": 5, "concurrency_cost": 2, "machine_limit": 0, "ordering": 0,
+                     "waste": 0, "unknown": 5}
+
+
+def test_split_previous_is_an_additive_cohort_total_and_missing_approval_is_coverage(store):
+    for number, day, minutes in ((1, 1, 30), (2, 2, 50)):
+        finish(store, number, at=NOW - timedelta(days=day, hours=1), minutes=minutes)
+    finish(store, 3, at=NOW - timedelta(hours=1), minutes=20)
+    store.clock[0] = NOW - timedelta(hours=2)
+    store.start_run(4, branch="b", worktree=store.worktree_path(4))
+    store.clock[0] = NOW - timedelta(hours=1)
+    store.finish_run(4, outcome="merged")
+    store.clock[0] = NOW  # Issue 4 merged with no approval on record.
+    card = orch_scorecard.collect(store, days=3)
+    today, before = (card["window"][key]["approval_to_merge"] for key in ("today", "previous"))
+    assert before["total_minutes"] == 80 and before["merges"] == 2  # 30 + 50, not their median 40.
+    assert today["total_minutes"] == 20 and today["merges"] == 1
+    assert today["missing_approval"] == 1 and today["parts"]["unknown"] == 20
+
+
+def test_split_recorded_recheck_cause_outranks_the_first_phase_name(store):
+    approved = NOW - timedelta(hours=1)
+    # The first checking phase is a base-changed recheck: concurrency, not work and not unknown.
+    parts = _flow_split(store, 7, approved, approved + timedelta(minutes=8),
+                        [_activity(approved, "base-changed", 0, 5)],
+                        phases=[("checking", 0, 5), ("ci", 5, 8)])[0]["parts"]
+    assert parts["concurrency_cost"] == 5 and parts["work"] == 3 and parts["unknown"] == 0
+
+
+def _demand(store, tmp_path, monkeypatch, start, *, blocked=False):
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "machine")
+    store.clock[0] = start
+    capacity.write_state(store, 1, start)
+    store._write_json(capacity.machine_root() / capacity.TEST_SLOTS_FILE, {"slots": 2, "changed_at": start.isoformat()})
+    store.save_approval(41, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=start.isoformat())
+    edges = [{"number": 40, "state": "open", "repository": None}] if blocked else []
+    store.update_local_issue(41, title="t", body="b", labels=["approved", "ready"], state="open", blocked_by=edges)
+
+
+def _idle_pair(store):
+    store.clock[0] = NOW
+    today = orch_scorecard.collect(store, days=2)["window"]["today"]
+    return today["run_slot_idle_minutes"], today["test_slot_idle_minutes"]
+
+
+def test_slot_idle_keeps_the_demand_of_an_issue_that_left_the_listing(store, tmp_path, monkeypatch):
+    _demand(store, tmp_path, monkeypatch, NOW - timedelta(minutes=20))
+    store.clock[0] = NOW - timedelta(minutes=5)
+    store.update_local_issue(41, labels=["approved", "docs", "ready"])  # Still open and ready.
+    assert _idle_pair(store) == (20, 20)
+    store.ingest([], NOW, {}, complete=True)
+    assert all(row["number"] != 41 for row in store.local_issues())
+    # The 15 observed minutes stay; it left at an unrecorded time after the last open observation.
+    assert _idle_pair(store) == (15, 15)
+
+
+def test_slot_idle_replays_recorded_dependencies_not_todays_edges(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=20)
+    _demand(store, tmp_path, monkeypatch, start, blocked=True)
+    store.clock[0] = start + timedelta(minutes=5)
+    store.update_local_issue(41, blocked_by=[])  # Blocked for the first 5 minutes only.
+    assert _idle_pair(store) == (15, 15)
+
+
+def test_lead_time_keeps_an_issue_that_left_the_listing(store):
+    store.clock[0] = NOW - timedelta(hours=2)
+    store.save_approval(41, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=store.clock[0].isoformat())
+    store.update_local_issue(41, title="t", body="b", labels=["approved", "ready"], state="open", blocked_by=[])
+    finish(store, 41, at=NOW - timedelta(hours=1), minutes=40, merged_at=NOW - timedelta(hours=1, minutes=40))
+    before = orch_scorecard.collect(store, days=2)["window"]["today"]
+    store.ingest([], NOW, {}, complete=True)
+    after = orch_scorecard.collect(store, days=2)["window"]["today"]
+    assert before["lead_time_minutes"] == after["lead_time_minutes"] == 20
+    assert after["median_minutes_to_merge"] == 20 and after["approval_to_merge"]["total_minutes"] == 20
+
+
+def _observed(store, tmp_path, monkeypatch, start, steps, *, lanes=None):
+    """Budgets from ``start``, an approval at ``start``, then each (minute, update) observation."""
+    _demand(store, tmp_path, monkeypatch, start)
+    for minute, fields in steps:
+        store.clock[0] = start + timedelta(minutes=minute)
+        store.update_local_issue(41, **fields)
+    store.clock[0] = NOW
+    today = orch_scorecard.collect(store, days=2, lanes=lanes)["window"]["today"]
+    return today["run_slot_idle_minutes"], today["test_slot_idle_minutes"]
+
+
+def test_lead_time_never_uses_a_later_first_observation_as_the_approval(store):
+    approved = NOW - timedelta(hours=2)
+    store.clock[0] = approved
+    store.save_approval(41, body="b", body_sha="s", acceptance_blobs={}, approved_by="human",
+                        approved_at=approved.isoformat())
+    store.clock[0] = approved + timedelta(minutes=5)  # First observed five minutes later.
+    store.update_local_issue(41, title="t", body="b", labels=["approved", "ready"], state="open", blocked_by=[])
+    finish(store, 41, at=approved + timedelta(minutes=30), minutes=20, merged_at=approved + timedelta(minutes=20))
+
+    def three():
+        today = orch_scorecard.collect(store, days=2)["window"]["today"]
+        return today["lead_time_minutes"], today["median_minutes_to_merge"], today["approval_to_merge"]["total_minutes"]
+
+    assert three() == (20, 20, 20)
+    store.ingest([], NOW, {}, complete=True)
+    assert three() == (20, 20, 20)
+
+
+def test_slot_idle_replays_a_recorded_hold_on_a_row_without_label_events(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=40)
+    # Seen unheld at 0, held at 10, unheld at 30: the hold's own start and end are unrecorded.
+    assert _observed(store, tmp_path, monkeypatch, start, [
+        (10, {"labels": ["approved", "blocked", "ready"]}), (30, {"labels": ["approved", "ready"]})]) == (10, 10)
+
+
+def test_slot_idle_dates_a_close_without_merge_and_a_reopen_by_observations(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=30)
+    # Open and ready through the observation at 10; closed (never merged) by 20.
+    assert _observed(store, tmp_path, monkeypatch, start, [
+        (10, {"labels": ["approved", "docs", "ready"]}), (20, {"state": "closed"})]) == (10, 10)
+
+
+def test_slot_idle_never_counts_a_closed_interval_of_a_reopened_issue(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=30)
+    assert _observed(store, tmp_path, monkeypatch, start, [
+        (10, {"state": "closed"}), (20, {"state": "open"})]) == (10, 10)
+
+
+def test_slot_idle_uses_the_lane_each_observation_saw(store, tmp_path, monkeypatch):
+    from foragent.orch_events import append_event
+
+    start = NOW - timedelta(minutes=30)
+    store.clock[0] = start - timedelta(minutes=1)
+    append_event(store, store.clock[0], None, "plan-pause", "Paused lane b", lane="b",
+                 until=(NOW + timedelta(hours=1)).isoformat())
+    # Lane a (never paused) through the observation at 10, then moved into paused lane b by 20.
+    assert _observed(store, tmp_path, monkeypatch, start, [
+        (0, {"labels": ["approved", "lane:a", "ready"]}),
+        (10, {"labels": ["approved", "docs", "lane:a", "ready"]}),
+        (20, {"labels": ["approved", "docs", "lane:b", "ready"]})], lanes={"a": {}, "b": {}}) == (10, 10)
+
+
+def test_slot_idle_keeps_a_merged_issue_open_until_its_confirmed_merge_after_removal(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=30)
+    _demand(store, tmp_path, monkeypatch, start)
+    merged = start + timedelta(minutes=20)
+    finish(store, 41, at=merged, minutes=0, merged_at=merged)
+    store.clock[0] = merged
+    store.update_local_issue(41, state="closed", merged=True, merged_at=merged.isoformat())
+    assert _idle_pair(store) == (20, 20)
+    store.ingest([], NOW, {}, complete=True)
+    assert all(row["number"] != 41 for row in store.local_issues())
+    assert _idle_pair(store) == (20, 20)  # The confirmed merge dates the close, not the absence.
+
+
+def test_slot_idle_takes_the_lane_from_exact_label_events(store, tmp_path, monkeypatch):
+    from foragent.orch_events import append_event
+
+    start = NOW - timedelta(minutes=30)
+    store.clock[0] = start - timedelta(minutes=1)
+    append_event(store, store.clock[0], None, "plan-pause", "Paused lane b", lane="b",
+                 until=(NOW + timedelta(hours=1)).isoformat())
+    _demand(store, tmp_path, monkeypatch, start)
+    for minute, labels in ((0, ["approved", "lane:a", "ready"]), (10, ["approved", "docs", "lane:a", "ready"]),
+                           (20, ["approved", "docs", "lane:b", "ready"])):
+        store.clock[0] = start + timedelta(minutes=minute)
+        store.update_local_issue(41, labels=labels)
+    move = start + timedelta(minutes=20)
+    store.record_read(41, "label_events", [
+        {"label": label, "action": action, "actor": "human", "created_at": at.isoformat()}
+        for at, label, action in ((start, "approved", "labeled"), (start, "ready", "labeled"),
+                                  (start, "lane:a", "labeled"), (move, "lane:a", "unlabeled"),
+                                  (move, "lane:b", "labeled"))], baseline=store.read_baseline())
+    store.clock[0] = NOW
+    today = orch_scorecard.collect(store, days=2, lanes={"a": {}, "b": {}})["window"]["today"]
+    # The events date the move exactly: unpaused lane a for all 20 minutes before it.
+    assert (today["run_slot_idle_minutes"], today["test_slot_idle_minutes"]) == (20, 20)
+
+
+def test_slot_idle_dates_only_the_close_its_merge_caused_after_a_reopen(store, tmp_path, monkeypatch):
+    start = NOW - timedelta(minutes=50)
+    _demand(store, tmp_path, monkeypatch, start)
+    for minute, fields in ((10, {"labels": ["approved", "docs", "ready"]}), (20, {"state": "closed"}),
+                           (30, {"state": "open"})):
+        store.clock[0] = start + timedelta(minutes=minute)
+        store.update_local_issue(41, **fields)
+    merged = start + timedelta(minutes=40)
+    finish(store, 41, at=merged, minutes=0, merged_at=merged)
+    store.clock[0] = merged
+    store.update_local_issue(41, state="closed", merged=True, merged_at=merged.isoformat())
+    # 0-10 observed open; 10-20 and 20-30 hold an unrecorded close and reopen; 30-40 open until the merge.
+    assert _idle_pair(store) == (20, 20)
+    store.ingest([], NOW, {}, complete=True)
+    assert _idle_pair(store) == (20, 20)
