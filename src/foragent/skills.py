@@ -129,113 +129,53 @@ def _terms(text: str) -> str:
     return " ".join(" ".join(line for line in text.splitlines() if not _copyright_line(line)).split())
 
 
+# A license declaration: any line whose label (the text before its first colon) names SPDX or a license,
+# in any case, spacing or word order and behind a comment mark (`SPDX License Identifier:`, `License:` …).
+_DECLARATION = re.compile(r"[\W_]*([^:]*?(?:spdx|licen[cs]e)[^:]*?)[ \t]*:(?!//)[ \t]*(.*)", re.I)
+
+
+def _declaration(line: str) -> tuple[str, str] | None:
+    """(label, permissive license or "unknown") when ``line`` declares a license, else None.
+
+    The value is read as an SPDX expression: every identifier joined by `AND`/`OR` (and parentheses)
+    must be a permissive one. Anything else (`WITH`, `LicenseRef-…`, words, nothing) is "unknown".
+    """
+    if (match := _DECLARATION.fullmatch(line.strip())) is None:
+        return None
+    words = [word for word in re.split(r"[\s()]+", match[2].strip().removesuffix("*/")) if word]
+    identities = [word for word in words if word.upper() not in {"AND", "OR"}]
+    known = [next((name for name in OPEN_SOURCE_LICENSES if name.casefold() == word.casefold()), None)
+             for word in identities]
+    return " ".join(match[1].split()), (known[0] if known and all(known) else "unknown")
+
+
 def _spdx(line: str) -> str | None:
-    """The permissive license an `SPDX-License-Identifier:` line names; "unknown" for any other one."""
-    if (match := re.fullmatch(r"SPDX-License-Identifier: *(\S+)", line.strip())) is None:
-        return None
-    return next((known for known in OPEN_SOURCE_LICENSES if known.casefold() == match[1].casefold()), "unknown")
+    """The permissive license a declaration line names, "unknown" for any other declaration, None for no declaration."""
+    return None if (found := _declaration(line)) is None else found[1]
 
 
-_URL = re.compile(r"<?https?://[^\s<>]+>?")
-# The exact names a permissive license goes by, besides its SPDX identifier (with or without "License").
-_LICENSE_NAMES = {
-    **{name.casefold(): identity for identity in OPEN_SOURCE_LICENSES
-       for name in (identity, f"{identity} License", f"The {identity} License")},
-    **{name.casefold(): identity for name, identity in (
-        ("MIT License", "MIT"), ("The MIT License", "MIT"), ("The MIT License (MIT)", "MIT"),
-        ("ISC License", "ISC"), ("Apache License 2.0", "Apache-2.0"), ("Apache License, Version 2.0", "Apache-2.0"),
-        ("Apache 2.0 License", "Apache-2.0"), ("Apache License Version 2.0", "Apache-2.0"),
-        ("BSD 2-Clause License", "BSD-2-Clause"), ("BSD 3-Clause License", "BSD-3-Clause"),
-        ("Simplified BSD License", "BSD-2-Clause"), ("New BSD License", "BSD-3-Clause"),
-        ("BSD Zero Clause License", "0BSD"),
-    )},
-}
-_LABEL = re.compile(
-    r"(?:Source|Upstream|Origin|Homepage|Repository|Attribution|Credits?|Authors?|Maintainers?)[ \t]*:[ \t]*(.+)", re.I)
-_BY = re.compile(r"(.+?) by (.+?)(?:, *((?:Copyright\b|©).*))?")
-_HOLDER = re.compile(
-    r"(?:Copyright\b|©)[ \t]*(?:\(c\)|©)?[ \t]*(?:\d{4}(?:[ \t]*[-–][ \t]*(?:\d{4}|present)?)?[ \t]*,?[ \t]*)+(.+)",
-    re.I)
+_URL = re.compile(r"<?https?://\S+")
+# A labelled notice: one to three words, a colon, then anything (`Source: …`, `Upstream: …`).
+_LABEL = re.compile(r"[^\W\d_][\w-]*(?: [\w-]+){0,2}[ \t]*:(?!//)[ \t]*\S.*")
+# An attribution: `<work> by <anything>`, the work being one word.
+_BY = re.compile(r"\S+ by \S.*")
 
 
-# Words that make up license identifiers outside the permissive set (SPDX families and Creative
-# Commons terms). A URL holding one of them, in any case, could name a license; the URL fails safe.
-_LICENSE_WORDS = frozenset({
-    "gpl", "agpl", "lgpl", "fdl", "gfdl", "mpl", "epl", "eupl", "cddl", "cpl", "osl", "afl", "sspl", "busl",
-    "bsl", "polyform", "elastic", "cc", "by", "nc", "nd", "sa", "noncommercial", "commercial", "nonfree",
-    "proprietary", "commons", "copyleft", "unlicense", "wtfpl", "artistic", "eula", "spdx",
-})
+def _notice(line: str) -> bool:
+    """A line allowed around a complete license text, and not judged (#1652 scope, 2026-11-02).
 
-
-def _license_part(part: str) -> bool:
-    """Whether one part of a URL could name a license, in any case: a word starting `licen`, a word of
-    `_LICENSE_WORDS`, a known license name, an identifier with a version (`GPL-3.0-only`) or an
-    all-capitals identifier (`AGPL`). Unsure counts as yes: the URL then fails safe."""
-    words = re.split(r"[^a-z0-9]+", part.casefold())
-    return bool(any(word.startswith("licen") or word in _LICENSE_WORDS for word in words)
-                or _LICENSE_NAMES.get(part.casefold())
-                or re.fullmatch(r"[a-z][\w.+]*(?:-[a-z][\w.+]*)*-v?\d+(?:\.\d+)*(?:-[\w.+]+)*", part, re.I)
-                or re.fullmatch(r"(?=(?:[^A-Z]*[A-Z]){2})[A-Z][A-Z0-9.+]*(?:-[A-Z0-9.+]+)*", part))
-
-
-def _url_parts(value: str) -> list[str] | None:
-    """The parts of ``value`` when it is one plain URL and none of its parts names a license, else None.
-
-    A URL with an escape (`%6c`), a backslash or any non-ASCII letter can spell a license in a way
-    this check does not read, so it is unsure and fails safe.
-    """
-    if _URL.fullmatch(value) is None:
-        return None
-    url = value.strip("<>")
-    if not url.isascii() or "%" in url or "\\" in url:
-        return None
-    parts = [part for part in re.split(r"[/?#=&,;:@]", url.split("://", 1)[-1]) if part]
-    return None if any(_license_part(part) for part in parts) else parts
-
-
-def _facts(lines: list[str]) -> tuple[set[str], set[str]]:
-    """The names a LICENSE file carries itself: whole copyright holders, and the parts of its plain URLs.
-
-    A holder is all of a copyright line after `Copyright`, `(c)` and the years. Copyright lines stay
-    unjudged (Jin's rule); a holder that runs on into another sentence or clause (`. ` and more,
-    `;`, `:`, `!`, `?`) is not one name and backs nothing.
-    """
-    clauses = [line for line in lines if _copyright_line(line)]
-    clauses += [match[3] for line in lines if (match := _BY.fullmatch(line)) and match[3]]
-    holders = {" ".join(match[1].split()) for clause in clauses if (match := _HOLDER.fullmatch(clause.strip()))}
-    holders = {holder for holder in holders if not re.search(r"[.!?][ \t]+\S|[;:!?]", holder)}
-    works = {part for line in lines for url in _URL.findall(line) for part in (_url_parts(url) or ())}
-    return holders, works
-
-
-def _attribution(line: str, holders: set[str], works: set[str]) -> bool:
-    """`<work> by <holder>[, <exact permissive license name>][, Copyright …]`.
-
-    The holder is exactly a name a copyright line of this file writes, and the work exactly a part
-    of one of its plain URLs; the trailing copyright part is a copyright clause and is not judged.
-    """
-    if (match := _BY.fullmatch(line)) is None:
-        return False
-    work, rest, _ = match.groups()
-    holder, comma, license_name = rest.partition(",")
-    return (" ".join(work.split()) in works and " ".join(holder.split()) in holders
-            and (not comma or _LICENSE_NAMES.get(license_name.strip().casefold()) in OPEN_SOURCE_LICENSES))
-
-
-def _notice(line: str, holders: set[str], works: set[str]) -> bool:
-    """A line allowed around a complete license text, by definition and nothing else (#1652):
-
-    a permissive SPDX line; a copyright line (not judged); a URL none of whose parts names a license;
-    a label line (`Source:`, `Upstream:`, `Attribution:`, …) whose value is such a URL or exactly a
-    name a copyright line of this file writes; or `_attribution`. Anything else fails, and an unsure
-    file is simply not a default (review standard, option 1).
+    Copyright lines, permissive SPDX lines, URL lines, labelled lines (`Source:`, `Attribution:`,
+    `Upstream:` …) and `<work> by …` attributions pass whatever they say: their content is a NOTE for
+    the person who approves the role table or a library, the real filter. Only unlabelled sentences
+    are judged, by failing: they may add a condition.
     """
     line = line.strip()
-    if _copyright_line(line) or _spdx(line) in OPEN_SOURCE_LICENSES or _url_parts(line) is not None:
+    if _copyright_line(line):
         return True
-    if (label := _LABEL.fullmatch(line)) is not None:
-        return _url_parts(label[1].strip()) is not None or " ".join(label[1].split()) in holders
-    return _attribution(line, holders, works)
+    # A declaration is always judged and never falls through to the unjudged forms below.
+    if (identity := _spdx(line)) is not None:
+        return identity in OPEN_SOURCE_LICENSES
+    return bool(_URL.fullmatch(line) or _LABEL.fullmatch(line) or _BY.fullmatch(line))
 
 
 def _permissive(text: str) -> str:
@@ -248,14 +188,13 @@ def _permissive(text: str) -> str:
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     declarations = [line for line in lines if not _copyright_line(line)]
-    if len(declarations) == 1 and (identity := _spdx(declarations[0])) is not None:
-        return identity if identity in OPEN_SOURCE_LICENSES else "unknown"
-    if any(_spdx(line) == "unknown" for line in lines):
-        return "unknown"  # A nonpermissive declaration fails whatever text follows it.
+    # The older short form is one `SPDX-License-Identifier:` line only; no other declaration stands in for terms.
+    if len(declarations) == 1 and (found := _declaration(declarations[0])) is not None:
+        label, identity = found
+        return identity if label.casefold() == "spdx-license-identifier" else "unknown"
     standards = {identity: _terms(standard) for identity, standard in STANDARD_LICENSES.items()}
     # The license text is one run of lines; only notices may stand before or after it.
-    holders, works = _facts(lines)
-    notices = [_notice(line, holders, works) for line in lines]
+    notices = [_notice(line) for line in lines]
     first = next((index for index, notice in enumerate(notices) if not notice), len(lines))
     last = next((index for index in range(len(lines) - 1, -1, -1) if not notices[index]), -1)
     for start in range(first + 1):

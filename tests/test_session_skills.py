@@ -317,53 +317,52 @@ RESTRICTED_TEXTS = {
     "copyleft": "SPDX-License-Identifier: GPL-3.0-only\n",
     "non-commercial": "SPDX-License-Identifier: CC-BY-NC-4.0\nCopyright 2026 Example\n",
     "only-copyright": "Copyright 2026 Example\n",
-    # #1652: an attribution or source notice never carries an unchecked license or a sentence.
-    "attribution-noncommercial-name": "example by Jane Doe, BSD-NonCommercial License, Copyright (c) 2026 Jane Doe\n"
-    + STANDARD_LICENSES["MIT"],
-    "attribution-license-in-author": "example by Jane Doe BSD-NonCommercial License\n" + STANDARD_LICENSES["MIT"],
-    "attribution-spdx-noncommercial": "example by Jane Doe, CC-BY-NC-4.0\n" + STANDARD_LICENSES["MIT"],
-    "labelled-license": "Attribution: BSD-NonCommercial License\n" + STANDARD_LICENSES["MIT"],
-    "labelled-sentence": "Source: Example Project\nAttribution: no commercial use\n" + STANDARD_LICENSES["MIT"],
+    # #1652 scope (2026-11-02): an unlabelled sentence around the text is judged and fails.
     "sentence-as-work": "Redistribution is prohibited by Jane Doe\n" + STANDARD_LICENSES["MIT"],
-    "labelled-copyleft-after-comma": "Attribution: Jane Doe, GPL-3.0-only\n" + STANDARD_LICENSES["MIT"],
-    "attribution-noncommercial-no-space": "example by Jane Doe,CC-BY-NC-4.0\n" + STANDARD_LICENSES["MIT"],
-    "identifier-as-name-word": "Attribution: Jane Doe GPL-3.0-only\n" + STANDARD_LICENSES["MIT"],
-    "one-word-attribution-is-no-work": "Attribution: noncommercial\n" + STANDARD_LICENSES["MIT"],
-    # #1652 review 3: a name the file's copyright lines or URLs do not carry is unsure and fails safe.
-    "title-case-ban": "Attribution: Redistribution Is Prohibited.\n" + JANE_MIT,
-    "title-case-source-ban": "Source: No Commercial Use\n" + JANE_MIT,
     "title-case-work-ban": "No Commercial Use by Jane Doe, MIT License\n" + JANE_MIT,
-    "unbacked-author": "pstack by Someone Else\nhttps://example.org/pstack\n" + JANE_MIT,
-    "work-without-url": "Source: pstack\n" + JANE_MIT,
-    "holder-then-condition": "Attribution: Jane Doe, Noncommercial\n" + JANE_MIT,
-    # #1652 review 4: only a whole holder backs a notice, never a part of a copyright line.
-    "condition-from-copyright-line": "Attribution: Redistribution is prohibited.\n" + BANNED_HOLDER_MIT,
-    "holder-sentence-repeated": "Attribution: Jane Doe. Redistribution is prohibited.\n" + BANNED_HOLDER_MIT,
-    "name-cut-from-a-longer-holder": "Attribution: Jane Doe\n" + BANNED_HOLDER_MIT,
-    "part-of-a-holder": "Attribution: Doe\n" + JANE_MIT,
-    "part-of-a-url-part": "Source: pst\nhttps://example.org/pstack\n" + JANE_MIT,
-    # #1652 review 5: a URL with any part that names a license is no notice, on every label and alone.
-    "license-in-url-and-label": "Source: Jane,GPL-3.0-only\nhttps://example.org/Jane,GPL-3.0-only\n"
-    + STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2026 Jane"),
-    "license-url-alone": "https://example.org/Jane,GPL-3.0-only\n" + JANE_MIT,
-    "upstream-copyleft-url": "Upstream: https://example.org/GPL-3.0-only\n" + JANE_MIT,
-    "homepage-noncommercial-url": "Homepage: https://example.org/CC-BY-NC/home\n" + JANE_MIT,
-    "origin-license-query": "Origin: https://example.org/get?license=nc\n" + JANE_MIT,
-    "repository-capitals-identifier": "Repository: https://example.org/AGPL\n" + JANE_MIT,
-    "identifier-as-work": "GPL-3.0-only by Jane Doe\nhttps://example.org/GPL-3.0-only\n" + JANE_MIT,
-    # #1652 review 6: escapes and case cannot hide a license in a URL, alone, on a label or as a work.
-    "escaped-license-label": "Attribution: https://creativecommons.org/%6cicenses/by-nc/4.0/\n" + JANE_MIT,
-    "escaped-license-alone": "https://creativecommons.org/%6cicenses/by-nc/4.0/\n" + JANE_MIT,
-    "lowercase-cc-terms": "Upstream: https://creativecommons.org/by-nc/4.0/\n" + JANE_MIT,
-    "mixed-case-family": "Homepage: https://example.org/Gpl\n" + JANE_MIT,
-    "fullwidth-letters": "Source: https://example.org/\uff4cicense\n" + JANE_MIT,
-    "escaped-work": "nebula by Jane Doe\nhttps://example.org/%6cicenses/nebula\n" + JANE_MIT,
-    "family-word-work": "polyform-noncommercial by Jane Doe\nhttps://example.org/polyform-noncommercial\n" + JANE_MIT,
-    # Anything but a plain URL or an exact holder fails safe (NOTE records, not restrictions).
-    "label-holder-with-license-name": "Attribution: Jane Doe, MIT License\n" + JANE_MIT,
-    "label-holder-with-mail": "Author: Jane Doe <jane@example.org>\n" + JANE_MIT,
-    "label-work-name": "Source: pstack\nUpstream: https://github.com/example/pstack\n" + JANE_MIT,
+    "sentence-after-url": "https://example.org/x Redistribution is prohibited.\n" + JANE_MIT,
+    "unlabelled-condition-after": JANE_MIT + "\nNo commercial use without written permission.\n",
+    "copyleft-spdx-beside-notices": "SPDX-License-Identifier: GPL-3.0-only\nSource: https://example.org/x\n" + JANE_MIT,
+    # #1652 review 8: every spelling of a license declaration is judged as an SPDX expression.
+    "spdx-tab": "SPDX-License-Identifier:\tGPL-3.0-only\n" + JANE_MIT,
+    "spdx-and-ref": "SPDX-License-Identifier: MIT AND LicenseRef-NonCommercial\n" + JANE_MIT,
+    "spdx-lowercase": JANE_MIT + "\nspdx-license-identifier: gpl-3.0-only\n",
+    "spdx-comment-mark": "# SPDX-License-Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "spdx-space-before-colon": "SPDX-License-Identifier : GPL-3.0-only\n" + JANE_MIT,
+    "spdx-with-exception": "SPDX-License-Identifier: MIT WITH Commons-Clause\n" + JANE_MIT,
+    "licence-spelling": "SPDX-Licence-Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "license-label": "License: GPL-3.0-only\n" + JANE_MIT,
+    "empty-declaration": "SPDX-License-Identifier:\n" + JANE_MIT,
+    # #1652 review 9: a declaration is always judged, whatever other form it also fits.
+    "declaration-shaped-as-by": "SPDX-License-Identifier: by LicenseRef-NonCommercial\n" + JANE_MIT,
+    "declaration-words-label": "SPDX License Identifier: GPL-3.0-only\n" + JANE_MIT,
+    "declaration-label-with-url": JANE_MIT + "\nUpstream License: https://example.org/gpl\n",
+    # The short form is one `SPDX-License-Identifier:` line; no other declaration replaces the terms.
+    "short-license-label": "License: MIT\n",
+    "short-spdx-label": "SPDX: MIT\n",
+    "short-spaced-label": "SPDX License Identifier: MIT\n",
 }
+
+# #1652 scope (2026-11-02): labelled notice lines, `<work> by …` and URLs are not judged; their content
+# is a NOTE for the person who approves the table or a library.
+LABELLED_NOTES = {
+    "attribution-sentence": "Attribution: Redistribution is prohibited.\n" + JANE_MIT,
+    "source-url-then-sentence": JANE_MIT + "\nSource: https://example.org/source Redistribution is prohibited.\n",
+    "linked-terms": "Attribution: https://commonsclause.com/\n" + JANE_MIT,
+    "upstream-identifier-url": "Upstream: https://example.org/GPL-3.0-only\n" + JANE_MIT,
+    "work-by-anyone": "pstack by Someone Else, MIT License\nhttps://example.org/pstack\n" + JANE_MIT,
+}
+
+
+@pytest.mark.parametrize("text", LABELLED_NOTES.values(), ids=LABELLED_NOTES)
+def test_labelled_notices_and_urls_are_not_judged(tmp_path, text):
+    root = tmp_path / "root"
+    write_skill(root / ".claude", "noted", license=None)
+    (root / ".claude/skills/noted/LICENSE").write_text(text)
+    config = Config(skill_libraries=[], default_skills={"docs": ["noted"]})
+    assert ".claude/skills/noted/SKILL.md" in section(config, "docs", root)
+    assert SkillManager(config).check_default("noted", root) is None
+
 
 # Jin, 2026-11-02: the copyright line is never judged; whatever its name says is a NOTE record.
 COPYRIGHT_NAME_NOTES = {
@@ -413,6 +412,9 @@ def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, 
     # #1652 superseded the old rejection: a permissive SPDX line beside a complete permissive text passes.
     "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
     "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    # #1652 review 8: an SPDX expression of permissive identifiers only.
+    "SPDX-License-Identifier: MIT OR Apache-2.0\n" + STANDARD_LICENSES["MIT"],
+    "// SPDX-License-Identifier:\t(MIT AND ISC)\n" + STANDARD_LICENSES["MIT"],
     # #1652: attribution and source notices around a complete permissive text.
     # A label value is a plain URL or exactly a name this file's copyright line writes (#1652).
     "Attribution: Jane Doe\nSource: https://example.org/example-project\n" + JANE_MIT,
