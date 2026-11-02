@@ -39,6 +39,7 @@ MESSAGES = {
         "scorecard_label_phase_implementing": "implementing minutes",
         "scorecard_label_phase_checking": "checking minutes",
         "scorecard_label_phase_test-slot-wait": "minutes waiting for a test slot",
+        "scorecard_label_phase_run-slot-wait": "minutes waiting for a machine slot",
         "scorecard_label_phase_baseline": "baseline minutes",
     },
     "ko": {
@@ -78,6 +79,7 @@ MESSAGES = {
         "scorecard_label_phase_implementing": "만드는 데 걸린 분",
         "scorecard_label_phase_checking": "확인하는 데 걸린 분",
         "scorecard_label_phase_test-slot-wait": "시험 자리를 기다린 분",
+        "scorecard_label_phase_run-slot-wait": "작업 자리를 기다린 분",
         "scorecard_label_phase_baseline": "기준선에 걸린 분",
     },
 }

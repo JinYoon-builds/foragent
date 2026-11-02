@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from foragent import cuts
-from foragent.issue import ParsedIssue
+from foragent.issue import ParsedIssue, authored_body
 
 
 REVIEW_VERDICT_CONTRACT = (
@@ -62,6 +62,8 @@ CONFIRM_PROMPT = (
     "every remaining finding, each one line with file:line and the concrete failure."
 )
 
+OTHER_CONTENT_HEADING = "Other approved issue content (verbatim):"
+
 
 def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     """Scope rules for reviewers; PR bodies pass the repository language for the human-read question."""
@@ -96,19 +98,23 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
-    task: str = REVIEW_PROMPT,
+    task: str = REVIEW_PROMPT, pass_scope: str = "",
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
     `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    `pass_scope` is the earlier PASS's facts and scope (review_pass_scope); `diff` then matches it.
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
         f"{task}\n\n{review_scope_rules(acceptance_dir)}"
+        + (f"\n\n{pass_scope}" if pass_scope else "")
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
-        + f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
+        + f"\n\nDone when commands:\n{commands}"
+        + (f"\n\n{OTHER_CONTENT_HEADING}\n{parsed.other_content}" if parsed.other_content else "")
+        + f"\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
@@ -116,12 +122,12 @@ def build_review_prompt(
 
 def build_confirm_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
-    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "",
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "", pass_scope: str = "",
 ) -> str:
     """The complete first-round result and current change for one confirming reviewer."""
     return build_review_prompt(
         parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
-        lane_decisions=lane_decisions, task=CONFIRM_PROMPT,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT, pass_scope=pass_scope,
     ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
@@ -240,7 +246,8 @@ def build_prompt(
         + f"Out of scope (do not do these): {parsed.out_of_scope}\n"
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
-        "Rules:\n"
+        + (f"{OTHER_CONTENT_HEADING}\n{parsed.other_content}\n" if parsed.other_content else "")
+        + "Rules:\n"
         f"{acceptance_rule}"
         f"{test_rule}"
         f"- {IMPLEMENTER_TEST_RULE}\n"
@@ -331,8 +338,10 @@ def build_resume_prompt(
     if lane_plan:
         # Always restated: a newer preread and approval may replace the plan the session saw.
         parts.append(lane_plan)
-    if previous_body is not None and previous_body != body:
-        old, new = previous_body.splitlines(), body.splitlines()
+    # Gate writing is not specification, so a change in it alone is no update.
+    old, new = (authored_body(previous_body).splitlines(), authored_body(body).splitlines()) \
+        if previous_body is not None else ([], [])
+    if old != new:
         for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
             if tag == "equal":
                 continue

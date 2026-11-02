@@ -106,13 +106,13 @@ def test_ci_trusted_checks_setting_loads_from_team_config_and_rejects_unknown_va
 
     path = tmp_path / ".foragent.yml"
     no_global = tmp_path / "missing-global.yml"
-    path.write_text(yaml.safe_dump({"review": "batch"}), encoding="utf-8")
+    path.write_text(yaml.safe_dump({"review": "fast"}), encoding="utf-8")
     assert getattr(load_config(tmp_path, no_global), KEY) == "auto"
     for value in ("auto", "ci", "all"):
-        path.write_text(yaml.safe_dump({"review": "batch", KEY: value}), encoding="utf-8")
+        path.write_text(yaml.safe_dump({"review": "fast", KEY: value}), encoding="utf-8")
         assert getattr(load_config(tmp_path, no_global), KEY) == value
     for value in ("some", "", True, None):
-        path.write_text(yaml.safe_dump({"review": "batch", KEY: value}), encoding="utf-8")
+        path.write_text(yaml.safe_dump({"review": "fast", KEY: value}), encoding="utf-8")
         with pytest.raises(ConfigError):
             load_config(tmp_path, no_global)
 

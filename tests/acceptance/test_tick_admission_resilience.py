@@ -17,7 +17,7 @@ from test_skills_autosync import isolated_home  # noqa: F401
 from test_order_machine_budget import fake_workloads  # noqa: F401
 
 
-@pytest.mark.parametrize("failed_step", ["github_refresh", "batch_reconcile", "parent_sync"])
+@pytest.mark.parametrize("failed_step", ["github_refresh", "parent_sync"])
 def test_non_start_failure_keeps_three_cached_admissions_and_records_the_fact(
     git_history, tmp_path, monkeypatch, failed_step,
 ):
@@ -46,8 +46,6 @@ def test_non_start_failure_keeps_three_cached_admissions_and_records_the_fact(
 
     if failed_step == "github_refresh":
         monkeypatch.setattr(case.tracker, "list_issues", broken)
-    elif failed_step == "batch_reconcile":
-        monkeypatch.setattr(scheduler, "_reconcile_batches", broken)
     else:
         monkeypatch.setattr(scheduler.board_parents, "follow_children", broken)
     context = tick_context(case)
@@ -134,6 +132,7 @@ def test_refresh_failure_rereads_one_issue_and_skips_only_unsafe_candidate(
 
 
 def test_optional_parent_and_batch_gh_share_ten_second_deadline(git_history, tmp_path, monkeypatch):
+    """Reject a fresh ten-second budget per parent request or loss of the five-second call cap."""
     import subprocess
     import time
     from foragent import tracker as tracker_module
@@ -146,6 +145,9 @@ def test_optional_parent_and_batch_gh_share_ten_second_deadline(git_history, tmp
         timeout = kw.get("timeout")
         calls.append(timeout)
         assert 0 < timeout <= min(5, 10 - elapsed[0]), "Optional gh must receive the remaining deadline"
+        if timeout >= 3:
+            elapsed[0] += 3
+            return subprocess.CompletedProcess(argv, 0, stdout=b"[]", stderr=b"")
         elapsed[0] += timeout
         raise subprocess.TimeoutExpired(argv, timeout)
     monkeypatch.setattr(subprocess, "run", run)
@@ -155,9 +157,8 @@ def test_optional_parent_and_batch_gh_share_ten_second_deadline(git_history, tmp
     def optional(*args, **kwargs):
         for n in range(4):
             gh.sub_issues(n + 1)
-    monkeypatch.setattr(scheduler, "_reconcile_batches", optional)
     monkeypatch.setattr(scheduler.board_parents, "follow_children", optional)
     report = scheduler.tick(tick_context(case, start_runs=False))
     assert report.skipped is None
-    assert calls == [5, 5] and elapsed[0] == 10, "Both optional steps share one bounded budget"
+    assert calls == [5, 5, 4, 1] and elapsed[0] == 10, "Optional parent requests share one bounded budget"
     assert any("defer" in line.lower() or "timeout" in line.lower() for line in report.actions)

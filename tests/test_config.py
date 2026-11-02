@@ -46,7 +46,7 @@ def test_exact_defaults(repo):
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True,
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
@@ -519,6 +519,19 @@ def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
     write_settings(repo / ".foragent.yml", {"legacy_owner": login})
     with pytest.raises(ConfigError, match="legacy_owner"):
         load_config(repo, tmp_path / "global.yml")
+
+
+def test_review_pass_scope_defaults_on_and_loads_from_the_repository(repo):
+    assert load_config(repo).review_pass_scope is True
+    write_settings(repo / ".foragent.yml", {"review_pass_scope": False})
+    assert load_config(repo).review_pass_scope is False
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_review_pass_scope_must_be_a_boolean(repo, value):
+    write_settings(repo / ".foragent.yml", {"review_pass_scope": value})
+    with pytest.raises(ConfigError, match="review_pass_scope must be true or false"):
+        load_config(repo)
 
 
 def test_legacy_owner_is_optional_and_kept_as_written(repo, tmp_path):

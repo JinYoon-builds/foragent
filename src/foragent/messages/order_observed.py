@@ -15,6 +15,7 @@ MESSAGES = {
         "observed_field_done_when_checklist": "Done when checklist",
         "observed_field_files": "Files",
         "observed_field_exclusive": "Exclusive files",
+        "observed_field_other_content": "Other issue content",
     },
     "ko": {
         "observed_invalid": "{path}에서 읽어 둔 이슈 기준을 확인할 수 없어요. 복구한 뒤 발행해 주세요.",
@@ -30,5 +31,6 @@ MESSAGES = {
         "observed_field_done_when_checklist": "완료 점검표 (Done when checklist)",
         "observed_field_files": "변경 파일",
         "observed_field_exclusive": "독점 파일",
+        "observed_field_other_content": "그 밖의 이슈 내용",
     },
 }
