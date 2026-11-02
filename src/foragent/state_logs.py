@@ -54,16 +54,54 @@ class FlowRecordsMixin:
         """
         try:
             with _file_lock(self.root / FLOW_LOCK):
-                record = {"at": self._now().astimezone(_state.UTC).isoformat(), "kind": kind, "issue": issue,
-                          "run_started_at": run_started_at, "data": data}
-                line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
-                if len(line) > FLOW_RECORD_BYTES:
-                    record["data"] = {"oversized_bytes": len(line)}
-                    line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
-                if len(line) <= FLOW_RECORD_BYTES:
-                    self._append_flow_line(line)
+                self._write_flow(kind, issue, run_started_at, data)
         except Exception:
             return
+
+    def record_flow_change(self, kind: str, *, issue: int | None = None, run_started_at: str | None = None,
+                           across_runs: bool = False, only_if=None, **data: object) -> None:
+        """Append one transition unless the latest same-kind record already says it.
+
+        The latest record is this execution's, or the issue's with ``across_runs``. ``only_if`` sees its
+        data (None without one) and can decline. Concurrent callers share the lock, so one change is one
+        record. A retained-out record is unknown, and its repeat is recorded again.
+        """
+        try:
+            with _file_lock(self.root / FLOW_LOCK):
+                latest = self._latest_flow(kind, issue, None if across_runs else (run_started_at,))
+                if latest is not None and latest["run_started_at"] == run_started_at and latest["data"] == data:
+                    return
+                if only_if is None or only_if(None if latest is None else latest["data"]):
+                    self._write_flow(kind, issue, run_started_at, data)
+        except Exception:
+            return
+
+    def _write_flow(self, kind: str, issue: int | None, run_started_at: str | None, data: dict) -> None:
+        record = {"at": self._now().astimezone(_state.UTC).isoformat(), "kind": kind, "issue": issue,
+                  "run_started_at": run_started_at, "data": data}
+        line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+        if len(line) > FLOW_RECORD_BYTES:
+            record["data"] = {"oversized_bytes": len(line)}
+            line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+        if len(line) <= FLOW_RECORD_BYTES:
+            self._append_flow_line(line)
+
+    def _latest_flow(self, kind: str, issue: int | None, runs: tuple | None) -> dict | None:
+        """The newest retained record of ``kind`` for ``issue``, limited to ``runs`` when given."""
+        marker = _state.json.dumps(kind).encode()
+        for name in (FLOW_FILE, FLOW_OLD_FILE):
+            for line in reversed(self._flow_generation(name).split(b"\n")):
+                if marker not in line:
+                    continue
+                try:
+                    value = _state.json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(value, dict) and value.get("kind") == kind and value.get("issue") == issue
+                        and isinstance(value.get("data"), dict)
+                        and (runs is None or value.get("run_started_at") in runs)):
+                    return value
+        return None
 
     def _append_flow_line(self, line: bytes) -> None:
         path = self.root / FLOW_FILE
