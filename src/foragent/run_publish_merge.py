@@ -30,6 +30,8 @@ def _merge_lock(n: int, ctx: RunContext):
             def acquire():
                 nonlocal started
                 stack.enter_context(ctx.store.merge_lock())
+                # Main writers (order/note flush, role memory, lanes) wait from the final check to the merge.
+                stack.enter_context(ctx.git.publish_lock())
                 started = ctx.now()
 
             try:

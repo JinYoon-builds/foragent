@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager, ExitStack
+from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
 import fcntl
 import os
@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 
 from foragent.state import StateStore
@@ -631,16 +632,7 @@ class GitRepo:
         if not paths:
             self._exclude_artifacts()
             return
-        identity = []
-        for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
-            try:
-                value = self._call(["config", "--get", key]).strip()
-            except GitError as exc:
-                cause = exc.__cause__
-                if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
-                    raise
-                value = ""
-            identity.extend(["-c", f"{key}={value or fallback}"])
+        identity = self._identity()
         # Already-staged deletions belong in the commit, but git add cannot
         # match them once they are absent from both the worktree and index.
         indexed = set(self._call(["ls-files", "--cached", "-z", "--", *paths]).split("\0"))
@@ -651,17 +643,44 @@ class GitRepo:
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 
-    @contextmanager
-    def publish_lock(self) -> Iterator[None]:
-        """Serialize base-branch publication across processes sharing this repository."""
-        path = Path(self._call(["rev-parse", "--git-common-dir"]).strip())
-        path = (path if path.is_absolute() else self.root / path) / "foragent-publish.lock"
-        with path.open("a", encoding="utf-8") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    def _identity(self) -> list[str]:
+        """``-c`` options naming the configured committer, with Foragent's fallback."""
+        identity = []
+        for key, fallback in (("user.name", "foragent"), ("user.email", "foragent@localhost")):
             try:
-                yield
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                value = self._call(["config", "--get", key]).strip()
+            except GitError as exc:
+                cause = exc.__cause__
+                if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
+                    raise
+                value = ""
+            identity.extend(["-c", f"{key}={value or fallback}"])
+        return identity
+
+    def rebase_onto_base(self, branch: str) -> None:
+        """Put the local commits not yet on ``origin/<branch>`` on top of its fetched tip.
+
+        A setup publisher calls this under the main-write lock: a merge may have landed while it
+        waited, so its own unpushed commits move onto that merge instead of being refused by the push.
+        Unrelated local edits are kept (``--autostash``); a conflicting rebase is undone and reported.
+        """
+        self.fetch("origin", branch)
+        remote = f"refs/remotes/origin/{branch}"
+        if self.is_ancestor(remote, "HEAD"):
+            return
+        try:
+            self._call([*self._identity(), "rebase", "--autostash", remote])
+        except GitError as exc:
+            try:
+                self._call(["rebase", "--abort"])
+            except GitError:
+                pass  # Nothing was started, so nothing is left to undo.
+            raise GitError(f"cannot move the local {branch} commits onto origin/{branch}; "
+                           f"they conflict with the latest {branch}: {exc}") from exc
+
+    def publish_lock(self) -> AbstractContextManager[None]:
+        """The one main-write lock for this repository; see ``main_write_lock``."""
+        return main_write_lock(self.root, lambda: self._call(["rev-parse", "--git-common-dir"]))
 
     def update_base(self, branch: str) -> None:
         """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
@@ -713,6 +732,48 @@ class GitRepo:
         return slug
 
 
+_MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by lock path.
+
+
+@contextmanager
+def main_write_lock(root: Path, common_dir: Callable[[], str] | None = None) -> Iterator[None]:
+    """The one main-write lock: every Foragent write that advances local or remote main holds it.
+
+    Merges take it after the store merge lock and keep it from their final check through the
+    merge; publishers take it after their own gates and refresh the base once they hold it.
+    Linked worktrees share it through the Git common directory. A writer nested in another
+    main write of the same thread reuses the hold.
+
+    The lock lives in the common Git directory that Git itself would use for ``root``
+    (``main_write_dir``). ``common_dir`` asks Git when those rules find none. With no answer
+    there is no repository for Git to write at ``root``, so there is no main to exclude.
+    """
+    common = main_write_dir(root)
+    if common is None and common_dir is not None:
+        common = Path(common_dir().strip())
+        common = common if common.is_absolute() else root / common
+    if common is None:
+        yield
+        return
+    key = os.path.realpath(common / "foragent-publish.lock")
+    held = _MAIN_WRITES.__dict__.setdefault("held", Counter())
+    if held[key]:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    with open(key, "a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        held[key] = 1
+        try:
+            yield
+        finally:
+            del held[key]
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def slug_from_url(url: str) -> str | None:
     """``owner/name`` of a GitHub remote url, else None. The one url-to-slug rule."""
     match = re.fullmatch(
@@ -720,6 +781,36 @@ def slug_from_url(url: str) -> str | None:
         r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?", url.strip(),
     )
     return None if match is None else f"{match[1]}/{match[2]}"
+
+
+def main_write_dir(root: Path) -> Path | None:
+    """The common Git directory that Git commands run at ``root`` use, found by Git's own rules.
+
+    ``GIT_COMMON_DIR`` and ``GIT_DIR`` win over discovery (a ``GIT_DIR``/``GIT_WORK_TREE``
+    checkout has no ``.git`` at its root); relative values are relative to ``root``, where
+    ``GitRepo`` runs Git. Otherwise the nearest ``.git`` from ``root`` up, as Git discovers it.
+    None when Git would find no repository there.
+    """
+    root = Path(root).absolute()
+    try:
+        if common := os.environ.get("GIT_COMMON_DIR"):
+            return (root / common).resolve()
+        if gitdir := os.environ.get("GIT_DIR"):
+            return _common_of((root / gitdir).resolve())
+        for directory in (root, *root.parents):
+            if (directory / ".git").exists():
+                return _common_git_dir(directory)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise GitError(f"cannot find the Git directory of {root} for the main-write lock: {exc}") from exc
+    return None
+
+
+def _common_of(gitdir: Path) -> Path:
+    """A git dir's common directory: a linked worktree's git dir names it in ``commondir``."""
+    commondir = gitdir / "commondir"
+    if commondir.is_file():
+        return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
+    return gitdir
 
 
 def _common_git_dir(root: Path) -> Path:
@@ -730,11 +821,7 @@ def _common_git_dir(root: Path) -> Path:
     line = dot_git.read_text(encoding="utf-8").strip()
     if not line.startswith("gitdir:"):
         raise OSError(f"not a git dir file: {dot_git}")
-    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
-    commondir = gitdir / "commondir"
-    if commondir.is_file():
-        return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
-    return gitdir
+    return _common_of((root / line.removeprefix("gitdir:").strip()).resolve())
 
 
 def origin_slug_from_files(root: Path, remote: str = "origin") -> str | None:

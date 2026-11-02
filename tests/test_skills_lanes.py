@@ -1,3 +1,4 @@
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -373,6 +374,8 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     commits = []
     tracked, pushes = [], []
 
+    events = []
+
     class Git:
         def current_branch(self):
             return "main"
@@ -381,10 +384,24 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
             tracked.append(paths)
 
         def commit_paths(self, paths, title):
+            events.append("commit")
             commits.append((paths, title))
+
+        @contextmanager
+        def publish_lock(self):
+            events.append("lock")
+            yield
+            events.append("unlock")
+
+        def remote_branch_sha(self, branch):
+            return "remote-main"
+
+        def rebase_onto_base(self, branch):
+            events.append(f"onto origin/{branch}")
 
         def push_base(self, branch):
             assert commits
+            events.append("push")
             pushes.append(branch)
 
     lane = add_lane(root, "api", ["api/**", "shared/**"], skills=["engineering/testing-strategy"],
@@ -403,6 +420,8 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     expected = [".foragent.yml", ".claude/agents/fa-api.md", ".gitignore", ".gitattributes"]
     assert commits == [(expected, "Foragent lane api")]
     assert tracked == [expected] and pushes == ["main"]
+    # A merge may land while the lock waits: the commit moves onto it before the push, all under the lock.
+    assert events == ["lock", "commit", "onto origin/main", "push", "unlock"]
     before = (root / ".foragent.yml").read_text()
     with pytest.raises(LaneError, match="already exists"):
         add_lane(root, "api", ["different/**"], git=Git())
@@ -450,6 +469,12 @@ def test_validate_and_add_lane_accept_more_than_three_skills(library, tmp_path):
         def commit_paths(self, paths, title):
             commits.append(paths)
 
+        def publish_lock(self):
+            return nullcontext()
+
+        def remote_branch_sha(self, branch):
+            return None  # Not pushed yet: there is no remote base to refresh.
+
         def push_base(self, branch):
             pass
 
@@ -468,6 +493,7 @@ def test_nonfree_lane_skill_installs_locally_with_warning(two_libraries, tmp_pat
     published = []
     monkeypatch.setattr(GitRepo, "ensure_tracked", lambda self, paths: published.extend(paths))
     monkeypatch.setattr(GitRepo, "commit_paths", lambda *args: None)
+    monkeypatch.setattr(GitRepo, "publish_lock", lambda self: nullcontext())  # Not a Git repository.
     lane = add_lane(root, "design", ["ui/**"], skills=["skills:frontend-design", "skills:docx"],
                     manager=manager, push=False)
     assert lane["skills"] == ["frontend-design", "docx"]
