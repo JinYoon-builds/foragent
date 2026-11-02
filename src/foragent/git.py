@@ -654,7 +654,7 @@ class GitRepo:
 
     def publish_lock(self) -> AbstractContextManager[None]:
         """The one main-write lock for this repository; see ``main_write_lock``."""
-        return main_write_lock(self.root, self._call)
+        return main_write_lock(self.root)
 
     def update_base(self, branch: str) -> None:
         """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
@@ -710,16 +710,17 @@ _MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by 
 
 
 @contextmanager
-def main_write_lock(root: Path, call: Callable[[list[str]], str] | None = None) -> Iterator[None]:
+def main_write_lock(root: Path) -> Iterator[None]:
     """The one main-write lock: every Foragent write that advances local or remote main holds it.
 
     Merges take it after the store merge lock and keep it from their final check through the
     merge; publishers take it after their own gates and refresh the base once they hold it.
-    Every checkout of a repository shares it through the common Git directory that Git reports
-    (``main_write_dir``). A writer nested in another main write of the same thread reuses the hold.
+    Every checkout of a repository shares it through its common Git directory
+    (``main_write_dir``). It needs only the checkout's path, so an injected Git boundary is
+    never bypassed. A writer nested in another main write of the same thread reuses the hold.
     With no repository at ``root`` there is no main to exclude, and nothing is locked.
     """
-    common = main_write_dir(root, call)
+    common = main_write_dir(root)
     if common is None:
         yield
         return
@@ -751,33 +752,15 @@ def slug_from_url(url: str) -> str | None:
     return None if match is None else f"{match[1]}/{match[2]}"
 
 
-def main_write_dir(root: Path, call: Callable[[list[str]], str] | None = None) -> Path | None:
-    """The common Git directory of the repository that Git commands run at ``root`` write.
+def main_write_dir(root: Path) -> Path | None:
+    """The common Git directory that Git commands run at ``root`` use, read from Git's files.
 
-    Git's own answer decides (``rev-parse --git-common-dir``), so every checkout layout Git
-    supports (symlinked or linked ``.git``, ``GIT_DIR``/``GIT_WORK_TREE``) shares one lock.
-    ``call`` runs Git; without it Git is asked only when the files show a repository, so a
-    directory Git would not treat as a checkout is never locked. The file reading is the answer
-    only for an injected Git that cannot report it.
+    Git's order: ``GIT_COMMON_DIR``, then ``GIT_DIR`` (relative to ``root``, where ``GitRepo``
+    runs Git), then the nearest ``.git`` from ``root`` up. A ``.git`` file, directory or symlink
+    is resolved and its ``commondir`` followed, as Git does for linked worktrees. Tests compare
+    each checkout layout with ``git rev-parse --git-common-dir``. None when Git would find no repository.
     """
     root = Path(root).absolute()
-    found = _discovered_common_dir(root)
-    if call is None:
-        if found is None:
-            return None
-        call = GitRepo(root)._call
-    try:
-        answer = call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
-    except GitError:
-        answer = ""
-    reported = Path(answer) if answer else None
-    if reported is not None and reported.is_absolute() and reported.is_dir():
-        return reported.resolve()
-    return found
-
-
-def _discovered_common_dir(root: Path) -> Path | None:
-    """The common Git directory the files show for ``root`` (environment, then the nearest ``.git``)."""
     try:
         if common := os.environ.get("GIT_COMMON_DIR"):
             return (root / common).resolve()

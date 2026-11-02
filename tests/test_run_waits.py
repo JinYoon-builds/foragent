@@ -14,6 +14,13 @@ from conftest import BASE_TIME
 from runner_support import conflicting_lanes, run_case, scripted_results
 
 
+class MainWriteGit:
+    """The runner's Git boundary for these slot cases: a checkout path without a repository."""
+
+    def __init__(self, root):
+        self.root = root
+
+
 @pytest.fixture
 def slot_case(tmp_path, monkeypatch):
     import os
@@ -26,7 +33,7 @@ def slot_case(tmp_path, monkeypatch):
     other = StateStore(tmp_path / "other", now=lambda: clock[0])
     store.start_run(1, branch="b", worktree="w", pid=os.getpid())
     store.update_run(1, phase="reviewing", phase_started_at=clock[0].isoformat())
-    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0],
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0], git=MainWriteGit(tmp_path),
                           monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
     sleeps = []
 
@@ -224,10 +231,33 @@ def test_free_merge_lock_keeps_the_slot_and_adds_no_wait_phase(slot_case, monkey
         return update(number, **fields)
 
     monkeypatch.setattr(c.store, "update_run", recorded)
+    from foragent import git as git_files
+
+    lock, order = c.store.merge_lock, []
+
+    @contextmanager
+    def main_write_lock(root):
+        assert root == c.ctx.git.root
+        order.append("main-write")
+        yield
+        order.append("main-write released")
+
+    monkeypatch.setattr(git_files, "main_write_lock", main_write_lock)
+
+    @contextmanager
+    def merge_lock():
+        with lock():
+            order.append("merge")
+            yield
+            order.append("merge released")
+
+    monkeypatch.setattr(c.store, "merge_lock", merge_lock)
     with _merge_lock(1, c.ctx):
         assert c.store.get_run(1).phase == "merging"
         assert capacity.machine_runs(c.store, c.ctx.now()) == 1
+        assert order == ["merge", "main-write"], "Main writers wait from inside the merge lock"
     assert phases == ["merging"] and c.sleeps == []
+    assert order == ["merge", "main-write", "main-write released", "merge released"]
 
 
 @pytest.mark.parametrize("full", ["before-lock", "after-lock", "never"])
@@ -464,7 +494,7 @@ def test_merge_lock_heartbeat_records_wait_and_clears_it_after_acquisition(tmp_p
     store = StateStore(tmp_path / "state", now=lambda: now[0])
     store.start_run(1, branch="branch", worktree="worktree")
     store.update_run(1, waited_seconds=10, executor_waited_seconds=5)
-    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=Config(),
+    ctx = SimpleNamespace(store=store, now=lambda: now[0], config=Config(), git=MainWriteGit(tmp_path),
                           monotonic=lambda: (now[0] - BASE_TIME).total_seconds())
     monkeypatch.setattr("foragent.capacity.machine_load", lambda: ("normal", 0.5))
     monkeypatch.setattr("foragent.capacity.kernel_pressure", lambda: "normal")
@@ -560,7 +590,7 @@ def test_idle_exit_queues_before_restoring_work_and_credits_queue_time(tmp_path,
     other = StateStore(tmp_path / "other", now=lambda: clock[0])
     store.start_run(1, branch="b", worktree="w", pid=os.getpid())
     store.update_run(1, phase="reviewing", phase_work_id="review-head")
-    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0],
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: clock[0], git=MainWriteGit(tmp_path),
                           monotonic=lambda: (clock[0] - BASE_TIME).total_seconds())
     identity = run_waits.phase_identity(store.get_run(1))
     wait = run_waits.WaitPhase(1, ctx, idle)

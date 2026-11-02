@@ -760,22 +760,6 @@ def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_p
     assert main_write_dir(root) == Path(expected).resolve() == (git_history.clone / ".git").resolve()
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_main_write_lock_file_reading_agrees_with_git_for_an_injected_git(git_history, tmp_path, monkeypatch,
-                                                                          layout):
-    """An injected Git that cannot answer rev-parse still finds the lock every real checkout uses."""
-    from foragent.git import main_write_dir
-
-    root, env = _layouts(git_history, tmp_path)[layout]
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-
-    def no_rev_parse(args):
-        raise GitError("unknown command in this fake")
-
-    assert main_write_dir(root, no_rev_parse) == (git_history.clone / ".git").resolve()
-
-
 @pytest.mark.parametrize("writer", ["setup", "publisher"])
 @pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir"])
 def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(git_history, tmp_path,
@@ -867,17 +851,18 @@ def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_reposi
     assert not failures
 
 
-def test_git_reported_common_dir_decides_over_the_file_reading(git_history, tmp_path):
-    from foragent.git import main_write_dir
 
-    reported = tmp_path / "reported-common-dir"
-    reported.mkdir()
-    calls = []
+def test_main_write_lock_needs_only_the_checkout_path(git_history, tmp_path, monkeypatch):
+    """No Git process is started for the lock, so an injected Git boundary is never bypassed."""
+    import subprocess as process
+    from foragent.git import main_write_dir, main_write_lock
 
-    def git(args):
-        calls.append(args)
-        return f"{reported}\n"
+    def no_process(*args, **kwargs):
+        raise AssertionError(f"The lock started a process: {args}")
 
-    assert main_write_dir(git_history.clone, git) == reported.resolve()
-    assert calls == [["rev-parse", "--path-format=absolute", "--git-common-dir"]]
+    monkeypatch.setattr(process, "run", no_process)
+    monkeypatch.setattr(process, "Popen", no_process)
+    assert main_write_dir(git_history.clone) == (git_history.clone / ".git").resolve()
+    with main_write_lock(git_history.clone):
+        assert (git_history.clone / ".git" / "foragent-publish.lock").exists()
     assert main_write_dir(tmp_path / "no-repository") is None, "A directory Git would not use is not locked"
