@@ -875,3 +875,11 @@ def test_an_injected_git_double_writes_no_history_and_takes_no_lock(tmp_path):
     with main_write_lock(SimpleNamespace(root=tmp_path, commit_paths=lambda *args: None)):
         entered.append(True)
     assert entered == [True] and not list(tmp_path.rglob("foragent-publish.lock"))
+
+
+@pytest.mark.parametrize("layout", ["clone", "linked-worktree", "symlinked-linked-worktree", "symlinked-git-dir"])
+def test_origin_slug_from_files_reads_the_origin_git_reports_in_every_dot_git_layout(git_history, tmp_path, layout):
+    git_command(git_history.clone, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
+    root, _ = _layouts(git_history, tmp_path)[layout]
+    reported = git_command(root, "remote", "get-url", "origin")
+    assert origin_slug_from_files(root) == slug_from_url(reported) == "owner/repo"

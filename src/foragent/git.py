@@ -767,14 +767,19 @@ def slug_from_url(url: str) -> str | None:
 
 
 def _common_git_dir(root: Path) -> Path:
-    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
+    """The git dir holding ``config``; a linked worktree's git dir names it via ``commondir``.
+
+    ``.git`` is a directory, a symlink to a git dir (possibly a linked worktree's), or a
+    ``gitdir:`` file; each reaches a git dir whose ``commondir``, when present, is followed.
+    """
     dot_git = root / ".git"
     if dot_git.is_dir():
-        return dot_git
-    line = dot_git.read_text(encoding="utf-8").strip()
-    if not line.startswith("gitdir:"):
-        raise OSError(f"not a git dir file: {dot_git}")
-    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
+        gitdir = dot_git.resolve()
+    else:
+        line = dot_git.read_text(encoding="utf-8").strip()
+        if not line.startswith("gitdir:"):
+            raise OSError(f"not a git dir file: {dot_git}")
+        gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
     commondir = gitdir / "commondir"
     if commondir.is_file():
         return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()
