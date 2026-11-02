@@ -517,6 +517,9 @@ def test_orch_merge_withdraws_reservation_when_premerge_cannot_finish(merge_case
         orch.merge(c.ctx, c.pr, approved_by="jin")
     assert [row["event"] for row in queue_events(c)] == ["ready", "withdrawn"]
     assert not c.tracker.merged_prs and not c.tracker.list_comments(c.pr)
+    withdrawals = [row for row in c.ctx.store.flow_records() if row["kind"] == "merge-withdrawal"]
+    assert [row["data"]["reason"] for row in withdrawals] == ["manual-merge-failed"]
+    assert expected.__name__ in withdrawals[0]["data"]["detail"]
 
 
 def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):

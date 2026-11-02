@@ -312,3 +312,137 @@ def test_the_command_posts_one_audit_comment(case, monkeypatch):
     monkeypatch.setattr(scheduler, "_kill_run", kill)
     orch.stop(case.ctx, 1, "reprioritize")
     assert case.tracker.calls.count(("comment", "<!-- foragent:orch -->")) == 1
+
+
+def _stop_rows(store):
+    return [(row["run_started_at"], row["data"]["decision"], row["data"]["reason"], row["data"]["detail"])
+            for row in store.flow_records() if row["kind"] == "stop"]
+
+
+def test_an_unsafe_target_is_recorded_once_with_its_rule(case, monkeypatch):
+    monkeypatch.setattr(processes, "list_processes",
+                        lambda: ProcessTable((ProcessIdentity(RUNNER, 1, RUNNER, RUNNER, 99.0),)))
+    for _ in range(2):
+        with pytest.raises(orch.OrchError):
+            orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store) == [(case.store.get_run(1).started_at, "skipped", "unsafe",
+                                   f"runner {RUNNER}: a different process now has this PID")]
+
+
+def test_a_refused_kill_is_recorded_once_and_a_completed_stop_names_its_why(case, monkeypatch):
+    started = case.store.get_run(1).started_at
+
+    def refuse(ctx, n, report, **kwargs):
+        report.actions.append("#1 Stop refused: fixture")
+        return False
+
+    monkeypatch.setattr(scheduler, "_kill_run", refuse)
+    for _ in range(2):
+        with pytest.raises(orch.OrchError):
+            orch.stop(case.ctx, 1, "reprioritize")
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: True)
+    orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store) == [(started, "skipped", "failed", "#1 Stop refused: fixture"),
+                                  (started, "stopped", "requested", "reprioritize")]
+
+
+def test_known_stop_refusal_evidence_is_not_recorded_again(case, monkeypatch):
+    from foragent.scheduler_stop import _flag_stop_refused
+
+    flags = []
+    monkeypatch.setattr(scheduler, "flag", lambda *args: flags.append(args))
+    monkeypatch.setattr(scheduler, "append_event", lambda *args, **kw: None)
+    ctx = SimpleNamespace(store=case.store, now=case.ctx.now)
+    run = case.store.get_run(1)
+    report = SimpleNamespace(actions=[])
+    _flag_stop_refused(ctx, run, report, PermissionError("fixture"))
+    _flag_stop_refused(ctx, run, report, PermissionError("fixture"))
+    assert _stop_rows(case.store) == [(run.started_at, "skipped", "refused", "fixture")]
+
+
+def test_a_real_refusal_is_one_record_and_a_retry_never_says_not_running(case, monkeypatch):
+    from foragent import scheduler_stop
+
+    def refuse(pid):
+        raise PermissionError("not ours")
+
+    monkeypatch.setattr(scheduler, "TickContext", lambda **kw: SimpleNamespace(**kw, kill_runner=refuse))
+    monkeypatch.setattr(scheduler_stop, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(scheduler, "flag", lambda ctx, n, reason, summary: ctx.store.save_flag(n, reason))
+    monkeypatch.setattr(scheduler, "_kill_executor", lambda *args: None)
+
+    def kill(ctx, n, report, **kwargs):
+        return scheduler_stop._stop_run_processes(ctx, ctx.store.get_run(n), report) == "stopped"
+
+    monkeypatch.setattr(scheduler, "_kill_run", kill)
+    with pytest.raises(orch.OrchError, match="Stop refused"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    with pytest.raises(orch.OrchError):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store) == [(case.store.get_run(1).started_at, "skipped", "refused", "not ours")]
+    assert case.store.get_run(1).status == "running"
+
+
+def test_a_voided_kill_of_a_running_record_is_not_called_not_running(case, monkeypatch):
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: False)
+    with pytest.raises(orch.OrchError):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert [row[2] for row in _stop_rows(case.store)] == ["run-changed"]
+
+
+def test_a_finished_run_after_the_check_is_recorded_not_running(case, monkeypatch):
+    def finish(ctx, n, report, **kwargs):
+        ctx.store.finish_run(n, outcome="merged")
+        return False
+
+    monkeypatch.setattr(scheduler, "_kill_run", finish)
+    with pytest.raises(orch.OrchError, match="not running"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert [row[2] for row in _stop_rows(case.store)] == ["not-running"]
+
+
+def test_a_busy_gate_and_a_missing_why_are_recorded_skips(case):
+    thread_done, held = threading.Event(), threading.Event()
+
+    def tick():
+        with case.store.hold_tick_lock():
+            held.set()
+            thread_done.wait(10)
+
+    thread = threading.Thread(target=tick)
+    thread.start()
+    held.wait(10)
+    try:
+        for _ in range(2):
+            with pytest.raises(orch.OrchError, match="gate is busy"):
+                orch.stop(case.ctx, 1, "reprioritize")
+    finally:
+        thread_done.set()
+        thread.join()
+    with pytest.raises(orch.OrchError, match="--why"):
+        orch.stop(case.ctx, 1, "  ")
+    assert [row[1:3] for row in _stop_rows(case.store)] == [("skipped", "busy"), ("skipped", "why-required")]
+
+
+def test_a_kill_path_error_is_recorded_and_raised_unchanged(case, monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("worktree unreadable")
+
+    monkeypatch.setattr(scheduler, "_kill_run", broken)
+    with pytest.raises(OSError, match="worktree unreadable"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store)[-1][1:] == ("skipped", "failed", "OSError: worktree unreadable")
+
+
+def test_a_completed_kill_stays_recorded_when_a_later_restore_step_fails(case, monkeypatch):
+    monkeypatch.setattr(scheduler, "_kill_run", lambda *a, **k: True)
+    monkeypatch.setattr(orch_stop_restore(), "_restore_stopped", lambda *a: (_ for _ in ()).throw(OSError("board")))
+    with pytest.raises(OSError, match="board"):
+        orch.stop(case.ctx, 1, "reprioritize")
+    assert _stop_rows(case.store)[-1][1:] == ("stopped", "requested", "reprioritize")
+
+
+def orch_stop_restore():
+    from foragent import scheduler_stop
+
+    return scheduler_stop

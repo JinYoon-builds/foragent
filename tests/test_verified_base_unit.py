@@ -167,3 +167,27 @@ def test_final_inputs_check_the_captured_base_when_tracking_refs_move(replay_cas
     assert inputs.base_sha == checked
     assert paths_bases == [checked]
     assert inputs.paths == ["feature.txt"]
+
+
+def test_final_lock_records_evidence_that_stopped_being_current_and_its_recovery(replay_case, monkeypatch):
+    attempt = replay_case
+    ctx = attempt.ctx
+    head = attempt.git.head_sha()
+    pr = ctx.tracker.create_pr(head=attempt.branch, base="main", title="Feature", body="")
+    ctx.tracker.set_pr_head_sha(pr, head)
+    ctx.tracker.set_pr_files(pr, ["feature.txt"])
+    ctx.tracker.set_pr_checks(pr, "pass")
+    monkeypatch.setattr(run_publish, "enabled", lambda *args: True)
+    answers = iter([False, False, True])
+    comparison = SimpleNamespace(current=lambda *args: next(answers), infrastructure="")
+
+    def final_read():
+        return run_publish._final_merge_inputs(
+            1, ctx, attempt.git, pr, attempt.branch, "main", head, attempt.approval, BASE_TIME.timestamp(),
+            comparison=comparison,
+        )
+
+    assert [final_read().comparison_current for _ in range(3)] == [False, False, True]
+    rows = [row["data"] for row in ctx.store.flow_records() if row["kind"] == "ci-evidence"]
+    assert [(row["refused"], row["reason"], row["head_sha"]) for row in rows] == [
+        (True, "changed-at-merge", head), (False, None, head)]

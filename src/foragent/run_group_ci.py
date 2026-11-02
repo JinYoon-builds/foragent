@@ -30,7 +30,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     interrupted = False
     try:
         if ci_mode.changed_workflows(ctx.git, ci_mode._trusted_sha(ctx.git, ctx.tracker), combined):
-            raise ci_mode.UnusableComparison("group acceptance workflow differs from the default branch")
+            raise ci_mode.WorkflowChanged("group acceptance workflow differs from the default branch")
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
         wait = _CIWait(ctx.now().timestamp())
         published = True  # Even a lost push response may have published the ref.
@@ -47,12 +47,14 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                         reports, ctx.repo, base_sha, combined, excluded, expected_scope=scope,
                         expected_shards=range(ctx.config.ci_shards))
                     break
-                except (ci_mode.MissingComparison, ci_mode.StaleComparison):
+                except (ci_mode.MissingComparison, ci_mode.StaleComparison) as exc:
+                    ci_mode._note_evidence(ctx, n, base_sha, combined, ci_mode._refusal(exc), str(exc))
                     remaining = min(wait.deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
                     if remaining <= 0:
                         raise ci_mode.UnusableComparison("group CI evidence timed out")
                     _progress(n, ctx)
                     ctx.sleep(min(30, remaining))
+        ci_mode._note_evidence(ctx, n, base_sha, combined)  # A regression below fails the group, not this evidence.
         metadata.update(scope=scope, reports_sha256=_report_digest(reports), duration_seconds=duration,
                         run_ids=sorted({report["run"]["id"] for report in reports}))
         verdict = "failed" if lost else "passed"
@@ -60,6 +62,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError,
             GitError, TrackerError, OSError, AttributeError) as exc:
         reason = str(exc).strip() or type(exc).__name__
+        ci_mode._note_evidence(ctx, n, base_sha, combined, ci_mode._refusal(exc), reason)
     except BaseException:
         interrupted = True
         raise

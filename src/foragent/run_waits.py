@@ -36,6 +36,29 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
         watcher.join()
 
 
+def note_activity(n: int, ctx: RunContext, name: str, cause: str, started: datetime, finished: datetime) -> None:
+    """Keep one known interval's cause in the local flow record; an instant one explains no time."""
+    if finished <= started:
+        return
+    try:
+        run = ctx.store.get_run(n)
+    except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
+        return
+    ctx.store.record_flow("activity", issue=n, run_started_at=run.started_at if run is not None else None,
+                          activity=name, cause=cause, started_at=started.astimezone(UTC).isoformat(),
+                          finished_at=finished.astimezone(UTC).isoformat())
+
+
+@contextmanager
+def activity(n: int, ctx: RunContext, name: str, cause: str):
+    """Record the block as one ``name`` interval caused by ``cause``, however it ends."""
+    started = ctx.now()
+    try:
+        yield
+    finally:
+        note_activity(n, ctx, name, cause, started, ctx.now())
+
+
 def _remaining(n: int, ctx: RunContext) -> int:
     run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
     if run is None:

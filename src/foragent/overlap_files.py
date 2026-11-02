@@ -173,8 +173,8 @@ def shared_limit(ctx, patterns: list[str], planned: dict[str, int]) -> int:
     return min([ctx.config.overlap_per_file, *hits])
 
 
-def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
-    """Count distinct runs sharing the same possible path, not matching patterns.
+def _full_groups(ctx, files: list[str], peers: list[Claim], union: set[str] | None):
+    """Yield (file, limit, peer group) for each full group; distinct runs count, not matching patterns.
 
     Each group of peers is checked against the limit of the files it shares with ``path``
     (``shared_limit``), so a glob claim is held only where an overlapping file is full.
@@ -191,17 +191,44 @@ def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | 
         for size in sizes:
             for group in combinations(matching, size):
                 for patterns in product(*(peer.files for peer in group)):
-                    if intersects(ctx, path, *patterns) and shared_limit(
-                            ctx, [path, *patterns], planned) <= size:
-                        return True
-    return False
+                    if intersects(ctx, path, *patterns):
+                        limit = shared_limit(ctx, [path, *patterns], planned)
+                        if limit <= size:
+                            yield path, limit, group
+
+
+def at_capacity(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> bool:
+    return next(_full_groups(ctx, files, peers, union), None) is not None
+
+
+def _hold(file: str | None, limit: int | None, runs, cause: str | None = None) -> dict:
+    """One hold's file and limit and the executions holding it; a numeric limit needs no cause."""
+    peers = sorted({(run.number, run.started_at) for run in runs})
+    return {"file": file, "limit": limit, **({"cause": cause} if cause else {}),
+            "peers": [{"issue": issue, "run_started_at": started} for issue, started in peers]}
+
+
+def capacity_holds(ctx, files: list[str], peers: list[Claim], *, union: set[str] | None = None) -> list[dict]:
+    """``at_capacity``'s evidence: every full file with its effective limit and peer executions."""
+    found: dict[tuple[str, int], list[Run]] = {}
+    for path, limit, group in _full_groups(ctx, files, peers, union):
+        found.setdefault((path, limit), []).extend(peer.run for peer in group)
+    return [_hold(path, limit, found[path, limit]) for path, limit in sorted(found)]
+
+
+def note_holds(ctx, number: int, run_started_at: str | None, holds: list[dict]) -> None:
+    """Record a changed hold; empty holds are a release, so only an actual hold can be released."""
+    ctx.store.record_flow_change("overlap", issue=number, run_started_at=run_started_at, holds=holds,
+                                 only_if=None if holds else lambda latest: bool(latest and latest.get("holds")))
 
 
 def can_start(ctx, lane: str, number: int) -> bool:
     known, unknown = claims(ctx)
     approval = ctx.store.load_approval(number)
     parsed = parse_body(approval.body) if approval is not None else None
-    return admits(ctx, lane, parsed, known, unknown)
+    holds = admission_holds(ctx, lane, parsed, known, unknown)
+    note_holds(ctx, number, None, holds)
+    return not holds
 
 
 def admits(
@@ -209,11 +236,25 @@ def admits(
     *, union: set[str] | None = None,
 ) -> bool:
     """The gate's file rule: lane serialisation without Files, exclusive reservations, overlap_per_file."""
+    return not admission_holds(ctx, lane, parsed, known, unknown, union=union)
+
+
+def admission_holds(
+    ctx, lane: str, parsed: ParsedIssue | None, known: list[Claim], unknown: list[Run],
+    *, union: set[str] | None = None,
+) -> list[dict]:
+    """What the file rule holds on, by its first deciding cause; empty when it admits."""
     if parsed is None or not parsed.files:
-        return not any(run.lane == lane for run in [*(claim.run for claim in known), *unknown])
-    if any(run.lane == lane for run in unknown):
-        return False
-    if any(any_overlap(ctx, parsed.files + parsed.exclusive, peer.parsed.exclusive)
-           or any_overlap(ctx, parsed.exclusive, peer.files) for peer in known):
-        return False
-    return not at_capacity(ctx, parsed.files, known, union=union)
+        same = [run for run in [*(claim.run for claim in known), *unknown] if run.lane == lane]
+        return [_hold(None, None, same, "lane-serialized")] if same else []
+    if same := [run for run in unknown if run.lane == lane]:
+        return [_hold(None, None, same, "lane-serialized")]
+    exclusive: dict[str, list[Run]] = {}
+    for peer in known:
+        for path in parsed.files + parsed.exclusive:
+            if any_overlap(ctx, [path], peer.parsed.exclusive) or (
+                    path in parsed.exclusive and any_overlap(ctx, [path], peer.files)):
+                exclusive.setdefault(path, []).append(peer.run)
+    if exclusive:
+        return [_hold(path, None, exclusive[path], "exclusive") for path in sorted(exclusive)]
+    return capacity_holds(ctx, parsed.files, known, union=union)

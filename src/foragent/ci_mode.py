@@ -25,6 +25,10 @@ class StaleComparison(UnusableComparison):
     """Every check passed except the base or measurement producer is no longer current."""
 
 
+class WorkflowChanged(UnusableComparison):
+    """The measuring workflow differs from the default branch, so its artifacts are not trusted."""
+
+
 def serialize_reports(reports):
     """Pin external evidence without letting malformed data escape as a code error."""
     try:
@@ -304,6 +308,29 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     return sorted(lost), duration
 
 
+def _refusal(exc):
+    """The refused branch as one word; the exception's text stays detail and decides nothing."""
+    if isinstance(exc, MissingComparison):
+        return "missing"
+    if isinstance(exc, StaleComparison):
+        return "stale"
+    if isinstance(exc, WorkflowChanged):
+        return "workflow-changed"
+    return "unavailable" if isinstance(exc, (TrackerError, GitError, OSError)) else "unusable"
+
+
+def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
+    """Record a changed refusal; acceptance with no reason only closes one still open."""
+    try:
+        run = ctx.store.get_run(n)
+        ctx.store.record_flow_change(
+            "ci-evidence", issue=n, run_started_at=run.started_at if run is not None else None,
+            only_if=None if reason else lambda latest: bool(latest and latest.get("refused")),
+            refused=reason is not None, reason=reason, detail=detail, base_sha=base_sha, head_sha=head)
+    except Exception:  # noqa: BLE001 - an observation never replaces the comparison's own result
+        return
+
+
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None):
     from foragent import ci_local, harness_guard
 
@@ -326,8 +353,10 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflows_changed = False
         workflow_error = str(exc)
     if workflows_changed:
+        _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
         try:
             ci_local.fallback_comparison(attempt, base_sha)
+            _note_evidence(ctx, n, base_sha, head)
             return evidence
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
@@ -335,6 +364,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
         detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
                   "(checks: ci, no local fallback)")
+        _note_evidence(ctx, n, base_sha, head, "target-unsupported", detail)
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
         raise ExecutorStopped("held", detail)
     try:
@@ -349,10 +379,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                                            expected_shards=range(ctx.config.ci_shards))
                 recorded_reports = serialize_reports(reports)
                 break
-            except (MissingComparison, StaleComparison):
+            except (MissingComparison, StaleComparison) as exc:
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
                 from foragent import runner
 
+                _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
                 remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
                 if infrastructure or remaining <= 0:
                     raise
@@ -364,23 +395,29 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
+        _note_evidence(ctx, n, base_sha, head, _refusal(exc), detail)
         # A local measurement is no substitute for current CI evidence.
         if ctx.config.checks_fallback == "local" and not isinstance(exc, StaleComparison):
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
+                _note_evidence(ctx, n, base_sha, head)
                 return evidence
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
         raise ExecutorStopped("held", detail) from exc
     ctx.store.update_run(n, comparison={"source": "ci", "duration_seconds": duration})
+    if not infrastructure:
+        _note_evidence(ctx, n, base_sha, head)  # A regression below fails the work, not this evidence.
     if lost:
         raise AttemptFailure("Acceptance baseline regression (previously passing tests):\n" + "\n".join(lost),
                              attempt.target_branch)
     if infrastructure:
+        _note_evidence(ctx, n, base_sha, head, "infrastructure", infrastructure)
         if ctx.config.checks_fallback == "local":
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
+                _note_evidence(ctx, n, base_sha, head)
                 return evidence
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"

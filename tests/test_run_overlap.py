@@ -252,3 +252,56 @@ def test_batch_late_union_uses_configured_base_and_preserves_exclusive(context, 
     assert all('--source=origin/trunk' in args for args in calls)
     assert context.store.get_run(1).overlap_records == []
 
+
+
+def _late_rows(context, number):
+    return [row for row in context.store.flow_records() if row['kind'] == 'overlap' and row['issue'] == number]
+
+
+def test_late_hold_records_this_execution_changes_on_polls_and_release(context):
+    context.config = replace(context.config, overlap_per_file=1)
+    now = clock(context)
+    reserve(context, 1, ['own.py'])
+    reserve(context, 2, ['shared.py'], lane='peer')
+    reserve(context, 3, ['shared.py'], lane='peer3')
+    edit(context, 1, {'own.py': 'own\n'}, commit=True)
+    edit(context, 1, {'shared.py': 'late\n'})
+    polls = []
+
+    def sleep(seconds):
+        polls.append(seconds)
+        now[0] += timedelta(seconds=7)
+        if len(polls) == 2:
+            context.store.finish_run(2, 'merged')
+        if len(polls) == 3:
+            context.store.finish_run(3, 'merged')
+
+    context.sleep = sleep
+    wait_for_overlap(attempt(context, 1))
+    started = context.store.get_run(1).started_at
+    rows = _late_rows(context, 1)
+    assert len(polls) == 3
+    assert all(row['run_started_at'] == started for row in rows)
+    assert [[peer['issue'] for hold in row['data']['holds'] for peer in hold['peers']] for row in rows] == [
+        [2, 3], [3], []]
+    assert rows[0]['data']['holds'][0]['file'] == 'shared.py' and rows[0]['data']['holds'][0]['limit'] == 1
+    activity = [row['data'] for row in context.store.flow_records() if row['kind'] == 'activity']
+    assert [(row['activity'], row['cause']) for row in activity] == [('overlap-wait', 'file-overlap')]
+
+
+def test_late_exclusive_hold_keeps_its_cause_without_a_numeric_limit(context):
+    now = clock(context)
+    reserve(context, 1, ['own.py'])
+    reserve(context, 2, ['peer.py'], lane='peer', exclusive=['shared.py'])
+    edit(context, 1, {'own.py': 'own\n'}, commit=True)
+    edit(context, 1, {'shared.py': 'late\n'})
+
+    def sleep(seconds):
+        now[0] += timedelta(seconds=7)
+        context.store.finish_run(2, 'merged')
+
+    context.sleep = sleep
+    wait_for_overlap(attempt(context, 1))
+    first = _late_rows(context, 1)[0]['data']['holds'][0]
+    assert first['file'] == 'shared.py' and first['limit'] is None and first['cause'] == 'exclusive'
+    assert _late_rows(context, 1)[-1]['data']['holds'] == []

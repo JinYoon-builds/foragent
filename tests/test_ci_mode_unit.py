@@ -1580,3 +1580,53 @@ def test_github_binary_download_preserves_bytes_and_text_errors(monkeypatch):
         tracker._call(['api', 'missing'])
     assert exc.value.stdout == 'body'
     assert all(not kwargs.get('text') for _, kwargs in calls)
+
+
+def _evidence_rows(store):
+    return [row["data"] for row in store.flow_records() if row["kind"] == "ci-evidence"]
+
+
+def _evidence_store(tmp_path):
+    from conftest import BASE_TIME
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / 'state', now=lambda: BASE_TIME)
+    store.start_run(1, branch='foragent/issue-1', worktree=store.worktree_path(1))
+    return store
+
+
+def test_acceptance_closes_only_an_open_evidence_refusal(tmp_path):
+    from foragent import ci_mode
+
+    store = _evidence_store(tmp_path)
+    ctx = SimpleNamespace(store=store)
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    assert _evidence_rows(store) == [], 'Nothing was refused, so there is nothing to close'
+    for _ in range(2):
+        ci_mode._note_evidence(ctx, 1, 'base', 'head', 'missing', 'no shards')
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    assert [(row['refused'], row['reason'], row['detail']) for row in _evidence_rows(store)] == [
+        (True, 'missing', 'no shards'), (False, None, None)]
+    assert _evidence_rows(store)[0]['base_sha'] == 'base' and _evidence_rows(store)[0]['head_sha'] == 'head'
+
+
+@pytest.mark.parametrize('error,reason', [
+    ('stale', 'stale'), ('missing', 'missing'), ('unusable', 'unusable'), ('transport', 'unavailable'),
+])
+def test_refusal_reason_comes_from_the_refused_branch(error, reason):
+    from foragent import ci_mode
+    from foragent.tracker import TrackerError
+
+    raised = {'stale': ci_mode.StaleComparison, 'missing': ci_mode.MissingComparison,
+              'unusable': ci_mode.UnusableComparison, 'transport': TrackerError}[error]
+    assert ci_mode._refusal(raised('same words')) == reason
+
+
+def test_failed_observation_never_replaces_the_comparison_result():
+    from foragent import ci_mode
+
+    def broken(n):
+        raise OSError('state unreadable')
+
+    ci_mode._note_evidence(SimpleNamespace(store=SimpleNamespace(get_run=broken)), 1, 'base', 'head', 'missing', 'x')

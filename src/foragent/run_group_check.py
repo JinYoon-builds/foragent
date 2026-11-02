@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 from foragent import cuts
 from foragent.git import GitError
 from foragent.issue import parse_body
-from foragent.run_waits import _progress, _test_slot, in_phase
+from foragent.run_waits import _progress, _test_slot, activity, in_phase
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -163,8 +163,22 @@ def check(
     if not group or key in done:
         return
     done.add(key)
-    with in_phase(n, ctx, "checking"):
+    with in_phase(n, ctx, "checking"), activity(n, ctx, "group-check", "queue"):
         _check_group(n, ctx, place, base_sha, group, ci)
+
+
+def refresh_cause(ctx: RunContext, n: int) -> str:
+    """Why this run verifies a moved base alone: this execution's joint check did not pass, or the base simply moved."""
+    from foragent.run_group_evidence import latest
+
+    try:
+        run = ctx.store.get_run(n)
+        found = latest(ctx, n)
+    except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
+        return "unknown"
+    failed = (found is not None and run is not None and found[0].get("verdict") in {"failed", "void"}
+              and found[0].get("at", "") >= run.started_at)
+    return "group-failed" if failed else "base-changed"
 
 
 def _check_group(n: int, ctx: RunContext, place: Seat, base_sha: str, group: list[Member], ci: bool) -> None:

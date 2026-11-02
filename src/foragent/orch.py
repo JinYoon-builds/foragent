@@ -597,8 +597,8 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise
-    except BaseException:
-        merge_turn.withdraw(ctx, place)
+    except BaseException as exc:
+        merge_turn.withdraw(ctx, place, reason="manual-merge-failed", detail=merge_turn.stopped_detail(None, exc))
         raise
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
     from foragent import capacity
+    from foragent.run_waits import activity
 
     while True:
         # Budget waits happen unlocked. A contended merge lock releases this slot again.
@@ -33,7 +34,8 @@ def _merge_lock(n: int, ctx: RunContext):
 
             try:
                 # Phase only if it waits: a free lock keeps the slot and adds no phase events.
-                run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False, resume=False)
+                with activity(n, ctx, "merge-lock", "lock-contention"):
+                    run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False, resume=False)
                 if not capacity.phase_holds_slot(ctx.store.get_run(n).phase):
                     continue  # A new start took the freed slot: give the lock back.
                 yield
@@ -121,6 +123,11 @@ def _final_merge_inputs(
     comparison_current = True
     if run_publish.enabled(ctx, base):
         comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
+        if comparison is not None:  # Accepted unlocked, then read again here: this read decides.
+            from foragent.ci_mode import _note_evidence
+
+            _note_evidence(ctx, n, target_sha, head, *(
+                () if comparison_current else ("changed-at-merge", "evidence no longer current at the final merge lock")))
         if comparison_current and comparison.infrastructure:
             # The unlocked comparison already handled this infrastructure state.
             status = "pass"

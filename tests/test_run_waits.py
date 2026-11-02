@@ -661,3 +661,20 @@ def test_idle_exit_credits_long_queues_without_spending_remaining_runtime(slot_c
     assert run.waited_seconds == 10 and run.waiting_until is None
     c.store.finish_run(1, outcome="merged")
     assert capacity.machine_runs(c.store, c.ctx.now()) == 0
+
+
+def test_activity_keeps_one_interval_through_failure_and_ignores_an_instant(slot_case):
+    from foragent.run_waits import activity
+
+    ctx, clock = slot_case.ctx, slot_case.clock
+    with activity(1, ctx, "checking", "initial"):
+        pass
+    with pytest.raises(ValueError):
+        with activity(1, ctx, "base-refresh", "base-changed"):
+            clock[0] += timedelta(seconds=5)
+            raise ValueError("work failed")
+    rows = [row for row in ctx.store.flow_records() if row["kind"] == "activity"]
+    assert [row["data"]["activity"] for row in rows] == ["base-refresh"]
+    assert rows[0]["data"]["cause"] == "base-changed"
+    assert rows[0]["run_started_at"] == ctx.store.get_run(1).started_at
+    assert rows[0]["data"]["finished_at"] == clock[0].isoformat()
