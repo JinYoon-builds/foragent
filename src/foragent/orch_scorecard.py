@@ -21,6 +21,8 @@ from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
+from foragent.orch_scorecard_records import _issues, approval_before
+from foragent.orch_scorecard_split import PARTS
 from foragent.state import StateStore
 
 DAY = timedelta(hours=24)
@@ -48,8 +50,12 @@ def _half_up(value: float) -> int:
     return int(math.floor(value + 0.5))
 
 
-def _runs(store: StateStore, now: datetime, days: int) -> list[tuple[int, dict[str, Any]]]:
-    """(bucket, facts) for each finished execution, placed by its finish time."""
+def _runs(store: StateStore, now: datetime, days: int,
+          issues: dict[int, dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """(bucket, facts) for each finished execution, placed by its finish time.
+
+    Minutes to merge run from the latest approval at or before the actual merge (the recorded
+    merge time, else the merged run's finish) to that merge; with no known approval they are unknown."""
     finished_at, merged_at = store.finish_times(), store.merge_times()
     rows = []
     for run in store.read_history():
@@ -63,7 +69,9 @@ def _runs(store: StateStore, now: datetime, days: int) -> list[tuple[int, dict[s
         # A merge time older than this execution's start belongs to an earlier execution.
         merged = run.outcome == "merged" or (
             run.outcome == "pr-open" and merge is not None and started is not None and merge >= started)
-        minutes = (finished - started).total_seconds() / 60 if merged and started and finished else None
+        moment = merge if merge is not None and started is not None and merge >= started else finished
+        approved = approval_before(store, issues, run.number, moment) if merged and moment else None
+        minutes = (moment - approved).total_seconds() / 60 if approved is not None else None
         rows.append((bucket, {"number": run.number, "outcome": run.outcome or "", "detail": run.detail,
                               "merged": merged, "minutes": minutes,
                               "failed": not merged and run.outcome not in NOT_FAILURES}))
@@ -157,7 +165,7 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     ``revert_times`` are the default branch's revert commit times; None leaves reverts unknown.
     """
     now = store._now()
-    runs, events = _runs(store, now, days), _events(store, now, days)
+    runs, events = _runs(store, now, days, _issues(store, lanes or {})), _events(store, now, days)
     calls = [0] * days
     for row in store.github_calls():
         # An hour counts in the window that holds its start.
@@ -178,7 +186,7 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     today.update(flows[0])
     previous.update(flow.previous(flows[1:]))
     previous["merges"] = _half_up(previous["merges"]) if previous["merges"] is not None else None
-    order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES]
+    order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES, *flow.EXTRA]
     today, previous = {name: today[name] for name in order}, {name: previous[name] for name in order}
     today["main_tests"], previous["main_tests"] = main_tests.windows(store, now, days)
     worse = _worse(today, previous) + flow.worse_names(today, previous)
@@ -222,9 +230,19 @@ def _flow_line(key: str, metrics: dict[str, Any], language: str) -> str:
     waits = ", ".join(f"{cause} {_number(minutes)}" for cause, minutes in metrics["wait_minutes_by_cause"].items())
     waste = metrics["waste_share"]
     return text(key, language, idle=_number(metrics["idle_minutes"]),
+                run_idle=_number(metrics["run_slot_idle_minutes"]), test_idle=_number(metrics["test_slot_idle_minutes"]),
                 waste=_number(None if waste is None else waste * 100, "%"), waits=waits,
                 lead=_number(metrics["lead_time_minutes"]), people=_number(metrics["person_interventions"]),
                 merges=_number(metrics["merges"]))
+
+
+def _split_line(key: str, metrics: dict[str, Any], language: str) -> str:
+    """Approval-to-merge issue-minutes by part, with the merges it could not explain."""
+    value = metrics["approval_to_merge"]
+    parts = ", ".join(text(f"scorecard_part_{part}", language, minutes=_number(value["parts"][part]))
+                      for part in (*PARTS, "unknown"))
+    return text(key, language, total=_number(value["total_minutes"]), parts=parts,
+                merges=_number(value["merges"]), missing=_number(value["missing_approval"]))
 
 
 def _main_tests_lines(today: dict[str, Any], previous: dict[str, Any], language: str) -> list[str]:
@@ -296,7 +314,9 @@ def human(card: dict[str, Any], language: str) -> str:
     lines = [_window_line("scorecard_today", today, language, card["days"]),
              _flow_line("scorecard_flow_today", today, language),
              _window_line("scorecard_previous", previous, language, card["days"]),
-             _flow_line("scorecard_flow_previous", previous, language)]
+             _flow_line("scorecard_flow_previous", previous, language),
+             _split_line("scorecard_split_today", today, language),
+             _split_line("scorecard_split_previous", previous, language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
     lines += orch_roles.scorecard_lines(today, previous, language)
