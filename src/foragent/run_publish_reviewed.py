@@ -216,9 +216,10 @@ def _publish_reviewed_in_turn(
             if continue_merge and not moved:
                 run_publish._check_publication(git, pr.base, inputs.base_sha)
                 title = f"{ctx.tracker.get_issue(n).title} (#{n})"
+                from foragent.run_pr_body import merge_retitle_body
                 subject = run_publish.retitle_for_merge(
                     ctx, pr.number, title=title, current_title=pr.title, base=pr.base,
-                    body=lambda: pr.body, note=lambda line: run_publish._append(log, line),
+                    body=lambda: merge_retitle_body(pr.head, ctx), note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
                 run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")

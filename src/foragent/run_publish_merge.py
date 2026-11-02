@@ -136,6 +136,8 @@ def _final_merge_inputs(
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
+    from foragent.run_pr_body import batch_body, publish_comments
+
     children = ctx.tracker.sub_issues(parent)
     if not children or any(child.state != "closed" for child in children):
         return
@@ -153,23 +155,17 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
             ctx.git.at(worktree).check_publication(base)
         finally:
             ctx.git.remove_worktree(worktree)
-    prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    # No closing keyword: the parent's completion belongs to the gate's order
-    # aggregation (board_parents), which comments first and closes the parent only
-    # once no child is open. A merge here must not close it behind that.
-    lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
-    for child in sorted(children, key=lambda child: child.number):
-        pr = prs.get(f"foragent/issue-{child.number}")
-        lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
     issue = ctx.tracker.get_issue(parent)
     title = f"Batch: {issue.title} (#{parent})"
-    body = "\n".join(lines)
+    body = batch_body(parent, ctx)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
+        publish_comments(ctx, pr, body)
         if issue.state == "open":  # A completed order (#411) stays in Done.
             run_publish.board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
+    publish_comments(ctx, pr, body)
     if issue.state == "open":
         run_publish.board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
@@ -177,17 +173,26 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
 
 def retitle_for_merge(
     ctx: RunContext, pr: int, *, title: str, current_title: str | None, base: str,
-    body: Callable[[], str], note: Callable[[str], None],
+    body: Callable[[], str | None], note: Callable[[str], None],
 ) -> dict[str, str]:
     """Give the PR its issue-derived title before merging; return extra merge_pr arguments.
 
     Branch commit messages (WIP checkpoints) never decide the title. The squash
     subject is the PR title, so it is passed only when retitling failed (other
-    than a rate limit): the merge then still uses the issue-derived subject.
+    than a rate limit): the merge then still uses the issue-derived subject. A PR with
+    no composition record changes its title alone, so the subject is right and no body is written.
     """
+    from foragent.run_pr_body import publish_comments
+
     if title != current_title:
         try:
-            ctx.tracker.update_pr(pr, base=base, title=title, body=body())
+            rendered = body()
+            if rendered is None:
+                note(f"PR #{pr} has no composition record; merging with subject {title!r} and no body write.")
+                ctx.tracker.retitle_pr(pr, title=title)
+                return {}
+            ctx.tracker.update_pr(pr, base=base, title=title, body=rendered)
+            publish_comments(ctx, pr, rendered)
         except run_publish.TrackerError as exc:
             if exc.is_rate_limit:
                 raise
