@@ -24,12 +24,15 @@ from test_state_split import offline_acceptance  # noqa: E402,F401
 def test_base_already_moved_after_ci_is_refreshed_before_queuing(short_case):
     case = short_case
     original_heads = []
+    moved = []
 
     def ci(pr, head, poll):
         if not original_heads:
             assert case.holder is None
             original_heads.append(head)
-            case.history.update({"docs/before-queue.md": "Moved before requesting merge.lock\n"})
+            # A source move refreshes; a neutral one keeps the head (#1688).
+            case.history.update({"src/before_queue.py": "MOVED = True\n"})
+            moved.append(case.history.tip)
         return "pass"
 
     case.ci_status = ci
@@ -37,7 +40,7 @@ def test_base_already_moved_after_ci_is_refreshed_before_queuing(short_case):
     assert len(case.holds) == 1
     locked_reads = [row for row in case.events if row.kind == "ci" and row.holder is not None]
     assert len(locked_reads) == 1 and locked_reads[0].head != original_heads[0]
-    assert case.verifications == [case.base_sha]
+    assert case.verifications == [case.base_sha, moved[0]]
     assert_short_holds(case)
     assert_merge_facts(case)
 
@@ -58,7 +61,7 @@ def test_ci_limits_and_registration_grace_restart_for_each_pushed_head(short_cas
 
     def move_once():
         if not moved:
-            case.history.update({"docs/late.md": "Neutral update\n"})
+            case.history.update({"src/late.py": "LATE = True\n"})  # a source move pushes a new head
             moved.append(case.history.tip)
 
     def ci(pr, head, poll):
@@ -72,7 +75,7 @@ def test_ci_limits_and_registration_grace_restart_for_each_pushed_head(short_cas
     case.ci_status = ci
     assert run(case) == "merged"
     assert sorted(case.poll_counts.values()) == [8, 42]
-    assert case.verifications == [case.base_sha]
+    assert case.verifications == [case.base_sha, moved[0]]
     assert_short_holds(case)
     assert_merge_facts(case)
 
@@ -108,7 +111,7 @@ def test_unmerged_run_keeps_both_durations_null(short_case):
 
     def move_once():
         if not moved:
-            case.history.update({"docs/late.md": "Neutral update\n"})
+            case.history.update({"src/late.py": "LATE = True\n"})  # a source move pushes a new head
             moved.append(case.history.tip)
 
     first = []
