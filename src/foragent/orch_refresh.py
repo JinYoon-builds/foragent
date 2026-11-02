@@ -229,8 +229,12 @@ def refresh(repo_root: Path, store: StateStore, config: Config, now: datetime) -
 
 def _refresh_locked(repo_root: Path, store: StateStore, config: Config, now: datetime) -> str:
     language = config.language
-    note = _fresh_handoff(store, language)
-    _quiet(store, now, language)
+    try:
+        note = _fresh_handoff(store, language)
+        _quiet(store, now, language)
+    except RefreshRefused as exc:
+        orch_spawn.note_skip(store, "refresh-refused", str(exc))
+        raise
     old = orch_sessions.active(store)
     old_id = old["session_id"] if old else None
     session = orch_spawn.spawn_orchestrator(repo_root, store, config, prompt=first_prompt(config, note, old_id, repo_root),

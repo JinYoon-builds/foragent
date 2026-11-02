@@ -191,37 +191,68 @@ def _role_env(session_id: str) -> dict[str, str]:
     return {"FORAGENT_ROLE": "orchestrator", "FORAGENT_SESSION_ID": session_id}
 
 
+def note_skip(store: StateStore, reason: str, detail: str | None = None) -> None:
+    """Why no orchestrator opened; only a changed reason is a new record."""
+    store.record_flow_change("spawn", decision="skipped", reason=reason, detail=detail)
+
+
+# ``skip_reason``'s words and the live evidence, as the flow record names them.
+SKIP_CODES = {"off": ("disabled", None), "no_work": ("no-work", None), "alive": ("live-session", "alive"),
+              "session": ("live-session", "session"), "seat": ("live-session", "seat")}
+
+
+def note_opened(store: StateStore, planned) -> None:
+    store.record_flow_change("spawn", decision="opened", reason=None, detail=planned[0],
+                             session_id=planned[3]["session_id"])
+
+
 def ensure_orchestrator(repo_root: Path, store: StateStore, config: Config, *, now: datetime,
                         spacing: bool = True, why: list | None = None) -> str | None:
     """Open one orchestrator if needed; return the screen used, or None.
 
     ``spacing=False`` is the explicit planning-session call (``fa orch ensure``,
     see ``orch_ensure.ensure_explicit``, which appends why it opened nothing to ``why``);
-    the gate's default path below is unchanged.
+    the gate's default path is unchanged. An error leaves as it came, with its record.
     """
+    try:
+        return _ensure(repo_root, store, config, now, spacing, why)
+    except Exception as exc:
+        note_skip(store, "error", f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _ensure(repo_root: Path, store: StateStore, config: Config, now: datetime,
+            spacing: bool, why: list | None) -> str | None:
     if not spacing:
         from foragent.orch_ensure import ensure_explicit  # Late: orch_ensure imports this module.
         return ensure_explicit(repo_root, store, config, now, why)
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
+        note_skip(store, "disabled")
         return None
     if not _approved_work(store) and not _alive(store, now):
+        note_skip(store, "no-work")
         return None
     root = repo_root.resolve()
     if (reason := _live_reason(store, root, now)) is not None:
+        note_skip(store, *SKIP_CODES[reason])
         observe_silence(root, store, config, now, reason)
         return None
     with watch_open._opening(store):  # Serialize with other openers in this state root.
         if _spaced(store, now):
+            note_skip(store, "spacing")
             return None
         reason = _live_reason(store, root, now)
         if reason is None:
             planned = plan_launch(root, store, now)
             if planned is None or not launch(root, store, now, planned):
+                note_skip(store, "launch-unavailable" if planned is None else "launch-failed")
                 return None
             adopt(store, planned, now)
     if reason is not None:  # The in-lock check's facts take the same silence step, outside the lock.
+        note_skip(store, *SKIP_CODES[reason])
         observe_silence(root, store, config, now, reason)
         return None
+    note_opened(store, planned)
     _opened(store, config, root, now, planned)
     return planned[0]
 

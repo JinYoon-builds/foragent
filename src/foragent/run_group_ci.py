@@ -30,7 +30,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     interrupted = False
     try:
         if ci_mode.changed_workflows(ctx.git, ci_mode._trusted_sha(ctx.git, ctx.tracker), combined):
-            raise ci_mode.UnusableComparison("group acceptance workflow differs from the default branch")
+            raise ci_mode.WorkflowChanged("group acceptance workflow differs from the default branch")
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
         wait = _CIWait(ctx.now().timestamp())
         published = True  # Even a lost push response may have published the ref.
@@ -48,12 +48,14 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                         reports, ctx.repo, base_sha, combined, excluded, expected_scope=scope,
                         expected_shards=range(ctx.config.ci_shards))
                     break
-                except (ci_mode.MissingComparison, ci_mode.StaleComparison):
+                except (ci_mode.MissingComparison, ci_mode.StaleComparison) as exc:
+                    ci_mode._note_evidence(ctx, n, base_sha, combined, ci_mode._refusal(exc), str(exc))
                     remaining = min(wait.deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
                     if remaining <= 0:
                         raise ci_mode.UnusableComparison("group CI evidence timed out")
                     _progress(n, ctx)
                     ctx.sleep(min(30, remaining))
+        ci_mode._note_evidence(ctx, n, base_sha, combined)  # A regression below fails the group, not this evidence.
         metadata.update(scope=scope, reports_sha256=_report_digest(reports), duration_seconds=duration,
                         run_ids=sorted({report["run"]["id"] for report in reports}))
         verdict = "failed" if lost else "passed"
@@ -61,6 +63,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError,
             GitError, TrackerError, OSError, AttributeError) as exc:
         reason = str(exc).strip() or type(exc).__name__
+        ci_mode._note_evidence(ctx, n, base_sha, combined, ci_mode._refusal(exc), reason)
     except BaseException:
         interrupted = True
         raise
@@ -94,29 +97,36 @@ class GroupComparisonEvidence:
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """Re-read the same member rule and the same CI evidence under the merge lock."""
+        refused = self._refused(n, ctx, git, head, base_sha)
+        ci_mode._note_evidence(ctx, n, base_sha, head, *(refused or ()))
+        return refused is None
+
+    def _refused(self, n, ctx, git, head, base_sha):
+        """Why this read no longer accepts the joint evidence, as (reason, detail), or None."""
         try:
-            if run_group_evidence.void_reason(ctx, n, head, base_sha, self.found, self.neutral) is not None:
-                return False
+            if (void := run_group_evidence.void_reason(ctx, n, head, base_sha, self.found, self.neutral)) is not None:
+                return "group-void", void
             event, _ = self.found
             combined = event["combined_sha"]
             if ci_mode.changed_workflows(git, ci_mode._trusted_sha(git, ctx.tracker), combined):
-                return False
+                return "workflow-changed", "group acceptance workflow differs from the default branch"
             excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
             scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
             if not ci_mode.scope_covers(event.get("scope"), scope):
-                return False
+                return "scope-changed", "the measurement scope no longer covers the current one"
             reports = ctx.tracker.pr_acceptance_reports(combined)
             if _report_digest(reports) != event.get("reports_sha256"):
-                return False
+                return ("reports-changed", "the reports differ from the accepted ones") if reports else (
+                    "missing", "no acceptance reports at this read")
             lost, _ = ci_mode.comparison(
                 reports, ctx.repo, event["base_sha"], combined, excluded, expected_scope=scope,
                 expected_shards=range(ctx.config.ci_shards))
-            return not lost
+            return ("regression", ", ".join(lost)) if lost else None
         except (GitError, OSError, KeyError, TypeError, ValueError, RecursionError, OverflowError,
                 AttributeError, TrackerError) as exc:
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
-            return False
+            return ci_mode._refusal(exc), str(exc)
 
 
 def evidence(view, head, base_sha):

@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, NoReturn
 from uuid import uuid4
 
 from foragent import orch_queue
-from foragent.run_waits import WaitPhase
+from foragent.run_waits import WaitPhase, note_activity
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -122,11 +122,23 @@ def join(ctx: RunContext, place: Seat, head_sha: str) -> None:
             _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
 
 
-def withdraw(ctx: RunContext, place: Seat) -> None:
-    """Leave the queue without merging; a later ready entry joins at the tail."""
+def withdraw(ctx: RunContext, place: Seat, *, reason: str = "unknown", detail: str | None = None) -> None:
+    """Leave the queue without merging; a later ready entry joins at the tail.
+
+    Only leaving a held position is a withdrawal, so an already absent seat records nothing.
+    """
     with ctx.store._state_lock():
-        if place.key in _waiting(_rows(ctx.store), place.target):
+        held = place.key in _waiting(_rows(ctx.store), place.target)
+        if held:
             _append(ctx.store, _row(ctx, place, "withdrawn"))
+    if held:
+        ctx.store.record_flow("merge-withdrawal", issue=place.n, run_started_at=place.started_at,
+                              reason=reason, detail=detail, target=place.target)
+
+
+def stopped_detail(outcome: str | None, error: BaseException | None) -> str | None:
+    """What ended a publication: its outcome, or the exception that left it."""
+    return outcome if error is None else f"{type(error).__name__}: {error}"
 
 
 def holds_turn(store: StateStore, place: Seat) -> bool:
@@ -157,8 +169,11 @@ def record_turn(ctx: RunContext, place: Seat, base_sha: str, result: str) -> Non
 
 
 @contextmanager
-def _merge_wait(n: int, ctx: RunContext):
-    """Credit one merge queue wait and keep its liveness visible to tick."""
+def _merge_wait(n: int, ctx: RunContext, name: str = "merge-lock-wait", cause: str = "queue"):
+    """Credit one merge queue wait and keep its liveness visible to tick.
+
+    The run's phase is ``merge-lock-wait`` for both kinds; ``name`` and ``cause`` tell queue standing from retry spacing.
+    """
     started = ctx.now()
     started_mono = ctx.monotonic()
     started_real = monotonic()
@@ -185,7 +200,9 @@ def _merge_wait(n: int, ctx: RunContext):
         yield credit
         completed = True
     finally:
-        wait.close(credit(close=True), resume=completed)
+        ended = credit(close=True)
+        note_activity(n, ctx, name, cause, started, ended)
+        wait.close(ended, resume=completed)
 
 
 def _wait_limit_reached(n: int, ctx: RunContext) -> bool:
@@ -248,11 +265,11 @@ def _report_wait_limit(n: int, ctx: RunContext, place: Seat) -> NoReturn:
     from foragent.run_attempt import ExecutorStopped
     from foragent.run_checks import _append as append_log
 
-    withdraw(ctx, place)
     run = ctx.store.get_run(n)
     detail = (f"Merge-turn wait limit ({MERGE_WAIT_SECONDS:g}s) reached after "
               f"{run.merge_waited_seconds:g}s ({run.merge_wait_polls} polls). "
               f"PR kept on {run.branch}; resume review of the existing PR when its merge turn can proceed.")
+    withdraw(ctx, place, reason="merge-wait-limit", detail=detail)
     orch_events.append_event(ctx.store, ctx.now(), n, "merge-wait-limit", detail,
                              run_started_at=run.started_at, waited_seconds=run.merge_waited_seconds,
                              limit_seconds=MERGE_WAIT_SECONDS)
@@ -272,8 +289,8 @@ def _report_remote_end(n: int, ctx: RunContext, place: Seat, ended: str) -> NoRe
     from foragent.run_attempt import ExecutorStopped
     from foragent.run_checks import _append as append_log
 
-    withdraw(ctx, place)
     detail = f"{ended} ended on GitHub during the merge-turn wait; this run stops without merging."
+    withdraw(ctx, place, reason="remote-ended", detail=detail)
     append_log(ctx.store.log_path(n), detail)
     ctx.tracker.remove_labels(n, [READY, RUNNING])
     raise ExecutorStopped("remote-ended", detail)
@@ -320,9 +337,9 @@ def rejoin_after_failed_merge(n: int, ctx: RunContext, place: Seat, error: Excep
     """
     from foragent.run_checks import _append as append_log
 
-    withdraw(ctx, place)
+    withdraw(ctx, place, reason="merge-refused", detail=str(error))
     append_log(ctx.store.log_path(n), f"Merge failed with the head unchanged; rejoining the merge queue: {error}")
-    with _merge_wait(n, ctx) as credit:
+    with _merge_wait(n, ctx, "merge-retry-pause", "merge-refused") as credit:
         _stop_if_ended(n, ctx, credit, place, pr)
         if _wait_limit_reached(n, ctx):
             _report_wait_limit(n, ctx, place)

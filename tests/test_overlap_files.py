@@ -210,3 +210,43 @@ def test_union_glob_does_not_exempt_a_non_union_exception(context, git_history):
     reserve(context, 1, ['docs/*.md'])
     reserve(context, 2, ['docs/*.md'], running=False)
     assert not can_start(context, 'main', 2)
+
+
+def _holds(context, number):
+    return [row["data"]["holds"] for row in context.store.flow_records()
+            if row["kind"] == "overlap" and row["issue"] == number]
+
+
+def test_admission_records_the_actual_cause_not_a_numeric_limit(context):
+    reserve(context, 1, ['src/a.py'], exclusive=['src/locked.py'])
+    started = context.store.get_run(1).started_at
+    reserve(context, 2, ['src/locked.py'], running=False)
+    assert can_start(context, 'other', 2) is False
+    assert can_start(context, 'other', 2) is False
+    assert _holds(context, 2) == [[{"file": "src/locked.py", "limit": None, "cause": "exclusive",
+                                    "peers": [{"issue": 1, "run_started_at": started}]}]]
+
+
+def test_no_files_keeps_lane_serialization_and_an_unheld_issue_records_nothing(context):
+    reserve(context, 1, ['src/a.py'])
+    started = context.store.get_run(1).started_at
+    reserve(context, 2, [], running=False)
+    reserve(context, 3, ['src/free.py'], running=False)
+    assert can_start(context, 'main', 2) is False
+    assert can_start(context, 'main', 3) is True
+    assert _holds(context, 2) == [[{"file": None, "limit": None, "cause": "lane-serialized",
+                                    "peers": [{"issue": 1, "run_started_at": started}]}]]
+    assert _holds(context, 3) == []
+
+
+def test_changed_peers_are_a_new_hold_and_release_ends_the_episode(context):
+    context.config = replace(context.config, overlap_per_file=1)
+    reserve(context, 1, ['src/a.py'])
+    reserve(context, 2, ['src/a.py'], running=False)
+    assert can_start(context, 'main', 2) is False
+    context.store.finish_run(1, outcome='merged')
+    assert can_start(context, 'main', 2) is True
+    assert can_start(context, 'main', 2) is True
+    reserve(context, 3, ['src/a.py'])
+    assert can_start(context, 'main', 2) is False
+    assert [[peer["issue"] for hold in holds for peer in hold["peers"]] for holds in _holds(context, 2)] == [[1], [], [3]]

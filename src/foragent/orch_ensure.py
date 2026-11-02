@@ -77,6 +77,7 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
     seen = _last_spawn(store)
     reason = skip_reason(repo_root, store, now)
     if reason is not None:
+        orch_spawn.note_skip(store, *orch_spawn.SKIP_CODES[reason])
         orch_spawn.observe_silence(repo_root, store, config, now, reason)
         why.append(reason)
         return None
@@ -84,19 +85,23 @@ def ensure_explicit(repo_root: Path, store: StateStore, config: Config, now: dat
     with _explicit_lock(store) as busy:
         reason = skip_reason(root, store, now)
         if reason is None and (_last_spawn(store) != seen or (busy and orch_spawn._spaced(store, now))):
+            orch_spawn.note_skip(store, "raced")
             why.append("raced")
             return None
         if reason is None:
             planned = orch_spawn.plan_launch(root, store, now)
             # The same record as the gate writes, so the gate's spacing also covers this spawn.
             if planned is None or not orch_spawn.launch(root, store, now, planned):
+                orch_spawn.note_skip(store, "launch-unavailable" if planned is None else "launch-failed")
                 why.append("failed")
                 return None
             orch_spawn.adopt(store, planned, now)
     if reason is not None:
         # The inner guard's facts take the same silence step, outside the openers' lock.
+        orch_spawn.note_skip(store, *orch_spawn.SKIP_CODES[reason])
         orch_spawn.observe_silence(repo_root, store, config, now, reason)
         why.append(reason)
         return None
+    orch_spawn.note_opened(store, planned)
     orch_spawn._opened(store, config, root, now, planned)
     return planned[0]
