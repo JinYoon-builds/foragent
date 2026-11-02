@@ -82,13 +82,12 @@ def _changes(old: dict, current: dict):
         yield "title", old["title"], current["title"]
     if old["body"] != current["body"]:
         before, after = asdict(parse_body(old["body"])), asdict(parse_body(current["body"]))
-        changed = False
-        for field in before:
-            if before[field] != after[field]:
-                changed = True
-                yield field, json.dumps(before[field], ensure_ascii=False), json.dumps(after[field], ensure_ascii=False)
-        # Unstructured bodies and changes outside known fields still need a diagnostic.
-        if not changed:
+        changes = [(field, json.dumps(before[field], ensure_ascii=False), json.dumps(after[field], ensure_ascii=False))
+                   for field in before if before[field] != after[field]]
+        # Unstructured bodies and changes outside known fields show the raw body, not a parsed remainder.
+        if any(field != "other_content" for field, _, _ in changes):
+            yield from changes
+        else:
             yield "body", old["body"], current["body"]
 
 

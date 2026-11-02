@@ -20,7 +20,7 @@ def settings_case(git_history, tmp_path, monkeypatch):
     from foragent import cli
     from foragent.config import load_config
 
-    case = make_case(git_history, tmp_path, monkeypatch, language="ko", review="batch", skill_libraries=[])
+    case = make_case(git_history, tmp_path, monkeypatch, language="ko", review="fast", skill_libraries=[])
     main = bind_cli(case, monkeypatch)
     (case.root / ".foragent.yml").write_text(yaml.safe_dump(asdict(case.config), allow_unicode=True), encoding="utf-8")
     monkeypatch.setattr(cli, "load_config", load_config)
@@ -71,7 +71,7 @@ def test_settings_window_s_opens_three_tabs_with_values_and_one_line_description
     assert glyphs["description"].strip(), "view_glyphs needs a one-line description"
     assert stored_settings(case, main, capsys)["view_glyphs"] == "auto"
     items = {
-        "team": (("머지", "모아서 물어보기"), ("작업자", "claude"), ("리뷰어", "codex")),
+        "team": (("머지", "바로"), ("작업자", "claude"), ("리뷰어", "codex")),
         "me": (("언어", "ko"),),
         "computer": (("동시 실행", "2"),),
     }
@@ -121,12 +121,12 @@ def test_settings_window_team_choice_confirms_once_and_uses_the_cli_setter(
         assert load_config(case.root).review == "fast"
         return True
 
-    # Review is the first team item; values follow fast -> batch -> careful.
+    # Review is the first team item; values follow fast -> careful.
     for key in ("s", "enter", "right", "enter"):
         handle_key(key, case.store, config, state=state, repo_root=case.root, confirm=confirm)
     assert len(confirmations) == 1 and "팀 전체에 적용돼요" in confirmations[0]
     assert len(calls) == 2, "settings window and CLI must call the same public setter"
-    assert stored_settings(case, main, capsys)["review"] == "batch"
+    assert stored_settings(case, main, capsys)["review"] == "careful"
 
 
 def test_settings_window_footer_reflects_review_changes(
@@ -140,11 +140,11 @@ def test_settings_window_footer_reflects_review_changes(
     state={'store':case.store}
     handle_key('s',case.store,load_config(case.root),state=state,repo_root=case.root)
     before=plain_frame(render_frame(snapshot,load_config(case.root),case.root,width=160,state=state))
-    assert '모아서 물어보기' in before
+    assert '바로' in before
     assert cli_exit(main,['settings','set','review','careful','--repo-root',str(case.root)])==0
     assert stored_settings(case,main,capsys)['review']=='careful'
     after=plain_frame(render_frame(snapshot,load_config(case.root),case.root,width=160,state=state))
-    assert '하나씩' in after and '모아서 물어보기' not in after
+    assert '하나씩' in after and '바로' not in after
     assert before.splitlines()[-1]==after.splitlines()[-1]=='도토리를 누르면 설명해요 · s 설정 · m 사용량 모드 · q 끝내기'
 
 

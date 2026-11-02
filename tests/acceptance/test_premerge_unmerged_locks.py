@@ -45,7 +45,7 @@ def merge_scenario(request, git_history, tmp_path, monkeypatch):
         # The PR target advances independently, before the other order reaches main.
         history.update({"required-version.txt": "v2\n"})
         target = history.tip
-        git_command(history.origin, "update-ref", "refs/heads/foragent/batch-1", target)
+        git_command(history.origin, "update-ref", "refs/heads/integration", target)
         git_command(history.origin, "update-ref", "refs/heads/main", common)
         history.tip = common
         history.update({
@@ -74,7 +74,7 @@ def merge_scenario(request, git_history, tmp_path, monkeypatch):
             f"```sh\nuv run pytest -q {PENDING_FILE}\n```\n"
         )
         tracker.add_issue(99, "Pending main feature", body, labels=["approved"])
-        base_branch = "main" if current_main else "foragent/batch-1"
+        base_branch = "main" if current_main else "integration"
         pr = tracker.create_pr(head="foragent/issue-1", base=base_branch,
                                title="Unrelated implementation", body="Closes #1")
         tracker.set_pr_head_sha(pr, head)
