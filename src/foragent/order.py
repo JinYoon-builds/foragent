@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_collect, order_done_when, order_landing, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
 from foragent import decisions as decision_links
 from foragent.config import Config
 from foragent.executors import executor_for
@@ -505,7 +505,7 @@ class PublishReport:
 
 
 def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: dict[str, str | bytes],
-                   manager: SkillManager | None, checked: str | None = None) -> dict[str, str]:
+                   manager: SkillManager | None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
     spec = f"docs/specs/{plan['id']}.md"
@@ -515,7 +515,6 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
-    landing = order_landing.Landing(git, root, checked, config, files).open()
     for lane in plan.get("new_lanes", []):
         if lane["name"] not in config.lanes:
             add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git, manager=manager, push=False)
@@ -528,9 +527,6 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
             pending = git.uncommitted_paths(paths)
             if pending:
                 git.commit_paths(pending, f"Foragent lane {lane['name']}")
-    if checked is not None:  # The lane's own commit is part of what this publication changes.
-        landing.extra = {path for lane in plan.get("new_lanes", []) for path in lane_files(
-            root, lane["name"], [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]])}
     for name, content in files.items():
         data = content.encode("utf-8") if isinstance(content, str) else content
         path = repo_path(root, name)
@@ -543,13 +539,13 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
-        landing.commit(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
         raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
     # Also retry a previously failed push when the files already match HEAD.
-    order_landing.push(git, config.base_branch, landing.finish(), checked is not None)
+    git.push_base(config.base_branch)
     return published_blobs
 
 
@@ -864,9 +860,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
                                       check_owner=not waiting, git=git)
-    # The collection check has just fetched the base when it had files to collect.
     affected = _affected_owners(publication.by_number.values(), publication.own, publication.files,
-                                repo, config, lambda: git or GitRepo(root), fetch=publication.collected is None)
+                                repo, config, lambda: git or GitRepo(root), fetch=True)
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), True, affected=affected, language=config.language)
@@ -906,10 +901,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             if affected:
                 raise PlanError(text("order_locks_refused", config.language,
                                      owners="\n".join(_owner_lines(affected))))
-            published_blobs = _publish_files(plan, root, config, git, publication.files, manager,
-                                             collected.commit if collected else None)
-            # Only after the push: a refused publication must leave no label behind.
             tracker.ensure_labels([LabelSpec(owner_label(owner), ownership.LABEL_COLOR, label_description(owner))])
+            published_blobs = _publish_files(plan, root, config, git, publication.files, manager)
         return _publish_issues(plan, root, config, tracker, repo=repo, publication=publication,
                                published_blobs=published_blobs, approve=approve)
 

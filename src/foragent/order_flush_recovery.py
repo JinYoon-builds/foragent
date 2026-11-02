@@ -1,7 +1,6 @@
 """Recover a single publication intent from Git facts, without undoing commits."""
 
 from foragent import order_flush_journal as journal
-from foragent import order_landing
 from foragent.i18n import text
 from foragent.order import PlanError
 from foragent.order_files import check_write
@@ -92,7 +91,7 @@ def committed(root, config, git, store, batch, records):
     return sha
 
 
-def push(config, git, store, batch, sha, *, recovering, exact=False):
+def push(config, git, store, batch, sha, *, recovering):
     remote = f"origin/{config.base_branch}"
     if recovering:
         if git.is_ancestor(sha, remote):
@@ -111,6 +110,6 @@ def push(config, git, store, batch, sha, *, recovering, exact=False):
             _install(git, config, sha, rebuilt)
             journal.append(store, "rebased", batch["batch"], old=sha, sha=rebuilt)
             sha = rebuilt
-    order_landing.push(git, config.base_branch, sha, exact)
+    git.push_base(config.base_branch)
     journal.append(store, "pushed", batch["batch"], sha=sha)
     return sha

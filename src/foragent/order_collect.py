@@ -2,17 +2,13 @@
 
 This is a factual importability check that never touches the caller's main, index or files.
 A scratch copy of the fetched base plus exactly this order's acceptance files is collected,
-not executed, with the project's own test command. A small conftest beside the copy then
-reports every imported module, so what the command's environment or the base's configuration
-adds from outside that tree is refused however it got there. A check that cannot establish a
-result refuses too, and says so apart from an import error.
+not executed, with the project's own test command and only the copy and the interpreter's folders
+on the import path. A check that cannot establish a result refuses too, and says so apart from an import error.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-import os
 from pathlib import Path
 import shlex
 import shutil
@@ -21,7 +17,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, order_collect_audit, order_scratch, processes
+from foragent import capacity, order_scratch, processes
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -32,6 +28,35 @@ LIMIT_S = 30.0
 _OUTPUT_CHARS = 1500
 # Inherited settings that add import paths or choose another project; the command may set its own.
 _CALLER_SETTINGS = "unset PYTHONPATH PYTHONUSERBASE PYTHONPYCACHEPREFIX PYTEST_PLUGINS UV_PROJECT UV_WORKING_DIRECTORY; "
+# Placed in the copy and loaded before the acceptance files. Import paths from anywhere (assignments
+# in the command, `-o pythonpath`, a path file) leave the search list unless they are in the copy or
+# the interpreter's own folders, so nothing else can satisfy an import.
+# Which files pytest collects depends on the project's plugins and options, so every file is named.
+# A named file no collector takes would stop the whole run; this gives it an empty collector.
+_COPY_CONFTEST = """import os, sys
+
+import pytest
+
+kept = [os.path.dirname(os.path.dirname(__file__)), sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix]
+kept = [os.path.realpath(path) for path in kept]
+sys.path[:] = [entry for entry in sys.path if any(
+    os.path.realpath(entry) == root or os.path.realpath(entry).startswith(root + os.sep) for root in kept)]
+
+
+class Published(pytest.File):
+    def collect(self):
+        return []
+
+
+class AnyPublishedFile:
+    def pytest_collect_file(self, file_path, parent):
+        if file_path.suffix != ".py" and parent.session.isinitpath(file_path):
+            return Published.from_parent(parent, path=file_path)
+
+
+def pytest_configure(config):
+    config.pluginmanager.register(AnyPublishedFile(), "foragent-collect-published")
+"""
 
 
 @dataclass(frozen=True)
@@ -109,14 +134,12 @@ class _Unavailable(Exception):
     """The check established no result; the first argument is the cause, the second the command."""
 
 
-def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Path, root: Path, config: Config,
+def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Path, config: Config,
              language: str, deadline: float) -> list[tuple[str, str]]:
     from foragent.order import detect_test_commands
     from foragent.run_checks import _pytest_command
 
-    tree, report, log, audit = work / "tree", work / "collect.xml", work / "collect.log", work / "imports.json"
-    # Inside the copy: pytest finds the project's configuration from the common folder of its arguments.
-    guard = tree / ".foragent-collect-audit"
+    tree, report, log = work / "tree", work / "collect.xml", work / "collect.log"
     order_scratch.build(git, base, tree)
     for name, content in selected.items():
         _write(tree, name, content)
@@ -127,13 +150,14 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     pytest = _pytest_command(command)
     if pytest is None:
         raise _Unavailable(text("order_collect_unsupported", language), command)
-    # Every file is named: pytest's own collectors decide what each is, a text file's doctests included.
-    targets = list(selected)
-    attempted = f"{pytest} --collect-only {shlex.join(targets)}"
-    site = order_collect_audit.install(guard)
-    invocation = (f"{_CALLER_SETTINGS}{order_collect_audit.started_first(pytest, site)} --collect-only "
-                  f"{shlex.quote(str(guard))} {shlex.join(targets)} "
-                  f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report))}")
+    attempted = f"{pytest} --collect-only {shlex.join(selected)}"
+    # Inside the copy: pytest finds the project's configuration from the common folder of its arguments.
+    named = tree / ".foragent-collect"
+    named.mkdir()
+    (named / "conftest.py").write_text(_COPY_CONFTEST, encoding="utf-8")
+    invocation = (f"{_CALLER_SETTINGS}{pytest} --collect-only {shlex.quote(str(named))} {shlex.join(selected)} "
+                  f"-o junit_family=legacy --junit-prefix= "
+                  f"--junitxml={shlex.quote(str(report))}")
     try:
         with capacity.hold_test_slot(config.test_slots, deadline=deadline,
                                      timed_out=lambda: text("order_collect_slot_timeout", language)):
@@ -142,8 +166,7 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
                 raise TimeoutError(text("order_collect_timeout", language, seconds=int(LIMIT_S)))
             code, timed_out, _ = processes.run_logged(
                 ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
-                env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1", "FORAGENT_COLLECT_TREE": str(tree),
-                     "FORAGENT_COLLECT_CALLER": str(root), "FORAGENT_COLLECT_AUDIT": str(audit)})
+                env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
     except (TimeoutError, OSError) as exc:
         raise _Unavailable(str(exc), attempted) from exc
     if timed_out:
@@ -152,10 +175,9 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     if errors:
         return errors
     # 5 is a successful collection without test functions, as for a helper module.
-    if errors is None or code not in {0, 5} or not audit.exists():
+    if errors is None or code not in {0, 5}:
         raise _Unavailable(text("order_collect_exit", language, code=code, output=_output(log, tree)), attempted)
-    return [(path, text("order_collect_leak", language, name=Path(path).stem))
-            for path in json.loads(audit.read_text(encoding="utf-8"))]
+    return []
 
 
 def check(plan: dict, files: dict[str, str | bytes], root: Path, config: Config, git: GitRepo | None = None, *,
@@ -190,7 +212,7 @@ def check(plan: dict, files: dict[str, str | bytes], root: Path, config: Config,
     work = None
     try:
         work = Path(tempfile.mkdtemp(prefix="foragent-collect-"))
-        errors = _collect(git, base, selected, work, root, config, language, started + LIMIT_S - spent)
+        errors = _collect(git, base, selected, work, config, language, started + LIMIT_S - spent)
     except _Unavailable as exc:
         raise unavailable(exc.args[0], exc.args[1]) from exc
     except Exception as exc:  # Whatever stopped the check, it did not establish a pass.
