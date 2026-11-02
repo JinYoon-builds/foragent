@@ -156,22 +156,6 @@ DECISIONS_START = "<!-- foragent:lane-decisions -->"
 DECISIONS_END = "<!-- /foragent:lane-decisions -->"
 
 
-def lane_decisions_block(section: str) -> str:
-    """`section` between markers, so a later review of the same PR can replace it."""
-    return f"{DECISIONS_START}\n{section}\n{DECISIONS_END}" if section else ""
-
-
-def refresh_lane_decisions(body: str, section: str) -> str:
-    """Replace a PR body's lane-decisions block with `section` (append, or drop when empty)."""
-    import re
-
-    block = lane_decisions_block(section)
-    pattern = re.compile(rf"(?:\n\n)?{re.escape(DECISIONS_START)}.*?{re.escape(DECISIONS_END)}", re.S)
-    if pattern.search(body):
-        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
-    return f"{body}\n\n{block}" if block else body
-
-
 def moved_files_section(moved_files: list[str]) -> str:
     return ("The base branch moved or split files this branch edits (old -> new). "
             "Carry your edits to the new locations so none are orphaned:\n"
@@ -267,6 +251,7 @@ def build_prompt(
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
         "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
         "with `- <point>: <why it is out of scope or not a defect>`.\n"
+        '- Write the short change summary as JSON in .foragent/PR.json: {"summary": "one or two complete sentences"}.\n'
         "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
         f"  Write the prose in {language}. Keep these English headings exactly:\n"
         "  ## What changed\n"

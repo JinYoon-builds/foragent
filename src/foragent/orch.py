@@ -587,9 +587,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
                 n, f"Approved by {approved_by} in the orchestrator ({at}). "
                    f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
+            from foragent.run_pr_body import merge_retitle_body
             subject = retitle_for_merge(
                 ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
-                body=lambda: current.body, note=print,
+                body=lambda: merge_retitle_body(current.head, ctx), note=print,
             )
             merge_turn.record_turn(ctx, place, checked.base, "merged")
             try:

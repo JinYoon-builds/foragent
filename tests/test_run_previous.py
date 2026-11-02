@@ -147,17 +147,12 @@ def test_rebuild_judges_conflicts_still_unresolved_after_partial_resolution(tmp_
 
 def test_rerun_review_adds_the_class_question_to_an_older_pr_scope():
     from foragent.i18n import text
+    from foragent.issue import parse_body
+    from foragent.run_pr_body import _pr_body
     from foragent.run_prompts import review_scope_rules
-    from foragent.run_review import with_review_scope
 
-    question = text("review_class_question", "en")
-    rules = review_scope_rules("tests/acceptance/")
-    older = "Closes #1\n\n## Review scope\n\n" + rules.removesuffix("\n" + question) + "\nThe acceptance tests are locked."
-    refreshed = with_review_scope(older, "tests/acceptance/", "en")
-    assert rules in refreshed and refreshed.count(question) == 1
-    assert with_review_scope(refreshed, "tests/acceptance/", "en") == refreshed
-    assert with_review_scope("Closes #1", "tests/acceptance/", "en") == "Closes #1\n\n## Review scope\n\n" + rules
-    custom = "Closes #1\n\n## Review scope\n\nOnly the API.\n"
-    assert question in with_review_scope(custom, "tests/acceptance/", "en")
-    korean = with_review_scope(older, "tests/acceptance/", "ko")
-    assert text("review_class_question", "ko") in korean
+    for language in ("en", "ko"):
+        rules = review_scope_rules("tests/acceptance/", language)
+        composed = _pr_body(1, parse_body(""), [], 1, [], review_scope="pr-body", language=language, summary="Summary.")
+        question = text("review_class_question", language)
+        assert rules in composed and composed.count(question) == 1
