@@ -29,13 +29,13 @@ def next_review_round(n: int, ctx: RunContext) -> int:
     return max((number for number, _ in _saved_rounds(ctx.store, n)), default=0) + 1
 
 
-def first_review_findings(store: StateStore, n: int, round_number: int, after: int | None = None) -> str:
+def first_review_findings(store: StateStore, n: int, round_number: int, body_sha: str | None = None) -> str:
     """Read the earliest usable defect review, excluding individual panel members.
 
     Failed or finding-free rounds leave the full review in charge until it produces findings.
     Those first usable findings remain the confirmation scope for every later round.
     Legacy native Claude artifacts may lack a VERDICT line, so recognize their findings format too.
-    Rounds up to `after` no longer count (see review_pass_scope.stale_anchor_round).
+    `body_sha` skips rounds journaled under another issue body.
     """
     from foragent.run_review import code_review_findings, parse_review
 
@@ -48,7 +48,9 @@ def first_review_findings(store: StateStore, n: int, round_number: int, after: i
         if (orch_events.has_event(store, n, "review", round=number, verdict="UNUSABLE")
                 or orch_events.has_event(store, n, "review", round=number, review_verdict="UNUSABLE")):
             continue
-        if after is not None and number <= after:
+        if body_sha and any(event.get("issue") == n and event.get("round") == number
+                            and event.get("body_sha", body_sha) != body_sha
+                            for event in orch_events.events(store, "review")):
             continue
         raw = path.read_text(encoding="utf-8", errors="replace")
         review = parse_review(raw)

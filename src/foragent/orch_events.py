@@ -7,9 +7,8 @@ from typing import Any
 from foragent.state import StateStore
 
 
-def events(store: StateStore, kind: str, *more_kinds: str) -> list[dict]:
-    """Retained events of the given kinds in journal order, skipping unreadable records."""
-    kinds = {kind, *more_kinds}
+def events(store: StateStore, kind: str) -> list[dict]:
+    """Retained events of one kind in journal order, skipping unreadable records."""
     try:
         lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -20,7 +19,7 @@ def events(store: StateStore, kind: str, *more_kinds: str) -> list[dict]:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("kind") in kinds:
+        if isinstance(event, dict) and event.get("kind") == kind:
             result.append(event)
     return result
 

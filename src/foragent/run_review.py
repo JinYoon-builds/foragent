@@ -200,16 +200,14 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
 
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
-            *, round_number: int = 1, pr: int | None = None, body_sha: str | None = None) -> ReviewResult:
+            *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     _phase(n, ctx, "reviewing")
-    review_pass_scope.start(n, ctx, round_number, body_sha)
     reviewer = resolved_reviewer(ctx.config)
     rebuttals = _read_rebuttals(git.root)
     decisions = _lane_decisions(n, ctx, git.root)
     scope = review_pass_scope.for_review(n, ctx, git, base_ref)
     limited = scope is not None and scope.diff is not None
-    first = "" if limited else first_review_findings(
-        ctx.store, n, round_number, review_pass_scope.stale_anchor_round(n, ctx, boundary=scope is not None))
+    first = "" if limited else first_review_findings(ctx.store, n, round_number, review_pass_scope.anchor_body(n, ctx))
     notes = scope.notes if scope else "" if first else _risk_notes(git, base_ref)
     boundary = {"pass_scope": scope.section, "diff": scope.diff} if scope else {}
     if not first and notes:
@@ -237,7 +235,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
-    facts = review_pass_scope.review_facts(n, ctx, git, passed, round_number)
+    facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
             + "".join(f"\nNOTE: {note}" for note in review.review_notes))
@@ -495,7 +493,7 @@ def _review_implementation(attempt: Implementation) -> None:
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
     review = _review(n, ctx, git, attempt.parsed, attempt.base_ref,
-                     round_number=_next_review_round(n, ctx), pr=pr, body_sha=attempt.approval.body_sha)
+                     round_number=_next_review_round(n, ctx), pr=pr)
     if pr is not None and review.conflicts:
         ctx.tracker.comment(pr, "\n".join([f"Round {len(attempt.reviews) + 1}: SPEC-CONFLICT", *review.conflicts]))
     _stop_on_spec_conflict(n, ctx, review)
@@ -560,8 +558,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is not None:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
-        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator",
-                        **review_pass_scope.review_facts(n, ctx, None, False))
+        _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")
 
     def approved() -> bool:
         issue = ctx.tracker.get_issue(n)
@@ -620,7 +617,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
             ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
             publish_comments(ctx, pr.number, body)
         review = _review(n, ctx, git, parsed, review_base, round_number=_next_review_round(n, ctx),
-                         pr=pr.number if ctx.config.review_scope == "pr-body" else None, body_sha=approval.body_sha)
+                         pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
         if review.timed_out or runner._remaining(n, ctx) <= 0:

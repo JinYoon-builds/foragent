@@ -10,7 +10,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
 from conftest import git_command
-from foragent import orch_events, review_pass_scope, risks, run_review  # noqa: E402
+from foragent import orch_events, review_pass_scope, risks  # noqa: E402
 from foragent.issue import body_hash  # noqa: E402
 from foragent.run_review import _journal_review  # noqa: E402
 from foragent.runner import review_only, run_issue  # noqa: E402
@@ -24,7 +24,6 @@ from test_risk_map import entry, offline  # noqa: F401
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
-FINISH = run_review._finish_review
 LIMITED = "Limit blocking findings to code changed after that PASS"
 
 
@@ -122,24 +121,6 @@ def test_clean_base_update_adds_no_review_and_never_moves_the_boundary(git_histo
     assert bound[0] in later[0] and "+from main" in later[0], "Main's merged code belongs to the later diff"
 
 
-@pytest.mark.parametrize("reviewed_other", [False, True], ids=["no-review", "reviewed-under-other-body"])
-def test_restored_body_keeps_the_pass_unless_a_review_ran_under_the_other_body(
-    git_history, tmp_path, monkeypatch, reviewed_other,
-):
-    case = passed_case(git_history, tmp_path, monkeypatch)
-    original = case.ctx.store.load_approval(1)
-    edit_body(case, "Something else.")
-    if reviewed_other:
-        capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
-    case.tracker.edit_body(1, original.body)
-    case.ctx.store.save_approval(**original.__dict__)
-    later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-    review_only(1, case.ctx)
-    assert (LIMITED in later[0]) is (not reviewed_other)
-    assert ("+accepted = 'reviewed'" in later[0]) is reviewed_other
-
-
 def test_new_pass_after_a_body_edit_sets_a_new_boundary(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
     first = case.tracker.pr_head_sha(2)
@@ -186,141 +167,6 @@ def anchored_case(git_history, tmp_path, monkeypatch, *, replies=("VERDICT: FAIL
     case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now),
                        config=replace(case.ctx.config, review="fast"))
     return case
-
-
-def restore_body(case, approval):
-    case.tracker.edit_body(1, approval.body)
-    case.ctx.store.save_approval(**approval.__dict__)
-
-
-def test_restored_body_after_a_review_elsewhere_drops_the_old_confirmation_anchor(git_history, tmp_path, monkeypatch):
-    case = anchored_case(git_history, tmp_path, monkeypatch)
-    original = case.ctx.store.load_approval(1)
-    edit_body(case, "Something else.")
-    other = capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
-    assert review_only(1, case.ctx) == "review-failed"
-    assert CONFIRMING not in other[0] and "+accepted = 'reviewed'" in other[0]
-    restore_body(case, original)
-    restored = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-    assert review_only(1, case.ctx) == "review-failed"
-    assert CONFIRMING not in restored[0] and FIRST_FINDING not in restored[0], "Old findings must not limit it"
-    assert LIMITED not in restored[0] and "+accepted = 'reviewed'" in restored[0]
-    # The next review confirms this full review's findings, never the older body's.
-    following = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-    review_only(1, case.ctx)
-    assert CONFIRMING in following[0] and OLD_FINDING in following[0] and FIRST_FINDING not in following[0]
-
-
-class Interrupted(KeyboardInterrupt):
-    pass
-
-
-@pytest.mark.parametrize("reviewer", ["codex", "claude"])
-@pytest.mark.parametrize("stage", ["before-save", "after-save"])
-def test_review_interrupted_under_another_body_still_ends_the_pass(
-    git_history, tmp_path, monkeypatch, reviewer, stage,
-):
-    case = anchored_case(git_history, tmp_path, monkeypatch, reviewer=reviewer)
-    original = case.ctx.store.load_approval(1)
-    edit_body(case, "Something else.")
-
-    def stop(*args, **kwargs):
-        raise Interrupted
-
-    if stage == "before-save":
-        capture_review(case, [stop])
-    else:
-        capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
-        monkeypatch.setattr("foragent.run_review._finish_review", stop)
-    with pytest.raises(Interrupted):
-        review_only(1, case.ctx)
-    if stage == "after-save":
-        monkeypatch.setattr("foragent.run_review._finish_review", FINISH)
-    restore_body(case, original)
-    case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now))
-    calls = []
-    later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING], calls=calls)
-    assert review_only(1, case.ctx) == "review-failed"
-    assert LIMITED not in later[0] and CONFIRMING not in later[0] and NEW_FINDING not in later[0]
-    if reviewer == "claude":
-        assert calls[0].get("review_level") is not None, "Today's native full review"
-    else:
-        assert "+accepted = 'reviewed'" in later[0]
-
-
-def test_panel_interrupted_under_another_body_still_ends_the_pass(git_history, tmp_path, monkeypatch):
-    git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"])])})
-    case = anchored_case(git_history, tmp_path, monkeypatch, replies=["VERDICT: FAIL\n" + FIRST_FINDING] * 5 + [PASS])
-    original = case.ctx.store.load_approval(1)
-    edit_body(case, "Something else.")
-    capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING] * 5)
-
-    def stop(*args, **kwargs):
-        raise Interrupted
-
-    monkeypatch.setattr("foragent.run_review._finish_review", stop)
-    with pytest.raises(Interrupted):
-        review_only(1, case.ctx)
-    monkeypatch.setattr("foragent.run_review._finish_review", FINISH)
-    restore_body(case, original)
-    case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now))
-    later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING] * 5)
-    assert review_only(1, case.ctx) == "review-failed"
-    assert later and all(LIMITED not in text and "+accepted = 'reviewed'" in text for text in later)
-
-
-def test_interrupted_review_under_the_same_body_keeps_the_pass(git_history, tmp_path, monkeypatch):
-    case = anchored_case(git_history, tmp_path, monkeypatch)
-
-    def stop(*args, **kwargs):
-        raise Interrupted
-
-    capture_review(case, [stop])
-    with pytest.raises(Interrupted):
-        review_only(1, case.ctx)
-    case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now))
-    later = capture_review(case, ["VERDICT: PASS"])
-    review_only(1, case.ctx)
-    assert LIMITED in later[0]
-
-
-def test_pass_belongs_to_the_body_it_started_under_not_a_mid_review_edit(git_history, tmp_path, monkeypatch):
-    case = anchored_case(git_history, tmp_path, monkeypatch)
-    original = case.ctx.store.load_approval(1)
-
-    def edit_during_review(call):
-        edit_body(case, "Something else.")
-        return "VERDICT: PASS"
-
-    capture_review(case, [edit_during_review])
-    review_only(1, case.ctx)
-    newest = orch_events.events(case.ctx.store, "review")[-1]
-    assert newest["verdict"] == "PASS" and newest["body_sha"] == original.body_sha
-    assert not review_pass_scope.applies(1, case.ctx, case.ctx.git), "No reviewer accepted the edited body"
-
-
-def test_orchestrator_verdict_under_another_body_also_ends_the_pass(git_history, tmp_path, monkeypatch):
-    case = anchored_case(git_history, tmp_path, monkeypatch)
-    original = case.ctx.store.load_approval(1)
-    edit_body(case, "Something else.")
-    case.ctx = replace(case.ctx, config=replace(case.ctx.config, review="careful"))
-    review_only(1, case.ctx, verdict_head=case.tracker.pr_head_sha(2))
-    restore_body(case, original)
-    later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-    review_only(1, case.ctx)
-    assert LIMITED not in later[0] and CONFIRMING not in later[0] and "+accepted = 'reviewed'" in later[0]
-
-
-@pytest.mark.parametrize("lost", ["commit", "record"])
-def test_lost_boundary_falls_back_to_full_not_to_the_old_confirmation(git_history, tmp_path, monkeypatch, lost):
-    case = anchored_case(git_history, tmp_path, monkeypatch)
-    if lost == "commit":
-        monkeypatch.setattr(review_pass_scope, "_exists", lambda git, commit: False)
-    else:
-        (case.store.root / "runs/issue-1/review-2.txt").unlink()
-    later = capture_review(case, ["VERDICT: FAIL\n" + OLD_FINDING])
-    assert review_only(1, case.ctx) == "review-failed"
-    assert LIMITED not in later[0] and CONFIRMING not in later[0] and "+accepted = 'reviewed'" in later[0]
 
 
 def test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence(git_history, tmp_path, monkeypatch):
