@@ -129,7 +129,7 @@ class Scope:
         if self._issues is not None:
             return
         rows = _rows(getattr(self._ctx, "store", None))
-        self._issues = {row["number"]: _model(row["number"], row.get("observed") or row) for row in rows
+        self._issues = {row["number"]: _model(row["number"], row) for row in rows
                         if row.get("observed") or row.get("title") or row.get("labels")}
         self._prs = {row["pr_number"]: row["number"] for row in rows if row.get("pr_number")}
 
@@ -193,6 +193,8 @@ class Scope:
             elif (issue := issue or local_issue(getattr(self._ctx, "store", None), number)) is None or singleton(issue, config):
                 # No team setting keeps the singleton's path, unless a stored row names an owner.
                 self._decisions[number] = None
+            elif self._unread:  # A failed read: a cached owner is not evidence for any write (#1004).
+                self._decisions[number] = _unreadable(self._ctx, number, Unresolved("no ownership snapshot"))
             else:
                 try:
                     require_owned(issue, config, self.login())

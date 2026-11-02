@@ -34,6 +34,9 @@ class IssueRefreshMixin:
             if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
                 snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
+            from foragent.state_observations import known_numbers, known_prs
+
+            linked = known_prs(snapshot) | {pr.number for pr in prs}  # Before the PR fields are cleared below.
             dropped, facts, fresh, local = set(), {}, set(), set()
             for issue in issues:
                 if issue.is_pull_request:
@@ -55,10 +58,8 @@ class IssueRefreshMixin:
                     row.update(pr_number=None, merged=False, merged_at=None)
                 if issue.number in comments:
                     row["comments"] = comments[issue.number]
-            from foragent.state_observations import known_numbers
-
             gone = {}
-            for number in sorted(known_numbers(snapshot) - observed):
+            for number in sorted(known_numbers(snapshot, linked) - observed):
                 outcome = self._observe(snapshot, number, None, at, lanes, since_revision=since_revision)
                 if outcome != "stale":
                     gone[number] = NOT_LISTED

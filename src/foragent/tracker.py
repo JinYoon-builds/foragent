@@ -777,6 +777,7 @@ class RecordingTracker:
         self._record_pr_state(pr, pr_base=base)
 
     def retitle_pr(self, pr, *, title):
+        self._require_effect(pr)
         self._tracker.retitle_pr(pr, title=title)
 
     def _record_pr_state(self, pr, **fields):

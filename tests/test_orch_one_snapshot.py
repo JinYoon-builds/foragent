@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import sys
@@ -510,3 +510,62 @@ def test_a_run_never_pushes_a_branch_without_a_snapshot(tmp_path):
     context._scope = orch_scope.Scope(context)
     run_publish._push_branch(attempt)
     assert git.pushed == ["foragent/issue-1"]
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_a_queued_pr_comment_is_refused_with_its_reason_when_the_issue_changes_hands(tmp_path, complete):
+    store, tracker, recorder, _ = queue_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]))
+    store.update_local_issue(1, pr_number=50)
+    store.queue_github_write(50, "comment", body="On Alice's PR")
+    store.queue_github_write(2, "comment", body="Still mine")
+    relabel(tracker, 1, "by:alice", "by:bob")
+    later = NOW + timedelta(seconds=1)  # A read after the queued write.
+    if complete:
+        store.ingest(tracker.list_issues(), later, {}, complete=True)
+    else:
+        store.refresh_local_issues(tracker.list_issues(), [], {}, later)
+    assert 50 in [entry["issue"] for entry in store.github_outbox()]
+    recorder.flush_outbox()
+    [refused] = store.refused_github_writes()
+    assert refused["issue"] == 50 and refused["body"] == "On Alice's PR" and "bob" in refused["refused"]
+    assert [(e["kind"], e["issue"]) for e in events(store)] == [("ownership-refused", 50)]
+    assert [c.body for c in tracker.list_comments(2)] == ["Still mine"]
+
+
+def test_retitling_a_pr_whose_issue_is_another_persons_is_refused(tmp_path):
+    from foragent.tracker import WriteRefused
+
+    store, tracker, recorder, _ = queue_case(tmp_path, (1, ["by:bob"]))
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Bob's", body="")
+    store.update_local_issue(1, pr_number=pr)
+    recorder._context._scope = orch_scope.Scope(recorder._context)
+    with pytest.raises(WriteRefused):
+        recorder.retitle_pr(pr, title="Mine now")
+    assert next(p for p in tracker.created_prs if p.number == pr).title == "Bob's"
+
+
+@pytest.mark.parametrize("labels, written", [(["by:alice"], False), ([], True)])
+def test_a_failed_read_trusts_no_cached_owner_but_keeps_the_singleton_path(tmp_path, labels, written):
+    _, tracker, recorder, context = queue_case(tmp_path, (1, labels), legacy=None)
+    context._scope = orch_scope.no_snapshot(context)
+    recorder.comment(1, "After a failed read")
+    assert bool(tracker.list_comments(1)) is written
+
+
+def test_a_pr_comment_queued_by_the_tracker_survives_a_bulk_refresh_and_is_refused(tmp_path):
+    """The bulk refresh clears and relists PR links; the queued PR comment must still reach replay (#1004)."""
+    store, tracker, recorder, context = queue_case(tmp_path, (1, ["by:alice"]), (2, ["by:alice"]))
+    pr = tracker.create_pr(head="foragent/issue-1", base="main", title="Alice's", body="")
+    store.update_local_issue(1, pr_number=pr)
+    store.queue_github_write(2, "comment", body="Ahead in the queue")  # So the next write queues.
+    recorder.comment(pr, "On Alice's PR")
+    assert [entry["issue"] for entry in store.github_outbox()] == [2, pr]
+    relabel(tracker, 1, "by:alice", "by:bob")
+    recorder.refresh_issues(observed_at=NOW + timedelta(seconds=1))
+    assert pr in [entry["issue"] for entry in store.github_outbox()]
+    assert not [e for e in events(store) if e["kind"] == "outbox-dropped"]
+    context._scope = None
+    recorder.flush_outbox()
+    [refused] = store.refused_github_writes()
+    assert refused["issue"] == pr and refused["body"] == "On Alice's PR" and "bob" in refused["refused"]
+    assert [c.body for c in tracker.list_comments(2)] == ["Ahead in the queue"]

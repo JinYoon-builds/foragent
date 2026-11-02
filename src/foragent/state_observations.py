@@ -171,14 +171,21 @@ def edges_after(snapshot: dict[str, Any], number: int, at: datetime, since_revis
     return written > at or (written == at and since_revision is not None and entry["revision"] > since_revision)
 
 
-def known_numbers(snapshot: dict[str, Any]) -> set[int]:
+def known_prs(snapshot: dict[str, Any]) -> set[int]:
+    """The PR numbers stored rows link to. Take them before a refresh rewrites the rows' PR fields."""
+    return {row["pr_number"] for row in snapshot["issues"].values() if row.get("pr_number")}
+
+
+def known_numbers(snapshot: dict[str, Any], prs: set[int] | None = None) -> set[int]:
     """Every issue the store knows: observed rows, recorded absences and issues with intents.
 
     An absence observation (a complete listing's omissions) must reach all of
     them, including an issue whose only trace is an intent queued after it vanished.
+    A queued write to a known PR (``prs``, default: the rows' links) targets that PR, which no issue
+    listing shows: replay judges it by its issue's owner (#1004), so it is not "missing".
     """
     return ({int(key) for key in snapshot["issues"]} | {int(key) for key in snapshot.get("absent", {})}
-            | {intent["issue"] for intent in snapshot.get("outbox", [])})
+            | {intent["issue"] for intent in snapshot.get("outbox", [])}) - (known_prs(snapshot) if prs is None else prs)
 
 
 def missing_since(snapshot: dict[str, Any], number: int) -> datetime | None:
