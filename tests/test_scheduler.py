@@ -972,7 +972,7 @@ def test_failed_termination_keeps_worktree_and_active_record(ctx):
         ctx.git.remove_worktree(path)
 
 
-@pytest.mark.parametrize("mode", ["batch", "careful"])
+@pytest.mark.parametrize("mode", ["careful"])
 @pytest.mark.parametrize("ready", [False, True])
 def test_open_review_pr_is_not_rescheduled_or_allowed_to_starve_next_issue(ctx, mode, ready):
     ctx.config = replace(ctx.config, review=mode)

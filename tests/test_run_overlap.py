@@ -221,10 +221,10 @@ def test_batch_late_union_uses_configured_base_and_preserves_exclusive(context, 
     reserve(context, 2, ['*.md'], exclusive=['shared*.md'] if exclusive else [])
     edit(context, 1, {'own.py': 'own\n'}, commit=True)
     path = edit(context, 1, {'shared[1].md': 'late\n'})
-    # Batch attributes disagree with the configured base, as do local edits.
+    # Integration attributes disagree with the configured base, as do local edits.
     git_history.update({'.gitattributes': '*.md merge=text\n'})
     context.git.fetch('origin', 'main')
-    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/batch', git_history.tip)
+    git_command(context.repo_root, 'update-ref', 'refs/remotes/origin/integration', git_history.tip)
     (path / '.gitattributes').write_text('*.md merge=text\n')
     calls, call = [], context.git._call
 
@@ -245,7 +245,7 @@ def test_batch_late_union_uses_configured_base_and_preserves_exclusive(context, 
 
     context.sleep = sleep
     owner = attempt(context, 1)
-    owner.target_branch = 'batch'
+    owner.target_branch = 'integration'
     wait_for_overlap(owner)
     assert waits == ([OVERLAP_POLL_SECONDS] if exclusive else [])
     assert len(calls) == (3 if exclusive else 1), 'Read one attribute batch per wait check'

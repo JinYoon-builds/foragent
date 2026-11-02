@@ -125,9 +125,9 @@ def test_dead_entries_are_skipped_and_targets_are_separate(tmp_path):
     legacy = {"n": 3, "event": "ready"}  # No started_at: live only while #3 is running.
     raw = "".join(json.dumps(row) + "\n" for row in (stale, legacy)).encode()
     (ctx.store.root / turn.QUEUE).write_bytes(raw)
-    batch = turn.seat(ctx, 2, "foragent/batch-9")
-    turn.join(ctx, batch, "c")
-    assert turn.holds_turn(ctx.store, batch)
+    integration = turn.seat(ctx, 2, "integration")
+    turn.join(ctx, integration, "c")
+    assert turn.holds_turn(ctx.store, integration)
     first = turn.seat(ctx, 1, "main")
     turn.join(ctx, first, "a")
     assert turn.holds_turn(ctx.store, first)
