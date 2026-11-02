@@ -15,7 +15,7 @@ import yaml
 from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
@@ -469,10 +469,17 @@ def init_repo(
         config_path.write_bytes(updated_config.encode("utf-8"))
         if role_source is not None:
             roles.report_dropped_comments(original)
-    if pending:
-        git.commit_paths(pending, "Set up Foragent")
-    if push_planned:
-        git.push_base(base_branch)
+    if pending or push_planned:
+        # Setup advances main like any other main write. A merge may land while this waits:
+        # fast-forward onto it before committing, the way order publication does. An earlier
+        # run's unpushed setup commit cannot fast-forward, so update_base refuses with its message.
+        with main_write_lock(git):
+            if push_planned and git.remote_branch_sha(base_branch) is not None:  # A first push has no remote base.
+                git.update_base(base_branch)
+            if pending:
+                git.commit_paths(pending, "Set up Foragent")
+            if push_planned:
+                git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
     if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root.resolve())):

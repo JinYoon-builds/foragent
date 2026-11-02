@@ -6,6 +6,7 @@ publication binds a local review's tree to its commit. The reviewer alone judges
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -84,13 +85,25 @@ def anchor_body(n: int, ctx: RunContext) -> str | None:
     return approval.body_sha if ctx.config.review_pass_scope and approval and _passes(n, ctx) else None
 
 
+def _expected_tree(git: GitRepo, head: str, base_ref: str) -> str:
+    """The PASS head with the integrated main merged in: main-only code folds in, conflicts stay as markers."""
+    try:
+        return git._call(["merge-tree", "--write-tree", head, git._own_base(base_ref)]).split("\n", 1)[0].strip()
+    except GitError as exc:
+        cause = exc.__cause__
+        if isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1 and cause.output:
+            return str(cause.output).split("\n", 1)[0].strip()  # conflicted hunks keep their markers
+        return head  # no merge possible: compare with the PASS head, which only widens the input
+
+
 def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary | None:
     """The applicable boundary for a review of this index, or None for today's review."""
     passed = _latest_pass(n, ctx, git)
     if passed is None:
         return None
     head, number, record = passed
-    since = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", head]).split("\0")
+    expected = _expected_tree(git, head, base_ref)
+    since = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", expected]).split("\0")
     paths = sorted({*git.changed_paths(base_ref), *filter(None, since)})
     # Read from the base ref: a branch cannot grant itself an exemption.
     matched = risks.matching(risks.load_at(git, base_ref), paths)
@@ -109,12 +122,14 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     return Boundary(head, notes, "\n".join([
         "Earlier PASS boundary (setting review_pass_scope: true; no pass_scope_exempt risk-map entry matches "
         "this change).", facts,
-        "Limit blocking findings to code changed after that PASS. The diff below runs from the PASS head to the "
-        "current tree: code integrated from main after the PASS counts as later change and can block, including "
-        "separate edits in the same file. Any instruction here to review all changed files means this diff.",
+        "Limit blocking findings to code changed after that PASS. The diff below runs from the PASS head, with "
+        "current main merged in, to the current tree. Code that arrived from main only by integrating it is left "
+        "out, even inside a file this PR changes, because its own issue already reviewed it; conflict resolutions "
+        "and new commits of this PR count as changes and can block. CI checks the combined code. "
+        "Any instruction here to review all changed files means this diff.",
         "A defect confined to unchanged code does not block: write it as a `NOTE: <path:line> — <defect>` line. "
         "A defect a later change causes or exposes belongs to that later change. You judge each finding.",
-        evidence]), git._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", head]))
+        evidence]), git._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", expected]))
 
 
 def keep_notes(n: int, ctx: RunContext, head: str, notes: tuple[str, ...]) -> None:
