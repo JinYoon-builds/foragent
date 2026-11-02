@@ -17,9 +17,10 @@ import pytest
 from conftest import git_command
 from runner_support import run_case  # noqa: F401
 from test_orch import review_case  # noqa: F401
-from foragent import orch, order, order_flush, order_notes, roles_commands, runner
+from foragent import orch, order, order_flush, order_notes, roles_commands, runner, scheduler
 from foragent.git import GitRepo
 from foragent.state import StateStore
+from foragent.tracker import FakeTracker
 
 
 def incoming_plan():
@@ -53,6 +54,11 @@ def writer_for(case, kind):
         memory.parent.mkdir(parents=True)
         memory.write_text("A reusable role lesson.\n")
 
+    elif kind == "role-session-memory":
+        memory = root / ".claude/agent-memory/fa-docs/MEMORY.md"
+        memory.parent.mkdir(parents=True)
+        memory.write_text("A reusable session lesson.\n")
+
     def write():
         if kind == "order-publish":
             publish()
@@ -60,6 +66,14 @@ def writer_for(case, kind):
             result = order_flush.flush(root, config, case.tracker, git, store,
                                        repo=case.ctx.repo, boundary="boundary")
             assert result["status"] == "published", result
+        elif kind == "role-session-memory":
+            context = scheduler.TickContext(
+                repo=case.ctx.repo, repo_root=root, config=config, git=git,
+                store=StateStore(root.parent / "role-publication", now=case.ctx.now),
+                tracker=FakeTracker(strict=True), now=case.ctx.now, start_runs=False,
+                launcher=lambda *a, **kw: pytest.fail("No lane job is due"),
+            )
+            scheduler.tick(context)
         else:
             roles_commands.set_role(root, "archivist", why="Retain role memory", git=git)
 
@@ -69,6 +83,8 @@ def writer_for(case, kind):
             assert git_command(case.history.origin, "show", "main:docs/specs/incoming-main-write.md") == "# Incoming order"
         elif kind == "note-flush":
             assert git_command(case.history.origin, "show", "main:docs/decisions.md").count("Retained decision") == 1
+        elif kind == "role-session-memory":
+            assert git_command(case.history.origin, "show", "main:.claude/agent-memory/fa-docs/MEMORY.md") == "A reusable session lesson."
         else:
             assert git_command(root, "show", "main:.claude/agent-memory/fa-archivist/MEMORY.md") == "A reusable role lesson."
 
@@ -191,7 +207,7 @@ def race_after_check(case, kind, entry, monkeypatch, *, contended=True):
         assert git_command(case.history.origin, "show", "main:feature.txt") == "done"
 
 
-@pytest.mark.parametrize("kind", ["order-publish", "order-flush", "note-flush", "role-memory"])
+@pytest.mark.parametrize("kind", ["order-publish", "order-flush", "note-flush", "role-memory", "role-session-memory"])
 def test_main_writer_arriving_after_final_check_cannot_invalidate_merge(run_case, monkeypatch, kind):
     race_after_check(run_case, kind, "implementation", monkeypatch)
 
