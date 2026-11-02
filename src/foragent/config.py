@@ -26,7 +26,7 @@ PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 @dataclass(frozen=True)
 class Config:
-    review: str = "batch"
+    review: str = "fast"
     review_paths: dict[str, str] = field(default_factory=dict)
     always_human: list[str] = field(default_factory=list)
     executor: str = "codex"
@@ -163,7 +163,7 @@ DEFAULTS: dict[str, Any] = asdict(Config())
 IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours"})
 # Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
 FILE_KEYS = frozenset({"executors"})
-_REVIEW_LEVELS = {"fast", "batch", "careful"}
+_REVIEW_LEVELS = {"fast", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
 

@@ -49,7 +49,7 @@ def fresh_config_values(path):
 
 EXPECTED_CONFIG = (
     "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
-    "review: batch\napprovers:\n- human\nchecks: local\n"
+    "review: fast\napprovers:\n- human\nchecks: local\n"
 )
 EXPECTED_TEMPLATE = """---
 name: Foragent task
@@ -190,7 +190,7 @@ def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     parsed = parse_body(body)
     assert parsed.version == "v1" and parsed.done_when_commands == [""]
     config = load_config(setup.root)
-    assert config.approvers == ["human"] and config.review == "batch"
+    assert config.approvers == ["human"] and config.review == "fast"
     assert config.executor == "codex" and config.acceptance_dir == "tests/acceptance/"
     assert config.run_hours == "always"
     assert list(setup.tracker.labels.values()) == LABELS
@@ -760,14 +760,14 @@ def test_explicit_default_options_override_global_config(setup):
     global_path = Path.home() / ".config/foragent/config.yml"
     global_path.parent.mkdir(parents=True)
     global_path.write_text("executor: claude\nrun_hours: 22-08\nreview: careful\napprovers: [global]\n")
-    setup.init(executor="codex", run_hours="always", review="batch", approvers=["human"])
+    setup.init(executor="codex", run_hours="always", review="fast", approvers=["human"])
     assert fresh_config_values(setup.root / PATHS[0]) == {
-        "executor": "codex", "run_hours": "always", "review": "batch", "approvers": ["human"],
+        "executor": "codex", "run_hours": "always", "review": "fast", "approvers": ["human"],
         "checks": "local",
     }
     config = load_config(setup.root)
     assert (config.executor, config.run_hours, config.review, config.approvers) == (
-        "codex", "always", "batch", ["human"],
+        "codex", "always", "fast", ["human"],
     )
 
 

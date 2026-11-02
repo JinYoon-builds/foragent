@@ -12,7 +12,7 @@ from statistics import median
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import capacity
+from foragent import capacity, orch_scorecard_history as history, orch_scorecard_split as split
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
@@ -26,8 +26,9 @@ CAUSES = {"test-slot-wait": "slot", "overlap-wait": "overlap", "merge-turn-wait"
           "merge-lock-wait": "merge", "executor-wait": "quota", "limit-wait": "quota", "run-slot-wait": "slot"}
 CAUSE_ORDER = ("slot", "overlap", "merge", "quota")
 INTERVENTIONS = {"ask", "escalate", "person-found"}
-HOLDING = {"blocked", "needs-human", "running"}  # Labels that keep an approved issue from starting.
+HOLDING = history.HOLDING
 NAMES = ("idle_minutes", "waste_share", "wait_minutes_by_cause", "lead_time_minutes", "person_interventions")
+EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge")  # Reported, never compared.
 
 
 def _minutes(start: datetime, end: datetime, now: datetime, days: int) -> list[float]:
@@ -50,6 +51,8 @@ def _bucket(moment: datetime | None, now: datetime, days: int) -> int | None:
 
 
 def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
+    if (recorded := history.labels_at(issue, moment)) is not None:
+        return recorded  # Retained observations replace today's labels from their first record.
     if not issue["events"]:
         # No label history: startable from its approval (D96). A current label is applied only
         # from a recorded time: a hold from its flag time, else (like a removed approval) from
@@ -79,7 +82,6 @@ def _labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
 
 def _facts_labels_at(issue: dict[str, Any], moment: datetime) -> set[str]:
     """The labels fa orch facts would read: label events where recorded, else the current labels.
-
     Facts reads only current labels, so without label events no ``ready`` is assumed (that
     is idle's rule) and a current ``running`` label still holds the issue."""
     if issue["events"]:
@@ -92,24 +94,18 @@ def _startable(issue: dict[str, Any], moment: datetime, pauses: dict[str, list[I
     """Approved, ready and open at ``moment``, not held by a label or a plan pause in ``pauses``.
 
     ``facts=True`` is facts' waiting list: no open-blocker rule and facts' labels."""
-    if not facts and any(until is None or moment < until for until in issue["blocked_until"]) or (issue["closed"] and (issue["open_until"] is None or moment >= issue["open_until"])):
+    if not facts and any((a is None or a <= moment) and (b is None or moment < b) for a, b in issue["blocked_until"]) or history.closed_at(issue, moment):
         return False
     labels = (_facts_labels_at if facts else _labels_at)(issue, moment)
     return ({"approved", "ready"} <= labels and not labels & HOLDING
-            and not _inside(pauses.get(issue["lane"], []), moment))
-
-
-def _latest_approval(issue: dict[str, Any], moment: datetime) -> datetime | None:
-    times = [at for at, label, action in issue["events"]
-             if label == "approved" and action == "labeled" and at <= moment]
-    if issue["approved_at"] is not None and issue["approved_at"] <= moment:
-        times.append(issue["approved_at"])
-    return max(times, default=None)
+            and not any(_inside(pauses.get(lane, []), moment) for lane in history.lanes_at(issue, moment)))
 
 
 def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[str, Any]],
-          executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[float]:
-    """Wall minutes with a startable approved issue while a run or test slot sat unused."""
+          executions: list[dict[str, Any]], phases: list[tuple[int | None, str, Interval]]) -> list[list[float]]:
+    """Wall minutes with a startable approved issue while a slot sat unused: [legacy run-or-test, run, test].
+
+    Run and test slots are measured separately, each against its own recorded budget, and may overlap."""
     budgets, pauses = _budgets(store, now), _pauses(store)
     occupied, testing = _occupancy(store, now, executions, phases)
     start = now - days * DAY
@@ -120,11 +116,11 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
         points.update((row["started"], row["finished"] or now))
     points.update(at for values in budgets.values() for at, _ in values)
     for issue in issues.values():
-        points.update(at for at, _, _ in issue["events"])
+        points.update(at for at, _, _ in [*issue["events"], *issue["history"]])
         points.update(at for at in (issue["approved_at"], issue["open_until"], issue["flagged_at"], issue["updated_at"],
-                                    *issue["blocked_until"]) if at is not None)
+                                    *(at for span in issue["blocked_until"] for at in span)) if at is not None)
     ordered = sorted(moment for moment in points if start <= moment <= now)
-    idle = [0.0] * days
+    idle, run_idle, test_idle = [0.0] * days, [0.0] * days, [0.0] * days
     for low, high in zip(ordered, ordered[1:]):
         moment = low + (high - low) / 2
         busy = {number for (index, number), (a, b) in occupied if not index and a <= moment < b}
@@ -134,9 +130,12 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
         parallel, slots = _value_at(budgets["parallel"], moment), _value_at(budgets["test_slots"], moment)
         testing_now = sum(1 for a, b in testing if a <= moment < b)
         running_now = sum(1 for _, (a, b) in occupied if a <= moment < b)
-        if (parallel is not None and running_now < parallel) or (slots is not None and testing_now < slots):
-            idle = [total + part for total, part in zip(idle, _minutes(low, high, now, days))]
-    return idle
+        part = _minutes(low, high, now, days)
+        run_free, test_free = parallel is not None and running_now < parallel, slots is not None and testing_now < slots
+        for free, totals in ((run_free or test_free, idle), (run_free, run_idle), (test_free, test_idle)):
+            if free:
+                totals[:] = [total + minutes for total, minutes in zip(totals, part)]
+    return [idle, run_idle, test_idle]
 
 
 def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None) -> list[dict[str, Any]]:
@@ -156,8 +155,7 @@ def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None
             continue
         if (bucket := _bucket(row["merged_at"], now, days)) is not None:
             merges[bucket] += 1
-            issue = issues.get(row["number"])
-            if issue and (approved := _latest_approval(issue, row["merged_at"])) is not None:
+            if (approved := split.approval_before(store, issues, row["number"], row["merged_at"])) is not None:
                 leads[bucket].append((row["merged_at"] - approved).total_seconds() / 60)
     waits = [dict.fromkeys(CAUSE_ORDER, 0.0) for _ in range(days)]
     for _, phase, (opened, closed) in phases:
@@ -168,8 +166,10 @@ def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None
     for event in _jsonl(store.root / "orch-events.jsonl"):
         if event.get("kind") in INTERVENTIONS and (bucket := _bucket(_time(event.get("at")), now, days)) is not None:
             people[bucket] += 1
-    idle = _idle(store, now, days, issues, executions, phases)
-    return [{"merges": merges[k], "idle_minutes": idle[k],
+    idle, run_idle, test_idle = _idle(store, now, days, issues, executions, phases)
+    approval = split.windows(store, now, days, issues, executions, phases)
+    return [{"merges": merges[k], "idle_minutes": idle[k], "run_slot_idle_minutes": run_idle[k],
+             "test_slot_idle_minutes": test_idle[k], "approval_to_merge": approval[k],
              "waste_share": wasted[k] / runtime[k] if runtime[k] else None,
              "wait_minutes_by_cause": waits[k],
              "lead_time_minutes": median(leads[k]) if leads[k] else None,
@@ -185,8 +185,11 @@ def previous(days: list[dict[str, Any]]) -> dict[str, Any]:
     result = {name: mid([day[name] for day in days]) for name in ("merges", *NAMES) if name != "wait_minutes_by_cause"}
     result["wait_minutes_by_cause"] = {cause: mid([day["wait_minutes_by_cause"][cause] for day in days]) or 0
                                        for cause in CAUSE_ORDER}
+    for name in ("run_slot_idle_minutes", "test_slot_idle_minutes"):
+        result[name] = mid([day[name] for day in days]) or 0
     for name in ("idle_minutes", "person_interventions"):
         result[name] = result[name] or 0
+    result["approval_to_merge"] = split.previous([day["approval_to_merge"] for day in days])
     return result
 
 
@@ -244,7 +247,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     lanes: dict[str, list[int]] = {}
     for number, issue in sorted(issues.items()):
         if number in approvals and number not in busy and _startable(issue, moment, {}, facts=True):
-            lanes.setdefault(issue["lane"], []).append(number)
+            lanes.setdefault(history.lane_at(issue, moment), []).append(number)
     ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
     ranked = _ranked(ctx, ready, claims=list(known))
     github = current and store.github_wait_until(moment) is not None

@@ -130,7 +130,7 @@ Classify each message using its context; a message may contain several kinds.
 | New work or change | Accumulate an order draft with the existing scope and decisions. When clear enough to split, propose the single card below. |
 | Change to a running issue | Propose an edit to that issue; ask whether to stop the running work or wait. A changed body needs explicit re-approval through order publication. |
 | Thought | Record it in the project's decision notes only; it creates no issues or approval. |
-| Setting change | Run `fa settings set KEY VALUE` for a key `fa settings list` shows ("turn off automatic merge" means `review batch`), with no extra confirmation, and report the change to the person in one line; for a team-scope key say it applies to the whole team, then commit and push `.foragent.yml` from a temporary worktree of the default branch. Unknown key or rejected value: one line with the valid choices. Details: [settings](references/settings.md). |
+| Setting change | Run `fa settings set KEY VALUE` for a key `fa settings list` shows ("turn off automatic merge" means `review careful`), with no extra confirmation, and report the change to the person in one line; for a team-scope key say it applies to the whole team, then commit and push `.foragent.yml` from a temporary worktree of the default branch. Unknown key or rejected value: one line with the valid choices. Details: [settings](references/settings.md). |
 
 For order drafts, use `fa-order`; follow [order card](references/order-card.md) for [add]/[edit]/[later], the planning handoff and first-hand approval before `fa order publish --approve`.
 
