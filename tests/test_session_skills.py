@@ -245,3 +245,150 @@ def test_a_library_license_never_overrides_a_restrictive_license_beside_the_copy
     if where == "project":
         with pytest.raises(SkillError, match="shared.*license"):
             SkillManager(config).check_default("shared", root)
+
+
+@pytest.mark.parametrize("kind", ["folder", "file", "inside"])
+@pytest.mark.parametrize("folder", [".claude/skills", "skills"])
+@pytest.mark.parametrize("where", ["checkout", "project"])
+def test_a_default_reached_through_a_symlink_never_reaches_a_session(tmp_path, kind, folder, where):
+    root, worktree = tmp_path / "root", tmp_path / "worktree"
+    elsewhere = tmp_path / "elsewhere"
+    write_skill(elsewhere, "linked")  # MIT where it lives, and the project is MIT too.
+    base = worktree if where == "checkout" else root
+    (base / folder).mkdir(parents=True)
+    (base / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    target = base / folder / "linked"
+    if kind == "folder":
+        target.symlink_to(elsewhere / "skills/linked")
+    else:
+        target.mkdir()
+        (target / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+        if kind == "file":
+            (target / "SKILL.md").symlink_to(elsewhere / "skills/linked/SKILL.md")
+        else:
+            (target / "SKILL.md").write_text("---\nname: linked\ndescription: About it\n---\nBody\n")
+            (target / "notes.md").symlink_to(elsewhere / "skills/linked/SKILL.md")
+    value = section(Config(default_skills={"docs": ["linked"]}, skill_libraries=[]), "docs", root, worktree)
+    assert "- linked: not available here" in value and "linked/SKILL.md" not in value
+    if where == "project" and folder == ".claude/skills":
+        with pytest.raises(SkillError, match="symlink"):
+            SkillManager(Config(skill_libraries=[])).check_default("linked", root)
+
+
+@pytest.mark.parametrize("link", ["skill", "parent"])
+def test_a_library_skill_reached_through_a_symlinked_folder_is_no_default_but_stays_in_the_catalog(tmp_path, link):
+    library, elsewhere = tmp_path / "library", tmp_path / "elsewhere"
+    write_skill(elsewhere, "linked")
+    library.mkdir()
+    if link == "skill":
+        (library / "skills").mkdir()
+        (library / "skills/linked").symlink_to(elsewhere / "skills/linked")
+    else:  # Only a folder above the skill is a link; the skill folder itself is not.
+        (library / "skills").symlink_to(elsewhere / "skills")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    entry = {"name": "lib", "repo": "https://github.com/anthropics/skills", "path": str(library)}
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["linked"]})
+    assert "- linked: not available here" in section(config, "docs", tmp_path / "project")
+    project = tmp_path / "project"
+    project.mkdir()
+    with pytest.raises(SkillError, match="symlink"):
+        SkillManager(config).check_default("linked", project)
+    assert not (project / ".claude").exists()
+    catalog = Config(skill_libraries=[entry])
+    assert [name for name, _, _ in available_skills(catalog, [])] == ["linked"]
+
+
+from foragent.license_texts import STANDARD_LICENSES  # noqa: E402
+
+RESTRICTED_TEXTS = {
+    "standard-then-ban": STANDARD_LICENSES["MIT"] + "\nRedistribution of this skill is prohibited.\n",
+    "spdx-then-ban": "SPDX-License-Identifier: MIT\nRedistribution of this skill is prohibited.\n",
+    "two-spdx": "SPDX-License-Identifier: MIT\nSPDX-License-Identifier: LicenseRef-Private\n",
+    "spdx-other-text": "SPDX-License-Identifier: MIT\n" + STANDARD_LICENSES["ISC"],
+    "copyright-then-ban": "SPDX-License-Identifier: MIT\nCopyright 2026 X. Redistribution is prohibited.\n",
+    "standard-copyright-then-ban": STANDARD_LICENSES["MIT"].replace(
+        "<year> <copyright holders>", "2026 X. Redistribution is prohibited"),
+}
+
+
+@pytest.mark.parametrize("text", RESTRICTED_TEXTS.values(), ids=RESTRICTED_TEXTS)
+@pytest.mark.parametrize("where", ["checkout", "project-installed", "library"])
+def test_a_license_with_any_added_wording_never_makes_a_default(tmp_path, text, where):
+    root, worktree, library = tmp_path / "root", tmp_path / "worktree", tmp_path / "library"
+    root.mkdir()
+    entry = {"name": "lib", "repo": "unused", "path": str(library), "revision": "pinned", "skills": ["worded"]}
+    if where == "library":
+        (library / "skills/worded").mkdir(parents=True)
+        (library / "skills/worded/SKILL.md").write_text("---\nname: worded\ndescription: About it\n---\nBody\n")
+        (library / "skills/worded/LICENSE").write_text(text)
+    else:
+        base = worktree if where == "checkout" else root
+        write_skill(base / ".claude", "worded", license=None)
+        (base / ".claude/skills/worded/LICENSE").write_text(text)
+    config = Config(skill_libraries=[entry] if where == "library" else [], default_skills={"docs": ["worded"]})
+    assert "- worded: not available here" in section(config, "docs", root, worktree)
+    if where != "checkout":
+        with pytest.raises(SkillError, match="worded.*license"):
+            SkillManager(config).check_default("worded", root)
+        assert not (root / ".claude/skills/worded").exists() or where == "project-installed"
+
+
+@pytest.mark.parametrize("text", [
+    STANDARD_LICENSES["MIT"], "SPDX-License-Identifier: MIT\n",
+    "SPDX-License-Identifier: MIT\n\n" + STANDARD_LICENSES["MIT"],
+    STANDARD_LICENSES["MIT"].replace("<year> <copyright holders>", "2024-2026 Anthropic, PBC"),
+    "SPDX-License-Identifier: MIT\nCopyright 2026 Example Inc.\n",
+    STANDARD_LICENSES["ISC"].replace("<year> <owner>", "2026 Example"),
+])
+def test_a_plain_standard_license_still_makes_a_default(tmp_path, text):
+    root = tmp_path / "root"
+    write_skill(root / ".claude", "plain", license=None)
+    (root / ".claude/skills/plain/LICENSE").write_text(text)
+    config = Config(skill_libraries=[], default_skills={"docs": ["plain"]})
+    assert ".claude/skills/plain/SKILL.md" in section(config, "docs", root)
+    assert SkillManager(config).check_default("plain", root) is None
+
+
+def test_an_installed_copy_without_its_own_file_needs_its_librarys_whole_license(tmp_path):
+    root, library = tmp_path / "root", tmp_path / "library"
+    (library / "skills/borrowed").mkdir(parents=True)
+    (library / "skills/borrowed/SKILL.md").write_text("---\nname: borrowed\ndescription: About it\n---\nBody\n")
+    (library / "LICENSE").write_text(RESTRICTED_TEXTS["standard-then-ban"])
+    write_skill(root / ".claude", "borrowed", license=None)
+    entry = {"name": "lib", "repo": "unused", "path": str(library), "revision": "pinned", "skills": ["borrowed"]}
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["borrowed"]})
+    assert "- borrowed: not available here" in section(config, "docs", root)
+    with pytest.raises(SkillError, match="borrowed.*license"):
+        SkillManager(config).check_default("borrowed", root)
+
+
+def test_a_linked_library_root_never_makes_a_default_but_still_lists_its_skills(tmp_path):
+    real, linked = tmp_path / "real-library", tmp_path / "library"
+    write_skill(real, "rooted")
+    linked.symlink_to(real)
+    entry = {"name": "lib", "repo": "https://github.com/anthropics/skills", "path": str(linked)}
+    config = Config(skill_libraries=[entry], default_skills={"docs": ["rooted"]})
+    project = tmp_path / "project"
+    project.mkdir()
+    assert "- rooted: not available here" in section(config, "docs", project)
+    with pytest.raises(SkillError, match="symlink"):
+        SkillManager(config).check_default("rooted", project)
+    assert not (project / ".claude").exists()
+    assert [name for name, _, _ in available_skills(Config(skill_libraries=[entry]), [])] == ["rooted"]
+
+
+@pytest.mark.parametrize("linked", ["project", "checkout", "above-project"])
+def test_a_linked_project_or_checkout_never_offers_its_copies_as_defaults(tmp_path, linked):
+    real = tmp_path / "real"
+    write_skill(real / "inner", "local")
+    if linked == "above-project":
+        (tmp_path / "via").symlink_to(real)
+        base = tmp_path / "via/inner"
+    else:
+        base = tmp_path / linked
+        base.symlink_to(real / "inner")
+    other = tmp_path / "other"
+    other.mkdir()
+    root, worktree = (other, base) if linked == "checkout" else (base, other)
+    config = Config(skill_libraries=[], default_skills={"docs": ["local"]})
+    assert "- local: not available here" in section(config, "docs", root, worktree)

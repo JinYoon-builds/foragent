@@ -119,6 +119,61 @@ def _license(skill: Path, library: Path, *, nearest: bool = False, walk: bool = 
     return next((identity for identity, expected in standards.items() if normalized == expected), "unknown"), license_file
 
 
+# A copyright notice alone: a year (or the template's placeholder) and a holder, with no second
+# sentence after it. Anything further on that line stays in the text and must match a standard.
+_COPYRIGHT_ONLY = re.compile(
+    r"^[ \t]*Copyright[ \t]+(?:\(c\)[ \t]*|©[ \t]*)?"
+    r"(?:\d{4}(?:[ \t]*[-,][ \t]*\d{4})*|<year>|\[yyyy\])[^.\r\n]*\.?[ \t]*$",
+    re.I | re.M,
+)
+
+
+def _bare_license(text: str) -> str:
+    """License text without copyright notices, for a whole-text comparison that keeps every other word."""
+    return " ".join(_COPYRIGHT_ONLY.sub("", text).split())
+
+
+def redistributable_license(directory: Path, base: Path) -> tuple[str, Path | None]:
+    """The closest LICENSE over ``directory`` (up to ``base``), judged for default use.
+
+    Only a whole standard text, or SPDX lines with nothing else or with exactly that
+    standard text, names the license. Any added wording may restrict it, so it is "unknown".
+    """
+    _, found = _license(directory, base, walk=True)
+    if found is None:
+        return "unknown", None
+    try:
+        text = found.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return "unknown", found
+    pattern = r"^[ \t]*(?:(?:#|//|/\*|\*)[ \t]*)?SPDX-License-Identifier:[ \t]*([^\r\n]*)"
+    declared = {value.strip().removesuffix("*/").strip().casefold() for value in re.findall(pattern, text, re.M)}
+    body = _bare_license(re.sub(pattern, "", text, flags=re.M))
+    standards = {identity: _bare_license(standard) for identity, standard in STANDARD_LICENSES.items()}
+    if not declared:
+        return next((identity for identity, expected in standards.items() if body == expected), "unknown"), found
+    if len(declared) != 1:
+        return "unknown", found
+    identity = next((known for known in OPEN_SOURCE_LICENSES if known.casefold() in declared), None)
+    if identity is None or (body and body != standards.get(identity)):
+        return "unknown", found
+    return identity, found
+
+
+def reached_through_symlink(path: Path) -> bool:
+    """Whether any folder on ``path``'s way, ``path`` itself, or anything inside it is a symlink.
+
+    A default must be the files its license facts describe; a link may lead anywhere. That
+    includes a linked library root, project or checkout, and any folder above them.
+    """
+    if os.path.realpath(path) != os.path.abspath(path):
+        return True
+    try:
+        return any(item.is_symlink() for item in path.rglob("*"))
+    except OSError:
+        return True
+
+
 def copy_license(directory: Path, base: Path, origin: Skill | None) -> str:
     """The license facts of a skill copy under ``base``; every fact that applies must allow it.
 
@@ -126,10 +181,10 @@ def copy_license(directory: Path, base: Path, origin: Skill | None) -> str:
     installed ``.claude/skills`` copy came from. Only when neither exists does the project's own
     LICENSE in ``base`` speak for the copy. Returns the first restrictive fact, else an open one.
     """
-    local, found = _license(directory, base, nearest=True)
+    local, found = redistributable_license(directory, base)
     facts = [local] if found is not None and found.parent != base else []
     if origin is not None and directory.parent.parent.name == ".claude":
-        facts.append(origin.license)
+        facts.append(redistributable_license(origin.path, origin.library.path)[0])
     facts = facts or [local]
     return next((fact for fact in facts if fact not in OPEN_SOURCE_LICENSES), facts[0])
 
@@ -409,8 +464,10 @@ class SkillManager:
             skill, failure = self._repo_skill(identity, root) or self._select(identity), None
         except SkillError as exc:
             skill, failure = None, exc
-        directory = repo_path(root, f".claude/skills/{skill.path.name if skill else entry_directory(identity)}")
-        if directory.exists():
+        directory = root / ".claude/skills" / (skill.path.name if skill else entry_directory(identity))
+        if directory.exists() or directory.is_symlink():
+            if reached_through_symlink(directory):
+                raise SkillError(f"refusing to keep {identity} as a default: {directory} is reached through a symlink")
             license_id = copy_license(directory, root, skill)
             if license_id not in OPEN_SOURCE_LICENSES:
                 raise SkillError(f"refusing to keep {identity} as a default: {directory} has no open-source "
@@ -418,6 +475,12 @@ class SkillManager:
             return None
         if failure is not None:
             raise failure
+        if reached_through_symlink(skill.path):
+            raise SkillError(f"refusing to install {identity} as a default: {skill.path} is reached through a symlink")
+        license_id, found = redistributable_license(skill.path, skill.library.path)
+        if license_id not in OPEN_SOURCE_LICENSES:
+            raise SkillError(f"refusing to install {identity} as a default: cannot confirm an open-source license "
+                             f"({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
         return self.check_install(identity, root, commit=True)
 
     def default_needs_ignore(self, skill: Skill, root: Path) -> bool:

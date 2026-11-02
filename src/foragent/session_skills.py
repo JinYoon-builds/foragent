@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING
 from foragent.config import DEFAULT_SKILL_ROLES
 from foragent.i18n import text
 from foragent.skills import (
-    OPEN_SOURCE_LICENSES, Skill, SkillError, SkillManager, copy_license, entry_directory, skill_summary,
+    OPEN_SOURCE_LICENSES, Skill, SkillError, SkillManager, copy_license, entry_directory, reached_through_symlink,
+    redistributable_license, skill_summary,
     with_vendored_library,
 )
 
@@ -41,7 +42,7 @@ class _Finder:
     """Find a skill's file: this checkout, then the project's own copy, then a library cache.
 
     Every copy answers for its own license facts, wherever it is found, so only a
-    redistributable copy reaches a session.
+    redistributable copy reaches a session. A copy reached through a symlink never does.
     """
 
     def __init__(self, config: Config, root: Path, worktree: Path):
@@ -52,7 +53,8 @@ class _Finder:
         for base, relative in ((self.worktree, True), (self.root, False)):
             for folder in (f".claude/skills/{directory}", f"skills/{directory}"):
                 path = base / folder / "SKILL.md"
-                if path.is_file() and copy_license(base / folder, base, origin) in OPEN_SOURCE_LICENSES:
+                if (path.is_file() and not reached_through_symlink(base / folder)
+                        and copy_license(base / folder, base, origin) in OPEN_SOURCE_LICENSES):
                     return path, f"{folder}/SKILL.md" if relative else str(path.absolute())
         return None
 
@@ -71,7 +73,8 @@ class _Finder:
         directory = skill.path.name if skill is not None else entry_directory(entry)
         if (found := self._local(directory, skill)) is not None:
             return found
-        if skill is None or skill.license not in OPEN_SOURCE_LICENSES:
+        if (skill is None or redistributable_license(skill.path, skill.library.path)[0] not in OPEN_SOURCE_LICENSES
+                or reached_through_symlink(skill.path)):
             return None
         path = (skill.path / "SKILL.md").resolve()
         return path, str(path)

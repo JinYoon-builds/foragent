@@ -101,7 +101,7 @@ def _run_executor(n: int, ctx: RunContext, executor: Executor, *, spender: str |
         poll()
         # Executors report plan usage in their own output; keep the latest numbers.
         usage.update(usage_events.record_from_log(ctx.store, log, offset, ctx.now()))
-        skill_reads.record(ctx.store, n, log, offset, kwargs.get("worktree"))
+        skill_reads.record(ctx.store, n, log, offset)
         _progress(n, ctx)
 
 
