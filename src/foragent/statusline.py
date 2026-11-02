@@ -205,6 +205,85 @@ def _session_input(raw: bytes) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _hook_session(payload: dict) -> str | None:
+    """The session a hook runs for, as ``fa`` would claim it: FORAGENT_SESSION_ID, else the hook's id.
+
+    A spawned session's FORAGENT_SESSION_ID differs from Claude's own id; reading the
+    hook id first would miss that such a session was displaced.
+    """
+    from foragent import status_pm
+
+    session_id = payload.get("session_id")
+    return status_pm.session_from_env() or (session_id if isinstance(session_id, str) and session_id else None)
+
+
+def _export_session(session_id: Any) -> None:
+    """Best effort: give this Claude session's commands FORAGENT_SESSION_ID (#1484).
+
+    Claude Code hands a SessionStart hook a CLAUDE_ENV_FILE whose exports reach
+    the session's later commands, so bare ``fa`` there knows which session typed it.
+    A session that already has an id (a spawned role) or any role keeps its own.
+    """
+    target = os.environ.get("CLAUDE_ENV_FILE")
+    if (not target or not isinstance(session_id, str) or not session_id
+            or os.environ.get("FORAGENT_SESSION_ID") or "FORAGENT_ROLE" in os.environ):
+        return
+    try:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(f"export FORAGENT_SESSION_ID={shlex.quote(session_id)}\n")
+    except OSError:
+        pass  # The session that is starting must not notice.
+
+
+def _pm_seat(cwd: Path, session_id: str | None):
+    """(config, seat, authority) for this person's PM seat around ``cwd``, else None. Read only."""
+    from foragent import presence, status_pm
+
+    project = presence._project(cwd)
+    if project is None or project[1] is None:
+        return None
+    try:
+        seat = status_pm.read(project[1])
+    except status_pm.SeatUnreadable:
+        return None  # Display only; publication itself refuses an unreadable seat.
+    if seat is None:
+        return None
+    return project[0], seat, status_pm.authority(project[1], session_id)
+
+
+def _pm_segment(cwd: Path, session_id: str | None) -> str | None:
+    """``PM <holder>`` for the statusline; a displaced session sees where the seat went."""
+    from foragent import status_pm
+    from foragent.i18n import text
+
+    try:
+        found = _pm_seat(cwd, session_id)
+        if found is None or not found[0].presence["statusline"]:
+            return None
+        config, seat, authority = found
+        key = "pm_seat_statusline_moved" if authority == "displaced" else "pm_seat_statusline"
+        return text(key, config.language, session=status_pm.short(seat["holder"]["session_id"]))
+    except Exception:  # The user's statusline must keep working whatever the local state holds.
+        return None
+
+
+def _pm_moved_notice(payload: dict) -> str | None:
+    """The note a displaced PM session reads on its next prompt, else None."""
+    from foragent import status_pm
+    from foragent.i18n import text
+
+    cwd = payload.get("cwd")
+    try:
+        folder = Path(cwd) if isinstance(cwd, str) and cwd else Path.cwd()
+        found = _pm_seat(folder, _hook_session(payload))
+    except Exception:  # The person's prompt must go on whatever the local state holds.
+        return None
+    if found is None or found[2] != "displaced":
+        return None
+    config, seat, _authority = found
+    return text("pm_seat_moved_context", config.language, holder=status_pm.short(seat["holder"]["session_id"]))
+
+
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     """Entry point for the SessionStart hook: one JSON object with the summary line, or nothing.
 
@@ -225,6 +304,7 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
     except OSError:  # The process folder is gone: neither step has a project to read.
         return 0
     presence.record_terminal(folder, datetime.now(UTC))
+    _export_session(session_id)
     try:
         if load_record() is not None:
             _sync_hook()
@@ -259,6 +339,9 @@ def prompt_context(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None
         context, problems = presence.prompt_context(folder, datetime.now(UTC))
     except Exception as exc:  # The person's prompt must go on whatever the local state holds.
         context, problems = None, [f"could not read the Foragent box ({type(exc).__name__}: {exc})"]
+    moved = _pm_moved_notice(payload)
+    if moved:
+        context = moved + ("\n\n" + context if context else "")
     from foragent.orch_inbox import clean
 
     # The one place box text leaves the process: whatever slipped past the row
@@ -299,6 +382,7 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     now = datetime.now(UTC)
     output = presence.append(output, presence.statusline_segment(Path.cwd(), now))
     session_id = _session_input(raw).get("session_id")
+    output = presence.append(output, _pm_segment(Path.cwd(), _hook_session(_session_input(raw))))
     art = presence.squirrel(Path.cwd(), session_id if isinstance(session_id, str) else None, now)
     stdout.write(art.encode("utf-8") + b"\n" + output if art else output)
     stdout.flush()
