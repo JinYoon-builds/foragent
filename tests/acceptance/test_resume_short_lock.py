@@ -18,7 +18,7 @@ BRANCH = "foragent/issue-1"
 RESOLVED = "theirs\nmine\n"
 
 
-def saved_run(case, *, saved_conflict=True):
+def saved_run(case, *, saved_conflict=True, preserved_files=("kept-work.txt",)):
     """Save real WIP, then restart it through run_issue's normal resume path.
 
     Use conflict-budget's real GitHistory add/add conflict and scripted
@@ -36,7 +36,8 @@ def saved_run(case, *, saved_conflict=True):
 
     def first(kwargs):
         (kwargs["worktree"] / "feature.txt").write_text("mine\n")
-        (kwargs["worktree"] / "kept-work.txt").write_text("keep saved work\n")
+        for name in preserved_files:
+            (kwargs["worktree"] / name).write_text("keep saved work\n")
         if saved_conflict:
             case.history.update({"feature.txt": "theirs\n"})
             return "Implemented"
@@ -55,7 +56,8 @@ def saved_run(case, *, saved_conflict=True):
     case.resume_base = case.history.tip
     case.saved_head = case.git.local_branch_sha(BRANCH)
     assert case.saved_head is not None
-    assert git_command(case.root, "show", f"{BRANCH}:kept-work.txt") == "keep saved work"
+    for name in preserved_files:
+        assert git_command(case.root, "show", f"{BRANCH}:{name}") == "keep saved work"
     assert case.merges == []
     assert_short_holds(case)
 
@@ -97,7 +99,7 @@ def test_resumed_conflict_resolves_and_verifies_outside_merge_lock(short_case, s
     assert case.store.get_run(1).attempts == 1, "Successful resolution must not rebuild"
     assert git_command(case.history.origin, "show", "main:feature.txt") == RESOLVED.strip()
     assert git_command(case.history.origin, "show", "main:kept-work.txt") == "keep saved work"
-    git_command(case.history.origin, "merge-base", "--is-ancestor", case.saved_head, "main")
+    git_command(case.history.origin, "merge-base", "--is-ancestor", case.saved_head, "refs/heads/foragent/issue-1")
     git_command(case.history.origin, "merge-base", "--is-ancestor", case.resume_base, "main")
     assert_short_holds(case)
 
@@ -146,7 +148,8 @@ def test_ready_run_merges_while_resumed_conflict_is_being_resolved(short_case):
 
 
 def test_exhausted_resume_conflict_budget_still_rebuilds_without_slow_work_under_lock(short_case):
-    case = saved_run(short_case)
+    # A rebuild requires a majority of own files to conflict on this main.
+    case = saved_run(short_case, preserved_files=())
     case.ctx.config = replace(case.ctx.config, conflict_retries=1)
     turns = []
 
