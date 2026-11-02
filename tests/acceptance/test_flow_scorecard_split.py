@@ -153,10 +153,16 @@ def test_time_to_merge_starts_at_latest_approval_and_reading_does_no_io(flow, ca
         "started_at": (merge - timedelta(minutes=5)).isoformat(), "target": "main",
     }) + "\n")
 
-    def forbidden(*args, **kwargs):
-        pytest.fail("Scorecard reads must not invoke a subprocess")
+    real_popen = subprocess.Popen
+    read_only_git = {"log", "rev-list", "rev-parse", "show", "cat-file", "merge-base"}
 
-    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    def guarded(cmd, *args, **kwargs):
+        words = [str(word) for word in (cmd if isinstance(cmd, (list, tuple)) else [cmd])]
+        if words and words[0].rsplit("/", 1)[-1] == "git" and read_only_git & set(words[1:]):
+            return real_popen(cmd, *args, **kwargs)  # A local read-only history query (#1560) is allowed.
+        pytest.fail(f"Scorecard reads must not invoke any other subprocess: {words}")
+
+    monkeypatch.setattr(subprocess, "Popen", guarded)
     card = _read(flow, capsys)
     today = card["window"]["today"]
     assert today["median_minutes_to_merge"] == pytest.approx(90), "Run start and cleanup are not approval/merge"

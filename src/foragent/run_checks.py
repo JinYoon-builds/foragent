@@ -28,7 +28,7 @@ from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
 from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -454,7 +454,10 @@ def _keep_gathered(state_root: Path, n: int, checks: list[CheckResult]) -> None:
 
 def _verify_implementation(attempt: Implementation) -> str:
     try:
-        return _verify_contents(attempt)
+        if getattr(attempt, "base_refresh", False):  # Inside the refresh's own record, not a second interval.
+            return _verify_contents(attempt)
+        with activity(attempt.n, attempt.ctx, "checking", "initial"):
+            return _verify_contents(attempt)
     except BaseException:
         _keep_gathered(attempt.ctx.store.root, attempt.n, attempt.checks)
         raise

@@ -117,11 +117,14 @@ def spawn_orchestrator(repo_root: Path, store: StateStore, config: Config, *, pr
     interleave; this function takes no lock and writes no heartbeat.
     """
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
+        orch_spawn.note_skip(store, "disabled")
         return None
     root = repo_root.resolve()
     planned = plan_launch(root, store, config, now, prompt)
     if planned is None or not launch(root, store, now, planned):
+        orch_spawn.note_skip(store, "launch-unavailable" if planned is None else "launch-failed")
         return None
+    orch_spawn.note_opened(store, planned)
     take_seat(store, planned, now)  # The deliberate replacement: the old holder becomes previous.
     _opened(store, config, root, now, planned)
     return planned[3]
