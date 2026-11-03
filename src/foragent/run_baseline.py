@@ -172,6 +172,8 @@ def _baseline_environment(root: Path) -> dict:
 def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     """Locked file -> approved issues that own it and have not merged (#327)."""
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    if getattr(ctx.config, "merge_owner", False):
+        merged.update(number for number, _ in ctx.store.owner_merge_facts())
     owners: dict[str, set[int]] = {}
     for path in (ctx.store.root / "approvals").glob("*.json"):
         approval = ctx.store.load_approval(int(path.stem))
