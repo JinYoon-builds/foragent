@@ -17,6 +17,7 @@ from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
 from foragent import cuts, gh
+from foragent.records import load_record
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +87,14 @@ class PullRequest:
     url: str = ""
 
 
+@dataclass(frozen=True)
+class OwnerPullRequest(PullRequest):
+    """Exact publication resource; legacy PR listings keep their original record shape."""
+
+    state: str = "open"
+    head_sha: str | None = None
+
+
 class Tracker(Protocol):
     def rate_limit_reset(self) -> datetime | None: ...
     def authenticated_login(self, *, refresh: bool = False) -> str: ...
@@ -113,8 +122,9 @@ class Tracker(Protocol):
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
     def retitle_pr(self, pr: int, *, title: str) -> None: ...
-    def close_pr(self, pr: int, comment: str | None = None) -> None: ...
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch: bool = True) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
+    def get_pr(self, pr: int) -> OwnerPullRequest: ...
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
@@ -123,7 +133,7 @@ class Tracker(Protocol):
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None: ...
+                 subject: str | None = None, delete_branch: bool = True) -> None: ...
 
 
 class TrackerError(RuntimeError):
@@ -204,6 +214,10 @@ class IdentityError(TrackerError):
     def __init__(self, login: str, kind: str):
         super().__init__(f"GitHub credential belongs to {login} ({kind}), not a person")
         self.login, self.kind = login, kind
+
+
+class RejectedEvidence(TrackerError):
+    """The completed producer or artifact is invalid; another transport read cannot fix it."""
 
 
 class CIEvidence(str):
@@ -718,16 +732,19 @@ class RecordingTracker:
             if row["pr_number"] == pr:
                 self._context.store.update_local_issue(row["number"], **fields)
 
-    def close_pr(self, pr, comment=None):
-        self._tracker.close_pr(pr, comment)
+    def close_pr(self, pr, comment=None, *, delete_branch=True):
+        options = {} if delete_branch else {"delete_branch": False}
+        self._tracker.close_pr(pr, comment, **options)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
-    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
+    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None, delete_branch=True):
+        options = {} if delete_branch else {"delete_branch": False}
         if subject is None:
-            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, **options)
         else:
-            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject)
-        self._record_pr_state(pr, merged=True)
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject, **options)
+        if not getattr(getattr(self._context, "config", None), "merge_owner", False):
+            self._record_pr_state(pr, merged=True)
 
 
 def _merge_flag(method: str) -> str:
@@ -934,9 +951,10 @@ class FakeTracker:
         return next((pr.number for pr in self.created_prs
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
 
-    def close_pr(self, pr: int, comment: str | None = None) -> None:
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch=True) -> None:
         self._close(pr, comment)
-        self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
+        if delete_branch:
+            self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
         if state not in {"open", "merged"}:
@@ -945,6 +963,13 @@ class FakeTracker:
             pr.merged_at is not None if state == "merged"
             else self.get_issue(pr.number).state == "open" and pr.merged_at is None
         )]
+
+    def get_pr(self, pr: int) -> OwnerPullRequest:
+        item = next((item for item in self.created_prs if item.number == pr), None)
+        if item is None:
+            raise TrackerError(f"PR #{pr}: HTTP 404")
+        return load_record(OwnerPullRequest, {**asdict(item), "state": self.get_issue(pr).state,
+                                             "head_sha": self.pr_head_sha(pr)})
 
     def set_pr_files(self, pr: int, files: list[str]) -> None:
         self._pr_files[pr] = list(files)
@@ -977,7 +1002,7 @@ class FakeTracker:
         return self._pr_heads.get(pr, "0" * 40)
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None:
+                 subject: str | None = None, delete_branch=True) -> None:
         _merge_flag(method)
         if self.pr_head_sha(pr) != expected_head_sha:
             raise TrackerError("PR head changed after verification")
@@ -1052,6 +1077,8 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 class GhTracker:
+    _artifact_error = TrackerError
+
     def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
                  sleep: Callable[[float], None] = time.sleep):
         self.repo = repo
@@ -1353,6 +1380,14 @@ class GhTracker:
         )
         return json.loads(output)["number"]
 
+    def get_pr(self, pr: int) -> OwnerPullRequest:
+        item = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))
+        return OwnerPullRequest(
+            item["number"], item["head"]["ref"], item["base"]["ref"],
+            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"], item["state"],
+            item["head"].get("sha"),
+        )
+
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
         if state not in {"open", "merged"}:
             raise ValueError(f"unsupported PR state: {state}")
@@ -1401,8 +1436,8 @@ class GhTracker:
             raise TrackerError(f"cannot parse PR number: {output.strip()}")
         return int(match[1])
 
-    def close_pr(self, pr: int, comment: str | None = None) -> None:
-        args = ["pr", "close", str(pr), "-R", self.repo, "--delete-branch"]
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch=True) -> None:
+        args = ["pr", "close", str(pr), "-R", self.repo, *(["--delete-branch"] if delete_branch else [])]
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
@@ -1535,7 +1570,7 @@ class GhTracker:
             # API/rate-limit errors retain their TrackerError classification.
             if isinstance(exc, TrackerError):
                 raise
-            raise TrackerError(f"Unusable acceptance artifacts: {exc}") from exc
+            raise self._artifact_error(f"Unusable acceptance artifacts: {exc}") from exc
 
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
@@ -1634,13 +1669,14 @@ class GhTracker:
         return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None:
+                 subject: str | None = None, delete_branch=True) -> None:
         # Explicit subject/body prevent GitHub's defaults from copying branch
         # messages, including runner-only trailers, into the squash commit.
         if subject is None and method == "squash":
             subject = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "title"]))["title"]
         self._call([
-            "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
+            "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method),
+            *(["--delete-branch"] if delete_branch else []),
             "--match-head-commit", expected_head_sha,
             *(["--subject", subject] if subject is not None else []),
             *(["--body", ""] if method == "squash" else []),

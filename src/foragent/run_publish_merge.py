@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from foragent.policy import Decision
 from foragent.run_checks_approved import acceptance_mismatches
+from foragent.state_local import _approval_identity
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,8 +49,8 @@ def _merge_lock(n: int, ctx: RunContext):
                     ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
-def _policy_allows(decision: Decision) -> bool:
-    return decision.kind == "merge"
+def _policy_allows(decision: Decision, *, authorization=None) -> bool:
+    return authorization is not None or decision.kind == "merge"
 
 
 @dataclass
@@ -89,15 +90,23 @@ def _final_merge_inputs(
 
     status = run_publish._ci_status(ctx, pr, git.root, ready_at)
     issue = ctx.tracker.get_issue(n)
+    if getattr(ctx.config, "merge_owner", False) and issue.state == "closed":
+        return run_publish._MergeInputs(stop=lambda: "issue-closed")
     saved = ctx.store.load_approval(n)
+    if (getattr(ctx.config, "merge_owner", False) and saved is not None
+            and _approval_identity(saved) != _approval_identity(approval)):
+        return run_publish._MergeInputs(stop=lambda: "superseded")
     if (run_publish.APPROVED not in issue.labels
             or (approved_body_sha is not None and run_publish.body_hash(issue.body) != approved_body_sha)
             or saved is None or saved.body_sha != approval.body_sha
             or saved.acceptance_blobs != approval.acceptance_blobs):
         return run_publish._MergeInputs(stop=invalid_approval)
-    current = next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None)
+    current = (ctx.tracker.get_pr(pr) if getattr(ctx.config, "merge_owner", False) else
+               next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None))
     if (current is None or current.head != branch or current.base != base
-            or base != ctx.config.base_branch):
+            or getattr(ctx.config, "merge_owner", False) and (current.state != "open" or current.merged_at)):
+        return run_publish._MergeInputs(stop=changed_base)
+    if base != ctx.config.base_branch:
         return run_publish._MergeInputs(stop=changed_base)
     ctx.git.fetch("origin", base)
     target_sha = git.ref_sha(f"origin/{base}")

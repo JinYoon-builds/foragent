@@ -1576,8 +1576,10 @@ def test_missing_trusted_default_branch_obeys_fallback_configuration(tmp_path, m
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: None)
     monkeypatch.setattr(ci_local, 'fallback_comparison', lambda attempt, base: local.append(base))
     if fallback:
-        assert ci_mode.require_comparison(attempt, 2, 'head', base_sha='base').reports is None
-        assert local == ['base']
+        evidence = ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
+        assert evidence.reports is None and local == ['base']
+        # No artifact was read: the trusted-branch recheck guards it, not a pinned (unread) report set.
+        assert evidence.fallback_reports is None
     else:
         with pytest.raises(ExecutorStopped, match='Default branch reference unavailable') as exc:
             ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
