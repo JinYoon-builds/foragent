@@ -171,9 +171,10 @@ class RunRecordsMixin:
             self._write_json(path, value)
 
     def active_runs(self) -> list[Run]:
-        paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> records.
+        paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
         runs = [*map(self.get_run, sorted(int(path.stem) for path in paths if path.stem.isdigit())),
-                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-"))]
+                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-")),
+                *self.draft_runs()]
         return [run for run in runs if run is not None and run.status == "running"]
 
     def pause_lane(self, lane: str, until: datetime) -> None:
@@ -225,8 +226,8 @@ class RunRecordsMixin:
         return until if now < until else None
 
     def finish_run(self, number: int | str, outcome: str, detail: str = "") -> Run:
-        if isinstance(number, str):  # A dream record (dream-<lane>) never enters runs.jsonl.
-            return self.finish_dream(number[6:], outcome, detail)
+        if isinstance(number, str):  # A dream or draft record (dream-<lane>, draft-<n>) never enters runs.jsonl.
+            return self._finish_side(number, outcome, detail)
         with self._state_lock():
             run = self.get_run(number)
             if run is None:

@@ -40,7 +40,7 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime, number: int | None = 
 def _at_plan_width(ctx: TickContext, lane: str) -> bool:
     """A live plan width caps the lane's running runs; without one the lane has no fixed cap."""
     width = orch_plan.width(ctx.store, lane, ctx.now())
-    return width is not None and sum(run.lane == lane for run in ctx.store.active_runs()) >= width
+    return width is not None and sum(run.lane == lane and run.kind != "draft" for run in ctx.store.active_runs()) >= width
 
 
 def _apply_budgets(
@@ -77,7 +77,7 @@ def _machine_budget(
     held = [number for lane, numbers in ready.items() for number in numbers if _lane_held(ctx, lane, now, number)]
     scheduler_flow.hold(ctx, held, "lane-held")
     waiting = sum(len(numbers) for numbers in ready.values()) - len(held)
-    waiting += getattr(ctx, "_dream_demand", 0)  # A due dream asks for one worker too.
+    waiting += getattr(ctx, "_dream_demand", 0) + getattr(ctx, "_draft_demand", 0)  # Due dreams and drafts ask too.
     sample = sample if sample is not None else scheduler.machine_load()
     pressure, load = sample
     machine = machine_budget.values()  # The shared value follows machine.yml only.
