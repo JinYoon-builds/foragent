@@ -36,7 +36,7 @@ def phase_word(store: StateStore, config: Config, number: int, row: dict[str, An
 
     run = _latest_run(store, number)
     # The issue, not its run, decides done: a merged run of a reopened issue is not done.
-    if row.get("state") == "closed" or (not row and run is not None and run.outcome == "merged"):
+    if row.get("state") == "closed" or (not row and run is not None and store.run_merged(run)):
         return watch.text("acorns_done", config.language)
     running = run is not None and run.status == "running"
     # The same rule as the row: labels, the running run and the recorded PR (an open

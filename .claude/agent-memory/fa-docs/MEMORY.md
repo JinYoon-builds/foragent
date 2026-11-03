@@ -20,6 +20,7 @@
 - r368-r369 (2026-11-03): #1512/#1697/#1718 (=#1469, merge c69e7f98): r368 fa-architect SKILL lacks gate-alarm start + dig method; r369 ask Dnn for alarm/worse-only/no-slot-wait rules. Wait: orchestrator.
 - r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
 - r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
+- r420 (2026-11-04): #1696 size signal + #1774 importer check folded into the accepted-but-unwritten r324/r383 docs/order.md edit. Wait: orchestrator turns it into one edit.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -60,3 +61,4 @@
 - New read-only `fa order` checks (collect #1523, red #1725) land with no reader-doc line; docs/order.md near the preread paragraph is the one place for them. Bundle such proposals.
 - Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
 - Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line. Alarm-rule Dnn ask stays r369.
+- 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.

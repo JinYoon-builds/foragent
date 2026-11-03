@@ -43,10 +43,11 @@ def _events(store: StateStore, now: datetime) -> list[tuple[datetime, dict[str, 
 def _recent_merged_files(store: StateStore, now: datetime) -> set[str]:
     """Files changed by merged executions that finished in the last 24 hours."""
     finished = store.finish_times()
+    owner_facts = store.owner_merge_facts()
     files: set[str] = set()
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
-        if run.outcome == "merged" and at is not None and now - PATH_WINDOW < at <= now:
+        if store.run_merged(run, owner_facts=owner_facts) and at is not None and now - PATH_WINDOW < at <= now:
             files.update(run.changed_files or [])
     return files
 
