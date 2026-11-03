@@ -58,10 +58,11 @@ def test_ask_kind_routes_to_planning_or_push_and_answer_closes_only_that_record(
         for value in (record["id"], question, *options):
             assert value in handoff, f"Planning handoff must carry {value!r}"
     else:
-        assert len(case.pushes) == 1, "Absent or stale planning must receive exactly one fallback push"
-        push = case.pushes[0]
-        assert record["id"] in push["title"] + push["line"]
-        assert question in push["title"] + push["line"]
+        assert case.pushes == [], "Absent or stale planning leaves the question for the next PM without a push"
+        handoff = output.out
+        assert "planning" in handoff.lower(), "Pending ask must retain its planning-session handoff"
+        for value in (record["id"], question, *options):
+            assert value in handoff, f"Pending planning handoff must carry {value!r}"
     before_pushes = list(case.pushes)
     assert inbox_command(case, "answer", record["id"], "--text", options[0]) == 0
     assert [row["id"] for row in inbox_rows(case, capsys, "questions")] == [other["id"]]

@@ -231,3 +231,5 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - Person-wait alarm draft (drafts/person-wait-alarm, roles s, split from #1469): 8 red on main, 8 pass with prototype; approve after clean preread.
 - #1655 first-run draft (drafts/first-run): 10 red on main/pass with prototype; changes 16 locked files (--yes); PM asked about item 1 in new projects (#1232 rule) and skill text; preread after.
 - #435 split (drafts/435split): unit 1 silence-checks proven (19 cases pass with prototype) -> approve; unit 2 silence-baseline-resume and #435 edit (13 cases) not prototyped -> publish unapproved, prototype them before approval (orch agent, when load allows).
+- #435 split publish refused: its watchdog lock fix touches tests/acceptance/test_silence_watchdog.py, which approved+running #1641 also carries. Publish right after #1641 merges (drop batch_branch=None from the lock diff then), preread again, approve-keys silence-checks.
+- Docs order must carry #1477's old scope: comparison docs match launch behaviour; old plans/notes outside docs/specs and docs/impl removed or folded.
