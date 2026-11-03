@@ -17,6 +17,13 @@ from foragent.paths import repo_path
 
 ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs"}
 MEMORY = {"fa-docs": "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"}
+# Shared by every role (#1233): writes go through fa, a missing command becomes an issue proposal.
+GITHUB_WRITES = (
+    "GitHub writes (issues, pull requests, comments, labels, board items and fields, API mutations)\n"
+    "go through FA commands such as `fa order`, `fa inspect` and `fa orch`. Read-only `gh` inspection\n"
+    "stays available. When no FA command fits a write you need, do not hand the write to the person:\n"
+    "propose an issue that asks for the missing FA command.\n"
+)
 _CHECKOUT_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 
 
@@ -29,6 +36,7 @@ def agent_text(role: str, skills: list[str] | None = None) -> str:
         f"---\nname: {role}\ndescription: Foragent {title} role\nmemory: project\n{listed}---\n"
         f"You are this repository's Foragent {title}; follow the {role} skill.\n"
         "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+        f"\n{GITHUB_WRITES}"
     )
 
 

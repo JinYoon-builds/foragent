@@ -42,11 +42,12 @@ class Setting:
 
 
 SETTINGS = (
-    Setting("review", "team", "batch", ("fast", "batch", "careful")),
+    Setting("review", "team", "fast", ("fast", "careful")),
     Setting("always_human", "team", [], kind="list"),
     Setting("executor", "team", "codex", ("claude", "codex")),
     Setting("reviewer", "team", None, ("claude", "codex", "none")),
     Setting("runner_unit_tests", "team", "auto", ("auto", "ci", "all")),
+    Setting("scheduled_roles", "team", True, (True, False), kind="bool"),
     Setting("orch_silent_alert_minutes", "team", 30, kind="range", low=0, high=1440),
     Setting("claude_quota.mode", "me", "keep", ("keep", "burn")),
     Setting("notify", "me", None, NOTIFY_FIXED, kind="notify"),

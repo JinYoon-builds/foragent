@@ -78,6 +78,12 @@ def install_panel(case, panel, *, implement=True):
     # either executor after the one ordinary implementation call.
     executor = SimpleNamespace(run=execute)
     case.ctx.executor_factory = lambda name: executor
+    # #1169 (2026-10-31, test owner): every reviewer counts in the shared machine budget,
+    # so the panel gets a budget large enough for the concurrency these cases observe.
+    from datetime import UTC, datetime
+
+    from foragent import capacity
+    capacity.write_state(case.store, 9, datetime.now(UTC))
 
 
 def assert_panel(panel, count):

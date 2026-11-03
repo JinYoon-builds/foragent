@@ -29,7 +29,7 @@ def no_facts_processes(monkeypatch):
 
 
 def facts_case(tmp_path, monkeypatch):
-    from foragent import cli
+    from foragent import cli, resource_sample
     from foragent.state import StateStore
 
     case = offline_local_cli(tmp_path, monkeypatch)
@@ -37,6 +37,8 @@ def facts_case(tmp_path, monkeypatch):
         "repo: owner/repo\nlanguage: en\nskill_libraries: []\nnotify: none\ntest_slots: 4\n")
     case.clock = [NOW]
     case.store = StateStore(case.store.root, now=lambda: case.clock[0])
+    # Freeze the gate input as well as the clock; observations must not read host load.
+    resource_sample.record(case.store, ("normal", 0.1), NOW)
     monkeypatch.setattr(StateStore, "for_repo", classmethod(
         lambda cls, repo, **kw: cls(case.store.root, now=lambda: case.clock[0])))
 
@@ -361,7 +363,7 @@ def facts_without_plan(case, capsys, monkeypatch, *, human=False):
 def test_orch_facts_idle_resources_and_one_binding_constraint_without_a_throughput_goal(
     tmp_path, monkeypatch, capsys, kind, load, slot_count,
 ):
-    from foragent import capacity, scheduler
+    from foragent import capacity, resource_sample, scheduler
 
     case = facts_case(tmp_path, monkeypatch)
     with (case.root / ".foragent.yml").open("a", encoding="utf-8") as config:
@@ -377,6 +379,7 @@ def test_orch_facts_idle_resources_and_one_binding_constraint_without_a_throughp
     monkeypatch.setattr(capacity, "memory_pressure", lambda: "normal")
     monkeypatch.setattr(os, "cpu_count", lambda: 8)
     monkeypatch.setattr(os, "getloadavg", lambda: (8 * load, 8 * load, 8 * load))
+    resource_sample.record(case.store, ("normal", load), NOW)
     capacity.write_state(case.store, 4, NOW)
     capacity.update_test_slots(slot_count, NOW, pressure="normal", load_per_cpu=0)
 
@@ -413,7 +416,7 @@ def test_orch_facts_idle_resources_and_one_binding_constraint_without_a_throughp
     })
 
     result = facts_without_plan(case, capsys, monkeypatch)
-    assert samples, "Read the patched machine-load sensor, without launching a process"
+    assert samples == [], "Read the recorded gate sample instead of the live machine-load sensor"
     resources = result["resources"]
     machine = resources["machine"]
     assert machine["load_per_cpu"] == load and machine["memory_pressure"] == "normal"

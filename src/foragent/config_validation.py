@@ -8,9 +8,29 @@ from foragent import review_perspectives
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
+_SKILL_ENTRY = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:[:/][A-Za-z0-9_-][A-Za-z0-9_.-]*)*")
+
+
+def _validate_default_skills(table: Any) -> None:
+    from foragent.config import ConfigError, DEFAULT_SKILL_ROLES
+
+    if table is None:
+        return
+    if not isinstance(table, dict):
+        raise ConfigError(f"default_skills must map {', '.join(DEFAULT_SKILL_ROLES)} to lists of skill names")
+    for role, names in table.items():
+        if role not in DEFAULT_SKILL_ROLES:
+            raise ConfigError(f"unknown default_skills role: {role} (use {', '.join(DEFAULT_SKILL_ROLES)})")
+        if names is not None and (not isinstance(names, list) or any(
+            not isinstance(name, str) or not _SKILL_ENTRY.fullmatch(name) for name in names
+        )):
+            raise ConfigError(f"default_skills.{role} must be a list of skill names")
+
+
 def _validate(values: dict[str, Any]) -> None:
     from foragent.config import ConfigError, SKILL_ROLES, _EXECUTORS, _REVIEW_LEVELS, _hours
 
+    _validate_default_skills(values["default_skills"])
     if values["notify_filter"] not in ("decisions", "all"):
         raise ConfigError("notify_filter must be decisions or all")
     if type(values["notify_summary_hour"]) is not int or not 0 <= values["notify_summary_hour"] <= 23:
@@ -46,6 +66,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("interview must be ouroboros or native")
     if not isinstance(values["overlap_mode"], str) or values["overlap_mode"] not in {"measured", "fixed"}:
         raise ConfigError("overlap_mode must be measured or fixed")
+    if type(values["scheduled_roles"]) is not bool:
+        raise ConfigError("scheduled_roles must be a boolean")
     if type(values["codex_goal"]) is not bool:
         raise ConfigError("codex_goal must be a boolean")
     if not isinstance(values["review_level"], str) or values["review_level"] not in {
@@ -58,13 +80,13 @@ def _validate(values: dict[str, Any]) -> None:
     ):
         raise ConfigError("language must be a short language tag, such as en, ko, or ja")
     if not isinstance(values["review"], str) or values["review"] not in _REVIEW_LEVELS:
-        raise ConfigError("review must be fast, batch, or careful")
+        raise ConfigError("review must be fast or careful")
     paths = values["review_paths"]
     if not isinstance(paths, dict):
         raise ConfigError("review_paths must be a mapping")
     for path, review in paths.items():
         if not isinstance(path, str) or not isinstance(review, str) or review not in _REVIEW_LEVELS:
-            raise ConfigError(f"invalid review_paths entry: {path}")
+            raise ConfigError(f"invalid review_paths entry: {path} (review must be fast or careful)")
     listed = _validate_executors(values.get("executor_list"))
     for key in ("executor", "reviewer"):
         value = values[key]
@@ -86,8 +108,9 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
     if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
-    if type(values["merge_group_max"]) is not int or values["merge_group_max"] < 1:
-        raise ConfigError("merge_group_max must be a positive integer (1 turns merge groups off)")
+    maximum = values["merge_group_max"]
+    if maximum != "auto" and (type(maximum) is not int or maximum < 1):
+        raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
     review_perspectives.validate(values, ConfigError)
     from foragent.order_perspectives import SEATS
     seats = values["perspectives"]
@@ -100,6 +123,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("view_glyphs must be emoji, ascii, or auto")
     if type(values["animation"]) is not bool:
         raise ConfigError("animation must be true or false")
+    if type(values["review_pass_scope"]) is not bool:
+        raise ConfigError("review_pass_scope must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     presence = values["presence"]

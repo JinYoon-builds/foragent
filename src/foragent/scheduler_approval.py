@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from foragent import scheduler
-from foragent.state import Approval
+from foragent.state import Approval, Flag
 from foragent.tracker import Issue, LabelEvent
 
 if TYPE_CHECKING:
@@ -69,8 +69,33 @@ def _check_integrity(
     return False
 
 
+def _record_held_approval(
+    ctx: TickContext, issue: Issue, flag: Flag | None, base_ref: str, report: TickReport, *, confirmed: bool,
+) -> None:
+    """Save a re-approval given during a human or technical hold; the hold itself stays."""
+    if ctx._refresh_failed or scheduler.APPROVED not in issue.labels:
+        return
+    event, _ = scheduler._latest_approval(
+        scheduler._label_events(ctx, issue.number, confirmed=confirmed), ctx.config.approvers,
+    )
+    if event is None:
+        return
+    at = scheduler.datetime.fromisoformat(event.created_at)
+    if flag is not None and at <= scheduler.datetime.fromisoformat(flag.flagged_at):
+        return  # The approval the hold already saw is not a re-approval.
+    stored = ctx.store.load_approval(issue.number)
+    if stored is not None and stored.approved_at == event.created_at:
+        return
+    issue = ctx.tracker.get_issue(issue.number)
+    if issue.state != "open" or issue.is_pull_request or scheduler.APPROVED not in issue.labels:
+        return
+    if scheduler._snapshot(ctx, issue, event, base_ref, report, board_status=False) is not None:
+        report.actions.append(f"#{issue.number} re-approval recorded; hold kept")
+
+
 def _snapshot(
     ctx: TickContext, issue: Issue, event: LabelEvent, base_ref: str, report: TickReport,
+    *, board_status: bool = True,
 ) -> Approval | None:
     edited_at = ctx.tracker.body_last_edited_at(issue.number)
     if edited_at is not None and scheduler.datetime.fromisoformat(edited_at) >= scheduler.datetime.fromisoformat(event.created_at):
@@ -104,5 +129,6 @@ def _snapshot(
         issue.number, scheduler.format_approval_comment(approval.body_sha, blobs, event.actor, event.created_at),
     )
     report.actions.append(f"#{issue.number} approval snapshot saved")
-    scheduler.board.sync_status(ctx, issue, "Approved")
+    if board_status:
+        scheduler.board.sync_status(ctx, issue, "Approved")
     return approval

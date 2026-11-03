@@ -7,7 +7,7 @@ from datetime import date, datetime
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -19,12 +19,14 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+# The sessions `default_skills` assigns to; one role never falls back to another (#1619).
+DEFAULT_SKILL_ROLES = ("workers", "reviewers", "orchestrator", "architect", "docs")
 PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
 @dataclass(frozen=True)
 class Config:
-    review: str = "batch"
+    review: str = "fast"
     review_paths: dict[str, str] = field(default_factory=dict)
     always_human: list[str] = field(default_factory=list)
     executor: str = "codex"
@@ -48,6 +50,8 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Session role -> skills it receives; written by a person, read through session_skills (#1619).
+    default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
@@ -64,6 +68,7 @@ class Config:
     reviewer_model: str | None = None
     review_max: int = 2
     review_level: str = "low"
+    review_pass_scope: bool = True  # False restores full/confirmation review after a saved PASS.
     review_scope: str = "claude-local"
     review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
     review_reviewers: int = 1
@@ -81,6 +86,8 @@ class Config:
     # Personal push filter (#1030): all pushes every kind; decisions pushes only decision kinds.
     notify_filter: str = "all"
     run_hours: str = "always"
+    # D99: the architect, docs role and retrospective wake when an order finishes; false holds them.
+    scheduled_roles: bool = True
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
     # A live orchestrator silent this long pushes once per silence episode (#952); 0 turns the push off.
@@ -95,7 +102,7 @@ class Config:
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
-    merge_group_max: int = 4
+    merge_group_max: int | Literal["auto"] = "auto"
     base_branch: str = "main"
     repo: str | None = None
     board: str | None = None
@@ -156,7 +163,7 @@ DEFAULTS: dict[str, Any] = asdict(Config())
 IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours"})
 # Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
 FILE_KEYS = frozenset({"executors"})
-_REVIEW_LEVELS = {"fast", "batch", "careful"}
+_REVIEW_LEVELS = {"fast", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
 

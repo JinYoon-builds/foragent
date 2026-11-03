@@ -82,9 +82,6 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 | `review` | 머지 | 사람이 보는 것 |
 |---|---|---|
 | `fast` | CI + Done when 통과 시 main에 자동 머지 | 묶음 끝에 결과물을 써 보기만 |
-| `batch` | 묶음 브랜치에 자동 머지, 사람이 묶음째 main에 넣음 | 묶음 단위 검토 |
-
-**`batch`의 묶음 = order의 부모 이슈(Epic) 하나.** 묶음 브랜치는 `foragent/batch-<부모#>`. 자식 PR은 이 브랜치로 머지한다. 주의: GitHub는 기본 브랜치가 아닌 곳에 머지된 PR의 `Closes #N`으로 이슈를 닫지 않는다. 그래서 gate가 자식 이슈를 직접 닫고(“묶음 브랜치에 머지됨” 댓글), 자식이 모두 닫히면 묶음 브랜치 → main PR을 연다. 그 PR은 inspect의 "검토" 항목이 된다.
 | `careful` | PR만 열어 둠, 사람이 머지 | PR 하나씩 |
 
 검수 강도와 무관하게 **자동 머지하지 않고 needs-human으로 보내는 경우:**
@@ -95,7 +92,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 
 `review`는 저장소 단위 기본값에 경로별 덮어쓰기를 허용한다. 예: 한 저장소 안에서 `app/`은 fast, `pipeline/`은 careful.
 
-사용자가 많아질수록 진짜 안전장치는 사람의 PR 검토보다 배포 쪽 장치(기능 플래그, 단계적 배포, 빠른 롤백)다. 이건 gate 밖이지만, 이 장치가 있으면 `batch`를 유지할 수 있다.
+사용자가 많아질수록 진짜 안전장치는 사람의 PR 검토보다 배포 쪽 장치(기능 플래그, 단계적 배포, 빠른 롤백)다. 이건 gate 밖이지만, 이 장치가 있으면 `fast`를 유지할 수 있다.
 
 ## 7. 예외와 알림
 
@@ -115,7 +112,7 @@ gate는 **하네스가 아니라 스케줄러**다. 모델과 직접 대화하�
 `.foragent.yml` 수정은 커밋해서 기본 브랜치에 푸시해야 반영된다. gate tick은 fetch 뒤 `origin/<base>`의 파일을 읽는다(공유 checkout은 당기지 않는다). 그 파일이 없거나 잘못되면 로컬 파일을 쓰고 stderr에 한 줄 알린다.
 
 ```yaml
-review: batch            # fast | batch | careful
+review: fast             # fast | careful
 review_paths:            # 경로별 덮어쓰기 (선택)
   app/**: fast
   pipeline/**: careful
@@ -129,6 +126,7 @@ reviewer: claude         # codex | claude | none (기본 = executor와 다른 �
 reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
+review_pass_scope: true   # 같은 이슈 본문이면 PASS 뒤 리뷰는 PASS 뒤에 바뀐 코드(main에서 들어온 코드 포함)로만 막고, 안 바뀐 코드의 지적은 NOTE로 남김. false면 저장된 PASS가 있어도 예전 리뷰로 돌아감. 위험 지도 항목의 `pass_scope_exempt: true`(`fa risk add --pass-scope-exempt`)와 경로가 맞는 변경은 예전 범위를 유지
 review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 4개(goal-fidelity·concurrency·interruption-rollback·test-quality)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
 review_reviewers: 1      # 1 이상 정수; 동시에 도는 관점 리뷰어 수의 상한. 1이면 하나씩 차례로 돌고, 관점은 줄지 않음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
@@ -141,9 +139,15 @@ stall_minutes: 30
 max_runtime_minutes: 90
 max_retries: 2
 conflict_retries: 2       # 별도 충돌 해결 예산; 소진하면 최신 대상 브랜치에서 한 번 재구축
+merge_group_max: auto    # auto(기본값) | 양의 정수; 1이면 그룹 검증을 끔
+scheduled_roles: true    # 주문이 끝나면 아키텍트·문서 역할·회고를 깨움(D99); false면 보류
 ```
 
 init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 기존 파일에서는 명시한 옵션의 키가 없을 때만 추가하고, 이미 있는 값은 보존한다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).
+
+`merge_group_max`가 없거나 정확히 `auto`이면 이 저장소에 남아 있는 `group-check` 기록을 저널 순서대로 읽어 그룹 크기 한도를 계산한다. 4에서 시작하여 현재 한도 이상의 인원이 통과하면 1씩 올려 최대 8까지, 더 작은 그룹의 통과는 그대로 둔다. 실패하면 1씩 내려 최소 2까지이며, 한 명의 실패도 같은 규칙을 적용한다. 인프라 오류·시간 초과 등 `void` 결과는 그대로 둔다. 계산한 한도는 저장하지 않으며 로컬과 CI 그룹 모두 같은 한도를 쓴다. 양의 정수를 지정하면 기록과 무관하게 그 한도로 고정하고, 1이면 그룹을 끈다. `fa status --json`의 `merge_group`에서 `limit`과 `mode`(`auto` 또는 `fixed`)를 확인할 수 있다.
+
+`scheduled_roles`는 주문의 자식 이슈가 모두 머지되거나 닫혔을 때 아키텍트 검토, 문서 역할, 오케스트레이터 회고를 깨우는 스위치다(D99). 기본값은 `true`이고, `false`면 세 역할을 보류한다. 그 주문이 건드린 레인의 꿈은 이 스위치와 무관하게 지금 방식대로 돈다. 살아 있는 `fa orch` 계획 일시 정지(레인 하나라도), 쿼터 소진, 실행기 일시 정지, `run_hours` 밖, `--no-start` 틱도 깨우지 않는다. 역할 세션은 준비된 이슈와 꿈이 남긴 기계 자리만 쓰고, 자리가 없으면 차례로 남는다. 아키텍트는 새 머지나 실행 기록이 없으면 돌지 않고, 성공은 세션 시작 시점까지의 입력을 덮는다. 시작이나 세션이 실패하면 한 시간 뒤, 또는 그보다 늦은 실행기 리셋 뒤에 다시 시도한다. 회고는 인박스 요청 하나로 전달하고 기계 자리를 쓰지 않는다. `fa orch facts`의 `role_schedule`에서 차례, 보류 이유, 마지막 시도와 오류, 다음 재시도를 확인할 수 있다. 직접 부르는 `fa orch architect`와 `fa orch role`은 이 스위치와 무관하다.
 
 Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. Stop 훅은 승인 스냅샷의 Done when 명령을 저장소 루트에서 실행하며, 실패하면 최대 8회 종료를 막는다. 이 한도는 runner의 재시도 사이에도 유지된다. 세션이 끝나면 runner가 독립적으로 다시 검증한다.
 

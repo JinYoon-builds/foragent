@@ -5,7 +5,7 @@ Why: `docs/decisions.md` D18 and D20. Foragent must not re-implement what Claude
 ## 1. Claude implementer uses native `/goal`, a deny rule and a Stop hook
 When `executor == "claude"`:
 - Prompt passed on stdin starts with `/goal <condition>` where condition (≤ 3500 chars) is:
-  `Every command in the "Done when" list below exits 0 when run from the repository root, nothing under <acceptance_dir> is modified, and no files outside this repository are changed. Or stop after 40 turns.`
+  `Every command in the "Done when" list below exits 0 when run from the repository root, nothing under <acceptance_dir> is modified, and you did not edit files outside this repository. Files that test tooling writes outside the repository do not count as your edits. At 40 turns, end the run without repeating the stop check.`
   followed by a blank line and the existing implementer prompt (plan = snapshot Goal/Out of scope/Done when, rules, TRY.md rule). Remove from the prompt the sentence "Do not modify anything under <acceptance_dir>" (it is now enforced by structure, see below).
 - Run `claude -p --permission-mode auto --output-format stream-json --verbose --settings <file>` (+ `--model`), stdin = prompt, cwd = worktree. stdout (stream-json lines) appended to the issue log; `last_message` = the final `result` event's `result` field; `full_message` same. Any stream line counts as progress (update `last_progress_at` through the existing progress hook).
 - `--settings <file>` points to a per-run JSON written by the runner into `store.root/runs/issue-<n>/claude-settings.json` (outside the worktree) with:

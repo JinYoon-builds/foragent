@@ -312,9 +312,12 @@ def test_failed_resume_relaunch_is_admitted_again(tmp_path, monkeypatch):
         return ExecResult(exit_code=1, timed_out=False, log_path=kwargs["log_path"], session_id=None,
                           last_message="resume failed", log_tail="")
 
+    def limit_wait(n, context, detail, *, requeue):
+        assert requeue is True, "the implementer still requeues directly when its daily cap stops a relaunch"
+        raise ExecutorStopped("limit-wait", detail)
+
     monkeypatch.setattr(run_execution, "_run_executor", launch)
-    monkeypatch.setattr(run_execution, "_limit_wait", lambda n, context, detail: (_ for _ in ()).throw(
-        ExecutorStopped("limit-wait", detail)))
+    monkeypatch.setattr(run_execution, "_limit_wait", limit_wait)
     monkeypatch.setattr("foragent.runner._remaining", lambda n, context: 60)
     with pytest.raises(ExecutorStopped, match="daily cap"):
         run_execution._available_executor(1, ctx, object(), session_body="body", resume_prompt="go on",

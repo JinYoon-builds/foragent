@@ -120,23 +120,25 @@ def _alive(run: Run, now: datetime, alive: dict[int, bool]) -> bool:
 
 
 def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: dict[int, bool]) -> int:
-    """capacity.machine_runs without its signal probe: this store's runs and live sibling runs."""
-    numbers = {run.number for run in running}
-    count = len(running) + sum(1 for number, prepared in store.run_starts().items()
-                               if number not in numbers and capacity._within_grace(prepared, now))
+    """capacity.machine_runs without its signal probe: this store's runs, live sibling runs and live workloads."""
+
+    def slots(source: StateStore, counted: list[Run], runs: list[Run]) -> int:
+        numbers = {run.number for run in runs}
+        starts = [number for number, prepared in source.run_starts().items()
+                  if number not in numbers and capacity._within_grace(prepared, now)]
+        return len(counted) + len(starts) + orch_facts_machine.workload_slots(source.root, counted, starts, alive)
+
+    count = slots(store, [run for run in running if capacity.phase_holds_slot(run.phase)], running)
     try:
-        siblings = [root for root in store.root.parent.iterdir()
-                    if root != store.root and ((root / "runs").is_dir() or (root / "run-starts").is_dir())]
+        siblings = [root for root in store.root.parent.iterdir() if root != store.root and capacity._holds_anything(root)]
     except OSError:
         siblings = []
     for root in siblings:
         try:
             sibling = StateStore(root, now=lambda: now)
             runs = _still_running(sibling, sibling.active_runs())
-            running = {run.number for run in runs}
-            count += sum(_alive(run, now, alive) for run in runs) + sum(
-                1 for number, prepared in sibling.run_starts().items()
-                if number not in running and capacity._within_grace(prepared, now))
+            count += slots(sibling, [run for run in runs
+                                     if capacity.phase_holds_slot(run.phase) and _alive(run, now, alive)], runs)
         except (OSError, ValueError, TypeError, KeyError):
             continue
     return count
@@ -242,7 +244,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     work["idle_while_waiting"] = work["free_run_slots"] > 0 and "structure" in held
     # Executors the waiting work needs: startable waiting issues and runs waiting in flight.
     lanes = {item.lane for item in waiting if item.startable}
-    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait")}
+    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait", "run-slot-wait")}
     needed = set().union(*(lane_executors(config, lane) for lane in lanes)) if lanes else set()
     quota = _quota(store, now)
     for name, value in quota.items():
@@ -278,7 +280,7 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
                 "detail": f"load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}"}
     if "github" in held:
         return {"kind": "github", "normal": True,
-                "detail": f"GitHub rate limit until {work['github_wait_until']}; the tick starts nothing: "
+                "detail": f"GitHub pause until {work['github_wait_until']}; the tick starts nothing: "
                           + ", ".join(held["github"])}
     if "run_hours" in held:
         return {"kind": "run_hours", "normal": True,

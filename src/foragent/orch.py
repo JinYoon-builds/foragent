@@ -1,38 +1,40 @@
 """Orchestrator actions, with GitHub evidence and a local event journal."""
 
 from collections import deque
-from collections.abc import Iterable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import math
 import os
 from pathlib import Path
-import re
 import shlex
 from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_seat
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
-from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane
+from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
 from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
 from foragent.processes import claude_session, run_logged
-from foragent.records import load_record
+from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline import _baseline_exclusions, _capture_baseline, _premerge_baseline
-from foragent.run_checks import CheckResult, trusts_ci
-from foragent.run_previous import retry_marker
+from foragent.run_baseline import pending_acceptance_exclusions
+from foragent.run_checks import CheckResult, _passing_acceptance_ids, trusts_ci
+from foragent.run_checks_approved import acceptance_refusal, done_when_refusal
+from foragent.run_previous import add_hint, retry_marker
 from foragent.run_publish import retitle_for_merge
 from foragent.runner import RunContext, _pytest_command, junit_node_id, review_only
-from foragent.tracker import Comment, Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
+from foragent.state import Approval
+from foragent.tracker import Issue, PullRequest, RecordingTracker, TrackerError, pr_issue_number
 
 
 class OrchError(ValueError):
@@ -147,6 +149,7 @@ def _text(value: str, name: str) -> str:
 
 def _event(ctx: RunContext, n: int | None, kind: str, summary: str, *, issues: Iterable[int] = (),
            say: str | None = None) -> dict:
+    """Journal the verb and comment it on the issue."""
     event = append_event(ctx.store, ctx.now(), n, kind, summary, say)
     if ctx.store.github_wait_until(ctx.now()) is not None and not ctx.store.github_outbox():
         return event
@@ -160,14 +163,10 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     """Inspect blocked evidence and audit the lookup, as orch-verbs requires."""
     items = []
     for row in ctx.store.local_issues():
-        if row["state"] != "open" or BLOCKED not in row["labels"]:
+        if row.get("is_pull_request", False) or row["state"] != "open" or BLOCKED not in row["labels"]:
             continue
         issue = Issue(row["number"], row["title"], row["body"], frozenset(row["labels"]), row["state"])
-        comments = [load_record(Comment, item) for item in row["comments"]]
-        flags = [(comment, match[1]) for comment in comments
-                 if (match := re.fullmatch(r"<!-- foragent:blocked reason=([a-z-]+) -->",
-                                           comment.body.splitlines()[0] if comment.body else ""))]
-        latest = max(flags, key=lambda item: (datetime.fromisoformat(item[0].created_at), item[0].id), default=None)
+        latest = current_blocker(row, ctx.store.github_outbox())
         reviews = []
         for path in sorted((ctx.store.root / "runs" / f"issue-{issue.number}").glob("review-*.txt")):
             reviews.append({"path": str(path), "text": path.read_text(encoding="utf-8", errors="replace")})
@@ -178,20 +177,22 @@ def list_blocked(ctx: RunContext) -> list[dict]:
                 tail = "".join(deque(stream, maxlen=60))
         items.append({"number": issue.number, "title": issue.title, "lane": row["lane"],
                       "reason": latest[1] if latest else None,
-                      "blocked_at": latest[0].created_at if latest else None,
-                      "details": latest[0].body if latest else "",
+                      "blocked_at": latest[0]["created_at"] if latest else None,
+                      "details": latest[0]["body"] if latest else "",
                       "reviews": reviews, "log_path": str(log), "log_tail": tail})
     append_event(ctx.store, ctx.now(), None, "list", f"Listed {len(items)} blocked issues")
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
+def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-    path = ctx.store.root / "hints" / f"{n}.txt"
-    if hint is not None:
-        ctx.store._atomic_write(path, hint)
-    else:
-        path.unlink(missing_ok=True)
+    # Undelivered advice (an earlier hint or a talk message) is kept; only delivery removes it.
+    error = None
+    if hint:
+        # The public fact (or durable publication intent) must precede deliverable local advice.
+        error = orch_advice.publish(ctx.tracker, ctx, n,
+                                    "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
+        add_hint(ctx.store, n, hint)
     # The next implementer receives the keep-work/defect-class default before any hint.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
@@ -199,14 +200,17 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> None:
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
     tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN])
+    return error
 
 
 def retry(ctx: RunContext, n: int, hint: str | None = None, say: str | None = None) -> str:
     _issue(ctx, n)
-    _retry(ctx, n, hint)
+    publication_error = _retry(ctx, n, hint)
     summary = f"#{n}: queued implementation retry" + (f"; hint: {hint}" if hint else "")
     _event(ctx, n, "retry", summary, say=say)
     kick_tick(ctx.repo_root)
+    if publication_error:
+        return f"{summary} (issue comment queued for the gate after: {publication_error})"
     return summary
 
 
@@ -222,9 +226,11 @@ def rerun_review(ctx: RunContext, n: int, say: str | None = None) -> str:
 
 
 def resolve(ctx: RunContext, n: int, verdict: str, note: str, say: str | None = None) -> str:
-    _issue(ctx, n)
     if verdict not in {"pass", "fail"}:
         raise OrchError("verdict must be pass or fail")
+    if ctx.store.load_approval(n) is None:  # The gate alone writes approval records; resolve only reads.
+        raise OrchError(f"issue #{n} has no approval record (missing); re-approve it, then resolve again")
+    _issue(ctx, n)
     note = _text(note, "note")
     pr = ctx.tracker.find_pr(f"foragent/issue-{n}")
     if pr is None:
@@ -301,6 +307,8 @@ class _Premerge:
     head: str
     base: str
     report: dict
+    approved: tuple[Approval, str] | None = None
+    refused: str | None = None  # One line: the approved input this PR no longer honours.
 
 
 @dataclass(frozen=True)
@@ -350,6 +358,74 @@ def _run_suite(ctx: RunContext, n: int, command: str, worktree: Path, junit: Pat
     return _SuiteRun(passed, failing)
 
 
+def _protected_broken(ctx: RunContext, n: int, head: str, base: str, merged: bool, directory: Path,
+                      log_path: Path, slot: Callable[[], AbstractContextManager], wait,
+                      baseline=None) -> list[str]:
+    """#1105: the run baseline's passing acceptance tests that do not pass on the merge result.
+
+    The protected set is what implementation runs protect: the base's passing acceptance ids
+    from the shared baseline cache (or one capture), minus the current exclusions. It is
+    re-run with the runs' fixed invocation on a fresh merge result; a protected test that
+    fails, is skipped or is missing there is broken, and an unreadable report breaks them all.
+    The user's own command is never rewritten or replayed on the base.
+    """
+    from foragent.run_implementation import _detect_test_command_at
+
+    if baseline is None:  # The acceptance-only comparison may already hold this base's baseline.
+        test_command = ctx.config.test_command or _detect_test_command_at(ctx.git, base)
+        label = f"protected baseline base={base}"
+        baseline = _capture_baseline(
+            ctx, test_command, base, log=log_path, report=directory / "protected-baseline.xml",
+            check=lambda selection, root: _suite_process(ctx, n, selection, root, log_path, label, slot()),
+            prepare=lambda: None, wait=wait, required_ids=frozenset(),
+        )
+    if baseline is None:
+        return []
+    owned = set(_baseline_exclusions(ctx, base, log_path))  # Approvals may have changed since capture.
+    protected = sorted({node for node in baseline.node_ids if node.split("::", 1)[0] not in owned})
+    if not protected:
+        return []
+    worktree, junit = directory / "protected", directory / "protected.xml"
+    ctx.git.add_detached_worktree(worktree, head)
+    try:
+        if merged:
+            ctx.git.at(worktree)._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                        "merge", "--no-commit", "--no-ff", base])
+        # The protected tests' files, not their ids: a removed test id would make pytest reject the
+        # whole selection, so the report would lose every other protected result. A file the merge
+        # result no longer has leaves its ids absent from the report, which breaks them.
+        files = sorted({node.split("::", 1)[0] for node in protected
+                        if (worktree / node.split("::", 1)[0]).is_file()})
+        if files:
+            command = (f"{baseline.command} {shlex.join(files)} -o junit_family=legacy --junit-prefix= "
+                       f"--junitxml={shlex.quote(str(junit.resolve()))}")
+            _suite_process(ctx, n, command, worktree, log_path, f"protected baseline head={head}"
+                           + (f" merged with base={base}" if merged else ""), slot())
+    finally:
+        ctx.git.remove_worktree(worktree)
+    try:
+        passing = set(_passing_acceptance_ids(junit))
+    except (OSError, ET.ParseError):
+        passing = set()
+    return [node for node in protected if node not in passing]
+
+
+def _approved_inputs(ctx: RunContext, pr: PullRequest, base: str) -> tuple[Approval, str] | None:
+    """The approval of a linked issue's PR and the configured base SHA its locks must match.
+
+    Batch, dream and unlinked PRs carry no approval of their own; neither does an issue without a snapshot.
+    """
+    number = pr_issue_number(pr.head)
+    if number is None or pr.head.startswith("foragent/batch-"):
+        return None
+    if (approval := ctx.store.load_approval(number)) is None:
+        return None
+    if pr.base == ctx.config.base_branch:
+        return approval, base
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    return approval, ctx.git.ref_sha(f"refs/remotes/origin/{ctx.config.base_branch}")
+
+
 def _premerge(ctx: RunContext, n: int) -> _Premerge:
     pr = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
@@ -358,6 +434,10 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
     ctx.git._call(["fetch", "origin", head])
     base = ctx.git.ref_sha(f"refs/remotes/origin/{pr.base}")
     log_path = ctx.store.root / "runs" / f"premerge-pr-{n}.log"
+    approved = _approved_inputs(ctx, pr, base)
+    refused = None
+    if approved is not None:
+        refused = acceptance_refusal(ctx.git, approved[0], {"head": head, "base": approved[1]})
     waited_seconds = 0.0
 
     def wait(acquire):
@@ -407,12 +487,17 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 conflicts.extend(merge_conflicts)
                 probe._call(["merge", "--abort"])
                 merged = False
-            commands = ([ctx.config.test_command] if ctx.config.test_command is not None
+            if approved is not None and refused is None and merged:
+                # Conflicts have no merged tree to judge; the conflict refusal decides those.
+                refused = done_when_refusal(pr_issue_number(pr.head), ctx, approved[0], worktree, log_path, test_slot)
+            # A refused PR cannot merge whatever the suite says: free the merge lock early.
+            commands = ([] if refused else [ctx.config.test_command] if ctx.config.test_command is not None
                         else detect_test_commands(worktree))
-            if not commands:
+            if not commands and not refused:
                 raise OrchError("no full test command detected; set test_command in .foragent.yml")
             ci_units = trusts_ci(ctx.repo_root, ctx.config)
             excluded = _baseline_exclusions(ctx, base, log_path)
+            pending = set(pending_acceptance_exclusions(ctx, (base, head), log_path))
             label = f"head={head} merged with base={base}" if merged else f"head={head} (base merge conflicts)"
             runs = []
             for i, command in enumerate(commands):
@@ -421,7 +506,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 selection = command
                 if acceptance_only:
                     selection = f"{pytest_command} {shlex.quote(ctx.config.acceptance_dir)}"
-                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in excluded)
+                    selection += "".join(f" {shlex.quote('--ignore=' + name)}" for name in sorted(pending))
                 if acceptance_only and not (worktree / ctx.config.acceptance_dir).is_dir():
                     run = _SuiteRun(True, frozenset())
                 else:
@@ -430,7 +515,8 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 runs.append((command, run, acceptance_only))
         finally:
             ctx.git.remove_worktree(worktree)
-        tests = "pass"
+        tests = "not run" if refused else "pass"
+        captured = None
         for i, (command, run, acceptance_only) in enumerate(runs):
             if run.passed and not acceptance_only:
                 continue
@@ -438,7 +524,8 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                 tests = "fail"
                 continue
             # D53: failures the base already has do not block; any other failure does.
-            head_failing = run.failing or frozenset()
+            head_failing = frozenset(node for node in (run.failing or ())
+                                     if node.split("::", 1)[0] not in pending)
             base_failing = frozenset()
             if acceptance_only:
                 try:
@@ -454,6 +541,7 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
                     continue
                 if baseline is not None:
                     base_failing = frozenset(baseline.failing_ids)
+                    captured = captured or baseline
             else:
                 selection = command
                 if _pytest_command(command) is not None:
@@ -474,12 +562,24 @@ def _premerge(ctx: RunContext, n: int) -> _Premerge:
             failing_on_base.extend(sorted(head_failing & base_failing))
             if head_failing - base_failing:
                 tests = "fail"
+        # A previously passing acceptance test must keep passing on the merge result (#1105).
+        # A refused PR cannot merge whatever the tests say (#1559): no run, and the lock is freed early.
+        lost = []
+        try:
+            if not refused:
+                lost = _protected_broken(ctx, n, head, base, merged, Path(directory), log_path, test_slot, wait,
+                                         captured)
+        except AttemptFailure:
+            tests = "fail"  # No usable base baseline: the protected set cannot be shown to still pass.
+        if lost:
+            tests = "fail"
+        broken = sorted(set(broken) | set(lost))
     ci = ctx.tracker.pr_checks(n)
     report = {"pr": n, "tests": tests, "conflicts": conflicts, "ci": ci,
               "broken": broken, "failing_on_base": failing_on_base,
-              "waited_seconds": waited_seconds,
-              "ready": tests == "pass" and not conflicts and ci in {"pass", "none"}}
-    return _Premerge(pr, head, base, report)
+              "waited_seconds": waited_seconds, "approved_inputs": refused,
+              "ready": not refused and tests == "pass" and not conflicts and ci in {"pass", "none"}}
+    return _Premerge(pr, head, base, report, approved, refused)
 
 
 def premerge(ctx: RunContext, n: int) -> dict:
@@ -508,26 +608,34 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
         datetime.fromisoformat(at)
     except ValueError as exc:
         raise OrchError("at must be an ISO8601 timestamp") from exc
-    checked = _premerge(ctx, n)
-    report = checked.report
-    if not report["ready"]:
-        broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
-        raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
-                        f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
-    # A human merge takes the target's FIFO merge turn too (#712). The merge lock is held from the
-    # turn claim to the merge, so every freshness check below runs after any lock wait.
+    # Refuse a live holder before waiting on its merge lock or doing premerge work.
+    # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
+    head = ctx.tracker.pr_head_sha(n)
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
-    with ctx.store.merge_lock():
-        if (holder := merge_turn.claim(ctx, place, checked.head)) is not None:
-            raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
-                            "run again after it finishes")
-        try:
+    if (holder := merge_turn.claim(ctx, place, head)) is not None:
+        raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "
+                        "run again after it finishes")
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(ctx.store.merge_lock())
+            checked = _premerge(ctx, n)
+            report = checked.report
+            if checked.refused:
+                raise OrchError(f"PR #{n} is not ready: {checked.refused}")
+            if not report["ready"]:
+                broken = f" (broken: {', '.join(report['broken'])})" if report["broken"] else ""
+                raise OrchError(f"PR #{n} is not ready: tests {report['tests']}{broken}; "
+                                f"conflicts: {', '.join(report['conflicts']) or 'none'}; CI {report['ci']}")
+            # Premerge and its tests ran unlocked; main writers wait from this re-check to the merge.
+            from foragent import git as git_files
+            stack.enter_context(git_files.main_write_lock(ctx.git))
             current = _open_pr(ctx, n)
             ctx.git.fetch("origin", current.base)
             if (current.base != checked.pr.base or current.head != checked.pr.head
                     or ctx.git.ref_sha(f"refs/remotes/origin/{current.base}") != checked.base
-                    or ctx.tracker.pr_head_sha(n) != checked.head):
+                    or ctx.tracker.pr_head_sha(n) != checked.head
+                    or _approved_inputs(ctx, current, checked.base) != checked.approved):
                 raise OrchError(f"PR #{n} head or base changed during pre-merge; run again")
             if current.head.startswith("foragent/dream-"):
                 from foragent.orch_dream import memory_path, published_event, stale_for_redo
@@ -551,9 +659,10 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             RecordingTracker(ctx.tracker, ctx, queue_writes=True).comment(
                 n, f"Approved by {approved_by} in the orchestrator ({at}). "
                    f"Pre-merge: tests pass{_base_note(report)}, no conflicts, CI {ci}.")
+            from foragent.run_pr_body import merge_retitle_body
             subject = retitle_for_merge(
                 ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
-                body=lambda: current.body, note=print,
+                body=lambda: merge_retitle_body(current.head, ctx), note=print,
             )
             merge_turn.record_turn(ctx, place, checked.base, "merged")
             try:
@@ -561,9 +670,9 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise
-        except BaseException:
-            merge_turn.withdraw(ctx, place)
-            raise
+    except BaseException as exc:
+        merge_turn.withdraw(ctx, place, reason="manual-merge-failed", detail=merge_turn.stopped_detail(None, exc))
+        raise
     summary = (f"PR #{n}: merged {checked.head}; approved by {approved_by} at {at}; "
                f"tests pass{_base_note(report)}, no conflicts, CI {ci}")
     _event(ctx, None, "merge", summary)

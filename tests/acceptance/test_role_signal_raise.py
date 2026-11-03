@@ -1,4 +1,8 @@
-"""Acceptance test for role-signal-raise. Locked by Foragent; do not edit."""
+"""Acceptance test for role-signal-raise. Locked by Foragent; do not edit.
+
+The historical cooldown test name is retained for signal-meaningful-change
+(2026-11-01): a called signal needs new evidence, not elapsed time alone.
+"""
 
 from datetime import timedelta
 
@@ -79,16 +83,27 @@ def test_a_met_signal_raises_one_gate_request_with_its_numbers_and_never_reaches
 
 
 def test_an_answered_signal_waits_for_the_cooldown_while_it_stays_met(tmp_path, monkeypatch):
+    """Keep the historical name; time alone is not new evidence after called."""
     case = raise_case(tmp_path, monkeypatch, [{"paths": ["src/payment/**"], "kinds": []}])
     completed(case, 1, finished=NOW - timedelta(hours=1), paths=["src/payment/charge.py"])
     [first] = raise_at(case, NOW)
     case.clock[0] = NOW + timedelta(minutes=10)
-    # #1155 (2026-10-31): a not-now answer now stays quiet until the facts change; the cooldown
-    # is checked with a called answer.
     assert answer(case, first["id"], "called", "security reviewed it") == 0
     assert raise_at(case, NOW + timedelta(hours=11)) == [], "Still met inside the cooldown: stay quiet"
-    again = raise_at(case, NOW + COOLDOWN + timedelta(minutes=5))
-    assert len(again) == 1 and again[0]["role"] == "security", "After the default 12-hour cooldown, raise again"
+    assert raise_at(case, NOW + COOLDOWN + timedelta(minutes=5)) == [], (
+        "A called signal must stay quiet after the old cooldown when no new evidence appears"
+    )
+    assert len(signal_requests(case)) == 1
+    # A newly matching file is real evidence; rejecting a timer must not mute
+    # the path signal permanently. Both merged files remain inside 24 hours.
+    changed_at = NOW + COOLDOWN + timedelta(minutes=10)
+    completed(case, 2, finished=changed_at, paths=["src/payment/refund.py"])
+    [again] = raise_at(case, changed_at)
+    assert again["id"] != first["id"] and again["role"] == "security"
+    assert again["status"] != "done"
+    assert {row["id"] for row in signal_requests(case)} == {first["id"], again["id"]}
+    assert raise_at(case, changed_at + timedelta(minutes=5)) == [], "New evidence raises only once"
+    assert case.pushes == [] and case.gh == []
 
 
 def test_a_signal_that_clears_can_be_raised_again_inside_the_cooldown(tmp_path, monkeypatch):

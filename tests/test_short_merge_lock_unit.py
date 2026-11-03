@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from foragent import runner  # noqa: E402
 from conftest import git_command  # noqa: E402
-from runner_support import batch_setup, enable_reviewer, run_case  # noqa: E402,F401
+from runner_support import enable_reviewer, run_case  # noqa: E402,F401
 from test_short_merge_lock import (  # noqa: E402,F401
     assert_merge_facts, assert_short_holds, publish_case, run, short_case,
 )
@@ -24,12 +24,15 @@ from test_state_split import offline_acceptance  # noqa: E402,F401
 def test_base_already_moved_after_ci_is_refreshed_before_queuing(short_case):
     case = short_case
     original_heads = []
+    moved = []
 
     def ci(pr, head, poll):
         if not original_heads:
             assert case.holder is None
             original_heads.append(head)
-            case.history.update({"docs/before-queue.md": "Moved before requesting merge.lock\n"})
+            # A source move refreshes; a neutral one keeps the head (#1688).
+            case.history.update({"src/before_queue.py": "MOVED = True\n"})
+            moved.append(case.history.tip)
         return "pass"
 
     case.ci_status = ci
@@ -37,7 +40,7 @@ def test_base_already_moved_after_ci_is_refreshed_before_queuing(short_case):
     assert len(case.holds) == 1
     locked_reads = [row for row in case.events if row.kind == "ci" and row.holder is not None]
     assert len(locked_reads) == 1 and locked_reads[0].head != original_heads[0]
-    assert case.verifications == [case.base_sha]
+    assert case.verifications == [case.base_sha, moved[0]]
     assert_short_holds(case)
     assert_merge_facts(case)
 
@@ -58,7 +61,7 @@ def test_ci_limits_and_registration_grace_restart_for_each_pushed_head(short_cas
 
     def move_once():
         if not moved:
-            case.history.update({"docs/late.md": "Neutral update\n"})
+            case.history.update({"src/late.py": "LATE = True\n"})  # a source move pushes a new head
             moved.append(case.history.tip)
 
     def ci(pr, head, poll):
@@ -72,7 +75,7 @@ def test_ci_limits_and_registration_grace_restart_for_each_pushed_head(short_cas
     case.ci_status = ci
     assert run(case) == "merged"
     assert sorted(case.poll_counts.values()) == [8, 42]
-    assert case.verifications == [case.base_sha]
+    assert case.verifications == [case.base_sha, moved[0]]
     assert_short_holds(case)
     assert_merge_facts(case)
 
@@ -93,8 +96,10 @@ def test_final_conflict_is_resolved_outside_the_lock(short_case):
 
     case.before_lock = move_once
     case.implementer.steps.append(resolve)
+    case.reviewer.steps.append(case.review)  # A resolution after a PASS gets one review of that later change.
     assert run(case) == "merged"
     assert len(case.implementer.calls) == 2
+    assert len(case.reviewer.calls) == 2
     assert len(case.holds) == 2
     assert_short_holds(case)
     assert_merge_facts(case)
@@ -106,7 +111,7 @@ def test_unmerged_run_keeps_both_durations_null(short_case):
 
     def move_once():
         if not moved:
-            case.history.update({"docs/late.md": "Neutral update\n"})
+            case.history.update({"src/late.py": "LATE = True\n"})  # a source move pushes a new head
             moved.append(case.history.tip)
 
     first = []
@@ -224,40 +229,6 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
         assert verified == [head]
 
 
-def test_batch_child_uses_short_lock_and_records_hold_without_reviewer_pass(run_case, monkeypatch):
-    case = run_case
-    batch_setup(case)
-    held = []
-    lock = case.store.merge_lock
-    merge = case.tracker.merge_pr
-
-    @contextmanager
-    def observed_lock():
-        with lock():
-            held.append(True)
-            try:
-                yield
-            finally:
-                held.pop()
-
-    def checks(pr):
-        return "pass"
-
-    def merge_pr(pr, **kwargs):
-        assert held
-        case.now[0] += timedelta(seconds=3)
-        merge(pr, **kwargs)
-
-    monkeypatch.setattr(case.store, "merge_lock", observed_lock)
-    monkeypatch.setattr(case.tracker, "pr_checks", checks)
-    monkeypatch.setattr(case.tracker, "merge_pr", merge_pr)
-    assert runner.run_issue(1, case.ctx) == "merged"
-    record = case.store.get_run(1)
-    assert record.last_review_pass_at is None
-    assert record.review_pass_to_merge_seconds is None
-    assert record.merge_lock_held_seconds == 3
-
-
 def test_ci_repair_latency_uses_the_last_reviewer_pass(run_case, monkeypatch):
     case = run_case
     case.executor.steps.append({})
@@ -294,7 +265,7 @@ def test_lock_hold_includes_bookkeeping_after_acquisition(tmp_path, monkeypatch)
     clock = [BASE_TIME]
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     store.start_run(1, branch="branch", worktree="worktree")
-    ctx = SimpleNamespace(store=store, now=lambda: clock[0])
+    ctx = SimpleNamespace(store=store, now=lambda: clock[0], git=SimpleNamespace(root=tmp_path / "checkout"))
 
     def credited_wait(number, context, acquire, phase, **options):
         acquire()
@@ -307,22 +278,17 @@ def test_lock_hold_includes_bookkeeping_after_acquisition(tmp_path, monkeypatch)
     assert store.get_run(1).merge_lock_held_seconds == 5
 
 
-@pytest.mark.parametrize("path", ["implementation", "review-only", "batch"])
+@pytest.mark.parametrize("path", ["implementation", "review-only"])
 def test_merge_finalization_stays_inside_the_final_lock(run_case, monkeypatch, path):
-    from foragent import run_publish
-
     case = run_case
     if path == "review-only":
         case.ctx.config = replace(case.ctx.config, review="careful")
         assert runner.run_issue(1, case.ctx) == "pr-open"
         case.ctx.config = replace(case.ctx.config, review="fast")
         case.now[0] += timedelta(seconds=1)
-    elif path == "batch":
-        batch_setup(case)
     held, events = [], []
     lock = case.store.merge_lock
     close = case.tracker.close_issue
-    batch_pr = run_publish._batch_pr
 
     @contextmanager
     def observed_lock():
@@ -342,17 +308,11 @@ def test_merge_finalization_stays_inside_the_final_lock(run_case, monkeypatch, p
         events.append("close")
         return close(*args)
 
-    def finalize_batch(*args):
-        assert held
-        events.append("batch")
-        return batch_pr(*args)
-
     monkeypatch.setattr(case.store, "merge_lock", observed_lock)
     monkeypatch.setattr(runner, "after_merge", after_merge)
     monkeypatch.setattr(case.tracker, "close_issue", close_issue)
-    monkeypatch.setattr(run_publish, "_batch_pr", finalize_batch)
     outcome = (runner.review_only(1, case.ctx, verdict_head=case.tracker.pr_head_sha(2))
                if path == "review-only" else runner.run_issue(1, case.ctx))
     assert outcome == "merged"
-    assert events == (["close", "batch"] if path == "batch" else ["reinstall", "close"])
+    assert events == ["reinstall", "close"]
     assert not held

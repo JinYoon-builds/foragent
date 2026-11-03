@@ -110,6 +110,45 @@ def test_flag_and_joined_event_read_the_same_structure(tmp_path, source):
     assert flag["signature"] == event["signature"] and "KeyError" in flag["title"]
 
 
+@pytest.mark.parametrize("source", ["flag:1", "event:1"])
+@pytest.mark.parametrize("labels", [[], ["blocked"], ["needs-human"]], ids=["unblocked", "blocked", "human"])
+def test_historical_report_reads_saved_error_not_the_current_blocker(tmp_path, source, labels):
+    from foragent.orch_events import append_event
+
+    store = store_at(tmp_path)
+    trace = (HEADER + frame(f"{PACKAGE}/runner.py", "run_issue")
+             + '    raise ValueError("KeyError: missing")\nValueError: private original\n')
+    # Preserve the pre-classification wire shape: no local_only field on the saved error.
+    store.save_flag(1, trace, local_only=False)
+    store.update_local_issue(1, title="Work", labels=labels, state="open")
+    if labels:
+        store.record_comments(1, [{"id": 1, "author": "bot", "created_at": store._now().isoformat(),
+                                  "body": f"<!-- foragent:{labels[0]} reason=spec-question -->\nChoose"}])
+        assert store.load_flag(1).reason == "spec-question"
+    else:
+        assert store.load_flag(1) is None
+    append_event(store, store._now(), 1, "error", trace)
+
+    report = upstream_report.propose(store, source, [])
+    assert "ValueError" in report["title"] and "foragent/runner.py" in report["body"]
+    assert "private original" not in report["body"] and "KeyError" not in report["title"]
+    assert store.load_local_flag(1).reason == trace
+    assert next(row for row in store.local_issues() if row["number"] == 1)["labels"] == labels
+
+
+def test_report_of_a_finished_failure_survives_issue_unblocking(tmp_path):
+    store = store_at(tmp_path)
+    store.start_run(3, branch="b", worktree=tmp_path / "w")
+    runner_crash(store, 3)
+    store.finish_run(3, "blocked")
+    store.update_local_issue(3, title="Work", labels=["approved"], state="open")
+    assert store.load_flag(3) is None
+
+    report = upstream_report.propose(store, "flag:3", [])
+    assert "KeyError" in report["title"] and "foragent/runner.py" in report["body"]
+    assert store.load_flag(3) is None
+
+
 def test_joined_event_without_its_original_is_read_only_when_unambiguous(tmp_path):
     from foragent.orch_events import append_event
 
@@ -385,15 +424,18 @@ def test_send_failure_prints_in_the_repository_language(tmp_path, monkeypatch, c
     (repo / ".foragent.yml").write_text("language: ko\nrepo: owner/repo\n", encoding="utf-8")
     store, report = prepared(tmp_path)
     monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo, **kw: store))
+    searches = []
 
     class Broken:
         def __init__(self, repo):
             pass
 
         def search_issues(self, query):
+            searches.append(query)
             raise TrackerError("invalid search response: expected an object")
 
     monkeypatch.setattr(cli, "GhTracker", Broken)
     assert cli.main(["report", "send", report["id"], "--yes", "--repo-root", str(repo)]) == 1
     err = capsys.readouterr().err
+    assert len(searches) == 1
     assert "GitHub 요청을 끝내지 못했어요" in err

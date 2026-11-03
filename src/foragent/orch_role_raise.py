@@ -7,7 +7,11 @@ check `fa orch roles` uses and, for each met signal, appends one ordinary inbox 
 
 Writers: the tick is the only writer of raised requests and of ``role-signal-clear``
 events; `fa orch signal-answer` is the only writer of ``role-signal-answer`` events.
-Raise times come from the inbox records themselves; nothing else is stored.
+Raise times and the facts each raise saw (``facts`` on the request) come from the inbox
+records themselves, so a gate restart keeps the same rule (#1155). The re-raise decision reads
+only the request record, never the 30-day journal: `fa orch signal-answer` sets ``answer`` in the
+same locked step that marks the request done, and the tick sets ``cleared_at`` on the request
+when its signal goes unmet (it also appends the ``role-signal-clear`` event for the record).
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_inbox, orch_roles
+from foragent import orch_events, orch_facts_kinds, orch_inbox, orch_roles
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -94,38 +98,111 @@ def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], n
             f"--why ...`, or answer `not-now --why <reason>`.")
 
 
+def fingerprint(signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any],
+                binding: dict[str, Any] | None) -> dict[str, Any]:
+    """The facts a signal is about, never the observation time (#1155).
+
+    The matched files of its paths and, for each met kind, that kind's facts numbers plus the
+    shared facts it is about (``orch_facts_kinds.SHARED_FACTS``): for the binding constraint,
+    only its kind and whether it is normal (its detail text churns). A kind never carries
+    another kind's facts, so a change elsewhere leaves a not-now signal quiet.
+    """
+    shared = {"binding": binding and {"kind": binding.get("kind"), "normal": binding.get("normal")}}
+    facts: dict[str, Any] = {}
+    if signal.get("paths"):
+        facts["files"] = sorted(orch_roles.matching_files(signal, files))
+    if signal.get("kinds"):
+        facts["kinds"] = {kind: {"numbers": numbers.get(kind),
+                                 **{name: shared[name] for name in orch_facts_kinds.SHARED_FACTS.get(kind, ())}}
+                          for kind in signal["kinds"] if kind in kinds}
+    return json.loads(json.dumps(facts, sort_keys=True, default=str))
+
+
+def _same(left: Any, right: Any) -> bool:
+    return json.dumps(left, sort_keys=True, default=str) == json.dumps(right, sort_keys=True, default=str)
+
+
+def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
+    """Project raw request facts into affected entities and relevant constraints.
+
+    This also reads pre-upgrade fingerprints, without changing persisted records.
+    Unprojected kinds (including lane_concentration) retain their raw numbers.
+    """
+    result: dict[tuple[str, ...], Any] = {}
+    if "files" in facts:
+        result[("files",)] = frozenset(facts["files"])
+    for kind, item in facts.get("kinds", {}).items():
+        numbers = item.get("numbers") or {}
+        result[(kind,)] = True
+        if kind in orch_facts_kinds.ENTITY_FACTS:
+            for field in orch_facts_kinds.ENTITY_FACTS[kind]:
+                result[(kind, field)] = frozenset(numbers.get(field) or ())
+            for field in orch_facts_kinds.VALUE_FACTS.get(kind, ()):
+                result[(kind, field)] = numbers.get(field)
+        else:
+            result[(kind, "numbers")] = numbers
+        for field in orch_facts_kinds.SHARED_FACTS.get(kind, ()):
+            result[(kind, field)] = item.get(field)
+    return result
+
+
+def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Shrinking sets stay quiet; compare every tick against the last raise."""
+    before = evidence(previous)
+    for key, value in evidence(current).items():
+        if key not in before:
+            return True
+        if isinstance(value, frozenset):
+            if value - before[key]:
+                return True
+        elif not _same(before[key], value):
+            return True
+    return False
+
+
 def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[str, Any]]:
     """Raise every met role signal that is due; return the inbox requests added.
 
     A signal (role plus its {paths, kinds} item) is never raised while an earlier request
-    for it is not done. After an answer, it is raised again when a tick saw it unmet since
-    that raise, or when the cooldown passed since that raise.
+    for it is not done. Once that request is done, it is raised again when a tick saw it unmet
+    since that raise, or its facts contain new evidence beyond the last raise, regardless
+    of its answer. Time alone is not evidence. Only legacy requests without stored facts
+    use the cooldown.
     """
     if not (Path(repo_root) / ".foragent.yml").is_file():
         return []  # Not a Foragent repository: no roles source, nothing to measure.
     config = load_config(Path(repo_root))
     roles = load_roles(config)
-    files, kinds, numbers = orch_roles.observe(store, config, Path(repo_root), roles)
+    files, kinds, numbers, binding = orch_roles.observe(store, config, Path(repo_root), roles)
     last: dict[str, dict[str, Any]] = {}
     for row in signal_requests(store):
         last[_key(row["role"], row["signal"])] = row
-    clears, wait, added = _clears(store), cooldown(repo_root), []
+    clears, added = _clears(store), []
     for name, entry in roles.items():
         for signal in entry["signals"]:
             key, previous = _key(name, signal), last.get(_key(name, signal))
             raised_at = _time(previous.get("created_at")) if previous else None
-            cleared = raised_at is not None and any(at > raised_at for at in clears.get(key, []))
+            cleared = previous is not None and (bool(previous.get("cleared_at")) or (
+                raised_at is not None and any(at > raised_at for at in clears.get(key, []))))
             if not orch_roles.signal_met(signal, files, kinds):
                 if previous is not None and not cleared:
+                    last[key] = orch_inbox.annotate_request(store, previous["id"], {"cleared_at": now.isoformat()})
                     orch_events.append_event(store, now, None, CLEAR, f"{name}: signal cleared",
                                              role=name, signal=source(signal))
-                    clears.setdefault(key, []).append(now)  # A repeated identical signal clears once.
+                    # A repeated identical signal sees the cleared request and clears once.
                 continue
-            if previous is not None and (previous.get("status") != "done"
-                                         or not (cleared or raised_at is None or now - raised_at >= wait)):
-                continue
+            facts = fingerprint(signal, files, kinds, numbers, binding)
+            if previous is not None:
+                if previous.get("status") != "done":
+                    continue
+                if "facts" in previous:
+                    due = cleared or new_evidence(previous["facts"], facts)
+                else:
+                    due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
+                if not due:
+                    continue
             last[key] = orch_inbox.add_request(store, "gate", _text(name, signal, files, kinds, numbers),
-                                               {"role": name, "signal": source(signal)})
+                                               {"role": name, "signal": source(signal), "facts": facts})
             added.append(last[key])  # A repeated identical signal sees this open request.
     return added
 
@@ -158,6 +235,7 @@ def answer(store: StateStore, request_id: str, how: str, why: str) -> dict[str, 
             raise orch_inbox.InboxError(f"request {request_id} is not a role signal")
         if record.get("status") == "done":
             raise orch_inbox.InboxError(f"request {request_id} is already done")
+        record["answer"] = how  # Set with the done mark, so a tick never sees done without it.
 
     record = orch_inbox.set_request_status(store, request_id, "done",
                                            f"role signal {how}: {why}" if why else f"role signal {how}",

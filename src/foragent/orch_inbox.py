@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -199,14 +200,39 @@ def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
-                       check=None) -> dict[str, Any]:
-    """Set one request's status; ``check(record)`` runs inside the same state lock and may raise InboxError."""
+                       check=None, *, answer: str | None = None, require_answer: bool = False,
+                       empty_answer_reason: str | None = None) -> dict[str, Any]:
+    """Set status and optional answer atomically; ``check(record)`` runs under the same lock.
+
+    CLI completion requires an answer or explicit empty reason; signals use their own check hook.
+    """
     if status not in REQUEST_STATUSES:
         raise InboxError(f"status must be one of: {', '.join(REQUEST_STATUSES)}")
 
+    has_answer = bool(answer and answer.strip())
+    has_reason = bool(empty_answer_reason and empty_answer_reason.strip())
+    if require_answer and answer is not None and not has_answer:
+        raise InboxError("closing a request needs a non-empty --answer")
+
     def change(record: dict[str, Any]) -> None:
+        if require_answer and (status == "done" or answer is not None):
+            from foragent.orch_role_raise import is_signal_request
+
+            if is_signal_request(record):
+                raise InboxError("close role signals with fa orch signal-answer")
         if check is not None:
             check(record)
+        stored_answer = record.get("answer")
+        has_stored_answer = isinstance(stored_answer, str) and bool(stored_answer.strip())
+        if status == "done" and require_answer and not (has_answer or has_stored_answer or has_reason):
+            raise InboxError("closing a request needs a non-empty --answer")
+        if answer is not None:
+            record["answer"] = answer
+            record.pop("empty_answer_reason", None)
+        elif status == "done" and has_stored_answer:
+            record.pop("empty_answer_reason", None)
+        elif status == "done" and has_reason:
+            record.setdefault("empty_answer_reason", empty_answer_reason)
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})
@@ -215,6 +241,11 @@ def set_request_status(store: StateStore, request_id: str, status: str, note: st
     append_event(store, store._now(), None, "request-status",
                  f"{request_id} {status}" + (f": {note}" if note else ""))
     return _public(record)
+
+
+def annotate_request(store: StateStore, request_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+    """Set ``fields`` on one request under the state lock; its status and notes stay as they are."""
+    return _public(_update(store, "requests", request_id, lambda record: record.update(fields)))
 
 
 def ask(store: StateStore, question: str, options: list[str], recommend: int | None,
@@ -490,14 +521,31 @@ def note_location(environ: dict[str, str], title: str | None = None,
     return {"kind": "terminal"}
 
 
-def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
-               where: dict[str, Any]) -> dict[str, Any]:
-    """Overwrite the orchestrator's latest note: what it does, why, what next, where."""
+def require_note_text(now: str) -> None:
     if not now.strip():
         raise InboxError("--now must not be empty")
+
+
+def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
+               where: dict[str, Any], *, retrospective: bool = False) -> dict[str, Any]:
+    """Replace the latest note, journal a response for each issue it names, and append its ``note`` event.
+
+    The latest note is a projection for the screens; the events are the history. Only
+    ``retrospective`` marks a note as a finished retrospective, and an unmarked note never
+    changes one. The event is the last write, so a failed note leaves no event behind.
+    """
+    require_note_text(now)
     record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
     store.root.mkdir(parents=True, exist_ok=True)
-    store._write_json(note_path(store), record)
+    summary = "\n".join(text for text in (now, why, next_step) if text)
+    with store._state_lock():
+        store._write_json(note_path(store), record)
+        for number in sorted({int(n) for n in re.findall(r"#(\d+)", summary)}):
+            append_event(store, datetime.fromisoformat(record["at"]), number, "acknowledged", summary,
+                         locked=True)
+        marked = {"retrospective": True} if retrospective else {}
+        append_event(store, datetime.fromisoformat(record["at"]), None, "note", now, locked=True,
+                     now=now, why=why, next=next_step, where=where, **marked)
     return record
 
 

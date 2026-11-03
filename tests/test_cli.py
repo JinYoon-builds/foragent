@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 import json
+from contextlib import contextmanager
 import os
 import subprocess
 import sys
@@ -269,7 +270,8 @@ def test_cli_dispatches_to_runner_and_returns_failure_code(app, monkeypatch, out
     def runner(number, ctx):
         calls.append(number)
         assert ctx.repo_root == root and ctx.git is git and ctx.tracker._tracker is tracker
-        assert ctx.store is store and store.get_run(number).pid == os.getpid()
+        # The pid is the runner's to claim after admission (#993), not the dispatcher's.
+        assert ctx.store is store and store.get_run(number).pid is None
         return outcome
 
     monkeypatch.setattr(cli, "run_issue", runner)
@@ -366,14 +368,23 @@ def test_init_cli_keeps_explicit_default_options(tmp_path, monkeypatch):
 
     def init(root, **kwargs):
         assert kwargs["executor"] == "codex" and kwargs["run_hours"] == "always"
-        assert kwargs["review"] == "batch" and kwargs["approvers"] == ["human"]
+        assert kwargs["review"] == "fast" and kwargs["approvers"] == ["human"]
         return InitReport([], [], False)
 
     monkeypatch.setattr(cli, "init_repo", init)
     assert cli.main([
         "init", "--repo-root", str(tmp_path), "--executor", "codex", "--run-hours", "always",
-        "--review", "batch", "--approver", "human",
+        "--review", "fast", "--approver", "human",
     ]) == 0
+
+
+def test_init_cli_rejects_batch_review(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "init_repo", lambda *a, **kw: pytest.fail("init must not run"))
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["init", "--repo-root", str(tmp_path), "--review", "batch"])
+    assert raised.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice: 'batch'" in err and "fast, careful" in err
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
@@ -936,3 +947,78 @@ def test_gate_commands_count_gh_calls_outside_a_tick_in_the_repo_store(app, caps
     capsys.readouterr()
     gh.count_call()  # e.g. a live status refresh or update check after the command starts
     assert [row["calls"] for row in store.github_calls()] == [1]
+
+
+def test_run_dream_is_admitted_before_it_claims_the_dream_pid(app, monkeypatch):
+    """A dream record whose pid has died is no reservation: admission comes first (#993)."""
+    root, git, tracker, store, _ = app
+    store.start_dream("main", worktree=store.root / "worktrees/dream-main")
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    store.update_run("dream-main", pid=dead.pid, process_identities=[])
+    order = []
+
+    @contextmanager
+    def hold(*args, **kwargs):
+        order.append(("admitted", kwargs.get("kind"), store.get_dream("main").pid))
+        yield
+
+    def run_dream(lane, ctx):
+        order.append(("work", lane, store.get_dream(lane).pid))
+        return 0
+
+    monkeypatch.setattr(cli.capacity, "hold_workload", hold)
+    monkeypatch.setattr(cli.orch_dream, "run_dream", run_dream)
+    assert cli.main(["gate", "run-dream", "main", "--repo-root", str(root)]) == 0
+    assert order == [("admitted", "dream", dead.pid), ("work", "main", os.getpid())]
+
+
+@pytest.mark.parametrize("record", ["admitted", "dead-pid"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_dream_workload_reuses_its_run_slot_and_releases_on_exit(app, monkeypatch, record, interrupted):
+    """The live dream record and its workload occupy one real shared slot (#993)."""
+    from foragent import capacity, capacity_sessions
+
+    root, _, _, store, _ = app
+    store.start_dream("main", worktree=store.root / "worktrees/dream-main")
+    if record == "admitted":
+        pid = os.getpid()
+    else:
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        pid = dead.pid
+    store.update_run("dream-main", pid=pid, process_identities=[])
+    monkeypatch.setattr(capacity, "machine_root", lambda: store.root.parent)
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.0))
+    monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+    capacity.write_state(store, 1, NOW)
+    hold = capacity.hold_workload
+    # A broken reuse rule must fail immediately rather than waiting for the run's timeout.
+    monkeypatch.setattr(capacity, "hold_workload", lambda *a, **kw: hold(*a, **{**kw, "wait_s": 0}))
+    calls = []
+
+    def dream(lane, ctx):
+        calls.append(lane)
+        try:
+            workloads = capacity_sessions.read(store.root)
+            assert len(workloads) == 1, "the dream must keep its admission until it exits"
+            assert (workloads[0].kind, workloads[0].role) == ("dream", "main")
+            assert ctx.store.get_dream(lane).pid == os.getpid()
+            assert capacity.machine_runs(store, NOW) == 1, "the dream was counted twice"
+            if interrupted:
+                raise KeyboardInterrupt
+            return 0
+        finally:
+            # The worker owns finishing its run, including interrupted exits.
+            store.finish_dream(lane, "killed" if interrupted else "done")
+
+    monkeypatch.setattr(cli.orch_dream, "run_dream", dream)
+    command = ["gate", "run-dream", "main", "--repo-root", str(root)]
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            cli.main(command)
+    else:
+        assert cli.main(command) == 0
+    assert calls == ["main"]
+    assert capacity_sessions.read(store.root) == []
+    assert capacity.machine_runs(store, NOW) == 0

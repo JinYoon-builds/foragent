@@ -50,7 +50,8 @@ class FakeProjects:
             project = self.projects[data["projectId"]]
             if any(field["name"] == data["name"] for field in project["fields"].values()):
                 raise TrackerError(f"duplicate board field: {data['name']}")
-            field = self._field(data["name"], data["singleSelectOptions"])
+            field = ({"id": self._id("PVTF"), "name": data["name"], "dataType": "TEXT"}
+                     if data["dataType"] == "TEXT" else self._field(data["name"], data["singleSelectOptions"]))
             project["fields"][field["id"]] = field
             result = {"createProjectV2Field": {"projectV2Field": field}}
         elif operation == "ForagentUpdateBoardField":
@@ -65,7 +66,8 @@ class FakeProjects:
             result = {"updateProjectV2Field": {"projectV2Field": field}}
         elif operation == "ForagentBoardIssue":
             number = variables["number"]
-            tracker.get_issue(number)
+            if number not in tracker.issues:
+                tracker.get_issue(number)  # A board read of a missing issue fails, without counting as an issue read.
             content_id = f"I_{variables['owner']}/{variables['name']}#{number}"
             items = []
             for project in self.projects.values():
@@ -91,8 +93,14 @@ class FakeProjects:
                     repository, _, number = item["contentId"].removeprefix("I_").rpartition("#")
                     option = next((option for option in status["options"]
                                    if option["id"] == item["values"].get(status["id"])), None) if status else None
-                    items.append({"content": {"number": int(number), "repository": {"nameWithOwner": repository}},
-                                  "fieldValueByName": {"name": option["name"]} if option else None})
+                    items.append({"id": item["id"],
+                                  "content": {"number": int(number), "repository": {"nameWithOwner": repository}},
+                                  "fieldValueByName": {"name": option["name"]} if option else None,
+                                  "fieldValues": self._connection([
+                                      {"text": item["values"][field["id"]], "field": {"name": field["name"]}}
+                                      for field in project["fields"].values()
+                                      if field.get("dataType") == "TEXT" and field["id"] in item["values"]
+                                  ])})
                 node = {"items": self._connection(items, variables.get("cursor"))}
             result = {"node": node}
         elif operation == "ForagentAddBoardItem":
@@ -104,13 +112,22 @@ class FakeProjects:
             result = {"addProjectV2ItemById": {"item": {"id": item["id"]}}}
         elif operation == "ForagentSetBoardValue":
             project = self.projects[data["projectId"]]
+            if data["itemId"] not in project["items"]:  # GitHub rejects a write to a removed card.
+                raise TrackerError(f"Could not resolve to a node with the global id of {data['itemId']}", returncode=1)
             item = project["items"][data["itemId"]]
             field = project["fields"][data["fieldId"]]
-            option_id = data["value"]["singleSelectOptionId"]
-            if not any(option["id"] == option_id for option in field["options"]):
-                raise TrackerError(f"unknown board option: {option_id}")
-            item["values"][field["id"]] = option_id
+            if field.get("dataType") == "TEXT":
+                item["values"][field["id"]] = data["value"]["text"]
+            else:
+                option_id = data["value"]["singleSelectOptionId"]
+                if not any(option["id"] == option_id for option in field["options"]):
+                    raise TrackerError(f"unknown board option: {option_id}", returncode=1)
+                item["values"][field["id"]] = option_id
             result = {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}
+        elif operation == "ForagentClearBoardValue":
+            item = self.projects[data["projectId"]]["items"][data["itemId"]]
+            item["values"].pop(data["fieldId"], None)
+            result = {"clearProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}
         elif "node" in query and "ProjectV2" in query:
             project = self.projects.get(variables["id"])
             node = None
@@ -120,6 +137,9 @@ class FakeProjects:
                     values = []
                     for field_id, option_id in item["values"].items():
                         field = project["fields"][field_id]
+                        if field.get("dataType") == "TEXT":
+                            values.append({"text": option_id, "field": {"name": field["name"]}})
+                            continue
                         option = next(option for option in field["options"] if option["id"] == option_id)
                         values.append({"name": option["name"], "field": {"name": field["name"]}})
                     items.append({"id": item["id"], "content": {"number": int(item["contentId"].rsplit("#", 1)[1])},

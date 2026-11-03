@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 import subprocess
 
+import pytest
+
 from foragent import orch_inbox, watch
 from foragent.config import Config
 from foragent.state import StateStore
@@ -57,6 +59,13 @@ def test_failed_switch_does_not_raise(tmp_path, monkeypatch):
     assert watch.switch_to_orchestrator(store) is False
 
 
+@pytest.mark.parametrize("key", ["x", "esc"])
+def test_keys_close_a_caller_supplied_legacy_box_and_restore_its_scroll(key):
+    state = {"issue": 7, "scroll": 1, "rows_scroll": 4}
+    assert watch.handle_key(key, None, Config(), state=state) is False
+    assert state == {"issue": None, "scroll": 4}
+
+
 def test_note_location_prefers_orca_then_tmux_then_terminal():
     assert orch_inbox.note_location({"ORCA_TERMINAL_HANDLE": "h", "TMUX": "x", "TMUX_PANE": "%2"}, "orch: p") == {
         "kind": "orca", "handle": "h", "title": "orch: p"}
@@ -75,7 +84,9 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     assert len(bubble) == 1 and "▀" in bubble[0] and "second line" not in frame
     stacked = watch.render_frame(snapshot(rows), config, tmp_path, width=50, now=NOW).splitlines()
     line = next(index for index, value in enumerate(stacked) if "Planning request" in value)
-    assert "▀" not in stacked[line] and any("▀" in value for value in stacked[:line])
+    # Below 80 columns the bubble takes the whole width, without the sprite beside it.
+    top = next(index for index, value in enumerate(stacked) if value.startswith("╭"))
+    assert top < line < top + 7 and not any("▀" in value or "▄" in value for value in stacked[top:top + 8])
     text = watch.render_frame(snapshot(rows), config, tmp_path, width=40, now=NOW)
     assert "Planning request" in text and "▀" not in text
     idle = watch.render_frame(snapshot([]), config, tmp_path, width=160, now=NOW)

@@ -40,6 +40,11 @@ The orchestrator calls you with `fa orch role docs` when one of your signals is 
    - `docs/rules.md` holds the rules in force now, one short line each.
    - `docs/decisions.md` is append-only history: decisions, each with its why and its date. Add
      new entries at the end; never edit or remove old ones.
+     A decision heading carries no implementation status (implemented, not implemented,
+     partial). Status is derived: `fa decisions --json` links each decision to issues from
+     their decision markers and published order specs, and derives `decided, nothing ordered`,
+     `in progress` or `done` from the last recorded issue facts. It shows links and completion,
+     not whether code fulfils every sentence of a decision. Do not write status by hand.
    - `README*` holds what the project is and how to use it.
    - `docs/voice.md` holds voice and wording rules.
    - Each other doc names its one purpose in its first line.
@@ -70,9 +75,15 @@ Keep your edits small. Do not rewrite a doc when a few lines fix it.
 Send proposals to the orchestrator with `fa orch request --from docs --text "<proposal>"`. A
 proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
 
+GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
+`fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.
+
 Never message the person directly. All communication goes only through the orchestrator.
 
 ## Memory
 
 Record durable lessons in your project memory: which doc owns which kind of fact, and recurring
-places where docs drift.
+places where docs drift. Proposals, decisions and waits belong on their GitHub issue or linked
+unpublished request through `fa orch request`. Track each proposal by its request id and date in
+`fa orch inbox`. Give each wait its waiting reason, next condition and responsible role so the
+owner can continue it after a restart.

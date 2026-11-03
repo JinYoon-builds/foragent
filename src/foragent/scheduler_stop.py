@@ -60,6 +60,9 @@ def _flag_stop_refused(ctx: TickContext, run: Run, report: TickReport, error: Ex
         report.actions.append(f"lane {run.lane} dream {summary}")
         return
     scheduler.flag(ctx, run.number, scheduler.Reason.STOP_REFUSED, summary)
+    # After the flag: a failed flag repeats this refusal, and its caller records that failure once.
+    ctx.store.record_flow_change("stop", issue=run.number, run_started_at=run.started_at, across_runs=True,
+                                 decision="skipped", reason="refused", detail=str(error))
     scheduler.append_event(ctx.store, ctx.now(), run.number, "stop-refused", summary)
     report.actions.append(f"#{run.number} {summary}")
 

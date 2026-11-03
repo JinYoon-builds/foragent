@@ -5,11 +5,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from foragent.policy import Decision
+from foragent.run_checks_approved import acceptance_mismatches
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from foragent.ci_mode import ComparisonEvidence
+    from foragent.run_group_ci import GroupComparisonEvidence
     from foragent.git import GitRepo
     from foragent.runner import RunContext
     from foragent.state import Approval
@@ -17,20 +19,33 @@ if TYPE_CHECKING:
 
 @contextmanager
 def _merge_lock(n: int, ctx: RunContext):
-    # Keep tick informed during an unbounded blocking flock acquisition.
-    started = None
-    try:
+    from foragent import capacity
+    from foragent.run_waits import activity
+
+    while True:
+        # Budget waits happen unlocked. A contended merge lock releases this slot again.
+        run_publish._phase(n, ctx, "merging")
+        started = None
         with run_publish.ExitStack() as stack:
             def acquire():
                 nonlocal started
                 stack.enter_context(ctx.store.merge_lock())
+                # Main writers (order/note flush, role memory, lanes) wait from the final check to the merge.
+                from foragent import git as git_files
+                stack.enter_context(git_files.main_write_lock(ctx.git))
                 started = ctx.now()
 
-            run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False)  # Phase only if it waits.
-            yield
-    finally:
-        if started is not None:
-            ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
+            try:
+                # Phase only if it waits: a free lock keeps the slot and adds no phase events.
+                with activity(n, ctx, "merge-lock", "lock-contention"):
+                    run_publish._credited_wait(n, ctx, acquire, "merge-lock-wait", eager=False, resume=False)
+                if not capacity.phase_holds_slot(ctx.store.get_run(n).phase):
+                    continue  # A new start took the freed slot: give the lock back.
+                yield
+                return
+            finally:
+                if started is not None:
+                    ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
 def _policy_allows(decision: Decision, base: str, batch_branch: str | None) -> bool:
@@ -55,7 +70,7 @@ def _final_merge_inputs(
     n: int, ctx: RunContext, git: GitRepo, pr: int, branch: str, base: str,
     head: str, approval: Approval, ready_at: float, *, base_sha: str | None = None,
     approved_body_sha: str | None = None,
-    comparison: ComparisonEvidence | None = None,
+    comparison: ComparisonEvidence | GroupComparisonEvidence | None = None,
 ) -> _MergeInputs:
     """Read every mutable prerequisite after acquiring the final merge lock.
 
@@ -98,10 +113,8 @@ def _final_merge_inputs(
     if base != ctx.config.base_branch:
         ctx.git.fetch("origin", ctx.config.base_branch)
         configured_base_sha = git.ref_sha(f"origin/{ctx.config.base_branch}")
-    for ref in (head, configured_base_sha):
-        blobs = git.blob_shas(ref, approval.acceptance_blobs)
-        if any(blobs.get(path) != sha for path, sha in approval.acceptance_blobs.items()):
-            return run_publish._MergeInputs(stop=invalid_approval)
+    if any(acceptance_mismatches(git, approval, ref) for ref in (head, configured_base_sha)):
+        return run_publish._MergeInputs(stop=invalid_approval)
     paths = sorted(set(git.changed_paths(target_sha)) | set(ctx.tracker.pr_changed_files(pr)))
     decision = run_publish._merge_decision(n, ctx, git, paths, issue.labels)
     # Bind this status and all verification evidence to the exact head we merge.
@@ -121,6 +134,8 @@ def _final_merge_inputs(
 
 
 def _batch_pr(parent: int, ctx: RunContext) -> None:
+    from foragent.run_pr_body import batch_body, publish_comments
+
     children = ctx.tracker.sub_issues(parent)
     if not children or any(child.state != "closed" for child in children):
         return
@@ -138,23 +153,17 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
             ctx.git.at(worktree).check_publication(base)
         finally:
             ctx.git.remove_worktree(worktree)
-    prs = {pr.head: pr for pr in ctx.tracker.list_prs("merged", "foragent/issue-") if pr.base == branch}
-    # No closing keyword: the parent's completion belongs to the gate's order
-    # aggregation (board_parents), which comments first and closes the parent only
-    # once no child is open. A merge here must not close it behind that.
-    lines = [run_publish.text("batch_pr_parent", ctx.config.language, parent=parent), "", "## Children", ""]
-    for child in sorted(children, key=lambda child: child.number):
-        pr = prs.get(f"foragent/issue-{child.number}")
-        lines.append(f"- #{child.number}: {child.title}" + (f" (PR #{pr.number})" if pr else ""))
     issue = ctx.tracker.get_issue(parent)
     title = f"Batch: {issue.title} (#{parent})"
-    body = "\n".join(lines)
+    body = batch_body(parent, ctx)
     if (pr := ctx.tracker.find_pr(branch)) is not None:
         ctx.tracker.update_pr(pr, base=ctx.config.base_branch, title=title, body=body)
+        publish_comments(ctx, pr, body)
         if issue.state == "open":  # A completed order (#411) stays in Done.
             run_publish.board.sync_status(ctx, parent, "PR open")
         return
     pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch, title=title, body=body)
+    publish_comments(ctx, pr, body)
     if issue.state == "open":
         run_publish.board.sync_status(ctx, parent, "PR open")
     ctx.tracker.comment(parent, f"PR #{pr} is waiting for your review\n\nhttps://github.com/{ctx.repo}/pull/{pr}")
@@ -162,19 +171,28 @@ def _batch_pr(parent: int, ctx: RunContext) -> None:
 
 def retitle_for_merge(
     ctx: RunContext, pr: int, *, title: str, current_title: str | None, base: str,
-    body: Callable[[], str], note: Callable[[str], None],
+    body: Callable[[], str | None], note: Callable[[str], None],
 ) -> dict[str, str]:
     """Give the PR its issue-derived title before merging; return extra merge_pr arguments.
 
     Branch commit messages (WIP checkpoints) never decide the title. The squash
     subject is the PR title, so it is passed only when retitling failed (other
-    than a rate limit): the merge then still uses the issue-derived subject.
+    than a rate limit): the merge then still uses the issue-derived subject. A PR with
+    no composition record changes its title alone, so the subject is right and no body is written.
     """
+    from foragent.run_pr_body import publish_comments
+
     if title != current_title:
         try:
-            ctx.tracker.update_pr(pr, base=base, title=title, body=body())
+            rendered = body()
+            if rendered is None:
+                note(f"PR #{pr} has no composition record; merging with subject {title!r} and no body write.")
+                ctx.tracker.retitle_pr(pr, title=title)
+                return {}
+            ctx.tracker.update_pr(pr, base=base, title=title, body=rendered)
+            publish_comments(ctx, pr, rendered)
         except run_publish.TrackerError as exc:
-            if exc.is_rate_limit:
+            if exc.waits:
                 raise
             note(f"PR #{pr} retitle failed; merging with subject {title!r}: {exc}")
             return {"subject": title}

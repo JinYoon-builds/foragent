@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import contextvars
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
 import os
@@ -16,18 +16,20 @@ from foragent import cuts, harness_guard
 from foragent.actions import flag, invalidate_approval
 from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
-from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
+from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import orch_events, orch_reviewers, quota_reviewer, review_notes, review_perspectives, risks
+from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
 from foragent.run_checks import _acceptance_matches, _append, _verify_review_head
 from foragent.run_attempt import ExecutorStopped
-from foragent.run_execution import _available_executor
+from foragent.run_execution import _available_executor, _requeue_limit
+from foragent.run_pr_body import load_values, publish_comments, read_values, render_values, review_values, save_values
 from foragent.run_prompts import (
-    build_review_prompt, lane_decisions_section, refresh_lane_decisions, review_scope_rules,
+    build_review_prompt, lane_decisions_section, review_scope_rules,
 )
+from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
 from foragent.run_waits import _phase, _progress, _timeout
 
 if TYPE_CHECKING:
@@ -44,6 +46,8 @@ class ReviewResult:
     timed_out: bool = False
     conflicts: tuple[str, ...] = ()
     review_notes: tuple[str, ...] = ()  # reviewer NOTE lines: recorded, never findings
+    no_findings: bool = False  # successful transport with an empty findings result
+    execution_failed: bool = False  # transport failure, separate from a missing verdict
 
 
 SPEC_CONFLICT = "SPEC-CONFLICT:"
@@ -65,15 +69,30 @@ def _stop_on_spec_conflict(n: int, ctx: RunContext, review: ReviewResult) -> Non
 
 def parse_review(message: str) -> ReviewResult:
     lines = message.splitlines()
-    for index, line in enumerate(lines):
-        if match := re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line):
-            rest = [line for line in lines[index + 1:] if line.strip()]
-            findings = [line for line in rest if review_notes.note_text(line) is None]
-            notes = review_notes.extract(message)
-            # A FAIL whose findings are all NOTE lines rejects nothing.
-            verdict = "PASS" if match[1] == "FAIL" and notes and not findings else match[1]
-            return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
-    return ReviewResult("UNUSABLE", "", ("reviewer gave no verdict",))
+    verdict_lines = [(index, re.fullmatch(r"VERDICT: (PASS|FAIL)\s*", line))
+                     for index, line in enumerate(lines) if line.startswith("VERDICT:")]
+    if len(verdict_lines) != 1 or verdict_lines[0][1] is None:
+        return ReviewResult("UNUSABLE", "", ("reviewer must give exactly one verdict",),
+                            no_findings=not verdict_lines and _empty_findings(message))
+    index, match = verdict_lines[0]
+    rest = [line for line in lines[index + 1:] if line.strip()]
+    findings = [line for line in rest if review_notes.note_text(line) is None]
+    notes = review_notes.extract(message)
+    # A FAIL whose findings are all NOTE lines rejects nothing.
+    verdict = "PASS" if match[1] == "FAIL" and notes and not findings else match[1]
+    return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
+
+
+def _empty_findings(message: str) -> bool:
+    """Convert the tool's empty findings marker, without judging any review prose."""
+    text = review_notes.strip(message).strip()
+    if not text:
+        return True
+    lines = text.splitlines()
+    return (lines[-1].strip() == "(none)"
+            and not any(FINDING_LINE.match(line) for line in lines[:-1])
+            and "```" not in text
+            and not code_review_findings("\n".join(lines[:-1]))[1])
 
 
 FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
@@ -122,10 +141,15 @@ def parse_code_review(message: str) -> ReviewResult:
         event = None
     if not isinstance(event, dict) or event.get("is_error") or not isinstance(event.get("result"), str):
         return ReviewResult("UNUSABLE", "", ("/code-review gave no usable result",))
-    verdict, findings, note = code_review_findings(event["result"])
+    text = event["result"]
+    review = parse_review(text)
+    if review.verdict == "UNUSABLE":
+        return review
+    verdict, findings, _ = code_review_findings(review.findings)
+    # The explicit verdict decides; the native findings payload is only a transport format.
     if verdict == "UNUSABLE":
-        return ReviewResult("UNUSABLE", "", (note,))
-    return ReviewResult(verdict, "\n".join(
+        return review
+    return replace(review, findings="\n".join(
         item if isinstance(item, str) else f"{item.get('file', '?')}:{item.get('line', '?')} — {item.get('summary', '')}"
         for item in findings
     ))
@@ -141,7 +165,7 @@ def _claude_review_scope(git: GitRepo, body: str, acceptance_dir: str, rebuttals
     mode = path.stat().st_mode if path.exists() else None
     section = (
         "# Review scope (written by Foragent for this review only)\n\n"
-        f"{body}\n\n{review_scope_rules(acceptance_dir)}\n\n"
+        f"{authored_body(body)}\n\n{review_scope_rules(acceptance_dir)}\n\n"
         + (f"{lane_decisions}\n\n" if lane_decisions else "")
         + (f"Implementer rebuttals (judge them):\n{rebuttals}\n\n" if rebuttals else "")
     ).encode("utf-8")
@@ -177,68 +201,30 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
 @quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
-    from foragent import runner
-
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
-    options = {"review_level": ctx.config.review_level} if reviewer == "claude" else {}
-    if reviewer == "claude" and pr is not None:
-        options["review_pr"] = pr
     rebuttals = _read_rebuttals(git.root)
     decisions = _lane_decisions(n, ctx, git.root)
-    notes = _risk_notes(git, base_ref)
-    if notes:
+    scope = review_pass_scope.for_review(n, ctx, git, base_ref)
+    limited = scope is not None and scope.diff is not None
+    first = "" if limited else first_review_findings(ctx.store, n, round_number, review_pass_scope.anchor_body(n, ctx))
+    notes = scope.notes if scope else "" if first else _risk_notes(git, base_ref)
+    boundary = {"pass_scope": scope.section, "diff": scope.diff} if scope else {}
+    if not first and notes:
         # One whole-change reviewer per perspective; the reviewer count only limits how many run at once.
-        return _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes,
-                             review_perspectives.shares(ctx.config), round_number, lane_decisions=decisions,
-                             workers=orch_reviewers.effective(ctx.store, ctx.config, n))
-    settings = {"model": ctx.config.reviewer_model}
-    edited = False
-    with ExitStack() as scope:
-        if reviewer == "claude" and ctx.config.review_scope == "claude-local":
-            approval = ctx.store.load_approval(n)
-            if approval is None:
-                raise ValueError("Claude review requires an approved snapshot")
-            scope.enter_context(_claude_review_scope(git, approval.body, ctx.config.acceptance_dir, rebuttals,
-                                                      lane_decisions=decisions))
-        before = git.review_state()
-        try:
-            result = _available_executor(
-                n, ctx, ctx.executor_factory(reviewer), worktree=git.root, reviewer=True,
-                prompt="" if reviewer == "claude" else build_review_prompt(
-                    parsed, git.staged_diff(base_ref), ctx.config.acceptance_dir, rebuttals=rebuttals,
-                    full_text_dir=cuts.issue_dir(ctx.store.root, n), lane_decisions=decisions,
-                ),
-                **settings, timeout_s=runner._remaining(n, ctx),
-                log_path=ctx.store.log_path(n), on_result=notes_of(n, ctx, reviewer, round_number), **options,
-            )
-            message = result.full_message if result.full_message is not None else result.last_message
-            raw = _raw_text(reviewer, message)
-            _save_review(n, ctx, f"review-{round_number}.txt", raw)
-        finally:
-            if git.review_state() != before:
-                git.restore_review_state(before)
-                edited = True
-                _append(ctx.store.log_path(n), "Reviewer changed repository state; restored HEAD, index and working tree.")
-    if result.timed_out or result.exit_code != 0:
-        review = ReviewResult("UNUSABLE", "", (
-            f"Reviewer exit_code={result.exit_code}, timed_out={result.timed_out}",
-        ))
+        review = _panel_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, notes,
+                               review_perspectives.shares(ctx.config), round_number, lane_decisions=decisions,
+                               workers=orch_reviewers.effective(ctx.store, ctx.config, n), **boundary)
     else:
-        parser = parse_code_review if reviewer == "claude" else parse_review
-        review = parser(message)
-    if reviewer == "claude":
-        review = ReviewResult(review.verdict, review.findings, (
-            f"reviewer: /code-review {ctx.config.review_level}", *review.notes,
-        ))
-    if edited:
-        review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
-    return _finish_review(n, ctx, replace(review, raw=raw, timed_out=result.timed_out, conflicts=spec_conflicts(raw)),
-                          round_number, (raw,))
+        review = single_review(n, ctx, git, parsed, base_ref, reviewer, rebuttals, decisions,
+                               round_number=round_number, pr=pr, first_review=first, **boundary)
+    if limited:
+        review_pass_scope.keep_notes(n, ctx, scope.head, review.review_notes)
+    return review
 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
-                   texts: tuple[str, ...]) -> ReviewResult:
+                   texts: tuple[str, ...], *, git: GitRepo | None = None) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
@@ -246,17 +232,19 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
     _record_notes(n, ctx, round_number, *texts)
-    if review.verdict == "PASS" and not review.conflicts:
+    passed = review.verdict == "PASS" and not review.conflicts
+    if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+    facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
             + "".join(f"\nNOTE: {note}" for note in review.review_notes))
     if review.conflicts:
         _append(log, "Review spec conflicts:\n" + "\n".join(review.conflicts))
         _journal_review(n, ctx, "SPEC-CONFLICT", "\n".join(review.conflicts), round_number,
-                        review_verdict=review.verdict)
+                        review_verdict=review.verdict, **facts)
     else:
-        _journal_review(n, ctx, review.verdict, review.findings, round_number)
+        _journal_review(n, ctx, review.verdict, review.findings, round_number, **facts)
     _progress(n, ctx)
     return review
 
@@ -285,11 +273,13 @@ def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
 
 def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
                   rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
-                  round_number: int, *, lane_decisions: str = "", workers: int = 1) -> ReviewResult:
+                  round_number: int, *, lane_decisions: str = "", workers: int = 1,
+                  pass_scope: str = "", diff: str | None = None) -> ReviewResult:
     """One independent whole-change reviewer per perspective share; one merge call decides.
 
-    At most `workers` reviewers run at once (the issue's reviewer count); the rest wait for a
-    free slot, so every perspective is still reviewed. The merge starts after all have returned.
+    At most `workers` reviewers (the issue's reviewer count) and the shared machine budget run at
+    once, each holding one machine slot; the rest wait for a free slot in later batches, so every
+    perspective is still reviewed. The merge starts after all have returned.
 
     Every call uses the prompt path at the risk-map tier, whatever reviewer or review_scope is
     set. A usage limit in any reviewer stops the whole round (limit-wait) and it runs again in
@@ -300,15 +290,15 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
     executor = ctx.executor_factory(reviewer)
     record = notes_of(n, ctx, reviewer, round_number)
-    diff = git.staged_diff(base_ref)
+    diff = git.staged_diff(base_ref) if diff is None else diff
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
 
-    def call(prompt: str, log_path: Path = log) -> ExecResult:
+    def call(prompt: str, log_path: Path = log, *, requeue: bool = True) -> ExecResult:
         # The panel decides the round's outcome from every call, so no call blocks the issue itself.
         return _available_executor(n, ctx, executor, worktree=git.root, reviewer=True, prompt=prompt,
                                    **settings, timeout_s=runner._remaining(n, ctx), log_path=log_path,
-                                   flag_exhaustion=False, on_result=record)
+                                   flag_exhaustion=False, on_result=record, requeue=requeue)
 
     def failure(label: str, error: BaseException) -> str:
         return f"{label} failed: {getattr(error, 'outcome', type(error).__name__)} {error}".rstrip()
@@ -333,15 +323,25 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     prompts = [build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
                                    full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                    risk_notes=review_perspectives.with_checklist(notes, ctx.config, share),
-                                   lane_decisions=lane_decisions)
+                                   lane_decisions=lane_decisions, pass_scope=pass_scope)
                for share in shares]
+    # Perspectives beyond the shared machine budget wait in the pool queue and run in later batches.
+    at_once = max(1, min(workers, len(prompts), capacity.workload_budget(ctx.store)))
+
+    def held(prompt: str, log_path: Path, k: int) -> ExecResult:
+        # Every reviewer holds one shared machine slot (the first reuses this run's own slot); a slot
+        # wait spends the run's remaining time, and a timeout makes that reviewer UNUSABLE.
+        with capacity.hold_workload(ctx.store, ctx.config, wait_s=runner._remaining(n, ctx),
+                                    kind="review", issue=n, role=f"reviewer {k}"):
+            return call(prompt, log_path, requeue=False)
+
     before = git.review_state()
     try:
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(prompts))),
+        with ThreadPoolExecutor(max_workers=at_once,
                                 thread_name_prefix=f"review-{n}") as pool:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
-            futures = [pool.submit(contextvars.copy_context().run, call, prompt, path)
-                       for prompt, path in zip(prompts, logs)]
+            futures = [pool.submit(contextvars.copy_context().run, held, prompt, path, k)
+                       for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
@@ -350,17 +350,22 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     # before any usage limit discards the round and it skips the merge call (which could drop it).
     member_conflicts = spec_conflicts(*(
         _raw_text(reviewer, _message(future.result())) for future, error in zip(futures, errors) if error is None))
-    # Outcome order: an interrupt propagates first; then any usage limit wins over every other
-    # reviewer outcome (the round is discarded and runs again in full); other errors are UNUSABLE.
+    # Interrupts propagate first. A completed spec conflict wins over limits; otherwise a limit
+    # requeues the discarded round once, after every member finishes. Other errors are UNUSABLE.
     raised = [error for error in errors if error is not None]
     for error in ([error for error in raised if not isinstance(error, Exception)]
                   + ([] if member_conflicts else [error for error in raised if _is_limit(error)])):
+        if _is_limit(error):
+            _requeue_limit(n, ctx)
         raise error
     problems: list[str] = []
     raws = []
     timed_out = False
+    no_findings = True
+    execution_failed = bool(raised)
     for k, (future, error) in enumerate(zip(futures, errors), start=1):
         if error is not None:
+            no_findings = False
             problems.append(failure(f"Reviewer {k} of {count}", error))
             raws.append(problems[-1])
         else:
@@ -368,9 +373,13 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
             message = result.full_message if result.full_message is not None else result.last_message
             raws.append(_raw_text(reviewer, message))
             timed_out |= result.timed_out
+            member = parse_review(raws[-1])
+            no_findings &= member.verdict == "PASS" or member.no_findings
             if result.timed_out or result.exit_code != 0:
+                no_findings = False
+                execution_failed = True
                 problems.append(f"Reviewer {k} of {count} exit_code={result.exit_code}, timed_out={result.timed_out}")
-            elif parse_review(raws[-1]).verdict == "UNUSABLE":
+            elif member.verdict == "UNUSABLE":
                 # A reviewer without a VERDICT line gave no usable review; never let the merge cover for it.
                 problems.append(f"Reviewer {k} of {count} gave no verdict")
         _save_review(n, ctx, f"review-{round_number}-{k}.txt", raws[-1])
@@ -378,36 +387,39 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     findings = "\n\n".join(f"Reviewer {k}:\n{raw}" for k, raw in enumerate(raws, start=1))
     if problems or member_conflicts:
         raw = findings
-        review = ReviewResult("UNUSABLE", "", tuple(problems) or ("Findings merge skipped: a reviewer reported a spec conflict",))
+        review = ReviewResult("UNUSABLE", "", tuple(problems) or ("Findings merge skipped: a reviewer reported a spec conflict",),
+                              no_findings=no_findings, execution_failed=execution_failed)
     else:
         try:
             result = call(build_review_prompt(parsed, diff, acceptance, rebuttals=rebuttals,
                                               full_text_dir=cuts.issue_dir(ctx.store.root, n),
                                               risk_notes=review_perspectives.with_checklist(notes, ctx.config),
-                                              panel_findings=findings, lane_decisions=lane_decisions))
+                                              panel_findings=findings, lane_decisions=lane_decisions,
+                                              pass_scope=pass_scope))
         except BaseException as error:
             result = None
             raw = unusable_error("Findings merge", error)
         finally:
             edited = restore(before) or edited
         if result is None:
-            review = ReviewResult("UNUSABLE", "", (raw,))
+            review = ReviewResult("UNUSABLE", "", (raw,), execution_failed=True)
         else:
             message = result.full_message if result.full_message is not None else result.last_message
             raw = _raw_text(reviewer, message)
             timed_out = result.timed_out
             review = (ReviewResult("UNUSABLE", "", (
                 f"Findings merge exit_code={result.exit_code}, timed_out={result.timed_out}",
-            )) if result.timed_out or result.exit_code != 0 else parse_review(raw))
+            ), execution_failed=True) if result.timed_out or result.exit_code != 0 else parse_review(raw))
     _save_review(n, ctx, f"review-{round_number}.txt", raw)
-    review = ReviewResult(review.verdict, review.findings, (
-        f"reviewers: {count}, up to {max(1, min(workers, count))} at once, one findings merge", *review.notes,
+    review = replace(review, notes=(
+        f"reviewers: {count}, up to {at_once} at once in {-(-count // at_once)} batches, one findings merge",
+        *review.notes,
     ))
     if edited:
-        review = ReviewResult(review.verdict, review.findings, (*review.notes, "Reviewer changes discarded; staged index restored."))
+        review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
-                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw))
+                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
@@ -428,7 +440,7 @@ _FINDING_LOCATION = re.compile(r"[\w.-]*[/.][\w./-]*:\d+")
 
 
 def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_number: int,
-                    source: str = "reviewer", review_verdict: str | None = None) -> None:
+                    source: str = "reviewer", review_verdict: str | None = None, **facts: str) -> None:
     """Record the round's verdict locally before any next round can start.
 
     A SPEC-CONFLICT round also keeps the reviewer's own verdict (PASS, FAIL or UNUSABLE),
@@ -438,7 +450,29 @@ def _journal_review(n: int, ctx: RunContext, verdict: str, findings: str, round_
         1 for line in findings.splitlines() if _FINDING_LOCATION.search(line))
     orch_events.append_event(ctx.store, ctx.now(), n, "review", f"{verdict} {count} findings",
                              verdict=verdict, findings=count, round=round_number, source=source,
-                             **({} if review_verdict is None else {"review_verdict": review_verdict}))
+                             **({} if review_verdict is None else {"review_verdict": review_verdict}), **facts)
+
+
+def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
+    """A reviewer PASS covers this clean commit for the approved body, and it is the open PR's head."""
+    approval = ctx.store.load_approval(n)
+    if approval is None or ctx.config.reviewer == "none":
+        return False
+    head = git.head_sha()
+    if git._call(["status", "--porcelain", "--untracked-files=no"]).strip():
+        return False  # uncommitted edits are not the reviewed commit
+    heads = review_pass_scope._heads(n, ctx)
+    if not any((event.get("head") or heads.get(event["tree"])) == head
+               and event.get("body_sha") == approval.body_sha for event in review_pass_scope._passes(n, ctx)):
+        return False
+    branch = f"foragent/issue-{n}"
+    pr = next((pr for pr in ctx.tracker.list_prs("open", branch) if pr.head == branch), None)
+    return pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
+
+
+def unchanged_since_pass(git: GitRepo, head: str) -> bool:
+    """Checks (a Done when edit, a base merge, a replay) left exactly the commit a reused PASS covered."""
+    return git.head_sha() == head and git.staged_tree_sha() == git._call(["rev-parse", "HEAD^{tree}"]).strip()
 
 
 def _is_limit(error: BaseException) -> bool:
@@ -451,42 +485,23 @@ def _risk_notes(git: GitRepo, base_ref: str) -> str:
     return risks.review_notes(risks.matching(risks.load_at(git, base_ref), changed), changed)
 
 
-def with_review_scope(body: str, acceptance_dir: str, language: str) -> str:
-    """Add the review scope, or every rule line an older PR's existing scope section lacks."""
-    rules = review_scope_rules(acceptance_dir, language)
-    if "## Review scope" not in body:
-        return body + "\n\n## Review scope\n\n" + rules
-    missing = [line for line in rules.splitlines() if line not in body]
-    if not missing:
-        return body
-    # An older section holding the remaining rules in order is replaced whole; otherwise
-    # the missing lines (the spec-conflict rule, the defect-class question) lead the section.
-    earlier = "\n".join(line for line in rules.splitlines() if line not in missing)
-    if earlier and earlier in body:
-        return body.replace(earlier, rules, 1)
-    return body.replace("## Review scope\n\n", "## Review scope\n\n" + "\n".join(missing) + "\n", 1)
-
-
 def _read_rebuttals(worktree: Path) -> str:
     path = worktree / ".foragent/REBUTTAL.md"
     return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 
 
-def _next_review_round(n: int, ctx: RunContext) -> int:
-    rounds = [int(path.stem.removeprefix("review-"))
-              for path in (ctx.store.root / "runs" / f"issue-{n}").glob("review-*.txt")
-              if path.stem.removeprefix("review-").isdigit()]
-    return max(rounds, default=0) + 1
-
-
 def _normalized_findings(review: ReviewResult) -> set[str]:
-    # Unstructured prose is one finding: repeated preambles alone are not a dispute.
-    points = [review.raw] if review.verdict == "UNUSABLE" else review.findings.splitlines()
+    points = review.findings.splitlines()
     return {" ".join(re.sub(r"^\s*[-*]\s+", "", point).split()).casefold()
             for point in points if point.strip()}
 
 
 def _review_implementation(attempt: Implementation) -> None:
+    """Set feedback; runner._implement_and_publish bounds all rework by max_retries + 1.
+
+    Missing verdicts still set attempt.failure, so they spend that shared attempt budget
+    even though they never spend the explicit-FAIL defect budget here.
+    """
     from foragent.ci_mode import commit_exclusions
     from foragent.run_publish import _open_or_update_pr, _push_branch, _render_pr_body
 
@@ -499,11 +514,12 @@ def _review_implementation(attempt: Implementation) -> None:
         _push_branch(attempt)
         pr = _open_or_update_pr(attempt, title, _render_pr_body(attempt))
         _progress(n, ctx)
-    review = _review(n, ctx, git, attempt.parsed, attempt.base_ref, round_number=_next_review_round(n, ctx), pr=pr)
+    review = _review(n, ctx, git, attempt.parsed, attempt.base_ref,
+                     round_number=_next_review_round(n, ctx), pr=pr)
     if pr is not None and review.conflicts:
         ctx.tracker.comment(pr, "\n".join([f"Round {len(attempt.reviews) + 1}: SPEC-CONFLICT", *review.conflicts]))
     _stop_on_spec_conflict(n, ctx, review)
-    if review.verdict == "UNUSABLE":
+    if review.verdict == "UNUSABLE" and not review.no_findings:
         review = replace(review, findings=review_notes.strip(review.raw))
     attempt.reviews.append(review)
     if pr is not None:
@@ -511,15 +527,25 @@ def _review_implementation(attempt: Implementation) -> None:
             f"Round {len(attempt.reviews)}: VERDICT: {review.verdict}", review.findings,
             *(f"NOTE: {note}" for note in review.review_notes), *review.notes,
         ]))
+    if review.verdict == "UNUSABLE" and review.no_findings:
+        return  # Empty tool result: ordinary merge policy, without manufacturing a PASS.
     if review.verdict != "PASS":
-        attempt.review_failures += 1
+        if review.verdict == "FAIL":
+            attempt.review_failures += 1
         attempt.review_feedback = True
         if review.verdict == "UNUSABLE":
             attempt.reviewer_text = review.findings
             attempt.failure = WholeFailure("A reviewer said (verbatim):\n" + review.findings)
         else:
             attempt.failure = WholeFailure(review.findings or "Reviewer found defects (no findings provided).")
-        findings = _normalized_findings(review) if _read_rebuttals(worktree).strip() else set()
+        # Keep the existing execution-error retry ceiling, without counting protocol errors as defects.
+        execution_failures = sum(item.execution_failed for item in attempt.reviews)
+        if review.execution_failed and execution_failures + attempt.review_failures > ctx.config.review_max:
+            flag(ctx, n, Reason.RETRIES_EXCEEDED, "Reviewer execution failed after all review attempts.",
+                 review.raw or "\n".join(review.notes))
+            raise ExecutorStopped("review-failed")
+        findings = (_normalized_findings(review)
+                    if review.verdict == "FAIL" and _read_rebuttals(worktree).strip() else set())
         if findings & attempt.previous_rebutted_findings:
             attempt.review_hold = True
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
@@ -529,9 +555,9 @@ def _review_implementation(attempt: Implementation) -> None:
 
 
 def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | None) -> str:
-    """Verify one immutable PR head, then apply the ordinary merge policy."""
+    """Review the exact PR head, refresh its base if needed, then apply ordinary merge policy."""
     from foragent import runner
-    from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head
+    from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head, _refresh_reviewed_head
 
     approval = ctx.store.load_approval(n)
     if approval is None:
@@ -586,36 +612,56 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         git.publication_paths.add(EXCLUSIONS)
     if not _acceptance_matches(n, ctx, git, approval):
         return "hash-mismatch"
-    if not git.is_ancestor(base_sha, head):
-        flag(ctx, n, Reason.RISK_HIGH, "PR base changed; retry implementation on the current base.", link)
-        return "base-changed"
+    behind = not git.is_ancestor(base_sha, head)
+    # Review only the PR's work: a two-way diff against a newer base includes
+    # unrelated base changes as apparent reversions.
+    review_base = git._call(["merge-base", base_sha, head]).strip() if behind else base_ref
 
     guarded_head = harness_guard.review_guard(ctx, n, git, base_ref, parsed.files, link,
                                               lambda new: _verify_review_head(n, ctx, git, parsed, new, link))
-    if stopped := guarded_head(head):
-        return stopped
-    _check_publication(git, pr.base)
+    if not behind:
+        if stopped := guarded_head(head):
+            return stopped
+        _check_publication(git, pr.base)
 
     if verdict_head is None and ctx.config.reviewer != "none":
         if runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
         if ctx.config.review_scope == "pr-body":
-            # Native PR review reads only the PR body: refresh the risk notes for this head and base.
-            body = with_review_scope(pr.body, ctx.config.acceptance_dir, ctx.config.language)
-            body = risks.refresh_notes(body, review_perspectives.with_checklist(_risk_notes(git, base_ref), ctx.config))
-            body = refresh_lane_decisions(body, _lane_decisions(n, ctx, git.root))
-            if body != pr.body:
-                pr = replace(pr, body=body)
-                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=pr.body)
-        review = _review(n, ctx, git, parsed, base_ref, round_number=_next_review_round(n, ctx),
+            # Native PR review reads only the PR body: compose it again with this head's facts.
+            values = load_values(n, ctx)
+            values.update(review_scope="pr-body", acceptance_dir=ctx.config.acceptance_dir,
+                          language=ctx.config.language,
+                          risk_notes=review_perspectives.with_checklist(_risk_notes(git, review_base), ctx.config),
+                          lane_decisions=_lane_decisions(n, ctx, git.root))
+            save_values(n, ctx, values)
+            body = render_values(n, ctx, values)
+            ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
+            publish_comments(ctx, pr.number, body)
+        review = _review(n, ctx, git, parsed, review_base, round_number=_next_review_round(n, ctx),
                          pr=pr.number if ctx.config.review_scope == "pr-body" else None)
         ctx.tracker.comment(pr.number, f"Re-run review: VERDICT: {review.verdict}\n{review.raw}")
         _stop_on_spec_conflict(n, ctx, review)
         if review.timed_out or runner._remaining(n, ctx) <= 0:
             return _timeout(n, ctx)
-        if review.verdict != "PASS":
+        if (values := read_values(n, ctx)) is not None:
+            # A later retitle composes from the record, so it has to hold this verdict in either scope.
+            values["reviews"] = [*values.get("reviews", []), *review_values([review])]
+            save_values(n, ctx, values)
+            if ctx.config.review_scope == "pr-body":
+                body = render_values(n, ctx, values)
+                ctx.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body=body)
+                publish_comments(ctx, pr.number, body)
+        if review.verdict != "PASS" and not review.no_findings:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Re-run review {review.verdict}.", review.raw or review.findings)
             return "review-failed"
+
+    if behind:
+        # The verdict judges the original head. Only a clean Git base merge can
+        # carry it forward; check the merged head once, as on later merge turns.
+        head, stopped = _refresh_reviewed_head(n, ctx, git, pr, head, base_sha, guarded_head)
+        if stopped:
+            return stopped
 
     from foragent.ci_mode import enabled, review_checks
     comparison_attempt = review_checks(n, ctx, git, pr.base) if enabled(ctx, pr.base) else None

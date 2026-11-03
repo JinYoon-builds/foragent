@@ -1,6 +1,10 @@
 from dataclasses import replace
 from datetime import UTC, datetime
+import json
+import subprocess
 from types import SimpleNamespace
+
+import pytest
 
 from foragent import run_group_check as group
 from foragent import run_merge_turn as turn
@@ -66,24 +70,145 @@ def test_a_lone_holder_is_no_group(tmp_path):
     assert numbers(ctx, 5) == []
 
 
-def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(tmp_path, monkeypatch):
+def record_result(store, verdict, count, **fields):
+    from foragent import orch_events
+
+    return orch_events.append_event(store, NOW, 99, "group-check", "result",
+                                    verdict=verdict, members=[{}] * count, **fields)
+
+
+def test_auto_replays_in_journal_order_and_only_uses_verdict_and_member_count(tmp_path):
+    store = StateStore(tmp_path / "state")
+    config = Config()
+    assert group.group_limit(store, config) == (4, "auto")
+    # Deliberately reverse timestamps: file order, not timestamps, defines the replay.
+    for verdict, count, expected in [
+        ("passed", 4, 5), ("passed", 3, 5), ("failed", 1, 4),
+        ("passed", 4, 5), ("void", 8, 5), ("unknown", 8, 5),
+        ("passed", 5, 6), ("passed", 6, 7), ("passed", 7, 8), ("passed", 8, 8),
+        *[("failed", 1, max(2, 7 - i)) for i in range(8)],
+    ]:
+        event = record_result(store, verdict, count, passed=verdict != "passed")
+        path = store.root / "orch-events.jsonl"
+        lines = path.read_text().splitlines()
+        event["at"] = str(100 - len(lines))
+        lines[-1] = json.dumps(event)
+        path.write_text("\n".join(lines) + "\n")
+        before = path.read_bytes()
+        assert group.group_limit(store, config) == (expected, "auto")
+        assert group.group_limit(store, config) == (expected, "auto")
+        assert path.read_bytes() == before
+    # Only retained history is replayed, with no persisted limit.
+    path.write_text("")
+    assert group.group_limit(store, config) == (4, "auto")
+
+
+def test_auto_ignores_unreadable_and_unusable_events(tmp_path):
+    store = StateStore(tmp_path / "state")
+    store.root.mkdir(parents=True)
+    path = store.root / "orch-events.jsonl"
+    path.write_text("\n".join([
+        "not json", "null", "[]", "1",
+        json.dumps({"kind": "other", "verdict": "failed", "members": []}),
+        json.dumps({"kind": "group-check", "verdict": "failed"}),
+        json.dumps({"kind": "group-check", "verdict": "passed", "members": 4}),
+        json.dumps({"kind": "group-check", "passed": True, "members": [{}] * 4}),
+    ]) + "\n")
+    assert group.group_limit(store, Config()) == (4, "auto")
+    record_result(store, "passed", 4)
+    assert group.group_limit(store, Config()) == (5, "auto")
+    path.unlink()
+    path.mkdir()  # An unreadable journal also leaves the starting limit alone.
+    assert group.group_limit(store, Config()) == (4, "auto")
+
+
+@pytest.mark.parametrize("maximum", [1, 3, 12])
+def test_fixed_limit_ignores_history_without_reading_it(tmp_path, monkeypatch, maximum):
+    from foragent import orch_events
+
+    store = StateStore(tmp_path / "state")
+    record_result(store, "passed", 20)
+    record_result(store, "failed", 1)
+
+    def unexpected_read(*args):
+        pytest.fail("a fixed limit must not read the journal")
+
+    monkeypatch.setattr(orch_events, "events", unexpected_read)
+    assert group.group_limit(store, Config(merge_group_max=maximum)) == (maximum, "fixed")
+
+
+def test_members_use_the_current_auto_limit(tmp_path):
+    ctx = make_ctx(tmp_path, (5, 1, 4, 7, 8, 9), maximum="auto")
+    assert numbers(ctx, 5) == [5, 1, 4, 7]
+    record_result(ctx.store, "passed", 4)
+    assert numbers(ctx, 5) == [5, 1, 4, 7, 8]
+    record_result(ctx.store, "failed", 1)
+    record_result(ctx.store, "failed", 1)
+    assert numbers(ctx, 5) == [5, 1, 4]
+
+
+@pytest.mark.parametrize("measured,remaining,expected", [
+    (736, 5000, 1472), (2000, 5000, 3600), (736, 1000, 1000), (100, 5000, 900),
+    (None, 5000, 1600),
+])
+@pytest.mark.parametrize("timed_out", [False, True])
+@pytest.mark.parametrize("blocked", [False, True])
+def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(
+    tmp_path, monkeypatch, measured, remaining, expected, timed_out, blocked,
+):
     from contextlib import nullcontext
 
-    from foragent import ci_mode, run_baseline, run_implementation, runner
+    from foragent import (
+        capacity, ci_mode, orch_events, run_baseline, run_baseline_limits, run_checks, run_implementation, runner,
+    )
+    import os
+    from datetime import timedelta
     from foragent.run_baseline import AcceptanceBaseline
     from foragent.run_checks import CheckResult
 
     ctx = make_ctx(tmp_path, (5, 1))
     ctx.config = replace(ctx.config, test_command="pytest -q")
     ctx.repo_root = tmp_path
+    clock = [NOW]
+    ctx.now = lambda: clock[0]
+    ctx.monotonic = lambda: (clock[0] - NOW).total_seconds()
+    for n in (5, 1):
+        ctx.store.update_run(n, phase="ci", phase_started_at=NOW.isoformat())
+    ctx.store.update_run(5, pid=os.getpid())
+    capacity.write_state(ctx.store, 1, NOW)
+    monkeypatch.setattr(runner, "_remaining", lambda *args: remaining)
     captured, ran = [], []
+    sleeps = []
+    other = StateStore(tmp_path / "other", now=ctx.now)
+    if blocked:
+        other.start_run(90, branch="other", worktree="other", pid=os.getpid())
+
+    def sleep(seconds):
+        pytest.fail("The leader holds the merge turn: a full machine must not queue it")
+
+    monkeypatch.setattr(capacity, "time", SimpleNamespace(monotonic=ctx.monotonic, sleep=sleep))
+    monkeypatch.setattr(run_baseline_limits, "repository_limit", lambda *args: (1600, 800))
+    monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *args, **kwargs: ["tests/test_related.py"])
     monkeypatch.setattr(ci_mode, "enabled", lambda ctx, target: False)
     monkeypatch.setattr(run_implementation, "_detect_test_command_at", lambda git, sha: None)
     monkeypatch.setattr(run_baseline, "_capture_acceptance_baseline", lambda n, ctx, command, ref: (
-        captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",))))
-    monkeypatch.setattr(group, "_combine", lambda git, base, members: "combined")
+        captured.append((n, command, ref)) or AcceptanceBaseline("pytest -q", ("tests/acceptance/test_a.py::t",), duration_seconds=measured)))
+    def combine(git, base, members):
+        assert ctx.store.get_run(5).phase == "checking"
+        assert capacity.machine_runs(ctx.store, NOW) == (2 if blocked else 1), "Local work counts exactly once"
+        return "combined"
+
+    monkeypatch.setattr(group, "_combine", combine)
+    monkeypatch.setattr(group, "_trees", lambda *args: ["tree-5", "tree-1"])
     monkeypatch.setattr(group, "_test_slot", lambda n, ctx: nullcontext())
-    monkeypatch.setattr(runner, "_check", lambda command, *a, **k: ran.append(command) or CheckResult(command, 0, False, ""))
+
+    def check(command, worktree, log, limit, **kwargs):
+        assert ctx.store.get_run(5).phase == "checking", "Every joint command counts as the leader's work"
+        assert capacity.machine_runs(ctx.store, NOW) == (2 if blocked else 1)
+        ran.append((command, limit, kwargs.get("clock")))
+        return CheckResult(command, 0, timed_out and "tests/acceptance/" in command, "")
+
+    monkeypatch.setattr(runner, "_check", check)
     ctx.git = SimpleNamespace(add_detached_worktree=lambda path, ref: None, remove_worktree=lambda path: None,
                               _call=lambda args: "")
     place = turn.seat(ctx, 5, "main")
@@ -91,4 +216,80 @@ def test_joint_suite_derives_current_mains_baseline_for_every_entrypoint(tmp_pat
     group.check(5, ctx, place, "h5", "main-sha", done)
     group.check(5, ctx, place, "h5", "main-sha", done)  # once per (main, heads)
     assert captured == [(5, "pytest -q", "main-sha")]
-    assert ran == ["echo member-5", "echo member-1", "pytest -q tests/acceptance/test_a.py::t"]
+    assert ran == [
+        ("echo member-5", 900, None),
+        ("echo member-1", 900, None),
+        ("pytest -q tests/acceptance/test_a.py::t", expected, ctx.monotonic),
+        ("PYTEST_ADDOPTS= pytest -o addopts= --rootdir=. --maxfail=0 "
+         "-p no:cacheprovider tests/test_related.py", 900, None),
+    ]
+    assert orch_events.has_event(ctx.store, 5, "group-check", passed=not timed_out,
+                                 verdict="void" if timed_out else "passed")
+    assert ctx.store.get_run(5).phase == "ci"
+    assert capacity.machine_runs(ctx.store, NOW) == (1 if blocked else 0), "The check gives its slot back"
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("conflict_index", [0, 1, 2])
+def test_combine_stops_at_first_real_conflict(git_history, monkeypatch, conflict_index):
+    from conftest import git_command
+    from foragent.git import GitRepo
+
+    history = git_history
+    original = history.tip
+    history.update({"conflict.txt": "base\n"})
+    base = history.tip
+    members = []
+    for index in range(4):
+        history.tip = original
+        git_command(history.origin, "update-ref", "refs/heads/main", original)
+        history.update({"conflict.txt" if index == conflict_index else f"member-{index}": f"{index}\n"})
+        members.append(group.Member(index, history.tip, ()))
+    git = GitRepo(history.origin)
+    call = git._call
+    attempted = []
+
+    def observe(args):
+        if args[:2] == ["merge-tree", "--write-tree"]:
+            attempted.append(args[-1])
+        return call(args)
+
+    monkeypatch.setattr(git, "_call", observe)
+    combined = group._combine(git, base, members)
+    assert attempted == [m.head_sha for m in members[:conflict_index + 1]]
+    trees = group._trees(git, base, combined)
+    assert len(trees) == conflict_index
+    assert git_command(history.origin, "show", f"{combined}:conflict.txt") == "base"
+    files = git_command(history.origin, "ls-tree", "--name-only", combined).splitlines()
+    assert [f"member-{i}" in files for i in range(4)] == [i < conflict_index for i in range(4)]
+    if conflict_index == 0:
+        assert combined == base
+
+
+def test_combine_does_not_swallow_merge_tree_infrastructure_error():
+    from foragent.git import GitError
+
+    def call(args):
+        if args[0] == "merge-tree":
+            raise GitError("unreadable CONFLICT object") from subprocess.CalledProcessError(128, args)
+        return ""
+
+    with pytest.raises(GitError, match="unreadable CONFLICT object"):
+        group._combine(SimpleNamespace(_call=call), "base", [group.Member(5, "head", ())])
+
+
+@pytest.mark.parametrize("verdict,fresh,cause", [
+    ("failed", True, "group-failed"), ("void", True, "group-failed"), ("passed", True, "base-changed"),
+    ("failed", False, "base-changed"), (None, True, "base-changed"),
+])
+def test_refresh_cause_reads_this_executions_group_verdict(tmp_path, verdict, fresh, cause):
+    from datetime import timedelta
+
+    from foragent import orch_events
+
+    ctx = make_ctx(tmp_path, [1, 2])
+    if verdict is not None:
+        offset = timedelta(seconds=1 if fresh else -1)
+        at = datetime.fromisoformat(ctx.store.get_run(1).started_at) + offset
+        orch_events.append_event(ctx.store, at, 1, "group-check", "fixture", members=[{"n": 1}], verdict=verdict)
+    assert group.refresh_cause(ctx, 1) == cause

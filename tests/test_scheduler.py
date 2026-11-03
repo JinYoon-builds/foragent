@@ -972,7 +972,7 @@ def test_failed_termination_keeps_worktree_and_active_record(ctx):
         ctx.git.remove_worktree(path)
 
 
-@pytest.mark.parametrize("mode", ["batch", "careful"])
+@pytest.mark.parametrize("mode", ["careful"])
 @pytest.mark.parametrize("ready", [False, True])
 def test_open_review_pr_is_not_rescheduled_or_allowed_to_starve_next_issue(ctx, mode, ready):
     ctx.config = replace(ctx.config, review=mode)
@@ -1179,10 +1179,11 @@ def test_flagged_issue_is_skipped_entirely(ctx, monkeypatch, label):
     def unexpected(*args):
         pytest.fail("flagged issues must not be inspected")
 
-    monkeypatch.setattr(ctx.tracker, "label_events", unexpected)
+    # Only approval evidence is read during a hold (#1679); nothing is checked for a start.
     monkeypatch.setattr(ctx.tracker, "blocked_by", unexpected)
-    assert tick(ctx).actions == []
-    assert ctx.store.load_approval(1) is None
+    report = tick(ctx)
+    assert not any("promoted" in action or "resumed" in action for action in report.actions)
+    assert ctx.tracker.get_issue(1).labels == {"approved", label, "ready"}
 
 
 def test_blocked_by_waits_until_all_blockers_close(ctx):
@@ -1598,10 +1599,13 @@ def test_first_snapshot_rejects_edits_at_or_after_approval(ctx, edit_seconds):
         assert ctx.store.load_approval(1) is None
         assert ctx.tracker.get_issue(1).labels == {"blocked"}
         assert len(ctx.tracker.list_comments(1)) == 1
-        comment = ctx.tracker.list_comments(1)[0].body
-        assert parse_reason(comment) == Reason.HASH_MISMATCH
-        assert "approval predates an edit" in comment
-        assert ctx.store.load_flag(1).flagged_at == ctx.now().isoformat()
+        comment = ctx.tracker.list_comments(1)[0]
+        assert parse_reason(comment.body) == Reason.HASH_MISMATCH
+        assert "approval predates an edit" in comment.body
+        # The tracker clock is deliberately frozen at the edit, separately from tick's clock.
+        assert ctx.store.load_flag(1).flagged_at == comment.created_at == (
+            NOW + timedelta(seconds=edit_seconds)
+        ).isoformat()
     else:
         assert ctx.store.load_approval(1).body == BODY + "Edited\n"
         assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
@@ -1691,12 +1695,47 @@ def test_other_flags_require_human_removal_even_with_new_approval(ctx, reason):
     flag(ctx, 1, reason, "Human input required.")
     ctx.now = lambda: NOW + timedelta(minutes=1)
     ctx.tracker.record_label(1, "approved", "human")
-    assert tick(ctx).actions == []
+    # The re-approval is recorded as evidence, but only a person removes the hold.
+    assert tick(ctx).actions == ["#1 approval snapshot saved", "#1 re-approval recorded; hold kept"]
     assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
-    assert ctx.store.load_approval(1) is None
+    assert ctx.store.load_approval(1).approved_at == ctx.now().isoformat()
+    comments = ctx.tracker.list_comments(1)
+    assert tick(ctx).actions == []
+    assert ctx.tracker.list_comments(1) == comments
     ctx.tracker.remove_labels(1, ["blocked"])
     tick(ctx)
     assert ctx.tracker.get_issue(1).labels == {"approved", "ready"}
+
+
+@pytest.mark.parametrize("label", ["blocked", "needs-human"])
+def test_approval_the_hold_already_saw_is_not_recorded_again(ctx, label):
+    approve(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    if label == "needs-human":
+        ctx.tracker.comment(1, "<!-- foragent:needs-human reason=escalated -->\nNeeds a verdict")
+        ctx.tracker.add_labels(1, ["needs-human"])
+    else:
+        flag(ctx, 1, Reason.SPEC_QUESTION, "Human input required.")
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    comments = ctx.tracker.list_comments(1)
+    assert tick(ctx).actions == []
+    assert ctx.store.load_approval(1) is None
+    assert ctx.tracker.list_comments(1) == comments
+
+
+def test_reapproval_during_a_hold_after_a_body_edit_invalidates_without_release(ctx):
+    approve(ctx)
+    tick(ctx)
+    ctx.now = lambda: NOW + timedelta(minutes=1)
+    flag(ctx, 1, Reason.SPEC_QUESTION, "Human input required.")
+    ctx.now = lambda: NOW + timedelta(minutes=2)
+    ctx.tracker.record_label(1, "approved", "human")
+    ctx.now = lambda: NOW + timedelta(minutes=3)
+    edit_body(ctx, 1, BODY + "Changed\n")
+    report = tick(ctx)
+    assert any("flagged hash-mismatch" in action for action in report.actions)
+    assert ctx.store.load_flag(1).reason == Reason.HASH_MISMATCH
+    assert ctx.tracker.get_issue(1).labels == {"blocked"}
 
 
 def test_nonapprover_cannot_resume_hash_mismatch(ctx):
@@ -2196,7 +2235,8 @@ def test_crash_restore_rechecks_local_issue_before_changing_labels(ctx, change):
     tick(ctx)
     mark_running(ctx)
     stale = ctx.tracker.get_issue(1)
-    store = StateStore(ctx.store.root)
+    # Local updates are observations at their call time, so they share the gate's clock.
+    store = StateStore(ctx.store.root, now=ctx.now)
     if change == "closed":
         store.update_local_issue(1, state="closed")
     else:

@@ -1,6 +1,6 @@
 """Consume complete PR-head acceptance evidence before an issue PR can merge."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from math import isfinite
 
@@ -25,10 +25,25 @@ class StaleComparison(UnusableComparison):
     """Every check passed except the base or measurement producer is no longer current."""
 
 
+class WorkflowChanged(UnusableComparison):
+    """The measuring workflow differs from the default branch, so its artifacts are not trusted."""
+
+
+def serialize_reports(reports):
+    """Pin external evidence without letting malformed data escape as a code error."""
+    try:
+        return json.dumps(reports, sort_keys=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise UnusableComparison(f"Unusable acceptance reports: {exc}") from exc
+
+
 def _excluded_subset(value, required):
     """CI's exclusions still protect every file the gate requires now."""
-    return (isinstance(value, list) and all(isinstance(path, str) for path in value)
-            and set(value) <= set(required))
+    return _paths(value) and set(value) <= set(required)
+
+
+def _paths(value):
+    return isinstance(value, list) and all(isinstance(path, str) for path in value)
 
 
 def scope_covers(recorded, required):
@@ -43,9 +58,20 @@ def _trusted_sha(git, tracker):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+        if isinstance(exc, TrackerError) and exc.waits:
             raise
         return None
+
+
+def changed_workflows(git, trusted_sha, head):
+    """PR artifacts are trusted only when their workflow matches the default branch."""
+    if trusted_sha is None:
+        raise GitError("Default branch reference unavailable")
+    return git._call([
+        "diff", "--name-only", "-z", trusted_sha, head, "--",
+        ".github/workflows/foragent-acceptance*.yml",
+        ".github/workflows/foragent-acceptance*.yaml",
+    ])
 
 
 @dataclass(frozen=True)
@@ -59,32 +85,64 @@ class ComparisonEvidence:
     status: str
     infrastructure: str
     reports: str | None = None
+    # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
+    accepted_sha: str | None = None
+
+    def follow(self, base_sha):
+        """The same evidence, accepted on a base the caller proved result-neutral."""
+        return replace(self, accepted_sha=base_sha)
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """One non-waiting read; changed evidence must be checked again unlocked."""
-        if (self.base_sha != base_sha or self.head_sha != head or self.status != status
-                or self.trusted_sha != _trusted_sha(git, ctx.tracker)):
-            return False
+        refused = self._refused(n, ctx, git, pr, head, base_sha, status)
+        _note_evidence(ctx, n, base_sha, head, *(refused or ()))
+        return refused is None
+
+    def _refused(self, n, ctx, git, pr, head, base_sha, status):
+        """Why this read no longer accepts the evidence, as (reason, detail), or None."""
+        accepted = self.accepted_sha or self.base_sha
+        if accepted != base_sha or self.head_sha != head:
+            return "revision-moved", f"accepted {accepted}/{self.head_sha}, now {base_sha}/{head}"
+        if self.status != status:
+            return "status-changed", f"accepted CI {self.status}, now {status}"
+        if self.trusted_sha != (trusted := _trusted_sha(git, ctx.tracker)):
+            return "trusted-moved", f"accepted default branch {self.trusted_sha}, now {trusted}"
         excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
         if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
-            return False
+            return "scope-changed", "the measurement scope no longer covers the current one"
         try:
             if self.infrastructure and status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr)
                 if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
-                    return False
+                    return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
-                return True  # Local evidence is pinned to the same base/head and scope.
-            return self.reports == json.dumps(ctx.tracker.pr_acceptance_reports(head), sort_keys=True)
-        except (AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                return None  # Local evidence is pinned to the same base/head and scope.
+            reports = ctx.tracker.pr_acceptance_reports(head)
+            if self.reports == serialize_reports(reports):
+                return None
+            return ("reports-changed", "the reports differ from the accepted ones") if reports else (
+                "missing", "no acceptance reports at this read")
+        except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
+            if isinstance(exc, TrackerError) and exc.waits:
                 raise
-            return False
+            return _refusal(exc), str(exc)
+
+
+def ci_protection(ctx):
+    """CI owns portable protection even when a target cannot produce evidence."""
+    return (ctx.config.checks == "ci" and ctx.config.checks_fallback != "local"
+            and acceptance_command(ctx.config, ctx.repo_root) is not None)
+
+
+def ci_evidence_target(ctx, target_branch):
+    """The generated acceptance workflow runs only against the configured base."""
+    return target_branch == ctx.config.base_branch
 
 
 def enabled(ctx, target_branch):
-    return (ctx.config.checks == "ci" and target_branch == ctx.config.base_branch
-            and acceptance_command(ctx.config, ctx.repo_root) is not None)
+    return (ci_protection(ctx)
+            or (ctx.config.checks == "ci" and ci_evidence_target(ctx, target_branch)
+                and acceptance_command(ctx.config, ctx.repo_root) is not None))
 
 
 def commit_exclusions(attempt, title):
@@ -164,6 +222,8 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
 
     Only a moved base or a superseded measurement producer is stale. Those wait
     until every other check passes, so an unrelated invalid field never retries.
+    The exclusions CI recorded are the reference for a completed measurement;
+    today's ``excluded`` may differ either way and neither waives nor adds a test.
     """
     reports = {}
     expected_shards = set(expected_shards)
@@ -175,7 +235,7 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     if not isinstance(artifacts, list):
         raise UnusableComparison(f"artifacts: observed {type(artifacts).__name__}, expected a list")
     artifact_ids = set()
-    excluded = set(excluded)
+    recorded = None
     for evidence in artifacts:
         try:
             def need(path, ok, expected, freshness=False):
@@ -195,7 +255,6 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
             run_id = need("run.id", _positive, "a positive integer")
             equal("run.head_sha", head_sha)
             equal("run.status", "completed")
-            equal("run.conclusion", "success")
             equal("run.event", "pull_request")
             need("run.path", lambda value: isinstance(value, str) and value.split("@", 1)[0] == WORKFLOW,
                  _shown(WORKFLOW))
@@ -210,16 +269,18 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
             equal("report.repository", repo)
             equal("report.base_sha", base_sha, freshness=True)
             equal("report.head_sha", head_sha)
-            ci_excluded = need("report.excluded", lambda value: _excluded_subset(value, excluded),
-                               f"a subset of {_shown(sorted(excluded))}")
+            ci_excluded = need("report.excluded", _paths, "a list of test file paths")
             need("report.scope", lambda value: isinstance(value, dict) and value.keys() == expected_scope.keys(),
                  f"an object with keys {_shown(sorted(expected_scope))}")
             for key in expected_scope:
                 if key != "excluded":
                     equal(f"report.scope.{key}", expected_scope[key])
-            need("report.scope.excluded", lambda value: _excluded_subset(value, expected_scope.get("excluded", [])),
-                 f"a subset of {_shown(expected_scope.get('excluded', []))}")
-            equal("report.scope.excluded", ci_excluded)
+            scope_excluded = need("report.scope.excluded", _paths, "a list of test file paths")
+            equal("report.excluded", scope_excluded)
+            if recorded is not None:
+                need("report.excluded", lambda value: set(value) == recorded,
+                     f"{_shown(sorted(recorded))} (exclusions of earlier shards)")
+            recorded = set(ci_excluded)
             shards = need("report.shard_count", lambda value: type(value) is int and 1 <= value <= 256,
                           "an integer from 1 to 256")
             equal("report.shard_count", len(expected_shards))
@@ -252,12 +313,12 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                     raise UnusableComparison(f"{path}: observed {_shown(dropped[0])}, "
                                              f"expected no tests from report.excluded {_shown(sorted(ci_excluded))}")
                 seen[side].update(ids)
-            # Files excluded since CI started are no longer protected.
-            lost.update(node for node in sides["base"][1] - sides["head"][1]
-                        if node.split("::", 1)[0] not in excluded)
+            # Tests from CI's excluded files are already rejected above, so every
+            # measured test stays protected even if it is excluded today.
+            lost.update(sides["base"][1] - sides["head"][1])
             reports[index] = evidence["report"]
             duration = max(duration, seconds)
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError, RecursionError, OverflowError) as exc:
             raise UnusableComparison(f"Unusable acceptance shard: {exc}") from exc
     if not expected_shards or set(reports) != expected_shards:
         raise MissingComparison(f"missing acceptance shards: report.shard_index: observed {_shown(sorted(reports))}, "
@@ -267,7 +328,44 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     return sorted(lost), duration
 
 
-def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None):
+def _refusal(exc):
+    """The refused branch as one word; the exception's text stays detail and decides nothing."""
+    if isinstance(exc, MissingComparison):
+        return "missing"
+    if isinstance(exc, StaleComparison):
+        return "stale"
+    if isinstance(exc, WorkflowChanged):
+        return "workflow-changed"
+    return "unavailable" if isinstance(exc, (TrackerError, GitError, OSError)) else "unusable"
+
+
+def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
+    """Record a changed refusal; acceptance with no reason only closes one still open."""
+    try:
+        run = ctx.store.get_run(n)
+        ctx.store.record_flow_change(
+            "ci-evidence", issue=n, run_started_at=run.started_at if run is not None else None,
+            only_if=None if reason else lambda latest: bool(latest and latest.get("refused")),
+            refused=reason is not None, reason=reason, detail=detail, base_sha=base_sha, head_sha=head)
+    except Exception:  # noqa: BLE001 - an observation never replaces the comparison's own result
+        return
+
+
+def reported_base(reports):
+    """The one base every shard reports measuring, or None."""
+    try:
+        bases = {item["report"]["base_sha"] for item in reports}
+    except (KeyError, TypeError):
+        return None
+    base = next(iter(bases), None) if len(bases) == 1 else None
+    return base if isinstance(base, str) else None
+
+
+def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
+                       later_base=None):
+    """Compare against ``base_sha``. CI measures whatever base the target had at
+    the push, so a caller may pass ``later_base(sha)`` to accept a report on a
+    later base it approves instead of waiting for a measurement that never comes."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
@@ -284,23 +382,25 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
     try:
-        if trusted_sha is None:
-            raise GitError("Default branch reference unavailable")
-        changed_workflows = attempt.git._call([
-            "diff", "--name-only", "-z", trusted_sha, head, "--",
-            ".github/workflows/foragent-acceptance*.yml",
-            ".github/workflows/foragent-acceptance*.yaml",
-        ])
+        workflows_changed = changed_workflows(attempt.git, trusted_sha, head)
     except GitError as exc:
-        changed_workflows = False
+        workflows_changed = False
         workflow_error = str(exc)
-    if changed_workflows:
+    if workflows_changed:
+        _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
         try:
             ci_local.fallback_comparison(attempt, base_sha)
+            _note_evidence(ctx, n, base_sha, head)
             return evidence
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
+    if ci_protection(ctx) and not ci_evidence_target(ctx, attempt.target_branch):
+        detail = (f"target {attempt.target_branch} cannot obtain foragent-acceptance CI evidence "
+                  "(checks: ci, no local fallback)")
+        _note_evidence(ctx, n, base_sha, head, "target-unsupported", detail)
+        flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
+        raise ExecutorStopped("held", detail)
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
@@ -311,11 +411,21 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
                                            expected_scope=scope,
                                            expected_shards=range(ctx.config.ci_shards))
+                recorded_reports = serialize_reports(reports)
                 break
-            except (MissingComparison, StaleComparison):
+            except (MissingComparison, StaleComparison) as exc:
+                reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
+                if (later_base is not None and reported is not None and reported != base_sha
+                        and later_base(reported)):
+                    base_sha = reported
+                    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
+                    scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
+                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
+                    continue
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
                 from foragent import runner
 
+                _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
                 remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
                 if infrastructure or remaining <= 0:
                     raise
@@ -323,34 +433,40 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
 
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
-    except (UnusableComparison, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.is_rate_limit:
+    except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
+        if isinstance(exc, TrackerError) and exc.waits:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
+        _note_evidence(ctx, n, base_sha, head, _refusal(exc), detail)
         # A local measurement is no substitute for current CI evidence.
         if ctx.config.checks_fallback == "local" and not isinstance(exc, StaleComparison):
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
+                _note_evidence(ctx, n, base_sha, head)
                 return evidence
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
         raise ExecutorStopped("held", detail) from exc
     ctx.store.update_run(n, comparison={"source": "ci", "duration_seconds": duration})
+    if not infrastructure:
+        _note_evidence(ctx, n, base_sha, head)  # A regression below fails the work, not this evidence.
     if lost:
         raise AttemptFailure("Acceptance baseline regression (previously passing tests):\n" + "\n".join(lost),
                              attempt.target_branch)
     if infrastructure:
+        _note_evidence(ctx, n, base_sha, head, "infrastructure", infrastructure)
         if ctx.config.checks_fallback == "local":
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
+                _note_evidence(ctx, n, base_sha, head)
                 return evidence
             except ci_local.LocalComparisonUnavailable as exc:
                 infrastructure += f"\n{exc}"
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                              json.dumps(reports, sort_keys=True))
+                              recorded_reports)
 
 
 def review_checks(n, ctx, git, target_branch):

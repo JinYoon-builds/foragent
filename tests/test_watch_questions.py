@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 import os
+import re
 
 from foragent import orch_inbox, watch_questions
 from foragent.state import StateStore
@@ -79,13 +80,13 @@ def test_an_answer_wins_over_a_needs_human_label_until_it_is_routed_again(tmp_pa
     asked = orch_inbox.ask(store, "Plan A or B?", ["A", "B"], 1, issues=[8])
     store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0], comments={8: [marker]})
     row = next(line for line in _frame(store, tracker, clock) if "#8" in line)
-    assert "waiting for you" in row and presence.counts(store, clock[0])[1] == 1
+    assert "question: you" in row and presence.counts(store, clock[0])[1] == 1
     orch_inbox.answer(store, asked["id"], "A")  # Answered at NOW, after the marker.
     found = watch_questions.collect(store)
     assert found.issues == {8: watch_questions.ANSWERED}
     frame = _frame(store, tracker, clock)
     row = next(line for line in frame if "#8" in line)
-    assert "waiting to restart" in row and "you" not in row, row
+    assert "wait: restart" in row and "you" not in row and "question" not in row, row
     assert "question" not in frame[0], frame[0]
     assert presence._question_groups(store, "en") == "" and presence.counts(store, clock[0])[1] == 0
     # Routed to the person again, later than the answer: the person's turn once more.
@@ -126,12 +127,14 @@ def test_a_question_names_its_recipient_whatever_the_work_state(tmp_path):
     _refresh(store, tracker, clock)
     for number in (11, 12):
         orch_inbox.ask(store, f"About #{number}?", ["a", "b"], 1, issues=[number])
-    frame = _frame(store, tracker, clock)  # No view state: the lane is folded.
-    rows = {number: next((line for line in frame if f"#{number} " in line), None) for number in (10, 11, 12, 13)}
-    assert "waiting for a turn" in rows[10], frame
-    assert rows[11] is not None and "waiting for you" in rows[11], frame
-    assert rows[12] is not None and "waiting for you" in rows[12], frame
-    assert rows[13] is None, "a folded lane still hides quiet queued work"
+    frame = _frame(store, tracker, clock)  # The text scene lists every acorn of the lane.
+    rows = {number: next((line for line in frame if re.search(rf"#{number}\b", line)), None)
+            for number in (10, 11, 12, 13)}
+    assert all(rows.values()), frame
+    for number in (11, 12):  # Queued and unapproved alike name the recipient.
+        assert "question: you" in rows[number], frame
+    for number in (10, 13):  # Quiet queued work asks nothing.
+        assert "question" not in rows[number] and "you" not in rows[number], frame
     assert presence._question_groups(store, "en") == " · questions: you 2"
 
 
@@ -292,3 +295,25 @@ def test_routing_after_asking_does_not_hide_the_answer(tmp_path):
     store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, clock[0],
                                comments={23: [marker(2), marker(10)]})  # Routed again after the answer.
     assert watch_questions.recipients(store) == {23: watch_questions.PERSON}
+
+
+def test_a_short_pixel_acorn_keeps_the_recipients_name(tmp_path, monkeypatch):
+    """Defect class: recipient names lost when a narrow pixel acorn drops its step word."""
+    from foragent import status, watch
+    from foragent.config import Config
+
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    _spec_question(store, tracker, 20, clock)
+    tracker.add_issue(21, "Asked", labels=["approved", "blocked", "lane:api"])
+    _refresh(store, tracker, clock)
+    orch_inbox.ask(store, "About #21?", ["a", "b"], 1, issues=[21])
+    for language, names in (("en", ("the orchestrator", "you")), ("ko", ("오케스트레이터", "진님"))):
+        config = Config(language=language, view_glyphs="emoji", lanes={"api": {"title": "Server side work"}})
+        snap = watch.collect(status.collect(store, config, clock[0]), tracker, store, config, clock[0])
+        frame = watch.render_frame(snap, config, store.root, width=24, now=clock[0]).splitlines()
+        for number, name in zip((20, 21), names):
+            row = next(line for line in frame if re.search(rf"#{number}\b", line))
+            assert name in row and watch._cells(row.rstrip()) <= 24, (language, row)

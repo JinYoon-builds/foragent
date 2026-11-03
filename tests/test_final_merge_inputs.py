@@ -8,7 +8,7 @@ import pytest
 
 from foragent import run_publish, runner
 from foragent.git import GitRepo
-from runner_support import batch_setup, run_case  # noqa: F401
+from runner_support import run_case  # noqa: F401
 from conftest import ACCEPTANCE, git_command
 
 
@@ -297,27 +297,3 @@ def test_requeuing_same_head_preserves_ci_wait_budget(queued_publish):
     assert case.tracker.merged_prs == []
     assert len(case.sleeps) == 40
     assert sum(case.sleeps) == 1200
-
-
-@pytest.mark.parametrize("reviewed", [False, True])
-def test_batch_parent_change_during_lock_wait_invalidates_target(run_case, monkeypatch, reviewed):
-    case = run_case
-    batch_setup(case)
-    if reviewed:
-        case.tracker.add_labels(1, ["risk:high"])
-        assert runner.run_issue(1, case.ctx) == "held"
-        case.now[0] += timedelta(seconds=1)
-        case.tracker.remove_labels(1, ["risk:high"])
-    lock = case.store.merge_lock
-
-    @contextmanager
-    def changed_parent():
-        case.tracker.set_parent(1, 98)
-        with lock():
-            yield
-
-    monkeypatch.setattr(case.store, "merge_lock", changed_parent)
-    outcome = (runner.review_only(1, case.ctx, verdict_head=case.tracker.pr_head_sha(100))
-               if reviewed else runner.run_issue(1, case.ctx))
-    assert outcome == "base-changed"
-    assert case.tracker.merged_prs == []

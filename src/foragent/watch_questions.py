@@ -34,9 +34,10 @@ needs-human question takes its kind from the reason recorded in its newest routi
 marker (``reasons.GROUP``: a review is a merge decision, a re-approval an order
 decision, anything else plain); without a marker it is plain.
 
-The spec flag's time is the earlier of its recorded time and when its file was
-written, so two writers' disagreeing clocks keep a question asked after the flag in
-the episode; a flag saved again later (a new spec question) still starts a new one.
+The spec question's time is its earliest record from the current run: the shared
+blocker's marker comment, the stored flag's own time and when its file was written. A
+later routing marker does not move it, two writers' disagreeing clocks keep a question
+asked after the flag in the episode, and a flag saved for a new run starts a new one.
 """
 
 from datetime import UTC, datetime
@@ -118,14 +119,17 @@ def collect(store, history: Iterable[Any] | None = None) -> Questions:
         if row.get("state") != "open":
             continue  # A closed issue waits for nobody, whatever its old records say.
         try:
-            flag = store.load_flag(number)
+            # Both records of a spec question: the shared blocker (waiting label + its newest
+            # marker comment) and the stored local flag written when the run stopped.
+            local = store.load_local_flag(number) if hasattr(store, "load_local_flag") else None
+            flags = [flag for flag in (store.load_flag(number), local) if flag is not None and flag.reason == SPEC]
             run = _latest_run(store, number, history)
         except (OSError, ValueError, TypeError, KeyError):
-            flag = run = None
-        # The current spec question: the flag says so and the latest run ended with it.
-        spec = flag is not None and flag.reason == SPEC and run is not None and run.outcome == SPEC
-        # The episode's start: the spec flag (saved after its run began), else the latest run's start.
-        start = _flagged(store, number, flag.flagged_at) if spec else _time(run.started_at) if run else None
+            flags, local, run = [], None, None
+        # The current spec question: a record says so and the latest run ended with it.
+        spec = bool(flags) and run is not None and run.outcome == SPEC
+        # The episode's start: the earliest record of that spec question, else the latest run's start.
+        start = _spec_start(store, number, flags, local, run) if spec else _time(run.started_at) if run else None
         current = lambda moment: moment is not None and (start is None or moment >= start)
         # An open question with no recorded asking time cannot be dated, so it is not hidden.
         waiting = {question for moment, question in asked.get(number, ()) if moment is None or current(moment)}
@@ -163,15 +167,23 @@ def _routed(row: dict[str, Any]) -> tuple[datetime | None, str]:
     return max(markers, key=lambda marker: marker[0], default=(None, PLAIN))
 
 
-def _flagged(store, number: int, flagged_at: str) -> datetime | None:
-    """When the flag was saved: the earlier of its recorded time and its file's write time."""
-    times = [moment for moment in (_time(flagged_at),) if moment is not None]
-    try:
-        written = (store.root / "flags" / f"{number}.json").stat().st_mtime
-        times.append(datetime.fromtimestamp(written, UTC))
-    except OSError:
-        pass
-    return min(times, default=None)
+def _spec_start(store, number: int, flags: list[Any], local: Any, run: Any) -> datetime | None:
+    """When the current spec question was raised: its earliest record that is not older than its run.
+
+    The shared flag's time is its newest marker comment, which a later routing (needs-human
+    with the same reason) moves forward, so it alone would hide a question asked before the
+    routing. The stored flag's own time and its file's write time count too (two writers'
+    clocks may disagree); a record from before the run began belongs to an earlier episode.
+    """
+    times = [moment for flag in flags if (moment := _time(flag.flagged_at)) is not None]
+    if local is not None and local in flags:
+        try:
+            times.append(datetime.fromtimestamp((store.root / "flags" / f"{number}.json").stat().st_mtime, UTC))
+        except OSError:
+            pass
+    begun = _time(run.started_at)
+    times = [moment for moment in times if begun is None or moment >= begun]
+    return min(times, default=begun)
 
 
 def waiting(found: dict[int, str], unlinked: int = 0) -> dict[str, int]:

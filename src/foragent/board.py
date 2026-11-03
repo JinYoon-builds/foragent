@@ -42,7 +42,7 @@ def card_warning(state: str) -> bool:
 
 FIELD_SELECTION = """... on ProjectV2SingleSelectField {
   id name options { id name color description }
-} ... on ProjectV2Field { id name } ... on ProjectV2IterationField { id name }"""
+} ... on ProjectV2Field { id name dataType } ... on ProjectV2IterationField { id name }"""
 
 
 def _data(tracker: Tracker, query: str, variables: dict) -> dict:
@@ -82,9 +82,20 @@ class Project:
                 return fields
             cursor = connection["pageInfo"]["endCursor"]
 
-    def ensure_fields(self, desired: dict[str, Iterable[str]], *, new_project: bool = False) -> dict[str, dict]:
-        fields = self.fields()
+    def ensure_fields(self, desired: dict[str, Iterable[str] | None], *, new_project: bool = False,
+                      fields: dict[str, dict] | None = None) -> dict[str, dict]:
+        fields = self.fields() if fields is None else fields
         for name, names in desired.items():
+            if names is None:  # Text projections have no select options.
+                field = fields.get(name)
+                if field is None:
+                    field = _data(self.tracker, """mutation ForagentCreateBoardField($input: CreateProjectV2FieldInput!) {
+                      createProjectV2Field(input: $input) { projectV2Field { """ + FIELD_SELECTION + """ } }
+                    }""", {"input": {"projectId": self.id, "name": name, "dataType": "TEXT"}})["createProjectV2Field"]["projectV2Field"]
+                elif field.get("dataType") != "TEXT":
+                    raise TrackerError(f"board field {name} must be text")
+                fields[name] = field
+                continue
             names = list(dict.fromkeys(names))
             field = fields.get(name)
             # Team columns and their metadata belong to the team. Only replace
@@ -356,14 +367,17 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
     recorded = getattr(tracker, "board_value", None)
     if not ctx.config.board or record is None or recorded is None:
         return
-    cards: dict[int, str] = {}
+    cards: dict[int, dict] = {}
     cursor = None
     try:
         while True:
             node = _data(tracker, """query ForagentBoardCards($id: ID!, $cursor: String) {
               node(id: $id) { ... on ProjectV2 { items(first: 100, after: $cursor) {
-                nodes { content { ... on Issue { number repository { nameWithOwner } } }
-                  fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } }
+                nodes { id content { ... on Issue { number repository { nameWithOwner } } }
+                  fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+                  fieldValues(first: 100) { nodes { ... on ProjectV2ItemFieldTextValue {
+                    text field { ... on ProjectV2Field { name } }
+                  } } } }
                 pageInfo { hasNextPage endCursor }
               } } }
             }""", {"id": ctx.config.board, "cursor": cursor})["node"]
@@ -374,7 +388,7 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
                 content = item.get("content") or {}
                 repository = (content.get("repository") or {}).get("nameWithOwner", "")
                 if content.get("number") is not None and repository.lower() == ctx.repo.lower():
-                    cards[content["number"]] = (item.get("fieldValueByName") or {}).get("name") or ""
+                    cards[content["number"]] = item
             if not connection["pageInfo"]["hasNextPage"]:
                 break
             cursor = connection["pageInfo"]["endCursor"]
@@ -383,10 +397,52 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
             raise
         log.warning("Could not read board cards for %s", ctx.repo, exc_info=True)
         return
-    for row in ctx.store.local_issues():
-        value = cards.get(row["number"], NO_CARD)
+    rows = ctx.store.local_issues()
+    for row in rows:
+        item = cards.get(row["number"])
+        value = ((item.get("fieldValueByName") or {}).get("name") or "") if item else NO_CARD
         if recorded(row["number"], ctx.config.board, "Status") != value:
             record(row["number"], ctx.config.board, "Status", value)
+    _refresh_waiting(ctx, tracker, rows, cards)
+
+
+def _refresh_waiting(ctx: BoardContext, tracker: Tracker, rows: list[dict], cards: dict[int, dict]) -> None:
+    """Project authored issue waits onto existing cards; only confirmed writes are cached."""
+    from foragent.order_waiting import section
+
+    project = Project(tracker, ctx.repo, ctx.config.board)
+    fields = None
+    for row in rows:
+        number = row["number"]
+        if number not in cards:
+            continue
+        value = (section(row.get("body")) or "") if row.get("state") != "closed" else ""
+        current = next((entry["text"] for entry in cards[number].get("fieldValues", {}).get("nodes", [])
+                        if (entry.get("field") or {}).get("name") == "Waiting"), "")
+        previous = tracker.board_value(number, project.id, "Waiting")
+        if current == value:
+            if previous != value and (previous is not None or value):
+                tracker.record_board_value(number, project.id, "Waiting", value)
+            continue
+        try:
+            if fields is None:
+                fields = project.fields()
+            if value:
+                fields = project.ensure_fields({"Waiting": None}, fields=fields)
+                _data(tracker, """mutation ForagentSetBoardValue($input: UpdateProjectV2ItemFieldValueInput!) {
+                  updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+                }""", {"input": {"projectId": project.id, "itemId": cards[number]["id"],
+                                 "fieldId": fields["Waiting"]["id"], "value": {"text": value}}})
+            elif "Waiting" in fields:
+                _data(tracker, """mutation ForagentClearBoardValue($input: ClearProjectV2ItemFieldValueInput!) {
+                  clearProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+                }""", {"input": {"projectId": project.id, "itemId": cards[number]["id"],
+                                 "fieldId": fields["Waiting"]["id"]}})
+            tracker.record_board_value(number, project.id, "Waiting", value)
+        except Exception as exc:
+            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+                raise
+            log.warning("Could not set board Waiting for issue #%s", number, exc_info=True)
 
 
 def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,

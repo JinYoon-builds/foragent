@@ -19,10 +19,10 @@ BASE_MODULES = (
 SCHEDULER_NAMES = (
     "APPROVED", "Approval", "BLOCKED", "Callable", "Config", "GitRepo", "Issue",
     "LabelEvent", "NEEDS_HUMAN", "Path", "READY", "RUNNING", "Reason", "StateStore",
-    "TickContext", "TickReport", "Tracker", "TrackerError", "UTC", "_batch_pr",
+    "TickContext", "TickReport", "Tracker", "TrackerError", "UTC",
     "_check_integrity", "_check_prerequisites", "_crash_detail", "_escalate_overdue_blocker",
     "_invalidate_approval", "_kill_executor", "_kill_run", "_latest_approval",
-    "_reconcile_batches", "_recover_orphan", "_recover_runs", "_restore_after_crash",
+    "_recover_orphan", "_recover_runs", "_restore_after_crash",
     "_restore_stalled", "_snapshot", "_tick_locked", "acceptance_paths", "append_event",
     "board", "body_hash", "dataclass", "datetime", "field", "flag", "format_approval_comment",
     "format_comment", "has_machine_check", "in_run_hours", "invalidate_approval", "issue_lane",

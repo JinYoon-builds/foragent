@@ -9,11 +9,12 @@ def settings_skill(name):
 
 
 def test_settings_ask_first_use_asks_only_merge_and_quota_with_batch_recommended():
+    """Reject first-use instructions that recommend the retired review mode."""
     text = settings_skill("fa-init")
     assert "fa settings set" in text, "First-use answers must use the same settings writer as the UI"
     assert re.search(r"(?:ask|question).{0,160}(?:only|just).{0,160}(?:review|merge).{0,240}(?:quota|claude_quota)", text)
-    assert re.search(r"batch.{0,35}(?:recommend|추천)|(?:recommend|추천).{0,35}batch", text)
-    for choice in ("fast", "batch", "careful", "keep", "burn"):
+    assert re.search(r"fast.{0,35}(?:recommend|추천)|(?:recommend|추천).{0,35}fast", text)
+    for choice in ("fast", "careful", "keep", "burn"):
         assert re.search(rf"\b{choice}\b", text), choice
     assert not re.search(r"(?:ask|question).{0,100}(?:review mode and executor|choose (?:an? )?executor)", text)
 

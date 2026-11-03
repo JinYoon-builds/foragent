@@ -38,13 +38,19 @@ def run(args) -> int:
         from foragent import lanes
         from foragent.commands import repo_store
 
-        config, _, store = repo_store(root)
+        config, repo, store = repo_store(root)
+        failures: list[str] = []
         try:
-            print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root))
+            print(lanes.talk(args.number, message=args.message, store=store, config=config, repo_root=root,
+                             accepted=lambda message: _publish_talk(cli, repo, store, config, args.number,
+                                                                    message, failures)))
         except lanes.LaneError as exc:
             if getattr(exc, "stdout", ""):  # A message still delivered goes to stdout; the failure to stderr.
                 print(exc.stdout)
             raise
+        finally:
+            for failure in failures:  # The message stays accepted locally; only its public copy failed.
+                print(failure, file=cli.sys.stderr)
         return 0
     if args.action == "dreamed":
         config = cli.load_config(root)
@@ -59,3 +65,14 @@ def run(args) -> int:
     print(f"Created lane:{args.name} ({', '.join(lane['paths'])})")
     cli._open_lane_view(root)
     return 0
+
+
+def _publish_talk(cli, repo: str, store, config, number: int, message: str, failures: list[str]) -> None:
+    """Keep an accepted talk message on the issue, verbatim; a refused write waits in the outbox."""
+    from foragent import orch_advice
+
+    tracker = cli.GhTracker(repo)
+    context = cli.SimpleNamespace(store=store, config=config, tracker=tracker,
+                                  now=lambda: cli.datetime.now(cli.UTC))
+    if error := orch_advice.publish(tracker, context, number, orch_advice.talk_body(message)):
+        failures.append(f"Could not copy the message to issue #{number} now ({error}); the gate will retry it.")
