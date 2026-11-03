@@ -323,8 +323,11 @@ def test_star_prompt_appears_only_in_the_human_briefing(star_case, capsys):
 
     config = replace(case.ctx.config, notify="claude-push")
     assert notify.send(config, "Build finished", "Finished issue #10")
-    outbox = case.store.root / "push-outbox.jsonl"
-    assert_no_offer(outbox.read_text(encoding="utf-8"), "Notifications must not carry a star request")
+    from test_view_notify import relayed  # #1650: alerts go to the planning session, not an outbox.
+
+    relayed_alerts = relayed(case.store)
+    assert relayed_alerts, "The alert must reach the planning session"
+    assert_no_offer(json.dumps(relayed_alerts, ensure_ascii=False), "Notifications must not carry a star request")
     body = case.tracker.get_issue(1).body
     parsed = parse_body(body)
     for prompt in (build_prompt(1, parsed, case.config.acceptance_dir),

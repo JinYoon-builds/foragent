@@ -14,8 +14,12 @@ from test_skills_autosync import cli_exit, isolated_home, write_global_config  #
 
 
 def records(repo):
-    path = StateStore.for_repo(repo).root / "push-outbox.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    # #1650: the unread push outbox is gone; read what the planning session relays to the person.
+    from test_view_notify import relayed
+
+    store = StateStore.for_repo(repo)
+    assert not (store.root.exists() and list(store.root.rglob("*outbox*")))
+    return relayed(store)
 
 
 @pytest.mark.parametrize("remote", ["git@github.com:offline/notify.git", "https://github.com/offline/notify.git"])
@@ -64,7 +68,7 @@ def test_public_notify_cannot_report_success_after_outbox_write_failure(tmp_path
     monkeypatch.chdir(root)
     state = StateStore.for_repo("offline/write-failure").root
     state.mkdir(parents=True)
-    (state / "push-outbox.jsonl").mkdir()  # Deterministic failure, even with privileged filesystem access.
+    (state / "orch-events.jsonl").mkdir()  # Deterministic failure, even with privileged filesystem access.
     code = cli_exit(cli.main, ["notify", "--title", "Failed", "--line", "Opaque", "--repo-root", str(root)])
     assert code != 0, "A failed outbox write cannot be reported as a successful CLI delivery"
     assert capsys.readouterr().err.strip(), "Delivery failure must be visible without reading logs"
