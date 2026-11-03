@@ -8,6 +8,7 @@ one row with the expected and the measured size is appended to ``sizes.jsonl``.
 """
 
 from datetime import UTC, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -86,7 +87,19 @@ def measure(git, base: str, head_sha: str) -> dict:
 
 
 ESTIMATES = "size-estimates.jsonl"
-_KEPT = ("key", "plan", "content", "files", "size")
+FROZEN = "run-estimates"
+
+
+def body_key(body: str) -> str:
+    """The authored content of an issue body: the same key whatever the gate or publish wrote on it.
+
+    Plan-child, owner, decision, ``foragent:write`` and ``foragent:waiting-prior`` marker lines, the
+    Waiting section and the Done when removal record are gate writing (``issue.authored_body``).
+    """
+    from foragent import order_done_when
+    from foragent.issue import authored_body
+
+    return hashlib.sha256(authored_body(order_done_when.without_record(body)).encode("utf-8")).hexdigest()
 
 
 def _append(root: Path, journal: str, entry: dict) -> None:
@@ -117,47 +130,92 @@ def _entries(root: Path, journal: str) -> list[dict]:
     return entries
 
 
-def retain(plan: dict, root: Path, config, store, by_number: dict) -> None:
-    """After a successful publication, keep the estimate of each published issue's exact preread.
+def retain(plan: dict, root: Path, config, store, by_number: dict, mapping: dict, tracker) -> None:
+    """Once every body of a publication is written, record each published body with its estimate.
 
-    The record is the one whose evidence key is this published plan (references included), so a
-    later reread of changed content or a publication that failed never replaces it. Approval by
-    ``--approve`` or later by label reads the same kept record. A failure here leaves the merge
-    comparison unknown and never fails the publication.
+    Called before any approval label or gate wake-up, so no run of these bodies can start before
+    its input is recorded. Every published legacy issue and edit gets an entry, so the latest
+    entry for a body always describes its latest publication: the estimate of the preread whose
+    evidence key is this exact published plan, or unknown (null) when no such preread exists.
+    A publication that stopped before writing records nothing; a failure never fails publication.
     """
     from foragent import order
 
     try:
-        records = order._preread_records(root)
-        items = [item for item in plan["issues"] if "statements" not in item]
+        try:
+            records = order._preread_records(root)
+        except order.PlanError:
+            records = {}
+        items = [item for item in plan["issues"] if "statements" not in item and item["key"] in mapping]
         items += [order.edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
                   if "statements" not in item and item["number"] in by_number]
         waiting, _ = order._uncreated_lanes(plan, config, items)
         for item in items:
-            if item["key"] in waiting:
-                continue  # no implementer read it before its lane existed
-            record = records.get(order.preread_target(plan, item, config, root)[2])
-            if isinstance(record, dict):
-                _append(store.root, ESTIMATES, {name: record.get(name) for name in _KEPT}
-                        | {"at": datetime.now(UTC).isoformat(timespec="seconds")})
-    except (OSError, ValueError, order.PlanError):
+            number = mapping[item["key"]] if not item.get("edit") else int(item["key"].lstrip("#"))
+            record = None
+            if item["key"] not in waiting:  # no implementer read it before its lane existed
+                record = records.get(order.preread_target(plan, item, config, root)[2])
+            record = record if isinstance(record, dict) else {}
+            size = record.get("size")
+            _append(store.root, ESTIMATES, {
+                "issue": number, "body": body_key(tracker.get_issue(number).body),
+                "files": record.get("files") or {}, "size": size if isinstance(size, dict) else None,
+                "at": datetime.now(UTC).isoformat(timespec="seconds")})
+    except (OSError, ValueError, KeyError, order.PlanError):
         pass
 
 
-def record(n: int, ctx, git, approval, base_sha: str, head_sha: str, pr: int, log=None) -> None:
-    """Retain one merged comparison; a failure is logged and never stops the merge."""
-    from foragent.order import latest_preread
+def freeze(store, number: int, approval, restarted: bool) -> None:
+    """At run start, fix this run's expected size; a restart of the same run keeps it.
 
+    The value belongs to the run, not to whatever approval is current later: a reapproval during
+    the run, a republication or a reread never changes it. It is the latest publication entry
+    for the approved authored body; if that entry's files disagree with the approval snapshot,
+    or there is no entry or no approval, it is unknown. Older entries are never fallen back on.
+    A failure never stops the run start.
+    """
+    path = store.root / FROZEN / f"{number}.json"
+    try:
+        if restarted and path.exists():
+            return
+        size = None
+        if approval is not None:
+            key, snapshot, latest = body_key(approval.body), approval.acceptance_blobs or {}, None
+            for entry in _entries(store.root, ESTIMATES):
+                if entry.get("issue") == number and entry.get("body") == key:
+                    latest = entry
+            files = (latest or {}).get("files")
+            if isinstance(files, dict) and all(snapshot.get(name, sha) == sha for name, sha in files.items()):
+                size = latest.get("size") if isinstance(latest.get("size"), dict) else None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({
+            "issue": number, "approval_body_sha": getattr(approval, "body_sha", None),
+            "approved_at": getattr(approval, "approved_at", None), "expected_size": size}), encoding="utf-8")
+        os.rename(temporary, path)  # atomic on POSIX, like the store's own record writes
+    except (OSError, ValueError):
+        return
+
+
+def frozen(store, number: int) -> dict | None:
+    """The expected size fixed at the start of this issue's current run, or None (unknown)."""
+    try:
+        value = json.loads((store.root / FROZEN / f"{number}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    size = value.get("expected_size") if isinstance(value, dict) else None
+    return size if isinstance(size, dict) else None
+
+
+def record(n: int, ctx, git, approval, base_sha: str, head_sha: str, pr: int, log=None) -> None:
+    """Retain one merged comparison; a failure is logged and never stops the merge.
+
+    The expected size is only the one fixed at run start (``freeze``); nothing is looked up again.
+    """
     try:
         base = git._call(["merge-base", base_sha, head_sha]).strip()
-        # The estimate is the one kept when this body was published (``retain``), matched by the
-        # approved body and snapshot; no preread made later and no file state is consulted.
-        latest = None if approval is None else latest_preread(
-            ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, None,
-            records=_entries(ctx.store.root, ESTIMATES))
-        expected = (latest or {}).get("size")
         _append(ctx.store.root, JOURNAL, {
-            "issue": n, "pr": pr, "expected_size": expected if isinstance(expected, dict) else None,
+            "issue": n, "pr": pr, "expected_size": frozen(ctx.store, n),
             "actual_size": measure(git, base, head_sha), "head": head_sha,
             "at": datetime.now(UTC).isoformat(timespec="seconds")})
     except Exception as exc:  # The merge already happened; the comparison is only a record of it.
