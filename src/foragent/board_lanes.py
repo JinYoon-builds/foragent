@@ -56,13 +56,30 @@ def owner(ctx, issue: Issue, lanes: dict[str, list[str]]) -> str | None:
     return next(iter(owners)) if len(owners) == 1 else None
 
 
-def _labels(ctx, lanes: dict[str, list[str]]) -> None:
-    """Create only the missing lane labels; an existing label keeps its colour and description."""
-    existing = ctx.tracker.label_names()
-    missing = [LabelSpec(f"{PREFIX}{name}", "ededed", f"Foragent lane {name}.")
-               for name in lanes if f"{PREFIX}{name}" not in existing]
-    if missing:
-        ctx.tracker.ensure_labels(missing)
+class _Labels:
+    """The configured lane labels, checked against GitHub's own label list at most once per pass.
+
+    Issue rows are never evidence that a label exists: a label deleted on GitHub after any read
+    would still show there. Only the label list is, so it is read before work depends on it.
+    """
+
+    def __init__(self, ctx, lanes: dict[str, list[str]]):
+        self.ctx, self.lanes, self.checked = ctx, lanes, None
+
+    def ensure(self) -> bool:
+        """Create only the missing lane labels; an existing label keeps its colour and description."""
+        if self.checked is None:
+            try:
+                existing = self.ctx.tracker.label_names()
+                missing = [LabelSpec(f"{PREFIX}{name}", "ededed", f"Foragent lane {name}.")
+                           for name in self.lanes if f"{PREFIX}{name}" not in existing]
+                if missing:
+                    self.ctx.tracker.ensure_labels(missing)
+                self.checked = True
+            except FAILURES as exc:
+                _deferred(exc, "lane labels")
+                self.checked = False
+        return self.checked
 
 
 FAILURES = (TrackerError, OSError)  # GitHub or transport failures defer; programming errors surface.
@@ -109,14 +126,14 @@ def _cards(ctx) -> dict[int, tuple[str, str | None]]:
 class _Board:
     """The configured board's Lane field and cards, read once per pass."""
 
-    def __init__(self, ctx, lanes: dict[str, list[str]], *, provision: bool):
+    def __init__(self, ctx, lanes: dict[str, list[str]]):
         self.ctx, self.field, self.cards = ctx, None, None
         if not ctx.config.board:
             return
         project = board.Project(ctx.tracker, ctx.repo, ctx.config.board)
         try:
             # Missing Lane options go after the existing ones, keeping their IDs; Status stays the team's.
-            fields = project.ensure_fields({"Lane": ["main", *lanes]}) if provision else project.fields()
+            fields = project.ensure_fields({"Lane": ["main", *lanes]})  # Writes only a missing option.
             self.field = fields.get("Lane")
             self.cards = _cards(ctx)
         except FAILURES as exc:
@@ -167,13 +184,11 @@ def reconcile(ctx, report=None) -> None:
     running = {run.number for run in ctx.store.active_runs()}
     if not (changed or confirming or pending - running):
         return  # Converged, or only running issues wait: no GitHub call.
-    if saved.get("lanes") != lanes:
-        try:
-            _labels(ctx, lanes)
-        except FAILURES as exc:
-            _deferred(exc, "lane labels")
-            return  # Nothing is recorded, so the next tick tries again.
-    cards = _Board(ctx, lanes, provision=changed)
+    labels = _Labels(ctx, lanes)
+    # A recorded change of the configured lanes always checks GitHub's labels on its own tick.
+    if saved.get("lanes") is not None and saved["lanes"] != lanes and not labels.ensure():
+        return  # Nothing is recorded, so the next tick tries again.
+    cards = _Board(ctx, lanes)  # Every pass adds a missing Lane option before it relies on one.
     full = changed or confirming
     waiting, seen = set(), set()
     for issue in local_issue_models(ctx.store):
@@ -192,6 +207,9 @@ def reconcile(ctx, report=None) -> None:
             waiting.add(issue.number)
             continue
         if not labelled:
+            if not labels.ensure():  # Any pass checks the labels before it applies one.
+                waiting.add(issue.number)
+                continue
             try:
                 if wanted not in issue.labels:
                     ctx.tracker.add_labels(issue.number, [wanted])

@@ -13,17 +13,33 @@ def body(*files):
     return "## Goal\nWork.\n## Files\n" + "".join(f"- {name}\n" for name in files) + "## Done when\n- done\n"
 
 
+def iso(tag):
+    """Listing tags t0, t1, ... as the store's ISO times."""
+    return f"2026-01-01T00:{int(tag[1:]):02d}:00+00:00"
+
+
 class Store:
+    """Rows are GitHub as of the latest listing, unless a test freezes an older snapshot."""
+
     def __init__(self, root, tracker, runs=()):
         self.root, self.tracker, self.runs = root, tracker, list(runs)
-        self.as_of, self.hidden = "t0", set()
+        self.as_of, self.hidden, self.frozen, self.outbox = "t0", set(), None, []
 
     def local_issues(self):
-        return [{"number": i.number, "title": i.title, "body": i.body, "labels": sorted(i.labels), "state": i.state}
+        if self.frozen is not None:
+            return [dict(row) for row in self.frozen]
+        return [{"number": i.number, "title": i.title, "body": i.body, "labels": sorted(i.labels), "state": i.state,
+                 "observed_at": iso(self.as_of)}
                 for i in self.tracker.issues.values() if i.number not in self.hidden]
 
+    def freeze(self):
+        self.frozen = self.local_issues()
+
     def issues_observation(self):
-        return {"as_of": self.as_of}
+        return {"as_of": iso(self.as_of)}
+
+    def github_outbox(self):
+        return list(self.outbox)
 
     def active_runs(self):
         return [SimpleNamespace(number=n) for n in self.runs]
@@ -158,6 +174,65 @@ def test_only_running_issues_waiting_reads_nothing(tmp_path):
     ctx.tracker.label_names = lambda: calls.append("label_names") or set()
     board_lanes.reconcile(ctx)
     assert calls == []
+
+
+def test_board_option_deleted_before_confirmation_is_added_again(tmp_path):
+    ctx = case(tmp_path, JOINED)
+    project = board.ensure(ctx.tracker, ctx.repo, ["old", "new"])
+    ctx.config.board = project
+    ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:old"])
+    board.add_issue(ctx.tracker, ctx.repo, project, 1, "old", "s")
+    board_lanes.reconcile(ctx)
+    ctx.config.lanes = SPLIT
+    board_lanes.reconcile(ctx)
+    field = board.Project(ctx.tracker, ctx.repo, project).fields()["Lane"]
+    ctx.tracker.graphql("""mutation ForagentUpdateBoardField($input: UpdateProjectV2FieldInput!) {
+      updateProjectV2Field(input: $input) { projectV2Field { id } } }""", {"input": {
+        "fieldId": field["id"], "singleSelectOptions": [o for o in field["options"] if o["name"] != "new"]}})
+    ctx.store.as_of = "t1"
+    board_lanes.reconcile(ctx)
+    from test_board import item_values
+    options = board.Project(ctx.tracker, ctx.repo, project).fields()["Lane"]["options"]
+    assert "new" in {o["name"] for o in options}
+    assert item_values(ctx.tracker, project, 1)["Lane"] == "new"
+    assert json.loads((tmp_path / board_lanes.STATE_FILE).read_text())["confirmed"] is True
+
+
+def test_label_deleted_after_the_last_listing_is_created_on_the_change_tick(tmp_path):
+    ctx = case(tmp_path, SPLIT)
+    ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:new"])
+    ctx.tracker.add_issue(2, "Two", body("service/b.py"), labels=["lane:old"])
+    board_lanes.reconcile(ctx)
+    ctx.store.as_of = "t1"
+    board_lanes.reconcile(ctx)
+    ctx.store.freeze()  # The store still shows the last listing, with lane:new on #1.
+    del ctx.tracker.labels["lane:new"]  # Deleting a label on GitHub removes it from its issues.
+    ctx.tracker.remove_labels(1, ["lane:new"])
+    ctx.tracker.writes.clear()
+    ctx.config.lanes = JOINED  # Only paths change, before any refresh.
+    board_lanes.reconcile(ctx)
+    assert ("ensure", ("lane:new",)) in ctx.tracker.writes, "Cached issue labels prove no label exists"
+    assert "lane:new" in ctx.tracker.labels
+
+
+def test_label_list_is_read_for_a_change_and_before_applying_a_label_only(tmp_path):
+    ctx = case(tmp_path, SPLIT)
+    ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:new"])
+    ctx.tracker.add_issue(2, "Two", body("service/b.py"), labels=["lane:old"])
+    calls = []
+    label_names = ctx.tracker.label_names
+    ctx.tracker.label_names = lambda: calls.append("label_names") or label_names()
+    board_lanes.reconcile(ctx)  # No recorded state and nothing to move: no label work.
+    assert calls == []
+    (tmp_path / board_lanes.STATE_FILE).unlink()
+    ctx.tracker.add_issue(3, "Three", body("product/c.py"), labels=["lane:old"])
+    board_lanes.reconcile(ctx)  # Moving #3 first checks that lane:new exists.
+    assert calls == ["label_names"] and ctx.tracker.get_issue(3).labels == {"lane:new"}
+    calls.clear()
+    ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}
+    board_lanes.reconcile(ctx)
+    assert calls == ["label_names"], "A recorded change always reads the label list once"
+    assert ("ensure", ("lane:extra",)) in ctx.tracker.writes
 
 
 def test_only_missing_labels_are_created(tmp_path):
