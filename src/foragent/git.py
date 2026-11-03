@@ -98,8 +98,12 @@ class GitRepo:
                 self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
                 return
             except GitError as exc:
-                # Another fetch can update the shared remote ref after Git reads it.
-                if "incorrect old value provided" not in str(exc) or attempt == 2:
+                # Another fetch can update the shared remote ref after Git reads it; Git reports
+                # that as an incorrect old value or, in newer versions, as a ref at another commit.
+                text = str(exc)
+                moved = "incorrect old value provided" in text or (
+                    "cannot lock ref" in text and "but expected" in text)
+                if not moved or attempt == 2:
                     raise
                 time.sleep(0.1 * (attempt + 1))
 

@@ -76,6 +76,7 @@ class Config:
     review_max: int = 2
     review_level: str = "low"
     review_pass_scope: bool = True  # False restores full/confirmation review after a saved PASS.
+    review_scoring: bool = True  # False lets every reviewer FAIL finding block without a scoring session (#1651).
     review_scope: str = "claude-local"
     review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
     review_reviewers: int = 1
