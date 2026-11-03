@@ -9,13 +9,10 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from foragent import notify
-from foragent.config import Config
 from foragent.orch_events import append_event
 from foragent.state import StateStore
 
@@ -23,14 +20,10 @@ REQUEST_STATUSES = ("new", "processing", "done")
 # What a person's question decides (#970): a D71 question, a merge approval or an order card.
 QUESTION_KINDS = ("question", "merge", "order")
 # A planning session that renewed its heartbeat this recently can still read a
-# cross-session message, so a new question does not need a push.
+# cross-session message; otherwise a question waits in the box for the next one.
 PLAN_HEARTBEAT_SECONDS = 120
 # The statusline renews an existing planning heartbeat only once it is this old.
 PLAN_RENEW_SECONDS = 60
-_QUESTION_PUSH = {
-    "en": ("A question needs your answer", "{id}: {question}"),
-    "ko": ("답할 질문이 있어요", "{id}: {question}"),
-}
 
 
 class InboxError(ValueError):
@@ -321,20 +314,6 @@ def renew_plan_heartbeat(store: StateStore) -> bool:
     if age is not None and age <= timedelta(seconds=PLAN_RENEW_SECONDS):
         return False
     write_plan_heartbeat(store)
-    return True
-
-
-def route_question(store: StateStore, config: Config, repo: str, record: dict[str, Any]) -> bool:
-    """Push a new question to the person only when no planning session is alive.
-
-    Returns whether a push was attempted. A live planning session reads the box
-    through a cross-session message instead.
-    """
-    if planning_alive(store):
-        return False
-    title, line = _QUESTION_PUSH.get(config.language, _QUESTION_PUSH["en"])
-    with notify.sending("question"):
-        notify.send(replace(config, repo=repo), title, line.format(**record))
     return True
 
 
