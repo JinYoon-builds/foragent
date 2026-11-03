@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -306,10 +306,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
     roles = timed("role_check", orch_role_schedule.startable, ctx, sample)  # So is a due role session.
+    drafts = timed("draft_check", orch_draft.startable, ctx, sample)  # Each placeholder issue's test draft too (#1729).
     if not ready:
         budget = timed("machine_budget", _machine_budget, ctx, ready, sample)
         orch_dream.start(ctx, dreams, budget, report)
         orch_role_schedule.dispatch(ctx, roles, budget, report)
+        orch_draft.start(ctx, drafts, budget, report)
         _reopen_view(ctx, report)
         return report
 
@@ -320,6 +322,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         return report
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
     orch_role_schedule.dispatch(ctx, roles, ctx._tick_budget, report)  # Then what the dream left.
+    orch_draft.start(ctx, drafts, ctx._tick_budget, report)  # Drafts never hold a ready issue's slot.
     _reopen_view(ctx, report)
     return report
 

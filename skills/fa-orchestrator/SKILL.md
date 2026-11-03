@@ -23,7 +23,7 @@ closes only that item. Use AskUserQuestion only while the person is talking dire
 session; otherwise record the question with `fa orch ask`, send it to planning and act on the recorded answer. The
 planning session runs `fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a
 planning handoff without a push: send it to planning as a cross-session message with SendMessage. If it is absent or
-its heartbeat is stale, `fa orch ask` sends the push itself, so do not add `fa notify`. New requests and answers wake
+its heartbeat is stale, the question waits in the FA inbox for the next planning session (PM), which asks the person; never push it to the person directly, not even with `fa notify`. New requests and answers wake
 `fa orch watch --follow` ([watch](references/watch.md)). Handle wait-resume notices: [waiting](references/waiting.md).
 
 ## Ask only D71 choices
@@ -110,8 +110,8 @@ Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why
 Read `fa inspect --json` for the human inbox and the original question/evidence. Ask as in the request box with 2–3
 choices, recommendation first and marked, plus deferral where useful. Explain what was tried and why this decision is
 needed. Record the chosen answer on the relevant issue with `fa inspect answer N --text "<chosen option and note>"`;
-keep deferred items pending. Carry requirement changes into an order edit; an answer alone is not re-approval. Push
-newly pending `needs-human` items and an empty queue with `fa notify` ([commands and timing](references/notify.md)).
+keep deferred items pending. Carry requirement changes into an order edit; an answer alone is not re-approval. Newly
+pending `needs-human` items and an empty queue reach the person through the PM, never by your own push ([PM route](references/notify.md)).
 Keep proposals, decisions and waits on their GitHub issue or linked unpublished request; each wait names its waiting reason, next condition and responsible role. On merge events, continue from those facts; memory holds reusable lessons.
 For a PR awaiting a human merge, follow [merge](references/merge.md): only after the person's explicit Merge choice is
 recorded by `fa orch answer`, run `fa orch merge PR --approved-by LOGIN --at ISO`; never merge through another
