@@ -11,7 +11,7 @@ from foragent.scheduler_stop import (
     _stop_already_refused, _stop_run_processes, registered_since, runner_alive,
 )
 from foragent.state import Run
-from foragent.tracker import Issue
+from foragent.tracker import Issue, TrackerError
 
 if TYPE_CHECKING:
     from foragent.scheduler import TickContext, TickReport
@@ -145,7 +145,7 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     )
-    if run is not None and run.outcome == "merged":
+    if run is not None and (ctx.store.run_merged(run) if getattr(ctx.config, "merge_owner", False) else run.outcome == "merged"):
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome == "limit-wait":
@@ -259,6 +259,19 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     if registered_since(ctx, run):  # The runner registered or progressed during the stop.
         return
+    if getattr(ctx.config, "merge_owner", False) and run.kind == "issue":
+        from foragent.merge_owner import pending
+
+        if pending(ctx.store, run.number):
+            ctx.git.remove_worktree(Path(run.worktree))
+            ctx.store.finish_run(run.number, outcome="merge-queued")
+            try:
+                ctx.tracker.remove_labels(run.number, [scheduler.RUNNING, scheduler.READY])
+            except TrackerError as exc:
+                # The durable admission keeps ownership. Owner reconciliation
+                # retries stale worker labels without blocking other admissions.
+                report.actions.append(f"#{run.number} admitted worker label cleanup deferred: {exc}")
+            return
     outcome = (run.outcome or "crashed") if run.kind == "issue" else "error"  # A dead dream: error, no labels.
     if run.executor_pgid is not None:
         ctx.store.update_run(run.key, executor_pgid=None)

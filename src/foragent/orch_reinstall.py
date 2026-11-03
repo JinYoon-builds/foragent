@@ -59,6 +59,9 @@ def _reinstall(ctx: "RunContext", base: str) -> str | None:
 
 def after_merge(ctx: "RunContext", pr: int, base: str) -> None:
     """Keep the successful merge even if installing or verifying fails."""
+    config = getattr(ctx, "config", None)
+    if getattr(config, "merge_owner", False) and base != config.base_branch:
+        return
     try:
         message = _reinstall(ctx, base)
     except Exception as exc:
