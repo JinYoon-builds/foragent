@@ -52,6 +52,9 @@ MESSAGES = {
         "scorecard_label_phase_test-slot-wait": "minutes waiting for a test slot",
         "scorecard_label_phase_run-slot-wait": "minutes waiting for a machine slot",
         "scorecard_label_phase_baseline": "baseline minutes",
+        "scorecard_decided": ("  decided issues waiting for tests now: {waiting}; decision to approval: "
+                              "{today} min today (unknown {unknown}), daily median {previous} min before "
+                              "(unknown {previous_unknown})"),
     },
     "ko": {
         "scorecard_today": ("최근 24시간: 실행 {runs}건, 머지 {merge_rate}, 승인부터 머지까지 {merge_minutes}분, "
@@ -102,5 +105,8 @@ MESSAGES = {
         "scorecard_label_phase_test-slot-wait": "시험 자리를 기다린 분",
         "scorecard_label_phase_run-slot-wait": "작업 자리를 기다린 분",
         "scorecard_label_phase_baseline": "기준선에 걸린 분",
+        "scorecard_decided": ("  지금 테스트를 기다리는 결정된 이슈: {waiting}; 결정부터 승인까지: "
+                              "오늘 {today}분 (알 수 없음 {unknown}건), 그 전 하루 중앙값 {previous}분 "
+                              "(알 수 없음 {previous_unknown}건)"),
     },
 }

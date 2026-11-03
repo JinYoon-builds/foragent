@@ -31,6 +31,9 @@ MESSAGES = {
         "facts_baseline": "Baseline capture: latest {duration} s, {share}% of the {limit} s limit",
         "facts_baseline_near": "; near the limit",
         "facts_baseline_none": "Baseline capture: no measured capture yet (limit {limit} s)",
+        "facts_tests_waiting": "Decided issues waiting for tests: {count}{issues}",
+        "facts_decision_to_approval": ("Decision to approval (last {days} days): median {median} min, "
+                                       "{approved} approved, unknown {unknown}"),
     },
     "ko": {
         "facts_schedule_role": ("예약 {role}: {state}; 주문 {orders}; 입력 기준 {cutoff}; 마지막 시도 {attempt}; "
@@ -62,5 +65,8 @@ MESSAGES = {
         "facts_baseline": "기준선 캡처: 최근 {duration} s, 한도 {limit} s의 {share}%",
         "facts_baseline_near": "; 한도에 가까움",
         "facts_baseline_none": "기준선 캡처: 아직 측정된 캡처 없음 (한도 {limit} s)",
+        "facts_tests_waiting": "테스트를 기다리는 결정된 이슈: {count}{issues}",
+        "facts_decision_to_approval": ("결정부터 승인까지(최근 {days}일): 중앙값 {median}분, "
+                                       "승인 {approved}건, 알 수 없음 {unknown}건"),
     },
 }

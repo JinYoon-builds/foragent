@@ -256,13 +256,16 @@ class IssueObservationsMixin:
         return approval.approved_at if approval is not None else None
 
     def _observe(self, snapshot: dict[str, Any], number: int, facts: dict[str, Any] | None, at: datetime,
-                 lanes: dict | None, *, since_revision: int | None = None, by_person: bool = True) -> str:
+                 lanes: dict | None, *, since_revision: int | None = None, by_person: bool = True,
+                 created_at: str | None = None) -> str:
         """Ingest one observation; the single writer of observed facts.
 
         Returns "stale" when the stored observation started later (nothing
         changes), "dropped" when it dropped an intent unsent, else "applied".
         Equal start times let this later ingest win, except in a bulk refresh
         (``since_revision``) against a row saved after the refresh began.
+        ``created_at`` is GitHub's creation time when the read carried it; it is
+        kept on the row and never inferred.
         """
         from foragent.labels import issue_lane
 
@@ -292,6 +295,8 @@ class IssueObservationsMixin:
             _state._forget_reads(row)
         lane = issue_lane(facts["labels"], lanes) if lanes is not None else row.get("lane", "main")
         row.update(facts, lane=lane, observed_at=at.isoformat())
+        if created_at:
+            row["created_at"] = created_at
         return "dropped" if self._retire(snapshot, number, facts, at, by_person=by_person) else "applied"
 
     def _record_issue_states(self, snapshot: dict[str, Any], before: dict[str, tuple], at: datetime, seen: Any = (),
@@ -357,7 +362,8 @@ class IssueObservationsMixin:
                 if issue.is_pull_request:
                     continue
                 seen.add(issue.number)
-                outcome = self._observe(snapshot, issue.number, issue_facts(issue), started_at, lanes)
+                outcome = self._observe(snapshot, issue.number, issue_facts(issue), started_at, lanes,
+                                        created_at=getattr(issue, "created_at", None))
                 if outcome != "stale":
                     applied.add(issue.number)
                 if outcome == "dropped":
