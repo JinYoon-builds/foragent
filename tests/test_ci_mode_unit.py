@@ -1752,10 +1752,11 @@ def test_ci_evidence_authentication_failure_ends_the_run_instead_of_holding(tmp_
     """#1208: a refused credential is not missing evidence; it propagates to the auth-failed outcome."""
     from conftest import BASE_TIME
     from foragent import ci_mode
+    from foragent.auth_retry import AuthExhausted
     from foragent.tracker import TrackerError
 
     def refuse(*args):
-        raise TrackerError('gh: Bad credentials (HTTP 401)')
+        raise AuthExhausted(TrackerError('gh: Bad credentials (HTTP 401)'))
     flags = []
     ctx = SimpleNamespace(
         repo='owner/repo', repo_root=tmp_path, config=Config(checks='ci', test_command='pytest'),
@@ -1771,6 +1772,6 @@ def test_ci_evidence_authentication_failure_ends_the_run_instead_of_holding(tmp_
     monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
     monkeypatch.setattr(ci_mode, 'flag', lambda *args: flags.append(args))
     monkeypatch.setattr('foragent.runner._remaining', lambda *args: 3600)
-    with pytest.raises(TrackerError) as raised:
+    with pytest.raises(AuthExhausted) as raised:
         ci_mode.require_comparison(attempt, 2, 'head', base_sha='base')
     assert raised.value.is_auth_failure and flags == []

@@ -20,6 +20,7 @@ from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
 from foragent.skills import Skill, SkillManager, with_vendored_library
+from foragent.auth_retry import AuthExhausted
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -213,7 +214,7 @@ def _identity_notes(tracker: Tracker, config: Config) -> list[str]:
 
     try:
         login = tracker.authenticated_login(refresh=True)
-    except (TrackerError, ValueError) as exc:
+    except (TrackerError, ValueError, AuthExhausted) as exc:
         return [text("init_identity_failed", config.language, error=" ".join(str(exc).split())[:300])]
     notes = [text("init_identity", config.language, login=login)]
     if config.legacy_owner is None:

@@ -3230,7 +3230,9 @@ def test_auth_failed_issue_waits_for_orch_retry_instead_of_restarting(ctx, label
     ctx.tracker.add_labels(1, ["ready"])  # a ready label alone (the runner's limit wait adds one too)
     tick(ctx)
     assert launches == [], "a ready label without `fa orch retry` restarted the auth-failed issue"
+    assert "ready" not in ctx.tracker.get_issue(1).labels, "a held auth-failed issue keeps neither ready nor running"
     request_retry(ctx, ctx.now())  # what `fa orch retry` records before adding ready
+    ctx.tracker.add_labels(1, ["ready"])
     tick(ctx)
     assert launches == [1]
 

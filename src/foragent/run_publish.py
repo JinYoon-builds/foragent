@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from foragent import board, cuts, irreversible_paths, review_perspectives, risks, run_auth_failed
 from foragent import run_merge_turn as merge_turn
+from foragent.auth_retry import AuthExhausted
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
 from foragent.git import GitError, GitRepo, PublicationError

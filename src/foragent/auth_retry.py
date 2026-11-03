@@ -3,8 +3,10 @@
 A credential helper, SSH agent or token refresh can fail once and then work.
 Transport adapters retry such failures here, below the runner, so one run
 continues without repeating implementation work or publication effects.
-When the budget is used up the last error propagates and the runner records
-``auth-failed`` without blocking the issue.
+When the budget is used up the transport raises ``AuthExhausted``. It is not a
+``TrackerError`` or ``GitError``, so no handler that degrades an ordinary Git or
+GitHub failure (a missing PR, an unreadable log, a void check) can swallow it; it
+reaches the runner, which records ``auth-failed`` without blocking the issue.
 """
 
 from __future__ import annotations
@@ -25,7 +27,8 @@ _CREDENTIAL = re.compile(
     r"|\bHTTP(?:/\S+)?\s+401\b|returned error: 401\b"
     r"|could not read (?:Username|Password) for"  # Git asked for a credential nobody can type
     r"|agent refused operation|sign_and_send_pubkey: signing failed"  # SSH agent hiccups
-    r"|gh auth login|not logged in(?:to)? (?:to )?any (?:GitHub )?hosts",  # gh has no usable login
+    r"|gh auth login|not logged in(?:to)? (?:to )?any (?:GitHub )?hosts"  # gh has no usable login
+    r"|set the GH_(?:ENTERPRISE_)?TOKEN environment variable",  # gh in automation/Actions without a token
     re.I,
 )
 # Git's generic trailer after any failed SSH transport says only "no access".
@@ -40,6 +43,20 @@ _TRAILER_LINES = re.compile(
 )
 
 T = TypeVar("T")
+
+
+class AuthExhausted(Exception):
+    """The credential kept being refused for the whole retry budget (#1208).
+
+    Deliberately outside the Git and GitHub error types: it ends the run. ``cause``
+    is the last refusal; the message is its text, so the one-line report keeps it.
+    """
+
+    is_auth_failure = True
+
+    def __init__(self, cause: BaseException, attempts: int = ATTEMPTS):
+        super().__init__(str(cause))
+        self.cause, self.attempts = cause, attempts
 
 
 def is_auth_failure(text: str) -> bool:
@@ -58,7 +75,8 @@ def first_line(text: str) -> str:
 
 
 def describe(exc: BaseException) -> str:
-    return f"authentication failed after {ATTEMPTS} attempts: {first_line(str(exc))}"
+    attempts = getattr(exc, "attempts", ATTEMPTS)
+    return f"authentication failed after {attempts} attempt{'s' * (attempts != 1)}: {first_line(str(exc))}"
 
 
 def retry(call: Callable[[], T], is_auth: Callable[[Exception], bool],
@@ -68,8 +86,10 @@ def retry(call: Callable[[], T], is_auth: Callable[[Exception], bool],
         try:
             return call()
         except Exception as exc:
-            if attempt == ATTEMPTS - 1 or not is_auth(exc):
+            if not is_auth(exc):
                 raise
+            if attempt == ATTEMPTS - 1:
+                raise AuthExhausted(exc) from exc
         # Looked up at call time so a patched or injected sleep applies.
         (sleep or time.sleep)(WAITS[min(attempt, len(WAITS) - 1)])
     raise AssertionError("unreachable")

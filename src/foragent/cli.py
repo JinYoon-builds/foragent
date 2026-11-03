@@ -29,6 +29,7 @@ except ImportError:
 import yaml
 
 from foragent import __version__, adopt, bench, brief, brief_report, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_dream, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
+from foragent.auth_retry import AuthExhausted
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
 from foragent.init import init_repo
@@ -220,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError, design_session.DesignError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
-            order.PlanError, orch.OrchError, orch_inbox.InboxError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:
+            order.PlanError, orch.OrchError, orch_inbox.InboxError, LaneError, SkillError, PathError, json.JSONDecodeError,
+            AuthExhausted) as exc:
         print(f"foragent: {' '.join(str(exc).split())}", file=sys.stderr)
         return 1
 

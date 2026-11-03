@@ -57,7 +57,7 @@ def finish(n: int, ctx: RunContext, exc: BaseException, labels: bool = True) -> 
     if labels and result != "merged":
         try:
             ctx.tracker.remove_labels(n, [READY, RUNNING])
-        except TrackerError as error:
+        except (TrackerError, auth_retry.AuthExhausted) as error:
             # The same credential may refuse this too; the tick removes a stale label.
             append_event(ctx.store, ctx.now(), n, "cleanup-failed",
                          f"label removal failed: {auth_retry.first_line(str(error))}")

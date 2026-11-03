@@ -31,6 +31,7 @@ from foragent.paths import repo_path
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OWNED_MARKER, OwnershipError, effective_orderer, label_description, owner_label, parse_orderer
+from foragent.auth_retry import AuthExhausted
 from foragent.tracker import IdentityError, Issue, LabelSpec, Tracker, TrackerError, pr_issue_number
 
 
@@ -206,7 +207,7 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
     except IdentityError as exc:
         identity = {"identity": {"login": None, "error": text(
             "identity_not_a_person", config.language, login=exc.login, kind=exc.kind)}}
-    except (TrackerError, OwnershipError) as exc:
+    except (TrackerError, OwnershipError, AuthExhausted) as exc:
         identity = {"identity": {"login": None, "error": text(
             "init_identity_failed", config.language, error=exc)}}
     feedback, decisions, other_orders, owner_errors = [], [], [], {}
@@ -568,7 +569,7 @@ def _order_owner(tracker: Tracker, config: Config, parent, children: list) -> st
         login = tracker.authenticated_login()
     except IdentityError as exc:
         raise PlanError(text("identity_not_a_person", language, login=exc.login, kind=exc.kind)) from exc
-    except TrackerError as exc:
+    except (TrackerError, AuthExhausted) as exc:
         raise PlanError(text("identity_unavailable", language, error=" ".join(str(exc).split())[:300])) from exc
     try:
         for issue in children:

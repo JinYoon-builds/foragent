@@ -76,6 +76,8 @@ def _check_prerequisites(
     from foragent import run_auth_failed
 
     if run_auth_failed.held(ctx.store, issue.number, approval.approved_at):  # #1208: `fa orch retry` decides
+        if scheduler.READY in issue.labels:  # a left-behind ready (refused cleanup, limit wait) must go too
+            ctx.tracker.remove_labels(issue.number, [scheduler.READY])
         return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None

@@ -58,7 +58,7 @@ def _trusted_sha(git, tracker):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.escalates:
+        if isinstance(exc, TrackerError) and exc.waits:
             raise
         return None
 
@@ -123,7 +123,7 @@ class ComparisonEvidence:
             return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                 "missing", "no acceptance reports at this read")
         except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.escalates:
+            if isinstance(exc, TrackerError) and exc.waits:
                 raise
             return _refusal(exc), str(exc)
 
@@ -434,7 +434,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.escalates:
+        if isinstance(exc, TrackerError) and exc.waits:
             raise
         detail = f"{exc}\n{infrastructure}".strip()
         _note_evidence(ctx, n, base_sha, head, _refusal(exc), detail)

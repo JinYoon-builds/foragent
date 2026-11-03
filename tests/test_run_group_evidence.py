@@ -336,37 +336,38 @@ def test_leader_spends_its_own_pass_only_across_neutral_commits(history):
 
 def test_refused_credential_reading_evidence_ends_the_run_instead_of_voiding(history, monkeypatch):
     """#1208: a refused read is not void evidence; it propagates to auth-failed."""
+    from foragent.auth_retry import AuthExhausted
     from foragent.git import GitError
 
     main = history.merge_1()
 
     def refused_head(pr):
-        raise TrackerError("gh: Bad credentials (HTTP 401)")
+        raise AuthExhausted(TrackerError("gh: Bad credentials (HTTP 401)"))
     history.ctx.tracker.pr_head_sha = refused_head
-    with pytest.raises(TrackerError):
+    with pytest.raises(AuthExhausted):
         evidence.void_reason(history.ctx, 4, "h4", main)
     history.ctx.tracker.pr_head_sha = lambda pr: history.heads[pr]
     real_call = history.ctx.git._call
 
     def refused_log(args):
         if args[:1] == ["log"]:
-            raise GitError("fatal: Could not read from remote repository.")
+            raise AuthExhausted(GitError("fatal: Could not read from remote repository."))
         return real_call(args)
     monkeypatch.setattr(history.ctx.git, "_call", refused_log)
-    with pytest.raises(GitError):
+    with pytest.raises(AuthExhausted):
         evidence.void_reason(history.ctx, 4, "h4", main)
 
 
 def test_refused_provenance_fetch_after_the_merge_keeps_merged_with_its_reason(history, monkeypatch):
+    from foragent.auth_retry import AuthExhausted
     from foragent.git import GitError
 
     def refuse(remote="origin", ref=None):
-        raise GitError("git@github.com: Permission denied (publickey).")
+        raise AuthExhausted(GitError("git@github.com: Permission denied (publickey)."))
     monkeypatch.setattr(history.ctx.git, "fetch", refuse)
     history.ctx.store.record_merge(1, NOW)  # the publication records the merge first
-    evidence.record_merge(1, history.ctx, "main", history.base, history.head_1)
-    run = history.ctx.store.get_run(1)
-    assert run.outcome == "merged" and "publickey" in run.detail
-    path = history.ctx.store.root / "orch-events.jsonl"
-    kinds = [e["kind"] for e in map(json.loads, path.read_text().splitlines()) if e.get("issue") == 1]
-    assert kinds.count("auth-failed") == 1 and merge_events(history.ctx)[-1]["commit"] is None
+    with pytest.raises(AuthExhausted):  # not swallowed as "unattributed": the runner ends the run
+        evidence.record_merge(1, history.ctx, "main", history.base, history.head_1)
+    from foragent import run_auth_failed
+
+    assert run_auth_failed.outcome(history.ctx, 1) == "merged", "the merge already happened: the run stays merged"

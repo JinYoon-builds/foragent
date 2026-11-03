@@ -7,6 +7,7 @@ import logging
 from typing import Protocol
 
 from foragent.config import Config
+from foragent.auth_retry import AuthExhausted
 from foragent.tracker import Issue, Tracker, TrackerError
 
 
@@ -348,8 +349,8 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
         elif (column := board_column(status, ctx.config.board_map)) is not None:
             _current.get().set_values(issue, {"Status": column}, add=False)
     except Exception as exc:
-        if isinstance(exc, TrackerError) and (exc.is_rate_limit or exc.is_auth_failure):
-            raise  # a GitHub wait or an exhausted credential retry is the run's outcome, not a warning
+        if isinstance(exc, AuthExhausted) or isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise  # a GitHub wait or an exhausted credential retry (#1208) is the run's outcome, not a warning
         log.warning("Could not set board Status to %s for issue %s", status,
                     getattr(issue, "number", issue), exc_info=True)
     finally:
@@ -393,8 +394,8 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
                 break
             cursor = connection["pageInfo"]["endCursor"]
     except Exception as exc:
-        if isinstance(exc, TrackerError) and (exc.is_rate_limit or exc.is_auth_failure):
-            raise  # a GitHub wait or an exhausted credential retry is the run's outcome, not a warning
+        if isinstance(exc, AuthExhausted) or isinstance(exc, TrackerError) and exc.is_rate_limit:
+            raise  # a GitHub wait or an exhausted credential retry (#1208) is the run's outcome, not a warning
         log.warning("Could not read board cards for %s", ctx.repo, exc_info=True)
         return
     rows = ctx.store.local_issues()
@@ -440,7 +441,7 @@ def _refresh_waiting(ctx: BoardContext, tracker: Tracker, rows: list[dict], card
                                  "fieldId": fields["Waiting"]["id"]}})
             tracker.record_board_value(number, project.id, "Waiting", value)
         except Exception as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
+            if isinstance(exc, AuthExhausted) or isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
             log.warning("Could not set board Waiting for issue #%s", number, exc_info=True)
 
@@ -458,7 +459,7 @@ def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,
             return
         values["Status"] = column
         Project(tracker, repo, project_id, board_map).set_values(issue, values, initial_status=True)
-    except TrackerError:
+    except (TrackerError, AuthExhausted):
         raise
     except Exception:
         log.warning("Could not add issue #%s to board", issue, exc_info=True)

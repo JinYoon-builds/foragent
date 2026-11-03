@@ -1345,7 +1345,9 @@ def test_gh_bad_paginated_json(output):
 
 def test_gh_failures_include_stderr():
     message = "gh: authentication required (HTTP 401)"
-    with pytest.raises(TrackerError) as error:
+    from foragent.auth_retry import AuthExhausted
+
+    with pytest.raises(AuthExhausted) as error:
         # A 401 retries within the authentication budget (#1208) and keeps its stderr.
         GhTracker(REPO, ScriptedRun(*[gh_error(message)] * 3), sleep=lambda seconds: None).get_issue(1)
     assert str(error.value) == message

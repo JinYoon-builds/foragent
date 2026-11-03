@@ -302,6 +302,7 @@ def test_refused_credential_while_combining_ends_the_run_but_other_git_errors_ar
     import pytest
 
     from foragent import ci_mode, run_baseline, run_implementation
+    from foragent.auth_retry import AuthExhausted
     from foragent.git import GitError
     from foragent.run_baseline import AcceptanceBaseline
 
@@ -318,9 +319,10 @@ def test_refused_credential_while_combining_ends_the_run_but_other_git_errors_ar
     message = ["git@github.com: Permission denied (publickey)."]
 
     def combine(git, base, members):
-        raise GitError(message[0])
+        error = GitError(message[0])
+        raise AuthExhausted(error) if error.is_auth_failure else error
     monkeypatch.setattr(group, "_combine", combine)
-    with pytest.raises(GitError):
+    with pytest.raises(AuthExhausted):
         group.check(5, ctx, place, "h5", "main-sha", set())
     message[0] = "fatal: merge-tree conflict"
     group.check(5, ctx, place, "h5", "other-sha", set())

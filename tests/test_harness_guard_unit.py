@@ -274,19 +274,21 @@ def test_held_publication_with_a_refused_credential_ends_the_run_instead_of_hold
     import pytest
 
     from foragent import harness_guard, run_publish
+    from foragent.auth_retry import AuthExhausted
     from foragent.git import GitError
 
     flags, message = [], ["git@github.com: Permission denied (publickey)."]
 
     def push(attempt):
-        raise GitError(message[0])
+        error = GitError(message[0])
+        raise AuthExhausted(error) if error.is_auth_failure else error
     monkeypatch.setattr(run_publish, "commit_exclusions", lambda attempt, title: None)
     monkeypatch.setattr(run_publish, "_push_branch", push)
     monkeypatch.setattr(run_publish, "flag", lambda *args, **kwargs: flags.append(args))
     ctx = SimpleNamespace(tracker=SimpleNamespace(get_issue=lambda n: SimpleNamespace(title="T")),
                           config=SimpleNamespace(language="en"), repo="o/r")
     attempt = SimpleNamespace(n=1, ctx=ctx, failure="held paths")
-    with pytest.raises(GitError):
+    with pytest.raises(AuthExhausted):
         harness_guard.publish_hold(attempt)
     assert flags == []
     message[0] = "fatal: the remote end hung up unexpectedly"

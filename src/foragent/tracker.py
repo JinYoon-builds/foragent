@@ -124,6 +124,10 @@ class Tracker(Protocol):
                  subject: str | None = None) -> None: ...
 
 
+_RATE_LIMIT = re.compile(
+    r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)", re.I)
+
+
 class TrackerError(RuntimeError):
     """A gh operation failed; the message contains its stderr."""
 
@@ -153,21 +157,14 @@ class TrackerError(RuntimeError):
 
     @property
     def is_rate_limit(self) -> bool:
-        diagnostic = f"{self}\n{self.stdout}"
-        return bool(re.search(
-            r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
-            diagnostic, re.I,
-        ))
+        return bool(_RATE_LIMIT.search(f"{self}\n{self.stdout}"))
 
     @property
     def is_auth_failure(self) -> bool:
-        return not self.is_rate_limit and auth_retry.is_auth_failure(
-            str(self) if self.stderr is None else self.stderr)
-
-    @property
-    def escalates(self) -> bool:
-        """A run stops for this error instead of degrading: it waits (``waits``) or ends auth-failed (#1208)."""
-        return self.waits or self.is_auth_failure
+        # gh's own diagnostic decides, never stdout: a paginated read's earlier pages are data
+        # and may mention a rate limit while this page's stderr says 401 (#1208).
+        text = str(self) if self.stderr is None else self.stderr
+        return not _RATE_LIMIT.search(text) and auth_retry.is_auth_failure(text)
 
     @property
     def is_not_found(self) -> bool:
@@ -524,8 +521,9 @@ class RecordingTracker:
         entry = self._queue(n, action, started, premise, field_payload) if action != "comment" else None
         try:
             result = operation()
-        except TrackerError as exc:
-            retry = self.queue_writes and exc.is_rate_limit
+        except (TrackerError, auth_retry.AuthExhausted) as exc:
+            # An exhausted credential is final too: its intent must not wait to be resent each tick (#1208).
+            retry = self.queue_writes and isinstance(exc, TrackerError) and exc.is_rate_limit
             if entry is not None and retry and field_payload != payload:
                 store.record_github_attempt(entry["id"], started, False, final=True)
                 entry = None  # Retry the unsent composite close, preserving its original premise.
@@ -593,6 +591,12 @@ class RecordingTracker:
                         store.acknowledge_github_comment(entry, result)
                     else:
                         store.record_github_attempt(entry["id"], started, True)
+            except auth_retry.AuthExhausted:
+                # The budget is spent: the intent is abandoned, never resent with a fresh budget next tick (#1208).
+                if started is not None:
+                    store.record_github_attempt(queued["id"], started, False, final=True,
+                                                labels=[label] if action == "remove_labels" else None)
+                raise
             except TrackerError as exc:
                 if started is not None and action != "comment":
                     # Every field-send attempt is recorded, whatever its failure.
@@ -1082,9 +1086,14 @@ class GhTracker:
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
         if _combines_effects(args):
-            # Several writes: once one took effect the command is not one idempotent step,
-            # so it gets a single attempt and fails as before (#1208, scope option A).
-            return self._attempt(args, input, binary)
+            # Several writes: once one took effect the command is not one idempotent step, so it
+            # is never retried (#1208, scope option A); a refused credential still ends the run.
+            try:
+                return self._attempt(args, input, binary)
+            except TrackerError as exc:
+                if exc.is_auth_failure:
+                    raise auth_retry.AuthExhausted(exc, attempts=1) from exc
+                raise
         # One request refused with a 401 had no effect, so the call may retry (#1208).
         return auth_retry.retry(lambda: self._attempt(args, input, binary),
                                 lambda exc: isinstance(exc, TrackerError) and exc.is_auth_failure,

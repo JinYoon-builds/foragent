@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 import yaml
 
 from foragent import board, capacity, harness_guard, orch_github, run_auth_failed
+from foragent.auth_retry import AuthExhausted
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -322,7 +323,7 @@ def _implement_and_publish(
     except ExecutorStopped as exc:
         outcome = exc.outcome
         raise
-    except (TrackerError, GitError) as exc:
+    except (TrackerError, GitError, AuthExhausted) as exc:
         if run_auth_failed.is_auth_failure(exc):
             # The same credential would refuse a WIP push too; keep the WIP on the local branch.
             attempt.tracker_available, outcome = False, run_auth_failed.outcome(ctx, n)
@@ -441,7 +442,7 @@ def review_only(
                                 and not current.labels & {BLOCKED, READY}):
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
-                except TrackerError as exc:
+                except (TrackerError, AuthExhausted) as exc:
                     if run_auth_failed.is_auth_failure(exc):  # its reason is kept, not raised past the record
                         outcome, detail = run_auth_failed.finish(n, ctx, exc, labels=False)
                     elif not wait_for_rate_limit(n, ctx, exc):
