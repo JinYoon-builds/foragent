@@ -54,8 +54,9 @@ SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Counts that are worse on any rise above the baseline, not only on doubling (#1733): one more
 # person-wait is a new burden. A different ``oldest_issue`` is worse as any changed value is.
 RISING_FACTS = {"waiting_on_person": ("waiting",)}
-# Kinds re-raised by a worse burden alone (#1733): a clear (the kind absent for a tick) never
-# re-arms them, so a wait that ends and the same oldest item returning at the same count stay quiet.
+# Kinds re-raised by a worse burden alone, measured against the facts of the last raise, never
+# those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
+# that ends and the same oldest item returning at the same count stay quiet.
 EVIDENCE_ONLY = frozenset({"waiting_on_person"})
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.

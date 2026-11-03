@@ -557,3 +557,61 @@ def test_a_clear_still_rearms_a_mixed_signal_through_its_other_kind(store, tmp_p
     set_waiting(measured, 1, others=["hot_overlap_files"])
     assert len(orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=15))) == 1, (
         "The other kind keeps the cleared rule")
+
+
+def wait_numbers(waiting, oldest="#7", seconds=60):
+    return {WAIT: waiting_facts(waiting, oldest, seconds)["kinds"][WAIT]["numbers"]}
+
+
+def answered_at(store, tmp_path, measured, raised, answered):
+    """Raise at ``raised`` waiting items, answer while ``answered`` wait (measured at the answer)."""
+    measured["signals"][:] = [{"paths": [], "kinds": [WAIT]}]
+    set_waiting(measured, raised)
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "called", "looked",
+                           facts={"kinds": {WAIT: {"numbers": wait_numbers(answered)[WAIT]}}})
+    [record] = [row for row in orch_inbox.requests(store) if row["id"] == first["id"]]
+    assert record["answer_facts"]["kinds"][WAIT]["numbers"]["waiting"] == answered, "The answer measured its own count"
+    return record
+
+
+@pytest.mark.parametrize("raised,answered,now,due", [
+    (2, 1, 2, False),  # Back to the count of the raise: not more than at that raise.
+    (1, 2, 2, True),   # More than at the raise, even though the answer already saw two.
+])
+def test_waiting_compares_with_the_raise_not_the_answer(store, tmp_path, measured, raised, answered, now, due):
+    """#1733 review: the baseline of an evidence-only kind is the raise, on both re-raise paths."""
+    record = answered_at(store, tmp_path, measured, raised, answered)
+    facts = {"kinds": {WAIT: {"numbers": wait_numbers(now)[WAIT]}}}
+    assert orch_role_raise.worse(orch_role_raise.baseline(record), facts) is due
+    set_waiting(measured, now)
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=5))) == int(due)
+
+
+@pytest.mark.parametrize("raised,answered,now,due", [(2, 1, 2, False), (1, 2, 2, True)])
+def test_the_gate_call_compares_waiting_with_the_raise_too(store, tmp_path, measured, monkeypatch,
+                                                           raised, answered, now, due):
+    from foragent import orch_architect
+    monkeypatch.setattr(orch_architect, "session_alive", lambda record: False)
+    monkeypatch.setattr(orch_architect, "read_record", lambda store, name: None)
+    record = answered_at(store, tmp_path, measured, raised, answered)
+    facts = {"kinds": {WAIT: {"numbers": wait_numbers(now)[WAIT]}}}
+    called = orch_role_raise._gate_due(store, NOW, "security", "key", record, record, facts)
+    assert (called is not None) is due
+
+
+def test_a_different_oldest_than_at_the_raise_calls_even_if_the_answer_saw_it(store, tmp_path, measured):
+    measured["signals"][:] = [{"paths": [], "kinds": [WAIT]}]
+    set_waiting(measured, 2, oldest="#7")
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "busy",
+                           facts={"kinds": {WAIT: {"numbers": wait_numbers(2, "#8")[WAIT]}}})
+    set_waiting(measured, 2, oldest="#8")
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=5))) == 1, (
+        "#8 is a different oldest item than #7 at the raise")
+
+
+def test_other_kinds_keep_the_answer_as_their_baseline():
+    record = {"facts": {"kinds": {"hot_overlap_files": {"numbers": {"runs_by_file": {"a.py": 3}}}}},
+              "answer_facts": {"kinds": {"hot_overlap_files": {"numbers": {"runs_by_file": {"a.py": 3, "b.py": 3}}}}}}
+    assert orch_role_raise.baseline(record) == record["answer_facts"]

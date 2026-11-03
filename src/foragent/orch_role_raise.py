@@ -165,11 +165,25 @@ def baseline(record: dict[str, Any] | None) -> dict[str, Any] | None:
 
     That is ``answer_facts`` (measured by `fa orch signal-answer` or a finished gate dive), else
     the facts the request was raised with; None for a legacy request without facts.
+    A kind of ``orch_facts_kinds.EVIDENCE_ONLY`` is compared with what that raise saw instead
+    (#1733: "more items than at that raise, or a different oldest item"); absent from the raise,
+    any presence now is more than then. Both the inbox re-raise and the gate call read this.
     """
     if record is None:
         return None
     facts = record.get("answer_facts") or record.get("facts")
-    return facts if isinstance(facts, dict) else None
+    raised = record.get("facts")
+    if not isinstance(facts, dict) or not isinstance(raised, dict) or facts is raised:
+        return facts if isinstance(facts, dict) else None
+    facts = json.loads(json.dumps(facts, default=str))
+    kinds = facts.get("kinds") if isinstance(facts.get("kinds"), dict) else {}
+    for kind in orch_facts_kinds.EVIDENCE_ONLY:
+        kinds.pop(kind, None)
+        if kind in (raised.get("kinds") or {}):
+            kinds[kind] = raised["kinds"][kind]
+    if kinds or "kinds" in facts:
+        facts["kinds"] = kinds
+    return facts
 
 
 def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False) -> bool:
