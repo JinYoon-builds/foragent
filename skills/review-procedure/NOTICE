@@ -1,0 +1,12 @@
+review-procedure
+Copyright Anthropic, PBC
+
+This skill contains text copied from the code-review plugin in
+anthropics/claude-plugins-official (path plugins/code-review/commands/code-review.md,
+commit 4ca561fb8532594e7a5faef945e85096fcec0616, 2025-11-20), licensed under the
+Apache License, Version 2.0. See LICENSE.
+
+Changes by Foragent (2026-11-03): the review steps were rewritten for Foragent's
+reviewer, panel and scoring sessions; CLAUDE.md became the issue Goal, Out of scope
+and project rule documents; a fatal-path perspective and a grounding rule were added.
+The score table and the false-positive list are copied verbatim.

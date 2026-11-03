@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, risks
+from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, review_scoring, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -224,7 +224,8 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
-                   texts: tuple[str, ...], *, git: GitRepo | None = None) -> ReviewResult:
+                   texts: tuple[str, ...], *, git: GitRepo | None = None,
+                   parsed: ParsedIssue | None = None) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
@@ -232,6 +233,8 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
     _record_notes(n, ctx, round_number, *texts)
+    # Every FAIL finding, in any round, gets one scoring session; only a grounded one blocks (#1651).
+    review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
@@ -419,7 +422,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
-                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git)
+                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git,
+                          parsed=parsed)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
