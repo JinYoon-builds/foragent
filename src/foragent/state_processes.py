@@ -20,7 +20,7 @@ def prune_process_identities(store, *, inactive_only: bool = False) -> None:
     with store._state_lock():
         for path in (store.root / "runs").glob("*.json"):
             run = (store.get_run(int(path.stem)) if path.stem.isdigit()
-                   else store.get_dream(path.stem.removeprefix("dream-")) if path.stem.startswith("dream-") else None)
+                   else store.get_run(path.stem) if path.stem.startswith(("dream-", "draft-")) else None)
             if run is None or (inactive_only and run.status == "running"):
                 continue
             # Recovery needs the runner's birth identity even after death or PID reuse.
