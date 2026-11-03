@@ -4,9 +4,9 @@ The gate calls ``ensure_orchestrator`` every tick. It opens one Claude session
 running ``/fa-orchestrator`` only when approved work exists, no orchestrator
 renewed its heartbeat lately, no recorded or gate-spawned orchestrator session
 is still running, no live lease holder sits in the seat (``orch_seat``), and no spawn happened in the last two minutes.
-The session opens in the background: a new Orca tab without focus, a detached
-tmux window, or ``claude --bg`` without a screen. The lane view stays beside the
-planning session, so nothing here splits a pane or switches focus.
+The session always opens hidden with ``claude --bg``, even when Orca or tmux is
+available (#1490): the person reaches it through the PM entrance. The lane view
+stays beside the planning session, so nothing here splits a pane or switches focus.
 """
 
 from contextlib import contextmanager
@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 from types import SimpleNamespace
 
@@ -162,12 +161,13 @@ def _orca(store: StateStore, root: Path) -> str | None:
 
 def _command(root: Path, store: StateStore, title: str, session_id: str | None = None,
              prompt: str | None = None) -> tuple[str, list[str]] | None:
-    """The launch argv for the first available screen.
+    """The launch argv: always ``claude --bg``, hidden from the person (#1490).
 
-    With ``session_id`` (#413) Claude gets ``--session-id`` and the role
-    environment as an ``env`` prefix in the Orca and tmux commands; the
-    background path takes that environment from ``_environment``. ``prompt``
-    follows ``/fa-orchestrator`` as its first message.
+    The orchestrator opens no person-facing terminal even when Orca or tmux is
+    available; the person talks to it through the PM entrance. With
+    ``session_id`` (#413) Claude gets ``--session-id``; its role environment
+    comes from ``_environment``. ``prompt`` follows ``/fa-orchestrator`` as
+    its first message.
     """
     claude = shutil.which("claude")
     if not claude:
@@ -176,14 +176,6 @@ def _command(root: Path, store: StateStore, title: str, session_id: str | None =
     agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
     named = ["--session-id", session_id] if session_id else []
     first = [prompt] if prompt else []
-    prefix = ["env", *(f"{key}={value}" for key, value in _role_env(session_id).items())] if session_id else []
-    session = shlex.join([*prefix, claude, *agent, *named, SKILL, *first])
-    if orca := _orca(store, root):
-        return "orca", [orca, "terminal", "create", "--worktree", f"path:{root}",
-                        "--title", title, "--command", session]
-    tmux = shutil.which("tmux") if os.environ.get("TMUX") else None
-    if tmux:
-        return "tmux", [tmux, "new-window", "-d", "-n", title, "-c", str(root), session]
     return "background", [claude, "--bg", "-n", title, *agent, *named, SKILL, *first]
 
 
