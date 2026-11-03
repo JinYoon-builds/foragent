@@ -10,10 +10,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from foragent import orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
 from foragent.state import Run, StateStore
+from foragent.state_observations import observed_facts
 
 HOLD_WINDOW = timedelta(days=7)
 HOLDS = 2
@@ -26,7 +28,8 @@ CONCENTRATION_WINDOW = timedelta(hours=6)
 CONCENTRATION_RUNS = 8
 CONCENTRATION_IDLE = 2
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration")
+         "lane_concentration", "waiting_on_person")
+WAITING_LABEL = "needs-human"
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
@@ -37,7 +40,13 @@ ENTITY_FACTS = {
     "repeated_design_holds": ("holds_by_issue",),
     "idle_lanes_with_backlog": ("idle_lanes", "ready_by_lane"),
 }
-VALUE_FACTS = {"files_over_limit": ("limit",)}
+# Any change of these values is evidence.
+VALUE_FACTS = {"files_over_limit": ("limit",), "waiting_on_person": ("oldest_issue",)}
+# These counts are evidence only when they rise above the last raise (#1733): fewer items stay quiet.
+RISING_FACTS = {"waiting_on_person": ("waiting",)}
+# Kinds re-raised by evidence alone (#1733): a clear (the kind absent for a tick) never re-arms them,
+# so a wait that ends and the same oldest item returning at the same count stay quiet.
+EVIDENCE_ONLY = frozenset({"waiting_on_person"})
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
@@ -140,6 +149,40 @@ def lane_concentration(store: StateStore, config: Config, now: datetime, running
     return bool(lane_concentration_numbers(store, config, now, running))
 
 
+def _waits(labels: Any, state: Any) -> bool:
+    return state == "open" and WAITING_LABEL in (labels or ())
+
+
+def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
+    """Open issues labelled needs-human, from observed issue state only (#1733).
+
+    The current observation (each stored issue row) says who waits. The retained issue-state
+    history says since when: the first record of the latest unbroken run of records showing
+    the issue open with the label. When trimming cut that run, its earliest kept record counts,
+    and an issue with no such record yet counts from its row's observation; both are lower bounds.
+    """
+    history = orch_scorecard_history.records(store)
+    starts: dict[int, datetime] = {}
+    for key, row in store._issue_view()["issues"].items():
+        if not key.isdigit() or row.get("is_pull_request") or row.get("observed_at") is None:
+            continue
+        facts = observed_facts(row)
+        if not _waits(facts["labels"], facts["state"]):
+            continue
+        start = None
+        for at, data in reversed(history.get(int(key), [])):
+            if not _waits(data.get("labels"), data.get("state")):
+                break
+            start = at
+        if (start := start or _time(row["observed_at"])) is not None:
+            starts[int(key)] = start
+    if not starts:
+        return {}
+    number, start = min(starts.items(), key=lambda item: (item[1], item[0]))
+    return {"waiting": len(starts), "oldest_issue": f"#{number}",
+            "oldest_waiting_seconds": max(0, int((now - start).total_seconds()))}
+
+
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
     """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
     numbers = {
@@ -148,6 +191,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "files_over_limit": files_over_limit_numbers(root),
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
+        "waiting_on_person": waiting_on_person_numbers(store, now),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}

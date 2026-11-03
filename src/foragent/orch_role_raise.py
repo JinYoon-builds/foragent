@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -122,11 +123,25 @@ def _same(left: Any, right: Any) -> bool:
     return json.dumps(left, sort_keys=True, default=str) == json.dumps(right, sort_keys=True, default=str)
 
 
+@dataclass(frozen=True)
+class Rising:
+    """A count that is new evidence only above its value at the last raise."""
+
+    value: Any
+
+    def above(self, before: Any) -> bool:
+        number, previous = self.value, getattr(before, "value", None)
+        if not isinstance(number, (int, float)) or isinstance(number, bool):
+            return False
+        return not isinstance(previous, (int, float)) or isinstance(previous, bool) or number > previous
+
+
 def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
     """Project raw request facts into affected entities and relevant constraints.
 
     This also reads pre-upgrade fingerprints, without changing persisted records.
-    Unprojected kinds (including lane_concentration) retain their raw numbers.
+    Unprojected kinds (including lane_concentration) retain their raw numbers. A projected
+    kind's other numbers (such as an age) are never evidence.
     """
     result: dict[tuple[str, ...], Any] = {}
     if "files" in facts:
@@ -134,11 +149,13 @@ def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
     for kind, item in facts.get("kinds", {}).items():
         numbers = item.get("numbers") or {}
         result[(kind,)] = True
-        if kind in orch_facts_kinds.ENTITY_FACTS:
-            for field in orch_facts_kinds.ENTITY_FACTS[kind]:
+        if kind in orch_facts_kinds.ENTITY_FACTS or kind in orch_facts_kinds.RISING_FACTS:
+            for field in orch_facts_kinds.ENTITY_FACTS.get(kind, ()):
                 result[(kind, field)] = frozenset(numbers.get(field) or ())
             for field in orch_facts_kinds.VALUE_FACTS.get(kind, ()):
                 result[(kind, field)] = numbers.get(field)
+            for field in orch_facts_kinds.RISING_FACTS.get(kind, ()):
+                result[(kind, field)] = Rising(numbers.get(field))
         else:
             result[(kind, "numbers")] = numbers
         for field in orch_facts_kinds.SHARED_FACTS.get(kind, ()):
@@ -155,9 +172,23 @@ def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
         if isinstance(value, frozenset):
             if value - before[key]:
                 return True
+        elif isinstance(value, Rising):
+            if value.above(before[key]):
+                return True
         elif not _same(before[key], value):
             return True
     return False
+
+
+def clear_rearms(facts: dict[str, Any]) -> bool:
+    """Whether a clear since the last raise may re-arm a signal with these current facts.
+
+    Matched files and met kinds outside ``orch_facts_kinds.EVIDENCE_ONLY`` keep the cleared rule;
+    a signal met only through evidence-only kinds is re-raised by ``new_evidence`` alone, whether
+    the clear came after the answer or while the request was still open.
+    """
+    return bool(facts.get("files")) or any(kind not in orch_facts_kinds.EVIDENCE_ONLY
+                                           for kind in facts.get("kinds", {}))
 
 
 def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[str, Any]]:
@@ -165,7 +196,7 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
 
     A signal (role plus its {paths, kinds} item) is never raised while an earlier request
     for it is not done. Once that request is done, it is raised again when a tick saw it unmet
-    since that raise, or its facts contain new evidence beyond the last raise, regardless
+    since that raise (unless it is met now only through evidence-only kinds), or its facts contain new evidence beyond the last raise, regardless
     of its answer. Time alone is not evidence. Only legacy requests without stored facts
     use the cooldown.
     """
@@ -196,7 +227,7 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
                 if previous.get("status") != "done":
                     continue
                 if "facts" in previous:
-                    due = cleared or new_evidence(previous["facts"], facts)
+                    due = (cleared and clear_rearms(facts)) or new_evidence(previous["facts"], facts)
                 else:
                     due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:

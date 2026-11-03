@@ -345,8 +345,11 @@ def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, t
     measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
     store.clock[0] = NOW + timedelta(hours=13)
     assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
-    field = orch_facts_kinds.ENTITY_FACTS.get(kind, ("n",))[0]
-    measured["numbers"] = {kind: {field: {"new-entity": 3}}}
+    if kind in orch_facts_kinds.RISING_FACTS:  # A count rising above the raise is that kind's evidence.
+        measured["numbers"] = {kind: {orch_facts_kinds.RISING_FACTS[kind][0]: 2}}
+    else:
+        field = orch_facts_kinds.ENTITY_FACTS.get(kind, ("n",))[0]
+        measured["numbers"] = {kind: {field: {"new-entity": 3}}}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
 
 
@@ -427,3 +430,121 @@ def test_only_legacy_requests_without_facts_use_the_cooldown(store, tmp_path, me
     assert orch_role_raise.raise_due(store, tmp_path, NOW) == []
     store.clock[0] = NOW + timedelta(hours=13)
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1
+
+
+WAIT = "waiting_on_person"
+
+
+def waiting_store(store, rows, records):
+    """Observed issue rows ({number: (labels, state, observed_at)}) and issue-state records [(at, number, labels, state)]."""
+    issues = {str(number): {"number": number, "title": "", "body": "", "labels": labels, "state": state,
+                            "observed_at": at.isoformat()} for number, (labels, state, at) in rows.items()}
+    issues["99"] = {"number": 99, "labels": ["needs-human"], "state": "open", "is_pull_request": True,
+                    "observed_at": NOW.isoformat()}
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "issues.json").write_text(__import__("json").dumps({"issues": issues}), encoding="utf-8")
+    for at, number, labels, state in records:
+        store.clock[0] = at
+        store.record_flow("issue-state", issue=number, labels=labels, state=state, blocked_by=None)
+    store.clock[0] = NOW
+
+
+def test_waiting_counts_open_needs_human_issues_from_the_start_of_their_latest_stretch(store):
+    hour = timedelta(hours=1)
+    waiting_store(store, {
+        7: (["approved", "needs-human"], "open", NOW),
+        8: (["needs-human"], "open", NOW),
+        9: (["needs-human"], "closed", NOW),
+        10: (["approved"], "open", NOW),
+        11: (["needs-human"], "open", NOW - 2 * hour),  # No record yet: its observation is the lower bound.
+    }, [
+        (NOW - 10 * hour, 7, ["needs-human"], "open"),  # An earlier stretch, ended by the closing below.
+        (NOW - 9 * hour, 7, ["needs-human"], "closed"),
+        (NOW - 6 * hour, 7, ["needs-human"], "open"),  # The latest stretch starts here.
+        (NOW - 5 * hour, 7, ["approved", "needs-human"], "open"),  # Another label change keeps it.
+        (NOW - 8 * hour, 8, ["needs-human"], "open"),  # Trimmed history: the earliest kept record counts.
+        (NOW - 7 * hour, 8, [], "open"),
+        (NOW - 3 * hour, 8, ["needs-human"], "open"),
+        (NOW - 12 * hour, 9, ["needs-human"], "open"),
+    ])
+    assert orch_facts_kinds.waiting_on_person_numbers(store, NOW) == {
+        "waiting": 3, "oldest_issue": "#7", "oldest_waiting_seconds": 6 * 3600}
+
+
+def test_waiting_ties_break_by_the_lower_issue_and_nobody_waiting_is_absent(store):
+    waiting_store(store, {12: (["needs-human"], "open", NOW), 5: (["needs-human"], "open", NOW)},
+                  [(NOW - timedelta(hours=1), 12, ["needs-human"], "open"),
+                   (NOW - timedelta(hours=1), 5, ["needs-human"], "open")])
+    assert orch_facts_kinds.waiting_on_person_numbers(store, NOW)["oldest_issue"] == "#5"
+    waiting_store(store, {5: (["approved"], "open", NOW)}, [])
+    assert orch_facts_kinds.waiting_on_person_numbers(store, NOW) == {}
+
+
+def waiting_facts(waiting, oldest, seconds):
+    return {"kinds": {WAIT: {"numbers": {"waiting": waiting, "oldest_issue": oldest,
+                                         "oldest_waiting_seconds": seconds}}}}
+
+
+@pytest.mark.parametrize("current,due", [
+    (waiting_facts(3, "#7", 100), True),     # More items wait than at the raise.
+    (waiting_facts(2, "#8", 100), True),     # Same count, a different oldest item.
+    (waiting_facts(2, "#7", 999999), False),  # Only older.
+    (waiting_facts(1, "#7", 100), False),    # Fewer items.
+])
+def test_waiting_rearms_on_a_rising_count_or_a_new_oldest_item_only(current, due):
+    assert orch_role_raise.new_evidence(waiting_facts(2, "#7", 100), current) is due
+
+
+def test_waiting_after_answer_raises_once_more_on_a_rise(store, tmp_path, measured):
+    measured["signals"][:] = [{"paths": [], "kinds": [WAIT]}]
+    measured["kinds"] = {WAIT}
+    measured["numbers"] = {WAIT: waiting_facts(2, "#7", 60)["kinds"][WAIT]["numbers"]}
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "not-now", "the architect is busy")
+    for waiting, seconds in ((1, 600), (2, 86400)):
+        measured["numbers"] = {WAIT: waiting_facts(waiting, "#7", seconds)["kinds"][WAIT]["numbers"]}
+        assert orch_role_raise.raise_due(store, tmp_path, NOW) == []
+    measured["numbers"] = {WAIT: waiting_facts(3, "#7", 90000)["kinds"][WAIT]["numbers"]}
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW)) == 1
+
+
+def set_waiting(measured, waiting, oldest="#7", seconds=60, others=()):
+    measured["kinds"] = ({WAIT} if waiting else set()) | set(others)
+    measured["numbers"] = {**({WAIT: waiting_facts(waiting, oldest, seconds)["kinds"][WAIT]["numbers"]}
+                              if waiting else {}), **{kind: {"runs_by_file": {"a.py": 3}} for kind in others}}
+
+
+@pytest.mark.parametrize("cleared_while", ["answered", "open"])
+def test_a_wait_that_ends_and_returns_unchanged_stays_quiet(store, tmp_path, measured, cleared_while):
+    """#1733: a clear is not evidence for waiting_on_person, after the answer or before it."""
+    measured["signals"][:] = [{"paths": [], "kinds": [WAIT]}]
+    set_waiting(measured, 1)
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    if cleared_while == "answered":
+        orch_role_raise.answer(store, first["id"], "called", "looked")
+    set_waiting(measured, 0)
+    assert orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=5)) == []
+    assert clears(store), "The unmet signal is still recorded as cleared"
+    if cleared_while == "open":
+        orch_role_raise.answer(store, first["id"], "not-now", "later")
+    set_waiting(measured, 1, seconds=5)
+    for minutes in (10, 15):
+        assert orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=minutes)) == [], (
+            "The same oldest item at the same count is not new evidence")
+    set_waiting(measured, 1, oldest="#9")
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=20))) == 1
+
+
+def test_a_clear_still_rearms_a_mixed_signal_through_its_other_kind(store, tmp_path, measured):
+    measured["signals"][:] = [{"paths": [], "kinds": [WAIT, "hot_overlap_files"]}]
+    set_waiting(measured, 1, others=["hot_overlap_files"])
+    [first] = orch_role_raise.raise_due(store, tmp_path, NOW)
+    orch_role_raise.answer(store, first["id"], "called", "looked")
+    set_waiting(measured, 0)
+    orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=5))
+    set_waiting(measured, 1)
+    assert orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=10)) == [], (
+        "Met only through the waiting kind, the clear does not re-arm")
+    set_waiting(measured, 1, others=["hot_overlap_files"])
+    assert len(orch_role_raise.raise_due(store, tmp_path, NOW + timedelta(minutes=15))) == 1, (
+        "The other kind keeps the cleared rule")
