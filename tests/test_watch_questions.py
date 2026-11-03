@@ -317,3 +317,46 @@ def test_a_short_pixel_acorn_keeps_the_recipients_name(tmp_path, monkeypatch):
         for number, name in zip((20, 21), names):
             row = next(line for line in frame if re.search(rf"#{number}\b", line))
             assert name in row and watch._cells(row.rstrip()) <= 24, (language, row)
+
+
+def _explain(store, tracker, clock, number, language="en"):
+    from foragent import status, watch
+    from foragent.config import Config
+    from foragent.watch_sections.lane_bubble import explain
+
+    config = Config(language=language, view_glyphs="ascii", lanes={"api": {}})
+    snap = watch.collect(status.collect(store, config, clock[0]), tracker, store, config, clock[0])
+    rows = explain(("acorn", number), snap, config, store.root, now=clock[0], width=80, state={})
+    return "\n".join("".join(value for value, _ in line) for line in rows)
+
+
+def test_an_answered_question_leaves_every_summary_and_its_click_names_the_wait(tmp_path):
+    """Defect classes: stale routing in the scene summaries; a wait display needing a recorded phase."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    tracker.add_issue(8, "Pick a plan", labels=["approved", "needs-human", "lane:api"])  # No run: no phase.
+    _spec_question(store, tracker, 9, clock)
+    asked = orch_inbox.ask(store, "Plan A or B?", ["A", "B"], 1, issues=[8])
+    _refresh(store, tracker, clock)
+    assert "question to answer" in "\n".join(_frame(store, tracker, clock))
+    assert "I will ask you in the planning session." in _explain(store, tracker, clock, 8)
+    orch_inbox.answer(store, asked["id"], "A")  # needs-human stays on the issue.
+    frame = "\n".join(_frame(store, tracker, clock))
+    assert "question to answer" not in frame and "question" not in frame, frame
+    click = _explain(store, tracker, clock, 8)  # Its class is a wait now; it has no phase.
+    assert "waiting to restart" in click and "you" not in click, click
+    assert "waiting for the orchestrator" in _explain(store, tracker, clock, 9)
+
+
+def test_an_issue_less_question_names_its_recipient_in_the_header_and_bubble(tmp_path):
+    """Defect class: unlinked questions losing their recipient in summaries."""
+    clock = [NOW]
+    store, tracker = _store(tmp_path, clock), FakeTracker(now=lambda: clock[0])
+    tracker.add_issue(9, "Busy", labels=["approved", "lane:api"])
+    _refresh(store, tracker, clock)
+    orch_inbox.ask(store, "Keep the weekly report?", ["yes", "no"], 1)
+    for language, header, bubble in (("ko", "진님 답할 질문 1개", "진님, 답할 질문이 1개 있어요."),
+                                     ("en", "1 question to answer for you", "For you: 1 question to answer;")):
+        frame = _frame(store, tracker, clock, language)
+        assert header in frame[0], frame[0]
+        assert bubble in "\n".join(frame), frame

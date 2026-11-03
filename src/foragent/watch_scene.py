@@ -103,6 +103,21 @@ def today_count(snapshot: Snapshot, slug: Any) -> int:
     return (snapshot.today_done or {}).get(slug) or 0
 
 
+def question_numbers(snapshot: Snapshot) -> set[int]:
+    """Issues whose question awaits the person: the question projection's when collected
+    (an answered question no longer counts, whatever label remains), else the status group."""
+    if snapshot.questions is not None:
+        return {number for number, who in snapshot.questions.items() if who == "person"}
+    return questions(snapshot.status)
+
+
+def person_questions(snapshot: Snapshot) -> int:
+    """How many questions await the person: per issue, plus open ones that name no issue."""
+    if snapshot.questions is not None:
+        return len(question_numbers(snapshot)) + (snapshot.unlinked_questions or 0)
+    return len(questions(snapshot.status))
+
+
 def questions(status: dict[str, Any]) -> set[int]:
     """Distinct issue numbers in the needs-human group (the header counts the same)."""
     issues = status.get("issues")

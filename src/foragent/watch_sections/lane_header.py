@@ -32,9 +32,9 @@ def _questions(status: dict[str, Any], snapshot: Snapshot | None = None) -> int:
     as waiting_human in the summary, but they ask nothing, so the summary is not a fallback.
     """
     if snapshot is not None and snapshot.questions is not None:
-        from foragent import watch_questions
+        from foragent import watch_scene
 
-        return watch_questions.waiting(snapshot.questions, snapshot.unlinked_questions)[watch_questions.PERSON]
+        return watch_scene.person_questions(snapshot)
     issues = status.get("issues")
     group = issues.get("needs-human") if isinstance(issues, dict) else None
     return len({item.get("number") for item in group or () if isinstance(item, dict)})
@@ -77,8 +77,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     questions = _questions(status, snapshot)
     if questions:
         spans.append(("● " if not ascii_glyphs else "* ", "question"))
-        spans.append((t("lane_header_question") if questions == 1
-                      else t("lane_header_questions", count=questions), "question"))
+        # The count names its recipient: every question here awaits the person.
+        who = t("question_person")
+        spans.append((t("lane_header_question", who=who) if questions == 1
+                      else t("lane_header_questions", count=questions, who=who), "question"))
     else:
         active = _working(status)
         spans.append(("● " if not ascii_glyphs else "* ", "green" if active else "dim"))

@@ -338,7 +338,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     evidence = _evidence(snapshot, config, now)
     if evidence:
         out.append(watch_scene.fit_marked(evidence, width, "..." if ascii_glyphs else "…"))
-    needs = watch_scene.questions(snapshot.status)
+    needs = watch_scene.question_numbers(snapshot)
     lanes = []
     for row in watch_scene.lane_rows(snapshot.status):
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)
