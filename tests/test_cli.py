@@ -760,8 +760,9 @@ def test_notify_cli_resolves_repo_without_github_access(app, monkeypatch):
     root, git, tracker, store, _ = app
     monkeypatch.setattr(cli, "GhTracker", lambda *args: pytest.fail("notification must not contact GitHub"))
     assert cli.main(["notify", "--repo-root", str(root), "--title", "확인", "--line", "준비 완료"]) == 0
-    record = json.loads((store.root / "push-outbox.jsonl").read_text())
-    assert record == {"title": "확인", "line": "준비 완료", "link": None}
+    record = json.loads((store.root / "orch-events.jsonl").read_text())
+    assert (record["status"], record["summary"]) == ("for the person", "확인: 준비 완료")
+    assert not list(store.root.rglob("*outbox*"))
     assert git.remotes == ["origin"]
 
 

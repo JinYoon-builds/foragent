@@ -4,6 +4,8 @@ from dataclasses import asdict
 from threading import Barrier, BrokenBarrierError, Lock
 from types import SimpleNamespace
 
+import pytest
+
 from foragent.executors import ExecResult
 from foragent.issue import parse_body
 from foragent.runner import run_issue
@@ -11,8 +13,16 @@ from foragent.state import StateStore
 from runner_support import ScriptedExecutor
 from test_orch_review_handoff import bind_cli
 from test_risk_map import cli_ok, copy_history, offline
+from test_orch_review_handoff import answers_scores
 from test_review_perspectives import CHECKLIST, assert_checklist, perspective_case, review_offline
 from test_skills_autosync import cli_exit, isolated_home
+
+
+@pytest.fixture(autouse=True)
+def normal_machine_load(monkeypatch):
+    # #1651: the host's live load must not decide these overlap checks (they failed on main at load ~11).
+    from foragent import capacity
+    monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
 
 
 class PanelExecutor:
@@ -76,7 +86,7 @@ def install_panel(case, panel, *, implement=True):
 
     # The contract does not choose a model for the merge step. Capture calls to
     # either executor after the one ordinary implementation call.
-    executor = SimpleNamespace(run=execute)
+    executor = SimpleNamespace(run=answers_scores(execute))
     case.ctx.executor_factory = lambda name: executor
     # #1169 (2026-10-31, test owner): every reviewer counts in the shared machine budget,
     # so the panel gets a budget large enough for the concurrency these cases observe.

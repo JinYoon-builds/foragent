@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from test_orch_review_handoff import answers_scores
+
 from foragent import capacity
 from foragent.executors import ExecResult
 from foragent.runner import run_issue
@@ -23,7 +25,7 @@ from test_skills_autosync import isolated_home  # noqa: F401
 
 
 PROJECT = {"name": "observability", "focus": "PROJECT-TRACE: preserve diagnostic provenance"}
-PERSPECTIVE_COUNT = 5  # Four person-selected perspectives plus this project perspective.
+PERSPECTIVE_COUNT = 7  # Six default perspectives (#1651) plus this project perspective.
 MAPPED = "src/runtime/ownership.py"
 UNMAPPED = "src/ordinary.py"
 
@@ -57,7 +59,8 @@ def install_review(case, review):
         return review(**kwargs)
 
     # Both models are captured: choosing the merger's model belongs to the lane.
-    case.ctx.executor_factory = lambda name: SimpleNamespace(run=execute)
+    # #1651: scoring sessions get a confirming score and never consume the scripted review.
+    case.ctx.executor_factory = lambda name: SimpleNamespace(run=answers_scores(execute))
 
 
 class FirstRound:
@@ -131,10 +134,9 @@ def test_risk_round_assigns_each_perspective_the_whole_change(
     assert_first_round(panel)
     # Semantic prompt checks do not prescribe internal seat names or formatting.
     seats = [
-        r"goal[ -]+fidelity|fidel\w*.{0,60}goal",
-        r"concurren\w*.{0,80}order|order\w*.{0,80}concurren",
-        r"interrupt\w*.{0,80}rollback|rollback.{0,80}interrupt",
-        r"test[ -]+quality|quality.{0,40}test",
+        # #1651: the review-procedure skill's six default perspectives.
+        r"rule[ -]+documents", r"obvious[ -]+bugs", r"git[ -]+history",
+        r"earlier[ -]+pr[ -]+comments", r"code[ -]+comments", r"fatal[ -]+path",
         re.escape(PROJECT["focus"]),
     ]
     assigned = []

@@ -192,8 +192,8 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
         "- paths: [feature.txt]\n  why: Preserve the feature output.\n"
         "  guidance: Check the resulting file.\n"
     )})
-    # #1372 (2026-11-01, test owner): four perspective reviews plus one findings merge.
-    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    # #1372 (2026-11-01, test owner): one review per default perspective (six, #1651) plus one findings merge.
+    enable_reviewer(c, ["VERDICT: PASS"] * 7)
     c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
     payload = "evidence-BEGIN\n" + "e" * 70000 + "\nevidence-END"
     if entry == "run":
@@ -207,7 +207,7 @@ def test_native_review_markers_survive_oversized_creation_and_refresh(run_case, 
         c.now[0] += timedelta(seconds=1)
         pr = c.tracker.created_prs[0]
         c.tracker.update_pr(pr.number, base=pr.base, title=pr.title, body="Person's unrelated edit")
-        enable_reviewer(c, ["VERDICT: PASS"] * 5)
+        enable_reviewer(c, ["VERDICT: PASS"] * 7)
         c.ctx.config = replace(c.ctx.config, review="fast")
     calls = reject_oversized_bodies(c, monkeypatch)
 
@@ -289,7 +289,7 @@ def test_required_summary_alone_over_limit_stops_before_write(run_case, monkeypa
         head = git_command(c.history.origin, "rev-parse", "refs/heads/foragent/issue-1")
         c.tracker.set_pr_head_sha(pr, head)
         c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
-        enable_reviewer(c, ["VERDICT: PASS"] * 5)
+        enable_reviewer(c, ["VERDICT: PASS"] * 7)
     calls = reject_oversized_bodies(c, monkeypatch)
     outcome = run_issue(1, c.ctx) if entry == "run" else review_only(1, c.ctx)
     assert outcome == "pr-body-too-long"
@@ -315,7 +315,7 @@ def test_gate_update_overwrites_human_edits_without_reading_body(run_case, monke
     listing = c.tracker.list_prs
     monkeypatch.setattr(c.tracker, "list_prs", lambda *a, **kw: [
         replace(p, body=UnreadableBody("old body")) for p in listing(*a, **kw)])
-    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    enable_reviewer(c, ["VERDICT: PASS"] * 7)
     c.ctx.config = replace(c.ctx.config, review="fast", review_scope="pr-body")
     calls = reject_oversized_bodies(c, monkeypatch)
     assert review_only(1, c.ctx) == "merged"
@@ -346,7 +346,7 @@ def test_real_closing_reference_is_structured_not_the_first_closes_line(run_case
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-7", head)
     c.tracker.set_pr_head_sha(pr, head)
     c.tracker.set_pr_files(pr, ["feature.txt"])
-    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    enable_reviewer(c, ["VERDICT: PASS"] * 7)
     c.ctx.config = replace(c.ctx.config, review="fast", review_scope="pr-body")
     calls = reject_oversized_bodies(c, monkeypatch)
     assert review_only(7, c.ctx) == "merged"
@@ -363,7 +363,7 @@ def test_optional_marker_blocks_have_independent_shares(run_case, monkeypatch, l
     monkeypatch.setattr(run_publish, "_risk_notes", lambda attempt: risk)
     monkeypatch.setattr(run_review, "_lane_decisions", lambda *a: decisions)
     c.executor.steps[0][".foragent/TRY.md"] = CARD
-    enable_reviewer(c, ["VERDICT: PASS"] * 5)
+    enable_reviewer(c, ["VERDICT: PASS"] * 7)
     c.ctx.config = replace(c.ctx.config, review_scope="pr-body")
     calls = reject_oversized_bodies(c, monkeypatch)
     assert run_issue(1, c.ctx) == "merged"
