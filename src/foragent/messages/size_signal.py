@@ -9,6 +9,7 @@ MESSAGES = {
         "sizes_row": "#{issue} (PR #{pr}): expected {expected}, actual {actual} (source/tests/files)",
         "sizes_unknown": "unknown",
         "sizes_summary": "Wrong estimates: {wrong} of {compared} compared ({share}); {unknown} without an estimate",
+        "size_record_failed": "Could not record the expected size ({error}); nothing depends on it yet. Try again.",
         "config_size_limits_invalid": (
             "size_limits must map s, m and l to source_lines, test_lines and file_count, "
             "each a whole number of at least 0"
@@ -22,6 +23,7 @@ MESSAGES = {
         "sizes_row": "#{issue} (PR #{pr}): 예상 {expected}, 실제 {actual} (소스/시험/파일)",
         "sizes_unknown": "모름",
         "sizes_summary": "틀린 예상: 비교한 {compared}개 중 {wrong}개({share}), 예상 없는 것 {unknown}개",
+        "size_record_failed": "예상 크기를 기록하지 못했어요({error}). 아직 이 기록에 기대는 것은 없어요. 다시 해 주세요.",
         "config_size_limits_invalid": (
             "size_limits는 s, m, l마다 source_lines, test_lines, file_count를 0 이상의 정수로 적어야 해요"
         ),

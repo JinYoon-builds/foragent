@@ -87,6 +87,7 @@ def measure(git, base: str, head_sha: str) -> dict:
 
 
 ESTIMATES = "size-estimates.jsonl"
+PUBLISHED = "size-publications.jsonl"
 FROZEN = "run-estimates"
 
 
@@ -102,49 +103,72 @@ def body_key(body: str) -> str:
     return hashlib.sha256(authored_body(order_done_when.without_record(body)).encode("utf-8")).hexdigest()
 
 
+CORRUPT = {"corrupt": True}  # a line that did not parse: an interrupted or damaged write
+
+
 def _append(root: Path, journal: str, entry: dict) -> None:
-    """One O_APPEND write; the leading newline isolates an interrupted tail."""
+    """One O_APPEND line written in full or not at all reported as written.
+
+    A short write is continued until every byte is out; any failure raises, so no caller
+    believes a line exists that does not. The leading newline isolates an interrupted tail.
+    """
     payload = ("\n" + json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
     root.mkdir(parents=True, exist_ok=True)
     fd = os.open(root / journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, payload)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
 def _entries(root: Path, journal: str) -> list[dict]:
+    """Every line in order; a line that does not parse stays in place as ``CORRUPT``.
+
+    Readers that depend on the latest line treat a damaged line after it as unknown rather
+    than letting the line before it answer.
+    """
     try:
-        content = (root / journal).read_text(encoding="utf-8")
+        content = (root / journal).read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return []
     entries = []
     for line in content.splitlines():
+        if not line.strip():
+            continue
         try:
             entry = json.loads(line)
         except ValueError:
-            continue  # an interrupted tail
-        if isinstance(entry, dict):
-            entries.append(entry)
+            entry = None
+        entries.append(entry if isinstance(entry, dict) else CORRUPT)
     return entries
 
 
-def note(store, record: dict, body: str | None, digest: str | None = None) -> None:
-    """Keep a preread's estimate where every run start can see it, the moment the estimate is born.
+class RecordError(Exception):
+    """An estimate input could not be recorded; the caller stops before anything depends on it."""
 
-    ``body`` is the body publication will render for the issue; its authored key and the
-    record's issue key, plan and bound files identify which approved issue the estimate is for.
-    A failure leaves later runs unknown and never stops the preread.
+
+def note(store, record: dict, digest: str | None, language: str = "en") -> None:
+    """Keep a preread's estimate under its evidence key, before the preread record itself.
+
+    The note carries the preread record's own id. A run start reads it only through a publication
+    fact naming that exact record (evidence key and id), so a note whose record was never written,
+    or was replaced by an overlapping reread, is never read. If this write fails the preread fails
+    and records nothing.
     """
+    size = record.get("size")
     try:
-        size = record.get("size")
         _append(store.root, ESTIMATES, {
-            "key": record.get("key"), "plan": record.get("plan"), "body": body_key(body) if body else None,
+            "digest": digest, "record": record.get("id"), "key": record.get("key"),
             "files": record.get("files") or {}, "size": size if isinstance(size, dict) else None,
-            "digest": digest, "at": record.get("at")})
-    except (OSError, ValueError):
-        pass
+            "at": record.get("at")})
+    except (OSError, ValueError) as exc:
+        raise RecordError(text("size_record_failed", language, error=exc)) from exc
 
 
 def _run_path(store, number: int, run) -> Path:
@@ -153,32 +177,93 @@ def _run_path(store, number: int, run) -> Path:
     return store.root / FROZEN / f"{number}-{identity}.json"
 
 
-def _approved_estimate(store, number: int, approval) -> dict | None:
-    """The estimate every preread of the approved issue agreed on, else unknown.
+def _published_items(plan: dict, config, by_number: dict, mapping: dict) -> list[tuple[int, dict]]:
+    """(issue number, preread item) for each published legacy child already numbered and each edit."""
+    from foragent import order
 
-    A preread counts when it was for this issue (plan child key or edit of #n), the body it
-    read is the approved authored body, and the files it bound agree with the approval snapshot.
-    A reread of the same inputs (same evidence key) replaces its earlier answer. Prereads of the
-    same body with different references and different estimates cannot be told apart here, so
-    they read unknown rather than one of them standing in for the other.
+    items = [(mapping[item["key"]], item) for item in plan["issues"] if "statements" not in item and item["key"] in mapping]
+    items += [(item["number"], order.edit_view(item, by_number[item["number"]], config)) for item in plan.get("edits", [])
+              if "statements" not in item and item["number"] in by_number]
+    return items
+
+
+def publishing(plan: dict, config, store, by_number: dict, mapping: dict, language: str = "en") -> None:
+    """Before any issue write, mark each existing published issue as being republished.
+
+    Until ``published`` records the outcome, a run start reads such an issue as unknown, so a
+    publication that stops or fails to record its outcome never leaves an older fact standing
+    in. If this mark cannot be written, the publication stops before writing anything.
+    """
+    try:
+        for number, _ in _published_items(plan, config, by_number, mapping):
+            _append(store.root, PUBLISHED, {"issue": number, "phase": "publishing",
+                                            "at": datetime.now(UTC).isoformat(timespec="seconds")})
+    except (OSError, ValueError) as exc:
+        raise RecordError(text("size_record_failed", language, error=exc)) from exc
+
+
+def published(plan: dict, root: Path, config, store, by_number: dict, mapping: dict, tracker) -> None:
+    """Record the one fact a publication knows: which preread each published body was read with.
+
+    Called once every body of the publication is written and before any approval label or gate
+    wake-up. For each published legacy child and edit it appends the issue number, the authored
+    key of the body as written, and the evidence key of the preread of this exact published plan,
+    or None when no preread read it (a reference change without a reread, a lane not yet created).
+    No estimate is copied here; the run start reads it from the preread note of that key. A failed
+    write leaves the issue's last line at ``publishing`` (unknown), never an older fact.
     """
     from foragent import order
 
+    try:
+        try:
+            records = order._preread_records(root)
+        except order.PlanError:
+            records = {}
+        items = _published_items(plan, config, by_number, mapping)
+        waiting, _ = order._uncreated_lanes(plan, config, [item for _, item in items])
+        for number, item in items:
+            digest = record = None
+            if item["key"] not in waiting:
+                key = order.preread_target(plan, item, config, root)[2]
+                if isinstance(records.get(key), dict) and records[key].get("id"):
+                    digest, record = key, records[key]["id"]  # the record publication saw, not a copy of it
+            _append(store.root, PUBLISHED, {
+                "issue": number, "phase": "published", "body": body_key(tracker.get_issue(number).body),
+                "digest": digest, "record": record, "at": datetime.now(UTC).isoformat(timespec="seconds")})
+    except (OSError, ValueError, KeyError, order.PlanError):
+        pass
+
+
+def _approved_estimate(store, number: int, approval) -> dict | None:
+    """The estimate of the preread the approved body was published with, else unknown.
+
+    The latest publication fact for this issue and the approved authored body names the preread
+    record publication saw (evidence key and record id); the note of exactly that record gives the
+    estimate, if the files it bound agree with the approval snapshot.
+    No publication fact, a republication still marked ``publishing`` (its outcome never recorded),
+    a publication no preread read, or a disagreeing snapshot reads unknown.
+    """
     if approval is None:
         return None
-    # The plan-child marker may sit above later gate lines (write, waiting), so search the whole body.
-    child = order._CHILD_LINE.search(approval.body)
-    key, snapshot, answers = body_key(approval.body), approval.acceptance_blobs or {}, {}
+    key, chosen = body_key(approval.body), None
+    lines = _entries(store.root, PUBLISHED)
+    mine = [index for index, fact in enumerate(lines) if fact.get("issue") == number]
+    if not mine or lines[mine[-1]].get("phase") != "published" or CORRUPT in lines[mine[-1]:]:
+        return None  # never published, an unrecorded republication outcome, or a damaged later line
+    for index in mine:
+        if lines[index].get("phase") == "published" and lines[index].get("body") == key:
+            chosen = lines[index]
+    if not chosen or not chosen.get("digest") or not chosen.get("record"):
+        return None
+    note = None
     for entry in _entries(store.root, ESTIMATES):
-        files = entry.get("files")
-        mine = entry.get("key") == f"#{number}" or (
-            child is not None and entry.get("plan") == child[1] and entry.get("key") == child[2])
-        if mine and entry.get("body") == key and isinstance(files, dict) and all(
-                snapshot.get(name, sha) == sha for name, sha in files.items()):
-            # A reread of the same inputs (same evidence key) replaces its earlier answer.
-            answers[entry.get("digest") or id(entry)] = json.dumps(entry.get("size"), sort_keys=True)
-    sizes = set(answers.values())
-    return json.loads(sizes.pop()) if len(sizes) == 1 else None
+        if entry.get("digest") == chosen["digest"] and entry.get("record") == chosen["record"]:
+            note = entry
+    snapshot, files = approval.acceptance_blobs or {}, (note or {}).get("files")
+    if not isinstance(files, dict) or any(snapshot.get(name, sha) != sha for name, sha in files.items()):
+        return None
+    size = note.get("size")
+    return size if isinstance(size, dict) else None
 
 
 def freeze(store, number: int, approval, run, previous, restarted: bool) -> None:
