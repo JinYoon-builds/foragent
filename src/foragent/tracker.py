@@ -118,6 +118,7 @@ class Tracker(Protocol):
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
+    def label_names(self) -> set[str]: ...
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
@@ -919,6 +920,9 @@ class FakeTracker:
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         self.labels.update((spec.name, spec) for spec in specs)
 
+    def label_names(self) -> set[str]:
+        return set(self.labels)
+
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         self._close(n, comment, reason=reason)
 
@@ -1338,6 +1342,9 @@ class GhTracker:
     def list_comments(self, n: int) -> list[Comment]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/comments?per_page=100"]))
         return [Comment(item["id"], item["user"]["login"], item["body"], item["created_at"]) for item in data]
+
+    def label_names(self) -> set[str]:
+        return {item["name"] for item in _items(self._call(["api", "--paginate", f"{self._path}/labels?per_page=100"]))}
 
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         for spec in specs:

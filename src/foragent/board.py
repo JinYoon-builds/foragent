@@ -269,6 +269,13 @@ class ProjectContext:
 _current: ContextVar[Project | None] = ContextVar("foragent_board", default=None)
 
 
+def reconcile_lanes(ctx, report=None) -> None:
+    """The gate's lane label and board Lane reconciliation (board_lanes owns it)."""
+    from foragent import board_lanes
+
+    board_lanes.reconcile(ctx, report)
+
+
 def set_status(issue: Issue | int, status: str) -> None:
     """Set Status within the repository context established by sync_status."""
     if (project := _current.get()) is not None:

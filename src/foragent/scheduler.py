@@ -302,6 +302,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
         scheduler_flow.considered(ctx, ready)
+        timed("lane_reconcile", board.reconcile_lanes, ctx, report)  # After recovery: lane paths -> labels, board Lane (#1230).
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
