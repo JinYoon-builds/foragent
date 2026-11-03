@@ -17,7 +17,7 @@ from test_scorecard_flow import (
 from test_skills_autosync import isolated_home  # noqa: F401
 
 
-PARTS = {"work", "concurrency_cost", "machine_limit", "ordering", "waste", "unknown"}
+PARTS = {"work", "rework", "concurrency_cost", "machine_limit", "ordering", "waste", "unknown"}
 
 
 def write(case, kind, number=41, **data):
@@ -98,7 +98,7 @@ def test_five_parts_use_changed_facts_and_keep_closed_issue_history(flow, capsys
     value = split(card)
     assert value["total_minutes"] == pytest.approx(63)
     assert value["parts"] == pytest.approx({
-        "work": 21, "concurrency_cost": 17, "machine_limit": 5,
+        "work": 21, "rework": 0, "concurrency_cost": 17, "machine_limit": 5,
         "ordering": 4, "waste": 14, "unknown": 2,
     })
     # Latest dependencies/labels now say nothing about the first 18 minutes.

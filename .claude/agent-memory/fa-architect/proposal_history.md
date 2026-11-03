@@ -45,3 +45,4 @@ Newer proposals are tracked by request id in `fa orch inbox`. Treat these record
 - 2026-11-01 (r247 session): r244 outcome = Jin chose groups kept, not A; r201-r206 and r225 not re-measured
 - 2026-11-02 #1523 bar: one read of base, scratch collect, refuse before first write; drop order_collect_audit + post-commit Landing undo (disabled in temp worktree: Done when 12/12 + 15/15); flush retry file deletion handled apart (Decision: orchestrator) - expected: merge <=2 more runs, src +567 -> <=350; measured: pending
 - 2026-11-02 (same session): r271 round 8 1 finding, r262/r272 not measurable, r261 became #1599; pre-PASS 4th+ FAIL 140/7d left unproposed until #1599 is measured
+- 2026-11-02 r333: r330 P1 measured unused (in-run fix, #1619 PASS r11, PR +1510 > +1100 target); r332 files_over_limit suggested not-now (redo 0)

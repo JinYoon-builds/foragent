@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shlex
 import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -96,16 +97,29 @@ def test_session_start_replaces_stale_handle_and_existing_readers_use_it(handle_
     # The gate has neither the planning handle nor Orca on its own PATH.
     monkeypatch.delenv("ORCA_TERMINAL_HANDLE")
     monkeypatch.setenv("PATH", str(case.root / "no-gate-tools"))
-    assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "orca"
+    launch_options = []
+
+    def observe_launch(launch):
+        def observed(argv, *args, **kwargs):
+            if Path(argv[0]).name == "claude":
+                launch_options.append(kwargs)
+            return launch(argv, *args, **kwargs)
+        return observed
+
+    monkeypatch.setattr(subprocess, "run", observe_launch(subprocess.run))
+    monkeypatch.setattr(subprocess, "Popen", observe_launch(subprocess.Popen))
+    assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "background"
     shown = [argv for argv in local.commands if argv[1:3] == ["terminal", "show"]]
-    assert shown == [[str(local.executable), "terminal", "show", "--terminal", "term_new"]]
+    assert shown == [], "A hidden launch must not probe or show the person's terminal"
     created = [argv for argv in local.commands if argv[1:3] == ["terminal", "create"]]
-    assert len(created) == 1, local.commands
-    assert created[0][0] == str(local.executable)
-    assert created[0][created[0].index("--worktree") + 1] == f"path:{case.root.resolve()}"
-    assert created[0][created[0].index("--title") + 1] == f"orch: {case.root.name}"
-    assert "/fa-orchestrator" in shlex.split(created[0][created[0].index("--command") + 1])
-    assert not any(Path(argv[0]).name in {"osascript", "tmux", "claude"} for argv in local.commands)
+    assert len(created) == 0, local.commands
+    launched = [argv for argv in local.commands if Path(argv[0]).name == "claude"]
+    assert len(launched) == 1, local.commands
+    assert launched[0][0] == shutil.which("claude")
+    assert launch_options and all(Path(options["cwd"]).resolve() == case.root.resolve() for options in launch_options)
+    assert launched[0][launched[0].index("-n") + 1] == f"orch: {case.root.name}"
+    assert "/fa-orchestrator" in launched[0] and "--bg" in launched[0]
+    assert not any(Path(argv[0]).name in {"osascript", "tmux", "orca"} for argv in local.commands)
     assert not any(argv[1:3] == ["terminal", "split"] for argv in local.commands), (
         "Keep the existing D76 orchestrator tab; only the lane view splits"
     )

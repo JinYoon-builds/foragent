@@ -305,3 +305,80 @@ def test_unavailable_current_base_fails_closed_instead_of_using_local_main(colle
     assert "collect" in diagnostic.lower() and LOCKED in diagnostic, diagnostic
     assert "base" in diagnostic.lower() or "origin" in diagnostic.lower(), diagnostic
     assert snapshot(case) == before
+
+
+# --- Lane test runs hold every machine test slot (2026-11-03: five refusals) ---------------------
+# The holder is a real `fa test` run of a lane test that keeps going until this test releases it.
+# The project allows one test slot, so that one run holds every slot the checks could take.
+LANE_TEST = (
+    "import pathlib, time\n\n"
+    "def test_lane_work_in_progress():\n"
+    "    here = pathlib.Path(__file__).parent\n"
+    "    (here / 'started').write_text('running')\n"
+    "    end = time.monotonic() + 300\n"
+    "    while not (here / 'release').exists() and time.monotonic() < end:\n"
+    "        time.sleep(0.05)\n"
+    "    (here / 'finished').write_text('done')\n"
+)
+
+
+@pytest.fixture
+def lane_tests_hold_every_slot(collection_case, tmp_path):
+    import threading
+    import time
+
+    case = collection_case
+    lane = tmp_path / "lane-run"
+    lane.mkdir()
+    (lane / "test_lane_work.py").write_text(LANE_TEST)
+    result = {}
+
+    def run():
+        try:
+            result["code"] = case.main([
+                "test", "--repo-root", str(case.root), "--",
+                "-q", "-p", "no:cacheprovider", "--rootdir", str(lane), str(lane / "test_lane_work.py"),
+            ])
+        except SystemExit as exc:
+            result["code"] = exc.code
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    end = time.monotonic() + 120
+    while not (lane / "started").exists() and thread.is_alive() and time.monotonic() < end:
+        time.sleep(0.05)
+    assert (lane / "started").exists(), f"The lane test run never started: {result}"
+    holder = SimpleNamespace(directory=lane, running=lambda: not (lane / "finished").exists())
+    try:
+        yield holder
+    finally:
+        (lane / "release").write_text("go")
+        thread.join(60)
+    assert result.get("code") == 0, f"The lane test run itself failed: {result}"
+
+
+def test_collect_check_passes_while_lane_tests_hold_every_slot(collection_case, lane_tests_hold_every_slot,
+                                                                capsys):
+    case, holder = collection_case, lane_tests_hold_every_slot
+    item = case.plan["issues"][0]
+    item["acceptance_files"][HELPER] = HELPER_TEXT
+    for action, options in (("publish", ["--dry-run"]), ("preread", ["--json"])):
+        code, diagnostic = call(case, capsys, action, *options)
+        assert code == 0, f"{action} {' '.join(options)} was refused while lane tests ran: {diagnostic}"
+        assert holder.running(), f"{action} waited for the lane test run to finish"
+    before = git_command(case.history.origin, "rev-parse", "main")
+    code, diagnostic = call(case, capsys, "publish")
+    assert code == 0, f"publish was refused while lane tests ran: {diagnostic}"
+    assert holder.running(), "publish waited for the lane test run to finish"
+    assert git_command(case.history.origin, "rev-parse", "main") != before
+    assert git_command(case.history.origin, "show", f"main:{LOCKED}") == IMPORTING.strip()
+    assert len(case.tracker.list_issues()) == 2
+
+
+@pytest.mark.parametrize("action,options", [
+    ("publish", ["--defer", BOUNDARY]), ("publish", ["--dry-run"]), ("preread", ["--json"]),
+])
+def test_uncollectable_file_is_still_refused_while_lane_tests_hold_every_slot(
+        collection_case, lane_tests_hold_every_slot, capsys, action, options):
+    assert_refusal(collection_case, capsys, action, *options)
+    assert lane_tests_hold_every_slot.running(), f"{action} waited for the lane test run to finish"

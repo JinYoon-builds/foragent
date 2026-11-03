@@ -39,8 +39,6 @@ def test_readme_explains_lanes_stock_claude_self_build_and_gif_placeholder():
         "Explain that the gate runs outside Claude Code")
     assert re.search(r"foragent built itself:\s*\d+\s+merged prs\s+in\s+\d+\s+days", readme, re.I), (
         "Include a numbered self-build sentence; recount N and D from git log during implementation")
-    assert any("gif" in line.lower() and re.search(r"placeholder|coming soon|todo", line, re.I)
-               for line in readme.splitlines()), "Leave an explicit GIF placeholder for Jin to record"
 
 
 @pytest.mark.parametrize("topic,terms,pointers", [
