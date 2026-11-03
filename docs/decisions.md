@@ -940,3 +940,8 @@ an idle factory may then pull waiting work from other people. They are not v1.
 - 계기: #1644 8회차에서 PASS 뒤 main을 합쳐 head가 바뀌자, 이 PR이 건드리지 않은 config.py(#1638에서 머지한 코드)를 다시 리뷰해 막혔다.
 - 결정: PASS 뒤 head가 바뀌어 다시 리뷰할 때는 현재 main과의 merge-base diff를 기준으로 이 PR이 바꾼 코드만 입력으로 준다. main을 합치기만 해서 들어온 코드는 그 이슈에서 이미 리뷰했으므로 이번 리뷰 입력에서 뺀다. 충돌을 해결하며 바꾼 줄과 이 PR의 새 커밋은 리뷰한다. 같은 본문의 PASS, 본문 수정 시 전체 리뷰, 표시된 위험 예외의 전체 범위, review_pass_scope 설정은 그대로 둔다. 조합이 깨지는지는 CI가 확인하며 CI 규칙은 바꾸지 않는다.
 - 대체하는 규칙: #1599의 "including code integrated from main". [이전 주문](specs/2026-11-02-review-pass-scope.md)의 main 유입 포함 규칙만 이 결정으로 대체한다. 나머지 동작은 유지한다.
+
+## 2026-11-02 리뷰 FAIL은 근거가 있을 때만 막는다 (#1651)
+
+- 결정: Anthropic code-review 플러그인 절차(Apache 2.0)를 거의 그대로 들인다. 모든 라운드의 FAIL 지적마다 새 채점 세션 하나가 0–100 점수와 근거(Goal·Out of scope 인용 줄, 잠긴 인수 시험, 실제로 깨지는 입력)를 낸다. 근거가 있고 80점 이상이면 막고, 근거 있는 치명 경로는 경로가 있으면 점수와 상관없이 막는다. 나머지는 점수와 함께 NOTE로 남긴다. Goal이 정하지 않은 점은 재작업이 아니라 spec-question으로 기획에 묻는다. 패널은 지금처럼 위험 메모가 있는 첫 라운드에서만 돌고 기본 관점은 플러그인 다섯 개와 fatal-path다. `review_scoring: false`로 끈다.
+- 근거: 2026-11-02 최근 FAIL 30건 중 실제 결함 11건, 취향·Goal 밖 요구 9건, Goal·잠긴 시험 결함 9건; 22건이 2라운드 이후.
