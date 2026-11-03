@@ -191,6 +191,59 @@ def _displaced_pm(root: Path) -> str | None:
     return None
 
 
+# Commands only a person (or the orchestrator) may run, keyed by (command, action); the value
+# is the option that makes the command person-only, or None when every form is (#1736).
+PERSON_ONLY = {
+    ("orch", "resolve"): "verdict",
+    ("orch", "merge"): "approved_by",
+    ("skills", "add"): "approve",
+    ("settings", "set"): None,
+    ("init", None): "fa_allow",
+    ("role", "add"): None,
+    ("role", "set"): None,
+    ("role", "remove"): None,
+    ("lanes", "skills"): None,
+}
+
+
+def _project_language(root: Path | None) -> str:
+    """The language the project around ``root`` (else the current folder) speaks, read only.
+
+    The nearest ``.foragent.yml`` decides; when it names none, or no project folder can
+    be found, the person's own config does, as load_config would overlay it. English otherwise.
+    """
+    from foragent import settings
+
+    try:
+        start = Path(root or Path.cwd()).resolve()
+        folder = next((folder for folder in (start, *start.parents) if (folder / ".foragent.yml").is_file()), start)
+    except OSError:
+        folder = Path(os.devnull)  # No folder to look in: only the personal config is left.
+    return settings.language(folder)
+
+
+def _launched_refusal(args) -> str | None:
+    """The refusal line when a session Foragent launched runs a person-only command, else None.
+
+    Executors mark every session they start (``executors.LAUNCHED_ENV``); a person's
+    terminal and the PM session have no FORAGENT_ROLE, the orchestrator keeps its own.
+    """
+    role = os.environ.get("FORAGENT_ROLE")
+    if role is None or role == "orchestrator":
+        return None
+    action = getattr(args, "action", None)
+    key = (args.command, action)
+    if key not in PERSON_ONLY:
+        return None
+    option = PERSON_ONLY[key]
+    if option is not None and getattr(args, option, None) in (None, False):
+        return None
+    command = " ".join(part for part in (args.command, action) if part)
+    if option is not None:
+        command += " --" + option.replace("_", "-")
+    return text("launched_person_only", _project_language(getattr(args, "repo_root", None)), command=command)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
@@ -201,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
         # Claude Code runs this on every refresh; keep it repository-free and byte-exact.
         return commands.module("statusline").run(None)
     args = _parser().parse_args(argv)
+    refused = _launched_refusal(args)
+    if refused:
+        print(f"foragent: {refused}", file=sys.stderr)
+        return 1
     if args.command == "gate":
         _leave_background()
     if (args.command == "order" and getattr(args, "action", None) in PM_ONLY_ORDER_ACTIONS
