@@ -85,28 +85,63 @@ def measure(git, base: str, head_sha: str) -> dict:
     return size
 
 
-def approved_files(ctx, git, approval):
-    """Each bound file as the approval found it: never the run's result or a later base.
+ESTIMATES = "size-estimates.jsonl"
+_KEPT = ("key", "plan", "content", "files", "size")
 
-    The approval snapshot holds the Done when acceptance files; any other bound file (a design
-    reference) is read at the base commit the approval stood on, found the way the gate finds
-    that snapshot (the last base commit at the approval time). Neither moves when the run edits
-    the file or a refresh merges a newer base, so a match made at implementation start holds.
+
+def _append(root: Path, journal: str, entry: dict) -> None:
+    """One O_APPEND write; the leading newline isolates an interrupted tail."""
+    payload = ("\n" + json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root / journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _entries(root: Path, journal: str) -> list[dict]:
+    try:
+        content = (root / journal).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    entries = []
+    for line in content.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # an interrupted tail
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def retain(plan: dict, root: Path, config, store, by_number: dict) -> None:
+    """After a successful publication, keep the estimate of each published issue's exact preread.
+
+    The record is the one whose evidence key is this published plan (references included), so a
+    later reread of changed content or a publication that failed never replaces it. Approval by
+    ``--approve`` or later by label reads the same kept record. A failure here leaves the merge
+    comparison unknown and never fails the publication.
     """
-    snapshot = approval.acceptance_blobs or {}
-    found: dict[str, str] = {}
-    approved_ref: list[str | None] = []
+    from foragent import order
 
-    def blob(name: str) -> str:
-        if name in snapshot:
-            return snapshot[name]
-        if name not in found:
-            if not approved_ref:
-                approved_ref.append(git.commit_before(f"origin/{ctx.config.base_branch}", approval.approved_at))
-            found[name] = (approved_ref[0] and git.blob_sha(approved_ref[0], name)) or "missing"
-        return found[name]
-
-    return blob
+    try:
+        records = order._preread_records(root)
+        items = [item for item in plan["issues"] if "statements" not in item]
+        items += [order.edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
+                  if "statements" not in item and item["number"] in by_number]
+        waiting, _ = order._uncreated_lanes(plan, config, items)
+        for item in items:
+            if item["key"] in waiting:
+                continue  # no implementer read it before its lane existed
+            record = records.get(order.preread_target(plan, item, config, root)[2])
+            if isinstance(record, dict):
+                _append(store.root, ESTIMATES, {name: record.get(name) for name in _KEPT}
+                        | {"at": datetime.now(UTC).isoformat(timespec="seconds")})
+    except (OSError, ValueError, order.PlanError):
+        pass
 
 
 def record(n: int, ctx, git, approval, base_sha: str, head_sha: str, pr: int, log=None) -> None:
@@ -115,20 +150,16 @@ def record(n: int, ctx, git, approval, base_sha: str, head_sha: str, pr: int, lo
 
     try:
         base = git._call(["merge-base", base_sha, head_sha]).strip()
+        # The estimate is the one kept when this body was published (``retain``), matched by the
+        # approved body and snapshot; no preread made later and no file state is consulted.
         latest = None if approval is None else latest_preread(
-            ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, approved_files(ctx, git, approval))
+            ctx.repo_root, n, approval.body, approval.acceptance_blobs or {}, None,
+            records=_entries(ctx.store.root, ESTIMATES))
         expected = (latest or {}).get("size")
-        entry = {"issue": n, "pr": pr, "expected_size": expected if isinstance(expected, dict) else None,
-                 "actual_size": measure(git, base, head_sha), "head": head_sha,
-                 "at": datetime.now(UTC).isoformat(timespec="seconds")}
-        payload = ("\n" + json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
-        ctx.store.root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(ctx.store.root / JOURNAL, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _append(ctx.store.root, JOURNAL, {
+            "issue": n, "pr": pr, "expected_size": expected if isinstance(expected, dict) else None,
+            "actual_size": measure(git, base, head_sha), "head": head_sha,
+            "at": datetime.now(UTC).isoformat(timespec="seconds")})
     except Exception as exc:  # The merge already happened; the comparison is only a record of it.
         if log is not None:
             log(f"Size record skipped: {exc}")
@@ -137,16 +168,8 @@ def record(n: int, ctx, git, approval, base_sha: str, head_sha: str, pr: int, lo
 def report(root: Path) -> dict:
     """One row per issue and PR (the last write wins), and the share of wrong known estimates."""
     rows: dict[tuple, dict] = {}
-    try:
-        content = (root / JOURNAL).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        content = ""
-    for line in content.splitlines():
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue  # an interrupted tail
-        if isinstance(entry, dict) and "issue" in entry:
+    for entry in _entries(root, JOURNAL):
+        if "issue" in entry:
             rows[(entry.get("issue"), entry.get("pr"))] = entry
     records = list(rows.values())
     known = [r for r in records if isinstance(r.get("expected_size"), dict) and isinstance(r.get("actual_size"), dict)]

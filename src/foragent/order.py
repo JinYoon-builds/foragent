@@ -1068,6 +1068,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
             row["blocked_by"] = [mapping[key] for key in item.get("blocked_by", [])]
     for row in rows:
         row["approved"] = "approved" in tracker.get_issue(row["number"]).labels
+    # Only now has this plan been published: keep the estimates its exact prereads gave.
+    size_signal.retain(plan, root, config, _workload_store(root, repo), by_number)
     return PublishReport(plan["title"], parent, rows, sorted(files), False)
 
 
@@ -1369,31 +1371,33 @@ def lane_proposal(root: Path, n: int, body: str, acceptance_blobs: dict[str, str
 
 
 def latest_preread(root: Path, n: int, body: str, acceptance_blobs: dict[str, str],
-                   current: Callable[[str], str]) -> dict | None:
+                   current: Callable[[str], str] | None, records: list[dict] | None = None) -> dict | None:
     """The latest preread record for what this run's implementer receives, if any.
 
     A record counts only when its key names this issue (plan child key in the same order,
     or an edit of #n), the body publish rendered for it equals the approved body byte for byte
-    (apart from the trailing lines publish appends), and every file it bound
-    (acceptance tests and references) has the blob ``current(name)`` (``"missing"`` when absent)
-    and, where the approval snapshot names the file, that snapshot's blob. ``current`` reads the
-    files as the implementer starts from them: a worktree before the run changes it, or the
-    approval's own state after the run (``size_signal.approved_files``), never the run's result. The preread writer keeps
-    records in write order, so the last match is the latest answer.
+    (apart from the trailing lines publish appends), every file it bound that the approval
+    snapshot names has that snapshot's blob, and, when ``current`` is given, every file it bound
+    (acceptance tests and references) has the blob ``current(name)`` (``"missing"`` when absent).
+    The handover passes the worktree the implementer starts from. ``records`` defaults to the
+    preread records; a merge passes the records kept at publication (``size_signal.retain``)
+    with ``current=None``, because their files were bound to the exact published plan.
+    Records are kept in write order, so the last match is the latest answer.
     """
-    try:
-        records = _preread_records(root)
-    except PlanError:
-        return None
+    if records is None:
+        try:
+            records = list(_preread_records(root).values())
+        except PlanError:
+            return None
     text, child = _without_child_marker(order_done_when.without_record(decision_links.MARKER_LINE.sub("", body)))
     content = _body_digest(text)
     latest = None
-    for record in records.values():
+    for record in records:
         if not isinstance(record, dict) or record.get("content") != content:
             continue
         seen = record.get("files")
         if not isinstance(seen, dict) or any(
-                not isinstance(sha, str) or current(name) != sha
+                not isinstance(sha, str) or (current is not None and current(name) != sha)
                 or acceptance_blobs.get(name, sha) != sha for name, sha in seen.items()):
             continue
         if record.get("key") == f"#{n}" or (

@@ -4474,44 +4474,79 @@ def _git_commit(repo, files, message, date, parents=None):
     return commit
 
 
-@pytest.mark.parametrize("approved_handoff, later_main, kept", [
-    ("approved handoff\n", None, True),
-    ("approved handoff\n", "main changed it after approval\n", True),
-    ("someone else's handoff\n", None, False),
-], ids=["run-changed-reference", "refresh-onto-main-that-changed-it", "approved-a-different-reference"])
-def test_merge_record_binds_references_to_the_approval_not_the_run_or_later_main(
-        publishing, plan, tmp_path, approved_handoff, later_main, kept):
-    """A run may edit a reference preread read, and a refresh may merge a newer main that edits it;
-    the estimate still belongs to the merge. Only a different approved reference loses it (#1696)."""
+@pytest.mark.parametrize("approved_reply, later_reply, history, approval_change, expected", [
+    ("SIZE: source=2 tests=0 files=2", "", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "SIZE: source=9 tests=9 files=9", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "", "failed-publication-of-reread", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "", "approved-by-label-later", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "", "side-branch-from-before-approval-merged-later", None, (2, 0, 2)),
+    ("", "SIZE: source=9 tests=9 files=9", "run", None, None),
+    ("SIZE: source=2 tests=0 files=2", "", "run", "acceptance-snapshot", None),
+    ("SIZE: source=2 tests=0 files=2", "", "run", "body", None),
+], ids=["later-preread-without-estimate", "later-preread-other-estimate", "failed-publication-of-reread",
+        "approved-by-label-later", "side-branch-merged-later",
+        "approved-without-estimate", "approval-snapshot-differs", "approved-body-differs"])
+def test_merge_record_keeps_the_estimate_the_approval_stood_on(
+        publishing, plan, tmp_path, monkeypatch, approved_reply, later_reply, history, approval_change, expected):
+    """The estimate is the one kept when the approved plan was published, with or without --approve.
+    A later reread of changed references (same body), a publication of it that fails, history merged
+    from a side branch or the run's own edits never replace it (#1696)."""
     import subprocess
     from types import SimpleNamespace
 
-    root, config, item = publishing[0], publishing[1], plan["issues"][0]
+    root, config, tracker, item = publishing[0], publishing[1], publishing[2], plan["issues"][0]
     name = "docs/design/a/HANDOFF.md"
     plan["reference_files"] = {name: "approved handoff\n"}
     item["references"] = [name]
-    _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=2 tests=0 files=2")])
+    plan["summary"] = "s"  # _proposals prereads the plan with this summary
+    _proposals(root, config, plan, [("s", f"APPROACH: Update the handoff.\n{approved_reply}")])
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    # A person may approve by label later; publishing alone keeps the estimate.
+    publish(publishing, plan, approve=history != "approved-by-label-later")
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    # An unpublished reread of changed references: same body, same acceptance files.
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{later_reply}")])
+    assert _child_body(changed, changed["issues"][0], config) == _child_body(plan, item, config)
+    if history == "failed-publication-of-reread":
+        def refuse(*args, **kwargs):
+            raise order.PlanError("publication failed")
+
+        with monkeypatch.context() as failing:
+            failing.setattr(tracker, "add_labels", refuse)
+            with pytest.raises(order.PlanError, match="publication failed"):
+                publish(publishing, changed, approve=True)
     repo = tmp_path / "merge-repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    approved = _git_commit(repo, {**API_FILES, name: approved_handoff}, "approved", "2026-11-01T10:00:00Z")
-    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", approved], cwd=repo, check=True)
+    git = lambda *args: subprocess.run(["git", *args], cwd=repo, check=True)  # noqa: E731
+    git("init", "-q", "-b", "main")
+    approved = _git_commit(repo, {**API_FILES, name: "approved handoff\n"}, "approved", "2026-11-01T10:00:00Z")
     base = approved
-    if later_main is not None:
-        base = _git_commit(repo, {name: later_main}, "main", "2026-11-01T12:00:00Z", parents=[approved])
-        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", base], cwd=repo, check=True)
+    if history == "side-branch-from-before-approval-merged-later":
+        side = _git_commit(repo, {name: "side branch handoff\n"}, "side", "2026-11-01T10:15:00Z",
+                           parents=[approved])
+        base = _git_commit(repo, {}, "merge side", "2026-11-01T12:00:00Z", parents=[approved, side])
+    git("update-ref", "refs/remotes/origin/main", base)
     head = _git_commit(repo, {name: "updated by the run\n", "src/login.py": "A = 1\nB = 2\n"}, "run",
                        "2026-11-01T11:00:00Z", parents=[approved])
-    if later_main is not None:  # The refresh merges the newer main; the run keeps its own handoff.
+    if base != approved:  # The refresh merges the newer main; the run keeps its own handoff.
         head = _git_commit(repo, {}, "refresh", "2026-11-01T13:00:00Z", parents=[head, base])
-    ctx = SimpleNamespace(repo_root=root, store=SimpleNamespace(root=tmp_path / "store"), config=config)
-    approval = SimpleNamespace(body=_child_body(plan, item, config), approved_at="2026-11-01T10:30:00+00:00",
-                               acceptance_blobs={FILE: order._blob(API_FILES[FILE].encode())})
+    body = child.body
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    if approval_change == "body":
+        body = _child_body(plan, {**item, "goal": item["goal"] + " Also more."}, config)
+    elif approval_change == "acceptance-snapshot":
+        blobs = {FILE: order._blob(b"assert 1 == 1\n")}
+    ctx = SimpleNamespace(repo_root=root, store=order._workload_store(root, REPO), config=config)
+    approval = SimpleNamespace(body=body, approved_at="2026-11-01T10:30:00+00:00", acceptance_blobs=blobs)
     notes = []
-    size_signal.record(7, ctx, GitRepo(repo), approval, base, head, 12, notes.append)
+    size_signal.record(child.number, ctx, GitRepo(repo), approval, base, head, 12, notes.append)
     assert notes == []
-    record, = size_signal.report(ctx.store.root)["records"]
-    assert (record["issue"], record["pr"]) == (7, 12)
+    report = size_signal.report(ctx.store.root)
+    record, = report["records"]
+    assert (record["issue"], record["pr"]) == (child.number, 12)
     # Measured from the merge base: the base's own change is not the run's size.
     assert record["actual_size"] == {"source_lines": 2, "test_lines": 0, "file_count": 2}
-    assert record["expected_size"] == ({"source_lines": 2, "test_lines": 0, "file_count": 2} if kept else None)
+    assert record["expected_size"] == (None if expected is None else dict(zip(size_signal.COUNTS, expected)))
+    assert (report["compared"], report["unknown"]) == ((1, 0) if expected else (0, 1))
