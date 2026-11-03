@@ -11,9 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
-import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shlex
 import shutil
 import subprocess
@@ -21,7 +20,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, order_scratch, processes
+from foragent import capacity, order_importers, order_scratch, processes
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
@@ -63,6 +62,9 @@ class AnyPublishedFile:
 
 def pytest_configure(config):
     config.pluginmanager.register(AnyPublishedFile(), "foragent-collect-published")
+    # This helper is not the project's conftest: a test's `import conftest` must never get it.
+    if sys.modules.get("conftest") is sys.modules.get(__name__):
+        sys.modules.pop("conftest", None)
 """
 
 
@@ -209,60 +211,6 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     if errors is None or code not in {0, 5}:
         raise _Unavailable(text("order_collect_exit", language, code=code, output=_output(log, tree)), attempted)
     return []
-
-
-def _changed(git: GitRepo, base: str, selected: dict[str, str | bytes]) -> list[str]:
-    """This order's Python acceptance files whose bytes differ from the base, new ones included."""
-    changed = []
-    for name, content in selected.items():
-        if not name.endswith(".py"):
-            continue
-        data = content.encode("utf-8") if isinstance(content, str) else content
-        current = git.blob_sha(base, name)
-        digest = hashlib.sha256 if current is not None and len(current) == 64 else hashlib.sha1
-        if current != digest(b"blob %d\0" % len(data) + data).hexdigest():
-            changed.append(name)
-    return changed
-
-
-def _module_names(changed: list[str]) -> set[str]:
-    """The names a changed file is imported by: its stem, or its package's name for an ``__init__.py``."""
-    names = set()
-    for name in changed:
-        path = PurePosixPath(name)
-        if path.stem == "__init__":
-            if path.parent.name:
-                names.add(path.parent.name)
-        elif path.stem != "conftest":
-            names.add(path.stem)
-    return names
-
-
-def _importers(git: GitRepo, base: str, changed: list[str], own: set[str]) -> list[str]:
-    """Python files on the base that mention a changed module's name as a word; never the order's own or a conftest.
-
-    Every way to import a module by name, however it is spelled or called, contains that name, so this
-    is a superset of the direct importers. A file that only mentions the name runs the same on both
-    sides, so it costs time and never a refusal.
-    """
-    names = _module_names(changed)
-    if not names:
-        return []
-    words = [argument for name in sorted(names) for argument in ("-e", name)]
-    try:
-        # -z prints each path raw: no quoting of non-ASCII or special characters.
-        output = git._call(["grep", "-z", "-l", "-w", "-F", *words, base, "--", "*.py"])
-    except GitError as exc:
-        cause = exc.__cause__
-        if isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1:
-            return []  # No file mentions a changed module.
-        raise
-    found = set()
-    for entry in output.split("\0"):
-        name = entry[len(base) + 1:] if entry.startswith(f"{base}:") else entry
-        if name and name not in own and PurePosixPath(name).name != "conftest.py":
-            found.add(name)
-    return sorted(found)
 
 
 # Added to the copy's conftest for importer runs: one JSON row per fact, read instead of pytest's text.
@@ -491,8 +439,8 @@ def _check_importers(git: GitRepo, base: str, selected: dict[str, str | bytes], 
     changed: list[str] = []
     importers: list[str] = []
     try:
-        changed = _changed(git, base, selected)
-        importers = _importers(git, base, changed, set(selected)) if changed else []
+        changed = order_importers.changed(git, base, selected)
+        importers = order_importers.importers(git, base, changed, set(selected)) if changed else []
         if not importers:
             return
         work = Path(tempfile.mkdtemp(prefix="foragent-importers-"))

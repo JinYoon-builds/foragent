@@ -671,10 +671,14 @@ def test_an_importer_run_that_does_not_finish_fails_closed_without_a_slot(shared
 
 
 def test_an_unreadable_importer_report_fails_closed(shared_case, monkeypatch):
+    # A real result object that says only "this run did not finish": the refusal must come from that.
     monkeypatch.setattr(order_collect, "_results",
-                        lambda path, tree: order_collect._Run(False, set(), {}, {}))
-    with pytest.raises(order.PlanError, match="could not be checked"):
+                        lambda path, tree: order_collect._Run(False, {}, set(), {}, {}))
+    with pytest.raises(order.PlanError) as refusal:
         check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    message = str(refusal.value)
+    assert "could not be checked" in message and "did not finish on the base" in message, message
+    assert "TypeError" not in message, message
 
 
 @pytest.mark.parametrize("name,text", [
@@ -686,14 +690,8 @@ def test_an_unreadable_importer_report_fails_closed(shared_case, monkeypatch):
      "def test_names():\n    assert NAMES == ('a', 'b')\n"),
     ("tests/test_multiline.py", "import os, \\\n    tests.acceptance.test_shared as shared\n\n\n"
      "def test_names():\n    assert shared.NAMES == ('a', 'b')\n"),
-    ("tests/test_by_name.py", "import importlib\n\n\n"
-     "def test_names():\n    assert importlib.import_module('tests.acceptance.test_shared').NAMES == ('a', 'b')\n"),
     ("tests/check_named_by_project.py", "from tests.acceptance.test_shared import NAMES\n\n\n"
      "def test_names():\n    assert NAMES == ('a', 'b')\n"),
-    ("tests/test_by_keyword.py", "import importlib\n\n\n"
-     "def test_names():\n    assert importlib.import_module(name='tests.acceptance.test_shared').NAMES == ('a', 'b')\n"),
-    ("tests/test_by_alias.py", "from importlib import import_module as load\n\nMODULE = 'tests.acceptance.' + 'test_shared'\n\n\n"
-     "def test_names():\n    assert load(MODULE).NAMES == ('a', 'b')\n"),
     ("tests/test_한글.py", "from tests.acceptance.test_shared import NAMES\n\n\n"
      "def test_names():\n    assert NAMES == ('a', 'b')\n"),
 ])
@@ -708,15 +706,32 @@ def test_every_direct_import_form_is_an_importer(shared_case, name, text):
     assert f"{name}::test_names" in str(refusal.value).split("Broken tests:")[1], str(refusal.value)
 
 
-def test_a_module_that_only_mentions_the_name_runs_on_both_sides_and_never_refuses(shared_case, monkeypatch):
+def test_a_module_that_only_mentions_the_name_is_not_run(shared_case, monkeypatch):
     _, _, git, history, _ = shared_case
-    history.update({"tests/test_mentions.py": "# test_shared is documented elsewhere\n\n\n"
+    history.update({"tests/test_mentions.py": "# test_shared is documented elsewhere\nWORD = 'test_shared'\n\n\n"
                     "def test_alone():\n    pass\n"})
     git.update_base("main")
     calls = _runs(monkeypatch)
-    extended = SHARED_OK + "\n\ndef test_new_lock():\n    assert False, 'red until implemented'\n"
-    assert check(shared_case, {SHARED: extended}) is not None
-    assert len(calls) == 3 and all("tests/test_mentions.py" in call for call in calls[1:])
+    with pytest.raises(order.PlanError):
+        check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    assert len(calls) == 3 and all(USER in call and "test_mentions" not in call for call in calls[1:])
+
+
+def test_a_changed_conftest_finds_the_tests_that_import_it_by_name(case, monkeypatch):
+    """A changed conftest.py is a module like any other to a test that imports it by name."""
+    _, _, git, history, _ = case
+    conftest = "tests/acceptance/conftest.py"
+    history.update({conftest: "def case():\n    return 1\n",
+                    "tests/test_case_user.py": "import sys, pathlib\n\n"
+                    "sys.path.insert(0, str(pathlib.Path(__file__).parent / 'acceptance'))\n"
+                    "from conftest import case\n\n\ndef test_case():\n    assert case() == 1\n"})
+    git.update_base("main")
+    calls = _runs(monkeypatch)
+    with pytest.raises(order.PlanError) as refusal:
+        check(case, {conftest: "def case():\n    return 2\n"})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert "tests/test_case_user.py::test_case" in broken and "assert 2 == 1" in broken, broken
+    assert len(calls) == 3
 
 
 def test_a_changed_package_init_finds_the_importers_of_the_package(shared_case):
