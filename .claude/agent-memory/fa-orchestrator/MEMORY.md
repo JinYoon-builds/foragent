@@ -19,3 +19,4 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Stray state writes](inspect-prepare-real-state.md) — fake inbox questions came from fa inspect prepare running Try it; trace by timestamp + find -newermt
 - [gh project scope](gh-project-scope-new-machine.md) — new machine gh token lacked project; publish committed then failed; Jin runs gh auth refresh -s project
 - [Publish moves main, stale heads](publish-moves-main-stale-heads.md) — many publishes mid-wave → CI "lost tests" on PASS runs; batch publishes, park not retry
+- [Keep approved supply](keep-approved-supply.md) — Jin 11-04: approved ready ≥ 2x run slots; refill from priority list without waiting for PM
