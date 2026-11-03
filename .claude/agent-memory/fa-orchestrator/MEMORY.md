@@ -3,7 +3,7 @@
 Durable lessons of this project's orchestrator. Only the orchestrator session writes this file.
 - [Drafts outside scratchpad](pending-drafts-not-in-scratchpad.md) — waiting test rewrites/plans go to a durable path; re-approval recipe
 - [Pending after merge](pending-after-merge.md) — follow-ups waiting on #962, #186/#435 merges
-- [Questions via planning session](questions-via-planning-session.md) — Jin talks only there; new orders: send plan path, it publishes
+- [Questions via planning session](questions-via-planning-session.md) — Jin talks only in planning; since 11-04 plans inside Jin-decided scope: orch approves itself
 - [Check held reasons first](check-held-reasons-first.md) — queued lane: read fa orch facts held: (cap vs overlap) before blaming files
 - [Peer messages in Korean](peer-messages-in-korean.md) — SendMessage to the PM in Korean, call it "PM"; Jin sees them
 - [Flow goal (11-01)](flow-goal-2026-11-01.md) — metric: part-5 real-waste minutes (no 70% target); flow5.py; retro reports it
@@ -18,3 +18,6 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Order after 11-03](order-after-11-03.md) — merge owner, then 2-3 days cleanup, then features; no new internal-mechanism features
 - [Stray state writes](inspect-prepare-real-state.md) — fake inbox questions came from fa inspect prepare running Try it; trace by timestamp + find -newermt
 - [gh project scope](gh-project-scope-new-machine.md) — new machine gh token lacked project; publish committed then failed; Jin runs gh auth refresh -s project
+- [Publish moves main, stale heads](publish-moves-main-stale-heads.md) — many publishes mid-wave → CI "lost tests" on PASS runs; batch publishes, park not retry
+- [Keep approved supply](keep-approved-supply.md) — Jin 11-04: approved ready ≥ 2x run slots; refill from priority list without waiting for PM
+- [Only /fa for people](only-fa-for-people.md) — Jin 11-04: people learn /fa only; PM opens dashboard/issue view; help & README lead with /fa

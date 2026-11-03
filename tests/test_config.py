@@ -21,6 +21,26 @@ def write_settings(path, settings):
     path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
 
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./...", "pytest && npm test"])
+def test_merge_owner_refuses_unsupported_test_commands_at_config_load(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    with pytest.raises(ConfigError) as error:
+        load_config(repo)
+    assert str(error.value) == "merge_owner requires an explicit supported pytest command in test_command."
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "uv run pytest", "python -m pytest tests"])
+def test_merge_owner_accepts_supported_pytest_commands(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    assert load_config(repo).merge_owner is True
+
+
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./..."])
+def test_flag_off_keeps_other_test_commands_supported(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": False, "test_command": command})
+    assert load_config(repo).test_command == command
+
+
 @pytest.mark.parametrize("value", ["auto", 1, 3, 12])
 def test_merge_group_max_accepts_auto_or_positive_integer(repo, value):
     write_settings(repo / ".foragent.yml", {"merge_group_max": value})
@@ -42,6 +62,7 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "merge_owner": False,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,

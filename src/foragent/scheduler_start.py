@@ -23,7 +23,12 @@ if TYPE_CHECKING:
 
 
 def _lane_held(ctx: TickContext, lane: str, now: datetime, number: int | None = None) -> bool:
-    """A start waits while a live plan pauses its lane, or quota admission holds it.
+    """A start waits while a live plan pauses its lane, the lane dreams, or quota admission holds it."""
+    return _lane_hold(ctx, lane, now, number) is not None
+
+
+def _lane_hold(ctx: TickContext, lane: str, now: datetime, number: int | None = None) -> str | None:
+    """Why a start of ``lane`` waits: ``plan_pause``, ``dream`` or ``quota``; None when it may start.
 
     ``number`` makes the quota decision the issue's own (#786): a continued run keeps its
     implementer and skips keep_percent, so a lane-wide answer must not hold it back.
@@ -31,10 +36,10 @@ def _lane_held(ctx: TickContext, lane: str, now: datetime, number: int | None = 
     and waits only on its own pair's executor pauses.
     """
     if orch_plan.lane_paused(ctx.store, lane, now):
-        return True
+        return "plan_pause"
     if (dream := ctx.store.get_dream(lane)) is not None and dream.status == "running":
-        return True  # While a lane dreams, no new issue of that lane starts.
-    return scheduler_quota.decide(ctx.store, ctx.config, lane, now, number).held
+        return "dream"  # While a lane dreams, no new issue of that lane starts.
+    return "quota" if scheduler_quota.decide(ctx.store, ctx.config, lane, now, number).held else None
 
 
 def _at_plan_width(ctx: TickContext, lane: str) -> bool:

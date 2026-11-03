@@ -1,6 +1,6 @@
 """Run records, run-start journal, pauses and run history."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,22 @@ from foragent.state_records import Run, carried_contract
 # Updates passing any of these change or attest process ownership, so they
 # observe the process tree; every other update is metadata only.
 PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
+
+
+def _owner_fact_matches(value):
+    if (not isinstance(value, dict) or type(value.get("number")) is not int
+            or not isinstance(value.get("started_at"), str)):
+        return False
+    fact = value.get("owner_merge")
+    if not isinstance(fact, dict) or value.get("owner_merge_started_at") != value["started_at"]:
+        return False
+    try:
+        merged = datetime.fromisoformat(fact["merged_at"])
+        started = datetime.fromisoformat(value["started_at"])
+        return (merged.tzinfo is not None and started.tzinfo is not None
+                and merged.astimezone(UTC) >= started.astimezone(UTC))
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 class RunRecordsMixin:
@@ -60,7 +76,12 @@ class RunRecordsMixin:
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer,
                       executor=executor, reviewer=reviewer, executor_model=executor_model, **session, **contract)
             self._merge_lock_seconds.pop((number, timestamp), None)
-            self._write_run(run)
+            value = self._run_value(run)
+            # Owner completion fields belong to an execution, not to the issue.
+            if "owner_merge" in value:
+                for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
+                    value.pop(key, None)
+            self._write_run(run, value)
             size_signal.freeze(self, number, approval, run, previous, restarted)  # this run's own estimate (#1696)
             if journal is not None:  # The audit event of this record (#107), under the same lock.
                 journal()
@@ -171,6 +192,48 @@ class RunRecordsMixin:
             value = _state.json.loads(path.read_text(encoding="utf-8"))
             value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
             self._write_json(path, value)
+
+    def record_owner_merge(self, number: int, started_at: str, fact: dict) -> None:
+        """Attach a validated GitHub merge fact to the admitted worker generation."""
+        with self._state_lock():
+            path = self.root / "runs" / f"{number}.json"
+            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            if value["started_at"] != started_at:
+                raise ValueError("Merge belongs to a superseded worker generation")
+            value["owner_merge"] = fact
+            value["owner_merge_started_at"] = started_at
+            value["merged_at"] = fact["merged_at"]
+            passed = value.get("last_review_pass_at")
+            value["review_pass_to_merge_seconds"] = (
+                (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
+                if passed else None)
+            self._write_json(path, value)
+            if value["status"] == "finished":
+                history = self.root / "runs.jsonl"
+                rows = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+                if not any(row["number"] == number and row["started_at"] == started_at
+                           and row.get("owner_merge") == fact
+                           and row.get("owner_merge_started_at") == started_at for row in rows):
+                    with history.open("a", encoding="utf-8") as stream:
+                        stream.write(_state.json.dumps(value, ensure_ascii=False) + "\n")
+
+    def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
+        """One completion fact, independent of the finished worker outcome."""
+        history = self.root / "runs.jsonl"
+        values = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+        for path in (self.root / "runs").glob("[0-9]*.json"):
+            try:
+                values.append(_state.json.loads(path.read_text()))
+            except (OSError, ValueError):
+                continue  # Optional owner facts must not break readers of completed history.
+        return {(value["number"], value["started_at"]): value["owner_merge"] for value in values
+                if _owner_fact_matches(value)}
+
+    def run_merged(self, run: Run, *, owner_facts=None) -> bool:
+        if run.outcome == "merged":
+            return True
+        facts = self.owner_merge_facts() if owner_facts is None else owner_facts
+        return (run.number, run.started_at) in facts
 
     def active_runs(self) -> list[Run]:
         paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
@@ -287,6 +350,9 @@ class RunRecordsMixin:
         times: dict[tuple[int, str], str] = {}
         for line in history.splitlines():
             value = _state.json.loads(line)
+            if (key == "merged_at" and not isinstance(value.get(key), str)
+                    and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):
+                value[key] = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
             if isinstance(value.get(key), str):
                 times[value["number"], value["started_at"]] = value[key]
         return times

@@ -690,13 +690,70 @@ def _child_environment(cwd: Path) -> dict[str, str]:
     return env
 
 
+# Only presentation settings may cross from the person's environment into a try.
+_TRY_PRESENTATION = ("LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+                     "TERM", "COLORTERM", "COLUMNS", "LINES")
+# Per-user services a throwaway HOME cannot separate: launchd's gui/<uid> jobs (the
+# person's live gate) and AppleScript (notifications and terminal windows). A try finds
+# these names first on PATH and they refuse, so they never reach the person's own.
+_SHARED_SERVICES = ("launchctl", "osascript")
+_TRY_BIN = ".foragent-try/bin"
+
+
+def try_home(home: Path, language: str) -> Path:
+    """Make a throwaway home: only the person's language as personal config, shared services refused."""
+    config = home / ".config/foragent/config.yml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(json.dumps({"language": language}, ensure_ascii=False) + "\n", encoding="utf-8")
+    shims = home / _TRY_BIN
+    shims.mkdir(parents=True, exist_ok=True)
+    for name in _SHARED_SERVICES:
+        shim = shims / name
+        shim.write_text(
+            f"#!/bin/sh\necho 'foragent try: {name} is not available; it would reach your own "
+            f"machine services' >&2\nexit 1\n", encoding="utf-8")
+        shim.chmod(0o755)
+    return home
+
+
+def try_environment(home: Path, cwd: Path) -> dict[str, str]:
+    """Build the complete try environment, used with run_logged(inherit_env=False).
+
+    Start empty so even unknown config roots, tool destinations and session handles
+    cannot escape the throwaway home. Only tool lookup, presentation and the uv
+    content cache come from the parent. Prepare home with try_home first.
+    """
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    path = _child_environment(cwd).get("PATH", os.defpath)
+    env = {key: os.environ[key] for key in _TRY_PRESENTATION if key in os.environ}
+    env.update({
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
+        "XDG_STATE_HOME": str(home / ".local/state"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "PATH": os.pathsep.join(entry for entry in (str(home / _TRY_BIN), path) if entry),
+        "FORAGENT_VIEW": "off",
+        "FORAGENT_UPDATE_CHECK": "off",
+        "FORAGENT_ORCH_SPAWN": "off",
+        "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR") or str(cache_home / "uv"),
+    })
+    return env
+
+
 def run_logged(
     argv: list[str], *, cwd: Path, timeout_s: int, log_path: Path,
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
-    stderr_path: Path | None = None, env: dict[str, str] | None = None,
+    stderr_path: Path | None = None, env: dict[str, str | None] | None = None,
+    inherit_env: bool = True,
 ) -> tuple[int | None, bool, str]:
-    """Append output without buffering an unbounded session in memory; env adds variables."""
+    """Append output without unbounded buffering; env overlays (None removes a key).
+
+    With inherit_env=False, env is the complete environment, with no parent values.
+    """
+    child_env = {**(_child_environment(cwd) if inherit_env else {}), **(env or {})}
+    child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -710,7 +767,7 @@ def run_logged(
             # Closing stdin during cancellation must not wait for a buffered
             # writer's lock while a descendant keeps the pipe open.
             bufsize=0,
-            start_new_session=True, env={**_child_environment(cwd), **(env or {})},
+            start_new_session=True, env=child_env,
         )
         prompt_errors = []
         prompt_cancelled = False
