@@ -248,6 +248,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if attempt.rebuilt:
             logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
             run_publish._hold_if_not_started(n, ctx, pr, logs)
+            run_publish._record_failure(n, ctx, pr, verified_head_sha)
             raise run_publish.ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         run_publish._ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
 
@@ -365,6 +366,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 else:
                     run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    size_signal.record(n, ctx, git, attempt.approval, inputs.base_sha, verified_head_sha, pr,
+                                       lambda line: run_publish._append(log, line))
                     if inputs.decision.kind == "merge":
                         runner.after_merge(ctx, pr, attempt.target_branch)
                     run_publish._progress(n, ctx)
@@ -413,4 +416,4 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish  # noqa: E402
+from foragent import run_publish, size_signal  # noqa: E402

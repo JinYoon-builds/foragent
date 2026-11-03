@@ -175,6 +175,9 @@ def goal_condition(acceptance_dir: str) -> str:
     prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
     suffix = (" is modified, and you did not edit files outside this repository."
               " Files that test tooling writes outside the repository do not count as your edits."
+              " Scratch work in a temporary directory that you created for this run (the system temp directory or a run scratch directory) does not count as an edit, whether or not you deleted it afterwards."
+              " The person's real files outside the repository, for example ~/.claude, other repositories and launchd jobs, must stay unchanged."
+              " Judge this condition on the final state of the run: an earlier failed command or an earlier scratch write that the final state no longer shows does not count."
               " At 40 turns, end the run without repeating the stop check.")
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 

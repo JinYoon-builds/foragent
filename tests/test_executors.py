@@ -556,3 +556,27 @@ def test_claude_child_sees_background_tasks_disabled_and_keeps_parent_environmen
 
     assert (tmp_path / "env.txt").read_text() == "1|kept\n"
     assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in os.environ
+
+
+@pytest.mark.parametrize("inherited", (None, "orchestrator"), ids=("person", "orchestrator"))
+@pytest.mark.parametrize("kind", ("claude", "claude-review", "codex"))
+def test_every_launched_session_is_marked_and_never_inherits_the_orchestrator(tmp_path, monkeypatch, kind, inherited):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    name = "codex" if kind == "codex" else "claude"
+    fake = bin_dir / name
+    fake.write_text("#!/bin/sh\ncat >/dev/null\nprintf '%s|%s\\n' \"${FORAGENT_ROLE-unset}\" \"$FA_PARENT_MARK\" > \"$FA_ENV_OUT\"\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FA_PARENT_MARK", "kept")
+    monkeypatch.setenv("FA_ENV_OUT", str(tmp_path / "env.txt"))
+    if inherited is None:
+        monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("FORAGENT_ROLE", inherited)
+    options = {"review_level": "high"} if kind == "claude-review" else {}
+    executor_for(name).run(worktree=tmp_path, prompt="implement", model=None,
+                           timeout_s=30, log_path=tmp_path / "run.log", **options)
+
+    assert (tmp_path / "env.txt").read_text() == "launched|kept\n"
+    assert os.environ.get("FORAGENT_ROLE") == inherited, "The gate's own environment is unchanged"

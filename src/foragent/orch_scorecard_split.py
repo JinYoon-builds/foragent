@@ -1,4 +1,4 @@
-"""Approval-to-merge accounting for `fa orch scorecard`: five parts plus unknown, in issue-minutes.
+"""Approval-to-merge accounting for `fa orch scorecard`: six parts plus unknown, in issue-minutes.
 
 Each confirmed merge counts once, from its issue's latest approval at or before the merge to
 the merge itself, in the window that holds the merge. The interval is cut at every moment a
@@ -13,6 +13,10 @@ Facts and the part they name:
 * Phase events, only where no recorded fact covers the time: the first implementing,
   reviewing, checking, ci or merging phase of the interval is work (later ones need an
   activity cause); an overlap wait is concurrency cost.
+* Failure facts: a later implementing, reviewing, checking, ci or resolving-conflict phase that
+  starts at or after a review FAIL (``review`` journal event) or a ``ci-failure`` record, and
+  before the end of the failed run, is rework. A later round no recorded failure caused says
+  nothing, and a recorded activity cause still wins over this phase-name inference.
 * ``ready`` records, from each record to the issue's next ready record or run start:
   ``slots-full`` with merge waiters holding slots is waste, without them and with the
   measured occupancy at the limit it is machine limit; ``free-slot`` and ``held-no-retry``
@@ -26,15 +30,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from foragent import orch_scorecard_history as history
+from foragent import orch_events, orch_scorecard_history as history
 from foragent.orch_facts_resources import _time
 from foragent.orch_scorecard_records import Interval, approval_before
 from foragent.state import StateStore
 
-PARTS = ("work", "concurrency_cost", "machine_limit", "ordering", "waste")
+PARTS = ("work", "rework", "concurrency_cost", "machine_limit", "ordering", "waste")
 CAUSES = {"initial": "work", "base-changed": "concurrency_cost", "group-failed": "concurrency_cost",
           "file-overlap": "concurrency_cost", "queue": "waste"}
 WORK_PHASES = {"implementing", "reviewing", "checking", "ci", "merging"}
+REWORK_PHASES = {"implementing", "reviewing", "checking", "ci", "resolving-conflict"}
 PHASE_PARTS = {"overlap-wait": "concurrency_cost"}
 READY_PARTS = {"free-slot": "waste", "held-no-retry": "waste", "blocked-by": "ordering",
                "file-overlap": "concurrency_cost"}
@@ -84,15 +89,36 @@ def _activity_facts(records: list[dict[str, Any]]) -> list[tuple[Interval, str]]
     return facts
 
 
-def _phase_facts(phases: list[tuple[str, Interval]], approved: datetime) -> list[tuple[Interval, str]]:
-    """First work phases of the interval are work; later ones say nothing without a cause."""
+def _failure_spans(number: int, records: list[dict[str, Any]], reviews: list[dict[str, Any]],
+                   runs: list[tuple[datetime, datetime | None]], end: datetime) -> list[Interval]:
+    """Each recorded failure of the issue, from its moment to the end of the run it failed.
+
+    A run ends when it finished, else when the issue's next run started, else at ``end``. A CI
+    failure names its run; a review FAIL belongs to the latest run started at or before it."""
+    runs = sorted(runs)
+    ends = {start: finished or next((later for later, _ in runs if later > start), end)
+            for start, finished in runs}
+    failures = [(at, _time(record.get("run_started_at"))) for record in records
+                if record["kind"] == "ci-failure" and (at := _time(record["at"])) is not None]
+    for event in reviews:
+        if event.get("issue") == number and event.get("verdict") == "FAIL" and (at := _time(event.get("at"))):
+            failures.append((at, max((start for start, _ in runs if start <= at), default=None)))
+    return [(at, ends[start]) for at, start in failures if start in ends and start <= at < ends[start]]
+
+
+def _phase_facts(phases: list[tuple[str, Interval]], approved: datetime,
+                 failures: list[Interval] = ()) -> list[tuple[Interval, str]]:
+    """First work phases of the interval are work; a later one is rework only after a recorded failure."""
     facts, seen = [], set()
     for phase, span in sorted(phases, key=lambda item: item[1][0]):
         if span[1] <= approved:
             continue
-        if phase in WORK_PHASES and phase not in seen:
-            seen.add(phase)
+        first = phase not in seen
+        seen.add(phase)
+        if phase in WORK_PHASES and first:
             facts.append((span, "work"))
+        elif phase in REWORK_PHASES and not first and any(a <= span[0] < b for a, b in failures):
+            facts.append((span, "rework"))
         elif phase in PHASE_PARTS:
             facts.append((span, PHASE_PARTS[phase]))
     return facts
@@ -121,6 +147,7 @@ def windows(store: StateStore, now: datetime, days: int, issues: dict[int, dict[
     out = [{"total_minutes": 0.0, "parts": dict.fromkeys((*PARTS, "unknown"), 0.0),
             "merges": 0, "missing_approval": 0} for _ in range(days)]
     records = store.flow_records()  # Bounded retained evidence; older facts may explain the interval.
+    reviews = orch_events.events(store, "review")
     merges = {}
     for row in executions:
         if row["merged"] and row["merged_at"] is not None and row["merged_at"] <= now:
@@ -137,8 +164,10 @@ def windows(store: StateStore, now: datetime, days: int, issues: dict[int, dict[
         own = [record for record in records if record["issue"] == number]
         starts = [row["started"] for row in executions if row["number"] == number]
         facts = _activity_facts(own) + _ready_facts(own, starts, merged) + _ordering_facts(own, merged)
-        parts = split(approved, merged, facts,
-                      _phase_facts([(phase, span) for issue, phase, span in phases if issue == number], approved))
+        runs = [(row["started"], row["finished"]) for row in executions if row["number"] == number]
+        failures = _failure_spans(number, own, reviews, runs, merged)
+        parts = split(approved, merged, facts, _phase_facts(
+            [(phase, span) for issue, phase, span in phases if issue == number], approved, failures))
         window["merges"] += 1
         window["total_minutes"] += (merged - approved).total_seconds() / 60
         for part, minutes in parts.items():

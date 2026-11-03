@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
+from foragent import orch_facts_decided as decided, orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
 from foragent import orch_scorecard_reverts as reverts
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
@@ -158,6 +158,26 @@ def _revert_counts(moments: list[datetime] | None, now: datetime, days: int) -> 
     return counts
 
 
+def _decided(store: StateStore, now: datetime, days: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Waiting-for-tests now and decision-to-approval minutes per 24-hour bucket.
+
+    Approvals sit in the bucket of their recorded approval time. The previous window takes
+    the median of the daily medians and the sum of unknown approvals; past waiting counts
+    are not recorded, so the previous waiting count is unknown."""
+    buckets: list[list] = [[] for _ in range(days)]
+    for item in decided.approvals(store):
+        if (index := _bucket(item[0], now, days)) is not None:
+            buckets[index].append(item)
+    daily = [decided.summary(items) for items in buckets]
+    today = {"tests_waiting": decided.tests_waiting(store)["count"],
+             "decision_to_approval_minutes": daily[0]["median_minutes"], "decision_unknown": daily[0]["unknown"]}
+    previous = {"tests_waiting": None,
+                "decision_to_approval_minutes": _median([day["median_minutes"] for day in daily[1:]
+                                                         if day["median_minutes"] is not None]),
+                "decision_unknown": sum(day["unknown"] for day in daily[1:])}
+    return today, previous
+
+
 def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
             revert_times: list[datetime] | None = None) -> dict[str, Any]:
     """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses.
@@ -189,6 +209,9 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     order = [*_day([], [], 0), "phase_minutes", "load", "merges", *flow.NAMES, *flow.EXTRA]
     today, previous = {name: today[name] for name in order}, {name: previous[name] for name in order}
     today["main_tests"], previous["main_tests"] = main_tests.windows(store, now, days)
+    now_decided, before_decided = _decided(store, now, days)
+    today.update(now_decided)
+    previous.update(before_decided)
     worse = _worse(today, previous) + flow.worse_names(today, previous)
     now_count, before_count = today["main_tests"]["count"], previous["main_tests"]["count"]
     if now_count is not None and before_count is not None and now_count > before_count:
@@ -203,6 +226,10 @@ def _number(value: Any, suffix: str = "") -> str:
     if value is None:
         return "-"
     return f"{value}{suffix}" if type(value) is int else f"{value:.1f}{suffix}"
+
+
+def _minutes(value: float | None) -> str:
+    return "-" if value is None else f"{value:.0f}"
 
 
 def _shown(name: str, value: Any) -> str:
@@ -319,6 +346,11 @@ def human(card: dict[str, Any], language: str) -> str:
              _split_line("scorecard_split_previous", previous, language)]
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
+    if "decision_to_approval_minutes" in today:
+        lines.append(text("scorecard_decided", language, waiting=_number(today["tests_waiting"]),
+                          today=_minutes(today["decision_to_approval_minutes"]), unknown=_number(today["decision_unknown"]),
+                          previous=_minutes(previous["decision_to_approval_minutes"]),
+                          previous_unknown=_number(previous["decision_unknown"])))
     lines += orch_roles.scorecard_lines(today, previous, language)
     for name in card["worse"]:
         before, now = _pair(card, name)
