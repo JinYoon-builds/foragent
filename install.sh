@@ -7,7 +7,7 @@
 # It sets up uv when it is missing, installs the fa command with uv, and registers the
 # Foragent Claude Code plugin when Claude Code is installed. It asks before it installs.
 # Pass --yes to install without the question (for scripts and CI).
-# A second run changes nothing: uv reinstalls the same tool and the plugin stays registered.
+# A second run changes nothing: an existing fa is left alone; fa update owns updates.
 #
 # FORAGENT_SOURCE overrides what uv installs (default: this repository on GitHub);
 # CI sets it to the checked-out copy so a pull request tests its own code.
@@ -35,6 +35,31 @@ for arg in "$@"; do
     *) fail "unknown option: $arg (try --help)" ;;
   esac
 done
+
+finish() {
+  if have codex; then
+    say ""
+    say "Codex was found. Codex as PM is experimental; Claude Code is the supported PM."
+  fi
+  say ""
+  say "Foragent is installed. Open Claude Code in your project folder and type /fa"
+}
+
+# A fresh shell (including the next CI step) may not have loaded uv's PATH changes.
+# Discover existing tools before downloading, editing profiles, or registering plugins.
+original_path="$PATH"
+PATH="$PATH:${XDG_BIN_HOME:-$HOME/.local/bin}:$HOME/.local/bin:$HOME/.cargo/bin"
+export PATH
+if ! have fa && have uv; then
+  bin_dir="$(uv tool dir --bin)"
+  PATH="$PATH:$bin_dir"
+  export PATH
+fi
+if have fa; then
+  say "Foragent is already installed. Nothing was changed. Run fa update to update it."
+  finish
+  exit 0
+fi
 
 say "Foragent installer"
 say ""
@@ -91,10 +116,10 @@ if ! have uv; then
 fi
 
 say "Installing the fa command..."
-uv tool install --force --reinstall "$SOURCE"
+uv tool install "$SOURCE"
 
 bin_dir="$(uv tool dir --bin)"
-case ":$PATH:" in
+case ":$original_path:" in
   *":$bin_dir:"*) ;;
   *)
     uv tool update-shell >/dev/null 2>&1 || true
@@ -122,10 +147,4 @@ else
   say "  claude plugin install foragent@foragent"
 fi
 
-if have codex; then
-  say ""
-  say "Codex was found. Codex as PM is experimental; Claude Code is the supported PM."
-fi
-
-say ""
-say "Foragent is installed. Open Claude Code in your project folder and type /fa"
+finish

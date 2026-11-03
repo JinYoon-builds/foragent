@@ -34,7 +34,7 @@ Without Node:
 curl -fsSL https://raw.githubusercontent.com/JinYoon-builds/foragent/main/install.sh | sh
 ```
 
-Both run the same installer. It shows what it will do and asks first. It installs uv (the Python tool installer) when it is missing, installs the `fa` command with uv, and registers the Foragent plugin in Claude Code. Running it again changes nothing. Add `--yes` to install without the question (`npx foragent --yes`, or `... | sh -s -- --yes`).
+Both run the same installer. It shows what it will do and asks first. It installs uv (the Python tool installer) when it is missing, installs the `fa` command with uv, and registers the Foragent plugin in Claude Code. When Foragent is already installed, it changes nothing and points to `fa update` for updates. Add `--yes` to install without the question (`npx foragent --yes`, or `... | sh -s -- --yes`).
 
 To install by hand instead, install uv (https://docs.astral.sh/uv/getting-started/installation/) and run:
 
@@ -127,7 +127,7 @@ Node가 없으면:
 curl -fsSL https://raw.githubusercontent.com/JinYoon-builds/foragent/main/install.sh | sh
 ```
 
-둘 다 같은 설치기를 돌려요. 할 일을 보여 주고 먼저 물어요. uv(Python 도구 설치기)가 없으면 설치하고, uv로 `fa` 명령을 설치하고, Claude Code에 Foragent 플러그인을 등록해요. 다시 돌려도 바뀌는 게 없어요. 묻지 않고 설치하려면 `--yes`를 붙여요(`npx foragent --yes`, 또는 `... | sh -s -- --yes`).
+둘 다 같은 설치기를 돌려요. 할 일을 보여 주고 먼저 물어요. uv(Python 도구 설치기)가 없으면 설치하고, uv로 `fa` 명령을 설치하고, Claude Code에 Foragent 플러그인을 등록해요. 이미 설치돼 있으면 아무것도 바꾸지 않고 업데이트 명령 `fa update`를 안내해요. 묻지 않고 설치하려면 `--yes`를 붙여요(`npx foragent --yes`, 또는 `... | sh -s -- --yes`).
 
 직접 설치하려면 uv를 설치하고(https://docs.astral.sh/uv/getting-started/installation/) 이렇게 실행해요.
 
