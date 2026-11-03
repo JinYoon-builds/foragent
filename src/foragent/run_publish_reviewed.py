@@ -122,7 +122,7 @@ def _publish_reviewed_in_turn(
         nonlocal head, base_sha, started, ci_wait, queued_status, ci_cause
         ci_cause = cause or run_group_check.refresh_cause(ctx, n)
         # The same turn rule as the implementation path: step aside while refreshing.
-        run_publish.merge_turn.step_aside(ctx, place)
+        run_publish.merge_turn.step_aside(ctx, place, target_sha)
         with activity(n, ctx, "base-refresh", ci_cause):
             head, stopped = run_publish._refresh_reviewed_head(n, ctx, git, pr, head, target_sha, reverify)
         if stopped:
@@ -176,7 +176,7 @@ def _publish_reviewed_in_turn(
             )
         if stopped:
             return stopped
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number, base_sha=base_sha)
         if stopped:
             return stopped
         if waited:

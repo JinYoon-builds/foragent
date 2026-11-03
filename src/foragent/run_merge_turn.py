@@ -10,12 +10,21 @@ Reading the queue: a run's entry is keyed by issue and the run's started_at.
 Its first ``ready`` entry fixes its position (a later head change keeps it). A
 ``withdrawn`` entry ends that position; a later ``ready`` joins at the tail. A
 ``turn`` record is history only. A run that merged leaves no withdrawn entry.
-The head, which holds the turn, is the first live entry in priority order
-that is not aside. An ``aside`` entry marks a seat that cannot merge now: it
-refreshes onto a moved base, re-verifies and waits for new CI. It keeps its
-position, and its next ``ready`` entry (or its ``withdrawn`` entry) ends the
-aside. While aside, the turn passes to the next live seat that is ready now;
-when every live seat is aside, the first one keeps the turn.
+The head, which holds the turn, is the first live entry in priority order,
+with one exception. An ``aside`` entry marks a seat that cannot merge now: it
+refreshes onto the moved base it names, re-verifies and waits for new CI. It
+keeps its position, and its ``back`` entry (current and green again, naming its
+new head and base) or its ``withdrawn`` entry ends the aside. Behind aside
+seats, the turn passes to the first live seat that is ready now: not aside, and
+the base of its latest ``ready`` or ``back`` entry contains the base of every
+aside seat ahead of it (equal, or a later main merged after that base). A seat
+verified on an older base would only start a second refresh of the same move,
+so it keeps waiting. When no seat qualifies, the first live seat keeps the turn.
+A seat that must refresh again while aside appends a new ``aside`` naming the
+new base. Containment is a Git fact the reader cannot compute, so whichever of
+the two rows is written later records it: ``contains`` lists
+``[ancestor, descendant]`` base pairs its writer proved with ``git
+merge-base --is-ancestor``. An unproven pair counts as not contained.
 Priority changes can change the next turn, while the merge lock serializes
 actual merges already in flight. Entries of runs that are not running are
 skipped, never deleted; the scheduler's crash recovery decides that an owner
@@ -98,19 +107,46 @@ def _waiting(rows: list[dict], target: str) -> dict[tuple[int, str | None], dict
     return active
 
 
-def _aside(rows: list[dict], target: str) -> set[tuple[int, str | None]]:
-    """Seats that stepped aside for ``target``: an aside row not yet followed by ready or withdrawn."""
-    aside: set[tuple[int, str | None]] = set()
-    for row in rows:
+def _aside(rows: list[dict], target: str) -> dict[tuple[int, str | None], tuple[int, str | None]]:
+    """Seats aside for ``target``: (row index, base it refreshes onto) of an aside row not yet
+    followed by the seat's back, ready or withdrawn row."""
+    aside: dict[tuple[int, str | None], tuple[int, str | None]] = {}
+    for index, row in enumerate(rows):
         if row.get("target", target) != target:
             continue
         key = (row["n"], row.get("started_at"))
         event = row.get("event")
         if event == "aside":
-            aside.add(key)
-        elif event in {"ready", "withdrawn"}:
-            aside.discard(key)
+            aside[key] = index, row.get("base_sha")
+        elif event in {"back", "ready", "withdrawn"}:
+            aside.pop(key, None)
     return aside
+
+
+def _contained(rows: list[dict]) -> set[tuple[str, str]]:
+    """Every proven (ancestor base, descendant base) pair the queue rows record."""
+    return {(pair[0], pair[1]) for row in rows for pair in row.get("contains") or ()
+            if isinstance(pair, list) and len(pair) == 2 and all(isinstance(sha, str) for sha in pair)}
+
+
+def _proofs(ctx: RunContext, pairs: set[tuple[str, str]]) -> list[list[str]]:
+    """The (ancestor, descendant) pairs this writer proves with Git; an unreadable pair stays unproven."""
+    from foragent.git import GitError
+
+    proved = []
+    for ancestor, descendant in sorted(pairs):
+        try:
+            if ctx.git.is_ancestor(ancestor, descendant):
+                proved.append([ancestor, descendant])
+        except GitError:
+            continue
+    return proved
+
+
+def _ready_bases(rows: list[dict], target: str) -> dict[tuple[int, str | None], str | None]:
+    """The base each seat's latest ready or back row was verified on."""
+    return {(row["n"], row.get("started_at")): row.get("base_sha") for row in rows
+            if row.get("event") in {"ready", "back"} and row.get("target", target) == target}
 
 
 def _live(store: StateStore, key: tuple[int, str | None]) -> bool:
@@ -125,10 +161,19 @@ def _turn_order(entries: dict[tuple[int, str | None], dict], priority: list[int]
 
 
 def _holder(store: StateStore, rows: list[dict], target: str) -> tuple[int, str | None] | None:
-    """The seat holding ``target``'s turn: the first live seat that is not aside, else the first live seat."""
+    """The seat holding ``target``'s turn (see the module rules)."""
     live = [key for key in _turn_order(_waiting(rows, target), orch_queue.get_global(store)) if _live(store, key)]
-    aside = _aside(rows, target)
-    return next((key for key in live if key not in aside), live[0] if live else None)
+    aside, bases, contained = _aside(rows, target), _ready_bases(rows, target), _contained(rows)
+    ahead: list[str | None] = []  # bases of the aside seats ahead
+    for key in live:
+        if key in aside:
+            ahead.append(aside[key][1])
+            continue
+        base = bases.get(key)
+        if all(other is not None and base is not None and (base == other or (other, base) in contained)
+               for other in ahead):
+            return key
+    return live[0] if live else None
 
 
 def _append(store: StateStore, row: dict) -> None:
@@ -142,27 +187,44 @@ def _row(ctx: RunContext, place: Seat, event: str, **fields) -> dict:
             **fields, "at": ctx.now().isoformat()}
 
 
-def join(ctx: RunContext, place: Seat, head_sha: str) -> None:
-    """Append this run's ready entry unless it already holds a position and is not aside.
+def join(ctx: RunContext, place: Seat, head_sha: str, base_sha: str | None = None) -> None:
+    """Append this run's ready entry unless it already holds a position.
 
-    A seat coming back from aside appends ready again; it keeps its first position.
+    A seat coming back from aside appends a back entry instead and keeps its position.
+    ``base_sha`` names the base this head was verified on.
     """
     with ctx.store._state_lock():
         rows = _rows(ctx.store)
-        if place.key not in _waiting(rows, place.target) or place.key in _aside(rows, place.target):
-            _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
+        event = ("ready" if place.key not in _waiting(rows, place.target)
+                 else "back" if place.key in _aside(rows, place.target) else None)
+        if event is None:
+            return
+        fields = {"head_sha": head_sha, "base_sha": base_sha}
+        if base_sha is not None:  # Prove which aside bases ahead of anyone this base already contains.
+            asides = {base for _, base in _aside(rows, place.target).values() if base not in {None, base_sha}}
+            if proofs := _proofs(ctx, {(base, base_sha) for base in asides}):
+                fields["contains"] = proofs
+        _append(ctx.store, _row(ctx, place, event, **fields))
 
 
-def step_aside(ctx: RunContext, place: Seat) -> None:
-    """Mark a queued seat that must refresh, re-verify and wait for CI before it can merge.
+def step_aside(ctx: RunContext, place: Seat, base_sha: str) -> None:
+    """Mark a queued seat that must refresh onto ``base_sha``, re-verify and wait for CI first.
 
-    It keeps its position; a run that is ready now takes the turn meanwhile. An absent or
-    already aside seat records nothing.
+    It keeps its position; a run verified on a base that contains ``base_sha`` takes the turn
+    meanwhile. An absent seat, or one already aside for the same base, records nothing; an
+    aside seat that must refresh onto a newer base records that base.
     """
     with ctx.store._state_lock():
         rows = _rows(ctx.store)
-        if place.key in _waiting(rows, place.target) and place.key not in _aside(rows, place.target):
-            _append(ctx.store, _row(ctx, place, "aside"))
+        current = _aside(rows, place.target).get(place.key)
+        if place.key not in _waiting(rows, place.target) or (current is not None and current[1] == base_sha):
+            return
+        fields = {"base_sha": base_sha}
+        verified = {base for key, base in _ready_bases(rows, place.target).items()
+                    if key != place.key and base not in {None, base_sha}}
+        if proofs := _proofs(ctx, {(base_sha, base) for base in verified}):
+            fields["contains"] = proofs  # Bases already queued that contain this one.
+        _append(ctx.store, _row(ctx, place, "aside", **fields))
 
 
 def withdraw(ctx: RunContext, place: Seat, *, reason: str = "unknown", detail: str | None = None) -> None:
@@ -347,13 +409,14 @@ def _stop_if_ended(n: int, ctx: RunContext, credit, place: Seat, pr: int | None)
         _report_remote_end(n, ctx, place, ended)
 
 
-def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str, pr: int | None = None) -> tuple[bool, str | None]:
+def await_turn(n: int, ctx: RunContext, place: Seat, head_sha: str, pr: int | None = None,
+               base_sha: str | None = None) -> tuple[bool, str | None]:
     """Join and wait without re-verifying or polling CI; return (waited, stop).
 
     The whole merge-turn wait is credited as waited, preserving the work budget.
     Queue waits and retry pauses share a separate bound per run, MERGE_WAIT_SECONDS.
     """
-    join(ctx, place, head_sha)
+    join(ctx, place, head_sha, base_sha)
     if holds_turn(ctx.store, place) and ctx.store.get_run(n).merge_waited_seconds < _read_due(n, ctx, pr):
         return False, None
     with _merge_wait(n, ctx) as credit:

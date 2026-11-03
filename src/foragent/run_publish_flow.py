@@ -82,7 +82,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         nonlocal ci_cause
         ci_cause = cause or run_group_check.refresh_cause(ctx, n)
         # A queued seat that must refresh cannot merge now: a ready run takes the turn meanwhile.
-        run_publish.merge_turn.step_aside(ctx, place)
+        run_publish.merge_turn.step_aside(ctx, place, move.target_sha)
         attempt.base_refresh = True  # This whole interval is one base-refresh record.
         try:
             with activity(n, ctx, "base-refresh", ci_cause):
@@ -289,7 +289,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             return stopped
         queued_status = None
         # Wait for the FIFO turn without re-verifying; CI is checked again on getting it (#712).
-        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr)
+        waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr,
+                                                                  base_sha=verified_base_sha)
         if stopped:
             return stopped
         if waited:
