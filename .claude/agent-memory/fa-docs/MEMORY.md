@@ -41,7 +41,7 @@
 - A bug-fix order can add an exception to a rules.md line with no decision ID (#1597, merge-turn owner vs machine budget lines 32/35): grep rules.md for the resource it touches, then ask, don't edit.
 - 'Preread answers' issues (e.g. #1156, #1203) have no doc effect; read the plan's acceptance map to find the real issues (#997, #999).
 - Order Goals can carry a dated rule ('Review standard (2026-11-02)' in #1599) with no decisions.md entry; check whether it changes a rules.md line and ask for a Dnn.
-- Prompt-content changes (e.g. #1570, whole authored issue in prompts) touch no reader doc; only docs/impl/*.md (2026-10 phase briefs, e.g. p7c-native.md:9) describe prompt contents. Treat those as history, not drift.
+- Prompt-content changes (e.g. #1570, whole authored issue in prompts) touch no reader doc; only docs/impl/*.md (2026-10 phase briefs, e.g. p7c-native.md:9) describe prompt contents. Treat those as history, not drift. Stop-condition orders (e.g. #1750) edit p7c-native.md in the same merge.
 - An order issue's title can name another issue (#1614 titled '#1526: review standard'); the merged commit carries the child number, so grep `git log` for both.
 - Several scheduled orders can be scope-corrections of one issue ('#1523: review standard, ...'); find the one merge via `git log --grep` on the shared number, then check docs/order.md, which lists every publish refusal.
 - Orders titled '#NNNN: lock ...' or '#NNNN: re-approve' (e.g. #1657/#1663/#1665 for #1527) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
