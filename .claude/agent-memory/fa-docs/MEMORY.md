@@ -20,6 +20,7 @@
 - r368-r369 (2026-11-03): #1512/#1697/#1718 (=#1469, merge c69e7f98): r368 fa-architect SKILL lacks gate-alarm start + dig method; r369 ask Dnn for alarm/worse-only/no-slot-wait rules. Wait: orchestrator.
 - r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
 - r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
+- r449 (2026-11-04): #1746/#1751/#1767 (=#1651, merge 826313b): ask D109 for undated-ID decisions.md:944 + rules.md:82-88 uncited section; gate.md:130 stale 4 defaults, :172 stray yaml; skills/review-procedure vs D37 → r347. Wait: orchestrator relays.
 - r420 (2026-11-04): #1696 size signal + #1774 importer check folded into the accepted-but-unwritten r324/r383 docs/order.md edit. Wait: orchestrator turns it into one edit.
 
 ## Lessons
@@ -62,3 +63,5 @@
 - Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
 - Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line. Alarm-rule Dnn ask stays r369.
 - 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.
+- '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
+- An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
