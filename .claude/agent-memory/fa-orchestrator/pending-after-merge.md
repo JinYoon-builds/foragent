@@ -241,3 +241,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1491 bar edit (drafts/1491-bar, architect r377): publish with approval at the next #1491 retry boundary or if round 5 FAILs; not while the run is in progress.
 - 11-03 08:3xZ 24h approval-to-merge split (after #1727): work 24%, rework 11%, concurrency 17%, machine limit 8%, ordering 2%, waste 21%, unknown 18% (was ~all unknown). #1635 Done when ('removing or raising the cap restores the pre-cap budget on the next tick') deferred to the new Mac.
 - Scorecard caveat (architect r380): parts before 5247ec34 (#1727) are mostly 'unknown'; compare waste/rework across days only from 2026-11-09.
+- After #1760 merges: check merge-queue rows where main moved between the holder's refresh and its CI result and a ready-run merge in that window turned main red (architect r382); feed into merge owner (#1502).
