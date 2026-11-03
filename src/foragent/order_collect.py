@@ -23,7 +23,7 @@ from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths
 
-# Slot admission and execution share this budget, per order, however many bases it is checked on.
+# Execution shares this budget, per order, however many bases it is checked on.
 LIMIT_S = 30.0
 _OUTPUT_CHARS = 1500
 # Inherited settings that add import paths or choose another project; the command may set its own.
@@ -158,15 +158,15 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     invocation = (f"{_CALLER_SETTINGS}{pytest} --collect-only {shlex.quote(str(named))} {shlex.join(selected)} "
                   f"-o junit_family=legacy --junit-prefix= "
                   f"--junitxml={shlex.quote(str(report))}")
+    # A short collect-only run takes no machine test slot, so lane test runs holding every slot
+    # never delay it; HELD_ENV keeps a `fa test` inside the project's command from queueing either.
+    remaining = deadline - time.monotonic()
     try:
-        with capacity.hold_test_slot(config.test_slots, deadline=deadline,
-                                     timed_out=lambda: text("order_collect_slot_timeout", language)):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(text("order_collect_timeout", language, seconds=int(LIMIT_S)))
-            code, timed_out, _ = processes.run_logged(
-                ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
-                env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
+        if remaining <= 0:
+            raise TimeoutError(text("order_collect_timeout", language, seconds=int(LIMIT_S)))
+        code, timed_out, _ = processes.run_logged(
+            ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
+            env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
     except (TimeoutError, OSError) as exc:
         raise _Unavailable(str(exc), attempted) from exc
     if timed_out:
