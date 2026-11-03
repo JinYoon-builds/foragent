@@ -149,7 +149,8 @@ def test_installer_is_idempotent_and_reuses_an_existing_uv(tmp_path):
     assert second.returncode == 0, output
     calls = machine.calls()
     assert not fetched(calls), f"An existing uv is reused, nothing is downloaded: {calls}"
-    assert len(installs_foragent(calls)) == 2, f"Each run installs Foragent once: {calls}"
+    assert len(installs_foragent(calls)) == 1, (
+        f"A second run finds Foragent installed and installs nothing; fa update owns updates: {calls}")
     assert machine.files() == after_first, "A second run leaves the same files in HOME (no duplicated lines)"
 
 
