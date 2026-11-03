@@ -34,9 +34,9 @@ def test_default_outbox_preserves_unicode_and_multiline_as_one_record(tmp_path, 
     monkeypatch.setattr(StateStore, "for_repo", lambda repo: StateStore(tmp_path))
     for _ in range(2):
         assert notify.send(Config(repo="owner/repo"), "검토", "첫 줄\n다음 줄") is True
-    lines = (tmp_path / "push-outbox.jsonl").read_text().splitlines()
-    assert len(lines) == 2
-    assert json.loads(lines[0]) == {"title": "검토", "line": "첫 줄\n다음 줄", "link": None}
+    relayed = [event for event in _journal(tmp_path) if event["status"] == notify.RELAY]
+    assert [event["summary"] for event in relayed] == ["검토: 첫 줄 다음 줄"] * 2  # The journal keeps one line.
+    assert not list(tmp_path.rglob("*outbox*"))
 
 
 def test_command_runs_literal_path_and_clears_inherited_link(monkeypatch):
@@ -63,6 +63,11 @@ def _journal(root):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+def _relayed_titles(root):
+    """Titles of the alerts handed to the planning session for the person (#1650)."""
+    return [event["summary"].partition(": ")[0] for event in _journal(root) if event["status"] == notify.RELAY]
+
+
 @pytest.mark.parametrize("policy", ["decisions", "all"])
 def test_filter_pushes_by_producer_kind_and_keeps_the_rest_as_notices(tmp_path, monkeypatch, policy):
     monkeypatch.setattr(StateStore, "for_repo", lambda repo: StateStore(tmp_path))
@@ -71,8 +76,8 @@ def test_filter_pushes_by_producer_kind_and_keeps_the_rest_as_notices(tmp_path, 
         with notify.sending(kind) as outcome:
             assert notify.send(config, str(kind), "same words") is True
         assert outcome.error is None
-    pushed = [json.loads(line)["title"] for line in (tmp_path / "push-outbox.jsonl").read_text().splitlines()]
-    kept = [(event["status"], event["channel"]) for event in _journal(tmp_path)]
+    pushed = _relayed_titles(tmp_path)
+    kept = [(event["status"], event["channel"]) for event in _journal(tmp_path) if event["status"] != notify.RELAY]
     if policy == "decisions":
         assert pushed == ["question", "merge", "order"]
         assert kept == [("not pushed", kind) for kind in (*notify.STATUS_KINDS, "untyped")]
@@ -86,16 +91,14 @@ def test_kind_does_not_leak_out_of_its_block(tmp_path, monkeypatch):
     with notify.sending("question"):
         assert notify.send(config, "inside", "line")
     assert notify.send(config, "after", "line")
-    pushed = [json.loads(line)["title"] for line in (tmp_path / "push-outbox.jsonl").read_text().splitlines()]
-    assert pushed == ["inside"]
+    assert _relayed_titles(tmp_path) == ["inside"]
 
 
 def test_failed_delivery_is_reported_and_kept_as_a_notice(tmp_path, monkeypatch):
     monkeypatch.setattr(StateStore, "for_repo", lambda repo: StateStore(tmp_path))
-    (tmp_path / "push-outbox.jsonl").mkdir()
     with notify.sending("merge") as outcome:
-        assert notify.send(Config(repo="owner/repo"), "Merge", "PR #3") is False
-    assert "IsADirectoryError" in outcome.error
+        assert notify.send(Config(repo="owner/repo", notify=f"command:{tmp_path / 'missing'}"), "Merge", "PR #3") is False
+    assert "FileNotFoundError" in outcome.error
     [event] = _journal(tmp_path)
     assert event["status"] == "failed" and event["channel"] == "merge" and "PR #3" in event["summary"]
 
@@ -113,7 +116,7 @@ def test_notify_none_pushes_nothing_but_keeps_status_facts(tmp_path, monkeypatch
     for kind in ("question", "silence"):
         with notify.sending(kind):
             assert notify.send(config, kind, "line") is True
-    assert not (tmp_path / "push-outbox.jsonl").exists()
+    assert _relayed_titles(tmp_path) == []
     assert [event["channel"] for event in _journal(tmp_path)] == ["silence"]
 
 
@@ -163,4 +166,7 @@ def test_an_unpushed_fact_whose_notice_cannot_be_written_is_not_acknowledged(tmp
             assert notify.send(config, "Silent", "line") is False, "A caller would mark it delivered"
         assert "journal unwritable" in outcome.error
     with notify.sending("question"):
-        assert notify.send(config, "Question", "line") is True, "Decisions live in their own record"
+        # Under none a decision lives in its own record; on the default route (#1650) it is
+        # relayed through the same planning journal, so it is not acknowledged either.
+        assert notify.send(config, "Question", "line") is (config.notify == "none"), \
+            "Decisions live in their own record"
