@@ -69,9 +69,8 @@ class StateBase:
         return value
 
     def _run_path(self, run: "Run") -> Path:
-        """runs/<n>.json for an issue run; runs/dream-<lane>.json for a lane's dream run."""
-        name = f"dream-{run.lane}" if run.kind == "dream" else str(run.number)
-        return self.root / "runs" / f"{name}.json"
+        """runs/<n>.json for an issue run; dream-<lane>.json or draft-<n>.json for a side run (Run.key)."""
+        return self.root / "runs" / f"{run.key}.json"
 
     def get_dream(self, lane: str) -> "Run | None":
         """A lane's dream run record; it never enters runs.jsonl (that history is issue-only)."""
@@ -105,9 +104,42 @@ class StateBase:
         self._write_json(self.root / "runs" / f"dream-{lane}.json", _state.asdict(run))
         return run
 
+    def get_draft(self, number: int) -> "Run | None":
+        """An issue's test-drafting run record (runs/draft-<n>.json); like a dream's, never in runs.jsonl."""
+        try:
+            value = (self.root / "runs" / f"draft-{number}.json").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        return _state.load_record(_state.Run, _state.json.loads(value))
+
+    def draft_runs(self) -> list["Run"]:
+        """Every issue's drafting record, running or finished."""
+        paths = sorted((self.root / "runs").glob("draft-*.json"))
+        return [run for path in paths if path.stem[6:].isdigit() and (run := self.get_draft(int(path.stem[6:])))]
+
+    def start_draft(self, number: int, lane: str, *, worktree: str | Path, attempts: int = 1,
+                    under_machine_lock: bool = False) -> "Run":
+        """Write a fresh drafting record, as start_dream writes a dream's (the tick holds the machine lock).
+
+        ``attempts`` counts the sessions that used an attempt, this one included; the record is the
+        issue's only durable drafting fact (journals are trimmed), so the tick carries it forward.
+        """
+        if not under_machine_lock:
+            with self._state_lock():
+                return self.start_draft(number, lane, worktree=worktree, attempts=attempts, under_machine_lock=True)
+        timestamp = self._timestamp()
+        run = _state.Run(number, f"foragent/draft-{number}", str(worktree), None, timestamp, timestamp,
+                         lane=lane, tier="s", last_activity_at=timestamp, kind="draft", attempts=attempts)
+        self._write_json(self.root / "runs" / f"draft-{number}.json", _state.asdict(run))
+        return run
+
     def finish_dream(self, lane: str, outcome: str, detail: str = "") -> "Run | None":
+        return self._finish_side(f"dream-{lane}", outcome, detail)
+
+    def _finish_side(self, key: str, outcome: str, detail: str = "") -> "Run | None":
+        """Finish a dream or draft record; side runs never enter runs.jsonl."""
         with self._state_lock():
-            run = self.get_dream(lane)
+            run = self.get_dream(key[6:]) if key.startswith("dream-") else self.get_draft(int(key[6:]))
             if run is None or run.status == "finished":
                 return run
             from foragent.processes import observe_tree
