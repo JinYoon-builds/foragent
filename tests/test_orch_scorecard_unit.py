@@ -782,7 +782,7 @@ def test_split_contradiction_is_unknown_and_duplicates_count_once(store):
         _activity(approved, "queue", 2, 6),  # Overlaps work for 2 minutes: unknown there.
     ])[0]
     assert today["total_minutes"] == 10 and today["merges"] == 1
-    assert today["parts"] == {"work": 2, "concurrency_cost": 0, "machine_limit": 0, "ordering": 0,
+    assert today["parts"] == {"work": 2, "rework": 0, "concurrency_cost": 0, "machine_limit": 0, "ordering": 0,
                               "waste": 2, "unknown": 6}
 
 
@@ -806,7 +806,7 @@ def test_split_phases_alone_name_only_first_work_and_overlap_waits(store):
         ("implementing", 0, 3), ("overlap-wait", 3, 5), ("implementing", 5, 8), ("merge-lock-wait", 8, 10),
         ("merging", 10, 12)])[0]["parts"]
     # A second implementing and a merge-lock wait without a recorded cause stay unknown.
-    assert parts == {"work": 5, "concurrency_cost": 2, "machine_limit": 0, "ordering": 0,
+    assert parts == {"work": 5, "rework": 0, "concurrency_cost": 2, "machine_limit": 0, "ordering": 0,
                      "waste": 0, "unknown": 5}
 
 
@@ -1001,3 +1001,108 @@ def test_slot_idle_dates_only_the_close_its_merge_caused_after_a_reopen(store, t
     assert _idle_pair(store) == (20, 20)
     store.ingest([], NOW, {}, complete=True)
     assert _idle_pair(store) == (20, 20)
+
+
+def _rework_split(store, phases, failures=(), runs=((0, 20),), records=()):
+    """The real split for issue 7 over 20 minutes with review FAILs or CI facts at given minutes.
+
+    ``failures`` are (minute, kind, verdict): kind ``review`` journals a review event, kind
+    ``ci`` records a ci-failure fact for the run that holds the minute."""
+    from foragent import orch_events, orch_scorecard_split as split
+
+    approved = NOW - timedelta(hours=1)
+    at = lambda minute: approved + timedelta(minutes=minute)  # noqa: E731
+    for minute, kind, data in records:
+        store.clock[0] = at(minute)
+        store.record_flow(kind, issue=7, **data)
+    for minute, kind, verdict in failures:
+        store.clock[0] = at(minute)
+        start = max(a for a, _ in runs if a <= minute)
+        if kind == "review":
+            orch_events.append_event(store, at(minute), 7, "review", f"{verdict} 1 findings", verdict=verdict)
+        else:
+            store.record_flow("ci-failure", issue=7, run_started_at=at(start).isoformat(), pr=2, head="h")
+    store.clock[0] = NOW
+    executions = [{"number": 7, "started": at(a), "finished": at(b), "merged": b == 20,
+                   "merged_at": at(b) if b == 20 else None} for a, b in runs]
+    issues = {7: {"events": [], "approved_at": approved}}
+    spans = [(7, phase, (at(a), at(b))) for phase, a, b in phases]
+    return split.windows(store, NOW, 2, issues, executions, spans)[0]["parts"]
+
+
+ROUNDS = [("implementing", 0, 5), ("reviewing", 5, 8), ("implementing", 8, 14), ("reviewing", 14, 16),
+          ("ci", 16, 18), ("merging", 18, 20)]
+
+
+@pytest.mark.parametrize("kind", ["review", "ci"])
+def test_split_rounds_after_a_recorded_failure_are_rework(store, kind):
+    parts = _rework_split(store, ROUNDS, [(8, kind, "FAIL")])
+    assert parts["rework"] == 8 and parts["work"] == 12 and parts["unknown"] == 0
+    assert sum(parts.values()) == 20
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "SPEC-CONFLICT", "UNUSABLE"])
+def test_split_only_a_review_fail_makes_rework(store, verdict):
+    parts = _rework_split(store, ROUNDS, [(8, "review", verdict)])
+    assert parts["rework"] == 0 and parts["work"] == 12 and parts["unknown"] == 8
+
+
+def test_split_rework_starts_at_the_failure(store):
+    # The FAIL lands mid-round: that round started before it and stays unknown.
+    parts = _rework_split(store, ROUNDS, [(10, "review", "FAIL")])
+    assert parts["rework"] == 2 and parts["unknown"] == 6  # Only reviewing 14-16; ci 16-18 is the first ci.
+
+
+@pytest.mark.parametrize("kind", ["review", "ci"])
+def test_split_rework_ends_with_the_failed_run(store, kind):
+    # A failure in a run that finished before the next run explains nothing in the next run.
+    parts = _rework_split(store, ROUNDS, [(6, kind, "FAIL")], runs=((0, 7), (8, 20)))
+    assert parts["rework"] == 0 and parts["unknown"] == 8
+
+
+def test_split_recorded_activity_cause_wins_over_rework(store):
+    approved = NOW - timedelta(hours=1)
+    parts = _rework_split(store, ROUNDS, [(8, "review", "FAIL")], records=[_activity(approved, "base-changed", 8, 14)])
+    assert parts["concurrency_cost"] == 6 and parts["rework"] == 2 and parts["work"] == 12
+
+
+def test_split_first_resolving_conflict_stays_unknown_and_a_later_one_after_failure_is_rework(store):
+    phases = [("implementing", 0, 5), ("resolving-conflict", 5, 8), ("resolving-conflict", 10, 14),
+              ("merging", 14, 20)]
+    parts = _rework_split(store, phases, [(5, "ci", "FAIL")])  # Both rounds start after the failure.
+    assert parts["rework"] == 4 and parts["work"] == 11 and parts["unknown"] == 5
+
+
+def _ci_case(store, monkeypatch):
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    monkeypatch.setattr(run_publish, "_phase", lambda n, ctx, phase: None)
+    store.clock[0] = NOW - timedelta(minutes=5)
+    store.start_run(3, branch="foragent/issue-3", worktree=store.worktree_path(3))
+    store.clock[0] = NOW
+    tracker = SimpleNamespace(pr_failed_logs=lambda pr, full_text_dir=None: "FAILED test_a",
+                              pr_head_sha=lambda pr: "abc")
+    return SimpleNamespace(store=store, tracker=tracker, repo="o/r", config=SimpleNamespace(max_retries=3))
+
+
+def test_ci_failure_keeps_a_local_fact_without_changing_the_retry(store, monkeypatch):
+    from foragent import run_publish, run_publish_ci
+
+    ctx = _ci_case(store, monkeypatch)
+    with pytest.raises(run_publish.CIFailure):
+        run_publish_ci._ci_failure(3, ctx, 9, "abc", "main")
+    facts = [record for record in store.flow_records() if record["kind"] == "ci-failure"]
+    assert [(f["issue"], f["run_started_at"], f["data"]) for f in facts] == [
+        (3, store.get_run(3).started_at, {"pr": 9, "head": "abc"})]
+    assert store.get_run(3).attempts == 2
+
+
+def test_ci_failure_record_error_never_replaces_the_run_result(store, monkeypatch):
+    from foragent import run_publish, run_publish_ci
+
+    ctx = _ci_case(store, monkeypatch)
+    monkeypatch.setattr(store, "record_flow", lambda *a, **k: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(run_publish.CIFailure):
+        run_publish_ci._ci_failure(3, ctx, 9, "abc", "main")
+    assert store.get_run(3).attempts == 2
