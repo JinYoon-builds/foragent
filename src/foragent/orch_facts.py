@@ -119,7 +119,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
             for directory in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR,
-                              *(("approvals",) if source == store.root else ())):
+                              *(("approvals", "inbox/questions") if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
             if source == store.root:

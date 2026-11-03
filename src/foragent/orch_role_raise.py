@@ -160,6 +160,38 @@ def burden(facts: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def held(kind: str, before: Any, after: Any) -> tuple[Any, Any]:
+    """One kind's burden numbers ready to compare (``HELD_FACTS``).
+
+    The named field is never read from ``after``: what is named now depends on when its time was
+    read (a marker fetched or delivered later). It becomes one question, decided by the earlier
+    answer alone: has its anchor stopped waiting? The anchor is the item the answer named, or,
+    when it named none, every item listed then. Only the count and that answer remain to
+    compare; the list itself is no burden.
+    """
+    field, members = orch_facts_kinds.HELD_FACTS.get(kind, (None, None))
+    if field is None or not isinstance(before, dict) or not isinstance(after, dict):
+        return before, after
+    before, after = dict(before), dict(after)
+    anchor = {before[field]} if before.get(field) is not None else set(before.get(members) or ())
+    listed = set(after.get(members) or ())
+    before[field], after[field] = False, bool(anchor) and not anchor & listed
+    before.pop(members, None)
+    after.pop(members, None)
+    return before, after
+
+
+def worse_facts(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """``worse`` over two burden views (``burden``), each kind's numbers through ``held``."""
+    before = json.loads(json.dumps(before, default=str))
+    after = json.loads(json.dumps(after, default=str))
+    for kind, item in (after.get("kinds") or {}).items():
+        prior = (before.get("kinds") or {}).get(kind)
+        if isinstance(item, dict) and isinstance(prior, dict):
+            prior["numbers"], item["numbers"] = held(kind, prior.get("numbers"), item.get("numbers"))
+    return worse(before, after)
+
+
 def worse(before: Any, after: Any) -> bool:
     """Whether ``after`` holds a burden ``before`` did not: a greater number, a new member or
     key, or a different value. Order, smaller numbers and missing members or values are not worse."""
@@ -219,7 +251,7 @@ def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
             if value - before[key]:
                 return True
         elif isinstance(value, _Burden):
-            if not isinstance(before[key], _Burden) or worse(before[key].numbers, value.numbers):
+            if not isinstance(before[key], _Burden) or worse(*held(key[0], before[key].numbers, value.numbers)):
                 return True
         elif not _same(before[key], value):
             return True
@@ -266,6 +298,27 @@ def _gate_call(store: StateStore, repo_root: Path, config, now: datetime, name: 
     return orch_inbox.annotate_request(store, request["id"], {"launched_at": now.isoformat()})
 
 
+def answered_facts(record: dict[str, Any], measured: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The facts an answer covers: those measured at the answer, and for any part of the signal
+    not present then (unmet for a moment, or unreadable), what the request was about.
+
+    Both answer paths store this (`fa orch signal-answer` and a finished gate dive), so a
+    burden that briefly vanished at the answer and returns unchanged is not worse than it.
+    """
+    about = record.get("call_facts") or record.get("facts")
+    if measured is None:
+        return about
+    if not isinstance(about, dict):
+        return measured
+    result = json.loads(json.dumps(measured, default=str))
+    if "files" in about and not result.get("files"):
+        result["files"] = about["files"]
+    kinds = result.setdefault("kinds", {}) if "kinds" in about or "kinds" in result else None
+    for kind, item in (about.get("kinds") or {}).items():
+        kinds.setdefault(kind, item)
+    return result
+
+
 def complete_call(store: StateStore, request_id: str, repo_root: Path | None = None) -> None:
     """Mark a gate alarm called once its session finished.
 
@@ -279,7 +332,7 @@ def complete_call(store: StateStore, request_id: str, repo_root: Path | None = N
         if record.get("status") == "done":
             raise orch_inbox.InboxError(f"request {request_id} is already done")
         record.update(answer="called",
-                      answer_facts=measured if measured is not None else record.get("call_facts") or record.get("facts"))
+                      answer_facts=answered_facts(record, measured))
 
     try:
         record = orch_inbox.set_request_status(store, request_id, "done",
@@ -297,7 +350,7 @@ def _gate_due(store: StateStore, now: datetime, name: str, key: str, previous: d
     from foragent import orch_architect
 
     baseline = (answer.get("answer_facts") or answer.get("facts")) if answer else None
-    if baseline is not None and not worse(burden(baseline), burden(facts)):
+    if baseline is not None and not worse_facts(burden(baseline), burden(facts)):
         return None  # The same or better than at the last answer.
     if orch_architect.session_alive(orch_architect.read_record(store, name)):
         return None  # The running session already digs; never start a second one.
@@ -417,7 +470,7 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
             raise orch_inbox.InboxError(f"request {request_id} is already done")
         record["answer"] = how  # Set with the done mark, so a tick never sees done without it.
         if facts is not None:
-            record["answer_facts"] = facts
+            record["answer_facts"] = answered_facts(record, facts)
 
     record = orch_inbox.set_request_status(store, request_id, "done",
                                            f"role signal {how}: {why}" if why else f"role signal {how}",

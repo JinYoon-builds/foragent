@@ -29,8 +29,6 @@ CONCENTRATION_IDLE = 2
 # The recent merge interval is the median gap between this many latest merges.
 STALL_MERGES = 4
 STALL_FACTOR = 3
-# Waiting on a person counts once its oldest item has waited this long.
-PERSON_WAIT = timedelta(hours=1)
 # Issue labels that hand an issue to a person: `fa orch escalate` and a blocking needs-human
 # reason set needs-human; `fa orch park --for-person` sets waiting-person.
 PERSON_LABELS = ("needs-human", "waiting-person")
@@ -51,6 +49,11 @@ CONTEXT_FACTS = {
     "files_over_limit": ("limit",),
     "lane_concentration": ("runs", "lane_runs"),
 }
+# An item a burden names, compared only by whether it still waits (#1469): kind -> (field,
+# list field). The current value of the field is never compared, since it depends on when a time
+# was read; a comparison asks whether the item the earlier answer named (or, with none named,
+# every item it listed) has left the list. The list itself is no burden, only the count is.
+HELD_FACTS = {"waiting_on_person": ("oldest", "items")}
 # A burden field derived as part / whole from a kind's numbers: name -> (part, whole).
 SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
@@ -209,32 +212,34 @@ def _person_since(store: StateStore, row: dict[str, Any], pending: list[dict[str
 
 
 def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Items that wait on a person, once the oldest has waited PERSON_WAIT (#1469).
+    """Items that wait on a person (#1469): present whenever one waits.
 
     Open issues labelled for a person (``PERSON_LABELS``) and open orchestrator questions all
-    count in ``waiting``. The oldest is chosen among the items with a known start (a question's
-    creation, an issue's marker comment), so it never changes while the same items wait.
+    count in ``waiting``; ``items`` names them (``#<issue>`` or the question id). ``oldest`` and
+    ``oldest_minutes`` come from the items with a known start (a question's creation, an issue's
+    marker comment) and are None when no start is known, for example before a refresh has read an
+    issue's comments. A start can move when a queued marker is delivered or first appears
+    when comments are read, so no presence or comparison reads it: ``HELD_FACTS`` compares only
+    whether the item named at an answer still waits, and ``oldest_minutes`` is elapsed time.
     """
     from foragent import orch_inbox
 
     known = [(at, row["id"]) for row in orch_inbox.questions(store)
-             if (at := _time(row.get("created_at"))) is not None and at <= now]
-    unknown = 0
+             if (at := _time(row.get("created_at"))) is not None]
+    items = {row["id"] for row in orch_inbox.questions(store)}
     pending = store.github_outbox()
     for row in store.local_issues():
         if (row.get("state") != "open" or row.get("is_pull_request")
                 or not set(row.get("labels") or ()) & set(PERSON_LABELS)):
             continue
-        since = _person_since(store, row, pending)
-        if since is not None and since <= now:
+        items.add(f"#{row['number']}")
+        if (since := _person_since(store, row, pending)) is not None:
             known.append((since, f"#{row['number']}"))
-        else:
-            unknown += 1
-    known.sort()
-    if not known or now - known[0][0] < PERSON_WAIT:
+    if not items:
         return {}
-    return {"waiting": len(known) + unknown, "oldest": known[0][1],
-            "oldest_minutes": round((now - known[0][0]).total_seconds() / 60)}
+    oldest = min(known, default=None)
+    return {"waiting": len(items), "oldest": oldest and oldest[1], "items": sorted(items),
+            "oldest_minutes": oldest and max(0, round((now - oldest[0]).total_seconds() / 60))}
 
 
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
