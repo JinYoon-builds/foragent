@@ -273,17 +273,19 @@ def test_spent_budget_starts_nothing(case, monkeypatch):
         check(case, {GOOD: "VALUE = 1\n"}, earlier=order_collect.Collected("not-this-base", order_collect.LIMIT_S))
 
 
-def test_slot_wait_shares_the_deadline_and_is_unavailable(case, monkeypatch):
-    monkeypatch.setattr(order_collect, "LIMIT_S", 0.2)
-    monkeypatch.setattr(processes, "run_logged", lambda *a, **k: pytest.fail("no slot was admitted"))
+def test_held_slots_do_not_delay_or_change_the_answer(case):
+    """Lane test runs holding every machine test slot neither delay collection nor change its answer."""
     held = capacity._take_test_slot(1, wait=False)
+    assert held is not None
     try:
+        assert check(case, {HELPER: "VALUE = 1\n"}).spent < order_collect.LIMIT_S
         with pytest.raises(order.PlanError) as refusal:
-            check(case, {GOOD: "VALUE = 1\n"})
+            check(case, {GOOD: IMPORTS})
+        assert not slot_is_free()
     finally:
         held.close()
-    assert "unavailable" in str(refusal.value) and "test slot" in str(refusal.value) and GOOD in str(refusal.value)
-    assert slot_is_free()
+    message = str(refusal.value)
+    assert "ModuleNotFoundError" in message and GOOD in message and "unavailable" not in message
 
 
 @pytest.mark.parametrize("command,cause", [
