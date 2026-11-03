@@ -11,8 +11,10 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 
@@ -62,13 +64,40 @@ except ImportError:
     GIT_SHA = "unknown"
 
 
+# The commands a person types; every other discovered command is for Foragent's own sessions.
+PERSON = ("init", "doctor", "inspect", "gate")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fa")
+    parser = argparse.ArgumentParser(prog="fa", usage="fa [-h] [--version] <command> ...",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
-    groups = parser.add_subparsers(dest="command", required=True)
+    groups = parser.add_subparsers(dest="command", required=True, metavar="<command>", prog="fa",
+                                   help=argparse.SUPPRESS)
     for group in commands.discover():
         group.add(groups)
+    parser.description = _command_list(groups)
     return parser
+
+
+def _command_list(groups) -> str:
+    """The help's command block: where to start, then person and internal commands."""
+    helps = {action.dest: action.help or "" for action in groups._choices_actions}
+    names = list(groups.choices)
+    width = max(map(len, names)) + 4
+    wrap = max(shutil.get_terminal_size().columns - 2 - width, 20)
+
+    def block(title, chosen):
+        lines = [title]
+        for name in chosen:
+            body = textwrap.wrap(helps.get(name, ""), wrap) or [""]
+            lines += [f"  {name:<{width - 2}}{body[0]}".rstrip(), *(" " * width + line for line in body[1:])]
+        return lines
+
+    person = [name for name in PERSON if name in groups.choices]
+    internal = [name for name in names if name not in PERSON]
+    return "\n".join(["Start with fa init, then /fa.", "", *block("Person commands:", person), "",
+                      *block("Internal commands:", internal)])
 
 
 # setpriority(2) "which" for a process's macOS darwin-background state.
