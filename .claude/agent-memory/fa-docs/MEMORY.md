@@ -62,3 +62,4 @@
 - Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
 - Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line. Alarm-rule Dnn ask stays r369.
 - 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.
+- '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
