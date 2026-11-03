@@ -12,9 +12,10 @@ Its first ``ready`` entry fixes its position (a later head change keeps it). A
 ``turn`` record is history only. A run that merged leaves no withdrawn entry.
 The head, which holds the turn, is the first live entry in priority order.
 Priority changes can change the next turn, while the merge lock serializes
-actual merges already in flight. Entries of runs that are not running are
-skipped, never deleted; the scheduler's crash recovery decides that an owner
-is dead.
+actual merges already in flight. Legacy entries require running workers.
+Owner admissions stay live for the current generation until withdrawal; worker
+cleanup outcomes do not revoke a durable handoff. Crash recovery handles workers
+that died before completing that handoff.
 """
 
 from __future__ import annotations
@@ -115,11 +116,11 @@ def _row(ctx: RunContext, place: Seat, event: str, **fields) -> dict:
             **fields, "at": ctx.now().isoformat()}
 
 
-def join(ctx: RunContext, place: Seat, head_sha: str) -> None:
+def join(ctx: RunContext, place: Seat, head_sha: str, **fields) -> None:
     """Append this run's ready entry unless it already holds a position."""
     with ctx.store._state_lock():
         if place.key not in _waiting(_rows(ctx.store), place.target):
-            _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
+            _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha, **fields))
 
 
 def withdraw(ctx: RunContext, place: Seat, *, reason: str = "unknown", detail: str | None = None) -> None:

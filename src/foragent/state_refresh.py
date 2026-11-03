@@ -93,8 +93,9 @@ class IssueRefreshMixin:
                     if pr.merged_at is not None:
                         _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
                     pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+            owner_facts = self.owner_merge_facts()
             for run in history:
-                if run.outcome == "merged" and str(run.number) in fresh:
+                if self.run_merged(run, owner_facts=owner_facts) and str(run.number) in fresh:
                     # A gate merge's size is the issue's size when the merge is first seen.
                     row = rows[str(run.number)]
                     sizes = dict(row.get("run_sizes") or {})
