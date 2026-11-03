@@ -113,8 +113,9 @@ def test_human_output_names_each_worse_metric_and_failures(store):
     assert card["unexplained_failures"] == [3]
     lines = orch_scorecard.human(card, "en").splitlines()
     # Today, its flow line, the previous days, their flow line, both approval-to-merge splits,
-    # the verdict, failures, then main tests.
-    assert len(lines) == 10 and "Main tests" in lines[9] and "flow" in lines[1] and "Boom" in lines[7] and "#3" in lines[8]
+    # the decided-issues line, the verdict, failures, then main tests.
+    assert len(lines) == 11 and "Main tests" in lines[10] and "flow" in lines[1] and "Boom" in lines[8] and "#3" in lines[9]
+    assert "waiting for tests" in lines[6]
     assert "approval to merge" in lines[4] and "previous-days total" in lines[5]
 
 
