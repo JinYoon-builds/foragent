@@ -10,7 +10,12 @@ Reading the queue: a run's entry is keyed by issue and the run's started_at.
 Its first ``ready`` entry fixes its position (a later head change keeps it). A
 ``withdrawn`` entry ends that position; a later ``ready`` joins at the tail. A
 ``turn`` record is history only. A run that merged leaves no withdrawn entry.
-The head, which holds the turn, is the first live entry in priority order.
+The head, which holds the turn, is the first live entry in priority order
+that is not aside. An ``aside`` entry marks a seat that cannot merge now: it
+refreshes onto a moved base, re-verifies and waits for new CI. It keeps its
+position, and its next ``ready`` entry (or its ``withdrawn`` entry) ends the
+aside. While aside, the turn passes to the next live seat that is ready now;
+when every live seat is aside, the first one keeps the turn.
 Priority changes can change the next turn, while the merge lock serializes
 actual merges already in flight. Entries of runs that are not running are
 skipped, never deleted; the scheduler's crash recovery decides that an owner
@@ -93,6 +98,21 @@ def _waiting(rows: list[dict], target: str) -> dict[tuple[int, str | None], dict
     return active
 
 
+def _aside(rows: list[dict], target: str) -> set[tuple[int, str | None]]:
+    """Seats that stepped aside for ``target``: an aside row not yet followed by ready or withdrawn."""
+    aside: set[tuple[int, str | None]] = set()
+    for row in rows:
+        if row.get("target", target) != target:
+            continue
+        key = (row["n"], row.get("started_at"))
+        event = row.get("event")
+        if event == "aside":
+            aside.add(key)
+        elif event in {"ready", "withdrawn"}:
+            aside.discard(key)
+    return aside
+
+
 def _live(store: StateStore, key: tuple[int, str | None]) -> bool:
     run = store.get_run(key[0])
     return run is not None and run.status == "running" and key[1] in {None, run.started_at}
@@ -102,6 +122,13 @@ def _turn_order(entries: dict[tuple[int, str | None], dict], priority: list[int]
     """Stable priority order over entries already in join order."""
     ranks = {n: index for index, n in enumerate(priority)}
     return sorted(entries, key=lambda key: ranks.get(key[0], len(priority)))
+
+
+def _holder(store: StateStore, rows: list[dict], target: str) -> tuple[int, str | None] | None:
+    """The seat holding ``target``'s turn: the first live seat that is not aside, else the first live seat."""
+    live = [key for key in _turn_order(_waiting(rows, target), orch_queue.get_global(store)) if _live(store, key)]
+    aside = _aside(rows, target)
+    return next((key for key in live if key not in aside), live[0] if live else None)
 
 
 def _append(store: StateStore, row: dict) -> None:
@@ -116,10 +143,26 @@ def _row(ctx: RunContext, place: Seat, event: str, **fields) -> dict:
 
 
 def join(ctx: RunContext, place: Seat, head_sha: str) -> None:
-    """Append this run's ready entry unless it already holds a position."""
+    """Append this run's ready entry unless it already holds a position and is not aside.
+
+    A seat coming back from aside appends ready again; it keeps its first position.
+    """
     with ctx.store._state_lock():
-        if place.key not in _waiting(_rows(ctx.store), place.target):
+        rows = _rows(ctx.store)
+        if place.key not in _waiting(rows, place.target) or place.key in _aside(rows, place.target):
             _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
+
+
+def step_aside(ctx: RunContext, place: Seat) -> None:
+    """Mark a queued seat that must refresh, re-verify and wait for CI before it can merge.
+
+    It keeps its position; a run that is ready now takes the turn meanwhile. An absent or
+    already aside seat records nothing.
+    """
+    with ctx.store._state_lock():
+        rows = _rows(ctx.store)
+        if place.key in _waiting(rows, place.target) and place.key not in _aside(rows, place.target):
+            _append(ctx.store, _row(ctx, place, "aside"))
 
 
 def withdraw(ctx: RunContext, place: Seat, *, reason: str = "unknown", detail: str | None = None) -> None:
@@ -142,11 +185,7 @@ def stopped_detail(outcome: str | None, error: BaseException | None) -> str | No
 
 
 def holds_turn(store: StateStore, place: Seat) -> bool:
-    entries = _waiting(_rows(store), place.target)
-    for key in _turn_order(entries, orch_queue.get_global(store)):
-        if _live(store, key):
-            return key == place.key
-    return False
+    return _holder(store, _rows(store), place.target) == place.key
 
 
 def holds_run_turn(store: StateStore, n: int) -> bool:
@@ -358,9 +397,7 @@ def claim(ctx: RunContext, place: Seat, head_sha: str) -> int | None:
     holds the merge lock for the whole merge, which keeps every later entry waiting.
     """
     with ctx.store._state_lock():
-        entries = _waiting(_rows(ctx.store), place.target)
-        for key in _turn_order(entries, orch_queue.get_global(ctx.store)):
-            if _live(ctx.store, key):
-                return key[0]
+        if (holder := _holder(ctx.store, _rows(ctx.store), place.target)) is not None:
+            return holder[0]
         _append(ctx.store, _row(ctx, place, "ready", head_sha=head_sha))
     return None

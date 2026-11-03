@@ -81,6 +81,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                      neutral: bool | None = None) -> str:
         nonlocal ci_cause
         ci_cause = cause or run_group_check.refresh_cause(ctx, n)
+        # A queued seat that must refresh cannot merge now: a ready run takes the turn meanwhile.
+        run_publish.merge_turn.step_aside(ctx, place)
         attempt.base_refresh = True  # This whole interval is one base-refresh record.
         try:
             with activity(n, ctx, "base-refresh", ci_cause):
