@@ -14,18 +14,24 @@ from test_risk_map import copy_history, entry, offline, risk_case
 from test_skills_autosync import isolated_home
 
 
-NAMES = ("goal-fidelity", "concurrency", "interruption-rollback", "test-quality")
+# #1651: the review-procedure skill's five plugin perspectives plus fatal-path.
+NAMES = ("rule-documents", "obvious-bugs", "git-history", "earlier-pr-comments", "code-comments", "fatal-path")
 THEMES = (
-    ("goal", "acceptance", "out of scope"),
-    ("race", "ordering", "stale"),
-    ("interrupt", "rollback", "partial"),
-    ("test", "wrong value", "skip", "twice"),
+    ("rule", "instruction"),
+    ("bug", "changed lines"),
+    ("git", "history", "blame"),
+    ("comments", "earlier pr"),
+    ("comments", "modified files"),
+    ("rare", "loses work", "wrong code", "another person", "stall"),
 )
 # Project overrides give prompt assertions distinct, known focus texts without
 # importing the missing API during collection or deriving the oracle from it.
+# Overrides of whatever defaults the code ships (2026-11-03): other test files import CHECKLIST as
+# "one override per default perspective", so it follows the shipped defaults; NAMES above stays the
+# oracle for the defaults themselves.
 CHECKLIST = [
-    {"name": name, "focus": f"FOCUS-{name}: " + ", ".join(themes)}
-    for name, themes in zip(NAMES, THEMES)
+    {"name": item["name"], "focus": f"FOCUS-{item['name']}: distinct project focus"}
+    for item in import_module("foragent.review_perspectives").DEFAULT_PERSPECTIVES
 ]
 PROJECT = {"name": "observability", "focus": "FOCUS-observability: lost diagnostic context"}
 
@@ -89,9 +95,9 @@ def test_review_perspectives_defaults_have_exact_order_and_required_focus():
 
 
 def test_review_perspectives_project_appends_and_overrides_in_place(tmp_path):
-    override = {"name": "goal-fidelity", "focus": "PROJECT-GOAL: verify the approved outcome"}
+    override = {"name": "rule-documents", "focus": "PROJECT-GOAL: verify the approved outcome"}
     path = tmp_path / ".foragent.yml"
-    # Put the addition first in YAML: it must still follow all four defaults.
+    # Put the addition first in YAML: it must still follow all six defaults.
     path.write_text(yaml.safe_dump({
         "review_perspectives": [PROJECT, override], "review_reviewers": 3,
     }), encoding="utf-8")

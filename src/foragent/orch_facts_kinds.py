@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from foragent.config import Config
@@ -25,19 +26,30 @@ BACKLOG = 3
 CONCENTRATION_WINDOW = timedelta(hours=6)
 CONCENTRATION_RUNS = 8
 CONCENTRATION_IDLE = 2
+# The recent merge interval is the median gap between this many latest merges.
+STALL_MERGES = 4
+STALL_FACTOR = 3
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration")
+         "lane_concentration", "merge_stall")
+# Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
+# signals. Repeated holds and idle lanes with ready work reach it through its default signals.
+ALARM_KINDS = ("merge_stall",)
+# Numbers that grow with time alone. A comparison of burdens leaves them out, so elapsed time never
+# makes a signal worse (#1469); the facts still show them.
+ELAPSED_FACTS = {"merge_stall": ("minutes_since_merge", "merge_interval_minutes")}
+# Numbers that give a burden its scale but are no burden themselves (#1469): a burden comparison
+# leaves them out. A larger total makes lane concentration smaller, not worse, so its burden is
+# the share ``SHARE_FACTS`` derives; a file limit is the rule, not a load.
+CONTEXT_FACTS = {
+    "files_over_limit": ("limit",),
+    "lane_concentration": ("runs", "lane_runs"),
+}
+# A burden field derived as part / whole from a kind's numbers: name -> (part, whole). A share is
+# worse when it rises; every other count only when it at least doubles.
+SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
-# Evidence is membership in these affected sets; their counts may drift (#1337).
-ENTITY_FACTS = {
-    "hot_overlap_files": ("runs_by_file",),
-    "files_over_limit": ("lines_by_file",),
-    "repeated_design_holds": ("holds_by_issue",),
-    "idle_lanes_with_backlog": ("idle_lanes", "ready_by_lane"),
-}
-VALUE_FACTS = {"files_over_limit": ("limit",)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
@@ -140,6 +152,29 @@ def lane_concentration(store: StateStore, config: Config, now: datetime, running
     return bool(lane_concentration_numbers(store, config, now, running))
 
 
+def merge_stall_numbers(store: StateStore, now: datetime, running: list[Run]) -> dict[str, Any]:
+    """Open issues wait while no merge came for three recent merge intervals (#1469).
+
+    The interval is the median gap between the latest merges; with fewer than two there is none.
+    Any open issue not running counts as queued, approved or not: none of them can merge.
+    """
+    finished = store.finish_times()
+    merges = sorted(at for run in store.read_history() if run.outcome == "merged"
+                    and (at := _time(finished.get((run.number, run.started_at)))) is not None and at <= now)
+    merges = merges[-STALL_MERGES:]
+    if len(merges) < 2:
+        return {}
+    interval = median(later - earlier for earlier, later in zip(merges, merges[1:]))
+    since = now - merges[-1]
+    active = {run.number for run in running}
+    queued = [issue["number"] for issue in store.local_issues()
+              if issue.get("state") == "open" and not issue.get("is_pull_request") and issue["number"] not in active]
+    if not queued or interval <= timedelta() or since < STALL_FACTOR * interval:
+        return {}
+    return {"queued": len(queued), "minutes_since_merge": round(since.total_seconds() / 60),
+            "merge_interval_minutes": round(interval.total_seconds() / 60)}
+
+
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
     """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
     numbers = {
@@ -148,6 +183,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "files_over_limit": files_over_limit_numbers(root),
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
+        "merge_stall": merge_stall_numbers(store, now, running),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}
