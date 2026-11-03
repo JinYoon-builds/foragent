@@ -3,7 +3,7 @@
 Durable lessons of this project's orchestrator. Only the orchestrator session writes this file.
 - [Drafts outside scratchpad](pending-drafts-not-in-scratchpad.md) — waiting test rewrites/plans go to a durable path; re-approval recipe
 - [Pending after merge](pending-after-merge.md) — follow-ups waiting on #962, #186/#435 merges
-- [Questions via planning session](questions-via-planning-session.md) — Jin talks only there; new orders: send plan path, it publishes
+- [Questions via planning session](questions-via-planning-session.md) — Jin talks only in planning; since 11-04 plans inside Jin-decided scope: orch approves itself
 - [Check held reasons first](check-held-reasons-first.md) — queued lane: read fa orch facts held: (cap vs overlap) before blaming files
 - [Peer messages in Korean](peer-messages-in-korean.md) — SendMessage to the PM in Korean, call it "PM"; Jin sees them
 - [Flow goal (11-01)](flow-goal-2026-11-01.md) — metric: part-5 real-waste minutes (no 70% target); flow5.py; retro reports it
