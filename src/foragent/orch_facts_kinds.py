@@ -29,19 +29,14 @@ CONCENTRATION_IDLE = 2
 # The recent merge interval is the median gap between this many latest merges.
 STALL_MERGES = 4
 STALL_FACTOR = 3
-# Issue labels that hand an issue to a person: `fa orch escalate` and a blocking needs-human
-# reason set needs-human; `fa orch park --for-person` sets waiting-person.
-PERSON_LABELS = ("needs-human", "waiting-person")
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration", "merge_stall", "waiting_on_person")
-# Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured signals.
-ALARM_KINDS = ("merge_stall", "waiting_on_person")
+         "lane_concentration", "merge_stall")
+# Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
+# signals. Repeated holds and idle lanes with ready work reach it through its default signals.
+ALARM_KINDS = ("merge_stall",)
 # Numbers that grow with time alone. A comparison of burdens leaves them out, so elapsed time never
 # makes a signal worse (#1469); the facts still show them.
-ELAPSED_FACTS = {
-    "merge_stall": ("minutes_since_merge", "merge_interval_minutes"),
-    "waiting_on_person": ("oldest_minutes",),
-}
+ELAPSED_FACTS = {"merge_stall": ("minutes_since_merge", "merge_interval_minutes")}
 # Numbers that give a burden its scale but are no burden themselves (#1469): a burden comparison
 # leaves them out. A larger total makes lane concentration smaller, not worse, so its burden is
 # the share ``SHARE_FACTS`` derives; a file limit is the rule, not a load.
@@ -49,24 +44,12 @@ CONTEXT_FACTS = {
     "files_over_limit": ("limit",),
     "lane_concentration": ("runs", "lane_runs"),
 }
-# An item a burden names, compared only by whether it still waits (#1469): kind -> (field,
-# list field). The current value of the field is never compared, since it depends on when a time
-# was read; a comparison asks whether the item the earlier answer named (or, with none named,
-# every item it listed) has left the list. The list itself is no burden, only the count is.
-HELD_FACTS = {"waiting_on_person": ("oldest", "items")}
-# A burden field derived as part / whole from a kind's numbers: name -> (part, whole).
+# A burden field derived as part / whole from a kind's numbers: name -> (part, whole). A share is
+# worse when it rises; every other count only when it at least doubles.
 SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
-# Evidence is membership in these affected sets; their counts may drift (#1337).
-ENTITY_FACTS = {
-    "hot_overlap_files": ("runs_by_file",),
-    "files_over_limit": ("lines_by_file",),
-    "repeated_design_holds": ("holds_by_issue",),
-    "idle_lanes_with_backlog": ("idle_lanes", "ready_by_lane"),
-}
-VALUE_FACTS = {"files_over_limit": ("limit",)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
@@ -192,56 +175,6 @@ def merge_stall_numbers(store: StateStore, now: datetime, running: list[Run]) ->
             "merge_interval_minutes": round(interval.total_seconds() / 60)}
 
 
-def _person_since(store: StateStore, row: dict[str, Any], pending: list[dict[str, Any]]) -> datetime | None:
-    """When the issue's current hand-off to a person began, from its issue comments.
-
-    The time is the marker comment that set the label: the needs-human (or blocked) reason
-    marker of `fa orch escalate` and a blocking needs-human reason, or the park marker of
-    `fa orch park --for-person`. Comments are durable, so the time never moves while the label
-    stays. A label set by hand has no marker and so no known start (None).
-    """
-    from foragent import orch_park, reasons
-
-    labels = set(row.get("labels") or ())
-    times = []
-    if "needs-human" in labels and (blocker := reasons.current_blocker(row, pending)) is not None:
-        times.append(_time(blocker[0].get("created_at")))
-    if "waiting-person" in labels:
-        times.append(orch_park.parked_at(store, row["number"], comments=row.get("comments") or []))
-    return min((at for at in times if at is not None), default=None)
-
-
-def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Items that wait on a person (#1469): present whenever one waits.
-
-    Open issues labelled for a person (``PERSON_LABELS``) and open orchestrator questions all
-    count in ``waiting``; ``items`` names them (``#<issue>`` or the question id). ``oldest`` and
-    ``oldest_minutes`` come from the items with a known start (a question's creation, an issue's
-    marker comment) and are None when no start is known, for example before a refresh has read an
-    issue's comments. A start can move when a queued marker is delivered or first appears
-    when comments are read, so no presence or comparison reads it: ``HELD_FACTS`` compares only
-    whether the item named at an answer still waits, and ``oldest_minutes`` is elapsed time.
-    """
-    from foragent import orch_inbox
-
-    known = [(at, row["id"]) for row in orch_inbox.questions(store)
-             if (at := _time(row.get("created_at"))) is not None]
-    items = {row["id"] for row in orch_inbox.questions(store)}
-    pending = store.github_outbox()
-    for row in store.local_issues():
-        if (row.get("state") != "open" or row.get("is_pull_request")
-                or not set(row.get("labels") or ()) & set(PERSON_LABELS)):
-            continue
-        items.add(f"#{row['number']}")
-        if (since := _person_since(store, row, pending)) is not None:
-            known.append((since, f"#{row['number']}"))
-    if not items:
-        return {}
-    oldest = min(known, default=None)
-    return {"waiting": len(items), "oldest": oldest and oldest[1], "items": sorted(items),
-            "oldest_minutes": oldest and max(0, round((now - oldest[0]).total_seconds() / 60))}
-
-
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
     """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
     numbers = {
@@ -251,7 +184,6 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
-        "waiting_on_person": waiting_on_person_numbers(store, now),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}

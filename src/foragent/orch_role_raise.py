@@ -147,113 +147,89 @@ def burden(facts: dict[str, Any]) -> dict[str, Any]:
     """The burden view of request facts, for comparisons only (#1469).
 
     It leaves out the numbers that grow with time alone (``ELAPSED_FACTS``) and those that only
-    give scale (``CONTEXT_FACTS``), adds the shares ``SHARE_FACTS`` derives, and shows a normal
-    binding constraint as none, so a return to normal is never a new burden.
+    give scale (``CONTEXT_FACTS``), adds the shares ``SHARE_FACTS`` derives, and keeps only the
+    binding constraint's kind and whether it is normal (its detail text churns).
     """
-    result = json.loads(json.dumps(facts, sort_keys=True, default=str))
+    result = json.loads(json.dumps(facts or {}, sort_keys=True, default=str))
     for kind, item in (result.get("kinds") or {}).items():
         if not isinstance(item, dict):
             continue
         item["numbers"] = burden_numbers(kind, item.get("numbers"))
         if isinstance(item.get("binding"), dict):
-            item["binding"] = None if item["binding"].get("normal") else item["binding"].get("kind")
+            item["binding"] = {"kind": item["binding"].get("kind"), "normal": bool(item["binding"].get("normal"))}
     return result
 
 
-def held(kind: str, before: Any, after: Any) -> tuple[Any, Any]:
-    """One kind's burden numbers ready to compare (``HELD_FACTS``).
+def baseline(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The one baseline of a signal: the facts recorded when its last request was answered.
 
-    The named field is never read from ``after``: what is named now depends on when its time was
-    read (a marker fetched or delivered later). It becomes one question, decided by the earlier
-    answer alone: has its anchor stopped waiting? The anchor is the item the answer named, or,
-    when it named none, every item listed then. Only the count and that answer remain to
-    compare; the list itself is no burden.
+    That is ``answer_facts`` (measured by `fa orch signal-answer` or a finished gate dive), else
+    the facts the request was raised with; None for a legacy request without facts.
     """
-    field, members = orch_facts_kinds.HELD_FACTS.get(kind, (None, None))
-    if field is None or not isinstance(before, dict) or not isinstance(after, dict):
-        return before, after
-    before, after = dict(before), dict(after)
-    anchor = {before[field]} if before.get(field) is not None else set(before.get(members) or ())
-    listed = set(after.get(members) or ())
-    before[field], after[field] = False, bool(anchor) and not anchor & listed
-    before.pop(members, None)
-    after.pop(members, None)
-    return before, after
+    if record is None:
+        return None
+    facts = record.get("answer_facts") or record.get("facts")
+    return facts if isinstance(facts, dict) else None
 
 
-def worse_facts(before: dict[str, Any], after: dict[str, Any]) -> bool:
-    """``worse`` over two burden views (``burden``), each kind's numbers through ``held``."""
-    before = json.loads(json.dumps(before, default=str))
-    after = json.loads(json.dumps(after, default=str))
-    for kind, item in (after.get("kinds") or {}).items():
-        prior = (before.get("kinds") or {}).get(kind)
-        if isinstance(item, dict) and isinstance(prior, dict):
-            prior["numbers"], item["numbers"] = held(kind, prior.get("numbers"), item.get("numbers"))
-    return worse(before, after)
-
-
-def worse(before: Any, after: Any) -> bool:
-    """Whether ``after`` holds a burden ``before`` did not: a greater number, a new member or
-    key, or a different value. Order, smaller numbers and missing members or values are not worse."""
+def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False) -> bool:
+    """``shares`` names the derived share fields of this level only: a kind's top-level numbers.
+    Nested keys are members (lanes, files, issues), whatever they are called, so their counts
+    must double."""
     if after is None:
         return False
+    if before is None:
+        return True  # Present now, absent at the baseline.
     if isinstance(after, dict) and isinstance(before, dict):
-        return any(key not in before or worse(before[key], value) for key, value in after.items())
+        return any(key not in before
+                   or _worse_value(before[key], value, share=key in shares)
+                   for key, value in after.items())
     if isinstance(after, list) and isinstance(before, list):
         seen = {json.dumps(item, sort_keys=True, default=str) for item in before}
         return any(json.dumps(item, sort_keys=True, default=str) not in seen for item in after)
     numeric = (int, float)
     if (isinstance(after, numeric) and isinstance(before, numeric)
             and not isinstance(after, bool) and not isinstance(before, bool)):
-        return after > before
+        if share:
+            return after > before
+        return after > 0 and (before <= 0 or after >= DOUBLED * before)
     return not _same(before, after)
 
 
-class _Burden:
-    """Unprojected numbers in ``evidence``: compared by ``worse``, not by equality."""
-
-    def __init__(self, numbers: Any) -> None:
-        self.numbers = numbers
+DOUBLED = 2  # A count of an existing member is worse once it at least doubles.
 
 
-def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
-    """Project raw request facts into affected entities and relevant constraints.
+def _worse_binding(before: Any, after: Any) -> bool:
+    """Another constraint binds (a new member, as the locked not-now test requires), or the
+    same one stopped being normal; a return to normal is better."""
+    if not isinstance(after, dict):
+        return False
+    if not isinstance(before, dict):
+        return not after.get("normal")
+    return after.get("kind") != before.get("kind") or (before.get("normal") and not after.get("normal"))
 
-    This also reads pre-upgrade fingerprints, without changing persisted records.
-    Unprojected kinds (including lane_concentration) keep their burden numbers
-    (``burden_numbers``), and only a worse burden counts as new for them (#1469).
+
+def worse(before: dict[str, Any] | None, after: dict[str, Any]) -> bool:
+    """Whether ``after`` holds a burden its baseline ``before`` did not (#1469).
+
+    Worse is a new member (a matched file, a met kind, a key such as an issue or file, a list
+    member such as an idle lane, or a different named lane or binding constraint), a share that
+    rises, or a count of an existing member that at least doubles. Smaller rises, the same or
+    better numbers, order, elapsed time and context numbers are not worse.
     """
-    result: dict[tuple[str, ...], Any] = {}
-    if "files" in facts:
-        result[("files",)] = frozenset(facts["files"])
-    for kind, item in facts.get("kinds", {}).items():
-        numbers = item.get("numbers") or {}
-        result[(kind,)] = True
-        if kind in orch_facts_kinds.ENTITY_FACTS:
-            for field in orch_facts_kinds.ENTITY_FACTS[kind]:
-                result[(kind, field)] = frozenset(numbers.get(field) or ())
-            for field in orch_facts_kinds.VALUE_FACTS.get(kind, ()):
-                result[(kind, field)] = numbers.get(field)
-        else:
-            result[(kind, "numbers")] = _Burden(burden_numbers(kind, numbers))
-        for field in orch_facts_kinds.SHARED_FACTS.get(kind, ()):
-            result[(kind, field)] = item.get(field)
-    return result
-
-
-def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
-    """Shrinking sets stay quiet; compare every tick against the last raise."""
-    before = evidence(previous)
-    for key, value in evidence(current).items():
-        if key not in before:
+    if before is None:
+        return True
+    before, after = burden(before), burden(after)
+    if set(after.get("files") or ()) - set(before.get("files") or ()):
+        return True
+    for kind, item in (after.get("kinds") or {}).items():
+        prior = (before.get("kinds") or {}).get(kind)
+        if not isinstance(prior, dict):
+            return True  # A kind present now that the baseline did not hold.
+        if _worse_value(prior.get("numbers"), item.get("numbers"),
+                        shares=frozenset(orch_facts_kinds.SHARE_FACTS.get(kind, {}))):
             return True
-        if isinstance(value, frozenset):
-            if value - before[key]:
-                return True
-        elif isinstance(value, _Burden):
-            if not isinstance(before[key], _Burden) or worse(*held(key[0], before[key].numbers, value.numbers)):
-                return True
-        elif not _same(before[key], value):
+        if _worse_binding(prior.get("binding"), item.get("binding")):
             return True
     return False
 
@@ -349,8 +325,7 @@ def _gate_due(store: StateStore, now: datetime, name: str, key: str, previous: d
     """The open request a gate call answers, ``{}`` for a new one, or None when no call is due."""
     from foragent import orch_architect
 
-    baseline = (answer.get("answer_facts") or answer.get("facts")) if answer else None
-    if baseline is not None and not worse_facts(burden(baseline), burden(facts)):
+    if answer is not None and not worse(baseline(answer), facts):
         return None  # The same or better than at the last answer.
     if orch_architect.session_alive(orch_architect.read_record(store, name)):
         return None  # The running session already digs; never start a second one.
@@ -365,10 +340,11 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
     """Raise every met role signal that is due; return the inbox requests added.
 
     A signal (role plus its {paths, kinds} item) is never raised while an earlier request
-    for it is not done. Once that request is done, it is raised again when a tick saw it unmet
-    since that raise, or its facts contain new evidence beyond the last raise, regardless
-    of its answer. Time alone is not evidence. Only legacy requests without stored facts
-    use the cooldown.
+    for it is not done. Once it is done, every path compares the current facts with one
+    baseline, the facts recorded when that request was answered (``baseline``), and raises or
+    calls again only when they are ``worse``. A no-start tick also records a request for a
+    signal that cleared and came back, as the locked raise test requires; that request alone
+    never starts a call. Only legacy requests without stored facts use the cooldown.
 
     With ``start`` the gate calls a ``GATE_CALLED`` role itself instead: when the signal was
     never answered, or its burden is worse than at its last answer. A clear and return, a
@@ -420,8 +396,10 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
             if previous is not None:
                 if previous.get("status") != "done":
                     continue
-                if "facts" in previous:
-                    due = cleared or new_evidence(previous["facts"], facts)
+                if baseline(previous) is not None:
+                    # A clear and return is a new episode the locked raise test records as a
+                    # request; it never calls by itself (the gate path above has no such rule).
+                    due = cleared or worse(baseline(previous), facts)
                 else:
                     due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:

@@ -108,7 +108,7 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
     measured["kinds"] = {"k0", "k1", "k2"}
     for day, count in ((3, 0), (2, 2), (1, 2)):  # Oldest first.
         store.clock[0] = NOW - timedelta(days=day, hours=1)
-        measured["numbers"] = {f"k{n}": {"day": -day} for n in range(3)}  # Worse facts re-arm not-now (#1155, #1469).
+        measured["numbers"] = {f"k{n}": {"day": 2 ** (10 - day)} for n in range(3)}  # Doubled counts re-arm (#1155, #1469).
         rows = orch_role_raise.raise_due(store, tmp_path, store.clock[0])[:count]
         for row in rows:
             orch_role_raise.answer(store, row["id"], "not-now", "later")
@@ -116,7 +116,7 @@ def test_previous_window_takes_the_per_day_median_and_human_line_shows_signals(s
             if row["status"] != "done":
                 orch_inbox.set_request_status(store, row["id"], "done")  # Done without an answer event.
     store.clock[0] = NOW
-    measured["numbers"] = {f"k{n}": {"day": 0} for n in range(3)}
+    measured["numbers"] = {f"k{n}": {"day": 2 ** 10} for n in range(3)}
     [today] = orch_role_raise.raise_due(store, tmp_path, NOW)[:1]
     orch_role_raise.answer(store, today["id"], "called", "looked")
     config = SimpleNamespace(roles={"security": {"agent": "fa-security"}})
@@ -345,8 +345,7 @@ def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, t
     measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
     store.clock[0] = NOW + timedelta(hours=13)
     assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
-    field = orch_facts_kinds.ENTITY_FACTS.get(kind, ("n",))[0]
-    measured["numbers"] = {kind: {field: {"new-entity": 3}}}
+    measured["numbers"] = {kind: {"n": 1, "new-entity": 3}}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
 
 
@@ -366,15 +365,15 @@ def test_a_binding_change_rearms_the_kinds_that_declare_it(store, tmp_path, meas
 
 @pytest.mark.parametrize("kind,initial,drift,new", [
     ("hot_overlap_files", {"runs_by_file": {"a": 3, "b": 4}},
-     {"runs_by_file": {"a": 8}}, {"runs_by_file": {"a": 8, "c": 3}}),
+     {"runs_by_file": {"a": 5}}, {"runs_by_file": {"a": 5, "c": 3}}),
     ("files_over_limit", {"limit": 500, "lines_by_file": {"a": 501, "b": 600}},
      {"limit": 500, "lines_by_file": {"a": 550}},
      {"limit": 500, "lines_by_file": {"a": 550, "c": 501}}),
     ("repeated_design_holds", {"holds_by_issue": {"#1": 2, "#2": 3}},
-     {"holds_by_issue": {"#1": 5}}, {"holds_by_issue": {"#1": 5, "#3": 2}}),
+     {"holds_by_issue": {"#1": 3}}, {"holds_by_issue": {"#1": 3, "#3": 2}}),
     ("idle_lanes_with_backlog", {"idle_lanes": ["a", "b"], "ready_by_lane": {"c": 3}},
-     {"idle_lanes": ["a"], "ready_by_lane": {"c": 9}},
-     {"idle_lanes": ["a"], "ready_by_lane": {"c": 9, "d": 3}}),
+     {"idle_lanes": ["a"], "ready_by_lane": {"c": 5}},
+     {"idle_lanes": ["a"], "ready_by_lane": {"c": 5, "d": 3}}),
 ])
 @pytest.mark.parametrize("how", ["called", "not-now", None])
 def test_new_entities_rearm_but_counts_shrinking_and_returning_members_do_not(
@@ -398,29 +397,39 @@ def test_new_entities_rearm_but_counts_shrinking_and_returning_members_do_not(
 
 
 def test_projection_preserves_constraints_paths_and_unprojected_kind_numbers():
+    """One comparison for every path (#1469): new members, a rising share or a doubled count."""
     def facts(kind, numbers, **shared):
         return {"files": ["b", "a"], "kinds": {kind: {"numbers": numbers, **shared}}}
 
+    worse = orch_role_raise.worse
     old = facts("files_over_limit", {"limit": 500, "lines_by_file": {"a": 600}})
-    assert orch_role_raise.new_evidence(old, facts(
-        "files_over_limit", {"limit": 550, "lines_by_file": {"a": 600}}))
+    assert not worse(old, facts("files_over_limit", {"limit": 550, "lines_by_file": {"a": 600}})), (
+        "The limit is the rule, not a burden")
+    assert not worse(old, facts("files_over_limit", {"limit": 500, "lines_by_file": {"a": 1199}}))
+    assert worse(old, facts("files_over_limit", {"limit": 500, "lines_by_file": {"a": 1200}})), "Doubled"
     idle = {"idle_lanes": ["a", "b"], "ready_by_lane": {"c": 3}}
     old = facts("idle_lanes_with_backlog", idle, binding={"kind": "cap", "normal": False})
-    assert not orch_role_raise.new_evidence(old, facts(
-        "idle_lanes_with_backlog", {**idle, "idle_lanes": ["b", "a"]},
-        binding={"kind": "cap", "normal": False}))
-    assert orch_role_raise.new_evidence(old, facts(
-        "idle_lanes_with_backlog", idle, binding={"kind": "cap", "normal": True}))
-    assert orch_role_raise.new_evidence(old, facts(
-        "idle_lanes_with_backlog", {**idle, "idle_lanes": ["a", "b", "d"]},
-        binding={"kind": "cap", "normal": False}))
-    assert not orch_role_raise.new_evidence({"files": ["a", "b"]}, {"files": ["b"]})
-    assert orch_role_raise.new_evidence({"files": ["a"]}, {"files": ["b"]})
+    assert not worse(old, facts("idle_lanes_with_backlog", {**idle, "idle_lanes": ["b", "a"]},
+                                binding={"kind": "cap", "normal": False}))
+    assert not worse(old, facts("idle_lanes_with_backlog", idle, binding={"kind": "cap", "normal": True})), (
+        "A constraint that stopped binding is better")
+    assert worse(old, facts("idle_lanes_with_backlog", idle, binding={"kind": "quota", "normal": False}))
+    assert worse(old, facts("idle_lanes_with_backlog", {**idle, "idle_lanes": ["a", "b", "d"]},
+                            binding={"kind": "cap", "normal": False}))
+    assert not worse(old, facts("idle_lanes_with_backlog", {**idle, "ready_by_lane": {"c": 5}},
+                                binding={"kind": "cap", "normal": False}))
+    assert worse(old, facts("idle_lanes_with_backlog", {**idle, "ready_by_lane": {"c": 6}},
+                            binding={"kind": "cap", "normal": False}))
+    assert not worse({"files": ["a", "b"]}, {"files": ["b"]})
+    assert worse({"files": ["a"]}, {"files": ["b"]})
     # Lane concentration is the busy lane's share (#1469): a larger total alone dilutes it.
-    assert orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 8, "lane_runs": 5}),
-                                        facts("lane_concentration", {"runs": 9, "lane_runs": 6}))
-    assert not orch_role_raise.new_evidence(facts("lane_concentration", {"runs": 18, "lane_runs": 16}),
-                                            facts("lane_concentration", {"runs": 19, "lane_runs": 16}))
+    assert worse(facts("lane_concentration", {"runs": 8, "lane_runs": 5}),
+                 facts("lane_concentration", {"runs": 9, "lane_runs": 6}))
+    assert not worse(facts("lane_concentration", {"runs": 18, "lane_runs": 16}),
+                     facts("lane_concentration", {"runs": 19, "lane_runs": 16}))
+    assert worse(facts("lane_concentration", {"runs": 18, "lane": "roles", "lane_runs": 16}),
+                 facts("lane_concentration", {"runs": 18, "lane": "view", "lane_runs": 16})), "Another lane"
+    assert worse(None, facts("merge_stall", {"queued": 1})), "No baseline yet"
 
 
 def test_only_legacy_requests_without_facts_use_the_cooldown(store, tmp_path, measured):

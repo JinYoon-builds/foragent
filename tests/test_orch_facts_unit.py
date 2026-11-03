@@ -866,15 +866,3 @@ def test_review_head_done_when_is_checking_time(env, monkeypatch):
     store._now = lambda: NOW
     row, = collect(store, root)["runs"]
     assert row["checking_seconds"] == 60 and row["test_phase_share"] == pytest.approx(0.6)
-
-
-def test_people_waiting_reach_the_frozen_facts(env):
-    """#1469: questions and labelled issues whose comments were never read both count."""
-    from foragent import orch_inbox
-
-    store, root = env
-    question = orch_inbox.ask(store, "Which option?", ["a", "b"], 1)
-    store.update_local_issue(12, title="Parked", labels=["waiting-person"], state="open", lane="main")
-    numbers = collect(store, root)["kind_numbers"]["waiting_on_person"]
-    assert numbers["items"] == sorted(["#12", question["id"]]) and numbers["waiting"] == 2
-    assert numbers["oldest"] == question["id"]
