@@ -289,6 +289,7 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
     Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
+    Beside the line, hookSpecificOutput.sessionTitle names the session's role and the project.
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -316,8 +317,15 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
                                                  datetime.now(UTC))
     except Exception:  # A failed summary must never disturb the session that is starting.
         message = None
-    if message:
-        stdout.write((json.dumps({"systemMessage": message}, ensure_ascii=False) + "\n").encode("utf-8"))
+    try:
+        title = presence.session_title(folder, payload.get("agent_type"))
+    except Exception:  # A failed title only drops the title.
+        title = None
+    output: dict[str, Any] = {"systemMessage": message} if message else {}
+    if title:
+        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "sessionTitle": title}
+    if output:
+        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()
     return 0
 
