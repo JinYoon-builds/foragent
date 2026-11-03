@@ -6,10 +6,12 @@ Runtime dependencies resolve through foragent.watch to preserve its patch points
 from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
+import os
 import re
 
 from foragent.config import Config
 from foragent.watch_cells import Style
+from foragent import watch_hint
 from foragent.watch_data import Snapshot
 
 
@@ -184,6 +186,29 @@ def _place(visible: list, row_map: dict[int, int], footer: int, height: int, ale
     return rows, row_map
 
 
+def _real_size() -> tuple[int, int] | None:
+    """The terminal's own rows and columns (curses writes to fd 1), or None without one.
+
+    curses trusts LINES/COLUMNS from the environment over the terminal, so its size can
+    stay the same while the real window changed."""
+    try:
+        size = os.get_terminal_size(1)
+    except (OSError, ValueError):
+        return None
+    return size.lines, size.columns
+
+
+def _resized(curses, height: int, width: int) -> bool:
+    """Whether the window is no longer `height` x `width`; unknown to curses counts as resized."""
+    real = _real_size()
+    if real is not None and real != (height, width):
+        return True
+    try:
+        return bool(curses.is_term_resized(height, width))
+    except (curses.error, AttributeError, TypeError):
+        return True
+
+
 def _reload(config: Config, repo_root: Path) -> Config:
     """The configuration as just saved, so rows, glyphs and the last line change at once."""
     from foragent.config import ConfigError, load_config
@@ -240,6 +265,13 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
     show_detail = False
     digits = ""
     error = ""
+    # Korean in Terminal.app: one font hint in the alert row for this first session,
+    # until the first key press (a refresh error takes the row first). The view holds
+    # the hint while it shows it, and records it only after a frame showed it whole and
+    # the window kept its size until the next key wait ended.
+    hint = watch_hint.due(config.language)
+    holding = None
+    seen_at = None  # The screen size of a frame that painted the hint whole.
     animation_started = watch.time.monotonic()
     # Data refreshes are due at fixed five-second deadlines from the start; missed ones are
     # skipped, never caught up, and at most one refresh runs at a time.
@@ -303,7 +335,18 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             visible = watch._window(frame, view_state, height, max(1, width), config.language,
                                     layout if store is not None else None)
             top = view_state.get("scroll", 0)
-            alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
+            fitted = None if error else watch_hint.fitting(hint, max(1, width))
+            if fitted and holding is None:
+                taken = watch_hint.hold()
+                if taken == watch_hint.SHOWN:
+                    hint = fitted = None  # Another view showed it whole.
+                elif taken == watch_hint.BUSY:
+                    fitted = None  # Another view shows it now; try again on a later frame.
+                else:
+                    holding = taken
+                    cleanup.callback(holding.release)
+            message, tone = (error, "yellow") if error else (fitted or "", "hit")
+            alert = [watch._fit(watch._line(message, tone), max(1, width))] if message else []
             row_map = view_state.get("row_map")
             footer = len((view_state.get("pinned_rows") or {}).get("footer", ())) if row_map is not None else 0
             if row_map is not None:
@@ -321,6 +364,10 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 # A refresh error takes the bottom row (in place of the position line).
                 bottom = max(0, height - 1)
                 visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
+            # The screen row the hint is painted on, when the placement kept it.
+            hint_row = next((y for y, row in enumerate(visible[:max(1, height)])
+                             if fitted and row is alert[0]), None)
+            hint_whole = hint_row is not None
             # One highlighted row, by its position: the first issue row on screen.
             mark = watch.highlighted_row(view_state)
             if mark is None:
@@ -344,7 +391,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     except curses.error:
                         # Writing the bottom-right cell reports an error after drawing it;
                         # a resize between measuring and painting does too.
-                        pass
+                        if y == hint_row:
+                            hint_whole = False  # Not known to be drawn whole: not seen.
                     for found in ISSUE_NUMBER.finditer(value):
                         url = watch.issue_url(config, int(found[1]))
                         if url is not None:
@@ -367,6 +415,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 except (curses.error, AttributeError):
                     pass
             screen.refresh()
+            seen_at = (height, width) if hint_whole and holding is not None else None
             # Curses cannot write OSC 8, so every visible #n is written again as a link after
             # each refresh. No "unchanged" shortcut: curses also repaints unchanged text (after
             # a resize, or when it clears the screen itself), and that drops the links.
@@ -376,6 +425,13 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 watch.sys.stdout.write(SAVE_CURSOR + "".join(links) + RESTORE_CURSOR)
                 watch.sys.stdout.flush()
             key = screen.getch()
+            if seen_at is not None and key != curses.KEY_RESIZE and not _resized(curses, *seen_at):
+                # The hint stayed whole on this screen through the key wait: it was seen.
+                holding.confirm()
+            if hint and key not in (-1, curses.KEY_RESIZE):
+                hint = None  # The first key press clears the hint off the position row.
+                if holding is not None:
+                    holding.release()  # Seen or not, this view stops showing it.
             slugs = list(snapshot.status.get("lanes") or ())
             if view_state.get("settings"):
                 # The window is keyboard-only and takes every key but q.
