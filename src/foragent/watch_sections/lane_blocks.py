@@ -33,6 +33,10 @@ ART_ROWS = 4
 PIXELS_FROM = 40
 ACORN_ROWS = 2  # Current acorns and queued ones each take at most this many rows.
 WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_parked"}
+# (class, recipient) -> (plain word, recipient words): a question names its recipient.
+TURNS = {("question", "person"): ("lane_blocks_word_question", "question_person"),
+         ("wait", "orchestrator"): ("lane_blocks_word_wait", "question_orchestrator"),
+         ("wait", "answered"): ("lane_blocks_word_wait", "question_restart")}
 # Hit = (x0, y0, x1, y1, target) in this block's own rows; Mark = (row, number).
 Hit = tuple[int, int, int, int, Any]
 
@@ -51,7 +55,11 @@ def _word(item: dict[str, Any], language: str) -> str:
     something: its step, what it waits for, or, for a phase no one named, that it waits."""
     from foragent import watch, watch_scene
 
-    kind, phase = item["class"], item["phase"]
+    kind, phase, asked = item["class"], item["phase"], item.get("asked")
+    if (kind, asked) in TURNS:
+        # A question's word names whose turn it is (#1160), after the plain word it extends.
+        base, name = TURNS[kind, asked]
+        return f"{watch.text(base, language)}: {watch.text(name, language)}"
     if kind == "working" and phase is None:
         key = "lane_blocks_step_baseline"  # A run that recorded no step yet is still preparing.
     elif kind == "working" and phase in watch_scene.STEPS:
@@ -72,11 +80,15 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
     does not fit (blocks.11: the complete issue ID first, the step only when it fits)."""
     from foragent.watch_art import sideways_acorn
 
+    from foragent import watch
+
     kind = item["class"]
     if not word:
-        return sideways_acorn(item["number"], "", {"working": "working", "question": "question",
-                                                   "parked": "parked"}.get(kind, "next"),
-                              tick=tick, ascii=ascii_glyphs)
+        # The short acorn keeps the complete ID and, for a question, its recipient's name.
+        name = TURNS.get((kind, item.get("asked")), (None, None))[1]
+        return sideways_acorn(item["number"], watch.text(name, language) if name else "",
+                              {"working": "working", "question": "question",
+                               "parked": "parked"}.get(kind, "next"), tick=tick, ascii=ascii_glyphs)
     style = {"working": "working", "question": "question", "parked": "parked"}.get(kind, "next")
     return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs)
 
@@ -326,7 +338,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     evidence = _evidence(snapshot, config, now)
     if evidence:
         out.append(watch_scene.fit_marked(evidence, width, "..." if ascii_glyphs else "…"))
-    needs = watch_scene.questions(snapshot.status)
+    needs = watch_scene.question_numbers(snapshot)
     lanes = []
     for row in watch_scene.lane_rows(snapshot.status):
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)

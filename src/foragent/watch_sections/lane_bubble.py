@@ -127,10 +127,11 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
         if recent > 0:
             sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
                               else t("lane_bubble_pace", count=recent), ""))
-    asked = len(watch_scene.questions(status))
+    # The person's questions from the projection: answered ones are gone, issue-less ones count.
+    asked, who = watch_scene.person_questions(snapshot), t("question_person")
     if asked:
-        sentences.append(("questions", t("lane_bubble_questions_one") if asked == 1
-                          else t("lane_bubble_questions", count=asked), "question"))
+        sentences.append(("questions", t("lane_bubble_questions_one", who=who) if asked == 1
+                          else t("lane_bubble_questions", count=asked, who=who), "question"))
     processing = [row for row in snapshot.requests or () if isinstance(row, dict) and row.get("status") == "processing"]
     if processing:
         # The planning request being handled now (D76), its first line only.
@@ -273,7 +274,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
 
     ascii = glyph_mode(config) == "ascii"
     t = lambda key, **values: watch_scene.text(key, language, ascii=ascii, **values)
-    needs = watch_scene.questions(snapshot.status)
+    needs = watch_scene.question_numbers(snapshot)
     for row in watch_scene.lane_rows(snapshot.status):
         current, upcoming = watch_scene.lane_items(snapshot, row, needs)
         item = next((item for item in current + upcoming if item["number"] == number), None)
@@ -293,7 +294,7 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
 
         return rows + explanation(item["authored"], language, width, mark=_ellipsis(config))
     if kind == "question":
-        return rows + [[(t("lane_bubble_question_click"), "question")]]
+        return rows + [[(t("lane_bubble_question_click", who=t("question_person")), "question")]]
     if kind == "parked":
         return rows + [[(t("lane_bubble_parked_click", lane=name), "")]]
     if kind == "next":
@@ -302,7 +303,12 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         if reason != t("lane_blocks_wait"):
             rows.append([(reason, "")])
         return rows
-    if kind == "wait":
+    if kind == "wait" and item.get("asked") in {"orchestrator", "answered"}:
+        # A question's wait names whose turn it is, whatever phase (none, often) its run recorded.
+        from foragent.watch_sections.lanes import row_words
+
+        rows.append([(row_words(item["state"], phase, item["asked"], language)[1], "")])
+    elif kind == "wait":
         key = "blocked" if item["state"] == "blocked" and phase not in watch_scene.WAIT_PHASES else phase
         rows.append([(t(key), "")])
     else:
