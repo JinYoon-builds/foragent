@@ -22,6 +22,45 @@ def store(tmp_path):
     return StateStore(tmp_path / "state", now=lambda: NOW)
 
 
+@pytest.mark.parametrize("content", [
+    "{malformed", "null", "[]", "{}", '{"owner_merge": {}}',
+    '{"number": 2, "owner_merge": {}, "owner_merge_started_at": "old"}',
+    '{"started_at": "2026-10-20T09:00:00Z", "owner_merge": {}, '
+    '"owner_merge_started_at": "2026-10-20T09:00:00Z"}',
+    '{"number": [], "started_at": "2026-10-20T09:00:00Z", '
+    '"owner_merge_started_at": "2026-10-20T09:00:00Z", '
+    '"owner_merge": {"merged_at": "2026-10-20T09:01:00Z"}}',
+])
+def test_flag_off_role_reader_ignores_malformed_or_partial_current_run(store, tmp_path, content):
+    from foragent import orch_roles
+    from foragent.config import Config
+
+    store.start_run(1, branch="merged", worktree=tmp_path / "worktree")
+    store.update_run(1, changed_files=["src/changed.py"])
+    store.finish_run(1, "merged")
+    (store.root / "runs/2.json").write_text(content)
+    roles = {"docs": {"signals": [{"paths": ["src/**"]}]}}
+
+    files, _, _, _ = orch_roles.observe(store, Config(merge_owner=False), tmp_path, roles)
+
+    assert files == {"src/changed.py"}
+
+
+def test_merge_times_keeps_recorded_time_with_mismatched_owner_metadata(store, tmp_path):
+    run = store.start_run(1, branch="merged", worktree=tmp_path / "worktree")
+    merged = NOW + timedelta(seconds=1)
+    store.record_merge(1, merged)
+    store.finish_run(1, "merged")
+    path = store.root / "runs.jsonl"
+    value = json.loads(path.read_text())
+    value.update(owner_merge={"merged_at": (merged + timedelta(hours=1)).isoformat()},
+                 owner_merge_started_at=(NOW - timedelta(hours=1)).isoformat())
+    path.write_text(json.dumps(value) + "\n")
+
+    assert store.owner_merge_facts() == {}
+    assert store.merge_times() == {(1, run.started_at): merged.isoformat()}
+
+
 @pytest.mark.parametrize("error", [PermissionError, OSError])
 def test_update_run_keeps_recorded_ownership_when_process_table_is_unreadable(
     store, fake_process_table, tmp_path, monkeypatch, error,

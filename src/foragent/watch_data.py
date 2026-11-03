@@ -251,8 +251,9 @@ def collect(
     except (OSError, ValueError):
         history = None  # Unreadable history: no completions or week counts, not zero ones.
     merged = {}
+    owner_facts = store.owner_merge_facts() if history is not None else {}
     for run in history or []:
-        if run.outcome == "merged":
+        if store.run_merged(run, owner_facts=owner_facts):
             merged.pop(run.number, None)
             merged[run.number] = run
     done: dict[str, list[Issue]] = {}
