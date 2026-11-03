@@ -28,10 +28,11 @@ def spawn_notify(repo_root: Path, store: StateStore) -> None:
 
 def spawn_runner(repo_root: Path, store: StateStore) -> Callable[..., int]:
     def launch(number: int | None = None, *, kind: str = "issue", lane: str | None = None) -> int:
-        dream = kind == "dream"
-        log = store.root / "logs" / f"dream-{lane}.log" if dream else store.log_path(number)
+        dream, draft = kind == "dream", kind == "draft"
+        key = f"dream-{lane}" if dream else f"draft-{number}" if draft else number
+        log = store.root / "logs" / f"{key}.log" if dream or draft else store.log_path(number)
         log.parent.mkdir(parents=True, exist_ok=True)
-        action = ["run-dream", str(lane)] if dream else ["run-issue", str(number)]
+        action = ["run-dream", str(lane)] if dream else ["run-draft" if draft else "run-issue", str(number)]
         with log.open("ab") as stream:
             process = subprocess.Popen(
                 [sys.executable, "-m", "foragent.cli", "gate", *action, "--repo-root", str(repo_root)],
@@ -43,7 +44,7 @@ def spawn_runner(repo_root: Path, store: StateStore) -> Callable[..., int]:
                 identities = observe_tree(roots=(process.pid,))
             except PermissionError:
                 identities = []  # A stop must refuse without birth evidence.
-            store.update_run(f"dream-{lane}" if dream else number, pid=process.pid, process_identities=identities)
+            store.update_run(key, pid=process.pid, process_identities=identities)
         return process.pid
 
     return launch

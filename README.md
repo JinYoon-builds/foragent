@@ -8,14 +8,20 @@ Stock Claude Code is already good at finishing one task. Foragent automates the 
 task ends → done-when commands → adversarial review → merge → next issue
 ```
 
-<!-- GIF placeholder: lane view and statusline recording, coming soon (Jin records it). -->
-**GIF placeholder:** a recording of the lane view and the statusline is coming soon.
-
-Foragent built itself: 208 merged PRs in 10 days (counted from `git log` on 2026-10-29).
+Foragent built itself: 397 merged PRs in 15 days (counted from `git log` on 2026-11-03).
 
 [한국어 README](#한국어)
 
 ## Install
+
+Before you install, have these ready:
+
+- **A local Git repository** for your project, with its GitHub repository connected as `origin`.
+- **GitHub CLI (`gh`)**, installed and logged in with `gh auth login`.
+- **Claude Code**, installed and logged in.
+- **uv**, the Python tool installer that the install command uses. Follow the official guide: https://docs.astral.sh/uv/getting-started/installation/
+
+Codex CLI is optional.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
@@ -85,6 +91,15 @@ These limits are known. Each item names the file where a change would start.
 ```
 
 ### 설치
+
+설치하기 전에 이것들을 준비해요.
+
+- **로컬 Git 저장소.** 프로젝트의 GitHub 저장소가 `origin`으로 연결되어 있어야 해요.
+- **GitHub CLI (`gh`).** 설치하고 `gh auth login`으로 로그인해요.
+- **Claude Code.** 설치하고 로그인해요.
+- **uv.** 설치 명령이 쓰는 Python 도구 설치기예요. 공식 안내를 따라 설치해요: https://docs.astral.sh/uv/getting-started/installation/
+
+Codex CLI는 선택이에요.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent

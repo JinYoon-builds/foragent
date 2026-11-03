@@ -275,7 +275,7 @@ def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
 
 def _reap_inactive_runs(ctx: TickContext, report: TickReport) -> None:
     """Only recorded ownership authorizes cleanup, including closed issues and finished dreams."""
-    for run in [*ctx.store.read_history(), *ctx.store.dream_runs()]:  # Dreams stay out of runs.jsonl.
+    for run in [*ctx.store.read_history(), *ctx.store.dream_runs(), *ctx.store.draft_runs()]:  # Side runs stay out of runs.jsonl.
         current = ctx.store.get_run(run.key)
         if current is not None and current.status == "running":
             continue
