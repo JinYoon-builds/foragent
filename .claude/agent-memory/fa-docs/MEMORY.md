@@ -16,6 +16,7 @@
 - r334 (2026-11-02): #1618/#1647/#1669 (#1619 default skills, merge 52543555): ask Jin for a Dnn for the 2026-11-02 license rule, then one rules.md line. Wait: orchestrator relays.
 - r338 (2026-11-03): #1676/#1677 (merge a8d3faea, D105 보강): gate.md:129 drop 'main 유입 포함'; rules.md add PASS-scope line citing D105 (answers r315). Wait: orchestrator judges.
 - r347 (2026-11-03): #1684/#1686/#1691 (=#1652, merge 43a39c7b): no doc edit; r334 Dnn ask updated with broader license rule + role table, and rules.md:79 (D37) vs committed pstack principle-* skills. Wait: orchestrator relays to Jin.
+- r365 (2026-11-03): orders #1709..#1720 check — Korean README lacks the self-build count line (#1477, 397 PRs/15 days). Wait: orchestrator judges, then docs edits.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -49,3 +50,4 @@
 - Order titles '#NNNN: review standard/license scope' plus a long-titled edit order can all be one issue; check `git log --grep '#NNNN'` once. Vendored library skills (skills/principle-*, pstack MIT) are committed despite rules.md D37 line; check that line when skill-source rules change.
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase.
 - 'approve for launch bundle N' orders (e.g. #1708 for #1484) have empty bodies; check the named issue's merge. Role-memory auto-publish (#1699) and the PM seat (#1484, latest `fa` entrance wins) appear in no reader doc; README only says type `/fa`.
+- README self-build count (#1477/#1720) is English-only and test_launch_readme.py checks only English; when the count changes, check the 한국어 section too. Batch-merged children (#1158/#1159) carry their own numbers; grep each child, not the parent.
