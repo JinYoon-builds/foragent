@@ -4516,27 +4516,29 @@ WAITING_MARK = "<!-- foragent:waiting-prior sha256=" + "b" * 64 + " id=" + "c" *
 
 
 @pytest.mark.parametrize("approved_reply, later, history, approval_change, expected", [
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "reread-other-estimate", "run", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "failed-publication-of-reread", "run", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "publication-after-run-start", "run", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "reread", "approved-by-label-later", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "reread", "side-branch-from-before-approval-merged-later", None, (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", "write-marker", (2, 0, 2)),
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", "waiting-prior-marker", (2, 0, 2)),
-    ("", "reread-other-estimate", "run", None, None),
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", "acceptance-snapshot", None),
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", "body", None),
-    ("SIZE: source=2 tests=0 files=2", "reread", "run", "no-run-start", None),
-], ids=["later-preread-without-estimate", "later-preread-other-estimate", "failed-publication-of-reread",
-        "publication-after-run-start", "approved-by-label-later", "side-branch-merged-later",
-        "write-marker", "waiting-prior-marker",
-        "approved-without-estimate", "approval-snapshot-differs", "approved-body-differs", "no-run-start"])
+    ("SIZE: source=2 tests=0 files=2", "reread-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "reread-other-estimate-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "publication-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "reread-same-estimate-before-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "same-inputs-reread-new-estimate-before-start", "run", None, (9, 9, 9)),
+    ("SIZE: source=2 tests=0 files=2", None, "approved-by-label-later", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "side-branch-from-before-approval-merged-later", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "write-marker", (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "waiting-prior-marker", (2, 0, 2)),
+    ("", None, "run", None, None),
+    ("SIZE: source=2 tests=0 files=2", "reread-other-estimate-before-start", "run", None, None),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "acceptance-snapshot", None),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "body", None),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "no-run-start", None),
+], ids=["reread-after-start", "reread-other-estimate-after-start", "publication-after-start",
+        "reread-same-estimate-before-start", "same-inputs-reread-new-estimate", "approved-by-label-later", "side-branch-merged-later",
+        "write-marker", "waiting-prior-marker", "approved-without-estimate",
+        "disagreeing-prereads-before-start", "approval-snapshot-differs", "approved-body-differs", "no-run-start"])
 def test_merge_record_keeps_the_estimate_the_approval_stood_on(
         publishing, plan, tmp_path, monkeypatch, approved_reply, later, history, approval_change, expected):
-    """The estimate is fixed once at run start from the published body the approval names. Rereads,
-    publications (failed, or after the start), history merged from a side branch, the run's edits and
-    gate markers on the body never change or drop it; a run that never started reads unknown (#1696)."""
+    """The run fixes its own estimate once at start from the approved issue's prereads. Rereads and
+    publications after the start, history merged from a side branch, the run's edits and gate markers
+    never change or drop it. Prereads that disagree before the start, or no start, read unknown (#1696)."""
     root, config, tracker, item = publishing[0], publishing[1], publishing[2], plan["issues"][0]
     name = "docs/design/a/HANDOFF.md"
     plan["reference_files"] = {name: "approved handoff\n"}
@@ -4544,22 +4546,20 @@ def test_merge_record_keeps_the_estimate_the_approval_stood_on(
     plan["summary"] = "s"  # _proposals prereads the plan with this summary
     _proposals(root, config, plan, [("s", f"APPROACH: Update the handoff.\n{approved_reply}")])
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
-    # A person may approve by label later; publishing alone keeps the estimate.
     publish(publishing, plan, approve=history != "approved-by-label-later")
     child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
-    # A reread of changed references: same body, same acceptance files.
     changed = deepcopy(plan)
     changed["reference_files"][name] = "changed handoff\n"
-    reply = "SIZE: source=9 tests=9 files=9" if later != "reread" else ""
-    _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
-    if later == "failed-publication-of-reread":
-        def refuse(*args, **kwargs):
-            raise order.PlanError("publication failed")
 
-        with monkeypatch.context() as failing:
-            failing.setattr(tracker, "add_labels", refuse)
-            with pytest.raises(order.PlanError, match="publication failed"):
-                publish(publishing, changed, approve=True)
+    def reread(reply):  # same body, changed references
+        _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
+
+    if later == "reread-same-estimate-before-start":
+        reread("SIZE: source=2 tests=0 files=2")
+    elif later == "reread-other-estimate-before-start":
+        reread("SIZE: source=9 tests=9 files=9")
+    elif later == "same-inputs-reread-new-estimate-before-start":  # a clean reread of the very same plan
+        _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
     repo, base, head = _merge_repo(tmp_path, name, history)
     body = child.body
     blobs = {FILE: order._blob(API_FILES[FILE].encode())}
@@ -4572,7 +4572,12 @@ def test_merge_record_keeps_the_estimate_the_approval_stood_on(
     store = order._workload_store(root, REPO)
     merge = _start_and_merge(store, child.number, body, blobs, repo, base, head,
                              start=approval_change != "no-run-start")
-    if later == "publication-after-run-start":  # A publication after the start changes nothing.
+    if later == "reread-after-start":
+        reread("")
+    elif later == "reread-other-estimate-after-start":
+        reread("SIZE: source=9 tests=9 files=9")
+    elif later == "publication-after-start":
+        reread("SIZE: source=9 tests=9 files=9")
         publish(publishing, changed, approve=True)
     merge()
     report = size_signal.report(store.root)
@@ -4633,71 +4638,79 @@ def _merged(store, number, repo, base, head):
 
 
 def _reread_and_republish(publishing, plan, name, reply):
-    """Republish the same body with changed references; ``reply`` None skips the matching preread."""
+    """Republish the same body with changed references after a preread answering ``reply``."""
     root, config = publishing[0], publishing[1]
     changed = deepcopy(plan)
     changed["reference_files"][name] = "changed handoff\n"
-    if reply is not None:
-        _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
+    _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
     publish(publishing, changed)
 
 
-def test_reapproving_the_same_body_fixes_the_new_estimate_at_its_run_start(publishing, plan, tmp_path, monkeypatch):
-    """The value belongs to the run: a reapproval during it changes nothing; the next run takes the new one (#1696)."""
+def _first_run(publishing, plan, tmp_path, monkeypatch):
+    """A published, approved issue whose run started with the estimate 2/0/2."""
     root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
     publish(publishing, plan, approve=True)
     child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
-    repo, base, head = _merge_repo(tmp_path, name, "run")
     store = order._workload_store(root, REPO)
     blobs = {FILE: order._blob(API_FILES[FILE].encode())}
     _approve(store, child.number, child.body, blobs, "2026-11-01T10:30:00+00:00")
     store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    repo, base, head = _merge_repo(tmp_path, name, "run")
+    return store, tracker, child, name, blobs, (repo, base, head)
+
+
+TWO, NINE = dict(zip(size_signal.COUNTS, (2, 0, 2))), dict(zip(size_signal.COUNTS, (9, 9, 9)))
+
+
+def test_reapproving_the_same_body_fixes_the_new_estimate_at_its_run_start(publishing, plan, tmp_path, monkeypatch):
+    """A reapproval during a run changes nothing; the next run fixes its own record, unknown when the
+    approved body's prereads now disagree (2 before, 9 after the reread) (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
     _reread_and_republish(publishing, plan, name, "SIZE: source=9 tests=9 files=9")
     body = tracker.get_issue(child.number).body
     assert size_signal.body_key(body) == size_signal.body_key(child.body), "same authored body"
     _approve(store, child.number, body, blobs, "2026-11-01T14:00:00+00:00")  # reapproved while running
-    assert _merged(store, child.number, repo, base, head) == dict(zip(size_signal.COUNTS, (2, 0, 2)))
+    assert _merged(store, child.number, *merge) == TWO
     store.finish_run(child.number, "merged")
     store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
-    assert _merged(store, child.number, repo, base, head) == dict(zip(size_signal.COUNTS, (9, 9, 9)))
+    assert _merged(store, child.number, *merge) is None
 
 
 def test_a_restarted_run_keeps_the_estimate_fixed_at_its_first_start(publishing, plan, tmp_path, monkeypatch):
-    """A crash or stall restart continues the same run, so its input stays fixed (#1696)."""
-    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
-    publish(publishing, plan, approve=True)
-    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
-    store = order._workload_store(root, REPO)
-    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
-    _approve(store, child.number, child.body, blobs, "2026-11-01T10:30:00+00:00")
-    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    """A crash or stall restart continues the same run, so it carries that run's own record (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
     _reread_and_republish(publishing, plan, name, "SIZE: source=9 tests=9 files=9")
-    _approve(store, child.number, tracker.get_issue(child.number).body, blobs, "2026-11-01T14:00:00+00:00")
     store.finish_run(child.number, "crashed")
     store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
-    repo, base, head = _merge_repo(tmp_path, name, "run")
-    assert _merged(store, child.number, repo, base, head) == dict(zip(size_signal.COUNTS, (2, 0, 2)))
+    assert _merged(store, child.number, *merge) == TWO
 
 
-def test_republishing_without_a_matching_preread_reads_unknown_not_the_old_estimate(
-        publishing, plan, tmp_path, monkeypatch):
-    """A publication of changed references that no preread read leaves its body's estimate unknown (#1696)."""
-    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
-    publish(publishing, plan)
-    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
-    _reread_and_republish(publishing, plan, name, None)
-    store = order._workload_store(root, REPO)
-    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
-    _approve(store, child.number, tracker.get_issue(child.number).body, blobs, "2026-11-01T14:00:00+00:00")  # by label
+def test_a_restart_of_a_run_without_a_record_stays_unknown(publishing, plan, tmp_path, monkeypatch):
+    """A restart never captures later data: the resumed run had no record, so neither does this one (#1696)."""
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(size_signal, "_approved_estimate", fail)
+        store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    assert list((store.root / size_signal.FROZEN).glob("*.json")) == []
+    store.finish_run(child.number, "stalled-restart")
     store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
-    repo, base, head = _merge_repo(tmp_path, name, "run")
-    assert _merged(store, child.number, repo, base, head) is None
+    assert _merged(store, child.number, *merge) is None
+
+
+def test_a_new_run_whose_record_failed_never_reads_the_previous_run(publishing, plan, tmp_path, monkeypatch):
+    """A failed record leaves the new run unknown; the previous run's record is not its estimate (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    assert _merged(store, child.number, *merge) == TWO
+    store.finish_run(child.number, "merged")
+    monkeypatch.setattr(size_signal, "_approved_estimate", lambda *args: (_ for _ in ()).throw(OSError("full")))
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *merge) is None
 
 
 def test_a_gate_starting_the_run_at_approval_already_has_the_estimate(publishing, plan, tmp_path, monkeypatch):
-    """The gate may start a run the moment the approved label lands; the estimate is kept before it (#1696)."""
-    from foragent.issue import body_hash
-
+    """The gate may start a run the moment the approved label lands; the estimate already exists (#1696)."""
     root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
     store = order._workload_store(root, REPO)
     blobs = {FILE: order._blob(API_FILES[FILE].encode())}
@@ -4707,35 +4720,30 @@ def test_a_gate_starting_the_run_at_approval_already_has_the_estimate(publishing
     def approve_and_start(number, labels):
         label(number, labels)
         if "approved" in labels and not started:  # a gate awakened right now starts the run
-            body = tracker.get_issue(number).body
-            store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs=blobs,
-                                approved_by="human", approved_at="2026-11-01T10:30:00+00:00")
+            _approve(store, number, tracker.get_issue(number).body, blobs, "2026-11-01T10:30:00+00:00")
             store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
             started.append(number)
 
     monkeypatch.setattr(tracker, "add_labels", approve_and_start)
     publish(publishing, plan, approve_keys=[item["key"]])
     number, = started
-    repo, base, head = _merge_repo(tmp_path, name, "run")
-    size_signal.record(number, __import__("types").SimpleNamespace(store=store), GitRepo(repo),
-                       store.load_approval(number), base, head, 12, pytest.fail)
-    record, = size_signal.report(store.root)["records"]
-    assert record["expected_size"] == dict(zip(size_signal.COUNTS, (2, 0, 2)))
+    assert _merged(store, number, *_merge_repo(tmp_path, name, "run")) == TWO
 
 
-def test_run_start_takes_only_the_latest_publication_of_the_body(tmp_path):
-    """An older publication of the same body never stands in when the latest one does not fit (#1696)."""
+def test_run_start_reads_unknown_when_the_approved_prereads_disagree(tmp_path):
+    """Two prereads of the same approved issue with different estimates cannot be told apart (#1696)."""
     from types import SimpleNamespace
 
     store = SimpleNamespace(root=tmp_path / "store")
     body = "## Goal\nShip it.\n"
-    for files, size in (({FILE: "old"}, (2, 0, 2)), ({FILE: "new"}, (9, 9, 9))):
-        size_signal._append(store.root, size_signal.ESTIMATES, {
-            "issue": 5, "body": size_signal.body_key(body), "files": files,
-            "size": dict(zip(size_signal.COUNTS, size))})
-    approval = SimpleNamespace(body=body, body_sha="x", approved_at="t", acceptance_blobs={FILE: "old"})
-    size_signal.freeze(store, 5, approval, False)
-    assert size_signal.frozen(store, 5) is None
-    approval.acceptance_blobs = {FILE: "new"}
-    size_signal.freeze(store, 5, approval, False)
-    assert size_signal.frozen(store, 5) == dict(zip(size_signal.COUNTS, (9, 9, 9)))
+    for size in ((2, 0, 2), (2, 0, 2), (9, 9, 9)):
+        size_signal.note(store, {"key": "#5", "plan": "p", "files": {FILE: "a"},
+                                 "size": dict(zip(size_signal.COUNTS, size))}, body)
+    approval = SimpleNamespace(body=body, body_sha="x", approved_at="t", acceptance_blobs={FILE: "a"})
+    assert size_signal._approved_estimate(store, 5, approval) is None
+    approval.acceptance_blobs = {FILE: "b"}
+    assert size_signal._approved_estimate(store, 5, approval) is None
+    other = SimpleNamespace(root=tmp_path / "other")
+    size_signal.note(other, {"key": "#5", "plan": "p", "files": {FILE: "a"}, "size": TWO}, body)
+    approval.acceptance_blobs = {FILE: "a"}
+    assert size_signal._approved_estimate(other, 5, approval) == TWO

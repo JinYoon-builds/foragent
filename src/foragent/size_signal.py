@@ -130,78 +130,89 @@ def _entries(root: Path, journal: str) -> list[dict]:
     return entries
 
 
-def retain(plan: dict, root: Path, config, store, by_number: dict, mapping: dict, tracker) -> None:
-    """Once every body of a publication is written, record each published body with its estimate.
+def note(store, record: dict, body: str | None, digest: str | None = None) -> None:
+    """Keep a preread's estimate where every run start can see it, the moment the estimate is born.
 
-    Called before any approval label or gate wake-up, so no run of these bodies can start before
-    its input is recorded. Every published legacy issue and edit gets an entry, so the latest
-    entry for a body always describes its latest publication: the estimate of the preread whose
-    evidence key is this exact published plan, or unknown (null) when no such preread exists.
-    A publication that stopped before writing records nothing; a failure never fails publication.
+    ``body`` is the body publication will render for the issue; its authored key and the
+    record's issue key, plan and bound files identify which approved issue the estimate is for.
+    A failure leaves later runs unknown and never stops the preread.
     """
-    from foragent import order
-
     try:
-        try:
-            records = order._preread_records(root)
-        except order.PlanError:
-            records = {}
-        items = [item for item in plan["issues"] if "statements" not in item and item["key"] in mapping]
-        items += [order.edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
-                  if "statements" not in item and item["number"] in by_number]
-        waiting, _ = order._uncreated_lanes(plan, config, items)
-        for item in items:
-            number = mapping[item["key"]] if not item.get("edit") else int(item["key"].lstrip("#"))
-            record = None
-            if item["key"] not in waiting:  # no implementer read it before its lane existed
-                record = records.get(order.preread_target(plan, item, config, root)[2])
-            record = record if isinstance(record, dict) else {}
-            size = record.get("size")
-            _append(store.root, ESTIMATES, {
-                "issue": number, "body": body_key(tracker.get_issue(number).body),
-                "files": record.get("files") or {}, "size": size if isinstance(size, dict) else None,
-                "at": datetime.now(UTC).isoformat(timespec="seconds")})
-    except (OSError, ValueError, KeyError, order.PlanError):
+        size = record.get("size")
+        _append(store.root, ESTIMATES, {
+            "key": record.get("key"), "plan": record.get("plan"), "body": body_key(body) if body else None,
+            "files": record.get("files") or {}, "size": size if isinstance(size, dict) else None,
+            "digest": digest, "at": record.get("at")})
+    except (OSError, ValueError):
         pass
 
 
-def freeze(store, number: int, approval, restarted: bool) -> None:
-    """At run start, fix this run's expected size; a restart of the same run keeps it.
+def _run_path(store, number: int, run) -> Path:
+    """The record of exactly this run: its issue and the time it started."""
+    identity = hashlib.sha256(str(run.started_at).encode("utf-8")).hexdigest()[:32]
+    return store.root / FROZEN / f"{number}-{identity}.json"
 
-    The value belongs to the run, not to whatever approval is current later: a reapproval during
-    the run, a republication or a reread never changes it. It is the latest publication entry
-    for the approved authored body; if that entry's files disagree with the approval snapshot,
-    or there is no entry or no approval, it is unknown. Older entries are never fallen back on.
-    A failure never stops the run start.
+
+def _approved_estimate(store, number: int, approval) -> dict | None:
+    """The estimate every preread of the approved issue agreed on, else unknown.
+
+    A preread counts when it was for this issue (plan child key or edit of #n), the body it
+    read is the approved authored body, and the files it bound agree with the approval snapshot.
+    A reread of the same inputs (same evidence key) replaces its earlier answer. Prereads of the
+    same body with different references and different estimates cannot be told apart here, so
+    they read unknown rather than one of them standing in for the other.
     """
-    path = store.root / FROZEN / f"{number}.json"
+    from foragent import order
+
+    if approval is None:
+        return None
+    # The plan-child marker may sit above later gate lines (write, waiting), so search the whole body.
+    child = order._CHILD_LINE.search(approval.body)
+    key, snapshot, answers = body_key(approval.body), approval.acceptance_blobs or {}, {}
+    for entry in _entries(store.root, ESTIMATES):
+        files = entry.get("files")
+        mine = entry.get("key") == f"#{number}" or (
+            child is not None and entry.get("plan") == child[1] and entry.get("key") == child[2])
+        if mine and entry.get("body") == key and isinstance(files, dict) and all(
+                snapshot.get(name, sha) == sha for name, sha in files.items()):
+            # A reread of the same inputs (same evidence key) replaces its earlier answer.
+            answers[entry.get("digest") or id(entry)] = json.dumps(entry.get("size"), sort_keys=True)
+    sizes = set(answers.values())
+    return json.loads(sizes.pop()) if len(sizes) == 1 else None
+
+
+def freeze(store, number: int, approval, run, previous, restarted: bool) -> None:
+    """At run start, write this run's own record once; no other record is ever read for it.
+
+    A fresh start fixes the estimate the approved prereads agreed on. A restart (stall, crash,
+    limit wait) continues the same run, so it carries exactly the record of the run it resumes,
+    or unknown when that run has none. Any failure leaves this run without a record: unknown.
+    """
     try:
-        if restarted and path.exists():
-            return
-        size = None
-        if approval is not None:
-            key, snapshot, latest = body_key(approval.body), approval.acceptance_blobs or {}, None
-            for entry in _entries(store.root, ESTIMATES):
-                if entry.get("issue") == number and entry.get("body") == key:
-                    latest = entry
-            files = (latest or {}).get("files")
-            if isinstance(files, dict) and all(snapshot.get(name, sha) == sha for name, sha in files.items()):
-                size = latest.get("size") if isinstance(latest.get("size"), dict) else None
+        if restarted:
+            source = _run_path(store, number, previous) if previous is not None else None
+            value = json.loads(source.read_text(encoding="utf-8")) if source and source.exists() else {}
+            size = value.get("expected_size") if isinstance(value, dict) else None
+        else:
+            size = _approved_estimate(store, number, approval)
+        path = _run_path(store, number, run)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         temporary.write_text(json.dumps({
-            "issue": number, "approval_body_sha": getattr(approval, "body_sha", None),
-            "approved_at": getattr(approval, "approved_at", None), "expected_size": size}), encoding="utf-8")
+            "issue": number, "run_started_at": run.started_at,
+            "approval_body_sha": getattr(approval, "body_sha", None),
+            "expected_size": size if isinstance(size, dict) else None}), encoding="utf-8")
         os.rename(temporary, path)  # atomic on POSIX, like the store's own record writes
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return
 
 
 def frozen(store, number: int) -> dict | None:
-    """The expected size fixed at the start of this issue's current run, or None (unknown)."""
+    """The expected size the current run of this issue recorded at its own start, or None (unknown)."""
     try:
-        value = json.loads((store.root / FROZEN / f"{number}.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        run = store.get_run(number)
+        value = json.loads(_run_path(store, number, run).read_text(encoding="utf-8")) if run else None
+    except (OSError, ValueError, AttributeError):
         return None
     size = value.get("expected_size") if isinstance(value, dict) else None
     return size if isinstance(size, dict) else None

@@ -61,7 +61,7 @@ class RunRecordsMixin:
                       executor=executor, reviewer=reviewer, executor_model=executor_model, **session, **contract)
             self._merge_lock_seconds.pop((number, timestamp), None)
             self._write_run(run)
-            size_signal.freeze(self, number, approval, restarted)  # this run's expected size (#1696)
+            size_signal.freeze(self, number, approval, run, previous, restarted)  # this run's own estimate (#1696)
             if journal is not None:  # The audit event of this record (#107), under the same lock.
                 journal()
             return run

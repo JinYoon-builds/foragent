@@ -1054,8 +1054,6 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
-    # Every body is written; keep its estimate before any approval or gate wake-up can start a run.
-    size_signal.retain(plan, root, config, _workload_store(root, repo), by_number, mapping, tracker)
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
@@ -1478,10 +1476,13 @@ def preread(plan: dict, root: Path, config: Config,
         unknowns = _unknowns(answer)
         decisions = _decisions(answer)
         approach = _approach(answer)
-        _record_preread(root, directory, digest, {
-            "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-            "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
-            "at": datetime.now(UTC).isoformat(timespec="seconds")})
+        record = {"key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
+                  "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
+                  "at": datetime.now(UTC).isoformat(timespec="seconds")}
+        _record_preread(root, directory, digest, record)
+        # The estimate is born here; each run start fixes it from these notes (#1696).
+        size_signal.note(store, record, (repo or config.repo) and _published_body(plan, item, repo or config.repo, config),
+                         digest)
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
