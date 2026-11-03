@@ -1,5 +1,34 @@
 """Acceptance test for orch-review-handoff. Locked by Foragent; do not edit."""
 
+import json as _json
+
+# #1651 public scoring session: the prompt starts with one JSON request carrying "finding";
+# the reply is one JSON object. This one confirms a real defect with a concrete breaking input.
+CONFIRMED_SCORE = _json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                               "locked_test": None, "breaking_input": "the input this fixture's reviewer reports",
+                               "spec_question": None})
+
+
+def scoring_request(prompt):
+    try:
+        request = _json.JSONDecoder().raw_decode(prompt or "")[0]
+    except ValueError:
+        return None
+    return request if isinstance(request, dict) and isinstance(request.get("finding"), str) else None
+
+
+def answers_scores(run, scorings=None):
+    """Wrap a scripted reviewer so scoring sessions get CONFIRMED_SCORE and never consume its script."""
+    from foragent.executors import ExecResult
+
+    def wrapped(**kwargs):
+        if scoring_request(kwargs["prompt"]) is not None:
+            if scorings is not None:
+                scorings.append(kwargs)
+            return ExecResult(0, False, CONFIRMED_SCORE, kwargs["log_path"])
+        return run(**kwargs)
+    return wrapped
+
 
 def make_case(git_history, tmp_path, monkeypatch, **config_values):
     """Offline runner/CLI dependencies, shared by these acceptance files.
@@ -69,9 +98,13 @@ def make_case(git_history, tmp_path, monkeypatch, **config_values):
 
     class Executor:
         def __init__(self, steps):
-            self.steps, self.calls = list(steps), []
+            self.steps, self.calls, self.scorings = list(steps), [], []
 
         def run(self, **kwargs):
+            if scoring_request(kwargs["prompt"]) is not None:
+                # #1651: also when a test hands this executor out directly (see scored_reviewer).
+                self.scorings.append(kwargs)
+                return ExecResult(0, False, CONFIRMED_SCORE, kwargs["log_path"])
             self.calls.append(kwargs)
             assert self.steps, "Unexpected executor invocation"
             step = self.steps.pop(0)
@@ -84,6 +117,9 @@ def make_case(git_history, tmp_path, monkeypatch, **config_values):
 
     implementer = Executor([implement])
     reviewer = Executor(["VERDICT: PASS"])
+    # #1651: each FAIL finding gets a scoring session. These fixtures script real defects, so the
+    # scorer confirms them; whatever reviewer.run a test installs keeps its own script and counts.
+    scored_reviewer = SimpleNamespace(run=answers_scores(lambda **kwargs: reviewer.run(**kwargs), reviewer.scorings))
     config = Config(**{"review": "fast", "reviewer": "codex", "executor": "claude", "approvers": ["human"],
                        "max_retries": 3, "review_max": 3, "repo": "owner/repo", **config_values})
     git = GitRepo(git_history.clone, git_run)
@@ -93,7 +129,7 @@ def make_case(git_history, tmp_path, monkeypatch, **config_values):
     store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1))
     ctx = RunContext("owner/repo", git_history.clone, tracker, store, config, git,
                      now=lambda: clock[0],
-                     executor_factory=lambda name: implementer if name == config.executor else reviewer,
+                     executor_factory=lambda name: implementer if name == config.executor else scored_reviewer,
                      sleep=lambda seconds: clock.__setitem__(0, clock[0] + timedelta(seconds=seconds)),
                      monotonic=lambda: clock[0].timestamp())
     return SimpleNamespace(ctx=ctx, root=git_history.clone, history=git_history,
