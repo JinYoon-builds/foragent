@@ -58,3 +58,4 @@
 - Permission/guard changes (e.g. #1736 person-only refusal) belong next to README's `Bash(fa:*)` paragraph, which exists in both English and 한국어; skills that tell the PM/orchestrator to run those commands stay true.
 - Orchestrator launch surface (#1490: always hidden `claude --bg`, no Orca tab/tmux window) appears in no reader doc; README's Orca/tmux lines (81/159) are about the lane view (watch_open), not the orchestrator.
 - New read-only `fa order` checks (collect #1523, red #1725) land with no reader-doc line; docs/order.md near the preread paragraph is the one place for them. Bundle such proposals.
+- Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
