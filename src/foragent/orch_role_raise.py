@@ -165,15 +165,30 @@ def baseline(record: dict[str, Any] | None) -> dict[str, Any] | None:
 
     That is ``answer_facts`` (measured by `fa orch signal-answer` or a finished gate dive), else
     the facts the request was raised with; None for a legacy request without facts.
+    A kind of ``orch_facts_kinds.EVIDENCE_ONLY`` is compared with what that raise saw instead
+    (#1733: "more items than at that raise, or a different oldest item"); absent from the raise,
+    any presence now is more than then. Both the inbox re-raise and the gate call read this.
     """
     if record is None:
         return None
     facts = record.get("answer_facts") or record.get("facts")
-    return facts if isinstance(facts, dict) else None
+    raised = record.get("facts")
+    if not isinstance(facts, dict) or not isinstance(raised, dict) or facts is raised:
+        return facts if isinstance(facts, dict) else None
+    facts = json.loads(json.dumps(facts, default=str))
+    kinds = facts.get("kinds") if isinstance(facts.get("kinds"), dict) else {}
+    for kind in orch_facts_kinds.EVIDENCE_ONLY:
+        kinds.pop(kind, None)
+        if kind in (raised.get("kinds") or {}):
+            kinds[kind] = raised["kinds"][kind]
+    if kinds or "kinds" in facts:
+        facts["kinds"] = kinds
+    return facts
 
 
 def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False) -> bool:
-    """``shares`` names the derived share fields of this level only: a kind's top-level numbers.
+    """``shares`` names the fields of this level that are worse on any rise (derived shares and
+    ``orch_facts_kinds.RISING_FACTS``), at a kind's top-level numbers only: a kind's top-level numbers.
     Nested keys are members (lanes, files, issues), whatever they are called, so their counts
     must double."""
     if after is None:
@@ -227,11 +242,23 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any]) -> bool:
         if not isinstance(prior, dict):
             return True  # A kind present now that the baseline did not hold.
         if _worse_value(prior.get("numbers"), item.get("numbers"),
-                        shares=frozenset(orch_facts_kinds.SHARE_FACTS.get(kind, {}))):
+                        shares=frozenset(orch_facts_kinds.SHARE_FACTS.get(kind, {}))
+                        | frozenset(orch_facts_kinds.RISING_FACTS.get(kind, ()))):
             return True
         if _worse_binding(prior.get("binding"), item.get("binding")):
             return True
     return False
+
+
+def clear_rearms(facts: dict[str, Any]) -> bool:
+    """Whether a clear since the last raise may re-raise a signal with these current facts.
+
+    Matched files and met kinds outside ``orch_facts_kinds.EVIDENCE_ONLY`` keep the clear-and-return
+    rule; a signal met only through evidence-only kinds is re-raised by ``worse`` alone, whether
+    the clear came after the answer or while the request was still open (#1733).
+    """
+    return bool(facts.get("files")) or any(kind not in orch_facts_kinds.EVIDENCE_ONLY
+                                           for kind in facts.get("kinds", {}))
 
 
 def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
@@ -399,7 +426,7 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
                 if baseline(previous) is not None:
                     # A clear and return is a new episode the locked raise test records as a
                     # request; it never calls by itself (the gate path above has no such rule).
-                    due = cleared or worse(baseline(previous), facts)
+                    due = (cleared and clear_rearms(facts)) or worse(baseline(previous), facts)
                 else:
                     due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:
