@@ -360,6 +360,19 @@ def test_code_review_result_parsing(text, verdict):
         assert result.findings == next(line for line in text.splitlines() if line.startswith("- "))
 
 
+@pytest.mark.parametrize("note", ["Review completed.", "NOTE: checked the hunks"])
+def test_none_marker_reads_the_same_on_the_first_or_last_line(note):
+    from foragent.run_review import code_review_findings
+
+    first, last = f"(none)\n\n{note}", f"{note}\n\n(none)"
+    assert code_review_findings(first) == code_review_findings(last) == ("PASS", [], "")
+    # NOTE lines are removed first; a marker between two prose lines is not the marker.
+    assert code_review_findings(f"{note}\n(none)\n{note}")[0] == (
+        "PASS" if note.startswith("NOTE:") else "UNUSABLE")
+    for text in (first, last):
+        assert parse_code_review(json.dumps({"result": text})).no_findings
+
+
 def test_code_review_plain_finding_reports_failure():
     text = "src/foragent/adopt.py:180 — I couldn't confirm this one, because ..."
     result = parse_code_review(json.dumps({"result": "VERDICT: FAIL\n" + text}))
@@ -1014,6 +1027,12 @@ def test_review_requires_exactly_one_verdict(text, native):
     ('[ {"summary":"selected locale is lost"} ]\n(none)', False),
     ("feature.txt:1 — selected locale is lost\n(none)", False),
     ('```json\n[{"summary":"selected locale is lost"}]\n```\n(none)', False),
+    ("(none)\n\nReview completed.", True), ("\n(none)\nNo defects found.\n", True),
+    ("(none)\nfeature.txt:1 — selected locale is lost", False),
+    ("(none)\nNo defects.\nfeature.txt:1 — selected locale is lost", False),
+    ('(none)\n[ {"summary":"selected locale is lost"} ]', False),
+    ('(none)\n```json\n[{"summary":"selected locale is lost"}]\n```', False),
+    ("Review completed.\n(none)\nMore prose.", False),
 ])
 @pytest.mark.parametrize("native", [False, True])
 def test_missing_verdict_keeps_protocol_separate_from_empty_findings(text, empty, native):
