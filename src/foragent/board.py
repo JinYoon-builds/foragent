@@ -2,7 +2,10 @@
 
 from collections.abc import Iterable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+import fcntl
+import json
 import logging
 from typing import Protocol
 
@@ -48,7 +51,7 @@ FIELD_SELECTION = """... on ProjectV2SingleSelectField {
 def _data(tracker: Tracker, query: str, variables: dict) -> dict:
     result = tracker.graphql(query, variables)
     if result.get("errors"):
-        raise TrackerError(f"board GraphQL errors: {result['errors']}")
+        raise TrackerError(f"board GraphQL errors: {result['errors']}", stdout=json.dumps(result))
     return result.get("data", result)
 
 
@@ -324,6 +327,35 @@ def _waits_on_person(ctx: BoardContext, issue: Issue | int) -> bool:
         return False
 
 
+def _report_failure(ctx: BoardContext, exc: Exception) -> None:
+    """Relay missing project scope once per repository; board.py owns the marker."""
+    if not isinstance(exc, TrackerError) or not (exc.missing_scopes & {"project", "read:project"}):
+        return
+    from foragent import notify
+    from foragent.i18n import text
+    from foragent.state import StateStore
+
+    try:
+        root = StateStore.for_repo(ctx.repo).root
+        root.mkdir(parents=True, exist_ok=True)
+        marker = root / "board-scope-notice.json"
+        # Serialize the check, delivery and acknowledgment across gate processes.
+        with (root / "board-scope-notice.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if marker.exists():
+                return
+            config = ctx.config if ctx.config.repo else replace(ctx.config, repo=ctx.repo)
+            with notify.sending("status"):
+                error = notify.deliver(config, text("board_scope_title", config.language),
+                                       text("board_scope_fix", config.language), kind="status")
+            if error is not None:
+                log.warning("Could not deliver board scope notice: %s", error)
+                return
+            marker.write_text(json.dumps({"at": datetime.now(UTC).isoformat()}) + "\n")
+    except Exception:
+        log.warning("Could not record board scope notice for %s", ctx.repo, exc_info=True)
+
+
 def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_only: bool = False,
                 parent: bool = False) -> None:
     """Move the issue's card to the column for ``status`` when the column differs.
@@ -359,6 +391,7 @@ def sync_status(ctx: BoardContext, issue: Issue | int, status: str, *, existing_
             raise
         log.warning("Could not set board Status to %s for issue %s", status,
                     getattr(issue, "number", issue), exc_info=True)
+        _report_failure(ctx, exc)
     finally:
         _current.reset(token)
 
@@ -403,6 +436,7 @@ def refresh_cards(ctx: BoardContext, tracker: Tracker | None = None) -> None:
         if isinstance(exc, TrackerError) and exc.is_rate_limit:
             raise
         log.warning("Could not read board cards for %s", ctx.repo, exc_info=True)
+        _report_failure(ctx, exc)
         return
     rows = ctx.store.local_issues()
     for row in rows:
@@ -450,6 +484,7 @@ def _refresh_waiting(ctx: BoardContext, tracker: Tracker, rows: list[dict], card
             if isinstance(exc, TrackerError) and exc.is_rate_limit:
                 raise
             log.warning("Could not set board Waiting for issue #%s", number, exc_info=True)
+            _report_failure(ctx, exc)
 
 
 def add_issue(tracker: Tracker, repo: str, project_id: str | None, issue: int,

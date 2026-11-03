@@ -172,6 +172,25 @@ class TrackerError(RuntimeError):
         ))
 
     @property
+    def missing_scopes(self) -> frozenset[str]:
+        """Scope names required by gh's diagnostics, never inferred from an HTTP code."""
+        diagnostics = [str(self)]
+        try:
+            payload = json.loads(self.stdout)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            diagnostics.extend(
+                error.get("message", "") for error in payload.get("errors", [])
+                if isinstance(error, dict) and error.get("type") == "INSUFFICIENT_SCOPES"
+            )
+        scopes = set()
+        for diagnostic in diagnostics:
+            for required in re.findall(r"requires one of the following scopes: \[([^\]]*)\]", diagnostic):
+                scopes.update(re.findall(r"['\"]([^'\"]+)['\"]", required))
+        return frozenset(scopes)
+
+    @property
     def is_not_found(self) -> bool:
         return bool(re.search(r"\bHTTP(?:/\S+)?\s+404\b", f"{self}\n{self.stdout}", re.I))
 
@@ -1168,7 +1187,7 @@ class GhTracker:
             if not isinstance(result, dict):
                 raise TrackerError("invalid GraphQL response: expected an object")
             if result.get("errors"):
-                raise TrackerError(f"GraphQL errors: {result['errors']}")
+                raise TrackerError(f"GraphQL errors: {result['errors']}", stdout=output)
             if not isinstance(result.get("data"), dict):
                 raise TrackerError("invalid GraphQL response: missing data")
             return result
