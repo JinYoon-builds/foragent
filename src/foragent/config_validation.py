@@ -125,6 +125,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("animation must be true or false")
     if type(values["review_pass_scope"]) is not bool:
         raise ConfigError("review_pass_scope must be true or false")
+    if type(values["review_scoring"]) is not bool:
+        raise ConfigError("review_scoring must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     presence = values["presence"]

@@ -152,7 +152,7 @@ merge_group_max: 1
 overlap_mode: fixed
 default_skills:  # 2026-11-02 Jin (#1652): repository copies of the principle skills, per role
   workers: [principle-prove-it-works, principle-fix-root-causes, principle-attack-the-premise, principle-sequence-verifiable-units]
-  reviewers: [principle-prove-it-works]
+  reviewers: [principle-prove-it-works, review-procedure]  # #1651: plugin review procedure
   orchestrator: [principle-prove-it-works, principle-attack-the-premise]
   architect: [principle-attack-the-premise, principle-redesign-from-first-principles]
   docs: []
