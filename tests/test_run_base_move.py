@@ -10,6 +10,7 @@ import pytest
 from foragent.git import GitRepo
 from foragent.run_baseline import AcceptanceBaseline
 from foragent.run_base_move import BaseMove, base_move_is_neutral, capture_move, config_move_is_neutral, moved_paths
+from foragent.state import StateStore
 
 
 def git(root: Path, *args: str, env: dict | None = None) -> str:
@@ -78,8 +79,10 @@ def attempt(root: Path, owners: dict[int, list[str]], *, merged=(), n: int = 1, 
         (state / "approvals" / f"{number}.json").write_text("{}")
     store = SimpleNamespace(
         root=state, load_approval=approvals.get,
-        read_history=lambda: [SimpleNamespace(number=number, outcome="merged") for number in merged],
+        read_history=lambda: [SimpleNamespace(number=number, outcome="merged", started_at="") for number in merged],
+        owner_merge_facts=dict,
     )
+    store.run_merged = lambda run, owner_facts=None: StateStore.run_merged(store, run, owner_facts=owner_facts)
     baseline = AcceptanceBaseline("pytest", (), excluded=tuple(skipped))
     approval = SimpleNamespace(acceptance_blobs={name: "sha" for name in own_locked})
     tracker = SimpleNamespace(list_issues=lambda state: [
