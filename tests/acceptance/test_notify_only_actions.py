@@ -25,16 +25,20 @@ from test_view_notify import notify_store
 def notification_case(git_history, tmp_path, monkeypatch):
     record_gh(monkeypatch)
     case = make_case(git_history, tmp_path, monkeypatch, notify="claude-push", language="en")
-    # Reuse the delivery fixture, so real send() writes to this case's outbox.
+    # Reuse the delivery fixture, so real send() hands alerts to this case's planning session.
     delivery_store = notify_store(tmp_path, monkeypatch)
     case.clock[0] = datetime(2026, 10, 23, 13, tzinfo=ZoneInfo("Asia/Seoul")).astimezone(UTC)
     ctx = InspectContext(case.tracker, case.store, "owner/repo", case.config,
                          now=lambda: case.clock[0], repo_root=case.root, git=case.git)
-    return case, ctx, delivery_store.root / "push-outbox.jsonl"
+    return case, ctx, delivery_store
 
 
-def pushes(path):
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+def pushes(store):
+    # #1650: the unread push outbox is gone; count what the planning session relays to the person.
+    from test_view_notify import relayed
+
+    assert not list(store.root.rglob("*outbox*"))
+    return relayed(store)
 
 
 def push_text(row):

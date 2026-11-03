@@ -21,6 +21,7 @@ from foragent.config import load_config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths
+from foragent.paths import PathError, repo_path
 
 # Slot admission and the run share this budget; running out means no verdict, not "not red".
 LIMIT_S = 600.0
@@ -51,12 +52,9 @@ class RedReport:
         self.out.write(_json.dumps(row) + "\\n")
         self.out.flush()
 
-    def pytest_collection_modifyitems(self, items):
-        counts = {}
-        for item in items:
-            name = item.nodeid.split("::")[0]
-            counts[name] = counts.get(name, 0) + 1
-        self.write({"phase": "items", "counts": counts})
+    def pytest_collection_finish(self, session):
+        # The final selection, after any deselection; every id here must report a call.
+        self.write({"phase": "items", "nodeids": [item.nodeid for item in session.items]})
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -69,10 +67,9 @@ class RedReport:
 
     def pytest_runtest_logreport(self, report):
         exception, missing = self.calls.get((report.nodeid, report.when), (None, None))
-        if report.failed and exception is None and getattr(report, "longrepr", None) is not None:
-            exception = "failure"
+        xfail = hasattr(report, "wasxfail") or str(report.longrepr or "").startswith("[XPASS(strict)]")
         self.write({"phase": report.when, "nodeid": report.nodeid, "outcome": report.outcome,
-                    "xfail": hasattr(report, "wasxfail"), "exception": exception, "missing": missing,
+                    "xfail": xfail, "exception": exception, "missing": missing,
                     "error": str(report.longrepr) if report.failed else ""})
 
 
@@ -118,10 +115,13 @@ def verdict(rows: list[dict], names: list[str], tree: Path, language: str) -> li
     """One line per item that is not red; empty when the draft is red."""
     say = lambda key, **values: text(key, language, **values)  # noqa: E731
     problems: list[str] = []
-    counts: dict[str, int] = {}
+    collected: list[str] = []
     for row in rows:
         if row["phase"] == "items":
-            counts = row["counts"]
+            collected = row["nodeids"]
+    counts: dict[str, int] = {}
+    for nodeid in collected:
+        counts[nodeid.split("::")[0]] = counts.get(nodeid.split("::")[0], 0) + 1
     broken = {row["nodeid"] for row in rows if row["phase"] == "collect"}
     for row in rows:
         if row["phase"] == "collect":
@@ -134,6 +134,8 @@ def verdict(rows: list[dict], names: list[str], tree: Path, language: str) -> li
     for row in rows:
         if row["phase"] in {"setup", "call", "teardown"}:
             tests.setdefault(row["nodeid"], {})[row["phase"]] = row
+    for nodeid in collected:
+        tests.setdefault(nodeid, {})
     for nodeid, phases in tests.items():
         setup, call, teardown = phases.get("setup"), phases.get("call"), phases.get("teardown")
         if setup and setup["outcome"] == "failed":
@@ -155,6 +157,17 @@ def verdict(rows: list[dict], names: list[str], tree: Path, language: str) -> li
     return problems
 
 
+def fetched_base(git: GitRepo, branch: str) -> str:
+    """The base branch as fetched from origin; the local branch only in a repository without origin.
+
+    Unlike the collect check, local commits are ignored: a draft must be red on what main really is.
+    """
+    if not order_collect._has_origin(git):
+        return git.ref_sha(f"refs/heads/{branch}")
+    git.fetch("origin", branch)
+    return git.ref_sha(f"refs/remotes/origin/{branch}")
+
+
 def check(plan: dict, root: Path, config, git: GitRepo | None = None) -> dict:
     """{"red", "base", "files", "problems"}; raises PlanError when no verdict could be reached."""
     language = _language(config)
@@ -169,13 +182,18 @@ def check(plan: dict, root: Path, config, git: GitRepo | None = None) -> dict:
 
     git = git or GitRepo(root)
     try:
-        base = order_collect._current_base(git, config.base_branch)
+        base = fetched_base(git, config.base_branch)
     except (GitError, OSError, subprocess.SubprocessError) as exc:
         cause = text("order_collect_no_base", language, branch=config.base_branch, error=" ".join(str(exc).split()))
         raise unavailable(cause, config.test_command) from exc
     work = None
     try:
         work = Path(tempfile.mkdtemp(prefix="foragent-red-"))
+        for name in names:
+            try:
+                repo_path(work / "tree", name)
+            except PathError as exc:
+                raise order_collect._Unavailable(text("order_red_bad_path", language, path=name), None) from exc
         code, tree, log, attempted = order_collect.run_copy(
             git, base, carried, names, work, config, language, time.monotonic() + LIMIT_S,
             before="-p no:cacheprovider", after="", conftest=order_collect._COPY_CONFTEST + _REPORTER,

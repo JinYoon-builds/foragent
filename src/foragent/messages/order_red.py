@@ -16,6 +16,7 @@ MESSAGES = {
         "order_red_setup_error": "{test} errors in setup: {error}",
         "order_red_teardown_error": "{test} errors in teardown: {error}",
         "order_red_no_files": "the plan names no acceptance file to check",
+        "order_red_bad_path": "the acceptance path {path} is not a repository-relative path inside the copy",
         "order_red_slot_timeout": "no machine test slot became free before the deadline",
         "order_red_timeout": "the draft did not finish within {seconds} seconds",
         "order_red_unavailable": (
@@ -37,6 +38,7 @@ MESSAGES = {
         "order_red_setup_error": "{test}가 준비 단계에서 오류가 나요: {error}",
         "order_red_teardown_error": "{test}가 정리 단계에서 오류가 나요: {error}",
         "order_red_no_files": "계획에 확인할 인수 파일이 없어요",
+        "order_red_bad_path": "인수 경로 {path}는 사본 안의 저장소 상대 경로가 아니에요",
         "order_red_slot_timeout": "마감 전에 기계 시험 칸이 비지 않았어요",
         "order_red_timeout": "초안이 {seconds}초 안에 끝나지 않았어요",
         "order_red_unavailable": (
