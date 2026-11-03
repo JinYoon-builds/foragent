@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -221,6 +221,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "resources": resources,
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
+        **orch_facts_decided.collect(store, now, RECENT),
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
     }
 
@@ -235,6 +236,21 @@ def _n(value: int | None) -> str:
 
 def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value * 100:.1f}%"
+
+
+def _decided_lines(facts: dict[str, Any], language: str) -> list[str]:
+    """Decided issues waiting for tests, and decision-to-approval time, as two lines."""
+    from foragent.i18n import text
+
+    waiting, approval = facts["tests_waiting"], facts["decision_to_approval"]
+    issues = waiting["issues"] or []
+    shown = (" (" + ", ".join(f"#{n}" for n in issues[:HUMAN_ITEMS]) + (", ..." if len(issues) > HUMAN_ITEMS else "")
+             + ")") if issues else ""
+    minutes = approval["median_minutes"]
+    return [text("facts_tests_waiting", language, count=_n(waiting["count"]), issues=shown),
+            text("facts_decision_to_approval", language, days=facts["window_days"],
+                 median="?" if minutes is None else f"{minutes:.0f}", approved=approval["approved"],
+                 unknown=approval["unknown"])]
 
 
 def human(facts: dict[str, Any], language: str = "en") -> str:
@@ -286,7 +302,8 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     blocks = [runs + ["  " + line for line in [*orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS),
                                                *orch_facts_reviews.project_review_lines(facts, language, HUMAN_ITEMS)]], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}",
                                     orch_facts_baselines.human_line(facts, language),
-                                    *orch_role_schedule.human_lines(facts["role_schedule"], language)]]
+                                    *orch_role_schedule.human_lines(facts["role_schedule"], language),
+                                    *_decided_lines(facts, language)]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
 

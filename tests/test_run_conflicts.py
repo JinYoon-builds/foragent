@@ -601,6 +601,9 @@ def test_failed_rebuild_blocks_without_more_implementation_or_resolution(conflic
         assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.ci_heads[0]
     if failure == "ci":
         assert "The rebuilt CI failed" in c.tracker.list_comments(1)[-1].body
+    # The rebuilt head's CI code failure is kept once as a local fact; other failures write none.
+    facts = [(f["run_started_at"], f["data"]["head"]) for f in c.store.flow_records() if f["kind"] == "ci-failure"]
+    assert facts == ([(c.store.get_run(1).started_at, c.ci_heads[-1])] if failure == "ci" else [])
 
 
 def test_conflict_budget_survives_ci_repair_and_republishing(conflicting_lanes, monkeypatch):

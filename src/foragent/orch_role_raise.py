@@ -12,6 +12,13 @@ records themselves, so a gate restart keeps the same rule (#1155). The re-raise 
 only the request record, never the 30-day journal: `fa orch signal-answer` sets ``answer`` in the
 same locked step that marks the request done, and the tick sets ``cleared_at`` on the request
 when its signal goes unmet (it also appends the ``role-signal-clear`` event for the record).
+
+Gate alarms (#1469): on a tick that may start work, the gate calls a role of ``GATE_CALLED``
+directly for its met signal (and for ``orch_facts_kinds.ALARM_KINDS``) instead of asking the
+orchestrator. The request stays open until that session finishes its dive, which records it
+``called`` (``complete_call``). After any answer it calls again only when the burden is worse
+than the facts stored at that answer (``answer_facts``, measured by `fa orch signal-answer`);
+the same or better numbers, a clear and return, or elapsed time alone stay quiet.
 """
 
 from __future__ import annotations
@@ -36,6 +43,12 @@ DEFAULT_COOLDOWN_HOURS = 12
 CLEAR = "role-signal-clear"
 ANSWER = "role-signal-answer"
 ANSWERS = ("called", "not-now")
+# Roles the gate calls itself for their met signals; the orchestrator receives the result.
+GATE_CALLED = ("architect",)
+# A gate call whose session ended without finishing its dive is tried again after this long,
+# as a failed scheduled role session is (orch_role_schedule.RETRY_AFTER).
+RETRY_AFTER = timedelta(hours=1)
+ALARM_SIGNAL = {"paths": [], "kinds": list(orch_facts_kinds.ALARM_KINDS)}
 
 
 def cooldown(repo_root: Path) -> timedelta:
@@ -88,12 +101,7 @@ def _clears(store: StateStore) -> dict[str, list[datetime]]:
 
 def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any]) -> str:
     """The role, the signal and each matched part's numbers: matching files, or the kind's facts numbers."""
-    parts = []
-    if signal.get("paths") and (matched := orch_roles.matching_files(signal, files)):
-        parts.append(f"{len(matched)} changed file(s) in the last 24 h match {', '.join(signal['paths'])}")
-    parts += [f"fact {kind}: {json.dumps(numbers[kind], sort_keys=True)}" if numbers.get(kind) else f"fact {kind}"
-              for kind in signal.get("kinds") or [] if kind in kinds]
-    return (f"Role signal for {name}: {json.dumps(source(signal))} is met ({'; '.join(parts)}). "
+    return (f"Role signal for {name}: {json.dumps(source(signal))} is met ({_parts(signal, files, kinds, numbers)}). "
             f"Call the role (fa orch {name} or its call command) and answer `fa orch signal-answer <id> called "
             f"--why ...`, or answer `not-now --why <reason>`.")
 
@@ -122,63 +130,245 @@ def _same(left: Any, right: Any) -> bool:
     return json.dumps(left, sort_keys=True, default=str) == json.dumps(right, sort_keys=True, default=str)
 
 
-def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
-    """Project raw request facts into affected entities and relevant constraints.
+def burden_numbers(kind: str, numbers: Any) -> Any:
+    """One kind's numbers as a burden: shares added, elapsed and context numbers left out."""
+    if not isinstance(numbers, dict):
+        return numbers
+    numbers = dict(numbers)
+    for name, (part, whole) in orch_facts_kinds.SHARE_FACTS.get(kind, {}).items():
+        if isinstance(numbers.get(part), (int, float)) and numbers.get(whole):
+            numbers[name] = numbers[part] / numbers[whole]
+    for field in (*orch_facts_kinds.ELAPSED_FACTS.get(kind, ()), *orch_facts_kinds.CONTEXT_FACTS.get(kind, ())):
+        numbers.pop(field, None)
+    return numbers
 
-    This also reads pre-upgrade fingerprints, without changing persisted records.
-    Unprojected kinds (including lane_concentration) retain their raw numbers.
+
+def burden(facts: dict[str, Any]) -> dict[str, Any]:
+    """The burden view of request facts, for comparisons only (#1469).
+
+    It leaves out the numbers that grow with time alone (``ELAPSED_FACTS``) and those that only
+    give scale (``CONTEXT_FACTS``), adds the shares ``SHARE_FACTS`` derives, and keeps only the
+    binding constraint's kind and whether it is normal (its detail text churns).
     """
-    result: dict[tuple[str, ...], Any] = {}
-    if "files" in facts:
-        result[("files",)] = frozenset(facts["files"])
-    for kind, item in facts.get("kinds", {}).items():
-        numbers = item.get("numbers") or {}
-        result[(kind,)] = True
-        if kind in orch_facts_kinds.ENTITY_FACTS:
-            for field in orch_facts_kinds.ENTITY_FACTS[kind]:
-                result[(kind, field)] = frozenset(numbers.get(field) or ())
-            for field in orch_facts_kinds.VALUE_FACTS.get(kind, ()):
-                result[(kind, field)] = numbers.get(field)
-        else:
-            result[(kind, "numbers")] = numbers
-        for field in orch_facts_kinds.SHARED_FACTS.get(kind, ()):
-            result[(kind, field)] = item.get(field)
+    result = json.loads(json.dumps(facts or {}, sort_keys=True, default=str))
+    for kind, item in (result.get("kinds") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        item["numbers"] = burden_numbers(kind, item.get("numbers"))
+        if isinstance(item.get("binding"), dict):
+            item["binding"] = {"kind": item["binding"].get("kind"), "normal": bool(item["binding"].get("normal"))}
     return result
 
 
-def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
-    """Shrinking sets stay quiet; compare every tick against the last raise."""
-    before = evidence(previous)
-    for key, value in evidence(current).items():
-        if key not in before:
+def baseline(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The one baseline of a signal: the facts recorded when its last request was answered.
+
+    That is ``answer_facts`` (measured by `fa orch signal-answer` or a finished gate dive), else
+    the facts the request was raised with; None for a legacy request without facts.
+    """
+    if record is None:
+        return None
+    facts = record.get("answer_facts") or record.get("facts")
+    return facts if isinstance(facts, dict) else None
+
+
+def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False) -> bool:
+    """``shares`` names the derived share fields of this level only: a kind's top-level numbers.
+    Nested keys are members (lanes, files, issues), whatever they are called, so their counts
+    must double."""
+    if after is None:
+        return False
+    if before is None:
+        return True  # Present now, absent at the baseline.
+    if isinstance(after, dict) and isinstance(before, dict):
+        return any(key not in before
+                   or _worse_value(before[key], value, share=key in shares)
+                   for key, value in after.items())
+    if isinstance(after, list) and isinstance(before, list):
+        seen = {json.dumps(item, sort_keys=True, default=str) for item in before}
+        return any(json.dumps(item, sort_keys=True, default=str) not in seen for item in after)
+    numeric = (int, float)
+    if (isinstance(after, numeric) and isinstance(before, numeric)
+            and not isinstance(after, bool) and not isinstance(before, bool)):
+        if share:
+            return after > before
+        return after > 0 and (before <= 0 or after >= DOUBLED * before)
+    return not _same(before, after)
+
+
+DOUBLED = 2  # A count of an existing member is worse once it at least doubles.
+
+
+def _worse_binding(before: Any, after: Any) -> bool:
+    """Another constraint binds (a new member, as the locked not-now test requires), or the
+    same one stopped being normal; a return to normal is better."""
+    if not isinstance(after, dict):
+        return False
+    if not isinstance(before, dict):
+        return not after.get("normal")
+    return after.get("kind") != before.get("kind") or (before.get("normal") and not after.get("normal"))
+
+
+def worse(before: dict[str, Any] | None, after: dict[str, Any]) -> bool:
+    """Whether ``after`` holds a burden its baseline ``before`` did not (#1469).
+
+    Worse is a new member (a matched file, a met kind, a key such as an issue or file, a list
+    member such as an idle lane, or a different named lane or binding constraint), a share that
+    rises, or a count of an existing member that at least doubles. Smaller rises, the same or
+    better numbers, order, elapsed time and context numbers are not worse.
+    """
+    if before is None:
+        return True
+    before, after = burden(before), burden(after)
+    if set(after.get("files") or ()) - set(before.get("files") or ()):
+        return True
+    for kind, item in (after.get("kinds") or {}).items():
+        prior = (before.get("kinds") or {}).get(kind)
+        if not isinstance(prior, dict):
+            return True  # A kind present now that the baseline did not hold.
+        if _worse_value(prior.get("numbers"), item.get("numbers"),
+                        shares=frozenset(orch_facts_kinds.SHARE_FACTS.get(kind, {}))):
             return True
-        if isinstance(value, frozenset):
-            if value - before[key]:
-                return True
-        elif not _same(before[key], value):
+        if _worse_binding(prior.get("binding"), item.get("binding")):
             return True
     return False
 
 
-def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[str, Any]]:
+def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
+    """A role's configured signals, plus the gate alarms for a configured gate-called role."""
+    signals = list(entry["signals"])
+    if name in GATE_CALLED and name in config.roles and ALARM_SIGNAL not in signals:
+        signals.append(ALARM_SIGNAL)
+    return signals
+
+
+def _parts(signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any]) -> str:
+    parts = []
+    if signal.get("paths") and (matched := orch_roles.matching_files(signal, files)):
+        parts.append(f"{len(matched)} changed file(s) in the last 24 h match {', '.join(signal['paths'])}")
+    parts += [f"fact {kind}: {json.dumps(numbers[kind], sort_keys=True)}" if numbers.get(kind) else f"fact {kind}"
+              for kind in signal.get("kinds") or [] if kind in kinds]
+    return "; ".join(parts)
+
+
+def _gate_call(store: StateStore, repo_root: Path, config, now: datetime, name: str,
+               request: dict[str, Any], facts: dict[str, Any], parts: str) -> dict[str, Any]:
+    """Start the role's session for the gate's open ``request``; return the request.
+
+    The request stays open until that session finishes its dive (``complete_call``), so a
+    refused or failed launch, a failed or timed-out session, or one that never reports leaves
+    the alarm pending for a later start tick. ``call_facts`` are what this call is about.
+    """
+    from foragent import orch_architect
+
+    request = orch_inbox.annotate_request(store, request["id"], {"call_facts": facts})
+    why = (f"Gate alarm {request['id']}: {json.dumps(source(request['signal']))} is met ({parts}). "
+           "Pick the worst real case behind it, follow it in time order and dig to a cause you can "
+           "show with records, code and a reproduction; then propose which number should move.")
+    try:
+        orch_architect.call(Path(repo_root), store, config, why, now, role=name, alarm=request["id"])
+    except Exception as exc:  # noqa: BLE001 - a refused or failed launch keeps the alarm pending.
+        print(text("tick_step_failed", config.language, step=f"role_alarm {name}",
+                   error=f"{type(exc).__name__}: {exc}"), file=sys.stderr, flush=True)
+        return request
+    return orch_inbox.annotate_request(store, request["id"], {"launched_at": now.isoformat()})
+
+
+def answered_facts(record: dict[str, Any], measured: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The facts an answer covers: those measured at the answer, and for any part of the signal
+    not present then (unmet for a moment, or unreadable), what the request was about.
+
+    Both answer paths store this (`fa orch signal-answer` and a finished gate dive), so a
+    burden that briefly vanished at the answer and returns unchanged is not worse than it.
+    """
+    about = record.get("call_facts") or record.get("facts")
+    if measured is None:
+        return about
+    if not isinstance(about, dict):
+        return measured
+    result = json.loads(json.dumps(measured, default=str))
+    if "files" in about and not result.get("files"):
+        result["files"] = about["files"]
+    kinds = result.setdefault("kinds", {}) if "kinds" in about or "kinds" in result else None
+    for kind, item in (about.get("kinds") or {}).items():
+        kinds.setdefault(kind, item)
+    return result
+
+
+def complete_call(store: StateStore, request_id: str, repo_root: Path | None = None) -> None:
+    """Mark a gate alarm called once its session finished.
+
+    Like `fa orch signal-answer`, the answer keeps the signal's facts measured now, at the
+    answer (``measure``), so a later call compares with what the finished dive left; the
+    launch's ``call_facts`` stand in only when they cannot be read.
+    """
+    measured = measure(store, repo_root, request_id) if repo_root is not None else None
+
+    def called(record: dict[str, Any]) -> None:
+        if record.get("status") == "done":
+            raise orch_inbox.InboxError(f"request {request_id} is already done")
+        record.update(answer="called",
+                      answer_facts=answered_facts(record, measured))
+
+    try:
+        record = orch_inbox.set_request_status(store, request_id, "done",
+                                               "role signal called: the gate's session finished", check=called)
+    except orch_inbox.InboxError:
+        return  # Answered meanwhile, or no longer known: that answer stands.
+    orch_events.append_event(store, store._now(), None, ANSWER, f"{request_id} {record['role']} called: gate alarm",
+                             request_id=request_id, role=record["role"], answer="called", why="gate alarm",
+                             signal=record["signal"])
+
+
+def _gate_due(store: StateStore, now: datetime, name: str, key: str, previous: dict[str, Any] | None,
+              answer: dict[str, Any] | None, facts: dict[str, Any]) -> dict[str, Any] | None:
+    """The open request a gate call answers, ``{}`` for a new one, or None when no call is due."""
+    from foragent import orch_architect
+
+    if answer is not None and not worse(baseline(answer), facts):
+        return None  # The same or better than at the last answer.
+    if orch_architect.session_alive(orch_architect.read_record(store, name)):
+        return None  # The running session already digs; never start a second one.
+    pending = previous if previous is not None and previous.get("status") != "done" else None
+    if pending is None:
+        return {}
+    launched = _time(pending.get("launched_at"))
+    return pending if launched is None or now - launched >= RETRY_AFTER else None
+
+
+def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = False) -> list[dict[str, Any]]:
     """Raise every met role signal that is due; return the inbox requests added.
 
     A signal (role plus its {paths, kinds} item) is never raised while an earlier request
-    for it is not done. Once that request is done, it is raised again when a tick saw it unmet
-    since that raise, or its facts contain new evidence beyond the last raise, regardless
-    of its answer. Time alone is not evidence. Only legacy requests without stored facts
-    use the cooldown.
+    for it is not done. Once it is done, every path compares the current facts with one
+    baseline, the facts recorded when that request was answered (``baseline``), and raises or
+    calls again only when they are ``worse``. A no-start tick also records a request for a
+    signal that cleared and came back, as the locked raise test requires; that request alone
+    never starts a call. Only legacy requests without stored facts use the cooldown.
+
+    With ``start`` the gate calls a ``GATE_CALLED`` role itself instead: when the signal was
+    never answered, or its burden is worse than at its last answer. A clear and return, a
+    restart or elapsed time alone never call. An open request of the signal, raised by a
+    no-start tick or kept by a launch that did not finish, is the one the call answers; it is
+    retried after ``RETRY_AFTER`` once a launched session is gone. A live session of the role
+    is never duplicated.
     """
     if not (Path(repo_root) / ".foragent.yml").is_file():
         return []  # Not a Foragent repository: no roles source, nothing to measure.
+    from foragent import orch_architect
+
     config = load_config(Path(repo_root))
-    roles = load_roles(config)
+    roles = {name: {**entry, "signals": _signals(name, entry, config)} for name, entry in load_roles(config).items()}
     files, kinds, numbers, binding = orch_roles.observe(store, config, Path(repo_root), roles)
     last: dict[str, dict[str, Any]] = {}
+    answered: dict[str, dict[str, Any]] = {}
     for row in signal_requests(store):
         last[_key(row["role"], row["signal"])] = row
+        if row.get("status") == "done":
+            answered[_key(row["role"], row["signal"])] = row
     clears, added = _clears(store), []
     for name, entry in roles.items():
+        gate = start and name in GATE_CALLED and name in config.roles
         for signal in entry["signals"]:
             key, previous = _key(name, signal), last.get(_key(name, signal))
             raised_at = _time(previous.get("created_at")) if previous else None
@@ -192,11 +382,24 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
                     # A repeated identical signal sees the cleared request and clears once.
                 continue
             facts = fingerprint(signal, files, kinds, numbers, binding)
+            if gate:
+                request = _gate_due(store, now, name, key, previous, answered.get(key), facts)
+                if request is None:
+                    continue
+                if not request:
+                    request = orch_inbox.add_request(store, "gate", _text(name, signal, files, kinds, numbers),
+                                                     {"role": name, "signal": source(signal), "facts": facts})
+                    added.append(request)
+                last[key] = _gate_call(store, repo_root, config, now, name, request, facts,
+                                       _parts(signal, files, kinds, numbers))
+                continue
             if previous is not None:
                 if previous.get("status") != "done":
                     continue
-                if "facts" in previous:
-                    due = cleared or new_evidence(previous["facts"], facts)
+                if baseline(previous) is not None:
+                    # A clear and return is a new episode the locked raise test records as a
+                    # request; it never calls by itself (the gate path above has no such rule).
+                    due = cleared or worse(baseline(previous), facts)
                 else:
                     due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:
@@ -207,19 +410,27 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
     return added
 
 
-def tick(store: StateStore, repo_root: Path, now: datetime, language: str) -> list[dict[str, Any]]:
-    """The gate tick's role-signal step; a failure is logged and never fails the tick."""
+def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
+         start: bool = False) -> list[dict[str, Any]]:
+    """The gate tick's role-signal step; a failure is logged and never fails the tick.
+
+    ``start`` is whether this tick may start work; only then does the gate call a role itself.
+    """
     with step("role_signals"):
         try:
-            return raise_due(store, repo_root, now)
+            return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
         except Exception as exc:  # noqa: BLE001 - one failed check must not stop the tick.
             print(text("tick_step_failed", language, step="role_signals", error=f"{type(exc).__name__}: {exc}"),
                   file=sys.stderr, flush=True)
             return []
 
 
-def answer(store: StateStore, request_id: str, how: str, why: str) -> dict[str, Any]:
+def answer(store: StateStore, request_id: str, how: str, why: str,
+           facts: dict[str, Any] | None = None) -> dict[str, Any]:
     """Record the orchestrator's answer to one role-signal request and mark it done.
+
+    ``facts`` are the signal's facts measured at the answer (``measure``); a later gate call
+    compares against them, not against the facts the raise saw (#1469).
 
     The not-done check and the done mark are one step under the inbox state lock, so of two
     concurrent answers only one succeeds; the other fails and appends no answer event.
@@ -236,6 +447,8 @@ def answer(store: StateStore, request_id: str, how: str, why: str) -> dict[str, 
         if record.get("status") == "done":
             raise orch_inbox.InboxError(f"request {request_id} is already done")
         record["answer"] = how  # Set with the done mark, so a tick never sees done without it.
+        if facts is not None:
+            record["answer_facts"] = answered_facts(record, facts)
 
     record = orch_inbox.set_request_status(store, request_id, "done",
                                            f"role signal {how}: {why}" if why else f"role signal {how}",
@@ -253,9 +466,24 @@ def add_parser(orch_actions) -> None:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
 
 
+def measure(store: StateStore, repo_root: Path, request_id: str) -> dict[str, Any] | None:
+    """The facts of one raised request's signal now; None when they cannot be read."""
+    record = next((row for row in signal_requests(store) if row["id"] == request_id), None)
+    if record is None or not (Path(repo_root) / ".foragent.yml").is_file():
+        return None
+    try:
+        config = load_config(Path(repo_root))
+        signal = record["signal"]
+        files, kinds, numbers, binding = orch_roles.observe(store, config, Path(repo_root),
+                                                            {record["role"]: {"signals": [signal]}})
+    except Exception:  # noqa: BLE001 - the answer itself must still be recorded.
+        return None
+    return fingerprint(signal, files, kinds, numbers, binding)
+
+
 def command(args, store: StateStore) -> None:
     try:
-        event = answer(store, args.id, args.answer, args.why)
+        event = answer(store, args.id, args.answer, args.why, measure(store, args.repo_root.resolve(), args.id))
     except orch_inbox.InboxError as exc:
         raise SystemExit(f"fa orch signal-answer: {exc}") from None
     print(f"Role {event['role']}: signal {args.id} answered {args.answer}.")
