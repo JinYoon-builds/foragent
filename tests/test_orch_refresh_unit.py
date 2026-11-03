@@ -3,7 +3,6 @@
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 
@@ -177,17 +176,16 @@ def test_every_launch_gets_its_own_new_session_id_and_records_it(setup, monkeypa
         monkeypatch.setattr(shutil, "which", lambda name: f"/offline/bin/{name}" if name in ("claude", "orca") else None)
     orch_sessions.activate(store, OLD, NOW - timedelta(hours=2))  # a dead session's record
     before = (store.root / "orch-heartbeat.json").read_bytes()
-    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == screen
+    # #1490: an available Orca or tmux host never makes the orchestrator visible.
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == "background"
     (argv, env), = calls
+    assert Path(argv[0]).name == "claude" and argv[1] == "--bg", argv
     record = _heartbeat(store)
     new_id = record["session_id"]
     assert new_id not in ("launcher-id", "old-id") and record["status"] == "active", "written at once"
     assert record["previous"]["session_id"] == "old-id" and record["previous"]["status"] == "retired"
     assert env["FORAGENT_SESSION_ID"] == new_id and env["FORAGENT_ROLE"] == "orchestrator"
-    command = argv if screen == "background" else shlex.split(argv[-1])
-    assert command[command.index("--session-id") + 1] == new_id
-    if screen != "background":  # the terminal app does not inherit the launcher's environment
-        assert command[:3] == ["env", "FORAGENT_ROLE=orchestrator", f"FORAGENT_SESSION_ID={new_id}"]
+    assert argv[argv.index("--session-id") + 1] == new_id
     assert orch_refresh.due(store, Config(repo="o/r"), NOW)["session_id"] == new_id
     later = NOW + timedelta(seconds=5)
     after_launch = (store.root / "orch-heartbeat.json").read_bytes()
@@ -247,7 +245,7 @@ def test_spawned_session_is_recorded_inside_the_openers_lock(setup, monkeypatch,
     record = orch_sessions.activate
     monkeypatch.setattr(orch_sessions, "activate",
                         lambda *args, **kwargs: seen.append(_lock_held(store)) or record(*args, **kwargs))
-    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == "tmux"
+    assert orch_spawn.ensure_orchestrator(repo, store, Config(repo="o/r"), now=NOW, spacing=not explicit) == "background"
     assert seen and all(seen), seen
 
 

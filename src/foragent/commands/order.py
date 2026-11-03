@@ -123,7 +123,9 @@ def add(commands) -> None:
     pending = order_actions.add_parser("pending", help=say("order_notes_pending_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
-    for command in (note, pending, flush):
+    red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
+    red.add_argument("plan", type=cli.Path)
+    for command in (note, pending, flush, red):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -244,6 +246,9 @@ def run(args) -> int:
     if args.action == "flush":
         from foragent import order_flush
         return order_flush.run(args, root)
+    if args.action == "red":
+        from foragent import order_red
+        return order_red.run(args, root)
     if args.action in {"note", "pending"}:
         from foragent import order_notes
         return order_notes.run(args, root)

@@ -40,7 +40,8 @@ class IssueRefreshMixin:
                     continue
                 key, old = str(issue.number), previous.get(str(issue.number)) or {}
                 outcome = self._observe(snapshot, issue.number, issue_facts(issue), at, lanes,
-                                        since_revision=since_revision)
+                                        since_revision=since_revision,
+                                        created_at=getattr(issue, "created_at", None))
                 if outcome == "stale":
                     continue
                 if outcome == "dropped":
