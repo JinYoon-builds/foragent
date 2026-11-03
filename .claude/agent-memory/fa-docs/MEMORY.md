@@ -19,6 +19,7 @@
 - r365 (2026-11-03): orders #1709..#1720 check — Korean README lacks the self-build count line (#1477, 397 PRs/15 days). Wait: orchestrator judges, then docs edits.
 - r368-r369 (2026-11-03): #1512/#1697/#1718 (=#1469, merge c69e7f98): r368 fa-architect SKILL lacks gate-alarm start + dig method; r369 ask Dnn for alarm/worse-only/no-slot-wait rules. Wait: orchestrator.
 - r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
+- r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -56,3 +57,4 @@
 - Goal behaviour meant for a role session (e.g. #1469 'dig one case') may land only as plumbing; grep the role's skill and prompt for the Goal's method words before calling it done.
 - Permission/guard changes (e.g. #1736 person-only refusal) belong next to README's `Bash(fa:*)` paragraph, which exists in both English and 한국어; skills that tell the PM/orchestrator to run those commands stay true.
 - Orchestrator launch surface (#1490: always hidden `claude --bg`, no Orca tab/tmux window) appears in no reader doc; README's Orca/tmux lines (81/159) are about the lane view (watch_open), not the orchestrator.
+- New read-only `fa order` checks (collect #1523, red #1725) land with no reader-doc line; docs/order.md near the preread paragraph is the one place for them. Bundle such proposals.
