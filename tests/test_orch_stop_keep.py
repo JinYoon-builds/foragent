@@ -3,6 +3,7 @@
 Git runs through the offline acceptance adapter (commits by fast-import); no real signal.
 """
 
+import json
 from pathlib import Path
 import sys
 
@@ -12,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from conftest import git_command  # noqa: E402
 from foragent import orch  # noqa: E402
-from foragent.git import GitError  # noqa: E402
 from test_orch_review_handoff import bind_cli, make_case  # noqa: E402
 from test_one_entrance_seat import invoke  # noqa: E402
 
@@ -78,12 +78,45 @@ def test_a_dream_worktree_is_saved_on_its_dream_branch(case):
     assert git_command(case.root, "show", "foragent/dream-orch:unsaved.txt") == "unfinished"
 
 
-def test_unsaved_work_with_no_branch_is_refused_and_kept(case):
+def _kept(case):
+    journal = case.store.root / "orch-events.jsonl"
+    lines = journal.read_text().splitlines() if journal.exists() else []
+    return [json.loads(line) for line in lines if '"worktree-kept"' in line]
+
+
+def test_unsaved_work_with_no_branch_is_kept_on_disk(case):
     path = _worktree(case, "scratch")
     orch.stop_all(case.ctx, WHY)
-    with pytest.raises(GitError, match="kept during the project stop"):
-        case.git.remove_worktree(path)
+    case.git.remove_worktree(path)
     assert (path / "unsaved.txt").read_text() == "unfinished\n"
+    assert [event["unsaved"] for event in _kept(case)] == [["unsaved.txt"]]
+
+
+def test_an_ignored_file_is_never_removed_unsaved(case):
+    path = _worktree(case, "dream-orch", "foragent/dream-orch")
+    (path / "unsaved.txt").unlink()
+    memory = path / ".claude" / "agent-memory" / "orch" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("a lesson the dream wrote\n")
+    (path / ".gitignore").write_text(".claude/agent-memory/\n")
+    orch.stop_all(case.ctx, WHY)
+    case.git.remove_worktree(path)
+    assert memory.read_text() == "a lesson the dream wrote\n", "Ignored output stays until the release"
+    assert any(".claude/agent-memory/" in item for event in _kept(case) for item in event["unsaved"])
+
+
+def test_an_excluded_file_is_never_removed_unsaved(case):
+    path = _worktree(case, "issue-1", "foragent/issue-1")
+    note = path / ".foragent" / "media-orch.md"
+    note.parent.mkdir()
+    note.write_text("a proposal staging leaves out\n")
+    orch.stop_all(case.ctx, WHY)
+    case.git.remove_worktree(path)
+    assert git_command(case.root, "show", "foragent/issue-1:unsaved.txt") == "unfinished", "What can be saved is"
+    assert note.read_text() == "a proposal staging leaves out\n", "What cannot be committed stays on disk"
+    orch.release(case.ctx)
+    case.git.remove_worktree(path)  # After the release the ordinary cleanup removes it.
+    assert not path.exists()
 
 
 def test_release_lifts_the_guard(case):

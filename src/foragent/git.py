@@ -114,34 +114,53 @@ class GitRepo:
                 store = StateStore(path.parent.parent)
                 stack.enter_context(store.worktree_lock(int(path.name[6:])))
             if path.exists():
-                if path.parent.name == "worktrees":
-                    self._keep_unsaved(path, StateStore(path.parent.parent))
+                if path.parent.name == "worktrees" and not self._discardable(path, StateStore(path.parent.parent)):
+                    return  # Kept during the project stop: removing it would lose unsaved files.
                 self._call(["worktree", "remove", "--force", str(path)])
             self._call(["worktree", "prune"])
 
-    def _keep_unsaved(self, path: Path, store: StateStore) -> None:
-        """The one discard point: under a project stop a dirty worktree is saved on its branch first.
+    def _discardable(self, path: Path, store: StateStore) -> bool:
+        """The one discard point: under a project stop, nothing unsaved is removed (#1491).
 
         Every exit of a stopped run (dreams, review reruns, verification, publication) ends in
-        this removal, so none can lose uncommitted work (#1491). A detached issue worktree
-        (a review rerun) takes its issue branch; one that cannot be saved raises, and stays.
+        this removal. A dirty worktree is first committed as WIP on its branch (a detached issue
+        worktree takes its issue branch). Removal goes ahead only when nothing is left that it
+        would delete, ignored and excluded files included (a dream's ignored memory, `.foragent/`
+        notes, injected skills, caches); otherwise the worktree stays on disk until the release.
         """
         from foragent import orch_stop
 
         if (why := orch_stop.active(store)) is None or not (path / ".git").is_file():
-            return
+            return True
         tree = self.at(path)
-        if not tree._call(["status", "--porcelain"]).strip():
-            return
+        if not tree._unsaved():
+            return True
         if tree.merge_in_progress():
             tree.quit_merge()  # Keep the partial resolution as files; the WIP is not a merge.
-        if tree._call(["rev-parse", "--abbrev-ref", "HEAD"]).strip() == "HEAD":
-            if not (path.name.startswith("issue-") and path.name[6:].isdigit()):
-                raise GitError(f"{path} has unsaved work and no branch; it is kept during the project stop")
+        detached = tree._call(["rev-parse", "--abbrev-ref", "HEAD"]).strip() == "HEAD"
+        if detached and path.name.startswith("issue-") and path.name[6:].isdigit():
             tree.attach_branch(f"foragent/issue-{path.name[6:]}")
-        tree.stage_changes()
-        if tree.has_staged_changes():
-            tree.commit(f"WIP: unfinished work kept by the project stop [stopped: {why}]")
+            detached = False
+        if not detached:
+            tree.stage_changes()
+            if tree.has_staged_changes():
+                tree.commit(f"WIP: unfinished work kept by the project stop [stopped: {why}]")
+        if not (left := tree._unsaved()):
+            return True
+        from datetime import UTC, datetime
+
+        from foragent.orch_events import append_event
+
+        number = int(path.name[6:]) if path.name.startswith("issue-") and path.name[6:].isdigit() else None
+        append_event(store, datetime.now(UTC), number, "worktree-kept",
+                     f"{path} kept during the project stop: {len(left)} unsaved path(s)",
+                     path=str(path), unsaved=left[:20])
+        return False
+
+    def _unsaved(self) -> list[str]:
+        """Every path a forced worktree removal would lose: changes, untracked and ignored files."""
+        output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
+        return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
