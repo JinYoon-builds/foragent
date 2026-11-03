@@ -11,10 +11,12 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from foragent import orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
 from foragent.state import Run, StateStore
+from foragent.state_observations import observed_facts
 
 HOLD_WINDOW = timedelta(days=7)
 HOLDS = 2
@@ -30,13 +32,15 @@ CONCENTRATION_IDLE = 2
 STALL_MERGES = 4
 STALL_FACTOR = 3
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration", "merge_stall")
+         "lane_concentration", "merge_stall", "waiting_on_person")
+WAITING_LABEL = "needs-human"
 # Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
 # signals. Repeated holds and idle lanes with ready work reach it through its default signals.
 ALARM_KINDS = ("merge_stall",)
 # Numbers that grow with time alone. A comparison of burdens leaves them out, so elapsed time never
 # makes a signal worse (#1469); the facts still show them.
-ELAPSED_FACTS = {"merge_stall": ("minutes_since_merge", "merge_interval_minutes")}
+ELAPSED_FACTS = {"merge_stall": ("minutes_since_merge", "merge_interval_minutes"),
+                 "waiting_on_person": ("oldest_waiting_seconds",)}
 # Numbers that give a burden its scale but are no burden themselves (#1469): a burden comparison
 # leaves them out. A larger total makes lane concentration smaller, not worse, so its burden is
 # the share ``SHARE_FACTS`` derives; a file limit is the rule, not a load.
@@ -47,6 +51,13 @@ CONTEXT_FACTS = {
 # A burden field derived as part / whole from a kind's numbers: name -> (part, whole). A share is
 # worse when it rises; every other count only when it at least doubles.
 SHARE_FACTS = {"lane_concentration": {"share": ("lane_runs", "runs")}}
+# Counts that are worse on any rise above the baseline, not only on doubling (#1733): one more
+# person-wait is a new burden. A different ``oldest_issue`` is worse as any changed value is.
+RISING_FACTS = {"waiting_on_person": ("waiting",)}
+# Kinds re-raised by a worse burden alone, measured against the facts of the last raise, never
+# those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
+# that ends and the same oldest item returning at the same count stay quiet.
+EVIDENCE_ONLY = frozenset({"waiting_on_person"})
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
@@ -175,6 +186,40 @@ def merge_stall_numbers(store: StateStore, now: datetime, running: list[Run]) ->
             "merge_interval_minutes": round(interval.total_seconds() / 60)}
 
 
+def _waits(labels: Any, state: Any) -> bool:
+    return state == "open" and WAITING_LABEL in (labels or ())
+
+
+def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
+    """Open issues labelled needs-human, from observed issue state only (#1733).
+
+    The current observation (each stored issue row) says who waits. The retained issue-state
+    history says since when: the first record of the latest unbroken run of records showing
+    the issue open with the label. When trimming cut that run, its earliest kept record counts,
+    and an issue with no such record yet counts from its row's observation; both are lower bounds.
+    """
+    history = orch_scorecard_history.records(store)
+    starts: dict[int, datetime] = {}
+    for key, row in store._issue_view()["issues"].items():
+        if not key.isdigit() or row.get("is_pull_request") or row.get("observed_at") is None:
+            continue
+        facts = observed_facts(row)
+        if not _waits(facts["labels"], facts["state"]):
+            continue
+        start = None
+        for at, data in reversed(history.get(int(key), [])):
+            if not _waits(data.get("labels"), data.get("state")):
+                break
+            start = at
+        if (start := start or _time(row["observed_at"])) is not None:
+            starts[int(key)] = start
+    if not starts:
+        return {}
+    number, start = min(starts.items(), key=lambda item: (item[1], item[0]))
+    return {"waiting": len(starts), "oldest_issue": f"#{number}",
+            "oldest_waiting_seconds": max(0, int((now - start).total_seconds()))}
+
+
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
     """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
     numbers = {
@@ -184,6 +229,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "idle_lanes_with_backlog": idle_lanes_with_backlog_numbers(config, running, waiting),
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
+        "waiting_on_person": waiting_on_person_numbers(store, now),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}
