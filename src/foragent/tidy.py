@@ -20,7 +20,8 @@ _START = "start"  # Period key before the first recorded tidy.
 
 
 def _merged_runs(store: StateStore) -> int:
-    return sum(run.outcome == "merged" for run in store.read_history())
+    owner_facts = store.owner_merge_facts()
+    return sum(store.run_merged(run, owner_facts=owner_facts) for run in store.read_history())
 
 
 def _quota_left(store: StateStore, now: datetime) -> list[str]:

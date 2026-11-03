@@ -563,13 +563,18 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if approval is None:
         invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")
         return "no-approval"
-    pr = next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
-               if pr.head == f"foragent/issue-{n}"), None)
+    authorization = ctx.merge_authorization if getattr(ctx.config, "merge_owner", False) else None
+    pr = (ctx.tracker.get_pr(authorization["pr"]) if authorization else
+          next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
+                if pr.head == f"foragent/issue-{n}"), None))
     if pr is None:
         flag(ctx, n, Reason.RISK_HIGH, "No open Foragent PR to review; retry implementation.")
         return "no-pr"
     head = ctx.tracker.pr_head_sha(pr.number)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+    if authorization and (pr.state != "open" or pr.merged_at or pr.head != f"foragent/issue-{n}"
+                          or pr.base != authorization["target"] or head != authorization["head"]):
+        return _hold_changed_head(n, ctx, link)
     parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     if pr.base not in {ctx.config.base_branch, batch_branch}:

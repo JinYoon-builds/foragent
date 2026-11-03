@@ -57,6 +57,7 @@ def _runs(store: StateStore, now: datetime, days: int,
     Minutes to merge run from the latest approval at or before the actual merge (the recorded
     merge time, else the merged run's finish) to that merge; with no known approval they are unknown."""
     finished_at, merged_at = store.finish_times(), store.merge_times()
+    owner_merges = store.owner_merge_facts()
     rows = []
     for run in store.read_history():
         key = (run.number, run.started_at)
@@ -67,7 +68,7 @@ def _runs(store: StateStore, now: datetime, days: int,
             continue
         merge = _time(merged_at.get(key))
         # A merge time older than this execution's start belongs to an earlier execution.
-        merged = run.outcome == "merged" or (
+        merged = store.run_merged(run, owner_facts=owner_merges) or (
             run.outcome == "pr-open" and merge is not None and started is not None and merge >= started)
         moment = merge if merge is not None and started is not None and merge >= started else finished
         approved = approval_before(store, issues, run.number, moment) if merged and moment else None
