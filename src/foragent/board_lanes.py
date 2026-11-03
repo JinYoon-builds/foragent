@@ -1,6 +1,11 @@
 """Keep lane labels, board Lane options and card Lane values in step with configured lane paths.
 
-The gate tick is the only writer (#1230). A configuration change is converged only after a
+The gate tick is the only writer (#1230). Provisioning is its own step and runs first: after
+a tick that read the configuration, every configured lane has its GitHub label and board
+Lane option, whether or not any issue moves, also with missing or unreadable state. A label
+deleted outside Foragent is created again on the next listing that does not show it.
+
+A configuration change is converged only after a
 pass over a complete issue listing taken after the change was first applied, and card
 Lane values are compared with the board itself, never inferred from labels. The state
 file, written only here, keeps the configuration, the listing the change was first seen
@@ -19,6 +24,7 @@ import logging
 
 from foragent import board, overlap_files
 from foragent.issue import parse_body
+from foragent.state_observations import stamp
 from foragent.tracker import Issue, LabelSpec, TrackerError, local_issue_models
 
 log = logging.getLogger(__name__)
@@ -56,30 +62,52 @@ def owner(ctx, issue: Issue, lanes: dict[str, list[str]]) -> str | None:
     return next(iter(owners)) if len(owners) == 1 else None
 
 
-class _Labels:
-    """The configured lane labels, checked against GitHub's own label list at most once per pass.
+def _carried(ctx, listing: str | None) -> set[str]:
+    """Lane labels GitHub showed on issues in the latest complete listing or a later read.
 
-    Issue rows are never evidence that a label exists: a label deleted on GitHub after any read
-    would still show there. Only the label list is, so it is read before work depends on it.
+    Older rows and our own unsent writes are left out: only a read from GitHub shows a label.
     """
+    at = stamp(listing)
+    if at is None:
+        return set()
+    unsent = {(entry.get("issue"), label) for entry in ctx.store.github_outbox()
+              for label in entry.get("labels") or ()}
+    return {label for row in ctx.store.local_issues()
+            if (seen := stamp(row.get("observed_at"))) is not None and seen >= at
+            for label in row.get("labels", ())
+            if label.startswith(PREFIX) and (row["number"], label) not in unsent}
 
-    def __init__(self, ctx, lanes: dict[str, list[str]]):
-        self.ctx, self.lanes, self.checked = ctx, lanes, None
 
-    def ensure(self) -> bool:
-        """Create only the missing lane labels; an existing label keeps its colour and description."""
-        if self.checked is None:
-            try:
-                existing = self.ctx.tracker.label_names()
-                missing = [LabelSpec(f"{PREFIX}{name}", "ededed", f"Foragent lane {name}.")
-                           for name in self.lanes if f"{PREFIX}{name}" not in existing]
-                if missing:
-                    self.ctx.tracker.ensure_labels(missing)
-                self.checked = True
-            except FAILURES as exc:
-                _deferred(exc, "lane labels")
-                self.checked = False
-        return self.checked
+def provision(ctx, lanes: dict[str, list[str]], prior: dict | None, listing: str | None) -> dict | None:
+    """Make every configured lane's GitHub label and board Lane option exist; None defers to the next tick.
+
+    This step stands alone: it does not depend on any issue moving. It is done again whenever
+    the configured lanes (names or paths) or the board differ from the last completed record,
+    including when that record is missing, and whenever a newer listing arrives. A lane label
+    that an issue of the latest listing shows is taken as present; every other configured lane
+    is checked against the label list, so a label deleted outside Foragent, used or not, is
+    created again by the next listing. Board Lane options are added on every configuration change.
+    """
+    names = list(lanes)
+    same_config = prior is not None and prior.get("lanes") == lanes and prior.get("board") == ctx.config.board
+    if same_config and prior.get("listing") == listing:
+        return prior  # Completed for this configuration and this listing: nothing new to look at.
+    wanted = [f"{PREFIX}{name}" for name in names]
+    carried = _carried(ctx, listing) & set(wanted)
+    try:
+        if not set(wanted) <= carried:
+            existing = ctx.tracker.label_names()
+            missing = [LabelSpec(label, "ededed", f"Foragent lane {label[len(PREFIX):]}.")
+                       for label in wanted if label not in existing]
+            if missing:  # An existing label keeps its colour and description.
+                ctx.tracker.ensure_labels(missing)
+        if not same_config and ctx.config.board:
+            # Missing Lane options go after the existing ones, keeping their IDs.
+            board.Project(ctx.tracker, ctx.repo, ctx.config.board).ensure_fields({"Lane": ["main", *names]})
+    except FAILURES as exc:
+        _deferred(exc, "lane labels and board Lane options")
+        return None
+    return {"lanes": lanes, "board": ctx.config.board, "listing": listing}
 
 
 FAILURES = (TrackerError, OSError)  # GitHub or transport failures defer; programming errors surface.
@@ -178,16 +206,20 @@ def reconcile(ctx, report=None) -> None:
     lanes = _configured(ctx.config)
     saved = _load(ctx.store)  # {} when nothing was recorded: every issue is checked, as after a change.
     listing = _listing(ctx)
+    prior = saved.get("labels")
+    if not isinstance(prior, dict):
+        prior = None  # A missing or malformed record provisions in full.
+    labels = provision(ctx, lanes, prior, listing)
+    if labels is None:
+        return  # Nothing is recorded, so the next tick provisions again before anything moves.
     changed = saved.get("lanes") != lanes or saved.get("board") != ctx.config.board
     pending = set(saved.get("pending", []))
     confirming = not changed and not saved.get("confirmed") and listing != saved.get("listing")
     running = {run.number for run in ctx.store.active_runs()}
     if not (changed or confirming or pending - running):
-        return  # Converged, or only running issues wait: no GitHub call.
-    labels = _Labels(ctx, lanes)
-    # A recorded change of the configured lanes always checks GitHub's labels on its own tick.
-    if saved.get("lanes") is not None and saved["lanes"] != lanes and not labels.ensure():
-        return  # Nothing is recorded, so the next tick tries again.
+        if labels != saved.get("labels"):
+            ctx.store._write_json(_path(ctx.store), {**saved, "labels": labels})
+        return  # Converged, or only running issues wait: no further GitHub call.
     cards = _Board(ctx, lanes)  # Every pass adds a missing Lane option before it relies on one.
     full = changed or confirming
     waiting, seen = set(), set()
@@ -207,9 +239,6 @@ def reconcile(ctx, report=None) -> None:
             waiting.add(issue.number)
             continue
         if not labelled:
-            if not labels.ensure():  # Any pass checks the labels before it applies one.
-                waiting.add(issue.number)
-                continue
             try:
                 if wanted not in issue.labels:
                     ctx.tracker.add_labels(issue.number, [wanted])
@@ -225,19 +254,19 @@ def reconcile(ctx, report=None) -> None:
     if not cards.ready:
         # Keep the change unconverged: the next tick reads the board and the issues again.
         _save(ctx, saved.get("lanes"), saved.get("listing"), confirmed=False,
-              pending=waiting | unseen, board=None)
+              pending=waiting | unseen, labels=labels, board=None)
         return
     if changed:
-        _save(ctx, lanes, listing, confirmed=False, pending=waiting)  # A newer listing confirms it.
+        _save(ctx, lanes, listing, confirmed=False, pending=waiting, labels=labels)  # A newer listing confirms it.
     elif confirming:
-        _save(ctx, lanes, saved.get("listing"), confirmed=True, pending=waiting)  # Complete: unseen are gone.
+        _save(ctx, lanes, saved.get("listing"), confirmed=True, pending=waiting, labels=labels)  # Complete: unseen are gone.
     else:
         # A waiting issue missing from the store returns to the next full pass, after a newer listing.
         _save(ctx, lanes, listing if unseen else saved.get("listing"),
-              confirmed=saved.get("confirmed", False) and not unseen, pending=waiting)
+              confirmed=saved.get("confirmed", False) and not unseen, pending=waiting, labels=labels)
 
 
-def _save(ctx, lanes, listing, *, confirmed: bool, pending, board=...) -> None:
+def _save(ctx, lanes, listing, *, confirmed: bool, pending, labels: dict, board=...) -> None:
     ctx.store._write_json(_path(ctx.store), {
         "lanes": lanes, "board": ctx.config.board if board is ... else board,
-        "listing": listing, "confirmed": confirmed, "pending": sorted(pending)})
+        "listing": listing, "confirmed": confirmed, "pending": sorted(pending), "labels": labels})

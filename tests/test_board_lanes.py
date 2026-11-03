@@ -198,7 +198,7 @@ def test_board_option_deleted_before_confirmation_is_added_again(tmp_path):
     assert json.loads((tmp_path / board_lanes.STATE_FILE).read_text())["confirmed"] is True
 
 
-def test_label_deleted_after_the_last_listing_is_created_on_the_change_tick(tmp_path):
+def test_label_deleted_outside_foragent_is_created_on_the_next_listing_that_shows_it_missing(tmp_path):
     ctx = case(tmp_path, SPLIT)
     ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:new"])
     ctx.tracker.add_issue(2, "Two", body("service/b.py"), labels=["lane:old"])
@@ -211,28 +211,126 @@ def test_label_deleted_after_the_last_listing_is_created_on_the_change_tick(tmp_
     ctx.tracker.writes.clear()
     ctx.config.lanes = JOINED  # Only paths change, before any refresh.
     board_lanes.reconcile(ctx)
-    assert ("ensure", ("lane:new",)) in ctx.tracker.writes, "Cached issue labels prove no label exists"
+    ctx.store.frozen = None
+    ctx.store.as_of = "t2"  # This listing shows lane:new on no issue any more.
+    board_lanes.reconcile(ctx)
+    assert ("ensure", ("lane:new",)) in ctx.tracker.writes
     assert "lane:new" in ctx.tracker.labels
+    labels = dict(ctx.tracker.labels)
+    ctx.tracker.writes.clear()
+    ctx.store.as_of = "t3"  # Nothing vanished since: no further label work.
+    board_lanes.reconcile(ctx)
+    assert not [w for w in ctx.tracker.writes if w[0] == "ensure"] and ctx.tracker.labels == labels
 
 
-def test_label_list_is_read_for_a_change_and_before_applying_a_label_only(tmp_path):
+@pytest.mark.parametrize("state", ["missing", "unreadable", "malformed-record", "recorded"])
+@pytest.mark.parametrize("issues", ["empty", "ambiguous", "running-only", "unmoved"])
+def test_every_configured_lane_label_exists_after_a_tick_whether_or_not_work_moves(tmp_path, state, issues):
+    ctx = case(tmp_path, SPLIT, runs=[1] if issues == "running-only" else ())
+    files = {"empty": None, "ambiguous": ("product/a.py", "service/b.py"),
+             "running-only": ("product/a.py",), "unmoved": ("product/a.py",)}[issues]
+    if files is not None:
+        ctx.tracker.add_issue(1, "One", body(*files), labels=["lane:new"])
+    if state == "recorded":
+        board_lanes.reconcile(ctx)
+    ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}  # No issue will ever use extra.
+    if state == "unreadable":
+        (tmp_path / board_lanes.STATE_FILE).write_text("not json", encoding="utf-8")
+    if state == "malformed-record":
+        board_lanes.reconcile(ctx)
+        ctx.tracker.labels.pop("lane:extra")
+        state_file = tmp_path / board_lanes.STATE_FILE
+        recorded = json.loads(state_file.read_text())
+        recorded["labels"]["carried"] = 3  # Names, board and listing still match.
+        state_file.write_text(json.dumps(recorded))
+        ctx.store.as_of = "t1"
+        ctx.tracker.writes.clear()
+    board_lanes.reconcile(ctx)
+    assert "lane:extra" in ctx.tracker.labels, "Provisioning does not wait for an issue to move"
+    assert [w for w in ctx.tracker.writes if w[0] == "ensure"] == [("ensure", ("lane:extra",))]
+    assert ctx.tracker.labels["lane:new"].color == "123456"
+    ctx.tracker.writes.clear()
+    board_lanes.reconcile(ctx)
+    assert not [w for w in ctx.tracker.writes if w[0] == "ensure"], "A completed provisioning is not repeated"
+
+
+def test_board_lane_option_exists_for_an_unused_lane_with_unreadable_state(tmp_path):
+    ctx = case(tmp_path, SPLIT)
+    project = board.ensure(ctx.tracker, ctx.repo, ["old", "new"])
+    ctx.config.board = project
+    ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}
+    (tmp_path / board_lanes.STATE_FILE).write_text("[]", encoding="utf-8")
+    board_lanes.reconcile(ctx)
+    options = board.Project(ctx.tracker, ctx.repo, project).fields()["Lane"]["options"]
+    assert "extra" in {o["name"] for o in options}
+    assert "lane:extra" in ctx.tracker.labels
+
+
+def test_rows_older_than_the_latest_listing_and_unsent_writes_prove_no_label(tmp_path):
     ctx = case(tmp_path, SPLIT)
     ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:new"])
     ctx.tracker.add_issue(2, "Two", body("service/b.py"), labels=["lane:old"])
+    ctx.store.freeze()
+    ctx.store.as_of = "t1"  # A newer listing than the frozen rows.
     calls = []
-    label_names = ctx.tracker.label_names
-    ctx.tracker.label_names = lambda: calls.append("label_names") or label_names()
-    board_lanes.reconcile(ctx)  # No recorded state and nothing to move: no label work.
-    assert calls == []
-    (tmp_path / board_lanes.STATE_FILE).unlink()
-    ctx.tracker.add_issue(3, "Three", body("product/c.py"), labels=["lane:old"])
-    board_lanes.reconcile(ctx)  # Moving #3 first checks that lane:new exists.
-    assert calls == ["label_names"] and ctx.tracker.get_issue(3).labels == {"lane:new"}
-    calls.clear()
-    ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}
+    ctx.tracker.label_names = lambda: calls.append("label_names") or set(ctx.tracker.labels)
     board_lanes.reconcile(ctx)
-    assert calls == ["label_names"], "A recorded change always reads the label list once"
+    assert calls == ["label_names"], "Rows from an older listing prove nothing"
+    calls.clear()
+    (tmp_path / board_lanes.STATE_FILE).unlink()
+    ctx.store.frozen = None
+    ctx.store.outbox = [{"issue": 1, "action": "add_labels", "labels": ["lane:new"]}]
+    board_lanes.reconcile(ctx)
+    assert calls == ["label_names"], "A label only our unsent write shows proves nothing"
+    calls.clear()
+    (tmp_path / board_lanes.STATE_FILE).unlink()
+    ctx.store.outbox = []
+    board_lanes.reconcile(ctx)
+    assert calls == [], "Every lane label on an issue of the latest listing needs no lookup"
+
+
+def test_provisioning_adds_a_missing_board_option_even_when_no_issue_pass_runs(tmp_path):
+    ctx = case(tmp_path, SPLIT)
+    project = board.ensure(ctx.tracker, ctx.repo, ["old", "new"])
+    ctx.config.board = project
+    ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:new"])
+    ctx.tracker.add_issue(2, "Two", body("service/b.py"), labels=["lane:old"])
+    board_lanes.reconcile(ctx)
+    ctx.store.as_of = "t1"
+    board_lanes.reconcile(ctx)  # Issues confirmed: later ticks run no issue pass.
+    field = board.Project(ctx.tracker, ctx.repo, project).fields()["Lane"]
+    ctx.tracker.graphql("""mutation ForagentUpdateBoardField($input: UpdateProjectV2FieldInput!) {
+      updateProjectV2Field(input: $input) { projectV2Field { id } } }""", {"input": {
+        "fieldId": field["id"], "singleSelectOptions": [o for o in field["options"] if o["name"] != "new"]}})
+    path = tmp_path / board_lanes.STATE_FILE
+    state = json.loads(path.read_text())
+    del state["labels"]  # Only the provisioning record is gone.
+    path.write_text(json.dumps(state), encoding="utf-8")
+    board_lanes.reconcile(ctx)
+    options = board.Project(ctx.tracker, ctx.repo, project).fields()["Lane"]["options"]
+    assert "new" in {o["name"] for o in options}
+
+
+@pytest.mark.parametrize("change", ["paths-only", "none-then-listing"])
+def test_deleted_unused_lane_label_is_created_again(tmp_path, change):
+    ctx = case(tmp_path, {**JOINED, "extra": {"paths": ["extra/**"]}})
+    ctx.tracker.add_issue(1, "One", body("product/a.py"), labels=["lane:old"])
+    board_lanes.reconcile(ctx)
+    ctx.store.as_of = "t1"
+    board_lanes.reconcile(ctx)  # Converged; no issue ever uses extra.
+    assert json.loads((tmp_path / board_lanes.STATE_FILE).read_text())["confirmed"] is True
+    del ctx.tracker.labels["lane:extra"]  # Deleted outside Foragent.
+    ctx.tracker.writes.clear()
+    if change == "paths-only":
+        ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}  # Same names, new paths.
+    else:
+        ctx.store.as_of = "t2"  # Same configuration, the next complete listing.
+    board_lanes.reconcile(ctx)
+    assert "lane:extra" in ctx.tracker.labels
     assert ("ensure", ("lane:extra",)) in ctx.tracker.writes
+    ctx.tracker.writes.clear()
+    board_lanes.reconcile(ctx)
+    assert not [w for w in ctx.tracker.writes if w[0] == "ensure"]
 
 
 def test_only_missing_labels_are_created(tmp_path):
@@ -260,27 +358,31 @@ def test_ambiguous_and_unmatched_files_keep_their_lane(tmp_path):
 def test_same_configuration_reads_nothing(tmp_path):
     ctx = case(tmp_path, JOINED)
     board_lanes.reconcile(ctx)
-    calls = []
-    ctx.tracker.label_names = lambda: calls.append("label_names") or set()
-    ctx.store.local_issues = lambda: calls.append("local_issues") or []
+    github = []
+    ctx.tracker.label_names = lambda: github.append("label_names") or set(ctx.tracker.labels)
+    graphql = ctx.tracker.graphql
+    ctx.tracker.graphql = lambda *args: github.append("graphql") or graphql(*args)
     board_lanes.reconcile(ctx)
     ctx.config.lanes = SPLIT
     board_lanes.reconcile(ctx)
-    calls.clear()
     ctx.store.as_of = "t1"  # A newer listing confirms the change once.
     board_lanes.reconcile(ctx)
-    assert calls == ["local_issues"]
-    calls.clear()
+    ctx.tracker.writes.clear()
+    github.clear()
     board_lanes.reconcile(ctx)
-    ctx.store.as_of = "t2"
+    assert github == [], "Same configuration, same listing: no GitHub call"
+    ctx.store.as_of = "t2"  # A newer listing: lanes no issue shows are checked once, nothing written.
     board_lanes.reconcile(ctx)
-    assert calls == [], "A confirmed configuration reads nothing, whatever the listings"
+    assert github == ["label_names"] and ctx.tracker.writes == []
+    board_lanes.reconcile(ctx)
+    assert github == ["label_names"], "Checked once per listing"
+    assert json.loads((tmp_path / board_lanes.STATE_FILE).read_bytes())["confirmed"] is True
 
 
 def test_programming_errors_are_not_deferred(tmp_path):
     ctx = case(tmp_path, JOINED)
     board_lanes.reconcile(ctx)
-    ctx.config.lanes = SPLIT
+    ctx.config.lanes = {**SPLIT, "extra": {"paths": ["extra/**"]}}
 
     def broken():
         raise AttributeError("bug")
