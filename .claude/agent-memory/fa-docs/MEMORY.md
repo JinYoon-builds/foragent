@@ -55,3 +55,4 @@
 - README self-build count (#1477/#1720) is English-only and test_launch_readme.py checks only English; when the count changes, check the 한국어 section too. Batch-merged children (#1158/#1159) carry their own numbers; grep each child, not the parent.
 - Goal behaviour meant for a role session (e.g. #1469 'dig one case') may land only as plumbing; grep the role's skill and prompt for the Goal's method words before calling it done.
 - Permission/guard changes (e.g. #1736 person-only refusal) belong next to README's `Bash(fa:*)` paragraph, which exists in both English and 한국어; skills that tell the PM/orchestrator to run those commands stay true.
+- Orchestrator launch surface (#1490: always hidden `claude --bg`, no Orca tab/tmux window) appears in no reader doc; README's Orca/tmux lines (81/159) are about the lane view (watch_open), not the orchestrator.
