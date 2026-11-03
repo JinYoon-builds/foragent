@@ -1,5 +1,6 @@
 """Boundary tests for per-issue review panels (#533) beyond the locked acceptance file."""
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 import time
@@ -14,9 +15,22 @@ from foragent.executors import ExecResult  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
 from foragent.state import StateStore  # noqa: E402
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import CHECKLIST, perspective_case, review_offline  # noqa: E402,F401
+from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
 from test_risk_map import copy_history, offline  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
+
+
+@pytest.fixture(autouse=True)
+def calm_machine(monkeypatch):
+    """Panel tests use short barriers and sleeps; live machine load must not hold reviewer admission."""
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "_sensor_block", lambda: None)
+
+
+def effective_panel(case):
+    """One reviewer per effective perspective: defaults plus the case's configured additions (#1769)."""
+    return review_perspectives.perspectives(case.config)
 
 
 def test_override_wins_rejects_below_one_and_clears(tmp_path):
@@ -71,13 +85,14 @@ def test_reviewer_count_limits_concurrency_but_never_drops_a_perspective(git_his
         root = tmp_path / f"count-{count}"
         case = perspective_case(copy_history(git_history, root), root, monkeypatch, count=count,
                                 review_max=0, max_retries=1)
-        panel = SlowPanel(["VERDICT: PASS"] * len(CHECKLIST), overlap=count)
+        members = effective_panel(case)
+        panel = SlowPanel(["VERDICT: PASS"] * len(members), overlap=count)
         install_panel(case, panel)
         assert run_issue(1, case.ctx) == "merged"
-        assert len(panel.reviews) == len(CHECKLIST) and len(panel.merges) == 1, count
+        assert len(panel.reviews) == len(members) and len(panel.merges) == 1, count
         assert panel.peak == count and not panel.overlap_errors and not panel.early_merge, count
-        covered = [item["name"] for call in panel.reviews for item in CHECKLIST if item["focus"] in call["prompt"]]
-        assert sorted(covered) == sorted(item["name"] for item in CHECKLIST), count
+        covered = [item["name"] for call in panel.reviews for item in members if item["focus"] in call["prompt"]]
+        assert sorted(covered) == sorted(item["name"] for item in members), count
 
 
 class LimitPanel(PanelExecutor):
@@ -99,12 +114,13 @@ class LimitPanel(PanelExecutor):
 
 def test_panel_usage_limit_is_limit_wait_and_discards_the_round(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = LimitPanel(["VERDICT: PASS"] * len(CHECKLIST))
+    size = len(effective_panel(case))
+    panel = LimitPanel(["VERDICT: PASS"] * size)
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
     assert outcome == "limit-wait"
     # Reviewers still queued behind the limit may never start: the round is discarded anyway.
-    assert 2 <= len(panel.reviews) <= len(CHECKLIST) and panel.merges == [], "A limited round must not reach the merge call"
+    assert 2 <= len(panel.reviews) <= size and panel.merges == [], "A limited round must not reach the merge call"
     labels = case.tracker.get_issue(1).labels
     assert "ready" in labels and "blocked" not in labels
     runs = case.store.root / "runs" / "issue-1"
@@ -113,17 +129,19 @@ def test_panel_usage_limit_is_limit_wait_and_discards_the_round(git_history, tmp
 
 def test_parallel_reviewers_get_distinct_log_paths(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=3, review_max=0, max_retries=1)
-    panel = PanelExecutor(["VERDICT: PASS"] * len(CHECKLIST))
+    size = len(effective_panel(case))
+    panel = PanelExecutor(["VERDICT: PASS"] * size)
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "merged"
     paths = [call["log_path"] for call in panel.reviews]
-    assert len(set(paths)) == len(CHECKLIST), "Concurrent reviewers must not share a log (and its derived .stdout file)"
+    assert len(set(paths)) == size, "Concurrent reviewers must not share a log (and its derived .stdout file)"
     assert case.store.log_path(1) not in paths
 
 
 def test_reviewer_without_verdict_makes_round_unusable_without_merge(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=0)
-    panel = PanelExecutor(["VERDICT: PASS", "I could not finish the review."] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2))
+    size = len(effective_panel(case))
+    panel = PanelExecutor(["VERDICT: PASS", "I could not finish the review."] + ["VERDICT: PASS"] * (size - 2))
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
     assert panel.merges == [], "A reviewer with no verdict must not reach the merge call"
@@ -158,18 +176,23 @@ class OutcomePanel(PanelExecutor):
         return result
 
 
-def run_outcome_panel(git_history, tmp_path, monkeypatch, panel):
-    case = perspective_case(git_history, tmp_path, monkeypatch, count=len(panel.messages), review_max=0,
+def run_outcome_panel(git_history, tmp_path, monkeypatch, make_panel):
+    """Run every effective perspective at once; ``make_panel(size)`` builds the panel for that many members."""
+    case = perspective_case(git_history, tmp_path, monkeypatch, review_max=0,
                             max_retries=1, transient_max_wait_minutes=0)
+    size = len(effective_panel(case))
+    case.config = case.ctx.config = replace(case.config, review_reviewers=size)
+    panel = make_panel(size)
     install_panel(case, panel)
-    return case, run_issue(1, case.ctx)
+    return case, panel, run_issue(1, case.ctx)
 
 
 def test_usage_limit_wins_over_another_reviewers_exhausted_retries(git_history, tmp_path, monkeypatch):
     for order in ({0: "transient", 1: "limit"}, {0: "limit", 1: "transient"}):
         root = tmp_path / "-".join(order.values())
-        panel = OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), order)
-        case, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, panel)
+        case, panel, outcome = run_outcome_panel(
+            copy_history(git_history, root), root, monkeypatch,
+            lambda size, order=order: OutcomePanel(["VERDICT: PASS"] * size, order))
         assert outcome == "limit-wait", order
         labels = case.tracker.get_issue(1).labels
         assert "ready" in labels and "blocked" not in labels, (order, labels)
@@ -178,13 +201,14 @@ def test_usage_limit_wins_over_another_reviewers_exhausted_retries(git_history, 
 
 def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path, monkeypatch):
     cases = {
-        "exhausted": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {1: "transient"}),
-        "raised": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {0: RuntimeError("reviewer crashed")}),
-        "merge-raised": OutcomePanel(["VERDICT: PASS"] * len(CHECKLIST), {}, merge_error=RuntimeError("merge crashed")),
+        "exhausted": lambda size: OutcomePanel(["VERDICT: PASS"] * size, {1: "transient"}),
+        "raised": lambda size: OutcomePanel(["VERDICT: PASS"] * size, {0: RuntimeError("reviewer crashed")}),
+        "merge-raised": lambda size: OutcomePanel(["VERDICT: PASS"] * size, {},
+                                                  merge_error=RuntimeError("merge crashed")),
     }
-    for name, panel in cases.items():
+    for name, make_panel in cases.items():
         root = tmp_path / name
-        case, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, panel)
+        case, panel, outcome = run_outcome_panel(copy_history(git_history, root), root, monkeypatch, make_panel)
         assert outcome != "merged" and case.tracker.merged_prs == [], name
         assert "blocked" in case.tracker.get_issue(1).labels, name
         merge_round = case.store.root / "runs" / "issue-1" / "review-1.txt"
@@ -194,7 +218,6 @@ def test_reviewer_and_merge_errors_make_the_round_unusable(git_history, tmp_path
 
 
 def test_break_it_a_missing_member_verdict_cannot_be_covered_by_the_merger(git_history, tmp_path, monkeypatch):
-    from dataclasses import replace
     from foragent import run_review
 
     parse = run_review.parse_review
@@ -210,8 +233,9 @@ def test_break_it_a_missing_member_verdict_cannot_be_covered_by_the_merger(git_h
 
 def test_merge_fail_blocks_once_with_merged_classes_and_no_raw_reviewer_text(git_history, tmp_path, monkeypatch):
     merged = "src/app.py:1 — stale writer drops the receipt\n  class: stale-owner"
-    raw = [f"VERDICT: FAIL\nsrc/app.py:{k} — RAW-PANEL-{k} a delayed writer wins" for k in range(len(CHECKLIST))]
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
+    raw = [f"VERDICT: FAIL\nsrc/app.py:{k} — RAW-PANEL-{k} a delayed writer wins"
+           for k in range(len(effective_panel(case)))]
     panel = PanelExecutor(raw, merged="VERDICT: FAIL\n" + merged)
     install_panel(case, panel)
     outcome = run_issue(1, case.ctx)
