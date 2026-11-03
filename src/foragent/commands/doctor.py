@@ -1,9 +1,5 @@
 """`fa doctor`: report role and lane drift; with --live, check that the executors can do real work."""
 
-import json
-import subprocess
-
-from foragent import gh, setup
 from foragent.commands import facade
 
 ORDER = 40
@@ -24,14 +20,16 @@ def add(commands) -> None:
 def run(args) -> int:
     cli = facade()
     if args.setup:
+        from foragent import setup
+
         try:
-            result = gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
+            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
             status = result.stdout + "\n" + result.stderr if result.returncode == 0 else ""
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, cli.subprocess.TimeoutExpired):
             status = ""
         items = setup.checklist(status)
         if args.json:
-            print(json.dumps({"items": items}))
+            print(cli.json.dumps({"items": items}))
         else:
             for item in items:
                 print(f"{'PASS' if item['ok'] else 'FAIL'} {item['id']}" +
