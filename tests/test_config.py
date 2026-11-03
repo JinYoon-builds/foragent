@@ -65,6 +65,9 @@ def test_exact_defaults(repo):
                   "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
                   "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None}},
         "tiers_headroom_ample": 0.5,
+        "size_limits": {"s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
+                        "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
+                        "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25}},
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -558,3 +561,16 @@ def test_default_skills_local_table_replaces_the_global_one_and_blank_means_empt
         "docs": ["kwp:engineering/one"], "workers": ["two"]}
     (tmp_path / ".foragent.yml").write_text("default_skills:\n  architect: [three]\n  docs:\n")
     assert load_config(tmp_path, global_path=other).default_skills == {"architect": ["three"], "docs": None}
+
+
+def test_size_limits_merge_per_label_and_reject_bad_values(repo):
+    (repo / ".foragent.yml").write_text("size_limits:\n  m:\n    source_lines: 7\n")
+    limits = load_config(repo).size_limits
+    assert limits["m"] == {"source_lines": 7, "test_lines": 437, "file_count": 17}
+    assert limits["s"]["source_lines"] == 199
+    for bad in ("size_limits:\n  m:\n    source_lines: -1\n", "size_limits:\n  m:\n    lines: 3\n",
+                "size_limits:\n  xl:\n    source_lines: 3\n", "size_limits: 5\n",
+                "size_limits:\n  s:\n    file_count: true\n"):
+        (repo / ".foragent.yml").write_text(bad)
+        with pytest.raises(ConfigError, match="size_limits"):
+            load_config(repo)

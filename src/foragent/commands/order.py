@@ -121,11 +121,12 @@ def add(commands) -> None:
     note.add_argument("--replaces", help=say("order_notes_replaces_help"))
     note.add_argument("--replace", help=say("order_flush_replace_help"))
     pending = order_actions.add_parser("pending", help=say("order_notes_pending_help"))
+    sizes = order_actions.add_parser("sizes", help=say("sizes_help"), description=say("sizes_help"))
     flush = order_actions.add_parser("flush", help=say("order_flush_help"))
     flush.add_argument("--boundary", required=True, help=say("order_flush_boundary_help"))
     red = order_actions.add_parser("red", help=say("order_red_help"), description=say("order_red_help"))
     red.add_argument("plan", type=cli.Path)
-    for command in (note, pending, flush, red):
+    for command in (note, pending, flush, red, sizes):
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
         command.add_argument("--json", action="store_true")
     edit = order_actions.add_parser("edit", help=say("order_edit_help"), description=say("order_edit_help"))
@@ -157,6 +158,8 @@ def add(commands) -> None:
 
 
 def _preread(args, root) -> int:
+    from foragent import size_signal
+
     cli = facade()
     config = cli.load_config(root)
     try:
@@ -177,6 +180,8 @@ def _preread(args, root) -> int:
                 print(f"  - {unknown}")
             if "current" in result:
                 print(result["current"])
+            else:
+                print("\n".join(size_signal.lines(result, config.language)))
     return 0
 
 
@@ -259,6 +264,9 @@ def run(args) -> int:
                   if hasattr(args, name)}
         print(cli.json.dumps(cli.order.progress(store, args.step, **fields), ensure_ascii=False))
         return 0
+    if args.action == "sizes":
+        from foragent import size_signal
+        return size_signal.run(args, root)
     if args.action == "preread":
         return _preread(args, root)
     if args.action == "perspectives":
