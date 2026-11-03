@@ -87,11 +87,11 @@ def test_orch_order_handoff_keeps_the_plan_in_state_drafts_with_a_current_conten
 
 def test_orch_order_handoff_explains_the_existing_push_when_planning_is_stale(handoff_text):
     assert re.search(
-        r"when the planning heartbeat is stale.{0,20}fa orch ask.{0,20}already pushes"
-        r".{0,30}to the person.{0,20}#970.{0,100}closed planning session"
-        r".{0,20}not hide the plan",
+        r"when the planning heartbeat is stale.{0,20}fa orch ask.{0,20}keeps the question"
+        r".{0,20}durable plan path and content hash.{0,30}fa inbox"
+        r".{0,30}next planning session.{0,30}ask the person",
         handoff_text,
-    ), "The existing stale-heartbeat push keeps the durable plan visible when planning is closed"
+    ), "Keep the question, durable plan path and content hash in FA until the next PM can ask the person"
 
 
 def test_orch_order_handoff_preserves_and_completes_the_originating_request(handoff_text):

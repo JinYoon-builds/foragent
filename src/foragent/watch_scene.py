@@ -103,6 +103,21 @@ def today_count(snapshot: Snapshot, slug: Any) -> int:
     return (snapshot.today_done or {}).get(slug) or 0
 
 
+def question_numbers(snapshot: Snapshot) -> set[int]:
+    """Issues whose question awaits the person: the question projection's when collected
+    (an answered question no longer counts, whatever label remains), else the status group."""
+    if snapshot.questions is not None:
+        return {number for number, who in snapshot.questions.items() if who == "person"}
+    return questions(snapshot.status)
+
+
+def person_questions(snapshot: Snapshot) -> int:
+    """How many questions await the person: per issue, plus open ones that name no issue."""
+    if snapshot.questions is not None:
+        return len(question_numbers(snapshot)) + (snapshot.unlinked_questions or 0)
+    return len(questions(snapshot.status))
+
+
 def questions(status: dict[str, Any]) -> set[int]:
     """Distinct issue numbers in the needs-human group (the header counts the same)."""
     issues = status.get("issues")
@@ -119,8 +134,16 @@ def acorn_class(snapshot: Snapshot, row: dict[str, Any], number: int, state: str
     fact, then a recorded wait phase or an orchestrator block, then work. Queued
     authored waits keep their own context; ordinary queued work is next.
     """
-    if (state == "waiting-human" or number in needs
-            or (number == row.get("issue") and row.get("state") == "waiting-human")):
+    # The question projection (watch_questions), when collected, decides whose turn a question
+    # is: the person's is a question, the orchestrator's a wait, and an answered one waits to
+    # restart even though its label may still say needs-human.
+    asked = (snapshot.questions or {}).get(number)
+    if asked == "person":
+        return "question"
+    if asked == "orchestrator" or (asked == "answered" and state in HOLDS):
+        return "wait"
+    if asked != "answered" and (state == "waiting-human" or number in needs
+                                or (number == row.get("issue") and row.get("state") == "waiting-human")):
         return "question"
     if row_of(snapshot.park_facts, number).get("parked"):
         return "parked"
@@ -170,7 +193,8 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         title = titles.get(number) or (snapshot.titles or {}).get(number) or fact.get("title") or (
             row.get("title") if number == row.get("issue") else "") or ""
         entry = {"number": number, "title": title, "state": state, "phase": phase, "run": run,
-                 "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored")}
+                 "class": acorn_class(snapshot, row, number, state, phase, needs), "authored": fact.get("authored"),
+                 "asked": (snapshot.questions or {}).get(number)}
         seen[number] = entry
         target.append(entry)
 
@@ -201,6 +225,10 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
         # A queued item keeps a recorded question or block; any other state of the queue is next.
         add(upcoming, item["number"], item["state"] if item.get("state") in HOLDS else "queued",
             item.get("phase"), None)
+    # An open question is visible even on an issue no status list shows (unapproved work).
+    for number, fact in sorted((snapshot.question_issues or {}).items()):
+        if fact.get("lane") == row.get("slug"):
+            add(upcoming, number, fact.get("state") or "queued", None, None)
     # An authored wait is visible even without approval or a scheduler queue entry.
     # add() keeps a listed worker/held/queued acorn and its class instead of duplicating it.
     for number, fact in authored.items():

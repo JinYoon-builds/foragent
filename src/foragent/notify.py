@@ -1,6 +1,5 @@
 """Pluggable notification delivery; failures are logged and isolated."""
 
-import fcntl
 import json
 import logging
 import os
@@ -73,6 +72,10 @@ def pushes(config: Config, kind: str | None) -> bool:
     return getattr(config, "notify_filter", "all") != "decisions" or kind in DECISION_KINDS
 
 
+# The planning (PM) session relays these to the person: unset, and the older value
+# ``claude-push`` that people's own config files still name.
+PLANNING_SESSION = (None, "claude-push")
+RELAY = "for the person"
 NO_REPOSITORY = "no repository could keep it: set repo in .foragent.yml or an origin remote"
 
 
@@ -119,14 +122,15 @@ def deliver(config: Config, title: str, line: str, link: str | None = None, *,
             kind: str | None = None, root: Path | None = None) -> str | None:
     """Deliver or enqueue an alert; None on success, else why it failed.
 
-    A missing/null setting uses claude-push for older configuration files. Without
-    ``config.repo`` the origin of the checkout holding ``root`` (default: the working
-    folder) names the repository. Under ``notify_filter: decisions`` only decision kinds
-    are pushed; any other alert, and any non-decision alert under ``notify: none``, is
-    kept as a notice the planning context reads. A failure is logged and also kept as a
-    notice when the repository is known.
+    Unset (and the older ``claude-push`` value people's own files still hold) hands the
+    alert to the planning session: a notice its prompt shows, keeping the title, line and
+    link, acknowledged only once written. Without ``config.repo`` the origin of the
+    checkout holding ``root`` (default: the working folder) names the repository. Under
+    ``notify_filter: decisions`` only decision kinds are pushed; any other alert, and any
+    non-decision alert under ``notify: none``, is kept as a notice the planning context
+    reads. A failure is logged and also kept as a notice when the repository is known.
     """
-    target = config.notify if config.notify is not None else "claude-push"
+    target = config.notify
     resolved: list[str | None] = []
 
     def repository() -> str | None:
@@ -145,20 +149,10 @@ def deliver(config: Config, title: str, line: str, link: str | None = None, *,
     if not pushes(config, kind):
         error = _notice(repository(), "not pushed", title, line, kind)
         return None if error is None else f"the alert is not pushed under notify_filter decisions, and {error}"
+    if target in PLANNING_SESSION:
+        return _notice(repository(), RELAY, title, " ".join(filter(None, (line, link))), kind)
     try:
-        if target == "claude-push":
-            repo = repository()
-            if not repo:
-                raise ValueError("claude-push requires a repository: set repo in .foragent.yml or an origin remote")
-            store = StateStore.for_repo(repo)
-            store.root.mkdir(parents=True, exist_ok=True)
-            record = json.dumps({"title": title, "line": line, "link": link}, ensure_ascii=False)
-            # Use the outbox itself: inspect already holds the notification lock.
-            with (store.root / "push-outbox.jsonl").open("a", encoding="utf-8") as stream:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-                stream.write(record + "\n")
-                stream.flush()
-        elif target == "macos":
+        if target == "macos":
             macos_notifier("\n".join(filter(None, (line, link))), title)
         elif isinstance(target, str) and target.startswith("command:"):
             path = target.removeprefix("command:")

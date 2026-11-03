@@ -48,3 +48,4 @@
 - GitHub drop/5xx recovery (#1644) lives in no reader doc; rules.md:37 (D24) covers executor transient errors only. Behavior fixes without a dated Goal rule need no doc line.
 - Order titles '#NNNN: review standard/license scope' plus a long-titled edit order can all be one issue; check `git log --grep '#NNNN'` once. Vendored library skills (skills/principle-*, pstack MIT) are committed despite rules.md D37 line; check that line when skill-source rules change.
 - Neutral base-move / evidence-reuse orders (#1687→#1688, run_publish_flow/ci_mode) touch no reader doc: no README/docs line names base moves or neutral moves; only decisions.md D-conflict line mentions rebase.
+- 'approve for launch bundle N' orders (e.g. #1708 for #1484) have empty bodies; check the named issue's merge. Role-memory auto-publish (#1699) and the PM seat (#1484, latest `fa` entrance wins) appear in no reader doc; README only says type `/fa`.

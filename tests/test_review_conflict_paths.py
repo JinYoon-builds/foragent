@@ -15,7 +15,7 @@ from foragent.run_review import spec_conflicts  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
 from runner_support import enable_native_reviewer, run_case  # noqa: E402,F401
 from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import CHECKLIST, perspective_case, review_offline  # noqa: E402,F401
+from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
 from test_risk_map import copy_history, offline  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
 
@@ -68,9 +68,16 @@ def test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it(ru
     assert [classes for _, _, classes in _artifacts(c.store)[1]] == [{"stale-base"}]
 
 
+def panel_size(case):
+    """Reviewers in the risk-map panel: one per effective perspective of the case's configuration."""
+    from foragent.review_perspectives import perspectives
+
+    return len(perspectives(case.config))
+
+
 def test_panel_member_conflict_stops_without_a_merge_call_that_could_drop_it(git_history, tmp_path, monkeypatch):
     case = perspective_case(git_history, tmp_path, monkeypatch, count=2, review_max=0, max_retries=1)
-    panel = PanelExecutor(["VERDICT: PASS", f"VERDICT: FAIL\n{CONFLICT}"] + ["VERDICT: PASS"] * (len(CHECKLIST) - 2),
+    panel = PanelExecutor(["VERDICT: PASS", f"VERDICT: FAIL\n{CONFLICT}"] + ["VERDICT: PASS"] * (panel_size(case) - 2),
                           merged="VERDICT: PASS")
     install_panel(case, panel)
     assert run_issue(1, case.ctx) == "spec-question"
@@ -104,14 +111,15 @@ def test_older_pr_scope_gains_the_spec_conflict_rule_once():
 class ConflictThenLimitPanel(PanelExecutor):
     """Responses belong to log identities, independent of thread arrival order."""
 
-    def __init__(self, *, first_arrival=1, first_completed=2, conflict=True):
-        super().__init__(["VERDICT: PASS"] * len(CHECKLIST))
+    def __init__(self, *, size, first_arrival=1, first_completed=2, conflict=True):
+        super().__init__(["VERDICT: PASS"] * size)
+        self.size = size
         self.first_arrival = first_arrival
         self.first_completed = first_completed
         self.conflict = conflict
         self.arrived = Event()
         self.both_running = Barrier(2)
-        self.finished = {k: Event() for k in range(1, len(CHECKLIST) + 1)}
+        self.finished = {k: Event() for k in range(1, size + 1)}
         self.responses = {}
         self.outcomes = {}
         self.arrivals = []
@@ -174,7 +182,7 @@ class ConflictThenLimitPanel(PanelExecutor):
 
 
 def install_ordered_panel(case, monkeypatch, **options):
-    panel = ConflictThenLimitPanel(**options)
+    panel = ConflictThenLimitPanel(size=panel_size(case), **options)
     install_panel(case, panel)
     panel.observe(monkeypatch)
     return panel
@@ -184,7 +192,8 @@ def assert_member_outcomes(panel):
     assert panel.responses == {1: "conflict" if panel.conflict else "pass", 2: "limit"}
     assert panel.arrivals == [panel.first_arrival, 3 - panel.first_arrival]
     assert panel.completions[:2] == [panel.first_completed, 3 - panel.first_completed]
-    assert panel.outcomes == {1: "returned", 2: "limit-wait", 3: "limit-wait", 4: "limit-wait"}
+    # Member 1 returns; member 2 records the limit and every queued member meets that pause.
+    assert panel.outcomes == {1: "returned", **{k: "limit-wait" for k in range(2, panel.size + 1)}}
 
 
 def assert_conflict_result(case, panel):

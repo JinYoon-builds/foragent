@@ -25,7 +25,7 @@ from foragent.config import ConfigError
 from foragent.i18n import text
 
 MACHINE_FILE = "machine-settings.yml"
-NOTIFY_FIXED = ("none", "claude-push", "macos")
+NOTIFY_FIXED = ("none", "macos")
 NOTIFY_PATTERNS = ("command:<path>", "slack:<x>", "ntfy:<x>")
 PRESSURE_LEVELS = ("warn", "critical")
 

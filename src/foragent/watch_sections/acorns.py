@@ -31,8 +31,8 @@ def _latest_run(store: StateStore, number: int) -> Any:
 
 def phase_word(store: StateStore, config: Config, number: int, row: dict[str, Any]) -> str:
     """The issue's row phase word; a finished issue is done, a queued one waits for a turn."""
-    from foragent import watch
-    from foragent.watch_sections.lanes import _kind
+    from foragent import watch, watch_questions
+    from foragent.watch_sections.lanes import row_words
 
     run = _latest_run(store, number)
     # The issue, not its run, decides done: a merged run of a reopened issue is not done.
@@ -45,7 +45,12 @@ def phase_word(store: StateStore, config: Config, number: int, row: dict[str, An
     state = issue_state(row.get("labels"), running, group) or "queued"
     # A run that ended keeps the phase it reached; a queued issue has none of its own.
     phase = run.phase if run is not None and state != "queued" else None
-    return watch.text(_kind(state, phase)[1], config.language)
+    # Whose turn the issue's question awaits: the same projection as the rows and statusline.
+    try:
+        question = watch_questions.recipients(store).get(number)
+    except (OSError, ValueError):
+        question = None  # Unreadable question facts leave the word unnamed, as the rows do.
+    return row_words(state, phase, question, config.language)[1]
 
 
 def issue_box(number: int, store: StateStore, config: Config, lane: str | None = None) -> list[str]:
