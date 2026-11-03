@@ -19,9 +19,24 @@ Before you install, have these ready:
 - **A local Git repository** for your project, with its GitHub repository connected as `origin`.
 - **GitHub CLI (`gh`)**, installed and logged in with `gh auth login`.
 - **Claude Code**, installed and logged in.
-- **uv**, the Python tool installer that the install command uses. Follow the official guide: https://docs.astral.sh/uv/getting-started/installation/
 
-Codex CLI is optional.
+Codex CLI is optional; Codex as PM is experimental.
+
+Install with one line. With Node:
+
+```sh
+npx foragent
+```
+
+Without Node:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/JinYoon-builds/foragent/main/install.sh | sh
+```
+
+Both run the same installer. It shows what it will do and asks first. It installs uv (the Python tool installer) when it is missing, installs the `fa` command with uv, and registers the Foragent plugin in Claude Code. Running it again changes nothing. Add `--yes` to install without the question (`npx foragent --yes`, or `... | sh -s -- --yes`).
+
+To install by hand instead, install uv (https://docs.astral.sh/uv/getting-started/installation/) and run:
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
@@ -97,9 +112,24 @@ These limits are known. Each item names the file where a change would start.
 - **로컬 Git 저장소.** 프로젝트의 GitHub 저장소가 `origin`으로 연결되어 있어야 해요.
 - **GitHub CLI (`gh`).** 설치하고 `gh auth login`으로 로그인해요.
 - **Claude Code.** 설치하고 로그인해요.
-- **uv.** 설치 명령이 쓰는 Python 도구 설치기예요. 공식 안내를 따라 설치해요: https://docs.astral.sh/uv/getting-started/installation/
 
-Codex CLI는 선택이에요.
+Codex CLI는 선택이에요. Codex를 PM으로 쓰는 건 실험 단계예요.
+
+한 줄로 설치해요. Node가 있으면:
+
+```sh
+npx foragent
+```
+
+Node가 없으면:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/JinYoon-builds/foragent/main/install.sh | sh
+```
+
+둘 다 같은 설치기를 돌려요. 할 일을 보여 주고 먼저 물어요. uv(Python 도구 설치기)가 없으면 설치하고, uv로 `fa` 명령을 설치하고, Claude Code에 Foragent 플러그인을 등록해요. 다시 돌려도 바뀌는 게 없어요. 묻지 않고 설치하려면 `--yes`를 붙여요(`npx foragent --yes`, 또는 `... | sh -s -- --yes`).
+
+직접 설치하려면 uv를 설치하고(https://docs.astral.sh/uv/getting-started/installation/) 이렇게 실행해요.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
