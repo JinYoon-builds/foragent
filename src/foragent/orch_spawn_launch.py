@@ -37,8 +37,8 @@ def plan_launch(root: Path, store: StateStore, config: Config, now: datetime,
                 prompt: str | None = None) -> tuple[str, list[str], dict, dict] | None:
     """Pick a new session id and the launch command: ``(screen, argv, env, descriptor)``, or None without Claude.
 
-    Every screen (Orca, tmux, ``claude --bg``) passes ``--session-id`` with the
-    new id, so every launch has a descriptor to record. The orchestrator's
+    The launch is always ``claude --bg`` (#1490) with ``--session-id`` set to
+    the new id, so every launch has a descriptor to record. The orchestrator's
     default skills travel in the first message, with any ``prompt``.
     """
     session_id = str(uuid.uuid4())
@@ -111,7 +111,7 @@ def spawn_orchestrator(repo_root: Path, store: StateStore, config: Config, *, pr
     (a refresh replaces a live session on purpose). Claude gets a new
     ``--session-id`` and ``prompt`` after ``/fa-orchestrator``. Returns
     ``{session_id, transcript_path, started_at}``, or None when spawning is off,
-    Claude or a screen is missing, or the launch failed. The caller holds the
+    Claude is missing, or the launch failed. The caller holds the
     openers' lock (``watch_open._opening``) from its checks until it has made
     the descriptor active, so two refreshes or a refresh and a gate spawn never
     interleave; this function takes no lock and writes no heartbeat.

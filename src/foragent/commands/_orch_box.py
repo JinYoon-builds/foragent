@@ -191,8 +191,7 @@ def _orch_inbox(args, store, config, repo: str) -> None:
             print(f"{label} saved at {record['at']} ({where['kind']}).")
     elif args.action == "ask":
         record = box.ask(store, args.question, args.option, args.recommend, args.issues, args.kind)
-        pushed = box.route_question(store, config, repo, record)
-        _print_ask(args, record, pushed, config.language)
+        _print_ask(args, record, box.planning_alive(store), config.language)
     elif args.action == "answer":
         record = box.answer(store, args.id, args.text)
         print(f"Question {record['id']} closed.")
@@ -224,17 +223,14 @@ def _orch_inbox(args, store, config, repo: str) -> None:
                 print(f"  answer: {row['answer']}")
 
 
-def _print_ask(args, record, pushed: bool, language: str) -> None:
-    """With planning alive, the handoff the agent sends by SendMessage (#970); else the push note."""
+def _print_ask(args, record, planning_alive: bool, language: str) -> None:
+    """The planning handoff (#970): sent now by SendMessage, or left in the box for the next PM."""
     cli = facade()
     fields = {key: record[key] for key in ("id", "kind", "question", "options", "recommend")}
     if args.json:
-        print(cli.json.dumps({**fields, "route": "push" if pushed else "planning"}, ensure_ascii=False))
+        print(cli.json.dumps({**fields, "planning_alive": planning_alive}, ensure_ascii=False))
         return
-    if pushed:
-        print(cli.text("orch_ask_pushed", language, **fields))
-        return
-    print(cli.text("orch_ask_planning", language, **fields))
+    print(cli.text("orch_ask_planning" if planning_alive else "orch_ask_waiting", language, **fields))
     print(record["question"])
     for index, option in enumerate(record["options"], 1):
         mark = cli.text("orch_ask_recommended", language) if index == record["recommend"] else ""

@@ -452,6 +452,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     if not infrastructure:
         _note_evidence(ctx, n, base_sha, head)  # A regression below fails the work, not this evidence.
     if lost:
+        from foragent import run_publish
+
+        run_publish._record_failure(n, ctx, pr, head)  # CI measured this head losing tests: a code failure.
         raise AttemptFailure("Acceptance baseline regression (previously passing tests):\n" + "\n".join(lost),
                              attempt.target_branch)
     if infrastructure:

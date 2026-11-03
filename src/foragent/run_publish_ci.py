@@ -28,6 +28,18 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     raise run_publish.ExecutorStopped("held", str(logs))
 
 
+def _record_failure(n: int, ctx: RunContext, pr: int, head: str) -> None:
+    """Keep a CI code failure as a local fact for the scorecard; recording never changes the run.
+
+    Every exit that handles a code failure of this run's head calls this once, after the
+    not-started hold (infrastructure, not code) and before its own retry or block decision."""
+    try:
+        run = ctx.store.get_run(n)
+        ctx.store.record_flow("ci-failure", issue=n, run_started_at=run.started_at, pr=pr, head=head)
+    except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
+        return
+
+
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
     """Spend one implementation retry, preserving the raw logs from every run."""
     logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
@@ -39,6 +51,7 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
         raise run_publish.ExecutorStopped(run_publish._hold_changed_head(n, ctx, link))
     run_publish._hold_if_not_started(n, ctx, pr, logs)
     run = ctx.store.get_run(n)
+    run_publish._record_failure(n, ctx, pr, head)
     run_publish._append(ctx.store.log_path(n), f"Attempt {run.attempts} failed:\n{failure}")
     if run.attempts >= ctx.config.max_retries + 1:
         run_publish.flag(ctx, n, run_publish.Reason.RETRIES_EXCEEDED, "CI failed after all attempts.", f"{failure}\n\n{link}")

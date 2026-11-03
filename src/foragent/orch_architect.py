@@ -8,15 +8,17 @@ and of the ``<name>-call`` event. The session itself, started as the hidden
 event. Roles never message a person: proposals reach the orchestrator through
 ``fa orch request``. Roles are read from ``foragent.roles.load_roles`` (D95).
 
-Every start takes one machine slot through ``capacity.hold_workload``, then passes that
-slot's one workload record to the session's pid, so the worker counts once for as long as
-it lives. The session removes that record when it ends, and a record left by a crash stops
-counting with its pid; the next start removes it. A start that cannot record its session
-stops that session, because nothing else could count or find it.
+A role call is never refused or delayed because lane run slots are full (#1469): it starts
+its session at once and adds one workload record for the session's pid, so lanes and later
+admissions count the worker once for as long as it lives. The session removes that record when
+it ends, a record left by a crash stops counting with its pid, and the next start removes it.
+A start that cannot record its session stops that session, because nothing else could count
+or find it. The record is written before the session starts, so a session that ends at once still
+finds its alarm and workload. A session the gate started for an alarm (``alarm`` in its record) delivers its
+final message to the orchestrator inbox; the orchestrator never decides whether it runs.
 """
 
 from contextlib import contextmanager
-import contextvars
 from datetime import UTC, datetime
 import fcntl
 import json
@@ -34,6 +36,9 @@ from foragent.orch_events import append_event
 from foragent.orch_role_prompt import ARCHITECT, REFACTOR, _entry, _has_agent, build_prompt  # noqa: F401
 from foragent.roles import load_roles
 from foragent.state import StateStore
+
+
+SENSED = {"critical": "critical memory pressure", "overload": "machine load too high"}
 
 
 class ArchitectRefused(Exception):
@@ -109,20 +114,6 @@ def _remove_workload(record: dict | None) -> None:
         capacity_sessions.remove(Path(workload))
 
 
-def _pass_slot(store: StateStore, role: str, pid: int, target: Path) -> None:
-    """Turn this command's held slot into the session's record at ``target``.
-
-    The one record changes owner in place, so no reader counts the worker twice. It then
-    moves to the session's own name, which this command's hold does not remove. The machine
-    lock keeps every admission out until the move ends, so none can see the record missing.
-    """
-    with capacity.machine_lock(store):
-        held = next(item.path for item in capacity_sessions.read(store.root)
-                    if item.pid == os.getpid() and item.kind == "role" and item.role == role)
-        capacity_sessions.add(store, held, pid=pid, kind="role", role=role)
-        os.replace(held, target)
-
-
 def _say(key: str, role: str, language: str, **values) -> str:
     """The architect keeps its own wording; every other role shares the role_* strings."""
     if role == ARCHITECT:
@@ -131,8 +122,11 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
-         role: str = ARCHITECT, short: str | None = None) -> str:
-    """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused."""
+         role: str = ARCHITECT, short: str | None = None, alarm: str | None = None) -> str:
+    """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused.
+
+    ``alarm`` is the gate's request id when the gate calls the role for an alarm.
+    """
     language = config.language
     if _entry(config, role) is None:
         raise ArchitectRefused(text("role_unknown", language, role=role,
@@ -148,6 +142,9 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
     if until is not None:
         raise ArchitectRefused(_say("paused", role, language, executor=config.executor,
                                     until=until.isoformat()))
+    # Full lane run slots never refuse a role call (#1469); critical memory and overload still hold all new work.
+    if (sensed := capacity._sensor_block()) is not None:
+        raise ArchitectRefused(f"Not started: {SENSED[sensed]}. Retry the same command when it drops.")
     with _call_lock(store, role):
         record = read_record(store, role)
         if session_alive(record):
@@ -158,36 +155,37 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
         log = log_path(store, started_at, role)
         log.parent.mkdir(parents=True, exist_ok=True)
 
-        def start() -> subprocess.Popen:
-            with capacity.hold_workload(store, config, wait_s=0, kind="role", role=role, now=lambda: now):
-                with log.open("ab") as stream:
-                    process = subprocess.Popen(
-                        [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
-                         "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
-                        cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
-                        stdout=stream, stderr=stream, env=gate_environment(),
-                    )
-                workload = capacity_sessions.new_path(store, process.pid)
-                try:
-                    _pass_slot(store, role, process.pid, workload)
-                    store._write_json(record_path(store, role), {
-                        "pid": process.pid, "start_time": _start_time(process.pid),
-                        "started_at": started_at, "why": why, "workload": str(workload),
-                        **({"short": short} if short else {}),
-                    })
-                except BaseException:
-                    # No record can count or find this session, so it must not run. It has only just started.
-                    process.kill()
-                    process.wait()
-                    capacity_sessions.remove(workload)
-                    raise
-            return process
-
+        # The session's own record exists before the session does, so a session that ends before
+        # this command resumes still finds its alarm and its workload record and delivers both.
+        workload = capacity_sessions.new_path(store, os.getpid())
+        session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
+                   "workload": str(workload), **({"short": short} if short else {}),
+                   **({"alarm": alarm} if alarm else {})}
+        store._write_json(record_path(store, role), session)
         try:
-            # A fresh context: the session is a new worker, so an outer hold of this thread cannot cover it.
-            process = contextvars.Context().run(start)
-        except TimeoutError as exc:
-            raise ArchitectRefused(str(exc)) from exc
+            with log.open("ab") as stream:
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
+                     "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
+                    cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
+                    stdout=stream, stderr=stream, env=gate_environment(),
+                )
+        except BaseException:
+            record_path(store, role).unlink(missing_ok=True)
+            raise
+        try:
+            # A session that already ended leaves this record to a dead pid, which counts for no
+            # one; the next start removes it.
+            capacity_sessions.add(store, workload, pid=process.pid, kind="role", role=role)
+            store._write_json(record_path(store, role), {
+                **session, "pid": process.pid, "start_time": _start_time(process.pid)})
+        except BaseException:
+            # No record can count or find this session, so it must not run. It has only just started.
+            process.kill()
+            process.wait()
+            capacity_sessions.remove(workload)
+            record_path(store, role).unlink(missing_ok=True)
+            raise
     append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
                  **({"short": short} if short else {}))
     return _say("started", role, language, pid=process.pid, log=log)
@@ -260,5 +258,19 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         finally:
             record = read_record(store, role)
             if record is not None and record.get("started_at") == started_at:
-                _remove_workload(record)
+                try:
+                    if record.get("alarm"):
+                        _deliver(store, role, record["alarm"], code, message, root)
+                finally:
+                    _remove_workload(record)
     return code
+
+
+def _deliver(store: StateStore, role: str, alarm: str, code: int, message: str, root: Path | None = None) -> None:
+    """Give the orchestrator the result of a session the gate started for an alarm."""
+    from foragent import orch_inbox, orch_role_raise
+
+    orch_inbox.add_request(store, role, f"{role} result for gate alarm {alarm} (exit code {code}): "
+                           + (message or "(no final message)"), {"role": role, "alarm": alarm})
+    if code == 0:  # Only a finished dive answers the alarm; a failed one leaves it for a retry.
+        orch_role_raise.complete_call(store, alarm, root)

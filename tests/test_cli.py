@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -1023,3 +1024,117 @@ def test_dream_workload_reuses_its_run_slot_and_releases_on_exit(app, monkeypatc
     assert calls == ["main"]
     assert capacity_sessions.read(store.root) == []
     assert capacity.machine_runs(store, NOW) == 0
+
+
+LAUNCHED_REFUSED = [
+    ["orch", "resolve", "1", "--verdict", "pass", "--note", "n"],
+    ["orch", "merge", "2", "--approved-by", "human"],
+    ["skills", "add", "https://github.com/offline/pack", "--approve"],
+    ["settings", "set", "review", "careful"],
+    ["init", "--fa-allow", "no"],
+    ["role", "add", "auditor"],
+    ["role", "set", "architect"],
+    ["role", "remove", "tester"],
+    ["lanes", "skills", "view", "x"],
+]
+LAUNCHED_ALLOWED = [
+    ["skills", "add", "https://github.com/offline/pack"],
+    ["settings", "list"],
+    ["settings", "get", "review"],
+    ["init"],
+    ["orch", "retry", "1"],
+    ["lanes", "dreamed", "view"],
+]
+
+
+def dispatched(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.commands, "module", lambda name: SimpleNamespace(run=lambda args: calls.append(name) or 0))
+    return calls
+
+
+@pytest.mark.parametrize("argv", LAUNCHED_REFUSED, ids=lambda argv: " ".join(argv[:2]))
+def test_launched_session_refuses_person_only_commands_before_their_module(tmp_path, monkeypatch, capsys, argv):
+    (tmp_path / ".foragent.yml").write_text("language: ko\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FORAGENT_ROLE", "launched")
+    calls = dispatched(monkeypatch)
+
+    assert cli.main(argv) == 1
+    output = capsys.readouterr()
+    assert calls == [] and output.out == ""
+    assert output.err.count("\n") == 1 and "Foragent가 시작한 세션" in output.err
+
+
+@pytest.mark.parametrize("role", ["launched", ""], ids=("launched", "empty"))
+@pytest.mark.parametrize("argv", LAUNCHED_ALLOWED, ids=lambda argv: " ".join(argv[:2]))
+def test_launched_session_keeps_the_other_forms(tmp_path, monkeypatch, capsys, argv, role):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FORAGENT_ROLE", role)
+    calls = dispatched(monkeypatch)
+    assert cli.main(argv) == 0 and calls == [argv[0]]
+
+
+@pytest.mark.parametrize("role", [None, "orchestrator"], ids=("person", "orchestrator"))
+@pytest.mark.parametrize("argv", LAUNCHED_REFUSED, ids=lambda argv: " ".join(argv[:2]))
+def test_person_and_orchestrator_reach_person_only_commands(tmp_path, monkeypatch, argv, role):
+    monkeypatch.chdir(tmp_path)
+    if role is None:
+        monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    else:
+        monkeypatch.setenv("FORAGENT_ROLE", role)
+    calls = dispatched(monkeypatch)
+    assert cli.main(argv) == 0 and calls == [argv[0]]
+
+
+def test_empty_role_is_refused_in_english_without_a_project(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FORAGENT_ROLE", "")
+    calls = dispatched(monkeypatch)
+    assert cli.main(["settings", "set", "review", "careful"]) == 1
+    assert calls == []
+    assert capsys.readouterr().err == (
+        "foragent: fa settings set is for a person. Foragent started this session, so nothing changed.\n")
+
+
+@pytest.mark.parametrize(("local", "personal", "expected"), [
+    ("repo: o/r\n", "language: ko\n", "ko"),
+    ("repo: o/r\nlanguage: en\n", "language: ko\n", "en"),
+    (None, "language: ko\n", "ko"),
+    ("repo: o/r\n", None, "en"),
+    ("repo: o/r\nreview: [broken\n", "language: ko\n", "ko"),
+], ids=("inherits-personal", "project-wins", "no-project", "no-config", "unreadable-project"))
+def test_launched_refusal_speaks_the_language_load_config_would(tmp_path, monkeypatch, capsys, local, personal, expected):
+    home = tmp_path / "home"
+    if personal is not None:
+        (home / ".config/foragent").mkdir(parents=True)
+        (home / ".config/foragent/config.yml").write_text(personal)
+    monkeypatch.setenv("HOME", str(home))
+    project = tmp_path / "project"
+    (project / "sub").mkdir(parents=True)
+    if local is not None:
+        (project / ".foragent.yml").write_text(local)
+    monkeypatch.chdir(project / "sub")
+    monkeypatch.setenv("FORAGENT_ROLE", "launched")
+    calls = dispatched(monkeypatch)
+
+    assert cli.main(["settings", "set", "review", "careful"]) == 1
+    assert calls == []
+    err = capsys.readouterr().err
+    assert ("Foragent가 시작한 세션" in err) == (expected == "ko") and ("Foragent started" in err) == (expected == "en")
+
+
+def test_launched_refusal_without_a_folder_still_reads_the_personal_language(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    (home / ".config/foragent").mkdir(parents=True)
+    (home / ".config/foragent/config.yml").write_text("language: ko\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FORAGENT_ROLE", "launched")
+    calls = dispatched(monkeypatch)
+
+    def gone(*args, **kwargs):
+        raise FileNotFoundError("the current folder was removed")
+
+    monkeypatch.setattr(cli.Path, "resolve", gone)
+    assert cli.main(["role", "remove", "tester", "--repo-root", str(tmp_path)]) == 1
+    assert calls == [] and "Foragent가 시작한 세션" in capsys.readouterr().err
