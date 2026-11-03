@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_stop, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -296,12 +296,13 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         return report
     with step("apply_budgets"):
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
-    if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
+    stopped = orch_stop.active(ctx.store) is not None  # A project stop starts no work of any kind (#1491).
+    if sample[0] != "critical" and not stopped:  # Critical memory also holds the baseline prebuild (#497).
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
     timed("order_finish_check", orch_role_schedule.observe, ctx)  # Facts only; a no-start tick records them too.
-    if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+    if stopped or not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
         scheduler_flow.hold(ctx, (number for numbers in ready.values() for number in numbers),
-                            "outside-run-hours" if ctx.start_runs else "starts-off")
+                            "project-stop" if stopped else "outside-run-hours" if ctx.start_runs else "starts-off")
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.

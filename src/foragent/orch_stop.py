@@ -7,20 +7,20 @@ saves the WIP (named `[stopped: <why>]`). _restore_stopped then returns the issu
 to ready with one stop event. Every unfinished record `fa gate status` lists is
 stoppable; when its workers are already gone the same path saves the work (#1207).
 
-`fa orch stop --all --keep-work --why` (#1491) is the project-wide stop: it appends one
-request to `<state>/stop-requests.jsonl` (this command is its only writer) and holds
-every lane through the plan's own pause until a person resumes it (orch_plan stays the
-writer of lane holds). It signals nothing: each run's owner, its runner, reads the
-request at every step boundary before more work or any publication
-(`raise_if_requested`) and saves and finishes its own run. Repeating the command only
-adds a request; it never resumes a lane.
+`fa orch stop --all --keep-work --why` (#1491) is the project-wide stop, and
+`fa orch resume --all` is its pair. Both append to `<state>/stop-requests.jsonl` (their
+only writers); `active()` derives the stop in force from it and is the one admission
+every start asks (tick starts, dreams, role sessions, review reruns, run entry). The
+stop also holds each lane not held yet through the plan's own pause (orch_plan stays the
+writer of lane holds) until its resume, which lifts only those holds. It signals
+nothing: each run's owner checks the stop before and after every external step
+(`raise_if_requested`) and leaves through its own save-and-finish path.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
 import json
 from typing import TYPE_CHECKING
 
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from foragent.state import StateStore
 
 TICK_LOCK_WAIT_S = 60
+STOP_PREFIX = "project stop: "
 
 
 @contextmanager
@@ -157,41 +158,93 @@ def _requests(store: StateStore) -> Path:
     return store.root / "stop-requests.jsonl"
 
 
-def requested(store: StateStore, run: Run) -> str | None:
-    """The why of the latest project-wide stop request, when it came after this run started."""
+def _records(store: StateStore) -> list[dict]:
+    """The stop and resume records in order; a torn line is no record."""
     try:
         lines = _requests(store).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return None
-    for line in reversed(lines):
+        return []
+    records = []
+    for line in lines:
         try:
             item = json.loads(line)
-            at = datetime.fromisoformat(item["at"])
-            return item["why"] if at >= datetime.fromisoformat(run.started_at) else None
-        except (ValueError, KeyError, TypeError):
-            continue  # A torn line is no request; the one before it still counts.
-    return None
+        except ValueError:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("why"), str):
+            records.append(item)
+    return records
+
+
+def _since_resume(records: list[dict]) -> list[dict]:
+    """The stop records after the latest resume; empty when no project stop is active."""
+    tail = []
+    for item in records:
+        tail = [] if item.get("kind") == "resume" else [*tail, item]
+    return tail
+
+
+def active(store: StateStore) -> str | None:
+    """The why of the project-wide stop in force, or None; the one admission check every start asks.
+
+    A stop stays in force until `fa orch resume --all` records its pair; it never expires.
+    """
+    stops = _since_resume(_records(store))
+    return stops[-1]["why"] if stops else None
+
+
+def owner(store: StateStore):
+    """A run owner's block: inside it, every external step of this process asks the stop."""
+    from foragent import stop_gate
+
+    return stop_gate.owner(lambda: active(store))
+
+
+def guarded(ctx):
+    """A copy of the owner's context whose GitHub calls and waits ask the stop first (stop_gate)."""
+    import copy
+    from dataclasses import is_dataclass, replace
+
+    from foragent import stop_gate
+    from foragent.tracker import RecordingTracker
+
+    ctx = replace(ctx) if is_dataclass(ctx) else copy.copy(ctx)
+    tracker = getattr(ctx, "tracker", None)
+    if isinstance(tracker, RecordingTracker):  # Later `replace(ctx, ...)` copies keep this inner tracker.
+        if not isinstance(tracker._tracker, stop_gate.Guarded):
+            tracker._tracker = stop_gate.Guarded(tracker._tracker)
+    elif tracker is not None and not isinstance(tracker, stop_gate.Guarded):
+        ctx.tracker = stop_gate.Guarded(tracker)
+    if (sleep := getattr(ctx, "sleep", None)) is not None:
+        def nap(seconds: float) -> None:  # Every wait loop ends within one interval of a stop.
+            stop_gate.check()
+            sleep(seconds)
+            stop_gate.check()
+
+        ctx.sleep = nap
+    return ctx
 
 
 def raise_if_requested(ctx: RunContext, n: int) -> None:
-    """The run owner's check: stop with outcome "stopped" so its own WIP save and finish run.
+    """The run owner's check before and after each external step: stop with outcome "stopped".
 
-    The runner's preservation path saves the worktree on the issue branch, and the next
-    tick's orphan recovery returns a finished "stopped" run to ready (_restore_stopped).
+    The owner's existing preservation path then saves the worktree on the issue branch and
+    finishes the run; the next tick's orphan recovery returns it to ready (_restore_stopped).
     """
+    if (why := active(ctx.store)) is None:
+        return
     run = ctx.store.get_run(n)
-    if run is None or run.status != "running" or (why := requested(ctx.store, run)) is None:
+    if run is None or run.status != "running":
         return
     _note(ctx, n, run, "stopped", "project-stop", why)
     raise ExecutorStopped("stopped", why)
 
 
 def stop_all(ctx: RunContext, why: str) -> str:
-    """Record one project-wide stop and hold every lane; each running run's owner saves and stops it.
+    """Record one project-wide stop and hold every lane not held yet; each run's owner stops its run.
 
     Nothing here signals a process or writes a run: the runner that owns each run reads the
-    request at its next step (`raise_if_requested`) and saves and finishes the run itself.
-    The tick lock orders the request and holds against a tick's start decisions.
+    stop at its next step (`raise_if_requested`) and saves and finishes the run itself.
+    The record names the lanes this stop held, so its resume lifts only those.
     """
     from foragent import orch_plan
     from foragent.orch import OrchError
@@ -204,13 +257,41 @@ def stop_all(ctx: RunContext, why: str) -> str:
     with _tick_lock(ctx, None):
         now = ctx.now()
         lanes = sorted({"main", *ctx.config.lanes}, key=lane_order)
-        held = orch_plan.load(ctx.store, now)["paused"]
-        for lane in lanes:
-            if held.get(lane, {}).get("until") != orch_plan.UNTIL_RESUMED.isoformat():
-                orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"project stop: {why}")
-        with ctx.store._state_lock(), _requests(ctx.store).open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"at": now.isoformat(), "why": why}, ensure_ascii=False) + "\n")
+        paused = orch_plan.load(ctx.store, now)["paused"]
+        held = [lane for lane in lanes if lane not in paused]  # A lane held before keeps its own hold.
+        for lane in held:
+            orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"{STOP_PREFIX}{why}")
+        _append(ctx.store, {"at": now.isoformat(), "kind": "stop", "why": why, "held": held})
         running = sorted(run.number for run in unfinished_runs(ctx.store))
     lines = [text("orch_stop_all_held", language, lanes=", ".join(lanes), why=why)]
     lines += [text("orch_stop_all_owner", language, n=n) for n in running]
     return "\n".join(lines)
+
+
+def resume_all(ctx: RunContext, why: str = "") -> str:
+    """Lift the project-wide stop and resume the lanes it held; a lane held before stays held."""
+    from foragent import orch_plan
+
+    language = ctx.config.language
+    with _tick_lock(ctx, None):
+        stops = _since_resume(_records(ctx.store))
+        if not stops:
+            return text("orch_resume_all_none", language)
+        now = ctx.now()
+        paused = orch_plan.load(ctx.store, now)["paused"]
+        resumed = []
+        for lane in dict.fromkeys(lane for item in stops for lane in item.get("held") or []):
+            item = paused.get(lane)
+            # Only the stop's own hold is lifted; a pause a person set since then stays.
+            if (item is not None and item["until"] == orch_plan.UNTIL_RESUMED.isoformat()
+                    and orch_plan.resume(ctx.store, lane)):
+                resumed.append(lane)
+        _append(ctx.store, {"at": now.isoformat(), "kind": "resume", "why": " ".join(why.split()),
+                            "resumed": resumed})
+    return text("orch_resume_all_done", language, lanes=", ".join(resumed) or "-")
+
+
+def _append(store: StateStore, record: dict) -> None:
+    """Append one stop or resume record; these commands are the file's only writers."""
+    with store._state_lock(), _requests(store).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")

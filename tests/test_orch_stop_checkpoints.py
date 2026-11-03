@@ -137,7 +137,8 @@ def test_a_stop_before_a_reviewed_merge_leaves_the_pr_unmerged(case, monkeypatch
     case.tracker.remove_labels(1, ["running"])
     from datetime import timedelta
 
-    case.clock[0] += timedelta(minutes=5)  # The review run starts after the first request.
+    case.clock[0] += timedelta(minutes=5)
+    orch.resume_all(case.ctx)  # The review run starts after the first stop was lifted.
     merged = []
     monkeypatch.setattr(case.tracker, "merge_pr", lambda *a, **k: merged.append(a))
     outcome = review_only(1, case.ctx, verdict_head=head)
@@ -202,6 +203,7 @@ def test_a_stop_during_review_never_pushes_a_new_head_to_an_open_pr(case, monkey
     case.tracker.set_pr_head_sha(pr, published)
     case.tracker.remove_labels(1, ["running"])
     case.clock[0] += timedelta(minutes=5)
+    orch.resume_all(case.ctx)
 
     def rework(kwargs):
         (kwargs["worktree"] / "feature.txt").write_text("done twice\n")

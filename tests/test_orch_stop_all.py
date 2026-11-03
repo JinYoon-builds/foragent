@@ -15,6 +15,7 @@ from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, tzinfo=UTC)
 RUNNER = 42000
+WHY = "Jin requested a stop"
 
 
 @pytest.fixture
@@ -42,23 +43,50 @@ def test_stop_all_holds_every_lane_including_main_through_the_plan(case):
         assert orch_plan.lane_paused(case.store, lane, NOW + timedelta(days=3650)), lane
         assert scheduler_start._lane_held(SimpleNamespace(store=case.store), lane, NOW), lane
     assert "api, view, main" in message and "Why: Jin requested a stop" in message
+    assert orch_stop.active(case.store) == "Jin requested a stop"
     requests = (case.store.root / "stop-requests.jsonl").read_text().splitlines()
-    assert [json.loads(line) for line in requests] == [{"at": NOW.isoformat(), "why": "Jin requested a stop"}]
+    assert [json.loads(line) for line in requests] == [
+        {"at": NOW.isoformat(), "kind": "stop", "why": "Jin requested a stop", "held": ["api", "view", "main"]}]
 
 
 def test_stop_all_is_repeatable_and_never_resumes_a_lane(case):
-    orch_plan.pause(case.store, "api", NOW + timedelta(hours=1), "earlier human pause")
+    earlier = NOW + timedelta(hours=1)
+    orch_plan.pause(case.store, "api", earlier, "earlier human pause")
     orch.stop_all(case.ctx, "first")
-    pauses = len(_events(case.store, "plan-pause"))
-    assert pauses == 4  # the earlier one, then each of the three lanes once
+    assert len(_events(case.store, "plan-pause")) == 3  # the earlier pause, then view and main once
     case.clock[0] = NOW + timedelta(minutes=5)
     orch.stop_all(case.ctx, "second")
-    assert len(_events(case.store, "plan-pause")) == pauses, "A held lane is not paused again"
+    assert len(_events(case.store, "plan-pause")) == 3, "A held lane is not paused again"
     assert _events(case.store, "plan-resume") == []
     held = orch_plan.load(case.store, case.clock[0])["paused"]
-    assert set(held) == {"api", "view", "main"}
-    assert all(item["until"] == orch_plan.UNTIL_RESUMED.isoformat() for item in held.values())
-    assert len((case.store.root / "stop-requests.jsonl").read_text().splitlines()) == 2
+    assert held["api"]["until"] == earlier.isoformat(), "A lane held before the stop keeps its own hold"
+    assert all(held[lane]["until"] == orch_plan.UNTIL_RESUMED.isoformat() for lane in ("view", "main"))
+    assert orch_stop.active(case.store) == "second"
+    case.clock[0] = NOW + timedelta(days=2)  # The earlier pause has passed; the stop still holds every start.
+    assert not orch_plan.lane_paused(case.store, "api", case.clock[0])
+    assert orch_stop.active(case.store) == "second"
+
+
+def test_resume_all_lifts_only_what_this_stop_held(case):
+    orch_plan.pause(case.store, "api", NOW + timedelta(days=30), "a person held api first")
+    orch.stop_all(case.ctx, "first")
+    case.clock[0] = NOW + timedelta(minutes=1)
+    orch.stop_all(case.ctx, "second")
+    orch_plan.pause(case.store, "view", NOW + timedelta(days=30), "a person paused view during the stop")
+    message = orch.resume_all(case.ctx, "Jin is back")
+    assert "lanes resumed: main" in message
+    assert orch_stop.active(case.store) is None
+    assert orch_plan.lane_paused(case.store, "api", case.clock[0]), "Held before the stop: stays held"
+    assert orch_plan.lane_paused(case.store, "view", case.clock[0]), "A person's own later pause stays"
+    assert not orch_plan.lane_paused(case.store, "main", case.clock[0])
+    assert len(_events(case.store, "plan-resume")) == 1, "Each held lane is resumed once"
+    assert orch.resume_all(case.ctx) == "No project stop is in force; nothing was changed."
+    assert len(_events(case.store, "plan-resume")) == 1
+    last = json.loads((case.store.root / "stop-requests.jsonl").read_text().splitlines()[-1])
+    assert (last["kind"], last["why"], last["resumed"]) == ("resume", "Jin is back", ["main"])
+    orch.stop_all(case.ctx, "again")  # A new stop after the resume holds the free lane again.
+    assert orch_stop.active(case.store) == "again"
+    assert orch_plan.lane_paused(case.store, "main", case.clock[0])
 
 
 def test_stop_all_signals_nothing_and_leaves_every_run_to_its_owner(case, monkeypatch):
@@ -88,16 +116,17 @@ def test_the_hold_outlives_the_plan_expiry_until_a_person_resumes(case):
     assert orch_plan.lane_paused(case.store, "main", later)
 
 
-def test_the_run_owner_stops_only_for_a_request_after_its_start(case):
+def test_the_run_owner_stops_only_while_a_stop_is_in_force(case):
     case.store.start_run(1, branch="foragent/issue-1", worktree=case.ctx.repo_root / "wt")
-    orch_stop.raise_if_requested(case.ctx, 1)  # No request yet.
+    orch_stop.raise_if_requested(case.ctx, 1)  # No stop yet.
     path = case.store.root / "stop-requests.jsonl"
-    path.write_text(json.dumps({"at": (NOW - timedelta(seconds=1)).isoformat(), "why": "old"}) + "\n")
-    orch_stop.raise_if_requested(case.ctx, 1)  # A request before this run started is not for it.
+    path.write_text(json.dumps({"at": NOW.isoformat(), "kind": "stop", "why": "old", "held": []}) + "\n"
+                    + json.dumps({"at": NOW.isoformat(), "kind": "resume", "why": "", "resumed": []}) + "\n")
+    orch_stop.raise_if_requested(case.ctx, 1)  # A stop that was resumed is not in force.
     with path.open("a") as stream:
-        stream.write(json.dumps({"at": NOW.isoformat(), "why": "Jin requested a stop"}) + "\n{torn")
+        stream.write(json.dumps({"at": NOW.isoformat(), "kind": "stop", "why": WHY, "held": []}) + "\n{torn")
     with pytest.raises(ExecutorStopped) as stopped:
         orch_stop.raise_if_requested(case.ctx, 1)
-    assert (stopped.value.outcome, str(stopped.value)) == ("stopped", "Jin requested a stop")
-    case.store.finish_run(1, outcome="stopped", detail="Jin requested a stop")
+    assert (stopped.value.outcome, str(stopped.value)) == ("stopped", WHY)
+    case.store.finish_run(1, outcome="stopped", detail=WHY)
     orch_stop.raise_if_requested(case.ctx, 1)  # A finished run has nothing left to stop.

@@ -260,7 +260,6 @@ def _implement_and_publish(
                 else:
                     if not reuse:
                         _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
-                        orch_stop.raise_if_requested(ctx, n)  # A project stop: save and finish here.
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:
@@ -364,7 +363,15 @@ def review_only(
     previous = ctx.store.get_run(n)
     started = False
     admission = ExitStack()
+    if (stop := orch_stop.active(ctx.store)) is not None:  # The one start admission (#1491).
+        from foragent.i18n import text
+
+        _append(ctx.store.log_path(n), text("orch_stop_start_refused", ctx.config.language, n=n, why=stop))
+        return "stopped"
+    owned = ExitStack()  # This review owns its run: after a stop it takes no external step (stop_gate).
     try:
+        owned.enter_context(orch_stop.owner(ctx.store))
+        ctx = orch_stop.guarded(ctx)
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
         if until := ctx.store.github_wait_until(ctx.now()):
@@ -405,30 +412,41 @@ def review_only(
         detail = str(exc)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
-        if not started:
+        if started and (stop := orch_stop.active(ctx.store)) is not None:
+            outcome, detail = "stopped", stop  # Whatever failed after a stop, the stop decides the exit.
+        elif not started:
             if not isinstance(exc, TrackerError) or not exc.waits:
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
-        _append(ctx.store.log_path(n), traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome, detail = "limit-wait", orch_github.cause(exc)
-        else:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
+        if outcome != "stopped":
+            _append(ctx.store.log_path(n), traceback.format_exc())
+            if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+                outcome, detail = "limit-wait", orch_github.cause(exc)
+            else:
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Review runner exited: {exc}"
         raise
     finally:
         admission.close()
+        owned.close()  # The exit below is the owner's own save and finish.
+        if started and outcome != "merged" and (stop := orch_stop.active(ctx.store)) is not None:
+            outcome, detail = "stopped", stop
+            try:
+                _save_review_worktree(n, ctx, worktree)
+            except Exception as exc:  # A failed save is logged; the run still finishes as stopped.
+                _append(ctx.store.log_path(n), f"WIP preservation failed: {type(exc).__name__}: {exc}")
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    # A stopped run keeps `running` for the tick's stop restore (_restore_stopped).
+                    if outcome not in {"limit-wait", "stopped"}:
                         current = ctx.tracker.current_issue(n)
                         if (outcome != "remote-ended" and current.state == "open"
                                 and not current.labels & {BLOCKED, READY}):
@@ -444,6 +462,15 @@ def review_only(
                     finally:
                         kick_tick(ctx.repo_root)
     return outcome
+
+
+def _save_review_worktree(n: int, ctx: RunContext, worktree: Path) -> None:
+    """A stopped review keeps what it wrote: the owner's WIP save on the issue branch."""
+    git = ctx.git.at(worktree)
+    if not (worktree / ".git").is_file():
+        return
+    git.attach_branch(f"foragent/issue-{n}")
+    _preserve_failed_implementation(n, ctx, git, "stopped", approval=ctx.store.load_approval(n))
 
 
 def _admission_seconds(ctx: RunContext) -> int:
@@ -486,6 +513,8 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
                                        process_identities=observe_tree(roots=(os.getpid(),)))
         if run.status == "running":
             admission.close()  # The record now names this live process: it holds the slot.
+        orch_stop.raise_if_requested(ctx, n)  # A project stop: this run starts no step (#1491).
+        ctx = orch_stop.guarded(ctx)  # From here its GitHub calls and waits ask the stop (stop_gate).
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
@@ -500,7 +529,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
                       lane_executor=lane_settings.executor)
         try:
             # Every command's timeout grows by time a talk paused the run (D55 addendum).
-            with extend_deadline(partial(paused_seconds, n, ctx)):
+            with extend_deadline(partial(paused_seconds, n, ctx)), orch_stop.owner(ctx.store):
                 outcome = _execute(n, ctx, worktree)
         except ExecutorStopped as exc:
             outcome = exc.outcome
@@ -513,7 +542,9 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
-        if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
+        if (stop := orch_stop.active(ctx.store)) is not None:
+            outcome, detail = "stopped", stop  # The save already ran; the stop decides the exit.
+        elif isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")

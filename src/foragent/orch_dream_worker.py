@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import difflib
 from datetime import UTC
 import fcntl
@@ -169,7 +169,7 @@ def _changed_lines(before: str, after: str) -> int:
 
 def run_dream(lane: str, ctx: RunContext) -> int:
     """The dream worker; it owns runs/dream-<lane>.json while its process lives."""
-    from foragent import usage_events
+    from foragent import orch_stop, stop_gate, usage_events
     from foragent.executors import classify_result
     from foragent.processes import track_process_group
 
@@ -186,7 +186,15 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     # The record is finished last, after the worktree cleanup: once it says finished, this worker
     # touches nothing a later dream of the lane could own (D95).
     final = ("error", "Dream worker ended before finishing.")
+    if (stop := orch_stop.active(store)) is not None:  # A project stop: this dream takes no step (#1491).
+        store.finish_dream(lane, "stopped", stop)
+        return 1
+    owned = ExitStack()  # The worker owns its dream: after a stop it takes no external step (stop_gate).
+    git = memory_dir = before_files = memory = None
+    committed = False
     try:
+        owned.enter_context(orch_stop.owner(store))
+        ctx = orch_stop.guarded(ctx)
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
         created = True  # Cleaned up in finally even when the branch cannot be prepared.
@@ -226,6 +234,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
                 return executor.run(worktree=worktree, prompt=text, model=model,
                                     timeout_s=config.max_runtime_minutes * 60, log_path=log, **options)
 
+        stop_gate.check()  # A stop during the preparation: the turn does not start.
         try:
             result = ctx.poll_hook(execute, poll)
         finally:
@@ -236,6 +245,7 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             return 1
         _keep_worker_files(memory_dir, before_files)
         proposal = worktree / ".foragent" / f"media-{lane}.md"
+        stop_gate.check()  # A stop during the turn: the media file and the PR are not published.
         if proposal.is_file():
             with log.open("a", encoding="utf-8") as stream:
                 stream.write(f"foragent: media {publish_media(proposal, target, bundle.get(target))}\n")
@@ -245,6 +255,8 @@ def run_dream(lane: str, ctx: RunContext) -> int:
             after = memory_file.read_text(encoding="utf-8") if memory_file.exists() else ""
             count = _changed_lines(before, after)
             git.commit_paths([directory], f"Lane {lane} memory: {ctx.now().astimezone().date().isoformat()}")
+            committed = True  # The memory is on the dream branch; only its publication is left.
+            stop_gate.check()
             # Completed only once the PR exists after the push; a failure here ends the dream as error.
             pr = _publish(ctx, git, lane, memory, count, before_files)
         if pr is None:
@@ -255,9 +267,21 @@ def run_dream(lane: str, ctx: RunContext) -> int:
         final = ("dreamed", f"{count} memory lines tidied.")
         return 0
     except Exception as exc:
-        final = ("error", f"Dream failed: {exc}")
-        raise
+        owned.close()
+        if (stop := orch_stop.active(store)) is None:
+            final = ("error", f"Dream failed: {exc}")
+            raise
+        # Every exit under a stop keeps what the dream wrote on its own branch, published nowhere.
+        final = ("stopped", stop)
+        if not committed and git is not None and memory_dir is not None and _files(memory_dir) != before_files:
+            try:
+                git.commit_paths([str(Path(memory).parent)], f"WIP: lane {lane} memory [stopped: {stop}]")
+            except Exception as error:  # The record still says stopped; the log says what was not kept.
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write(f"foragent: stopped dream not saved: {type(error).__name__}: {error}\n")
+        return 1
     finally:
+        owned.close()
         if created:
             try:
                 ctx.git.remove_worktree(worktree)

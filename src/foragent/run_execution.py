@@ -209,6 +209,7 @@ def _available_executor(
             result = _run_executor(n, ctx, executor, spender=spender, on_session=live, **kwargs)
             if on_result is not None:
                 on_result(result)
+            orch_stop.raise_if_requested(ctx, n)  # A stop during the turn: its result takes no further step.
             return result
         except BaseException:
             # run_logged flushes stdout into the log during interruption cleanup.

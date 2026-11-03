@@ -305,8 +305,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     def unusable_error(label: str, error: BaseException) -> str:
         """Re-raise a usage limit or an interrupt; any other error becomes an UNUSABLE note."""
-        if _is_limit(error) or not isinstance(error, Exception):
-            raise error
+        if _is_limit(error) or getattr(error, "outcome", None) == "stopped" or not isinstance(error, Exception):
+            raise error  # A project stop is not an unusable review: the run stops (#1491).
         return failure(label, error)
 
     # Each concurrent reviewer logs to its own file: executors derive per-call output files

@@ -85,6 +85,13 @@ class GitRepo:
         ).stdout
 
     def _call(self, args: list[str]) -> str:
+        command = args
+        while command[:1] in (["-C"], ["-c"]):
+            command = command[2:]
+        if command[:1] in (["push"], ["fetch"], ["ls-remote"]):
+            from foragent import stop_gate
+
+            stop_gate.check()  # A run under a project stop reaches no remote (#1491); its WIP save does.
         try:
             return self._run(args)
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
