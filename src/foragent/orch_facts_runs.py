@@ -240,8 +240,9 @@ def _merges_since_tidy(store: StateStore) -> int:
     latest = max((moment for moment in moments if moment is not None), default=None)
     merged, finished = store.merge_times(), store.finish_times()
     count = 0
+    owner_facts = store.owner_merge_facts()
     for run in store.read_history():
-        if run.outcome != "merged":
+        if not store.run_merged(run, owner_facts=owner_facts):
             continue
         key, started = (run.number, run.started_at), _time(run.started_at)
         moment = _time(merged.get(key))
