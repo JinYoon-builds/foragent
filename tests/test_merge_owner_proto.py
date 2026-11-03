@@ -452,7 +452,7 @@ def test_final_recheck_under_lock(proto, monkeypatch, change):
 
 def test_merge_owner_is_validated_opt_in(tmp_path):
     assert Config().merge_owner is False
-    (tmp_path / ".foragent.yml").write_text("merge_owner: true\n")
+    (tmp_path / ".foragent.yml").write_text("merge_owner: true\ntest_command: uv run pytest\n")
     assert load_config(tmp_path, global_path=tmp_path / "absent").merge_owner is True
     (tmp_path / ".foragent.yml").write_text("merge_owner: yes-please\n")
     with pytest.raises(ConfigError, match="merge_owner must be a boolean"):

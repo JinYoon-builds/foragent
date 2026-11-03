@@ -15,6 +15,9 @@ PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
 
 
 def _owner_fact_matches(value):
+    if (not isinstance(value, dict) or type(value.get("number")) is not int
+            or not isinstance(value.get("started_at"), str)):
+        return False
     fact = value.get("owner_merge")
     if not isinstance(fact, dict) or value.get("owner_merge_started_at") != value["started_at"]:
         return False
@@ -218,7 +221,11 @@ class RunRecordsMixin:
         """One completion fact, independent of the finished worker outcome."""
         history = self.root / "runs.jsonl"
         values = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
-        values.extend(_state.json.loads(path.read_text()) for path in (self.root / "runs").glob("[0-9]*.json"))
+        for path in (self.root / "runs").glob("[0-9]*.json"):
+            try:
+                values.append(_state.json.loads(path.read_text()))
+            except (OSError, ValueError):
+                continue  # Optional owner facts must not break readers of completed history.
         return {(value["number"], value["started_at"]): value["owner_merge"] for value in values
                 if _owner_fact_matches(value)}
 
@@ -343,10 +350,9 @@ class RunRecordsMixin:
         times: dict[tuple[int, str], str] = {}
         for line in history.splitlines():
             value = _state.json.loads(line)
-            if key == "merged_at" and isinstance(value.get("owner_merge"), dict):
-                if not _owner_fact_matches(value):
-                    continue
-                value[key] = value["owner_merge"]["merged_at"]
+            if (key == "merged_at" and not isinstance(value.get(key), str)
+                    and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):
+                value[key] = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
             if isinstance(value.get(key), str):
                 times[value["number"], value["started_at"]] = value[key]
         return times
