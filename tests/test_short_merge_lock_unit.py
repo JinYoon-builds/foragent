@@ -215,8 +215,9 @@ def test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock(run_case, m
     queue = [json.loads(line) for line in (case.store.root / "merge-queue.jsonl").read_text().splitlines()]
     review_events = [row["event"] for row in queue if row.get("started_at") == record.started_at]
     if merged:
-        # A merged run leaves no withdrawn entry; the turn passes when its run stops.
-        assert review_events == ["ready", "turn"]
+        # A merged run leaves no withdrawn entry; the turn passes when its run stops. A moved
+        # base is refreshed aside (#1760): the seat steps aside, comes back, then takes its turn.
+        assert review_events == (["ready", "aside", "back", "turn"] if change == "base" else ["ready", "turn"])
     if change == "base":
         log = case.store.log_path(1).read_text()
         assert log.count("re-verifying") == 1, "The moved base is merged in and re-verified once"
