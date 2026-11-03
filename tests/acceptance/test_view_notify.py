@@ -11,6 +11,22 @@ def notify_store(tmp_path, monkeypatch):
     return store
 
 
+def relayed(store):
+    """Alerts the planning session relays to the person (#1650: the unread push outbox is gone)."""
+    from datetime import UTC, datetime
+
+    from foragent import orch_inbox
+
+    notices, _ = orch_inbox.recent_notices(store, datetime.min.replace(tzinfo=UTC))
+    rows = []
+    for notice in notices:
+        if notice.get("status") in ("not pushed", "failed"):
+            continue
+        title, _, line = notice["summary"].partition(": ")
+        rows.append({"title": title, "line": line, "link": None})
+    return rows
+
+
 @pytest.mark.parametrize("target", [None, "claude-push"])
 def test_default_and_cli_append_push_outbox_and_none_is_silent(git_history, tmp_path, monkeypatch, target):
     import json
@@ -28,13 +44,13 @@ def test_default_and_cli_append_push_outbox_and_none_is_silent(git_history, tmp_
                         processes.append((a, kw)) or SimpleNamespace(returncode=0, stdout="", stderr=""))
     send(Config(repo="owner/repo", notify=target), "Title", "Line", "https://example.test/issue/1")
     assert main(["notify", "--title", "CLI title", "--line", "CLI line"]) == 0
-    path = case.store.root / "push-outbox.jsonl"
-    records = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [(row["title"], row["line"]) for row in records] == [("Title", "Line"), ("CLI title", "CLI line")]
-    assert records[0]["link"] == "https://example.test/issue/1"
-    before = path.read_bytes()
+    records = relayed(case.store)
+    assert [(row["title"], row["line"]) for row in records] == [
+        ("Title", "Line https://example.test/issue/1"), ("CLI title", "CLI line")]
+    assert not list(case.store.root.rglob("*outbox*"))
+    before = relayed(case.store)
     send(Config(repo="owner/repo", notify="none"), "Ignored", "Ignored", None)
-    assert path.read_bytes() == before
+    assert relayed(case.store) == before
     assert processes == []
 
 
@@ -137,5 +153,5 @@ def test_delivery_failure_is_logged_without_escaping_and_inspect_uses_default_ou
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw:
                         processes.append((a, kw)) or SimpleNamespace(returncode=0, stdout="", stderr=""))
     assert main(["inspect", "notify"]) == 0
-    assert (case.store.root / "push-outbox.jsonl").is_file()
+    assert relayed(case.store) and not list(case.store.root.rglob("*outbox*"))
     assert processes == []

@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -92,9 +92,11 @@ def tick(ctx: TickContext) -> TickReport:
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
+            timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
             with tick_processes(ctx.store) as snapshot:
-                cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
