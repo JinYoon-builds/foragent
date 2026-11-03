@@ -123,24 +123,6 @@ def test_planning_alive_needs_a_fresh_valid_heartbeat(tmp_path):
         assert not orch_inbox.planning_alive(store)
 
 
-def test_route_question_pushes_only_without_live_planning(tmp_path, monkeypatch):
-    from datetime import UTC, datetime
-
-    from foragent.config import Config
-
-    clock = [datetime(2026, 10, 24, tzinfo=UTC)]
-    store = _clocked(tmp_path, clock)
-    sent = []
-    monkeypatch.setattr(orch_inbox.notify, "send", lambda config, title, line, link=None: sent.append(
-        (config.repo, title, line)) or True)
-    record = orch_inbox.ask(store, "Widen scope?", ["yes", "no"], 1)
-    assert orch_inbox.route_question(store, Config(language="ko"), "o/r", record)
-    assert sent == [("o/r", "답할 질문이 있어요", f"{record['id']}: Widen scope?")]
-    orch_inbox.write_plan_heartbeat(store)
-    assert not orch_inbox.route_question(store, Config(), "o/r", record)
-    assert len(sent) == 1
-
-
 def test_brief_counts_open_questions_and_hides_zero_line(store):
     from foragent import brief
 

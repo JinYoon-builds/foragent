@@ -1,0 +1,4 @@
+Portions of the review instructions in skills/review-procedure/SKILL.md are adapted from Anthropic's code-review plugin, commands/code-review.md, distributed under the Apache License 2.0.
+Source: https://github.com/anthropics/claude-plugins-official/tree/main/plugins/code-review
+Changes: Foragent adds a fatal-path perspective, a grounding rule (Goal line, locked test or concrete breaking input), spec questions and scoring in every review round.
+The upstream plugin has no NOTICE file. The Apache license is reproduced without modification.
