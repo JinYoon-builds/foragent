@@ -40,6 +40,8 @@ class Issue:
     dependencies_summary: tuple[tuple[str, int], ...] | None = None
     # Why GitHub closed the issue ("completed", "not_planned", ...); None while open or unknown.
     state_reason: str | None = None
+    # When GitHub created the issue; None when the read did not carry it.
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1031,7 +1033,7 @@ def _issue(data: dict[str, Any]) -> Issue:
         frozenset(label["name"] for label in data.get("labels", [])),
         data["state"], "pull_request" in data, data.get("updated_at"),
         _summary(data.get("sub_issues_summary")), _summary(data.get("issue_dependencies_summary")),
-        data.get("state_reason"),
+        data.get("state_reason"), data.get("created_at"),
     )
 
 

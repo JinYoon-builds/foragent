@@ -277,7 +277,8 @@ def test_duplicate_running_entries_keep_the_question_in_any_order(states, with_r
     snapshot.status["active_runs"] = [_run(7)] if with_run else []
     assert _classes(snapshot, row)[7] == "question"
     word, click = _acorn_and_click(snapshot, tmp_path, 7)
-    assert word == "question" and watch.text("lane_bubble_question_click", "en") in click
+    expected = watch.text("lane_bubble_question_click", "en", who=watch.text("question_person", "en"))
+    assert word == "question" and expected in click
 
 
 @pytest.mark.parametrize("with_run", [True, False], ids=["active-run", "listed-only"])

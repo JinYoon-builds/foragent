@@ -13,3 +13,6 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Prove locks can pass](prove-locks-can-pass.md) — run related locks and a scratch prototype before publishing; five stops of this class on 11-01
 - [Read result before reporting](read-result-before-reporting.md) — never report an outcome in the same step as the command
 - [rerun-review needs CODEX_HOME](rerun-review-needs-codex-home.md) — export the live account first; empty review plus "Error finding codex home" is this
+- [Lane draft runs load](lane-draft-runs-load.md) — draft agents' pytest sits outside test slots; one file, nice 15, targets only
+- [Merge owner before launch](merge-owner-before-launch.md) — Jin 11-03: #1502 split starts 11-04, first card to Jin; no new merge-path patches
+- [Order after 11-03](order-after-11-03.md) — merge owner, then 2-3 days cleanup, then features; no new internal-mechanism features

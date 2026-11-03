@@ -18,6 +18,9 @@ def add(commands) -> None:
 def run(args) -> int:
     cli = facade()
     root = args.repo_root.resolve()
+    if not (root / ".foragent.yml").is_file():
+        print("foragent: not a Foragent repo: .foragent.yml missing; run `fa init` first", file=cli.sys.stderr)
+        return 1
     config = cli.load_config(root)
     from foragent.roles import role_drift
     from foragent.runner_doctor import lane_skill_drift

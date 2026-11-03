@@ -22,6 +22,7 @@ TABLE = {
     'docs': [],
 }
 TABLE = {role: [f'principle-{name}' for name in names] for role, names in TABLE.items()}
+TABLE['reviewers'].append('review-procedure')  # #1651: the review procedure is a reviewer default skill.
 ALL = {name for names in TABLE.values() for name in names}
 DOCUMENTS = ('docx', 'pdf', 'pptx', 'xlsx')
 

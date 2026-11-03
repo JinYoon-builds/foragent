@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -92,9 +92,11 @@ def tick(ctx: TickContext) -> TickReport:
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
+            timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
             with tick_processes(ctx.store) as snapshot:
-                cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
@@ -111,7 +113,8 @@ def tick(ctx: TickContext) -> TickReport:
                     if not exc.is_rate_limit:
                         raise
                     return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
-                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
+                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
+                                     start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
                 return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
@@ -304,10 +307,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
     roles = timed("role_check", orch_role_schedule.startable, ctx, sample)  # So is a due role session.
+    drafts = timed("draft_check", orch_draft.startable, ctx, sample)  # Each placeholder issue's test draft too (#1729).
     if not ready:
         budget = timed("machine_budget", _machine_budget, ctx, ready, sample)
         orch_dream.start(ctx, dreams, budget, report)
         orch_role_schedule.dispatch(ctx, roles, budget, report)
+        orch_draft.start(ctx, drafts, budget, report)
         _reopen_view(ctx, report)
         return report
 
@@ -318,6 +323,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         return report
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
     orch_role_schedule.dispatch(ctx, roles, ctx._tick_budget, report)  # Then what the dream left.
+    orch_draft.start(ctx, drafts, ctx._tick_budget, report)  # Drafts never hold a ready issue's slot.
     _reopen_view(ctx, report)
     return report
 

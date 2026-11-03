@@ -157,6 +157,46 @@ def compare(checks, count=2):
                       expected_shards=range(count))
 
 
+
+@pytest.mark.parametrize("approve", [True, False], ids=["later-main", "unapproved"])
+def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkeypatch, approve):
+    """Main can move between fetch and push; CI then measures that later base (#1688)."""
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks="ci", checks_fallback=None, test_command="pytest", ci_shards=2)
+    values = [report(), report(1)]  # both shards measured "base"
+    for value in values:
+        value["report"]["scope"] = measurement_scope(config, tmp_path, [])
+    asked, sleeps = [], []
+    git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
+    tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
+                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
+                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "flag", lambda *args: None)
+
+    def later_base(sha):
+        asked.append(sha)
+        return approve
+
+    deadline = BASE_TIME.timestamp()
+    if approve:
+        evidence = ci_mode.require_comparison(attempt, 99, "head", base_sha="pushed", deadline=deadline,
+                                              later_base=later_base)
+        assert asked == ["base"] and sleeps == []
+        assert evidence.base_sha == "base" and evidence.reports is not None
+        assert evidence.current(1, ctx, git, 99, "head", "base", "pass")
+        assert not evidence.current(1, ctx, git, 99, "head", "pushed", "pass")
+    else:
+        with pytest.raises(ExecutorStopped):
+            ci_mode.require_comparison(attempt, 99, "head", base_sha="pushed", deadline=deadline,
+                                       later_base=later_base)
+        assert asked == ["base"]
+
 @pytest.mark.parametrize("damage", ["non-json-extra", "circular-extra", "overflow-duration",
                                    "transport-key", "transport-type", "transport-json", "transport-recursion", "transport-overflow"])
 def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(tmp_path, monkeypatch, damage):
@@ -1400,6 +1440,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     reads = []
     heads = set()
     locks = []
+    measured = {}  # CI measures each pushed head once; a later main move never rewrites it
     merge_lock = case.store.merge_lock
     sleep = case.ctx.sleep
 
@@ -1408,14 +1449,15 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         heads.add(head)
         if changed[0] and change == 'missing' or not changed[0] and change == 'appeared':
             return []
-        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
+        base = measured.setdefault(head, case.history.tip)
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), base)
         values = [report(), report(1)]
         for value in values:
             value['run']['head_sha'] = value['artifact']['workflow_run']['head_sha'] = head
             if changed[0] and change == 'producer':
                 value['run']['id'] = value['artifact']['workflow_run']['id'] = 43
             payload = value['report']
-            payload.update(base_sha=case.history.tip, head_sha=head, excluded=excluded,
+            payload.update(base_sha=base, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
             if changed[0] and change in {'regression', 'appeared'}:
                 payload['head']['passing_ids'] = []
@@ -1451,11 +1493,12 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     case.ctx.sleep = unlocked_sleep
     outcome = runner.review_only(1, case.ctx, repair_ci=False) if reviewed else runner.run_issue(1, case.ctx)
 
-    # Both paths refresh a moved base on their merge turn (#712).
+    # Both paths recheck a moved base on their merge turn (#712); only review-only
+    # merges a neutral docs move into the head, implementation reuses it (#1688).
     if change in {'producer', 'base'}:
         assert outcome == 'merged'
         assert len(locks) == 2
-        assert len(heads) == (2 if change == 'base' else 1)
+        assert len(heads) == (2 if change == 'base' and reviewed else 1)
     else:
         assert outcome != 'merged' and not case.tracker.merged_prs
     if change in {'producer', 'regression', 'missing'}:

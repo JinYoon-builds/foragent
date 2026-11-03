@@ -87,6 +87,12 @@ class ComparisonEvidence:
     reports: str | None = None
     # A local fallback pins the CI reports it saw; new reports must be compared again.
     fallback_reports: str | None = None
+    # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
+    accepted_sha: str | None = None
+
+    def follow(self, base_sha):
+        """The same evidence, accepted on a base the caller proved result-neutral."""
+        return replace(self, accepted_sha=base_sha)
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         """One non-waiting read; changed evidence must be checked again unlocked."""
@@ -96,8 +102,9 @@ class ComparisonEvidence:
 
     def _refused(self, n, ctx, git, pr, head, base_sha, status):
         """Why this read no longer accepts the evidence, as (reason, detail), or None."""
-        if self.base_sha != base_sha or self.head_sha != head:
-            return "revision-moved", f"accepted {self.base_sha}/{self.head_sha}, now {base_sha}/{head}"
+        accepted = self.accepted_sha or self.base_sha
+        if accepted != base_sha or self.head_sha != head:
+            return "revision-moved", f"accepted {accepted}/{self.head_sha}, now {base_sha}/{head}"
         if self.status != status:
             return "status-changed", f"accepted CI {self.status}, now {status}"
         if self.trusted_sha != (trusted := _trusted_sha(git, ctx.tracker)):
@@ -121,7 +128,6 @@ class ComparisonEvidence:
             if isinstance(exc, TrackerError) and exc.waits:
                 raise
             return _refusal(exc), str(exc)
-
 
     def _fallback_refused(self, ctx, head):
         """CI reports that changed after a local fallback replace it; only a failed read adds nothing."""
@@ -365,7 +371,21 @@ def _note_evidence(ctx, n, base_sha, head, reason=None, detail=None):
         return
 
 
-def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None):
+def reported_base(reports):
+    """The one base every shard reports measuring, or None."""
+    try:
+        bases = {item["report"]["base_sha"] for item in reports}
+    except (KeyError, TypeError):
+        return None
+    base = next(iter(bases), None) if len(bases) == 1 else None
+    return base if isinstance(base, str) else None
+
+
+def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
+                       later_base=None):
+    """Compare against ``base_sha``. CI measures whatever base the target had at
+    the push, so a caller may pass ``later_base(sha)`` to accept a report on a
+    later base it approves instead of waiting for a measurement that never comes."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
@@ -409,6 +429,14 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 recorded_reports = serialize_reports(reports)
                 break
             except (MissingComparison, StaleComparison) as exc:
+                reported = reported_base(reports) if isinstance(exc, StaleComparison) else None
+                if (later_base is not None and reported is not None and reported != base_sha
+                        and later_base(reported)):
+                    base_sha = reported
+                    excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
+                    scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
+                    evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
+                    continue
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
                 from foragent import runner
 
@@ -439,6 +467,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     if not infrastructure:
         _note_evidence(ctx, n, base_sha, head)  # A regression below fails the work, not this evidence.
     if lost:
+        from foragent import run_publish
+
+        run_publish._record_failure(n, ctx, pr, head)  # CI measured this head losing tests: a code failure.
         raise AttemptFailure("Acceptance baseline regression (previously passing tests):\n" + "\n".join(lost),
                              attempt.target_branch)
     if infrastructure:
