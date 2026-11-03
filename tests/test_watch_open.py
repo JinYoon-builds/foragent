@@ -176,7 +176,7 @@ def test_open_failure_is_one_localized_nonfatal_line(opening, tmp_path, monkeypa
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했어요" in captured.err
+    assert "대시보드를 열지 못했어요" in captured.err
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])

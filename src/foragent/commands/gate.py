@@ -19,10 +19,7 @@ def add(commands) -> None:
         else:
             command.add_argument("--live", action="store_true",
                                  help="Read GitHub once and refresh the local snapshot first")
-    watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
-    watch_command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    watch_command.add_argument("--once", action="store_true")
-    watch_command.add_argument("--open", action="store_true", help="Open the view in a split or new window and return")
+    add_watch_flags(actions.add_parser("watch", help="Show the dashboard (fa dashboard does the same)"))
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=cli.Path, required=True)
@@ -42,6 +39,15 @@ def add(commands) -> None:
     for name in ("install", "uninstall", "launchd-status"):
         command = actions.add_parser(name)
         command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+
+
+def add_watch_flags(command) -> None:
+    """The dashboard's flags, shared by `fa gate watch` and `fa dashboard`."""
+    cli = facade()
+    command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    command.add_argument("--once", action="store_true", help="Print the dashboard once as plain text")
+    command.add_argument("--open", action="store_true",
+                         help="Open the dashboard in a split or new window and return")
 
 
 def _status(tracker, store, config=None) -> dict:
