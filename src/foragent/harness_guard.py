@@ -272,11 +272,10 @@ def guard_comparison(attempt, head: str, pr: int | None = None) -> None:
 
 def publish_hold(attempt) -> str:
     """Publish a held head for a person (the PR when possible); no publication check overrides the hold."""
-    from foragent import orch_stop, run_publish
+    from foragent import run_publish
     from foragent.run_pr_body import publish_comments
 
     n, ctx = attempt.n, attempt.ctx
-    orch_stop.raise_if_requested(ctx, n)  # A project stop publishes nothing, a held head either.
     try:
         title = f"{ctx.tracker.get_issue(n).title} (#{n})"
         run_publish.commit_exclusions(attempt, title)

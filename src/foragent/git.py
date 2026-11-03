@@ -85,13 +85,6 @@ class GitRepo:
         ).stdout
 
     def _call(self, args: list[str]) -> str:
-        command = args
-        while command[:1] in (["-C"], ["-c"]):
-            command = command[2:]
-        if command[:1] in (["push"], ["fetch"], ["ls-remote"]):
-            from foragent import stop_gate
-
-            stop_gate.check()  # A run under a project stop reaches no remote (#1491); its WIP save does.
         try:
             return self._run(args)
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
@@ -121,8 +114,34 @@ class GitRepo:
                 store = StateStore(path.parent.parent)
                 stack.enter_context(store.worktree_lock(int(path.name[6:])))
             if path.exists():
+                if path.parent.name == "worktrees":
+                    self._keep_unsaved(path, StateStore(path.parent.parent))
                 self._call(["worktree", "remove", "--force", str(path)])
             self._call(["worktree", "prune"])
+
+    def _keep_unsaved(self, path: Path, store: StateStore) -> None:
+        """The one discard point: under a project stop a dirty worktree is saved on its branch first.
+
+        Every exit of a stopped run (dreams, review reruns, verification, publication) ends in
+        this removal, so none can lose uncommitted work (#1491). A detached issue worktree
+        (a review rerun) takes its issue branch; one that cannot be saved raises, and stays.
+        """
+        from foragent import orch_stop
+
+        if (why := orch_stop.active(store)) is None or not (path / ".git").is_file():
+            return
+        tree = self.at(path)
+        if not tree._call(["status", "--porcelain"]).strip():
+            return
+        if tree.merge_in_progress():
+            tree.quit_merge()  # Keep the partial resolution as files; the WIP is not a merge.
+        if tree._call(["rev-parse", "--abbrev-ref", "HEAD"]).strip() == "HEAD":
+            if not (path.name.startswith("issue-") and path.name[6:].isdigit()):
+                raise GitError(f"{path} has unsaved work and no branch; it is kept during the project stop")
+            tree.attach_branch(f"foragent/issue-{path.name[6:]}")
+        tree.stage_changes()
+        if tree.has_staged_changes():
+            tree.commit(f"WIP: unfinished work kept by the project stop [stopped: {why}]")
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

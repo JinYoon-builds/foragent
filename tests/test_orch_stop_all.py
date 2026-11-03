@@ -67,24 +67,24 @@ def test_stop_all_is_repeatable_and_never_resumes_a_lane(case):
     assert orch_stop.active(case.store) == "second"
 
 
-def test_resume_all_lifts_only_what_this_stop_held(case):
+def test_release_lifts_only_what_this_stop_held(case):
     orch_plan.pause(case.store, "api", NOW + timedelta(days=30), "a person held api first")
     orch.stop_all(case.ctx, "first")
     case.clock[0] = NOW + timedelta(minutes=1)
     orch.stop_all(case.ctx, "second")
     orch_plan.pause(case.store, "view", NOW + timedelta(days=30), "a person paused view during the stop")
-    message = orch.resume_all(case.ctx, "Jin is back")
+    message = orch.release(case.ctx, "Jin is back")
     assert "lanes resumed: main" in message
     assert orch_stop.active(case.store) is None
     assert orch_plan.lane_paused(case.store, "api", case.clock[0]), "Held before the stop: stays held"
     assert orch_plan.lane_paused(case.store, "view", case.clock[0]), "A person's own later pause stays"
     assert not orch_plan.lane_paused(case.store, "main", case.clock[0])
     assert len(_events(case.store, "plan-resume")) == 1, "Each held lane is resumed once"
-    assert orch.resume_all(case.ctx) == "No project stop is in force; nothing was changed."
+    assert orch.release(case.ctx) == "No project stop is in force; nothing was changed."
     assert len(_events(case.store, "plan-resume")) == 1
     last = json.loads((case.store.root / "stop-requests.jsonl").read_text().splitlines()[-1])
-    assert (last["kind"], last["why"], last["resumed"]) == ("resume", "Jin is back", ["main"])
-    orch.stop_all(case.ctx, "again")  # A new stop after the resume holds the free lane again.
+    assert (last["kind"], last["why"], last["resumed"]) == ("release", "Jin is back", ["main"])
+    orch.stop_all(case.ctx, "again")  # A new stop after the release holds the free lane again.
     assert orch_stop.active(case.store) == "again"
     assert orch_plan.lane_paused(case.store, "main", case.clock[0])
 
@@ -121,7 +121,7 @@ def test_the_run_owner_stops_only_while_a_stop_is_in_force(case):
     orch_stop.raise_if_requested(case.ctx, 1)  # No stop yet.
     path = case.store.root / "stop-requests.jsonl"
     path.write_text(json.dumps({"at": NOW.isoformat(), "kind": "stop", "why": "old", "held": []}) + "\n"
-                    + json.dumps({"at": NOW.isoformat(), "kind": "resume", "why": "", "resumed": []}) + "\n")
+                    + json.dumps({"at": NOW.isoformat(), "kind": "release", "why": "", "resumed": []}) + "\n")
     orch_stop.raise_if_requested(case.ctx, 1)  # A stop that was resumed is not in force.
     with path.open("a") as stream:
         stream.write(json.dumps({"at": NOW.isoformat(), "kind": "stop", "why": WHY, "held": []}) + "\n{torn")

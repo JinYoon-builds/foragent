@@ -8,6 +8,8 @@ on the import path. A check that cannot establish a result refuses too, and says
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
@@ -134,15 +136,26 @@ class _Unavailable(Exception):
     """The check established no result; the first argument is the cause, the second the command."""
 
 
-def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Path, config: Config,
-             language: str, deadline: float) -> list[tuple[str, str]]:
+def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: list[str], work: Path,
+             config: Config, language: str, deadline: float, *, before: str, after: str, conftest: str,
+             timeout: str, slot_timeout: str | None,
+             inspect: Callable[[Path], None] | None = None) -> tuple[int, Path, Path, str]:
+    """Run the project's pytest on exactly ``names`` in a scratch copy of ``base`` plus ``written``.
+
+    A run that executes tests waits for a machine test slot (``slot_timeout`` is its refusal); a short
+    collect-only run passes None and takes no slot, so lane test runs holding every slot never delay it.
+    ``inspect`` sees the finished copy before anything runs and may raise _Unavailable.
+    Returns (exit code, copy, log, command shown). Raises _Unavailable when no run happened or it did not finish.
+    """
     from foragent.order import detect_test_commands
     from foragent.run_checks import _pytest_command
 
-    tree, report, log = work / "tree", work / "collect.xml", work / "collect.log"
+    tree, log = work / "tree", work / "run.log"
     order_scratch.build(git, base, tree)
-    for name, content in selected.items():
+    for name, content in written.items():
         _write(tree, name, content)
+    if inspect is not None:
+        inspect(tree)
     # The clean copy decides, so caller-only project files cannot select a command.
     command = config.test_command or next(iter(detect_test_commands(tree)), None)
     if command is None:
@@ -150,27 +163,40 @@ def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Pa
     pytest = _pytest_command(command)
     if pytest is None:
         raise _Unavailable(text("order_collect_unsupported", language), command)
-    attempted = f"{pytest} --collect-only {shlex.join(selected)}"
+    attempted = f"{pytest} {before} {shlex.join(names)}"
     # Inside the copy: pytest finds the project's configuration from the common folder of its arguments.
     named = tree / ".foragent-collect"
     named.mkdir()
-    (named / "conftest.py").write_text(_COPY_CONFTEST, encoding="utf-8")
-    invocation = (f"{_CALLER_SETTINGS}{pytest} --collect-only {shlex.quote(str(named))} {shlex.join(selected)} "
-                  f"-o junit_family=legacy --junit-prefix= "
-                  f"--junitxml={shlex.quote(str(report))}")
-    # A short collect-only run takes no machine test slot, so lane test runs holding every slot
-    # never delay it; HELD_ENV keeps a `fa test` inside the project's command from queueing either.
-    remaining = deadline - time.monotonic()
+    (named / "conftest.py").write_text(conftest, encoding="utf-8")
+    # Each name is passed as "./name", so pytest reads it as a path: never an option ("-..") or an
+    # argument file ("@..").
+    paths = shlex.join(f"./{name}" for name in names)
+    invocation = f"{_CALLER_SETTINGS}{pytest} {before} {shlex.quote(str(named))} {paths} {after}"
     try:
-        if remaining <= 0:
-            raise TimeoutError(text("order_collect_timeout", language, seconds=int(LIMIT_S)))
-        code, timed_out, _ = processes.run_logged(
-            ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
-            env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
+        # HELD_ENV keeps a `fa test` inside the project's command from queueing for a second slot.
+        with (capacity.hold_test_slot(config.test_slots, deadline=deadline, timed_out=lambda: slot_timeout)
+              if slot_timeout is not None else contextlib.nullcontext()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timeout)
+            code, timed_out, _ = processes.run_logged(
+                ["/bin/sh", "-c", invocation], cwd=tree, timeout_s=remaining, log_path=log,
+                env={**capacity.HELD_ENV, "PYTHONDONTWRITEBYTECODE": "1"})
     except (TimeoutError, OSError) as exc:
         raise _Unavailable(str(exc), attempted) from exc
     if timed_out:
-        raise _Unavailable(text("order_collect_timeout", language, seconds=int(LIMIT_S)), attempted)
+        raise _Unavailable(timeout, attempted)
+    return code, tree, log, attempted
+
+
+def _collect(git: GitRepo, base: str, selected: dict[str, str | bytes], work: Path, config: Config,
+             language: str, deadline: float) -> list[tuple[str, str]]:
+    report = work / "collect.xml"
+    code, tree, log, attempted = run_copy(
+        git, base, selected, list(selected), work, config, language, deadline, before="--collect-only",
+        after=f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report))}",
+        conftest=_COPY_CONFTEST, timeout=text("order_collect_timeout", language, seconds=int(LIMIT_S)),
+        slot_timeout=None)
     errors = _errors(report, tree)
     if errors:
         return errors

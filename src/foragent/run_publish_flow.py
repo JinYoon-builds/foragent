@@ -248,6 +248,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if attempt.rebuilt:
             logs = ctx.tracker.pr_failed_logs(pr, full_text_dir=run_publish.cuts.issue_dir(ctx.store.root, n))
             run_publish._hold_if_not_started(n, ctx, pr, logs)
+            run_publish._record_failure(n, ctx, pr, verified_head_sha)
             raise run_publish.ExecutorStopped(_block_rebuild(attempt, f"CI failed:\n{logs}"))
         run_publish._ci_failure(n, ctx, pr, verified_head_sha, attempt.target_branch)
 
@@ -351,9 +352,6 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
-                from foragent import orch_stop
-
-                orch_stop.raise_if_requested(ctx, n)  # Waits for overlap, the lock and CI can be long.
                 run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)

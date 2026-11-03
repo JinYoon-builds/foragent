@@ -382,3 +382,141 @@ def test_uncollectable_file_is_still_refused_while_lane_tests_hold_every_slot(
         collection_case, lane_tests_hold_every_slot, capsys, action, options):
     assert_refusal(collection_case, capsys, action, *options)
     assert lane_tests_hold_every_slot.running(), f"{action} waited for the lane test run to finish"
+
+
+# --- A changed shared test file breaks other tests that import it (2026-11-03) -------------------
+# An order rewrote the shared acceptance file's NAMES/CHECKLIST. Its own new tests were red on main
+# as expected, but a unit test that imported CHECKLIST and perspective_case from it, and passed on
+# main, broke once the order landed: main CI was red for about 50 minutes. The small project below
+# has the same shape: a shared acceptance file, a passing importer and an importer red on main.
+SHARED = "tests/acceptance/test_review_perspectives.py"
+IMPORTER = "tests/test_review_conflict_paths.py"
+IMPORTER_TEST = "test_panel_has_one_verdict_per_perspective"
+RED_IMPORTER = "tests/test_review_already_red.py"
+PRODUCT = "PERSPECTIVES = ('goal-fidelity', 'concurrency', 'interruption-rollback', 'test-quality')\n"
+SHARED_PATHS = (
+    "import pathlib, sys\n\n"
+    "ROOT = pathlib.Path(__file__).resolve().parents[2]\n"
+    "if str(ROOT) not in sys.path:\n"
+    "    sys.path.insert(0, str(ROOT))\n\n"
+    "import product\n\n"
+)
+SHARED_BASE = SHARED_PATHS + (
+    "NAMES = ('goal-fidelity', 'concurrency', 'interruption-rollback', 'test-quality')\n"
+    "CHECKLIST = tuple(f'{name}: checked' for name in NAMES)\n\n\n"
+    "def perspective_case(count=2):\n"
+    "    return {'reviewers': count, 'perspectives': list(NAMES)}\n\n\n"
+    "def test_review_perspectives_defaults():\n"
+    "    assert product.PERSPECTIVES == NAMES\n"
+)
+# The same kind of change the incident made: new names the product does not have yet.
+SHARED_RENAMED = SHARED_PATHS + (
+    "NAMES = ('rule-documents', 'obvious-bugs', 'git-history', 'earlier-pr-comments', 'code-comments',\n"
+    "         'fatal-path')\n"
+    "CHECKLIST = tuple(f'{name}: checked' for name in NAMES)\n\n\n"
+    "def perspective_case(count=2):\n"
+    "    return {'reviewers': count, 'perspectives': list(NAMES)}\n\n\n"
+    "def test_review_perspectives_defaults():\n"
+    "    assert product.PERSPECTIVES == NAMES\n"
+)
+# A shared name the importer needs is gone, so the importer no longer imports at all.
+SHARED_WITHOUT_CASE = SHARED_PATHS + (
+    "NAMES = ('goal-fidelity', 'concurrency', 'interruption-rollback', 'test-quality')\n"
+    "CHECKLIST = tuple(f'{name}: checked' for name in NAMES)\n\n\n"
+    "def test_review_perspectives_defaults():\n"
+    "    assert product.PERSPECTIVES == NAMES\n"
+)
+# A new lock that is red on main but leaves everything importers use as it was.
+SHARED_EXTENDED = SHARED_BASE + (
+    "\n\nFATAL_PATH = 'fatal-path'\n\n\n"
+    "def test_review_perspectives_gain_fatal_path():\n"
+    "    assert FATAL_PATH in product.PERSPECTIVES, 'red until implemented'\n"
+)
+IMPORTER_PATHS = (
+    "import pathlib, sys\n\n"
+    "ROOT = pathlib.Path(__file__).resolve().parents[1]\n"
+    "for directory in (ROOT, ROOT / 'tests' / 'acceptance'):\n"
+    "    if str(directory) not in sys.path:\n"
+    "        sys.path.insert(0, str(directory))\n\n"
+    "import product\n"
+    "from test_review_perspectives import CHECKLIST, perspective_case\n\n\n"
+)
+IMPORTER_BASE = IMPORTER_PATHS + (
+    f"def {IMPORTER_TEST}():\n"
+    "    case = perspective_case()\n"
+    "    assert len(CHECKLIST) == len(product.PERSPECTIVES)\n"
+    "    assert case['perspectives'] == list(product.PERSPECTIVES)\n"
+)
+RED_IMPORTER_BASE = IMPORTER_PATHS + (
+    "def test_review_already_red():\n"
+    "    assert len(CHECKLIST) == 99, 'red on main before any order'\n"
+)
+
+
+@pytest.fixture
+def importer_case(collection_case):
+    case = collection_case
+    case.history.update({
+        "product.py": PRODUCT, SHARED: SHARED_BASE, IMPORTER: IMPORTER_BASE, RED_IMPORTER: RED_IMPORTER_BASE,
+    })
+    case.git.update_base("main")
+    item = case.plan["issues"][0]
+    item["files"] = ["product.py", SHARED]
+    item["done_when"] = [f"uv run pytest -q {SHARED}"]
+    item["acceptance_files"] = {SHARED: SHARED_RENAMED}
+    return case
+
+
+def assert_importer_refusal(case, capsys, action, *options):
+    before, readers = snapshot(case), len(case.worker_calls)
+    shared = (case.root / SHARED).read_bytes()
+    code, diagnostic = call(case, capsys, action, *options)
+    assert code != 0, f"{action} accepted an order that breaks {IMPORTER}, which passes on main: {diagnostic}"
+    assert IMPORTER in diagnostic, f"The refusal must name the broken importer {IMPORTER}: {diagnostic}"
+    assert RED_IMPORTER not in diagnostic, f"{RED_IMPORTER} was already red on main: {diagnostic}"
+    assert snapshot(case) == before, "Refusal changed publication files, index, origin, issues or waiting orders"
+    assert (case.root / SHARED).read_bytes() == shared, "Refusal changed the shared file in the checkout"
+    assert len(case.worker_calls) == readers, "An importer refusal must precede the preread model"
+    return diagnostic
+
+
+@pytest.mark.parametrize("action,options", [
+    ("publish", []), ("publish", ["--dry-run"]), ("publish", ["--defer", BOUNDARY]), ("preread", ["--json"]),
+])
+def test_changed_shared_file_that_breaks_a_passing_importer_is_refused(importer_case, capsys, action, options):
+    diagnostic = assert_importer_refusal(importer_case, capsys, action, *options)
+    assert IMPORTER_TEST in diagnostic, f"The refusal must name the broken test {IMPORTER_TEST}: {diagnostic}"
+
+
+def test_importer_that_no_longer_imports_is_refused(importer_case, capsys):
+    case = importer_case
+    case.plan["issues"][0]["acceptance_files"] = {SHARED: SHARED_WITHOUT_CASE}
+    diagnostic = assert_importer_refusal(case, capsys, "publish", "--dry-run")
+    assert "perspective_case" in diagnostic, f"The refusal must show why the importer broke: {diagnostic}"
+
+
+def test_changed_shared_file_that_keeps_importers_passing_publishes(importer_case, capsys):
+    case = importer_case
+    item = case.plan["issues"][0]
+    item["acceptance_files"] = {SHARED: SHARED_EXTENDED}
+    for action, options in (("publish", ["--dry-run"]), ("preread", ["--json"])):
+        code, diagnostic = call(case, capsys, action, *options)
+        assert code == 0, f"{action} {' '.join(options)} refused an order whose importers keep passing: {diagnostic}"
+    before = git_command(case.history.origin, "rev-parse", "main")
+    code, diagnostic = call(case, capsys, "publish")
+    assert code == 0, f"publish refused an order whose importers keep passing: {diagnostic}"
+    assert case.events == ["commit", "push"]
+    assert git_command(case.history.origin, "rev-parse", "main") != before
+    assert git_command(case.history.origin, "show", f"main:{SHARED}") == SHARED_EXTENDED.strip()
+    assert len(case.tracker.list_issues()) == 2
+
+
+def test_importer_check_does_not_wait_for_lane_test_runs(importer_case, lane_tests_hold_every_slot, capsys):
+    case, holder = importer_case, lane_tests_hold_every_slot
+    assert_importer_refusal(case, capsys, "publish", "--dry-run")
+    assert holder.running(), "The refusal waited for the lane test run to finish"
+    case.plan["issues"][0]["acceptance_files"] = {SHARED: SHARED_EXTENDED}
+    code, diagnostic = call(case, capsys, "publish")
+    assert code == 0, f"publish was refused while lane tests ran: {diagnostic}"
+    assert holder.running(), "publish waited for the lane test run to finish"
+    assert git_command(case.history.origin, "show", f"main:{SHARED}") == SHARED_EXTENDED.strip()

@@ -49,6 +49,10 @@ def add(commands) -> None:
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
     stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
+    release = orch_actions.add_parser("release", help="The pair of `fa orch stop --all`: lift the project stop "
+                                                      "and resume the lanes it held")
+    release.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    release.add_argument("--why", default="", help="Optional: why the stop ends, kept in the journal")
     dream = orch_actions.add_parser("dream", help="Replace a lane's stale dream with a fresh one")
     dream.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     dream.add_argument("--redo", metavar="LANE", required=True,
@@ -162,4 +166,6 @@ def run(args) -> int:
         if args.all == (args.number is not None):
             raise SystemExit("fa orch stop: give an issue number or --all, not both")
         print(orch.stop_all(ctx, args.why) if args.all else orch.stop(ctx, args.number, args.why))
+    elif args.action == "release":
+        print(orch.release(ctx, args.why))
     return 0

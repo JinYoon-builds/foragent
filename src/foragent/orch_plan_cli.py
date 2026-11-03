@@ -48,12 +48,8 @@ def add_parsers(orch_actions, queue) -> None:
     pause.add_argument("lane")
     pause.add_argument("--until", required=True, help="ISO time; without a timezone it is local time")
     pause.add_argument("--why", required=True)
-    resume = orch_actions.add_parser("resume", help="Remove a lane's plan pause, or --all: lift the project stop")
-    resume.add_argument("lane", nargs="?")
-    resume.add_argument("--all", action="store_true",
-                        help="The pair of `fa orch stop --all`: lift the project-wide stop and resume the lanes "
-                             "it held; a lane held before the stop stays held")
-    resume.add_argument("--why", default="", help="With --all: why the stop ends, kept in the record")
+    resume = orch_actions.add_parser("resume", help="Remove a lane's plan pause")
+    resume.add_argument("lane")
     plan = orch_actions.add_parser("plan", help="Show the plan, or set lane widths, file overlap limits and expiry")
     plan.add_argument("--width", action="append", default=[], metavar="LANE=N",
                       help="Cap a lane's running runs (N >= 1), or LANE=off to clear; may repeat")
@@ -133,22 +129,6 @@ def run(args, store, config) -> None:
             until = _plan_time("pause", args.until, language)
             item = plan_module.pause(store, args.lane, until, args.why, args.by)["paused"][args.lane]
             print(text("orch_plan_paused", language, lane=args.lane, **item))
-            return
-        if args.action == "resume" and args.all == (args.lane is not None):
-            _fail("fa orch resume: give a lane or --all, not both")
-        if args.action == "resume" and args.all:
-            import time
-            from types import SimpleNamespace
-
-            from foragent import orch_stop
-            from foragent.orch import OrchError
-
-            ctx = SimpleNamespace(store=store, config=config, now=store._now, monotonic=time.monotonic,
-                                  sleep=time.sleep)
-            try:
-                print(orch_stop.resume_all(ctx, args.why))
-            except OrchError as exc:
-                _fail(str(exc))
             return
         if args.action == "resume":
             removed = plan_module.resume(store, args.lane, args.by)

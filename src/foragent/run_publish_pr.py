@@ -12,12 +12,7 @@ if TYPE_CHECKING:
     from foragent.state import Run
 
 
-def _push_branch(attempt: Implementation, *, saving: bool = False) -> None:
-    """Push the run's branch; only the WIP save (``saving``) still pushes after a project stop."""
-    if not saving:
-        from foragent import orch_stop
-
-        orch_stop.raise_if_requested(attempt.ctx, attempt.n)  # A new head reaches CI and the PR.
+def _push_branch(attempt: Implementation) -> None:
     if attempt.rebuilt:
         attempt.git.push(attempt.branch, lease=attempt.rebuild_lease)
         attempt.rebuild_lease = attempt.git.head_sha()

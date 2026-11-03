@@ -24,9 +24,7 @@ def _preserve_failed_implementation(
     its executor ended (it passes `push_branch`), or `owned_deletions` (`fa orch
     stop`'s save of a killed tree under the tick lock).
     """
-    from foragent import stop_gate
-
-    with stop_gate.saving(), ctx.store.worktree_lock(n):  # A stopped run's save reaches its branch (#1491).
+    with ctx.store.worktree_lock(n):
         # Recheck only after acquiring the lock: a competing cleanup may have
         # removed the worktree while we waited. A parent repository is no save.
         if not (git.root / ".git").is_file():

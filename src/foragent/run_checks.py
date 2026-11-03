@@ -73,18 +73,13 @@ def _check(
     elapsed: list[float] = []
 
     def timed(env):
-        from foragent import stop_gate
-
-        stop_gate.check()  # Every check of a run owner: none starts under a project stop, even after its slot wait,
         started = clock() if clock is not None else None
         try:
-            result = runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
-                                       env=env)
+            return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
+                                     env=env)
         finally:
             if started is not None:
                 elapsed.append(max(0.0, clock() - started))
-        stop_gate.check()  # and one stopped during the command leaves no result to handle or clean up.
-        return result
 
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.

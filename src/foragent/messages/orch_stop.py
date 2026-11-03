@@ -10,16 +10,16 @@ MESSAGES = {
         "orch_stop_failed": "#{n}: the run was not stopped: {actions}",
         "orch_stop_done": "#{n}: stopped; unfinished work kept on foragent/issue-{n}. Why: {why}",
         "orch_stop_all_busy": "fa orch stop --all: the gate is busy; try again. Nothing was changed.",
-        "orch_stop_all_held": "Project stop recorded; no new run starts in lanes {lanes} until you resume "
-                              "them (fa orch resume --all). Why: {why}",
+        "orch_stop_all_held": "Project stop recorded; no new run starts in lanes {lanes} until you release "
+                              "it (fa orch release). Why: {why}",
         "orch_stop_all_owner": "#{n}: saves its unfinished work on foragent/issue-{n} and stops when its "
                                "current step returns.",
         "orch_stop_role_refused": "{role} not started: a project stop is in force ({why}); "
-                                  "fa orch resume --all lifts it.",
+                                  "fa orch release lifts it.",
         "orch_stop_start_refused": "#{n} not started: a project stop is in force ({why}); "
-                                   "fa orch resume --all lifts it.",
-        "orch_resume_all_none": "No project stop is in force; nothing was changed.",
-        "orch_resume_all_done": "Project stop lifted; lanes resumed: {lanes}. Lanes held before the stop stay held.",
+                                   "fa orch release lifts it.",
+        "orch_release_none": "No project stop is in force; nothing was changed.",
+        "orch_release_done": "Project stop lifted; lanes resumed: {lanes}. Lanes held before the stop stay held.",
     },
     "ko": {
         "orch_stop_why_required": "fa orch stop: --why에 멈추는 이유를 적어 주세요. 아무것도 바꾸지 않았어요.",
@@ -31,13 +31,13 @@ MESSAGES = {
         "orch_stop_done": "#{n}: 멈췄어요. 끝내지 못한 작업은 foragent/issue-{n}에 남겼어요. 이유: {why}",
         "orch_stop_all_busy": "fa orch stop --all: gate가 바빠요. 다시 시도해 주세요. 아무것도 바꾸지 않았어요.",
         "orch_stop_all_held": "프로젝트 정지를 기록했어요. 다시 풀기 전까지 레인 {lanes}에서 새 실행을 "
-                              "시작하지 않아요(fa orch resume --all). 이유: {why}",
+                              "시작하지 않아요(fa orch release). 이유: {why}",
         "orch_stop_all_owner": "#{n}: 지금 단계가 끝나면 끝내지 못한 작업을 foragent/issue-{n}에 남기고 멈춰요.",
         "orch_stop_role_refused": "{role}을 시작하지 않았어요. 프로젝트 정지가 걸려 있어요({why}). "
-                                  "fa orch resume --all로 풀어요.",
+                                  "fa orch release로 풀어요.",
         "orch_stop_start_refused": "#{n}을 시작하지 않았어요. 프로젝트 정지가 걸려 있어요({why}). "
-                                   "fa orch resume --all로 풀어요.",
-        "orch_resume_all_none": "걸려 있는 프로젝트 정지가 없어요. 아무것도 바꾸지 않았어요.",
-        "orch_resume_all_done": "프로젝트 정지를 풀었어요. 다시 연 레인: {lanes}. 정지 전부터 보류된 레인은 그대로예요.",
+                                   "fa orch release로 풀어요.",
+        "orch_release_none": "걸려 있는 프로젝트 정지가 없어요. 아무것도 바꾸지 않았어요.",
+        "orch_release_done": "프로젝트 정지를 풀었어요. 다시 연 레인: {lanes}. 정지 전부터 보류된 레인은 그대로예요.",
     },
 }

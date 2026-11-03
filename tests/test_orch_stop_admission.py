@@ -42,7 +42,7 @@ def test_a_project_stop_holds_every_start_of_a_tick_until_its_resume(lane, monke
     _tick(lane)
     assert (lane.starts, prebuilds, dreams, roles) == ([], [], [], [])
     assert _reasons(lane, 1) == ["project-stop"], "The stop itself is the one admission answer"
-    orch.resume_all(_control(lane.store, lane.config, lane.now))
+    orch.release(_control(lane.store, lane.config, lane.now))
     _tick(lane)
     assert lane.starts == [1] and prebuilds and dreams == [["orch"]] and roles == [["architect"]]
 
@@ -75,21 +75,6 @@ def test_a_dream_worker_started_after_a_stop_takes_no_step(world):
     assert (dream.status, dream.outcome, dream.detail) == ("finished", "stopped", WHY)
 
 
-def test_a_dream_stopped_during_its_turn_keeps_its_edit_and_publishes_nothing(world, monkeypatch):
-    def edit(worktree):
-        path = worktree / MEMORY
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("a lesson\n")
-        orch.stop_all(_control(world.store, world.config, world.ctx.now), WHY)
-
-    calls, publish = worker_world(world, edit, lambda: pytest.fail("No publication after a stop"))
-    monkeypatch.setattr(orch_dream_worker, "_publish", publish)
-    dreaming(world, pid=None, start=None)
-    assert orch_dream_worker.run_dream("orch", world.ctx) == 1
-    assert calls == {"commits": [[".claude/agent-memory/orch"]], "published": []}
-    assert world.store.get_dream("orch").outcome == "stopped"
-
-
 @pytest.fixture
 def case(git_history, tmp_path, monkeypatch):
     return make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
@@ -113,16 +98,12 @@ def test_a_rerun_review_does_not_start_during_a_stop(case):
     assert case.store.get_run(1) == before and case.reviewer.calls == []
 
 
-def test_a_stop_during_review_only_checks_keeps_new_files_and_writes_nothing(case, monkeypatch):
-    real = run_publish.retitle_for_merge
-    with monkeypatch.context() as first:
-        first.setattr(run_publish, "retitle_for_merge", lambda *a, **k: (orch.stop_all(case.ctx, WHY), real(*a, **k))[1])
-        assert run_issue(1, case.ctx) == "stopped"  # Opens the PR, then stops before merging.
+def test_a_stop_during_review_only_checks_keeps_new_files(case, monkeypatch):
+    case.ctx.config = replace(case.ctx.config, always_human=["feature.txt"])
+    assert run_issue(1, case.ctx) != "merged"  # The PR waits for a person, so it stays open.
     pr = case.tracker.find_pr("foragent/issue-1")
     head = case.tracker.pr_head_sha(pr)
-    case.tracker.remove_labels(1, ["running"])
     case.clock[0] += timedelta(minutes=5)
-    orch.resume_all(case.ctx)
     from foragent import runner
 
     checks = runner._check
@@ -136,26 +117,21 @@ def test_a_stop_during_review_only_checks_keeps_new_files_and_writes_nothing(cas
         return replace(result, exit_code=1)  # Without the stop it would fail and be flagged.
 
     monkeypatch.setattr(runner, "_check", check)
-    comments = len(case.tracker.comments.get(1, []))
-    assert review_only(1, case.ctx, verdict_head=head) == "stopped"
+    review_only(1, case.ctx, verdict_head=head)  # Its failure handling after the stop is a non-goal.
     saved = git_command(case.root, "show", "refs/heads/foragent/issue-1:review-notes.txt")
-    assert saved == "written during the review checks", "The owner's WIP save keeps the new file"
-    labels = case.tracker.get_issue(1).labels
-    assert "running" in labels and "blocked" not in labels, "No failure flag; the tick restores the stop"
-    assert len(case.tracker.comments.get(1, [])) == comments, "No comment after the stop"
-    assert case.tracker.pr_head_sha(pr) == head, "The open PR keeps its head"
-    run = case.store.get_run(1)
-    assert (run.status, run.outcome, run.detail) == ("finished", "stopped", WHY)
+    assert saved == "written during the review checks", "The worktree removal kept the new file"
+    assert case.tracker.pr_head_sha(pr) == head, "The WIP stays local: the open PR keeps its head"
 
 
-def test_no_check_command_runs_while_a_stop_is_in_force(case, monkeypatch):
-    from contextlib import nullcontext
+def test_a_role_child_takes_no_turn_after_a_stop(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
 
-    from foragent import runner
-    from foragent.run_attempt import ExecutorStopped
-    from foragent.run_checks_approved import run_done_when
+    from foragent.config import Config
+    from foragent.state import StateStore
 
-    monkeypatch.setattr(runner, "run_logged", lambda *a, **k: pytest.fail("No check after a stop"))
-    orch.stop_all(case.ctx, WHY)  # Between steps: e.g. while the run waited for the merge lock.
-    with orch_stop.owner(case.store), pytest.raises(ExecutorStopped):
-        run_done_when(1, case.ctx, "true", case.root, case.store.log_path(1), 60, slot=nullcontext())
+    store = StateStore(tmp_path / "state", now=lambda: datetime(2026, 11, 3, tzinfo=UTC))
+    config = Config(repo="o/r")
+    orch.stop_all(_control(store, config, store._now), WHY)  # Between `call` and the child's turn.
+    monkeypatch.setattr(orch_architect.executors, "executor_for", lambda name: pytest.fail("No role turn"))
+    with pytest.raises(orch_architect.ArchitectRefused, match="project stop"):
+        orch_architect.run_session(tmp_path, store, config, "measure", "2026-11-03T00:00:00+00:00", store._now)
