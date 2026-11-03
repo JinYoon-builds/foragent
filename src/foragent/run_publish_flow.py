@@ -351,6 +351,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
+                from foragent import orch_stop
+
+                orch_stop.raise_if_requested(ctx, n)  # Waits for overlap, the lock and CI can be long.
                 run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)

@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, orch_stop
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -260,6 +260,7 @@ def _implement_and_publish(
                 else:
                     if not reuse:
                         _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                        orch_stop.raise_if_requested(ctx, n)  # A project stop: save and finish here.
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:
@@ -335,7 +336,7 @@ def _implement_and_publish(
             _cleanup_after(n, ctx, outcome, "WIP preservation", lambda: _preserve_failed_implementation(
                 n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
                 title=attempt.issue.title, pushed_head=attempt.pushed_head, tracker_available=attempt.tracker_available,
-                push_branch=lambda: _push_branch(attempt),
+                push_branch=lambda: _push_branch(attempt, saving=True),
             ))
 
 

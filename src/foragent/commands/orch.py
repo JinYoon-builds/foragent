@@ -41,9 +41,11 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
-    stop = orch_actions.add_parser("stop", help="Stop a running issue, keep its work and return it to ready")
+    stop = orch_actions.add_parser("stop", help="Stop a running issue (or --all), keep its work and return it to ready")
     stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    stop.add_argument("number", type=int)
+    stop.add_argument("number", type=int, nargs="?")
+    stop.add_argument("--all", action="store_true",
+                      help="Project-wide stop: hold every lane and stop every running issue, keeping its work")
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
     stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
@@ -157,5 +159,7 @@ def run(args) -> int:
     elif args.action == "merge":
         print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
     elif args.action == "stop":
-        print(orch.stop(ctx, args.number, args.why))
+        if args.all == (args.number is not None):
+            raise SystemExit("fa orch stop: give an issue number or --all, not both")
+        print(orch.stop_all(ctx, args.why) if args.all else orch.stop(ctx, args.number, args.why))
     return 0

@@ -48,6 +48,9 @@ def _refresh_reviewed_head(
     if stopped := reverify(new_head):
         return head, stopped
     run_publish._check_publication(git, pr.base, target_sha)
+    from foragent import orch_stop
+
+    orch_stop.raise_if_requested(ctx, n)  # The refreshed head would reach the PR and its CI.
     git.push_head(pr.head, lease=head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
@@ -222,6 +225,9 @@ def _publish_reviewed_in_turn(
                     body=lambda: merge_retitle_body(pr.head, ctx), note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
+                from foragent import orch_stop
+
+                orch_stop.raise_if_requested(ctx, n)  # A project stop never merges, after a review either.
                 run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
                     ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)

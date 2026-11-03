@@ -9,6 +9,11 @@ MESSAGES = {
                             "started for this run ({rule}); nothing was changed.",
         "orch_stop_failed": "#{n}: the run was not stopped: {actions}",
         "orch_stop_done": "#{n}: stopped; unfinished work kept on foragent/issue-{n}. Why: {why}",
+        "orch_stop_all_busy": "fa orch stop --all: the gate is busy; try again. Nothing was changed.",
+        "orch_stop_all_held": "Project stop recorded; no new run starts in lanes {lanes} until you resume "
+                              "them (fa orch resume LANE). Why: {why}",
+        "orch_stop_all_owner": "#{n}: saves its unfinished work on foragent/issue-{n} and stops when its "
+                               "current step returns.",
     },
     "ko": {
         "orch_stop_why_required": "fa orch stop: --why에 멈추는 이유를 적어 주세요. 아무것도 바꾸지 않았어요.",
@@ -18,5 +23,9 @@ MESSAGES = {
                             "시작한 프로세스가 아니에요({rule}). 아무것도 바꾸지 않았어요.",
         "orch_stop_failed": "#{n}: 실행을 멈추지 못했어요: {actions}",
         "orch_stop_done": "#{n}: 멈췄어요. 끝내지 못한 작업은 foragent/issue-{n}에 남겼어요. 이유: {why}",
+        "orch_stop_all_busy": "fa orch stop --all: gate가 바빠요. 다시 시도해 주세요. 아무것도 바꾸지 않았어요.",
+        "orch_stop_all_held": "프로젝트 정지를 기록했어요. 다시 풀기 전까지 레인 {lanes}에서 새 실행을 "
+                              "시작하지 않아요(fa orch resume LANE). 이유: {why}",
+        "orch_stop_all_owner": "#{n}: 지금 단계가 끝나면 끝내지 못한 작업을 foragent/issue-{n}에 남기고 멈춰요.",
     },
 }
