@@ -29,6 +29,9 @@ def add(commands) -> None:
     run_dream = actions.add_parser("run-dream", help="Run one lane's memory dream")
     run_dream.add_argument("lane")
     run_dream.add_argument("--repo-root", type=cli.Path, required=True)
+    run_draft = actions.add_parser("run-draft", help="Draft one placeholder issue's acceptance tests in its lane")
+    run_draft.add_argument("number", type=int)
+    run_draft.add_argument("--repo-root", type=cli.Path, required=True)
     from foragent.commands._orch_architect import add_gate
 
     add_gate(actions)
@@ -224,6 +227,19 @@ def run(args) -> int:
             store.update_run(dream.key, pid=cli.os.getpid(),
                              process_identities=cli.observe_tree(roots=(cli.os.getpid(),)))
             return cli.orch_dream.run_dream(args.lane, cli.RunContext(
+                repo=repo, repo_root=root, tracker=tracker, store=store,
+                config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
+            ))
+    elif args.action == "run-draft":
+        if (draft := store.get_draft(args.number)) is None or draft.status != "running":
+            raise cli.ConfigError(f"no running draft record for issue #{args.number}")
+        # As a dream: admission before the pid claim; the record the tick launched this process for is reused.
+        with cli.capacity.hold_workload(store, config, wait_s=config.max_runtime_minutes * 60, kind="draft"):
+            store.update_run(draft.key, pid=cli.os.getpid(),
+                             process_identities=cli.observe_tree(roots=(cli.os.getpid(),)))
+            from foragent import orch_draft
+
+            return orch_draft.run_draft(args.number, cli.RunContext(
                 repo=repo, repo_root=root, tracker=tracker, store=store,
                 config=config, git=git, now=lambda: cli.datetime.now(cli.UTC),
             ))

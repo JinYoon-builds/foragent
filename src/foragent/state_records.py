@@ -113,8 +113,8 @@ class Run:
 
     @property
     def key(self) -> int | str:
-        """The record's name in runs/: the issue number, or dream-<lane> for a dream run."""
-        return f"dream-{self.lane}" if self.kind == "dream" else self.number
+        """The record's name in runs/: the issue number, dream-<lane> for a dream, draft-<n> for a draft."""
+        return f"dream-{self.lane}" if self.kind == "dream" else f"draft-{self.number}" if self.kind == "draft" else self.number
     # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
     # work_events maps each finished work identity to its first phase event, across executions.
     phase_work_id: str | None = None
