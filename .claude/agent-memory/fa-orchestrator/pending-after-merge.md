@@ -226,3 +226,6 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - Person-wait alarm moved out of #1469 → new issue (bundle 3, parent #1469): fa-roles agent drafting in scratchpad personwait; approve after clean preread.
 - Collect-check vs test slots: issue drafted by fa-order agent (scratchpad collectslot), bundle 1, approve after clean preread. The two FA idea notes (371952c0, b627d402) cannot be removed: --replaces works only for decisions; they stay; at the after-flow-measure flush they land in ideas.md and the docs role links or removes them (PM: no note-delete issue).
 - Collect-slot fix draft (drafts/collect-slot, order s): new locks red on main for the slot timeout, prototype passes. Preread with retries; publish first (it unblocks every other publish).
+- PAUSED all lanes at 00:48Z until 2026-11-03T02:18:37+00:00 (PM: free a test slot to publish collect-slot and the blocked batch, then resume at once).
+- Person-only guard draft (drafts/person-only-commands, view s): 47/50 red on main, 50 pass with prototype; orchestrator kept allowed (resolve, dream merge, settings) — PM to confirm; preread after the paused-window batch.
+- Person-wait alarm draft (drafts/person-wait-alarm, roles s, split from #1469): 8 red on main, 8 pass with prototype; approve after clean preread.
