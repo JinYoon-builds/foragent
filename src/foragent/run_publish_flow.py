@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
         error = exc
         raise
     finally:
-        if outcome != "merged":
+        if not attempt.ctx.config.merge_owner and outcome != "merged":
             run_publish.merge_turn.withdraw(attempt.ctx, place, reason="publish-stopped",
                                             detail=run_publish.merge_turn.stopped_detail(outcome, error))
 
@@ -287,6 +287,21 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if stopped:
             return stopped
         queued_status = None
+        if ctx.config.merge_owner:
+            from foragent.merge_owner import enqueue
+
+            comparison = None
+            if run_publish.enabled(ctx, attempt.target_branch):
+                comparison = run_publish.require_comparison(
+                    attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                    base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                    later_base=measured_later,
+                )
+                measured_base_sha = comparison.base_sha
+                if verified_base_sha != measured_base_sha:
+                    comparison = comparison.follow(verified_base_sha)
+            return enqueue(ctx, n, git, pr, attempt.branch, attempt.target_branch,
+                           verified_head_sha, verified_base_sha, attempt.approval, pr_ready_at, comparison)
         # Wait for the FIFO turn without re-verifying; CI is checked again on getting it (#712).
         waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, verified_head_sha, pr)
         if stopped:

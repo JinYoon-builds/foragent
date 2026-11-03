@@ -55,7 +55,14 @@ def retry(ctx: InspectContext, number: int) -> None:
             return
         raise InspectError(f"issue #{number} is not a tech-failure item; retry refused (no needs-human label)")
     if (pr := ctx.tracker.find_pr(f"foragent/issue-{number}")) is not None:
-        ctx.tracker.close_pr(pr, "Closed by Foragent retry")
+        if ctx.config.merge_owner:
+            from foragent.merge_owner import close_for_repair
+
+            current = ctx.tracker.get_pr(pr)
+            close_for_repair(ctx, number, pr, current.head_sha or ctx.tracker.pr_head_sha(pr), current.base,
+                             branch=f"foragent/issue-{number}", comment="Closed by Foragent retry")
+        else:
+            ctx.tracker.close_pr(pr, "Closed by Foragent retry")
     if not requested:
         ctx.tracker.comment(number, f"{RETRY_MARKER}\nRetry requested.")
     ctx.tracker.remove_labels(number, [NEEDS_HUMAN])

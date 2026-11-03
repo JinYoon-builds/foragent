@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from foragent.policy import Decision
 from foragent.run_checks_approved import acceptance_mismatches
+from foragent.state_local import _approval_identity
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -48,8 +49,8 @@ def _merge_lock(n: int, ctx: RunContext):
                     ctx.store.record_merge_lock(n, (ctx.now() - started).total_seconds())
 
 
-def _policy_allows(decision: Decision, base: str, batch_branch: str | None) -> bool:
-    return decision.kind == "merge" or (
+def _policy_allows(decision: Decision, base: str, batch_branch: str | None, *, authorization=None) -> bool:
+    return authorization is not None or decision.kind == "merge" or (
         decision.kind == "hold_mode" and decision.mode != "careful" and base == batch_branch
     )
 
@@ -92,14 +93,21 @@ def _final_merge_inputs(
 
     status = run_publish._ci_status(ctx, pr, git.root, ready_at)
     issue = ctx.tracker.get_issue(n)
+    if ctx.config.merge_owner and issue.state == "closed":
+        return run_publish._MergeInputs(stop=lambda: "issue-closed")
     saved = ctx.store.load_approval(n)
+    if (ctx.config.merge_owner and saved is not None
+            and _approval_identity(saved) != _approval_identity(approval)):
+        return run_publish._MergeInputs(stop=lambda: "superseded")
     if (run_publish.APPROVED not in issue.labels
             or (approved_body_sha is not None and run_publish.body_hash(issue.body) != approved_body_sha)
             or saved is None or saved.body_sha != approval.body_sha
             or saved.acceptance_blobs != approval.acceptance_blobs):
         return run_publish._MergeInputs(stop=invalid_approval)
-    current = next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None)
-    if current is None or current.head != branch or current.base != base:
+    current = (ctx.tracker.get_pr(pr) if ctx.config.merge_owner else
+               next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None))
+    if (current is None or current.head != branch or current.base != base
+            or ctx.config.merge_owner and (current.state != "open" or current.merged_at)):
         return run_publish._MergeInputs(stop=changed_base)
     parent = ctx.tracker.parent_of(n)
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None

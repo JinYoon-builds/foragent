@@ -66,7 +66,7 @@ def _check_prerequisites(
         (run for run in reversed(ctx.store.read_history()) if run.number == issue.number), None,
     )
     if (
-        latest_run is not None and latest_run.outcome == "merged"
+        latest_run is not None and (ctx.store.run_merged(latest_run) if ctx.config.merge_owner else latest_run.outcome == "merged")
         and scheduler.datetime.fromisoformat(approval.approved_at) <= scheduler.datetime.fromisoformat(latest_run.started_at)
     ):
         if scheduler.READY in issue.labels:

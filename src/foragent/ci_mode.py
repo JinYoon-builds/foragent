@@ -10,7 +10,7 @@ from foragent.git import GitError
 from foragent.reasons import Reason
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
 from foragent.run_baseline import _baseline_exclusions
-from foragent.tracker import TrackerError
+from foragent.tracker import RejectedEvidence, TrackerError
 
 
 class UnusableComparison(ValueError):
@@ -54,11 +54,11 @@ def scope_covers(recorded, required):
             and _excluded_subset(recorded.get("excluded"), required.get("excluded", [])))
 
 
-def _trusted_sha(git, tracker):
+def _trusted_sha(git, tracker, *, strict=False):
     try:
         return git.ref_sha(f"origin/{tracker.pr_default_branch()}")
     except (GitError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.waits:
+        if isinstance(exc, TrackerError) and (strict or exc.waits):
             raise
         return None
 
@@ -105,7 +105,9 @@ class ComparisonEvidence:
             return "revision-moved", f"accepted {accepted}/{self.head_sha}, now {base_sha}/{head}"
         if self.status != status:
             return "status-changed", f"accepted CI {self.status}, now {status}"
-        if self.trusted_sha != (trusted := _trusted_sha(git, ctx.tracker)):
+        trusted = (_trusted_sha(git, ctx.tracker, strict=True) if ctx.config.merge_owner
+                   else _trusted_sha(git, ctx.tracker))
+        if self.trusted_sha != trusted:
             return "trusted-moved", f"accepted default branch {self.trusted_sha}, now {trusted}"
         excluded = _baseline_exclusions(ctx, base_sha, ctx.store.log_path(n))
         if not scope_covers(self.scope, measurement_scope(ctx.config, ctx.repo_root, excluded)):
@@ -123,7 +125,9 @@ class ComparisonEvidence:
             return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                 "missing", "no acceptance reports at this read")
         except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.waits:
+            if isinstance(exc, RejectedEvidence) and ctx.config.merge_owner:
+                return "unusable", str(exc)
+            if isinstance(exc, TrackerError) and (ctx.config.merge_owner or exc.waits):
                 raise
             return _refusal(exc), str(exc)
 
@@ -362,7 +366,7 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None):
+                       later_base=None, wait=True):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves instead of waiting for a measurement that never comes."""
@@ -376,7 +380,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         base_sha = attempt.git.ref_sha(f"origin/{attempt.target_branch}")
     excluded = _baseline_exclusions(ctx, base_sha, attempt.log)
     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-    trusted_sha = _trusted_sha(attempt.git, ctx.tracker)
+    trusted_sha = (_trusted_sha(attempt.git, ctx.tracker, strict=True) if not wait and ctx.config.merge_owner
+                   else _trusted_sha(attempt.git, ctx.tracker))
     evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
     # pull_request executes the head's workflow. Its artifacts are usable only
     # when all acceptance workflows match the default branch exactly.
@@ -422,6 +427,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
                     evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
                     continue
+                if not wait:
+                    raise
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
                 from foragent import runner
 
@@ -434,7 +441,10 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
-        if isinstance(exc, TrackerError) and exc.waits:
+        if not wait and isinstance(exc, (MissingComparison, StaleComparison)):
+            raise
+        if isinstance(exc, TrackerError) and (exc.waits or (
+                not wait and not isinstance(exc, RejectedEvidence))):
             raise
         detail = f"{exc}\n{infrastructure}".strip()
         _note_evidence(ctx, n, base_sha, head, _refusal(exc), detail)

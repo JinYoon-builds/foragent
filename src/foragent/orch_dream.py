@@ -166,7 +166,9 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
             continue
         # By its finish, not by its merges: a dream before an order ended leaves that order's turn.
         covered = last_dream_at(store, lane)
-        merged = {run.number for run, _ in _runs_since(store, lane, None) if run.outcome == "merged"}
+        owner_facts = store.owner_merge_facts() if config.merge_owner else {}
+        merged = {run.number for run, _ in _runs_since(store, lane, None)
+                  if (store.run_merged(run, owner_facts=owner_facts) if config.merge_owner else run.outcome == "merged")}
         if any(children & merged and (covered is None or finished > covered) for children, finished in orders):
             due.append(lane)
     return due
@@ -240,8 +242,15 @@ def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -
             # The tick is the only closer of a redo's stale PR, so a PR opened after the command ran
             # is closed too; the fresh dream may start in this same tick.
             try:
-                ctx.tracker.close_pr(open_pr, "Replaced by a fresh dream (`fa orch dream --redo`); "
-                                              "the lane's notebooks on the base branch are unchanged.")
+                comment = "Replaced by a fresh dream (`fa orch dream --redo`); the lane's notebooks on the base branch are unchanged."
+                if ctx.config.merge_owner:
+                    from foragent.merge_owner import close_for_repair
+
+                    current = ctx.tracker.get_pr(open_pr)
+                    close_for_repair(ctx, None, open_pr, current.head_sha or ctx.tracker.pr_head_sha(open_pr),
+                                     current.base, branch=current.head, comment=comment)
+                else:
+                    ctx.tracker.close_pr(open_pr, comment)
             except TrackerError as exc:
                 if exc.is_rate_limit:
                     scheduler.orch_github.pause(ctx, exc)

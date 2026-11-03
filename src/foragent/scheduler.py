@@ -100,6 +100,10 @@ def tick(ctx: TickContext) -> TickReport:
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
+                if ctx.config.merge_owner:
+                    from foragent import merge_owner
+
+                    merge_owner.start(ctx, cleanup)
                 timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
                 timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
                 if skipped := _github_wait(ctx, {}, "github_wait_check"):
@@ -199,6 +203,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
+        if ctx.config.merge_owner:
+            from foragent.merge_owner import pending
+
+            if pending(ctx.store, issue.number):
+                board.sync_status(ctx, issue, "PR open")
+                return
         if processes_available:  # Cleans a left-over worktree; board writes skip parents.
             repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
