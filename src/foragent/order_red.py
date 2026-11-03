@@ -10,6 +10,7 @@ missing module. Nothing in the checkout, its index, branches or GitHub changes a
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -43,6 +44,27 @@ def _missing(excinfo):
     return None
 
 
+def _in_body(item, excinfo):
+    # A real failure is raised while the test's own function runs. unittest runs setUp, tearDown,
+    # cleanups and its unexpected-success verdict inside the same call, so the phase proves nothing.
+    function = getattr(item, "function", None)
+    if function is None:
+        return False
+    import inspect as _inspect
+
+    function = _inspect.unwrap(getattr(function, "__func__", function))
+    code = getattr(function, "__code__", None)
+    if code is None:
+        return False
+    tb = excinfo.tb
+    while tb is not None:
+        frame = tb.tb_frame.f_code
+        if frame is code or (frame.co_filename, frame.co_firstlineno) == (code.co_filename, code.co_firstlineno):
+            return True
+        tb = tb.tb_next
+    return False
+
+
 class RedReport:
     def __init__(self):
         self.out = open(os.path.join(os.path.dirname(__file__), "red.jsonl"), "a", encoding="utf-8")
@@ -63,13 +85,14 @@ class RedReport:
 
     def pytest_runtest_makereport(self, item, call):
         if call.excinfo is not None:
-            self.calls[(item.nodeid, call.when)] = (call.excinfo.typename, _missing(call.excinfo))
+            self.calls[(item.nodeid, call.when)] = (call.excinfo.typename, _missing(call.excinfo),
+                                                    _in_body(item, call.excinfo))
 
     def pytest_runtest_logreport(self, report):
-        exception, missing = self.calls.get((report.nodeid, report.when), (None, None))
+        exception, missing, in_body = self.calls.get((report.nodeid, report.when), (None, None, False))
         xfail = hasattr(report, "wasxfail") or str(report.longrepr or "").startswith("[XPASS(strict)]")
         self.write({"phase": report.when, "nodeid": report.nodeid, "outcome": report.outcome,
-                    "xfail": xfail, "exception": exception, "missing": missing,
+                    "xfail": xfail, "exception": exception, "missing": missing, "in_body": in_body,
                     "error": str(report.longrepr) if report.failed else ""})
 
 
@@ -152,9 +175,27 @@ def verdict(rows: list[dict], names: list[str], tree: Path, language: str) -> li
             problems.append(say("order_red_missing", test=nodeid, module=call["missing"]))
         elif not call["exception"]:
             problems.append(say("order_red_no_exception", test=nodeid))
+        elif not call["in_body"]:
+            problems.append(say("order_red_outside_body", test=nodeid, error=_short(call["error"], tree)))
         if teardown and teardown["outcome"] == "failed":
             problems.append(say("order_red_teardown_error", test=nodeid, error=_short(teardown["error"], tree)))
     return problems
+
+
+def _inside_only(tree: Path, language: str) -> None:
+    """Refuse a copy holding a link that leads outside it: the run would read the caller's files."""
+    inside = os.path.realpath(tree)
+    outside = []
+    for folder, directories, files in os.walk(tree):
+        for entry in [*directories, *files]:
+            path = os.path.join(folder, entry)
+            if os.path.islink(path):
+                target = os.path.realpath(path)
+                if target != inside and not target.startswith(inside + os.sep):
+                    outside.append(os.path.relpath(path, tree))
+    if outside:
+        raise order_collect._Unavailable(text("order_red_outside_link", language, paths=", ".join(sorted(outside))),
+                                         None)
 
 
 def fetched_base(git: GitRepo, branch: str) -> str:
@@ -192,13 +233,16 @@ def check(plan: dict, root: Path, config, git: GitRepo | None = None) -> dict:
         for name in names:
             try:
                 repo_path(work / "tree", name)
+                if "::" in name:  # pytest would select one test of another file, not run this one.
+                    raise PathError(name)
             except PathError as exc:
                 raise order_collect._Unavailable(text("order_red_bad_path", language, path=name), None) from exc
         code, tree, log, attempted = order_collect.run_copy(
             git, base, carried, names, work, config, language, time.monotonic() + LIMIT_S,
             before="-p no:cacheprovider", after="", conftest=order_collect._COPY_CONFTEST + _REPORTER,
             timeout=text("order_red_timeout", language, seconds=int(LIMIT_S)),
-            slot_timeout=text("order_red_slot_timeout", language))
+            slot_timeout=text("order_red_slot_timeout", language),
+            inspect=lambda tree: _inside_only(tree, language))
         rows = _rows(tree / ".foragent-collect" / _REPORT)
         if code not in {0, 1, 2, 5} or not any(row["phase"] == "items" for row in rows):
             raise order_collect._Unavailable(

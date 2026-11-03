@@ -8,6 +8,7 @@ on the import path. A check that cannot establish a result refuses too, and says
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,11 +138,13 @@ class _Unavailable(Exception):
 
 def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: list[str], work: Path,
              config: Config, language: str, deadline: float, *, before: str, after: str, conftest: str,
-             timeout: str, slot_timeout: str | None) -> tuple[int, Path, Path, str]:
+             timeout: str, slot_timeout: str | None,
+             inspect: Callable[[Path], None] | None = None) -> tuple[int, Path, Path, str]:
     """Run the project's pytest on exactly ``names`` in a scratch copy of ``base`` plus ``written``.
 
     A run that executes tests waits for a machine test slot (``slot_timeout`` is its refusal); a short
     collect-only run passes None and takes no slot, so lane test runs holding every slot never delay it.
+    ``inspect`` sees the finished copy before anything runs and may raise _Unavailable.
     Returns (exit code, copy, log, command shown). Raises _Unavailable when no run happened or it did not finish.
     """
     from foragent.order import detect_test_commands
@@ -151,6 +154,8 @@ def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: li
     order_scratch.build(git, base, tree)
     for name, content in written.items():
         _write(tree, name, content)
+    if inspect is not None:
+        inspect(tree)
     # The clean copy decides, so caller-only project files cannot select a command.
     command = config.test_command or next(iter(detect_test_commands(tree)), None)
     if command is None:
@@ -163,7 +168,10 @@ def run_copy(git: GitRepo, base: str, written: dict[str, str | bytes], names: li
     named = tree / ".foragent-collect"
     named.mkdir()
     (named / "conftest.py").write_text(conftest, encoding="utf-8")
-    invocation = f"{_CALLER_SETTINGS}{pytest} {before} {shlex.quote(str(named))} {shlex.join(names)} {after}"
+    # Each name is passed as "./name", so pytest reads it as a path: never an option ("-..") or an
+    # argument file ("@..").
+    paths = shlex.join(f"./{name}" for name in names)
+    invocation = f"{_CALLER_SETTINGS}{pytest} {before} {shlex.quote(str(named))} {paths} {after}"
     try:
         # HELD_ENV keeps a `fa test` inside the project's command from queueing for a second slot.
         with (capacity.hold_test_slot(config.test_slots, deadline=deadline, timed_out=lambda: slot_timeout)
