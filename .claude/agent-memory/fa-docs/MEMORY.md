@@ -21,7 +21,7 @@
 - r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
 - r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
 - r449 (2026-11-04): #1746/#1751/#1767 (=#1651, merge 826313b): ask D109 for undated-ID decisions.md:944 + rules.md:82-88 uncited section; gate.md:130 stale 4 defaults, :172 stray yaml; skills/review-procedure vs D37 → r347. Wait: orchestrator relays.
-- r420 (2026-11-04): #1696 size signal + #1774 importer check folded into the accepted-but-unwritten r324/r383 docs/order.md edit. Wait: orchestrator turns it into one edit.
+- r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
 - Since #1167 no default review perspective flags docs; find drift by reading merged diffs against docs. Order numbers are issue numbers, and merge titles usually carry a different PR number.
@@ -65,3 +65,4 @@
 - 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.
 - '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
 - An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
+- When the scheduled check is for an order that wrote my own proposal (e.g. #1826), compare the diff with the request texts and check named commands exist (commands/order.py add_parser); then close the memory wait.
