@@ -124,27 +124,34 @@ class ComparisonEvidence:
 
 
     def _fallback_refused(self, ctx, head):
-        """CI reports that appeared after a local fallback replace it; a failed read adds nothing."""
+        """CI reports that changed after a local fallback replace it; only a failed read adds nothing."""
         if self.fallback_reports is None:
-            return None
+            return None  # A changed acceptance workflow makes every artifact untrusted.
         try:
-            current = serialize_reports(ctx.tracker.pr_acceptance_reports(head) or [])
-        except (UnusableComparison, TrackerError) as exc:
-            if isinstance(exc, TrackerError) and exc.waits:
+            reports = ctx.tracker.pr_acceptance_reports(head)
+        except TrackerError as exc:
+            if exc.waits:
                 raise
             return None
-        if current == self.fallback_reports:
+        if _pinned(reports) == self.fallback_reports:
             return None
         return "reports-changed", "CI reports changed after the local fallback"
 
 
+UNSERIALIZABLE = "<unserializable acceptance reports>"  # never equal to a JSON serialization
+
+
+def _pinned(reports):
+    """The reports as pinned by a local fallback; reports that cannot be serialized still pin."""
+    try:
+        return serialize_reports(reports or [])
+    except UnusableComparison:
+        return UNSERIALIZABLE
+
+
 def _fallback_evidence(evidence, reports):
     """The local fallback's evidence, pinned to the CI reports it fell back from."""
-    try:
-        seen = serialize_reports(reports or [])
-    except UnusableComparison:
-        seen = None
-    return replace(evidence, fallback_reports=seen)
+    return replace(evidence, fallback_reports=_pinned(reports))
 
 
 def enabled(ctx):

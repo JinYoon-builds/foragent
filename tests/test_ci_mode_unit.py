@@ -1694,6 +1694,25 @@ def test_reports_that_appear_after_a_local_fallback_refuse_it_at_the_locked_read
     assert replace(local, fallback_reports=None).current(1, ctx, None, 2, 'head', 'base', 'pass')
 
 
+def test_unserializable_reports_still_pin_a_local_fallback(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from foragent import ci_mode
+
+    deep = []
+    for _ in range(100000):
+        deep = [deep]  # json.dumps raises RecursionError on this
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    local = ci_mode._fallback_evidence(replace(accepted, reports=None), [{'report': deep}])
+    assert local.fallback_reports is not None, 'An unserializable report must not drop the locked re-read'
+    reads += [[{'report': deep}], [{'shard': 0}]]
+    answers = [local.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(2)]
+    assert answers == [True, False], 'Usable reports replacing unserializable ones must be compared again'
+    # Usable reports that turn unserializable also changed: compare again instead of keeping the fallback.
+    usable = ci_mode._fallback_evidence(replace(accepted, reports=None), [{'shard': 0}])
+    reads.append([{'report': deep}])
+    assert usable.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+
+
 def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, monkeypatch):
     from foragent.tracker import TrackerError
 
