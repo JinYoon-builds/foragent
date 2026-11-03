@@ -17,3 +17,4 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Merge owner before launch](merge-owner-before-launch.md) — Jin 11-03: PM builds it outside FA; orch lane paused, #1491 #1641 #1760 parked until it merges
 - [Order after 11-03](order-after-11-03.md) — merge owner, then 2-3 days cleanup, then features; no new internal-mechanism features
 - [Stray state writes](inspect-prepare-real-state.md) — fake inbox questions came from fa inspect prepare running Try it; trace by timestamp + find -newermt
+- [gh project scope](gh-project-scope-new-machine.md) — new machine gh token lacked project; publish committed then failed; Jin runs gh auth refresh -s project
