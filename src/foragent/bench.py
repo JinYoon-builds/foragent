@@ -45,10 +45,12 @@ def _record(args: argparse.Namespace) -> int:
 
     runs = merged = retries = None
     if args.state_dir is not None:
-        history = [run for run in StateStore(args.state_dir).read_history()
+        store = StateStore(args.state_dir)
+        history = [run for run in store.read_history()
                    if started <= _timestamp(run.started_at) <= finished]
         runs = len(history)
-        merged = sum(run.outcome == "merged" for run in history)
+        owner_facts = store.owner_merge_facts()
+        merged = sum(store.run_merged(run, owner_facts=owner_facts) for run in history)
         retries = sum(run.attempts - 1 for run in history)
 
     env = {**os.environ, "FA_BENCH_SCENARIO": str(directory)}
