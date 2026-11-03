@@ -229,3 +229,5 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - PAUSED all lanes at 00:48Z until 2026-11-03T02:18:37+00:00 (PM: free a test slot to publish collect-slot and the blocked batch, then resume at once).
 - Person-only guard draft (drafts/person-only-commands, view s): 47/50 red on main, 50 pass with prototype; orchestrator kept allowed (resolve, dream merge, settings) — PM to confirm; preread after the paused-window batch.
 - Person-wait alarm draft (drafts/person-wait-alarm, roles s, split from #1469): 8 red on main, 8 pass with prototype; approve after clean preread.
+- #1655 first-run draft (drafts/first-run): 10 red on main/pass with prototype; changes 16 locked files (--yes); PM asked about item 1 in new projects (#1232 rule) and skill text; preread after.
+- #435 split (drafts/435split): unit 1 silence-checks proven (19 cases pass with prototype) -> approve; unit 2 silence-baseline-resume and #435 edit (13 cases) not prototyped -> publish unapproved, prototype them before approval (orch agent, when load allows).
