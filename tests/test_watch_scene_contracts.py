@@ -103,7 +103,7 @@ def test_selecting_an_authored_wait_shows_its_canonical_context_not_a_guessed_tu
     primary = {
         'working': ('working', '일하고 있어요'),
         'blocked': ('handled by the orchestrator', '오케스트레이터가 보는 중'),
-        'waiting-human': ('I will ask in the planning session.', '기획 세션에서 물어볼게요.'),
+        'waiting-human': ('I will ask you in the planning session.', '기획 세션에서 물어볼게요.'),
         'parked': ('Parked in lane work.', 'work 레인에서 보류 중이에요.'),
     }
     if state in primary:
@@ -184,7 +184,7 @@ def test_authored_context_keeps_question_and_park_priority_over_an_active_wait(
     body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
         snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', 2)}))
     expected = (('Parked in lane work.', 'work 레인에서 보류 중이에요.') if evidence == 'parked'
-                else ('I will ask in the planning session.', '기획 세션에서 물어볼게요.'))
+                else ('I will ask you in the planning session.', '기획 세션에서 물어볼게요.'))
     assert expected[language == 'ko'] in body, body
     assert 'test slot' not in body and '시험 자리' not in body
     block = '\n'.join(''.join(value for value, _ in line) for line in lane_blocks.render(
@@ -290,7 +290,7 @@ def test_unresolved_authored_lane_keeps_the_recorded_acorn_and_its_selection(
     assert '#2 Choice' in body and ('work 레인' if language == 'ko' else 'lane work') in body, body
     expected = {
         'held-blocked': ('handled by the orchestrator', '오케스트레이터가 보는 중'),
-        'held-question': ('I will ask in the planning session.', '기획 세션에서 물어볼게요.'),
+        'held-question': ('I will ask you in the planning session.', '기획 세션에서 물어볼게요.'),
         'queued': ('Waiting: Locale pending', '기다리는 이유: Locale pending'),
     }.get(source, ('writing code', '코드를 쓰고 있어요'))
     assert expected[language == 'ko'] in body, body
