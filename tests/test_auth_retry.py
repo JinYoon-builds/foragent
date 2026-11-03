@@ -165,145 +165,28 @@ def test_generic_trailer_after_a_network_or_repository_diagnostic_is_not_authent
     assert not auth_retry.is_auth_failure(f"{cause}\nfatal: Could not read from remote repository.\n")
 
 
-class FakeGitHub:
-    """A gh runner over issue 1 / PR 2. The first ``refusals`` composite attempts are refused
-    with a 401 after doing ``partial`` ("none", "comment" or "action") of their writes."""
-
-    HEAD = "a" * 40
-
-    def __init__(self, refusals=1, partial="none"):
-        self.refusals, self.partial = refusals, partial
-        self.state, self.merged_head, self.merges, self.writes = "OPEN", None, 0, 0
-        self.comments, self.calls = [], []
-
-    def refuse(self, args):
-        raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh: Bad credentials (HTTP 401)")
-
-    def comment(self, args, author="fa"):
-        if "--comment" in args:
-            self.comments.append((author, args[args.index("--comment") + 1]))
-
-    def act(self, args):
-        if args[:2] == ["pr", "merge"]:
-            self.merges += 1
-            self.state, self.merged_head = "MERGED", args[args.index("--match-head-commit") + 1]
-        else:
-            self.state = "CLOSED"
-
-    def __call__(self, args, input=None):
-        from datetime import UTC, datetime
-
-        self.calls.append(list(args))
-        if args[:2] in (["issue", "close"], ["pr", "close"], ["pr", "merge"]):
-            self.writes += 1
-            if self.refusals:
-                self.refusals -= 1
-                if self.partial in ("comment", "action"):
-                    self.comment(args)
-                if self.partial == "action":
-                    self.act(args)
-                self.refuse(args)
-            self.comment(args)
-            self.act(args)
-            return ""
-        assert args[:3] not in (["api", "-X", "POST"], ["api", "-X", "DELETE"]), f"a rewritten write: {args}"
-        if args == ["api", "user"]:
-            return json.dumps({"login": "FA", "type": "User"})
-        if args[:2] == ["api", "--paginate"] and "/comments" in args[2]:
-            now = datetime.now(UTC).isoformat()
-            return json.dumps([{"id": i, "user": {"login": author}, "body": body, "created_at": now}
-                               for i, (author, body) in enumerate(self.comments)])
-        if args[:2] == ["pr", "view"]:
-            return json.dumps({"state": self.state, "headRefOid": self.merged_head or self.HEAD})
-        if args[:1] == ["api"] and args[1].endswith("/issues/1"):
-            return json.dumps({"number": 1, "title": "T", "state": "open" if self.state == "OPEN" else "closed"})
-        raise AssertionError(args)
-
-
 COMPOSITES = {
     "issue-close": lambda tracker: tracker.close_issue(1, "Merged into batch."),
     "pr-close": lambda tracker: tracker.close_pr(2, "Closed by retry"),
-    "pr-merge": lambda tracker: tracker.merge_pr(2, expected_head_sha=FakeGitHub.HEAD, subject="T (#1)"),
+    "pr-merge": lambda tracker: tracker.merge_pr(2, expected_head_sha="a" * 40, subject="T (#1)"),
 }
-COMMENTED = ["issue-close", "pr-close"]
-
-
-@pytest.fixture(autouse=True)
-def _no_identity_cache(monkeypatch):
-    from foragent import identity_cache
-
-    monkeypatch.setattr(identity_cache, "credential_key", lambda: None)
 
 
 @pytest.mark.parametrize("command", COMPOSITES)
-def test_one_refusal_before_any_effect_waits_then_the_same_command_completes(command):
-    github, waits = FakeGitHub(refusals=1, partial="none"), []
-    COMPOSITES[command](GhTracker("o/r", run=github, sleep=waits.append))
-    assert github.writes == 2 and waits == [auth_retry.WAITS[0]]
-    assert github.state == ("MERGED" if command == "pr-merge" else "CLOSED") and github.merges <= 1
-    assert len(github.comments) == (1 if command in COMMENTED else 0)
-
-
-@pytest.mark.parametrize("command", COMPOSITES)
-def test_refusal_after_the_effect_took_place_is_reported_done_without_resending(command):
-    github = FakeGitHub(refusals=1, partial="action")
-    COMPOSITES[command](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert github.writes == 1 and github.merges <= 1 and len(github.comments) <= 1
-
-
-@pytest.mark.parametrize("command", COMMENTED)
-def test_refusal_after_only_our_comment_is_not_resent_and_keeps_the_error(command):
-    github = FakeGitHub(refusals=1, partial="comment")
+def test_a_command_that_sends_several_writes_is_attempted_once(command):
+    """#1208 scope A: only one-step idempotent calls retry; a multi-write command fails as before."""
+    run, calls = gh_failing("gh: Bad credentials (HTTP 401)", 99)
     with pytest.raises(TrackerError) as raised:
-        COMPOSITES[command](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert raised.value.is_auth_failure and github.writes == 1 and len(github.comments) == 1
-
-
-@pytest.mark.parametrize("command", COMMENTED)
-def test_someone_elses_identical_comment_is_not_ours(command):
-    github = FakeGitHub(refusals=1, partial="none")
-    github.comment(["--comment", "Merged into batch." if command == "issue-close" else "Closed by retry"],
-                   author="someone")
-    COMPOSITES[command](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert github.writes == 2 and [author for author, _ in github.comments] == ["someone", "fa"]
-
-
-@pytest.mark.parametrize("command", COMPOSITES)
-def test_persistent_refusal_resends_within_the_budget_then_keeps_the_error(command):
-    github = FakeGitHub(refusals=99, partial="none")
-    with pytest.raises(TrackerError) as raised:
-        COMPOSITES[command](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert raised.value.is_auth_failure and github.writes == auth_retry.ATTEMPTS and github.merges == 0
-
-
-def test_a_close_that_finds_the_pr_merged_is_not_this_close():
-    github = FakeGitHub(refusals=1)
-    github.state = "MERGED"
-    with pytest.raises(TrackerError):
-        COMPOSITES["pr-close"](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert github.writes == 1
-
-
-def test_a_merge_of_another_head_is_not_this_merge():
-    """#1208: the verified head was replaced and the new head merged elsewhere: no success, no resend."""
-    github = FakeGitHub(refusals=1, partial="none")
-    github.state, github.merged_head = "MERGED", "b" * 40
-    with pytest.raises(TrackerError) as raised:
-        COMPOSITES["pr-merge"](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert raised.value.is_auth_failure and github.writes == 1
-
-
-def test_refused_reads_after_a_composite_refusal_still_end_as_authentication_failure():
-    github = FakeGitHub()
-
-    def refuse_everything(args, input=None):
-        github.calls.append(list(args))
-        github.refuse(args)
-    with pytest.raises(TrackerError) as raised:
-        GhTracker("o/r", run=refuse_everything, sleep=lambda seconds: None).merge_pr(
-            2, expected_head_sha="a" * 40, subject="T")
+        COMPOSITES[command](GhTracker("o/r", run=run, sleep=lambda seconds: pytest.fail("must not wait")))
     assert raised.value.is_auth_failure
-    assert sum(call[:2] == ["pr", "merge"] for call in github.calls) == 1
+    assert [call[:2] for call in calls if call[:2] != ["pr", "view"]] == [
+        {"issue-close": ["issue", "close"], "pr-close": ["pr", "close"], "pr-merge": ["pr", "merge"]}[command]]
+
+
+def test_a_single_write_still_retries():
+    run, calls = gh_failing("gh: Bad credentials (HTTP 401)", 1)
+    GhTracker("o/r", run=run, sleep=lambda seconds: None).close_issue(1)  # one request: issue close, no comment
+    assert len(calls) == 2
 
 
 def test_stdout_never_decides_authentication():
@@ -324,10 +207,10 @@ def test_failed_ci_check_named_like_an_authentication_failure_is_not_retried():
     assert len(calls) == 1
 
 
-def test_unavailable_covers_rate_limits_and_credentials_only():
-    assert TrackerError("API rate limit exceeded (HTTP 403)").is_unavailable
-    assert TrackerError("gh: Bad credentials (HTTP 401)").is_unavailable
-    assert not TrackerError("gh: Resource not accessible by integration (HTTP 403)").is_unavailable
+def test_escalates_covers_rate_limits_and_credentials_only():
+    assert TrackerError("API rate limit exceeded (HTTP 403)").escalates
+    assert TrackerError("gh: Bad credentials (HTTP 401)").escalates
+    assert not TrackerError("gh: Resource not accessible by integration (HTTP 403)").escalates
 
 
 def test_retitle_and_pr_refresh_propagate_authentication_failures(tmp_path):
@@ -371,7 +254,11 @@ def test_merge_authentication_failure_ends_the_run_once_without_rejoining_the_qu
     def refuse(pr, **kwargs):
         merges.append(pr)
         raise TrackerError("gh: Bad credentials (HTTP 401)")
-    monkeypatch.setattr(case.tracker, "merge_pr", refuse)
+
+    def refuse_with_ready(pr, **kwargs):
+        case.tracker.add_labels(1, ["ready"])  # a ready label left behind (the runner's limit wait adds one too)
+        return refuse(pr, **kwargs)
+    monkeypatch.setattr(case.tracker, "merge_pr", refuse_with_ready)
     assert run_issue(1, case.ctx) == "auth-failed"
     assert merges == [2], "a refused merge rejoined the merge queue"
     run = case.store.get_run(1)
@@ -503,26 +390,3 @@ def test_reinstall_fetch_refused_after_the_merge_keeps_merged_with_its_reason(ru
     run = case.store.get_run(1)
     assert run.outcome == "merged" and "publickey" in run.detail
     assert len(auth_events(case)) == 1
-
-
-def test_refused_merge_of_a_pr_that_is_closed_but_not_merged_is_not_reported_merged():
-    github = FakeGitHub(refusals=1)
-    github.state = "CLOSED"
-    with pytest.raises(TrackerError) as raised:
-        COMPOSITES["pr-merge"](GhTracker("o/r", run=github, sleep=lambda seconds: None))
-    assert raised.value.is_auth_failure and github.writes == 1
-
-
-@pytest.mark.parametrize("command", COMPOSITES)
-def test_unreadable_state_after_a_refused_composite_write_keeps_the_authentication_error(command):
-    """#1208: a 503 while verifying must not replace the refusal (it would read as an ordinary failure)."""
-    github = FakeGitHub(refusals=1)
-
-    def run(args, input=None):
-        if args[:2] == ["pr", "view"] or (args[:1] == ["api"] and args[1].endswith("/issues/1")):
-            github.calls.append(list(args))
-            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="gh: Service Unavailable (HTTP 503)")
-        return github(args, input)
-    with pytest.raises(TrackerError) as raised:
-        COMPOSITES[command](GhTracker("o/r", run=run, sleep=lambda seconds: None))
-    assert raised.value.is_auth_failure and github.writes == 1

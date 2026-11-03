@@ -122,14 +122,52 @@ def _same(left: Any, right: Any) -> bool:
     return json.dumps(left, sort_keys=True, default=str) == json.dumps(right, sort_keys=True, default=str)
 
 
+def evidence(facts: dict[str, Any]) -> dict[tuple[str, ...], Any]:
+    """Project raw request facts into affected entities and relevant constraints.
+
+    This also reads pre-upgrade fingerprints, without changing persisted records.
+    Unprojected kinds (including lane_concentration) retain their raw numbers.
+    """
+    result: dict[tuple[str, ...], Any] = {}
+    if "files" in facts:
+        result[("files",)] = frozenset(facts["files"])
+    for kind, item in facts.get("kinds", {}).items():
+        numbers = item.get("numbers") or {}
+        result[(kind,)] = True
+        if kind in orch_facts_kinds.ENTITY_FACTS:
+            for field in orch_facts_kinds.ENTITY_FACTS[kind]:
+                result[(kind, field)] = frozenset(numbers.get(field) or ())
+            for field in orch_facts_kinds.VALUE_FACTS.get(kind, ()):
+                result[(kind, field)] = numbers.get(field)
+        else:
+            result[(kind, "numbers")] = numbers
+        for field in orch_facts_kinds.SHARED_FACTS.get(kind, ()):
+            result[(kind, field)] = item.get(field)
+    return result
+
+
+def new_evidence(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Shrinking sets stay quiet; compare every tick against the last raise."""
+    before = evidence(previous)
+    for key, value in evidence(current).items():
+        if key not in before:
+            return True
+        if isinstance(value, frozenset):
+            if value - before[key]:
+                return True
+        elif not _same(before[key], value):
+            return True
+    return False
+
+
 def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[str, Any]]:
     """Raise every met role signal that is due; return the inbox requests added.
 
     A signal (role plus its {paths, kinds} item) is never raised while an earlier request
     for it is not done. Once that request is done, it is raised again when a tick saw it unmet
-    since that raise. Otherwise, after a not-now answer it is raised again only when its facts
-    (see ``fingerprint``) differ from the ones that raise carried; after any other end, when
-    the cooldown passed since that raise. A request without stored facts uses the cooldown.
+    since that raise, or its facts contain new evidence beyond the last raise, regardless
+    of its answer. Time alone is not evidence. Only legacy requests without stored facts
+    use the cooldown.
     """
     if not (Path(repo_root) / ".foragent.yml").is_file():
         return []  # Not a Foragent repository: no roles source, nothing to measure.
@@ -139,7 +177,7 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
     last: dict[str, dict[str, Any]] = {}
     for row in signal_requests(store):
         last[_key(row["role"], row["signal"])] = row
-    clears, wait, added = _clears(store), cooldown(repo_root), []
+    clears, added = _clears(store), []
     for name, entry in roles.items():
         for signal in entry["signals"]:
             key, previous = _key(name, signal), last.get(_key(name, signal))
@@ -157,10 +195,10 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime) -> list[dict[st
             if previous is not None:
                 if previous.get("status") != "done":
                     continue
-                if previous.get("answer") == "not-now" and "facts" in previous:
-                    due = cleared or not _same(previous["facts"], facts)
+                if "facts" in previous:
+                    due = cleared or new_evidence(previous["facts"], facts)
                 else:
-                    due = cleared or raised_at is None or now - raised_at >= wait
+                    due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:
                     continue
             last[key] = orch_inbox.add_request(store, "gate", _text(name, signal, files, kinds, numbers),

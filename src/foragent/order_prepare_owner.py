@@ -9,8 +9,11 @@ Nothing here signals a process.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
+import fcntl
 import os
+from pathlib import Path
 
 from foragent import processes
 from foragent.config import Config
@@ -54,6 +57,42 @@ def alive(owner: dict | None) -> bool | None:
 def _same(owner: dict | None, me: dict) -> bool:
     """A recorded owner with this process's pid is this process or one that already ended."""
     return isinstance(owner, dict) and owner.get("pid") == me["pid"]
+
+
+@contextmanager
+def publication_gate(folder: Path):
+    """Hold publication's last check and its writes as one step against any preparation starting.
+
+    The lock lives in the repository's state folder, which every clone on this machine shares;
+    each clone's own publication lock does not reach the others. Publications wait for each other.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "route.lock", "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def claim(folder: Path, record: dict, keys: list[str], write) -> bool:
+    """Take the statement route for ``keys`` before any agent starts; False while a publication runs.
+
+    Under the gate, so a publication either sees the claim at its last check or finishes first.
+    Preparation never waits here: it reports waiting and starts nothing.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "route.lock", "a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        try:
+            record["claimed"] = sorted({*record.get("claimed", []), *keys})
+            write()
+            return True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def take(record: dict, config: Config) -> bool:

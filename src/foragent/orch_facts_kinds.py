@@ -30,6 +30,14 @@ KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
+# Evidence is membership in these affected sets; their counts may drift (#1337).
+ENTITY_FACTS = {
+    "hot_overlap_files": ("runs_by_file",),
+    "files_over_limit": ("lines_by_file",),
+    "repeated_design_holds": ("holds_by_issue",),
+    "idle_lanes_with_backlog": ("idle_lanes", "ready_by_lane"),
+}
+VALUE_FACTS = {"files_over_limit": ("limit",)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:

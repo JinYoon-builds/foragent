@@ -22,7 +22,8 @@ def dreaming(snapshot, lane, **row):
 
 
 def lane_line(frame, config, lane):
-    rows = [line.strip() for line in frame.splitlines() if config.lanes[lane]["title"] in line]
+    rows = [line[14:].strip() if len(line) > 14 and not line[:14].strip("▀▄ ") else line.strip()
+            for line in frame.splitlines() if config.lanes[lane]["title"] in line]
     assert rows, frame
     return rows
 
@@ -48,8 +49,11 @@ def test_dreaming_row_keeps_the_done_count_in_order_and_drops_it_at_zero(tmp_pat
     first, second = list(config.lanes)
     snapshot = replace(dreaming(snapshot, first), today_done={first: 2, second: 0})
     frame = plain_frame(render_frame(dreaming(snapshot, second), config, tmp_path, width=80))
-    assert lane_line(frame, config, first)[0] == "💭 🧩 Agent0 dreaming · ✓ 2 done"
-    assert lane_line(frame, config, second)[0] == "💭 🧩 Agent1 dreaming"
+    # The shared idle block: each name, then ✓N only when N > 0, then 💭 while it dreams.
+    row = lane_line(frame, config, first)
+    assert row == lane_line(frame, config, second) and len(row) == 1
+    assert row[0].endswith("🧩 Agent0 ✓2 💭 · 🧩 Agent1 💭"), row
+    assert "dreaming" not in frame
 
 
 def test_ascii_glyphs_draw_the_bubble_as_brackets(tmp_path):
@@ -57,8 +61,9 @@ def test_ascii_glyphs_draw_the_bubble_as_brackets(tmp_path):
     config = replace(config, view_glyphs="ascii")
     first = list(config.lanes)[0]
     frame = plain_frame(render_frame(dreaming(snapshot, first), config, tmp_path, width=80))
-    assert lane_line(frame, config, first)[0] == "[~] 🧩 담당0 꿈꾸는 중 · ✓ 2개 끝냄"
-    assert "💭" not in frame
+    # A hand-built snapshot has no today counts, so only the ASCII dream mark follows the name.
+    assert lane_line(frame, config, first)[0].startswith("🧩 담당0 [~] | 🧩 담당1")
+    assert "💭" not in frame and "꿈꾸는 중" not in frame
 
 
 def test_lane_with_waiting_work_shows_its_normal_rows_without_a_bubble(tmp_path):
@@ -68,7 +73,10 @@ def test_lane_with_waiting_work_shows_its_normal_rows_without_a_bubble(tmp_path)
     queued = [{"number": 7, "title": "Next work"}]
     frame = plain_frame(render_frame(dreaming(snapshot, first, queued=queued), config, tmp_path, width=80))
     assert "💭" not in frame and "꿈꾸는 중" not in frame
-    assert any("#7" in line for line in lane_line(frame, config, first)), frame
+    # A lane with waiting work has its own block: its name row, then #7 on its queue row.
+    name = next(index for index, line in enumerate(frame.splitlines()) if config.lanes[first]["title"] in line
+                and "area0/**" in line)
+    assert any("◖█#7▌" in line for line in frame.splitlines()[name:name + 5]), frame
 
 
 def test_unfolding_a_dreaming_lane_lists_its_finished_issues_below_the_bubble(tmp_path):
@@ -77,7 +85,7 @@ def test_unfolding_a_dreaming_lane_lists_its_finished_issues_below_the_bubble(tm
     first = list(config.lanes)[0]
     state = {"unfolded": [first]}
     frame = plain_frame(render_frame(dreaming(snapshot, first), config, tmp_path, width=80, state=state))
-    # The unbounded frame (shell) also keeps the done list, whose rows name the lane too.
-    rows = [row for row in lane_line(frame, config, first) if not row.startswith("#")]
-    assert rows[0].startswith("💭") and len(rows) == 3, frame
-    assert "#1" in rows[1] and "#2" in rows[2]
+    # Lane acorns replace finished rows: unfolding changes nothing, the lane sleeps and dreams.
+    assert frame == plain_frame(render_frame(dreaming(snapshot, first), config, tmp_path, width=80))
+    assert lane_line(frame, config, first)[0].count("💭") == 1
+    assert "#1" not in frame and "#2" not in frame

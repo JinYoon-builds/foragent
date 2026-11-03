@@ -11,8 +11,10 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 
@@ -62,13 +64,40 @@ except ImportError:
     GIT_SHA = "unknown"
 
 
+# The commands a person types; every other discovered command is for Foragent's own sessions.
+PERSON = ("init", "doctor", "inspect", "gate")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="fa")
+    parser = argparse.ArgumentParser(prog="fa", usage="fa [-h] [--version] <command> ...",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"foragent {__version__} ({GIT_SHA})")
-    groups = parser.add_subparsers(dest="command", required=True)
+    groups = parser.add_subparsers(dest="command", required=True, metavar="<command>", prog="fa",
+                                   help=argparse.SUPPRESS)
     for group in commands.discover():
         group.add(groups)
+    parser.description = _command_list(groups)
     return parser
+
+
+def _command_list(groups) -> str:
+    """The help's command block: where to start, then person and internal commands."""
+    helps = {action.dest: action.help or "" for action in groups._choices_actions}
+    names = list(groups.choices)
+    width = max(map(len, names)) + 4
+    wrap = max(shutil.get_terminal_size().columns - 2 - width, 20)
+
+    def block(title, chosen):
+        lines = [title]
+        for name in chosen:
+            body = textwrap.wrap(helps.get(name, ""), wrap) or [""]
+            lines += [f"  {name:<{width - 2}}{body[0]}".rstrip(), *(" " * width + line for line in body[1:])]
+        return lines
+
+    person = [name for name in PERSON if name in groups.choices]
+    internal = [name for name in names if name not in PERSON]
+    return "\n".join(["Start with fa init, then /fa.", "", *block("Person commands:", person), "",
+                      *block("Internal commands:", internal)])
 
 
 # setpriority(2) "which" for a process's macOS darwin-background state.
@@ -89,8 +118,83 @@ def _leave_background() -> None:
         pass
 
 
+# `fa order` actions that publish or approve; a displaced PM session refuses them (#1484).
+PM_ONLY_ORDER_ACTIONS = ("publish", "flush", "edit")
+
+
+def _pm_project(cwd: Path):
+    """(config, store, root) for the project around ``cwd``, else None; reads no child process."""
+    from foragent import presence
+
+    project = presence._project(cwd)
+    if project is None or project[1] is None:
+        return None
+    return project[0], project[1], presence.project_root(cwd)
+
+
+def _enter_pm() -> int:
+    """Bare ``fa``: make this Claude session the person's PM for this project (#1484).
+
+    The latest explicit entrance wins; the session it replaces is told on its next
+    prompt and refuses publication and approval. A shell without a Claude session
+    (no FORAGENT_SESSION_ID) gets one line and claims nothing.
+    """
+    from foragent import status_pm
+
+    try:
+        project = _pm_project(Path.cwd())
+    except (ConfigError, OSError):
+        project = None
+    language = project[0].language if project else "en"
+    session = status_pm.session_from_env()
+    if session is None:
+        print(text("pm_seat_no_session", language))
+        return 0
+    if project is None:
+        print(text("pm_seat_no_project", language), file=sys.stderr)
+        return 1
+    config, store, root = project
+    from foragent import presence
+
+    repo = presence._repo(config, root)
+    try:
+        result = status_pm.claim(store, session, datetime.now(UTC), root)
+    except status_pm.SeatUnreadable as exc:
+        print(text("pm_seat_unreadable", language, reason=str(exc)), file=sys.stderr)
+        return 1
+    previous = result["previous"]
+    if previous is not None:
+        print(text("pm_seat_taken_from", language, repo=repo, session=session,
+                   previous=status_pm.short(previous["session_id"])))
+    else:
+        print(text("pm_seat_kept" if result["kept"] else "pm_seat_taken", language, repo=repo, session=session))
+    return 0
+
+
+def _displaced_pm(root: Path) -> str | None:
+    """The refusal line when this session lost the person's PM seat for ``root``, else None."""
+    from foragent import status_pm
+
+    try:
+        project = _pm_project(root)
+    except (ConfigError, OSError):
+        return None  # The command itself reports an unreadable project.
+    if project is None:
+        return None
+    config, store, _root = project
+    try:
+        status_pm.require_not_displaced(store, status_pm.session_from_env())
+    except status_pm.SeatMoved as moved:
+        return text("pm_seat_moved", config.language, holder=status_pm.short(moved.holder["session_id"]))
+    except status_pm.SeatUnreadable as exc:
+        return text("pm_seat_unreadable", config.language, reason=str(exc))
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:
+        return _enter_pm()
     if argv[:1] == ["test"]:
         return _test_command(argv[1:])
     if argv == ["statusline"]:
@@ -99,11 +203,21 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "gate":
         _leave_background()
+    if (args.command == "order" and getattr(args, "action", None) in PM_ONLY_ORDER_ACTIONS
+            and not getattr(args, "dry_run", False)):
+        refused = _displaced_pm(getattr(args, "repo_root", None) or Path.cwd())
+        if refused:
+            print(f"foragent: {refused}", file=sys.stderr)
+            return 1
     group = commands.module(args.command)
     if args.command == "statusline":
         return group.run(args)
     try:
         return group.run(args)
+    except order.DoneWhenExecutableError as exc:
+        for line in exc.lines:
+            print(f"foragent: {line}", file=sys.stderr)
+        return 1
     except (ConfigError, TrackerError, GitError, launchd.LaunchdError, OSError, design_session.DesignError,
             inspect_actions.InspectError, InspectRuntimeError, subprocess.SubprocessError,
             order.PlanError, orch.OrchError, orch_inbox.InboxError, LaneError, SkillError, PathError, json.JSONDecodeError) as exc:

@@ -118,13 +118,16 @@ def test_orch_spawn_orca_uses_recorded_executable_or_path_and_opens_adjacent_vie
 
     for source in ("orca-recorded", "orca-path"):
         case, commands, pushes = orch_spawn_case(git_history, tmp_path / source, monkeypatch, screen=source)
-        monkeypatch.setenv("TMUX", "/offline/tmux,1,0")  # Reachable Orca has priority over tmux.
-        assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "orca"
+        monkeypatch.setenv("TMUX", "/offline/tmux,1,0")  # Both hosts are available; the orchestrator stays hidden.
+        assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "background"
         created = [argv for argv in commands if argv[1:3] == ["terminal", "create"]]
-        assert len(created) == 1, commands
-        argv = created[0]
-        assert f"orch: {case.root.name}" in argv[argv.index("--title") + 1]
-        command = shlex.split(argv[argv.index("--command") + 1])
+        assert len(created) == 0, commands
+        launched = [argv for argv in commands if Path(argv[0]).name == "claude"]
+        assert len(launched) == 1, commands
+        argv = launched[0]
+        assert "--bg" in argv
+        assert f"orch: {case.root.name}" in argv[argv.index("-n") + 1]
+        command = argv
         assert "claude" in [Path(part).name for part in command] and "/fa-orchestrator" in command
         # D76: keep the historical test name for baseline runners. The view
         # belongs beside the planning session; spawning must leave focus there.
@@ -132,6 +135,7 @@ def test_orch_spawn_orca_uses_recorded_executable_or_path_and_opens_adjacent_vie
         assert not any("switch" in argv for argv in commands), commands
         assert not any("gate watch" in part for argv in commands for part in argv), commands
         assert not any(Path(argv[0]).name in {"tmux", "osascript"} for argv in commands)
+        assert not any(Path(argv[0]).name == "orca" for argv in commands)
         orch_spawn_assert_push(pushes)
 
 
@@ -139,15 +143,18 @@ def test_orch_spawn_tmux_opens_a_named_claude_window(git_history, tmp_path, monk
     from foragent.orch_spawn import ensure_orchestrator
 
     case, commands, pushes = orch_spawn_case(git_history, tmp_path, monkeypatch, screen="tmux")
-    assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "tmux"
+    assert ensure_orchestrator(case.root, case.store, case.config, now=case.clock[0]) == "background"
     windows = [argv for argv in commands if Path(argv[0]).name == "tmux" and "new-window" in argv]
-    assert len(windows) == 1, commands
-    argv = windows[0]
-    assert "-d" in argv, "the orchestrator window must open in the background"
+    assert len(windows) == 0, commands
+    launched = [argv for argv in commands if Path(argv[0]).name == "claude"]
+    assert len(launched) == 1, commands
+    argv = launched[0]
+    assert "--bg" in argv, "the orchestrator process must start in the background"
     assert argv[argv.index("-n") + 1] == f"orch: {case.root.name}"
     command = " ".join(argv)
     assert "claude" in command and "/fa-orchestrator" in command
     assert not any(Path(argv[0]).name in {"orca", "osascript"} for argv in commands)
+    assert not any(Path(argv[0]).name == "tmux" for argv in commands)
     orch_spawn_assert_push(pushes)
 
 

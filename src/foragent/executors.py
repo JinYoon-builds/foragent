@@ -206,9 +206,12 @@ def claude_command(
     return args + (["--model", model] if model is not None else [])
 
 
-def claude_review_command(level: str, model: str | None = None, *, pr: int | None = None) -> list[str]:
+def claude_review_command(level: str, model: str | None = None, *, pr: int | None = None,
+                          append_system_prompt: str | None = None) -> list[str]:
     target = f"{pr} " if pr is not None else ""
     args = ["claude", "-p", f"/code-review {target}{level}", "--permission-mode", "auto", "--output-format", "json"]
+    if append_system_prompt:  # A slash-command review has no prompt of its own to carry added text.
+        args += ["--append-system-prompt", append_system_prompt]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -282,6 +285,7 @@ class ClaudeExecutor:
         resume_session_id: str | None = None,
         goal: str | None = None, read_only: bool = False, effort: str | None = None,
         permission_mode: str | None = None, setting_sources: str | None = None,
+        append_system_prompt: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {key: value for key, value in (("permission_mode", permission_mode),
@@ -295,7 +299,8 @@ class ClaudeExecutor:
         if resume_session_id is not None:
             options["resume_session_id"] = resume_session_id
             options["prompt"] = prompt
-        command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
+        added = {"append_system_prompt": append_system_prompt} if append_system_prompt else {}
+        command = (claude_review_command(review_level, model, pr=review_pr, **added) if review_level is not None
                    else claude_command(model, settings_path, **options))
         if review_level is None and resume_session_id is None and goal is not None:
             # Text stdin is one message: blank lines do not end /goal's argument.

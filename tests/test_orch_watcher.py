@@ -75,8 +75,8 @@ def test_unchanged_poll_order_and_closed_prs_do_not_wake_but_batch_merges_do(ctx
 
     def sleep(seconds):
         polls.append(seconds)
-        assert len(polls) == 1, "A merged batch must wake the next poll"
-        pr = ctx.tracker.create_pr(head="foragent/batch-42", base="main", title="Batch", body="")
+        assert len(polls) == 1, "A merged issue PR must wake the next poll"
+        pr = ctx.tracker.create_pr(head="foragent/issue-42", base="main", title="Feature", body="")
         ctx.tracker.merge_pr(pr, expected_head_sha=ctx.tracker.pr_head_sha(pr))
 
     monkeypatch.setattr(orch.time, "sleep", sleep)

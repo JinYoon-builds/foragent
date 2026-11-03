@@ -1,9 +1,9 @@
 """Acceptance test for signal-not-now-sticks. Locked by Foragent; do not edit.
 
-Break-it checks (all must fail on main before the feature exists):
+Break-it checks (updated for signal-meaningful-change, 2026-11-01):
 1. Same facts: rejects treating not-now as a timer or hashing the observation time.
-2. Changed facts: rejects permanent suppression, a cooldown-only fix, or comparing
-   only whether the signal is met; each fact change must re-arm it exactly once.
+2. Changed facts: a changed binding constraint or a new idle lane must re-arm
+   exactly once; counts drifting within the same backlog lanes must stay quiet.
 3. Different signal: rejects muting an entire role or comparing unrelated facts.
 4. Reopened store: rejects keeping suppression only on the old StateStore object.
 
@@ -100,15 +100,15 @@ def test_same_facts_produce_zero_reraises_across_ticks(not_now_case, capsys):
         assert rows[0]["status"] == "done"
 
 
-@pytest.mark.parametrize("binding,idle_lanes,ready_by_lane", [
+@pytest.mark.parametrize("binding,idle_lanes,ready_by_lane,expected_new_requests", [
     ({"kind": "quota", "normal": True, "detail": "usage-limit pause holds #41"},
-     ["order", "view"], {"orch": 4}),
-    (CAP, ["order", "skills", "view"], {"orch": 4}),
-    (CAP, ["order", "view"], {"orch": 5}),
+     ["order", "view"], {"orch": 4}, 1),
+    (CAP, ["order", "skills", "view"], {"orch": 4}, 1),
+    (CAP, ["order", "view"], {"orch": 5}, 0),
 ], ids=["binding-changes", "idle-lanes-change", "ready-work-changes"])
 def test_changed_facts_raise_exactly_one_new_request(
-        not_now_case, capsys, binding, idle_lanes, ready_by_lane):
-    """Rejects a permanent mute, a cooldown, and met/unmet-only comparisons."""
+        not_now_case, capsys, binding, idle_lanes, ready_by_lane, expected_new_requests):
+    """Keep the historical case ids; distinguish meaningful changes from count drift."""
     case = not_now_case
     first = first_not_now(case, capsys)
     case.facts["binding"] = deepcopy(binding)
@@ -117,19 +117,25 @@ def test_changed_facts_raise_exactly_one_new_request(
     }
     rows = tick_signals(case, capsys)  # Five minutes later, still continuously met.
     added = [row for row in rows if row["id"] != first]
-    assert len(added) == 1, "Changed facts must raise exactly 1 new request on the next tick"
-    new = added[0]
-    assert new["signal"] == IDLE_SIGNAL and new["status"] != "done"
-    assert next(row for row in rows if row["id"] == first)["status"] == "done"
-    for _ in range(3):
-        assert {row["id"] for row in tick_signals(case, capsys)} == {first, new["id"]}, (
-            "Changed facts must not create duplicate open requests"
-        )
-    defer(case, capsys, new["id"])
-    case.clock[0] += timedelta(hours=13)
-    assert {row["id"] for row in tick_signals(case, capsys)} == {first, new["id"]}, (
-        "A second not-now must suppress its newly considered facts too"
+    assert len(added) == expected_new_requests, (
+        "Changed binding or a new idle lane must re-raise once; count drift in the same backlog lane must stay quiet"
     )
+    for new in added:
+        assert new["signal"] == IDLE_SIGNAL and new["status"] != "done"
+    assert next(row for row in rows if row["id"] == first)["status"] == "done"
+    expected_ids = {first, *(row["id"] for row in added)}
+    for _ in range(3):
+        assert {row["id"] for row in tick_signals(case, capsys)} == expected_ids, (
+            "Reobserving considered evidence must not create duplicate requests"
+        )
+    for new in added:
+        defer(case, capsys, new["id"])
+    case.clock[0] += timedelta(hours=13)
+    final = tick_signals(case, capsys)
+    assert {row["id"] for row in final} == expected_ids, (
+        "Considered evidence and count drift must stay quiet after the old cooldown too"
+    )
+    assert all(row["status"] == "done" for row in final)
 
 
 def test_a_different_signal_is_unaffected_on_the_same_role(not_now_case, capsys):

@@ -1,7 +1,7 @@
 """Classify a moved base before merging it into a verified branch (#376).
 
 A move is result-neutral only when every new base commit touches documentation
-under docs/, locked acceptance files that another open, unmerged issue owns and
+under docs/, role memory under .claude/agent-memory/, locked acceptance files that another open, unmerged issue owns and
 this run's acceptance baseline did not run (#514), or a .foragent.yml change
 limited to keys that do not affect checks (#514). Any other path, or a path
 this branch changed itself, re-verifies as before.
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 REUSED = "base moved: only result-neutral paths; verification reused"
 REVERIFY = "base moved: result-affecting paths; re-verifying"
-NEUTRAL_DIRECTORY = "docs/"
+NEUTRAL_DIRECTORIES = ("docs/", ".claude/agent-memory/")
 CONFIG_PATH = ".foragent.yml"
 # Keys that change which checks run or who runs them (#514); others are neutral.
 CHECK_KEYS = frozenset({
@@ -211,7 +211,7 @@ def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
     own = _own_paths(attempt.git, move.target_sha)
     if paths & own:
         return False
-    rest = {path for path in paths if not path.startswith(NEUTRAL_DIRECTORY)}
+    rest = {path for path in paths if not path.startswith(NEUTRAL_DIRECTORIES)}
     if CONFIG_PATH in rest:
         if not config_move_is_neutral(attempt.git, move):
             return False

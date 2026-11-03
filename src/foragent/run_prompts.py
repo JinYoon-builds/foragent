@@ -7,15 +7,19 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from foragent import cuts
-from foragent.issue import ParsedIssue
+from foragent.issue import ParsedIssue, authored_body
 
+
+REVIEW_VERDICT_CONTRACT = (
+    "Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
+    "followed by every finding, each one line with file:line and the concrete failure."
+)
 
 REVIEW_PROMPT = (
     "Review this change for defects that break the stated goal, violate Out of scope, "
     "or would make the Done when commands pass without the goal being met "
     "(weakened checks, special-casing test inputs). Ignore style and nice-to-haves. "
-    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` "
-    "followed by every finding, each one line with file:line and the concrete failure."
+    "Do not edit files. " + REVIEW_VERDICT_CONTRACT
 )
 REVIEW_FEEDBACK_INSTRUCTIONS = (
     "For each review finding, name the defect class it belongs to, "
@@ -39,10 +43,26 @@ IMPLEMENTER_TEST_RULE = "When you write or fix a test, check it by the break-it 
 
 PANEL_MERGE_PROMPT = (
     "Independent reviewers checked this change, each from its own share of the review perspectives. "
-    "Their raw findings follow. Merge them: remove duplicates and keep only the defects you judge real "
-    "and reproducible against the diff above. Your reply is the final review: give the verdict and the "
-    "kept findings in the format above. Reviewer verdicts do not count; only yours does."
+    "Their raw findings follow, unedited; several may describe the same defect in different words. "
+    "Group the findings by defect class, not by identical text: findings with one root cause are one class, "
+    "even when their wording, lines or files differ. Keep only the classes you judge real and reproducible "
+    "against the diff above, and leave out every claim you dismiss. For each kept class give one finding "
+    "line `path:line — summary`, then indented lines `class: <name>`, the evidence, and every affected "
+    "instance (path:line). Your reply is the final review: give the verdict and the kept classes in the "
+    "format above. Reviewer verdicts do not count; only yours does."
 )
+
+CONFIRM_PROMPT = (
+    "Limit this review to confirming that the first-round defect classes below are fixed. "
+    "For every class, verify the fix across all instances throughout the changed code, including "
+    "instances beyond the cited lines and files. Use all the first-round evidence and affected "
+    "instances as the starting point for your own search. Judge the implementer's rebuttals. "
+    "This is one confirmation task, not another perspective review or findings merge. "
+    "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
+    "every remaining finding, each one line with file:line and the concrete failure."
+)
+
+OTHER_CONTENT_HEADING = "Other approved issue content (verbatim):"
 
 
 def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
@@ -50,6 +70,7 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
     from foragent.i18n import text
 
     return (
+        REVIEW_VERDICT_CONTRACT + "\n"
         "Block only on: the Goal is not met, something listed in Out of scope was changed, or a check was weakened.\n"
         f"Tests under {acceptance_dir} that belong to other issues fail on purpose until those issues land; do not report them.\n"
         "Improvements beyond this issue's Goal are not defects.\n"
@@ -77,21 +98,37 @@ def build_review_prompt(
     parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, rebuttals: str = "",
     full_text_dir: Path | None = None,
     risk_notes: str = "", panel_findings: str = "", lane_decisions: str = "",
+    task: str = REVIEW_PROMPT, pass_scope: str = "",
 ) -> str:
     """One reviewer's prompt; `panel_findings` makes it the merge call over a panel's raw findings.
 
     `lane_decisions` is `lane_decisions_section` output: the lane's recorded choices, as context.
+    `pass_scope` is the earlier PASS's facts and scope (review_pass_scope); `diff` then matches it.
     """
     commands = "\n".join(f"```sh\n{command}\n```" for command in parsed.done_when_commands)
     return (
-        f"{REVIEW_PROMPT}\n\n{review_scope_rules(acceptance_dir)}"
+        f"{task}\n\n{review_scope_rules(acceptance_dir)}"
+        + (f"\n\n{pass_scope}" if pass_scope else "")
         + (f"\n\n{risk_notes}" if risk_notes else "")
         + f"\n\nGoal:\n{parsed.goal}\n\nOut of scope:\n{parsed.out_of_scope}"
         + (f"\n\n{lane_decisions}" if lane_decisions else "")
-        + f"\n\nDone when commands:\n{commands}\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
+        + f"\n\nDone when commands:\n{commands}"
+        + (f"\n\n{OTHER_CONTENT_HEADING}\n{parsed.other_content}" if parsed.other_content else "")
+        + f"\n\nDiff:\n{cuts.head(diff, 60000, full_text_dir, 'review-diff.patch')}"
         + (f"\n\nImplementer rebuttals (judge them):\n{rebuttals}" if rebuttals else "")
         + (f"\n\n{PANEL_MERGE_PROMPT}\n\n{panel_findings}" if panel_findings else "")
     )
+
+
+def build_confirm_prompt(
+    parsed: ParsedIssue, diff: str, acceptance_dir: str = "tests/acceptance/", *, first_review: str,
+    rebuttals: str = "", full_text_dir: Path | None = None, lane_decisions: str = "", pass_scope: str = "",
+) -> str:
+    """The complete first-round result and current change for one confirming reviewer."""
+    return build_review_prompt(
+        parsed, diff, acceptance_dir, rebuttals=rebuttals, full_text_dir=full_text_dir,
+        lane_decisions=lane_decisions, task=CONFIRM_PROMPT, pass_scope=pass_scope,
+    ) + f"\n\nFirst-round defect classes and evidence (verbatim):\n{first_review}"
 
 
 def parent_section(parent_context: str) -> str:
@@ -125,22 +162,6 @@ DECISIONS_START = "<!-- foragent:lane-decisions -->"
 DECISIONS_END = "<!-- /foragent:lane-decisions -->"
 
 
-def lane_decisions_block(section: str) -> str:
-    """`section` between markers, so a later review of the same PR can replace it."""
-    return f"{DECISIONS_START}\n{section}\n{DECISIONS_END}" if section else ""
-
-
-def refresh_lane_decisions(body: str, section: str) -> str:
-    """Replace a PR body's lane-decisions block with `section` (append, or drop when empty)."""
-    import re
-
-    block = lane_decisions_block(section)
-    pattern = re.compile(rf"(?:\n\n)?{re.escape(DECISIONS_START)}.*?{re.escape(DECISIONS_END)}", re.S)
-    if pattern.search(body):
-        return pattern.sub(lambda match: f"\n\n{block}" if block else "", body, count=1)
-    return f"{body}\n\n{block}" if block else body
-
-
 def moved_files_section(moved_files: list[str]) -> str:
     return ("The base branch moved or split files this branch edits (old -> new). "
             "Carry your edits to the new locations so none are orphaned:\n"
@@ -149,7 +170,9 @@ def moved_files_section(moved_files: list[str]) -> str:
 
 def goal_condition(acceptance_dir: str) -> str:
     prefix = 'Every command in the "Done when" list below exits 0 when run from the repository root, nothing under '
-    suffix = " is modified, and no files outside this repository are changed. Or stop after 40 turns."
+    suffix = (" is modified, and you did not edit files outside this repository."
+              " Files that test tooling writes outside the repository do not count as your edits."
+              " At 40 turns, end the run without repeating the stop check.")
     return prefix + acceptance_dir[:3500 - len(prefix) - len(suffix)] + suffix
 
 
@@ -223,7 +246,8 @@ def build_prompt(
         + f"Out of scope (do not do these): {parsed.out_of_scope}\n"
         "The work is accepted only when these commands succeed (they will be run for you afterwards):\n"
         f"{commands}\n"
-        "Rules:\n"
+        + (f"{OTHER_CONTENT_HEADING}\n{parsed.other_content}\n" if parsed.other_content else "")
+        + "Rules:\n"
         f"{acceptance_rule}"
         f"{test_rule}"
         f"- {IMPLEMENTER_TEST_RULE}\n"
@@ -234,6 +258,7 @@ def build_prompt(
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
         "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
         "with `- <point>: <why it is out of scope or not a defect>`.\n"
+        '- Write the short change summary as JSON in .foragent/PR.json: {"summary": "one or two complete sentences"}.\n'
         "- When the Done when commands would pass, also write .foragent/TRY.md so a person can check your work in about a minute.\n"
         f"  Write the prose in {language}. Keep these English headings exactly:\n"
         "  ## What changed\n"
@@ -313,8 +338,10 @@ def build_resume_prompt(
     if lane_plan:
         # Always restated: a newer preread and approval may replace the plan the session saw.
         parts.append(lane_plan)
-    if previous_body is not None and previous_body != body:
-        old, new = previous_body.splitlines(), body.splitlines()
+    # Gate writing is not specification, so a change in it alone is no update.
+    old, new = (authored_body(previous_body).splitlines(), authored_body(body).splitlines()) \
+        if previous_body is not None else ([], [])
+    if old != new:
         for tag, start, end, new_start, new_end in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
             if tag == "equal":
                 continue

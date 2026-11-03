@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 
+from foragent.state_locks import _file_lock
+
 # Days a finished run's logs stay, by its newest run's outcome; any non-merged outcome keeps 30.
 # Merged runs keep `fa settings` log_retention_days (#160), 7 by default.
 MERGED_RETENTION_DAYS = 7
@@ -18,6 +20,12 @@ JOURNAL_RETENTION = timedelta(days=30)
 JOURNALS = ("orch-events.jsonl", "gate-events.jsonl")
 # issue-N.log and its companions issue-N.<anything> and issue-N-<anything>.
 _ISSUE_FILE = re.compile(r"issue-(\d+)[.-]")
+# Flow observations: two whole generations, so every retained file set stays finite
+# (2,048 lines and 7 MiB) and rotation never rewrites an accepted line.
+FLOW_FILE, FLOW_OLD_FILE, FLOW_LOCK = "flow-records.jsonl", "flow-records.1.jsonl", "flow.lock"
+FLOW_GENERATION_LINES = 1024
+FLOW_GENERATION_BYTES = 3584 * 1024
+FLOW_RECORD_BYTES = 1024 * 1024
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -30,6 +38,118 @@ def _parse_time(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _flow_value(value: object) -> str:
+    return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+class FlowRecordsMixin:
+    """The local, append-only observation log. Its leaf lock takes no other lock."""
+
+    def record_flow(self, kind: str, *, issue: int | None = None, run_started_at: str | None = None,
+                    **data: object) -> None:
+        """Append one observation at the store's UTC clock; a failure never reaches the caller.
+
+        Callable while holding the state lock. The time is read inside the lock, so file
+        order is time order. An oversized record keeps only its size, its content unknown.
+        """
+        try:
+            with _file_lock(self.root / FLOW_LOCK):
+                self._write_flow(kind, issue, run_started_at, data)
+        except Exception:
+            return
+
+    def record_flow_change(self, kind: str, *, issue: int | None = None, run_started_at: str | None = None,
+                           across_runs: bool = False, only_if=None, **data: object) -> None:
+        """Append one transition unless the latest same-kind record already says it.
+
+        The latest record is this execution's, or the issue's with ``across_runs``. ``only_if`` sees its
+        data (None without one) and can decline. Concurrent callers share the lock, so one change is one
+        record. A retained-out record is unknown, and its repeat is recorded again.
+        """
+        try:
+            with _file_lock(self.root / FLOW_LOCK):
+                latest = self._latest_flow(kind, issue, None if across_runs else (run_started_at,))
+                if latest is not None and latest["run_started_at"] == run_started_at and latest["data"] == data:
+                    return
+                if only_if is None or only_if(None if latest is None else latest["data"]):
+                    self._write_flow(kind, issue, run_started_at, data)
+        except Exception:
+            return
+
+    def _write_flow(self, kind: str, issue: int | None, run_started_at: str | None, data: dict) -> None:
+        record = {"at": self._now().astimezone(_state.UTC).isoformat(), "kind": kind, "issue": issue,
+                  "run_started_at": run_started_at, "data": data}
+        line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+        if len(line) > FLOW_RECORD_BYTES:
+            record["data"] = {"oversized_bytes": len(line)}
+            line = _state.json.dumps(record, default=_flow_value).encode() + b"\n"
+        if len(line) <= FLOW_RECORD_BYTES:
+            self._append_flow_line(line)
+
+    def _latest_flow(self, kind: str, issue: int | None, runs: tuple | None) -> dict | None:
+        """The newest retained record of ``kind`` for ``issue``, limited to ``runs`` when given."""
+        marker = _state.json.dumps(kind).encode()
+        for name in (FLOW_FILE, FLOW_OLD_FILE):
+            for line in reversed(self._flow_generation(name).split(b"\n")):
+                if marker not in line:
+                    continue
+                try:
+                    value = _state.json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(value, dict) and value.get("kind") == kind and value.get("issue") == issue
+                        and isinstance(value.get("data"), dict)
+                        and (runs is None or value.get("run_started_at") in runs)):
+                    return value
+        return None
+
+    def _append_flow_line(self, line: bytes) -> None:
+        path = self.root / FLOW_FILE
+        try:
+            current = path.read_bytes()
+        except FileNotFoundError:
+            current = b""
+        torn = bool(current) and not current.endswith(b"\n")  # An earlier write ended early.
+        lines = current.count(b"\n") + torn
+        if lines >= FLOW_GENERATION_LINES or len(current) + torn + len(line) > FLOW_GENERATION_BYTES:
+            _state.os.replace(path, self.root / FLOW_OLD_FILE)
+            torn = False
+        with path.open("ab") as stream:
+            stream.write(b"\n" + line if torn else line)
+
+    def flow_records(self, *, since: datetime | None = None, until: datetime | None = None) -> list[dict]:
+        """Retained observations in ``[since, until)``, oldest first; unreadable lines are unknown.
+
+        Reading creates and changes nothing, and takes only a shared flow lock.
+        """
+        try:
+            with (self.root / FLOW_LOCK).open("rb") as stream:
+                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_SH)
+                raw = b"".join(self._flow_generation(name) for name in (FLOW_OLD_FILE, FLOW_FILE))
+        except OSError:
+            return []  # No lock file: nothing was ever recorded here.
+        rows = []
+        for line in raw.split(b"\n"):
+            try:
+                value = _state.json.loads(line)
+            except ValueError:
+                continue
+            at = _parse_time(value.get("at")) if isinstance(value, dict) else None
+            if at is None or not isinstance(value.get("kind"), str) or not isinstance(value.get("data"), dict):
+                continue
+            if (since is None or at >= since) and (until is None or at < until):
+                rows.append((at, {key: value.get(key) for key in ("at", "kind", "issue", "run_started_at", "data")}))
+        rows.sort(key=lambda row: row[0])  # Stable: equal times keep their written order.
+        return [row for _, row in rows]
+
+    def _flow_generation(self, name: str) -> bytes:
+        try:
+            content = (self.root / name).read_bytes()
+        except FileNotFoundError:
+            return b""
+        return content if content.endswith(b"\n") else content + b"\n"
+
+
 class LogRetentionMixin:
     def trim_journals(self, now: datetime) -> list[Path]:
         """Drop journal lines older than 30 days; return the journals that changed.
@@ -38,6 +158,8 @@ class LogRetentionMixin:
         state lock, which every journal append also takes. The talk events of a run
         still active stay whatever their age: its talk state and paused time are
         derived from them (D95), so trimming one would end a talk without evidence.
+        The newest marked retrospective note also stays whatever its age: the last
+        retrospective time is derived from it.
         """
         cutoff, trimmed = now - JOURNAL_RETENTION, []
         with self._state_lock():
@@ -48,12 +170,30 @@ class LogRetentionMixin:
                     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
                 except FileNotFoundError:
                     continue
-                kept = [line for line in lines if not self._journal_line_expired(line, cutoff, active)]
+                newest = self._newest_retrospective(lines)
+                kept = [line for index, line in enumerate(lines)
+                        if index == newest or not self._journal_line_expired(line, cutoff, active)]
                 if len(kept) != len(lines):
                     self._atomic_write(path, "".join(kept))
                     trimmed.append(path)
         self.trimmed_journals = trimmed  # The tick's housekeeping reports the trim prune_logs did.
         return trimmed
+
+    @staticmethod
+    def _newest_retrospective(lines: list[str]) -> int | None:
+        """The index of the newest ``note`` line marked ``retrospective``, or None."""
+        newest, newest_at = None, None
+        for index, line in enumerate(lines):
+            try:
+                value = _state.json.loads(line)
+            except ValueError:
+                continue
+            if not (isinstance(value, dict) and value.get("kind") == "note" and value.get("retrospective") is True):
+                continue
+            at = _parse_time(value.get("at"))
+            if at is not None and (newest_at is None or at >= newest_at):
+                newest, newest_at = index, at
+        return newest
 
     @staticmethod
     def _journal_line_expired(line: str, cutoff: datetime, active: set = frozenset()) -> bool:

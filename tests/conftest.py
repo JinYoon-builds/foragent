@@ -208,6 +208,23 @@ def isolated_test_slots(tmp_path, monkeypatch):
     monkeypatch.delenv(capacity.TEST_SLOT_ENV, raising=False)
 
 
+# Their subject is starting a role, not admission; a loaded host must not refuse their starts.
+ROLE_START_MODULES = {
+    "test_architect_project_schedule", "test_background_launch_budget", "test_orch_architect",
+    "test_role_short_reason", "test_role_source", "test_orch_role_schedule",
+}
+
+
+@pytest.fixture(autouse=True)
+def calm_sensors_for_role_starts(request, monkeypatch):
+    """A role start reads the load and memory sensors (#994), so these modules fix them as calm."""
+    from foragent import capacity
+
+    if request.module.__name__ in ROLE_START_MODULES:
+        monkeypatch.setattr(capacity, "machine_load", lambda: ("normal", 0.5))
+        monkeypatch.setattr(capacity, "kernel_pressure", lambda: "normal")
+
+
 @pytest.fixture(autouse=True)
 def no_real_machine_sleep(request, monkeypatch):
     """The sensor reports no sleep, so the owner's real sleep never credits runs on fake clocks (#415).
@@ -313,6 +330,20 @@ LOCAL_ONLY_FILES = {
     "tests/acceptance/test_doctor_live.py", "tests/acceptance/test_update_check.py",
     "tests/acceptance/test_view_open_terminals.py", "tests/acceptance/test_view_open_triggers.py",
 }
+
+
+# Locked files cannot opt out, and many publish from fake Git, a scrubbed PATH or a repository without
+# a test command. Those files test other rules; only these two test collection.
+COLLECTION_FILES = {"tests/acceptance/test_publish_collect_check.py", "tests/test_order_collect.py"}
+
+
+@pytest.fixture(autouse=True)
+def _collection_tested_on_its_own(request, monkeypatch):
+    from foragent import order_collect
+
+    root = Path(__file__).resolve().parent.parent
+    if request.path.relative_to(root).as_posix() not in COLLECTION_FILES:
+        monkeypatch.setattr(order_collect, "check", lambda *args, **kwargs: None)
 
 
 def pytest_itemcollected(item):

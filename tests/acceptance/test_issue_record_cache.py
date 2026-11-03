@@ -189,7 +189,9 @@ def test_issue_record_cache_drop_under_lock_preserves_a_peers_latest_write(store
     assert [row["number"] for row in rows] == [8]
     assert rows[0]["title"] == "Peer's latest title"
     assert rows[0]["labels"] == ["approved", "peer-label"]
-    assert rows[0]["comments"][-1]["body"] == "Peer's pending comment"
+    # #1125 (2026-11-01, test owner; Jin chose scope B): an unsent queued comment never
+    # appears among issue comments; it stays only in the pending queue checked below.
+    assert "Peer's pending comment" not in [comment["body"] for comment in rows[0]["comments"]]
     assert [(entry["id"], entry["issue"], entry["body"]) for entry in pending] == [
         (2, 8, "Pending comment"), (3, 8, "Peer's pending comment"),
     ], "Dropping issue 7 must preserve the peer's pending writes for issue 8"

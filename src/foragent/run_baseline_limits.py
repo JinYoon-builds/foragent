@@ -61,6 +61,14 @@ def _duration(value) -> float | None:
     return value
 
 
+def recorded_duration(saved: dict, report_path: Path) -> tuple[float | None, bool]:
+    """Prefer the recorded measurement; only legacy entries use their companion JUnit total."""
+    if "duration_seconds" in saved:
+        return _duration(saved["duration_seconds"]), False
+    duration = _estimate(report_path)
+    return duration, duration is not None
+
+
 def read_entries(cache_root: Path, repo_root: Path, repo: str | None, now: datetime) -> list[CacheEntry]:
     """This repository's cache entries recorded up to ``now``, newest first; unreadable files are skipped."""
     entries = []
@@ -72,15 +80,7 @@ def read_entries(cache_root: Path, repo_root: Path, repo: str | None, now: datet
             created_at = datetime.fromisoformat(saved["created_at"])
             if created_at.tzinfo is None or created_at > now:
                 continue
-            estimated = False
-            if "duration_seconds" in saved:
-                duration = _duration(saved["duration_seconds"])
-            elif path.with_suffix(".xml").is_file():
-                # An older producer (tagged or not): the runner's estimate from the JUnit total time.
-                duration = _estimate(path.with_suffix(".xml"))
-                estimated = duration is not None
-            else:
-                duration = None
+            duration, estimated = recorded_duration(saved, path.with_suffix(".xml"))
             entries.append(CacheEntry(path.stem, saved, created_at, duration, estimated,
                                       saved.get("timed_out") is True))
         except (OSError, ValueError, TypeError, KeyError, ET.ParseError):

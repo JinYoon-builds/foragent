@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -713,3 +714,172 @@ def test_publication_conflict_language_falls_back_to_english_silently(tmp_path, 
     expected = "충돌 마커가 남음: a.py:3" if config == "language: ko\n" else "Conflict marker left: a.py:3"
     assert str(raised.value) == expected
     assert capsys.readouterr() == ("", "")
+
+
+def _layouts(git_history, tmp_path):
+    """Checkout layouts by name: (worktree root, env) for one repository's git dir."""
+    clone = git_history.clone
+    linked = tmp_path / "linked"
+    git_command(clone, "worktree", "add", "--detach", str(linked), "HEAD")
+    separate = tmp_path / "separate-worktree"
+    separate.mkdir()
+    sub = clone / "sub"
+    sub.mkdir()
+    symlinked = tmp_path / "symlinked-worktree"  # A linked worktree whose .git is a symlink to its git dir.
+    git_command(clone, "worktree", "add", "--detach", str(symlinked), "HEAD")
+    gitdir = Path(git_command(symlinked, "rev-parse", "--path-format=absolute", "--git-dir"))
+    (symlinked / ".git").unlink()
+    (symlinked / ".git").symlink_to(gitdir, target_is_directory=True)
+    shared = tmp_path / "symlinked-repository"  # A checkout whose .git is a symlink to the repository's.
+    shared.mkdir()
+    (shared / ".git").symlink_to(clone / ".git", target_is_directory=True)
+    return {
+        "bare-repository": (clone / ".git", {}),
+        "symlinked-linked-worktree": (symlinked, {}),
+        "symlinked-git-dir": (shared, {}),
+        "clone": (clone, {}),
+        "linked-worktree": (linked, {}),
+        "git-dir-env": (separate, {"GIT_DIR": str(clone / ".git"), "GIT_WORK_TREE": str(separate)}),
+        "relative-git-dir-env": (separate, {"GIT_DIR": "../clone/.git", "GIT_WORK_TREE": "."}),
+        "work-tree-below-the-repository": (sub, {"GIT_WORK_TREE": str(sub)}),
+    }
+
+
+LAYOUTS = ["clone", "linked-worktree", "git-dir-env", "relative-git-dir-env", "work-tree-below-the-repository",
+           "symlinked-linked-worktree", "symlinked-git-dir", "bare-repository"]
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_main_write_lock_lives_where_git_keeps_the_common_dir(git_history, tmp_path, monkeypatch, layout):
+    root, env = _layouts(git_history, tmp_path)[layout]
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    expected = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root,
+                              check=True, capture_output=True, text=True).stdout.strip()
+    assert GitRepo(root).common_dir() == Path(expected).resolve() == (git_history.clone / ".git").resolve()
+
+
+@pytest.mark.parametrize("writer", ["setup", "publisher"])
+@pytest.mark.parametrize("layout", ["git-dir-env", "symlinked-linked-worktree", "symlinked-git-dir", "bare-repository"])
+def test_every_checkout_layout_waits_for_the_primary_checkouts_main_write_lock(git_history, tmp_path,
+                                                                               monkeypatch, layout, writer):
+    import fcntl
+    from threading import Event, Thread
+    from foragent.git import main_write_lock
+
+    root, env = _layouts(git_history, tmp_path)[layout]
+    held, release, failures = Event(), Event(), []
+
+    def merger():  # The gate's primary checkout, without any environment.
+        try:
+            with GitRepo(git_history.clone).publish_lock():
+                held.set()
+                release.wait(10)
+        except BaseException as exc:
+            failures.append(exc)
+            held.set()
+
+    thread = Thread(target=merger)
+    thread.start()
+    try:
+        assert held.wait(10) and not failures
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        real_flock, contended = fcntl.flock, []
+
+        def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
+            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+                try:
+                    return real_flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    contended.append(True)
+                    release.set()
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", probe)
+        lock = main_write_lock(GitRepo(root)) if writer == "setup" else GitRepo(root).publish_lock()
+        with lock:
+            assert contended == [True], "This checkout must wait for the lock the primary checkout holds"
+    finally:
+        release.set()
+        thread.join(10)
+    assert not failures
+
+
+def test_setup_in_a_git_dir_checkout_waits_for_the_main_write_lock_of_the_repository(git_history, tmp_path,
+                                                                                     monkeypatch):
+    import fcntl
+    from threading import Event, Thread
+    from foragent.git import main_write_lock
+
+    held, release, failures = Event(), Event(), []
+
+    def merger():  # The gate's ordinary checkout of the same repository, without GIT_DIR.
+        try:
+            with GitRepo(git_history.clone).publish_lock():
+                held.set()
+                release.wait(10)
+        except BaseException as exc:
+            failures.append(exc)
+            held.set()
+
+    thread = Thread(target=merger)
+    thread.start()
+    try:
+        assert held.wait(10) and not failures
+        root, env = _layouts(git_history, tmp_path)["git-dir-env"]
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        real_flock, contended = fcntl.flock, []
+
+        def probe(fd, operation):  # Observe contention without waiting on a guessed duration.
+            if operation & fcntl.LOCK_EX and not operation & fcntl.LOCK_NB:
+                try:
+                    return real_flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    contended.append(True)
+                    release.set()
+            return real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", probe)
+        with main_write_lock(GitRepo(root)):
+            assert contended == [True], "Setup must wait for the merge holding this repository's lock"
+    finally:
+        release.set()
+        thread.join(10)
+    assert not failures
+
+
+
+@pytest.mark.parametrize("answer", ["not-a-repository", "empty", "relative"])
+def test_main_write_is_refused_when_git_cannot_report_the_lock_directory(tmp_path, answer):
+    """Fail closed: without the repository's lock directory no main write runs."""
+    from foragent.git import main_write_lock
+
+    if answer == "not-a-repository":
+        git = GitRepo(tmp_path)
+    else:
+        git = GitRepo(tmp_path, lambda args: "" if answer == "empty" else ".git\n")
+    entered = []
+    with pytest.raises(GitError, match="main is not written without it"):
+        with main_write_lock(git):
+            entered.append(True)
+    assert entered == [] and not list(tmp_path.rglob("foragent-publish.lock"))
+
+
+def test_an_injected_git_double_writes_no_history_and_takes_no_lock(tmp_path):
+    from types import SimpleNamespace
+    from foragent.git import main_write_lock
+
+    entered = []
+    with main_write_lock(SimpleNamespace(root=tmp_path, commit_paths=lambda *args: None)):
+        entered.append(True)
+    assert entered == [True] and not list(tmp_path.rglob("foragent-publish.lock"))
+
+
+@pytest.mark.parametrize("layout", ["clone", "linked-worktree", "symlinked-linked-worktree", "symlinked-git-dir"])
+def test_origin_slug_from_files_reads_the_origin_git_reports_in_every_dot_git_layout(git_history, tmp_path, layout):
+    git_command(git_history.clone, "remote", "set-url", "origin", "git@github.com:owner/repo.git")
+    root, _ = _layouts(git_history, tmp_path)[layout]
+    reported = git_command(root, "remote", "get-url", "origin")
+    assert origin_slug_from_files(root) == slug_from_url(reported) == "owner/repo"

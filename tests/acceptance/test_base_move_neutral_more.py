@@ -101,7 +101,7 @@ def test_new_open_orders_locked_acceptance_reuses_verification(
 
     assert case.tracker.get_issue(4).state == "open"
     assert NEW_ORDER not in git_command(
-        case.history.origin, "diff", "--name-only", case.moves[0], "refs/heads/foragent/issue-1",
+        case.history.origin, "diff", "--name-only", f"{case.moves[0]}...refs/heads/foragent/issue-1",
     ).splitlines(), "The running branch must not touch the new order's locked file"
     assert log.count(REUSED) == 1, (
         f"A new locked file owned through {ownership} was never protected by this run; re-verified"

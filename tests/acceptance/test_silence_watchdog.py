@@ -375,7 +375,7 @@ def verify(case, site):
     attempt = SimpleNamespace(
         n=1, ctx=case.ctx, git=git, worktree=case.root, log=case.store.log_path(1),
         parsed=SimpleNamespace(done_when_commands=["pytest tests/test_work.py"] if site == "done-when" else []),
-        batch_branch=None, start_ref="main", target_branch="main", baseline=None,
+        start_ref="main", target_branch="main", baseline=None,
     )
     if site == "done-when":
         git.changed_paths = lambda ref: ["feature.txt"]

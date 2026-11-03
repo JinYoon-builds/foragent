@@ -11,7 +11,7 @@ from foragent.roles import load_roles
 REFACTOR = "skills/fa-orchestrator/references/refactor.md"
 
 # The procedure lives in the architect's skills; the prompt keeps the evidence, the why and a pointer.
-PROMPT = """You are the architect for this repository. The orchestrator started you with this evidence:
+PROMPT = """You are the architect for this repository. You were started with this evidence:
 
 {why}
 
@@ -35,10 +35,13 @@ scope, or taste), which the orchestrator forwards to the person as a multiple-ch
 
 ## Memory
 
-Record each proposal in {memory} as one bullet with its request id, the date and its expected effect:
-`- <date> <request id>: <one line> - expected: <effect>; measured: pending`. First check the measured
-effect of earlier proposals there with `fa orch scorecard` or `fa orch facts`, and append what you
-measured. Leave the change uncommitted.
+Read {memory} first. Append only reusable lessons there; leave the change uncommitted.
+Keep proposals, decisions and waits on the owning GitHub issue or linked unpublished request.
+Track each proposal by its request id and date in `fa orch inbox`. Keep its expected effect and
+`measured: pending` in that request or issue. On later runs, read earlier proposals in `fa orch inbox`
+and linked issue history, then check their measured effect with `fa orch scorecard` or `fa orch facts`.
+Record the measurement on its request or issue through the orchestrator, and append only the
+reusable lesson to memory.
 
 End with a one-line summary of what you proposed, or "Nothing to change.".
 """
@@ -46,7 +49,7 @@ End with a one-line summary of what you proposed, or "Nothing to change.".
 ARCHITECT = "architect"
 
 # Every other role: the evidence, the role's skills and memory, and the one way out (the orchestrator).
-ROLE_PROMPT = """You are the {role} role for this repository. The orchestrator started you with this evidence:
+ROLE_PROMPT = """You are the {role} role for this repository. You were started with this evidence:
 
 {why}
 
@@ -60,8 +63,11 @@ is a valid outcome.
 
 ## Memory
 
-Your project memory is {memory}. Read {memory_file} first and record each proposal there as one
-bullet with its request id and the date. Leave the change uncommitted.
+Your project memory is {memory}. Read {memory_file} first. Append only reusable lessons there;
+leave the change uncommitted. Keep proposals, decisions and waits on the owning GitHub issue or
+linked unpublished request, delivered through `fa orch request`. Track each proposal by its
+request id and date in `fa orch inbox`. Include the responsible role and next condition with each
+wait so the owner can continue it after a restart.
 
 End with a one-line summary of what you proposed, or "Nothing to change.".
 """

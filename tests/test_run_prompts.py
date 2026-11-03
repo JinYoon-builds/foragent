@@ -2,8 +2,11 @@ from dataclasses import replace
 
 import pytest
 
+from foragent import order_waiting
 from foragent.issue import parse_body
-from foragent.runner import build_prompt, build_review_prompt, goal_condition, parse_review, run_issue
+from foragent.runner import (
+    build_prompt, build_resume_prompt, build_review_prompt, goal_condition, parse_review, run_issue,
+)
 from foragent.run_skill_catalog import catalog_section
 from runner_support import BODY, COMMAND, run_case
 
@@ -85,7 +88,19 @@ def test_native_goal_condition_length_cap_preserves_instructions():
     condition = goal_condition("a" * 5000)
     assert len(condition) == 3500
     assert condition.startswith('Every command in the "Done when" list below exits 0')
-    assert condition.endswith("no files outside this repository are changed. Or stop after 40 turns.")
+    assert condition.endswith(" is modified, and you did not edit files outside this repository."
+                              " Files that test tooling writes outside the repository do not count as your edits."
+                              " At 40 turns, end the run without repeating the stop check.")
+
+
+@pytest.mark.parametrize("acceptance_dir", ["tests/acceptance/", "quality/인수 checks/"])
+def test_native_goal_condition_scopes_outside_edits_to_the_implementer(acceptance_dir):
+    condition = goal_condition(acceptance_dir)
+    assert f"nothing under {acceptance_dir} is modified" in condition
+    assert "no files outside this repository are changed" not in condition
+    assert "you did not edit files outside this repository" in condition
+    assert "test tooling writes outside the repository do not count" in condition
+    assert condition.endswith("At 40 turns, end the run without repeating the stop check.")
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -196,3 +211,107 @@ def test_rework_prompts_ask_for_the_whole_class_and_a_searched_list_only_on_rewo
     ):
         assert prompt.count(SEARCHED_LIST_INSTRUCTIONS) == 1
     assert ".foragent/SEARCHED.md" in SEARCHED_LIST_INSTRUCTIONS
+
+
+PLAIN_BODY = "<!-- foragent:v1 -->\n## Goal\nShip it.\n\n## Out of scope\nOthers.\n\n## Done when\n```sh\ntrue\n```\n"
+EXTRA = "## Done when\n- [x] Reads well\n\n## Contracts\nThe API stays."
+EXTRA_BODY = PLAIN_BODY + "- [x] Reads well\n\n## Contracts\nThe API stays.\n"
+
+
+def test_prompts_add_other_content_only_when_the_issue_has_some():
+    plain, extra = parse_body(PLAIN_BODY), parse_body(EXTRA_BODY)
+    section = f"Other approved issue content (verbatim):\n{EXTRA}\n"
+    plain_prompt, extra_prompt = build_prompt(1, plain, "tests/acceptance/"), build_prompt(1, extra, "tests/acceptance/")
+    assert "Other approved" not in plain_prompt
+    assert extra_prompt.replace(section, "", 1) == plain_prompt
+    assert extra_prompt.index("```\n" + section) < extra_prompt.index("Rules:")
+    plain_review, extra_review = build_review_prompt(plain, "diff"), build_review_prompt(extra, "diff")
+    assert "Other approved" not in plain_review
+    assert extra_review.replace(section + "\n", "", 1) == plain_review
+    assert extra_review.index(section) < extra_review.index("Diff:")
+
+
+def test_review_cuts_a_long_diff_but_never_long_authored_content():
+    padding = "".join(f"Requirement {number}.\n" for number in range(8000))
+    assert len(padding) > 60000
+    parsed = parse_body(PLAIN_BODY + "## Contracts\n" + padding)
+    prompt = build_review_prompt(parsed, "x" * 70000)
+    assert padding.strip() in prompt and "x" * 70000 not in prompt
+    assert "Requirement 7999." in build_prompt(1, parsed, "tests/acceptance/")
+
+
+def updates(prompt):
+    return [part for part in prompt.split("\n\n") if part.startswith("Specification update")]
+
+
+@pytest.mark.parametrize("trailing", ["", "  "])
+def test_resume_treats_what_the_real_gate_writes_as_no_update(trailing):
+    body = EXTRA_BODY.rstrip("\n") + trailing
+    stamped = order_waiting.stamp(body, order_waiting.replace_section(body, "A wait"))
+    written = order_waiting.mark_write(body, stamped)
+    assert "foragent:write" in written and "foragent:waiting-prior" in written
+    assert updates(build_resume_prompt(1, body, written)) == []
+    assert updates(build_resume_prompt(1, written, body)) == []
+    assert "foragent:" not in parse_body(written).other_content
+
+
+def test_resume_states_each_changed_authored_line_once_without_repeating_the_rest():
+    gate = "\n## Waiting\nReason: a boundary\n"
+    revised = EXTRA_BODY.replace("[x] Reads well", "[ ] Reads better").replace("The API stays.", "The API moves.")
+    prompt = build_resume_prompt(1, EXTRA_BODY, revised + gate)
+    found = updates(prompt)
+    assert len(found) == 2 and "- [ ] Reads better" in found[0] and "The API moves." in found[1]
+    for unchanged in ("Ship it.", "Others.", "```", "## Contracts", "Waiting", "boundary", "foragent:"):
+        assert unchanged not in prompt
+    removed = build_resume_prompt(1, EXTRA_BODY, PLAIN_BODY)
+    assert "Remove these previous requirements:" in removed and "The API stays." in removed
+
+
+def test_resume_counts_lines_in_the_authored_body():
+    assert updates(build_resume_prompt(1, "<!-- foragent:v1 -->\n## Goal\nOld\n", "<!-- foragent:v1 -->\n## Goal\nNew\n")) == [
+        "Specification update at previous issue body lines 2-2:\nNew",
+    ]
+
+
+def test_resume_without_a_recorded_body_has_no_update():
+    assert updates(build_resume_prompt(1, None, EXTRA_BODY)) == []
+    assert updates(build_resume_prompt(1, EXTRA_BODY, EXTRA_BODY)) == []
+
+
+def test_gate_writes_after_an_unfinished_fence_stay_out_of_prompts_and_resume():
+    body = PLAIN_BODY + "\n## Example\n```\ncode\n"
+    written = order_waiting.mark_write(body, order_waiting.stamp(body, order_waiting.replace_section(body, "A wait")))
+    parsed = parse_body(written)
+    for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
+        assert "## Example\n```\ncode" in prompt
+        assert "A wait" not in prompt and "foragent:write" not in prompt and "waiting-prior" not in prompt
+    assert updates(build_resume_prompt(1, body, written)) == []
+
+
+@pytest.mark.parametrize("trailing", ["", "  "])
+def test_a_snapshot_with_a_glued_marker_stays_clean_and_a_rewrite_is_no_update(trailing):
+    marker = "<!-- foragent:write id=" + "a" * 32 + " -->"
+    clean = EXTRA_BODY.rstrip("\n") + trailing
+    snapshot = clean + marker + "\n"
+    rewritten = order_waiting.mark_write(snapshot, clean + "\n")
+    assert marker not in rewritten.replace(f"\n{marker}\n", "\n") and marker in rewritten
+    parsed = parse_body(snapshot)
+    for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
+        assert "The API stays." in prompt and "foragent:" not in prompt
+    assert updates(build_resume_prompt(1, snapshot, rewritten)) == []
+    assert updates(build_resume_prompt(1, snapshot, clean)) == []
+    edited = updates(build_resume_prompt(1, snapshot, rewritten.replace("The API stays.", "The API moves.")))
+    assert len(edited) == 1 and "The API moves." in edited[0] and "foragent:" not in edited[0]
+
+
+def test_a_marker_glued_to_a_closing_fence_stays_out_when_approved_content_adds_a_block():
+    marker = "<!-- foragent:write id=" + "a" * 32 + " -->"
+    clean = PLAIN_BODY + "\n## Example\n```\nfirst-block\n```"
+    snapshot = clean + marker + "\n"
+    reapproved = snapshot + "\n## More\n```\nsecond-block\n```\n"
+    parsed = parse_body(reapproved)
+    for prompt in (build_prompt(1, parsed, "tests/acceptance/"), build_review_prompt(parsed, "diff")):
+        assert "```\nfirst-block\n```\n\n## More\n```\nsecond-block\n```" in prompt and "foragent:" not in prompt
+    resume = build_resume_prompt(1, snapshot, reapproved)
+    assert resume.count("Specification update") == 1 and "second-block" in resume
+    assert "first-block" not in resume and "foragent:" not in resume

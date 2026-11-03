@@ -35,6 +35,8 @@ ACORNS = ("implementing", "checking", "reviewing", "ci", "merging")
 BASELINE_PHASES = frozenset({"baseline", "baseline-wait"})
 # The orchestrator's conflict fix comes after code, local tests and review.
 RESOLVING_DONE = 3
+# Recipients of a question still waiting for an answer (watch_questions).
+ASKING = frozenset({"person", "orchestrator"})
 
 
 def glyph_mode(config: Config) -> str:
@@ -52,8 +54,18 @@ def glyph_mode(config: Config) -> str:
     return "emoji" if "UTF8" in locale.upper().replace("-", "") else "ascii"
 
 
-def _kind(state: str, phase: str | None) -> tuple[str, str]:
-    """The glyph kind and phase-word key of one row's facts."""
+def _kind(state: str, phase: str | None, question: str | None = None) -> tuple[str, str]:
+    """The glyph kind and phase-word key of one row's facts.
+
+    ``question`` is whose turn the issue's question awaits (watch_questions): a
+    question names its recipient; an answered one waits to restart, naming nobody.
+    """
+    if question == "person":
+        return "person", "squirrel_answer"
+    if question == "orchestrator":
+        return "wait", "squirrel_orchestrator"
+    if question == "answered" and state in {"blocked", "waiting-human"}:
+        return "wait", "squirrel_restart"
     if state == "waiting-human" or phase in PERSON_PHASES:
         return "person", "squirrel_person"
     if state == "blocked":
@@ -65,6 +77,38 @@ def _kind(state: str, phase: str | None) -> tuple[str, str]:
     if phase is None or phase in CODE_PHASES:
         return "code", "squirrel_code"
     return "wait", "squirrel_turn"  # Queue, slot, overlap and limit waits.
+
+
+def row_words(state: str, phase: str | None, question: str | None, language: str) -> tuple[str, str]:
+    """(glyph kind, phase word) for one issue: the one rule every display of an issue's state uses.
+
+    ``question`` comes from the question projection (watch_questions), so a question
+    names its recipient and an answered one names nobody wherever the issue is shown.
+    """
+    from foragent import watch
+
+    kind, key = _kind(state, phase, question)
+    return kind, watch.text(key, language, who=watch.text("question_person", language))
+
+
+def person_turn(language: str) -> str:
+    """The words for a question waiting on the person ("waiting for you")."""
+    return row_words("waiting-human", None, "person", language)[1]
+
+
+def recipient(question: str | None, language: str) -> str | None:
+    """The name a waiting question carries ("you", "the orchestrator"); None for no recipient."""
+    from foragent import watch
+
+    return watch.text(f"question_{question}", language) if question in ASKING else None
+
+
+def turn_within(language: str, width: int) -> str:
+    """The person's turn words, or only their name when the words would not fit ``width`` cells."""
+    from foragent import watch
+
+    words = person_turn(language)
+    return words if watch._cells(words) <= width else recipient("person", language)
 
 
 def _time(value: Any) -> datetime | None:
@@ -141,7 +185,9 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     from foragent import watch
 
     language = config.language
-    kind, words = _kind(state, phase)
+    # Whatever the work state, a question names its recipient (#1160).
+    question = (snapshot.questions or {}).get(number)
+    kind, words = row_words(state, phase, question, language)
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The run behind the row: the active one, else (except for a queued issue, which has no
     # run yet) the issue's latest recorded run from the full history, then status.history.
@@ -172,7 +218,9 @@ def _issue_row(snapshot: Snapshot, config: Config, row: dict[str, Any], name: st
     done = finished_acorns(phase, events, started, waiting_from)
     acorns = "".join(glyphs["done" if index in done else "left"] for index in range(len(ACORNS)))
     return {"glyph": glyphs[kind], "lane": name, "number": f"#{number}", "issue": number, "title": watch._clean(title or ""),
-            "words": watch.text(words, language), "activity": activity,
+            "words": words, "activity": activity,
+            # The recipient's name, kept whole when a narrow row must shorten the words.
+            "who": recipient(question, language),
             # Without a recorded time (a queued issue, a row with no run) the cell says so.
             "elapsed": elapsed_text(elapsed, language) or "—", "acorns": acorns,
             "style": "yellow" if activity or kind == "person" else ""}
@@ -218,6 +266,15 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
 
     status, language = snapshot.status, config.language
     clones = _clones(status)
+    # A task can change lanes after a merge. Current rows anywhere in the view
+    # take precedence over that task's historical row in its previous lane.
+    current = {run["number"] for runs in clones.values() for run in runs}
+    current.update(number for number, fact in snapshot.waiting_facts.items() if fact.get("authored"))
+    current.update(snapshot.question_issues)  # An open question's row is current too.
+    for lane in status["lanes"].values():
+        current.update(item["number"] for group in ("running", "held", "queued") for item in lane.get(group) or [])
+        if lane.get("issue") is not None and lane["state"] in {"working", "waiting-human", "blocked"}:
+            current.add(lane["issue"])
     found: list[dict[str, Any]] = []
     for row in status["lanes"].values():
         slug, name = row["slug"], row["lane_display"]
@@ -253,7 +310,21 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
                                      item.get("title") or snapshot.titles.get(number) or "", glyphs, now))
         shown = {item["issue"] for item in active}
         queued = [item for item in row.get("queued", []) if item["number"] not in shown]
-        finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in shown]
+        authored = {number: fact for number, fact in snapshot.waiting_facts.items()
+                    if fact.get("authored") and fact.get("lane") == slug}
+        listed = shown | {item["number"] for item in queued}
+        queued += [{"number": number, "title": fact.get("title", "")}
+                   for number, fact in authored.items() if number not in listed]
+        # An open question on an issue no status list shows (unapproved work, say) still gets a row.
+        listed = shown | {item["number"] for item in queued}
+        asking = [item for number, item in sorted(snapshot.question_issues.items())
+                  if item.get("lane") == slug and number not in listed]
+        for item in asking:
+            active.append(_issue_row(snapshot, config, row, name, item["number"], None, item.get("state"),
+                                     None, item.get("title") or "", glyphs, now))
+        # A reopened issue can have a past merge and a current wait or question. Its current
+        # row carries the explanation; the historical row must not repeat it as done.
+        finished = [issue for issue in snapshot.done.get(slug, []) if issue.number not in current]
         rows: list[dict[str, Any]] = []
         if not active and not queued:
             # Today's merges in this lane; a snapshot built without them keeps the order's done list.
@@ -265,16 +336,26 @@ def _rows(snapshot: Snapshot, config: Config, glyphs: dict[str, str], now: datet
             if is_open:
                 rows += [_finished_row(snapshot, config, issue, name, glyphs) for issue in finished]
         else:
-            hideable = max(0, len(finished) - 1) + max(0, len(queued) - 1)
+            # Folded, a lane keeps its next queued issue, every authored wait and every
+            # queued issue with an open question.
+            questions = snapshot.questions or {}
+            folded_queue = [item for index, item in enumerate(queued) if index == 0 or item["number"] in authored
+                            or questions.get(item["number"]) in ASKING]
+            visible_queue = queued if is_open else folded_queue
+            hideable = max(0, len(finished) - 1) + len(queued) - len(folded_queue)
             last = last_finished(snapshot, finished)
             for issue in finished if is_open else [last] if last is not None and not tight else []:
                 rows.append(_finished_row(snapshot, config, issue, name, glyphs))
             rows += active
-            for item in queued if is_open else queued[:1]:
+            for item in visible_queue:
                 # A queued issue has no run: neither the lane's phase nor its acorns are its own.
                 waiting = _issue_row(snapshot, config, row, name, item["number"], None, "queued", None,
                                      item.get("title") or snapshot.titles.get(item["number"]) or "", glyphs, now)
-                rows.append({**waiting, "style": "dim"})
+                asks = questions.get(item["number"]) in ASKING
+                if item["number"] in authored and not asks:
+                    waiting["words"] = watch.text("waiting_view_state", language)
+                # A question names its recipient and keeps its own emphasis; plain queued work is dim.
+                rows.append(waiting if asks else {**waiting, "style": "dim"})
         found += [{**item, "slug": slug} for item in rows]
         if hideable and (is_open or not tight):
             words = (watch.text("acorns_fold", language) if is_open
@@ -310,11 +391,19 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         others = sum(value + 1 for key, value in widths.items() if key != "title" and value)
         widths["title"] = min(widths["title"], max(0, width - others - 1))
     # The row must fit: warnings, then the lane name, then the phase word give way, so the
-    # glyph, number, elapsed time and acorns at the end are never pushed off the line.
-    for key, least in (("activity", 0), ("lane", 4), ("words", 4), ("lane", 1), ("words", 1)):
+    # glyph, number, elapsed time and acorns at the end are never pushed off the line. A
+    # question's word keeps at least its recipient's name; only a line too narrow even for
+    # that cuts the name.
+    named = max((watch._cells(row["who"]) for row in cells if row.get("who")), default=0)
+    for key, least in (("activity", 0), ("lane", 4), ("words", max(4, named)), ("lane", 1),
+                       ("words", max(1, named)), ("words", 1)):
         over = sum(value + 1 for value in widths.values() if value) - 1 - width
         if over > 0:
             widths[key] = max(min(widths[key], least), widths[key] - over)
+    for row in cells:
+        # A question word too long for its column becomes the recipient's name alone.
+        if row.get("who") and watch._cells(row["words"]) > widths["words"]:
+            row["words"] = row["who"]
     shown = [key for key in columns if widths[key]]
     hits, marks = context.get("hits"), context.get("marks")
     lines: list[Line] = []
@@ -340,4 +429,10 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
             continue
         if hits is not None:
             hits.append(target)
+        if "issue" in row:
+            authored = snapshot.waiting_facts.get(row["issue"], {}).get("authored")
+            if authored:
+                from foragent.watch_waiting import explanation
+
+                lines += explanation(authored, config.language, width)
     return lines

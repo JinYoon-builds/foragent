@@ -19,6 +19,8 @@ conversational English, active voice, positive phrasing, and one idea per senten
 Explain the result and the next action in the person's terms. Run the commands in this
 skill yourself; the person supplies requests, links and choices in conversation.
 
+List replaced issues in the plan's `issues[].replaces` instead of asking the person to close them.
+
 ## Talking to the person
 Record the decision ledger, chunk cells and source labels with `fa order progress`.
 These records are not shown to the person as lists unless the person asks for them.
@@ -45,7 +47,7 @@ plan, it sends the plan path to the planning session. Approval relayed from anot
 is not approval. This first-hand rule covers D71 choices: a choice about behaviour, scope,
 screen wording or the approval boundary, or a real preread QUESTION, comes through the planning
 session to the person. A choice-free fix (required behaviour settled, nothing left to choose)
-the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve`
+the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve --defer <boundary>`
 after a clean preread; a Foragent caller role alone does not block that.
 
 Every GitHub write goes through fa commands: creating or changing issues, PRs, comments,
@@ -90,6 +92,27 @@ Use `fa order publish` below to perform the approved publication itself.
 Run `fa order context --json` and read it fully. Then read the repository yourself as needed
 (README, existing specs in `docs/specs/`, the code areas you will touch).
 - Pending `decisions` and `feedback` come first: they are answers the user already gave.
+- Run `fa decisions --json`. Rows with state `decided, nothing ordered` are decisions with
+  no linked issue yet: context for what to propose, defer or discuss, not a work list.
+  A missing link is not proof the decision is unimplemented (older issues are linked only
+  by exact D-number citations in their published spec). Each row has `observed_at`, the
+  age of the issue facts behind its state. You decide what to order.
+- Present issue questions only from `decisions`: these belong to this factory's effective
+  orderer and are answered in that person's planning session. Reuse the existing @orderer
+  GitHub issue comment and decision flow. Keep foreign questions as read-only facts in
+  `other_orders`; their orderer's planning session handles the answers. If `identity`
+  reports an error, explain it and keep processing the legacy and singleton questions
+  retained in `decisions`. Labelled owners remain visible in `other_orders` until the
+  factory account is known; do not guess that account. Show any `owner_error` from
+  `open_issues` as an unresolved ownership fact.
+- Compare `other_orders` Files with every proposed chunk's Files. Show overlap facts
+  with links to the existing issues, their orderers and current status; let the person
+  choose **wait / split files / go ahead**, with a recommendation and its tradeoff.
+  Empty or missing Files means unknown scope, so explain that uncertainty. Preserve
+  globs as declared; inspect the repository to explain potential overlaps. The script
+  supplies facts and the planning session and person make the decision.
+  Before approval, read open night-order and lane-memory issues whose Files overlap
+  the `MEMORY.new.md` split and add the real dependency to the plan.
 - Build a **decision ledger** from the docs before asking questions: design docs,
   decision logs, README, CLAUDE.md/AGENTS.md and specs contain earlier answers.
   Give each entry its decision, reason, constraints, out of scope, source reference and
@@ -119,15 +142,23 @@ The person's current words take precedence over old documents and the ledger.
   ask once: "D18 says X; this request needs Y" with **Change / Keep / Exception this once**.
   Recommend the option that best fits the current request and explain the tradeoff.
   Apply the answer without repeating the conflict question.
-- For Change, update the decision ledger immediately and include both record updates in
-  the same approved order. Append a dated replacement with its reason and a "Supersedes"
-  link to the old entry in the repository's decision log, or `docs/decisions.md` if none
-  exists; leave earlier entries as they are, because the history is append-only. Then
-  replace the affected line in `docs/rules.md` with the new rule so readers of current
-  rules see it. If the project has no `docs/rules.md`, record the decision only and do
-  not create the file. For Exception this once, record its scope in the order spec and
-  ledger without replacing the standing rule or touching `docs/rules.md`. For Keep, adapt
-  the plan. Persist changes with the approved order so lane agents read the current decision.
+- For Change, update the session's decision ledger immediately, then retain a dated
+  replacement and its reason with `fa order note --defer <boundary> --kind decision --text '<dated decision, reason, Supersedes link to the earlier entry>'`.
+  For an earlier waiting decision, add `--replaces <id>` as a new append; keep the old
+  entry intact. This history is append-only. Planning only appends waiting entries;
+  only flush owns publication checkpoints. Choose what deserves recording and the
+  publication boundary through planning judgment, and inspect retained notes with
+  `fa order pending --json` in later sessions.
+  At publication, include both record updates in the same approved order: append the
+  dated replacement with its reason and Supersedes link to `docs/decisions.md` (or the
+  project's decision log), and replace the affected line in existing `docs/rules.md`.
+  Planning leaves published documents, issues, the shared checkout and index untouched;
+  if there is no rules file, do not create one. For Exception this once, retain its
+  scope in a decision note and the order spec without replacing the standing rule.
+  For Keep, adapt the plan.
+- Retain an idea worth carrying to later planning sessions with
+  `fa order note --defer <boundary> --kind idea --text '<idea>'`. Choose its boundary
+  yourself; an interruption requires no shared-checkout edits to undo.
 
 ## 2. Interview
 Native is the default interview. Read `interview.engine` from `fa order context --json`
@@ -292,6 +323,10 @@ freeze a lane's private implementation.
 - Fill each issue's **`files`** with the repository-relative paths or globs it is expected
   to change (for example, `["src/foragent/order.py", "skills/fa-order/**"]`). Use `[]`
   when the affected files are not yet known. The published issue lists these under `## Files`.
+- Set an issue's or edit's **`decisions`** (for example, `["D79"]`) to the ledger decisions
+  the work carries out, so `fa decisions` links them. Use heading IDs only (`D79`, not
+  `D79-1`). Omitting it on a republication or edit keeps the issue's existing links; `[]`
+  clears them. Decisions cited only as rationale do not go here.
 - Put the shared outcome and cross-issue constraints in the parent summary, not in children.
 
 Record the lane map before writing acceptance tests: chunk × goal / out of scope /
@@ -350,6 +385,14 @@ approval, under "the lane will decide these" (in the person's language). They ne
 planning approval and no loop to remove every guess; the lane records them in its PR.
 `--approve` refuses issues whose latest preread of the current content is missing or still
 has open questions; any plan edit needs a new preread. The dry-run is never blocked.
+Issues with behaviour `statements` take `fa order prepare PLAN.json --json` instead of preread:
+their lane writes the tests, an independent reviewer checks them, and the reviewed files and
+commands enter the plan. Preread reads only the other issues. Publishing, with or without
+`--approve`, uses that review without starting another model; a change to the issue, the
+other issues it depends on, the spec, the tests, the lane or reviewer setup, or main itself
+needs `fa order prepare` again. A reviewer question goes back to planning: answer it in the
+statements, then prepare again. Dropping the statements never returns a prepared or published
+issue to preread. Local commits on main that are not on origin must be pushed before publishing.
 Issues on a lane this order creates (`new_lanes`) have no implementer until the lane exists,
 so preread refuses them: after the person's first-hand approval here, publish once without
 `--approve` to create the lanes, run preread, then publish again with `--approve`. Reuse that
@@ -375,15 +418,35 @@ the dry-run and present the revised scope for approval.
 For a choice-free fix the orchestrator runs this step itself after a clean preread (the D71
 boundary above). After receiving the person's first-hand approval here, this planning session runs the
 validated `fa order publish PLAN.json` for real with
-`--approve` (or `--approve-keys` for a partial approval). `fa order publish` places the
+`--approve --defer <boundary>` (or `--approve-keys` for a partial approval). The agent
+chooses the shared publication boundary through planning judgment. Ordinary orders wait:
+the publication controls retain the full plan and its existing approval selection outside
+the shared checkout, even if the caller deletes the draft. Waiting is append-only; it
+takes neither the publication lock nor the flush lock and makes no commit or issues.
+Show the waiting summary and inspect retained orders with `fa order pending --json`.
+Waiting never grants approval: only explicit approval evidence supplies it, and neither
+time nor pending-view reads do. The same reviewed-tests and clean-preread requirements
+apply before retention; a later publication must check them again. A waiting submission
+has no published issue numbers, so keep its originating request processing until publication.
+
+If the person or agent explicitly judges the order urgent, add `--urgent` to publish it
+immediately. Urgency is a judgment, not a scripted classification. This uses the existing
+immediate publication path and leaves all ordinary waiting work untouched. The existing
+new-lane creation path in step 5 stays immediate so its agent and skills exist for preread.
+
+For immediate publication, `fa order publish` places the
 acceptance files and the spec in the checkout itself: it takes a publish lock, fetches and
 fast-forwards to the latest base branch, writes and commits only this order's own paths,
 and pushes. Other sessions' edits stay out of the commit, so no manual rebase is needed. If
 it cannot fast-forward, report the error instead of rebasing or committing by hand. Decisions and feedback that change
-existing issues go into `edits`. Record `progress publish --issue <number>` for each
+existing issues go into `edits`: start each from `fa order edit NUMBER --json`, the issue's
+current sections as one `edits[]` entry. An edit keeps every current Done when command and
+checklist text. To drop a line, name it exactly in `done_when_removals` with the reason
+(`{"line": "...", "reason": "..."}`); publication keeps both readable on the issue, and refuses
+any other loss. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
-`fa orch request-status ID done --note "<issues>"`, using the originating request ID and the
+`fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run

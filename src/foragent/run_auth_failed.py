@@ -40,8 +40,13 @@ def outcome(ctx: RunContext, n: int) -> str:
     return "merged" if merged_in_this_run(ctx, n) else OUTCOME
 
 
-def finish(n: int, ctx: RunContext, exc: BaseException, label: str | None) -> tuple[str, str]:
-    """Record the one-line reason and drop ``label`` if given; return (outcome, detail)."""
+def finish(n: int, ctx: RunContext, exc: BaseException, labels: bool = True) -> tuple[str, str]:
+    """Record the one-line reason; unless merged, drop ``ready`` and ``running`` (best effort).
+
+    The issue then stays idle until `fa orch retry`. ``labels=False`` when a label
+    write is the very call the credential just refused. Returns (outcome, detail).
+    """
+    from foragent.labels import READY, RUNNING
     from foragent.orch_events import append_event
     from foragent.tracker import TrackerError
 
@@ -49,13 +54,13 @@ def finish(n: int, ctx: RunContext, exc: BaseException, label: str | None) -> tu
     detail = auth_retry.describe(exc) + (" (after the merge)" if result == "merged" else "")
     ctx.store.update_run(n, outcome=result, detail=detail)
     append_event(ctx.store, ctx.now(), n, OUTCOME, detail)
-    if label is not None:
+    if labels and result != "merged":
         try:
-            ctx.tracker.remove_labels(n, [label])
+            ctx.tracker.remove_labels(n, [READY, RUNNING])
         except TrackerError as error:
             # The same credential may refuse this too; the tick removes a stale label.
             append_event(ctx.store, ctx.now(), n, "cleanup-failed",
-                         f"running label removal failed: {auth_retry.first_line(str(error))}")
+                         f"label removal failed: {auth_retry.first_line(str(error))}")
     return result, detail
 
 
@@ -121,4 +126,4 @@ def held(store, n: int, approved_at: str) -> bool:
 def record_after(n: int, ctx: RunContext, failure: object) -> None:
     """Record a refused credential in a step after the merge (the reinstall's fetch); the run stays merged."""
     if is_auth_failure(failure):
-        finish(n, ctx, failure, None)
+        finish(n, ctx, failure, labels=False)

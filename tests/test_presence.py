@@ -140,6 +140,16 @@ def stall_store(tmp_path, monkeypatch):
     root.mkdir()
     (root / ".foragent.yml").write_text(yaml.safe_dump({"repo": "offline/stall"}), encoding="utf-8")
     now = datetime(2026, 10, 30, 12, tzinfo=UTC)
+    from foragent import statusline
+
+    class FixedClock(datetime):
+        """The prompt hook reads the wall clock; pin it so a fixed-date store stays inside its windows."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(statusline, "datetime", FixedClock)
     return root, StateStore.for_repo("offline/stall", now=lambda: now), now
 
 
@@ -205,14 +215,18 @@ def test_statusline_counts_open_questions_only_in_the_planning_session(stall_sto
     root, store, now = stall_store
     assert presence.statusline_segment(root, now) == STALL_BASE
     first = orch_inbox.ask(store, "One?", ["a", "b"], 1)
+    # An open question with no issue is the person's: every session names the recipient,
+    # only the planning session adds where to answer.
     assert presence.statusline_segment(root, now) == (
-        STALL_BASE + " · 1 question needs your answer in the planning session")
+        STALL_BASE + " · questions: you 1 · 1 question needs your answer in the planning session")
     orch_inbox.ask(store, "Two?", ["a", "b"], 1)
-    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 2 · 2 questions need your answer in the planning session")
     orch_inbox.answer(store, first["id"], "a")
-    assert presence.statusline_segment(root, now).endswith(" · 1 question needs your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 1 · 1 question needs your answer in the planning session")
     monkeypatch.setenv("FORAGENT_ROLE", "orchestrator")
-    assert presence.statusline_segment(root, now) == STALL_BASE
+    assert presence.statusline_segment(root, now) == STALL_BASE + " · questions: you 1"
 
 
 def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_store):
@@ -255,7 +269,7 @@ def test_a_corrupt_question_file_hides_no_valid_question_count(stall_store, brok
     orch_inbox.ask(store, "Valid?", ["a", "b"], 1, issues=[5])
     (store.root / "inbox" / "questions" / "broken.json").write_text(broken, encoding="utf-8")
     # The last case is an object with wrong field types: skipped alone like the others.
-    question = " · 1 question needs your answer in the planning session"
+    question = " · questions: you 1 · 1 question needs your answer in the planning session"
     assert presence.statusline_segment(root, now) == "🐿 0 lanes working · ✋ 1 · 0 merged today" + question
     assert presence.session_start_message(root, None, now) == (
         "since the last report: 0 merges · ✋ 1 · /fa for the report")
@@ -336,13 +350,24 @@ def test_an_unreadable_state_folder_is_reported(stall_store, monkeypatch):
         None, ["state folder: unreadable (PermissionError: Permission denied)"])
 
 
-def _hook(root, monkeypatch):
-    """Run the installed prompt hook entry with a strict UTF-8 stderr, as Claude Code's pipe is."""
+def _hook(root, monkeypatch, now):
+    """Run the installed prompt hook entry with a strict UTF-8 stderr, as Claude Code's pipe is.
+
+    The hook reads the wall clock; pin it to the fixture's ``now`` so recency is judged
+    against the test's own time, not the host's.
+    """
     import json
     import sys
+    from datetime import datetime
 
     from foragent import statusline
 
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(statusline, "datetime", Clock)
     stderr = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
     out = io.BytesIO()
     monkeypatch.setattr(sys, "stderr", stderr)
@@ -402,7 +427,7 @@ def test_a_lone_surrogate_in_one_field_replaces_only_that_character(stall_store,
             return Listing(names + [Entry()]) if str(path) == str(folder) else Listing(names)
 
         monkeypatch.setattr(orch_inbox.os, "scandir", scandir)
-    context, error = _hook(root, monkeypatch)
+    context, error = _hook(root, monkeypatch, now)
     assert '"opaque"' in context and "Visible question" in context, "valid rows still reach the turn"
     assert "bad?text" in context or "bad?.json" in context, "only the unencodable character is replaced"
     if field == "filename":
@@ -440,7 +465,7 @@ def test_a_deeply_nested_row_is_skipped_alone(stall_store, monkeypatch, place):
             stream.write('{"kind": "notice", "at": ' + DEEP + "}\n")
     else:
         (store.root / "inbox" / place / "deep.json").write_text(DEEP)
-    context, error = _hook(root, monkeypatch)
+    context, error = _hook(root, monkeypatch, now)
     assert '"opaque"' in context and "Visible question" in context, "valid rows still reach the turn"
     assert "RecursionError" in error or "unreadable notice line" in error, "the skipped row is named"
     assert presence.prompt_context(root, now)[1], "a partial read, not a complete box"
@@ -606,7 +631,7 @@ def test_a_line_separator_inside_a_field_keeps_the_notice_whole(stall_store, mon
     # append_event folds whitespace in summary (U+2029 included); channel keeps U+2028 as is.
     assert [(event["channel"], event["summary"]) for event in notices] == [("push\u2028line", "Para graph")]
     assert problems == []
-    context, error = _hook(root, monkeypatch)
+    context, error = _hook(root, monkeypatch, now)
     assert '"push\u2028line"' in context and error == ""
 
 
@@ -616,7 +641,7 @@ def test_a_lone_surrogate_in_a_raw_notice_line_reaches_the_turn_replaced(stall_s
     root, store, now = _bound_stall_store(stall_store)
     at = (now - timedelta(minutes=2)).isoformat()
     _raw_journal(store, '{"at": "%s", "kind": "notice", "status": "sent", "summary": "a\\ud800b"}\n' % at)
-    context, error = _hook(root, monkeypatch)
+    context, error = _hook(root, monkeypatch, now)
     assert '"a?b"' in context and '"opaque"' in context
 
 
@@ -737,3 +762,36 @@ def test_well_formed_events_of_other_kinds_are_not_diagnosed(stall_store):
     append_event(store, now - timedelta(minutes=2), 201, "retry", "Retry", say="Retried.", verdict="ok")
     notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
     assert notices == [] and problems == []
+
+
+def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_question(stall_store):
+    """Defect class: planning display paths counting open questions the projection no longer awaits."""
+    import os
+    from datetime import timedelta
+
+    from foragent import orch_inbox, presence
+    from foragent.tracker import FakeTracker
+
+    root, store, now = _bound_stall_store(stall_store)  # One open question with no issue: still awaited.
+    tracker = FakeTracker(now=lambda: now)
+    tracker.add_issue(7, "Storage", labels=["approved", "blocked", "lane:api"])
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")
+    store.save_flag(7, "spec-question", flagged_at=now.isoformat())
+    store.finish_run(7, outcome="spec-question")
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, now)
+    asked = orch_inbox.ask(store, "Run 1: which region?", ["a", "b"], 1, issues=[7])
+    later = lambda minutes: now + timedelta(minutes=minutes)
+    os.utime(store.root / "flags" / "7.json", (now.timestamp(),) * 2)
+    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert asked["question"] in presence.prompt_context(root, now)[0]
+    store._now = lambda: later(5)
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")  # The retry starts a new episode.
+    segment = presence.statusline_segment(root, later(5))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(5))[0] or "")
+    store.finish_run(7, outcome="merged")
+    tracker.close_issue(7)  # Merged and closed: still not awaited.
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, later(6))
+    segment = presence.statusline_segment(root, later(6))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(6))[0] or "")

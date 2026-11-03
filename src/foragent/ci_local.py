@@ -37,7 +37,7 @@ def report_ids(report, result, measurement):
 def check(n, ctx, command, root):
     from foragent import runner
     return runner._check(command, root, ctx.store.log_path(n), max(1, runner._remaining(n, ctx)),
-                         progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
+                         progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                          full_text_dir=cuts.issue_dir(ctx.store.root, n))
 
 
@@ -65,10 +65,13 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
     previous = phase_identity(ctx.store.get_run(n))
     _phase(n, ctx, "baseline")
     ctx.store.update_run(n, phase_work_id=f"baseline-local:{base_sha}")
+    completed = False
     try:
-        return _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        result = _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        completed = True
+        return result
     finally:
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
 def _capture_local_only(n, ctx, git, command, base_sha, excluded):
@@ -96,7 +99,8 @@ def _capture_local_only(n, ctx, git, command, base_sha, excluded):
                 collected, passing = report_ids(report, result, json.loads(evidence.read_text()))
             except (OSError, ValueError, ET.ParseError) as exc:
                 raise AttemptFailure(f"local_only acceptance baseline unavailable: {exc}") from exc
-        return AcceptanceBaseline(command, passing, collected, tuple(sorted(set(collected) - set(passing))), tuple(excluded), base_sha)
+        return AcceptanceBaseline(command, passing, collected, tuple(sorted(set(collected) - set(passing))),
+                                  tuple(excluded), base_sha, duration_seconds=result.seconds)
 
 
 def _uses_local_only(root):

@@ -7,9 +7,11 @@ from datetime import datetime
 from glob import escape
 
 from foragent.i18n import text
-from foragent.overlap_files import Claim, any_overlap, approved_issue, at_capacity, claims, measure, union_patterns
+from foragent.overlap_files import (
+    Claim, _hold, any_overlap, approved_issue, at_capacity, capacity_holds, claims, measure, note_holds, union_patterns,
+)
 from foragent.run_checks import _append
-from foragent.run_waits import _credited_wait
+from foragent.run_waits import _credited_wait, activity
 
 # Seconds between re-checks while a late file waits for its holders. Each check
 # measures this run and every peer, so a short poll multiplies tick load.
@@ -59,25 +61,44 @@ def _record_peers(ctx, owner: Claim, peers: list[Claim], *, union: set[str] | No
     _edit_records(ctx, owner.run.number, edit)
 
 
-def _late_blockers(ctx, owner: Claim, peers: list[Claim], union: set[str]) -> dict[str, list[int]]:
+def _late_holders(owner: Claim, peers: list[Claim]) -> list[Claim]:
     own_order = (datetime.fromisoformat(owner.run.started_at), owner.run.number)
     # Stable holders keep their place. Expanding runs must use one total order
     # across all their claims, including declarations and exclusive reservations;
     # per-path precedence lets crossed additions wait on each other forever.
-    holders = [peer for peer in peers if not peer.run.late_files
-               or (datetime.fromisoformat(peer.run.started_at), peer.run.number) < own_order]
+    return [peer for peer in peers if not peer.run.late_files
+            or (datetime.fromisoformat(peer.run.started_at), peer.run.number) < own_order]
+
+
+def _exclusive_holders(ctx, owner: Claim, holders: list[Claim], pattern: str) -> list[Claim]:
+    # Exclusive reservations, the owner's included, win over the union exemption.
+    return [peer for peer in holders if any_overlap(ctx, [pattern], peer.parsed.exclusive)
+            or (any_overlap(ctx, [pattern], owner.parsed.exclusive) and any_overlap(ctx, [pattern], peer.files))]
+
+
+def _late_blockers(ctx, owner: Claim, peers: list[Claim], union: set[str]) -> dict[str, list[int]]:
+    holders = _late_holders(owner, peers)
     blocked = {}
     for path in owner.run.late_files:
         pattern = escape(path)
-        # Exclusive reservations, the owner's included, win over the union exemption.
-        exclusive = [peer.run.number for peer in holders if any_overlap(ctx, [pattern], peer.parsed.exclusive)
-                     or (any_overlap(ctx, [pattern], owner.parsed.exclusive) and any_overlap(ctx, [pattern], peer.files))]
+        exclusive = [peer.run.number for peer in _exclusive_holders(ctx, owner, holders, pattern)]
         full = at_capacity(ctx, [pattern], holders, union=union)
         if exclusive or full:
             numbers = exclusive + ([peer.run.number for peer in holders
                                     if any_overlap(ctx, [pattern], peer.files)] if full else [])
             blocked[path] = sorted(set(numbers))
     return blocked
+
+
+def _late_holds(ctx, owner: Claim, peers: list[Claim], blocked: list[str], union: set[str]) -> list[dict]:
+    """The evidence behind ``_late_blockers``: each blocked file's actual cause and peer executions."""
+    holders, holds = _late_holders(owner, peers), []
+    for path in sorted(blocked):
+        pattern = escape(path)
+        if exclusive := _exclusive_holders(ctx, owner, holders, pattern):
+            holds.append(_hold(path, None, [peer.run for peer in exclusive], "exclusive"))
+        holds += [{**hold, "file": path} for hold in capacity_holds(ctx, [pattern], holders, union=union)]
+    return holds
 
 
 def wait_for_overlap(attempt) -> None:
@@ -88,6 +109,7 @@ def wait_for_overlap(attempt) -> None:
     def blocked():
         run = ctx.store.get_run(n)
         if approved_issue(ctx, run) is None:
+            note_holds(ctx, n, run.started_at, [])
             return {}
         run = measure(ctx, run, attempt.parsed, attempt.target_branch)
         owner = Claim(run, attempt.parsed, [escape(path) for path in run.effective_files]
@@ -97,7 +119,12 @@ def wait_for_overlap(attempt) -> None:
         _record_peers(ctx, owner, peers, union=union)
         for peer in peers:
             _record_peers(ctx, peer, [owner], union=union)
-        return _late_blockers(ctx, owner, peers, union)
+        blockers = _late_blockers(ctx, owner, peers, union)
+        try:
+            note_holds(ctx, n, run.started_at, _late_holds(ctx, owner, peers, list(blockers), union))
+        except Exception:  # noqa: BLE001 - an observation never replaces this wait's own answer
+            pass
+        return blockers
 
     blockers = blocked()
     if not blockers:
@@ -112,7 +139,8 @@ def wait_for_overlap(attempt) -> None:
         blockers="; ".join(f"{path}: " + ", ".join(f"#{number}" for number in numbers)
                            for path, numbers in sorted(blockers.items())),
     ))
-    _credited_wait(n, ctx, acquire, "overlap-wait")
+    with activity(n, ctx, "overlap-wait", "file-overlap"):
+        _credited_wait(n, ctx, acquire, "overlap-wait")
 
 
 @contextmanager

@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from foragent import orch_park, scheduler
+from foragent import orch_park, scheduler, scheduler_flow
+from foragent.orch_events import acknowledged_at
 from foragent.records import load_record
 from foragent.state import Approval
 from foragent.tracker import Dependency, Issue, LabelEvent
@@ -104,6 +105,7 @@ def _check_prerequisites(
         report.actions.append(f"#{issue.number} flagged spec-question: blocker #{cancelled.number} was closed as not planned")
         return False
     if any(dependency.state == "open" for dependency in dependencies):
+        scheduler_flow.note_blockers(ctx, issue.number, dependencies)
         if scheduler.READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
             report.actions.append(f"#{issue.number} returned to approved waiting for open blockers")
@@ -135,14 +137,16 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     ])
     if ctx.now() - since <= scheduler.timedelta(minutes=ctx.config.orchestrator_timeout_minutes):
         return issue
-    # A park newer than the clock's start is the orchestrator's response to these blockers.
-    if (parked := orch_park.parked_at(ctx.store, issue.number)) is not None and parked > since:
+    # A response remains effective until a later blocker/run starts a new clock.
+    parked = orch_park.parked_at(ctx.store, issue.number, comments=row.get("comments", []))
+    responses = [at for at in (parked, acknowledged_at(ctx.store, issue.number)) if at is not None]
+    if responses and max(responses) > since:
         return issue
     ctx.tracker.add_labels(issue.number, [scheduler.NEEDS_HUMAN])
     scheduler.board.sync_status(ctx, issue, "Needs human")
     ctx.tracker.comment(issue.number, scheduler.format_comment(
         scheduler.Reason.ORCHESTRATOR_TIMEOUT,
-        "The orchestrator has not responded to this blocker.",
+        f"Orchestrator timeout: no response to this blocker within {ctx.config.orchestrator_timeout_minutes} minutes.",
         f"Blocked since {latest.created_at}; timeout: {ctx.config.orchestrator_timeout_minutes} minutes.\n\n"
         f"Latest blocker:\n{latest.body}",
     ))
