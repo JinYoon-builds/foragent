@@ -127,7 +127,8 @@ reviewer_model: null
 review_level: low       # Claude /code-review: low | medium | high | xhigh | max
 review_scope: claude-local  # claude-local | pr-body
 review_pass_scope: true   # 같은 이슈 본문이면 PASS 뒤 리뷰는 PASS 뒤에 바뀐 코드(main에서 들어온 코드 포함)로만 막고, 안 바뀐 코드의 지적은 NOTE로 남김. false면 저장된 PASS가 있어도 예전 리뷰로 돌아감. 위험 지도 항목의 `pass_scope_exempt: true`(`fa risk add --pass-scope-exempt`)와 경로가 맞는 변경은 예전 범위를 유지
-review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 4개(goal-fidelity·concurrency·interruption-rollback·test-quality)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
+review_perspectives: []  # 위험 지도 PR 리뷰 관점 추가 [{name, focus}]; 기본 6개(rule-documents·obvious-bugs·git-history·earlier-pr-comments·code-comments·fatal-path)와 이름이 같으면 그 focus를 바꿈. 관점마다 리뷰어 한 명이 변경 전체를 봄
+review_scoring: true   # 리뷰 FAIL 지적마다 채점 세션 하나. 근거(Goal 인용 줄·잠긴 시험·깨지는 입력)가 있고 80점 이상이거나, 근거 있는 치명 경로가 실제로 있으면 막음. 나머지는 점수와 함께 NOTE. Goal이 정하지 않은 점은 spec-question. false면 채점 없이 모든 FAIL이 막음
 review_reviewers: 1      # 1 이상 정수; 동시에 도는 관점 리뷰어 수의 상한. 1이면 하나씩 차례로 돌고, 관점은 줄지 않음
 perspectives: {}         # fa order perspectives 자리별 실행기 {skeptic|first_time_user|attacker|operator|maintainer|incidents|other_users: codex|claude}; 없으면 attacker·maintainer는 codex, 나머지는 claude
 review_max: 2            # 리뷰 FAIL 허용 수; 초과하면 PR을 열고 risk-high로 보류
@@ -144,6 +145,8 @@ scheduled_roles: true    # 주문이 끝나면 아키텍트·문서 역할·회�
 ```
 
 init이 기본값을 쓰고, 사람이나 init 옵션으로 고친다. 기존 파일에서는 명시한 옵션의 키가 없을 때만 추가하고, 이미 있는 값은 보존한다. 모델은 전역 기본값(`foragent config`) + 이 파일의 덮어쓰기 (D12).
+
+리뷰 FAIL 지적은 라운드마다(리뷰어 한 명, 패널 합침, 확인 라운드 모두) 지적 하나에 새 채점 세션 하나를 붙여 하나씩 차례로 채점한다(D109). 치명 경로는 데이터 손실, main 깨뜨리기, 승인 없는 머지, 사람만 가진 권한을 에이전트에게 넘기기다. 잠긴 시험 근거는 인수 폴더에 실제로 있는 파일이어야 한다. 채점자는 `skills/review-procedure`(code-review 플러그인의 0–100 표와 오탐 목록, Apache-2.0)를 따른다. 막지 않은 지적은 점수와 함께 `review-score` 이벤트와 `runs/issue-N/score-R-K.txt`에 남는다. 점수가 없거나 잘못된 답은 FAIL을 유지한다. 채점자가 Goal이 그 점을 정하지 않았다고 답하면(`spec_question`) 잠긴 시험 충돌처럼 실행을 멈추고 기획 쪽에 spec-question을 보낸다. 재작업이 아니다. 관점 패널은 위험 메모가 있는 첫 라운드에서만 돈다. `review_scoring: false`면 채점 없이 모든 FAIL이 막는다.
 
 `merge_group_max`가 없거나 정확히 `auto`이면 이 저장소에 남아 있는 `group-check` 기록을 저널 순서대로 읽어 그룹 크기 한도를 계산한다. 4에서 시작하여 현재 한도 이상의 인원이 통과하면 1씩 올려 최대 8까지, 더 작은 그룹의 통과는 그대로 둔다. 실패하면 1씩 내려 최소 2까지이며, 한 명의 실패도 같은 규칙을 적용한다. 인프라 오류·시간 초과 등 `void` 결과는 그대로 둔다. 계산한 한도는 저장하지 않으며 로컬과 CI 그룹 모두 같은 한도를 쓴다. 양의 정수를 지정하면 기록과 무관하게 그 한도로 고정하고, 1이면 그룹을 끈다. `fa status --json`의 `merge_group`에서 `limit`과 `mode`(`auto` 또는 `fixed`)를 확인할 수 있다.
 
@@ -169,7 +172,3 @@ Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. St
 - **OpenAI Symphony** (스타 약 2.8만, 2026-02 공개, 0.0.3, 월 1~2커밋): 같은 발상(이슈 보드 = 컨트롤 플레인). gate의 차이는 **입구와 출구의 관문**: 승인된 본문만 실행, Done when 직접 실행, 검수 강도·항상 사람 경로. 가운데 스케줄러는 빌리거나 참고할 대상. SPEC과 코드는 아직 직접 읽지 않았다.
 - **orwa-mahmoud/nightshift, marcus/nightshift**: 이슈 큐를 외부 검증하며 당겨 오지 않는다 ([research/nightshift-scan-raw.md](research/nightshift-scan-raw.md)).
 - **공식 `/goal`** (Claude Code, Codex 실험): 작업 하나를 끝까지 돌리는 것은 흡수됐다. 큐에서 새 컨텍스트로 하나씩 꺼내는 것은 흡수되지 않았다. gate는 후자만 한다.
-
-```yaml
-review_scoring: true   # 리뷰 FAIL 지적마다 채점 세션 하나. 근거(Goal 인용 줄·잠긴 시험·깨지는 입력)가 있고 80점 이상이거나, 근거 있는 치명 경로가 실제로 있으면 막음. 나머지는 점수와 함께 NOTE. Goal이 정하지 않은 점은 spec-question. false면 채점 없이 모든 FAIL이 막음
-```
