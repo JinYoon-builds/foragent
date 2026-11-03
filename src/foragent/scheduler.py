@@ -113,7 +113,8 @@ def tick(ctx: TickContext) -> TickReport:
                     if not exc.is_rate_limit:
                         raise
                     return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
-                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
+                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
+                                     start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
                 return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
