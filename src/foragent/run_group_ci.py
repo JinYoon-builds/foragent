@@ -77,7 +77,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                 if pr is None:
                     pr = ctx.tracker.find_pr(branch)
                 if pr is not None:
-                    if ctx.config.merge_owner:
+                    if getattr(ctx.config, "merge_owner", False):
                         from foragent.merge_owner import close_for_repair
 
                         close_for_repair(ctx, None, pr, combined, target, branch=branch)
@@ -87,7 +87,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                 _append(ctx.store.log_path(n), f"Group PR cleanup: {exc}")
             finally:
                 try:
-                    if not ctx.config.merge_owner and ctx.git.remote_branch_sha(branch) is not None:
+                    if not getattr(ctx.config, "merge_owner", False) and ctx.git.remote_branch_sha(branch) is not None:
                         ctx.git._call(["push", "origin", "--delete", branch])
                 except (GitError, OSError) as exc:
                     _append(ctx.store.log_path(n), f"Group branch cleanup: {exc}")

@@ -563,7 +563,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if approval is None:
         invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")
         return "no-approval"
-    authorization = ctx.merge_authorization if ctx.config.merge_owner else None
+    authorization = ctx.merge_authorization if getattr(ctx.config, "merge_owner", False) else None
     pr = (ctx.tracker.get_pr(authorization["pr"]) if authorization else
           next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
                 if pr.head == f"foragent/issue-{n}"), None))

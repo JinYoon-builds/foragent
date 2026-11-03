@@ -93,10 +93,10 @@ def _final_merge_inputs(
 
     status = run_publish._ci_status(ctx, pr, git.root, ready_at)
     issue = ctx.tracker.get_issue(n)
-    if ctx.config.merge_owner and issue.state == "closed":
+    if getattr(ctx.config, "merge_owner", False) and issue.state == "closed":
         return run_publish._MergeInputs(stop=lambda: "issue-closed")
     saved = ctx.store.load_approval(n)
-    if (ctx.config.merge_owner and saved is not None
+    if (getattr(ctx.config, "merge_owner", False) and saved is not None
             and _approval_identity(saved) != _approval_identity(approval)):
         return run_publish._MergeInputs(stop=lambda: "superseded")
     if (run_publish.APPROVED not in issue.labels
@@ -104,10 +104,10 @@ def _final_merge_inputs(
             or saved is None or saved.body_sha != approval.body_sha
             or saved.acceptance_blobs != approval.acceptance_blobs):
         return run_publish._MergeInputs(stop=invalid_approval)
-    current = (ctx.tracker.get_pr(pr) if ctx.config.merge_owner else
+    current = (ctx.tracker.get_pr(pr) if getattr(ctx.config, "merge_owner", False) else
                next((item for item in ctx.tracker.list_prs("open", branch) if item.number == pr), None))
     if (current is None or current.head != branch or current.base != base
-            or ctx.config.merge_owner and (current.state != "open" or current.merged_at)):
+            or getattr(ctx.config, "merge_owner", False) and (current.state != "open" or current.merged_at)):
         return run_publish._MergeInputs(stop=changed_base)
     parent = ctx.tracker.parent_of(n)
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None

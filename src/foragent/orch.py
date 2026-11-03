@@ -194,7 +194,7 @@ def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expec
         error = orch_advice.publish(ctx.tracker, ctx, n,
                                     "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
         add_hint(ctx.store, n, hint)
-    if ctx.config.merge_owner:
+    if getattr(ctx.config, "merge_owner", False):
         pr = expected_pr if expected_pr is not None else ctx.tracker.find_pr(f"foragent/issue-{n}")
         if pr is not None:
             from foragent.merge_owner import close_for_repair
@@ -206,7 +206,7 @@ def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expec
     # The next implementer receives the keep-work default, including after a
     # lost close response. Changed-head holds never publish a retry marker.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
-    if not ctx.config.merge_owner and (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
+    if not getattr(ctx.config, "merge_owner", False) and (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
@@ -623,7 +623,7 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
-    if ctx.config.merge_owner:
+    if getattr(ctx.config, "merge_owner", False):
         from foragent.runner import review_only
 
         issue_n = pr_issue_number(current.head)

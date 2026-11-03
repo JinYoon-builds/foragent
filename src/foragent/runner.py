@@ -156,7 +156,7 @@ class RunContext:
 
 
 def _handed_off(n: int, ctx: RunContext) -> bool:
-    if not ctx.config.merge_owner:
+    if not getattr(ctx.config, "merge_owner", False):
         return False
     from foragent.merge_owner import pending
 

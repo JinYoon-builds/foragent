@@ -158,7 +158,7 @@ def fallback_comparison(attempt, base_sha):
 
     n, ctx = attempt.n, attempt.ctx
     started = ctx.monotonic()
-    if ctx.config.merge_owner:
+    if getattr(ctx.config, "merge_owner", False):
         command = (ctx.config.test_command or getattr(attempt.baseline, "command", None)
                    or next(iter(runner.detect_test_commands(attempt.worktree)), None))
         if command is None:

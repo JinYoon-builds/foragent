@@ -166,9 +166,9 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
             continue
         # By its finish, not by its merges: a dream before an order ended leaves that order's turn.
         covered = last_dream_at(store, lane)
-        owner_facts = store.owner_merge_facts() if config.merge_owner else {}
+        owner_facts = store.owner_merge_facts() if getattr(config, "merge_owner", False) else {}
         merged = {run.number for run, _ in _runs_since(store, lane, None)
-                  if (store.run_merged(run, owner_facts=owner_facts) if config.merge_owner else run.outcome == "merged")}
+                  if (store.run_merged(run, owner_facts=owner_facts) if getattr(config, "merge_owner", False) else run.outcome == "merged")}
         if any(children & merged and (covered is None or finished > covered) for children, finished in orders):
             due.append(lane)
     return due
@@ -243,7 +243,7 @@ def start(ctx: TickContext, lanes: list[str], budget: int, report: TickReport) -
             # is closed too; the fresh dream may start in this same tick.
             try:
                 comment = "Replaced by a fresh dream (`fa orch dream --redo`); the lane's notebooks on the base branch are unchanged."
-                if ctx.config.merge_owner:
+                if getattr(ctx.config, "merge_owner", False):
                     from foragent.merge_owner import close_for_repair
 
                     current = ctx.tracker.get_pr(open_pr)

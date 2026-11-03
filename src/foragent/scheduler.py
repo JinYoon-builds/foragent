@@ -100,7 +100,7 @@ def tick(ctx: TickContext) -> TickReport:
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
-                if ctx.config.merge_owner:
+                if getattr(ctx.config, "merge_owner", False):
                     from foragent import merge_owner
 
                     merge_owner.start(ctx, cleanup)
@@ -203,7 +203,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
-        if ctx.config.merge_owner:
+        if getattr(ctx.config, "merge_owner", False):
             from foragent.merge_owner import pending
 
             if pending(ctx.store, issue.number):

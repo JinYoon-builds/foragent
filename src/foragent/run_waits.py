@@ -72,7 +72,7 @@ def activity(n: int, ctx: RunContext, name: str, cause: str):
 
 
 def _remaining(n: int, ctx: RunContext) -> int:
-    if ctx.config.merge_owner and (started := getattr(ctx, "merge_owner_started_at", None)):
+    if getattr(ctx.config, "merge_owner", False) and (started := getattr(ctx, "merge_owner_started_at", None)):
         return max(0, int(ctx.config.max_runtime_minutes * 60 - (ctx.now() - started).total_seconds()))
     run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
     if run is None:

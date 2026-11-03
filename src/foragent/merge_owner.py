@@ -30,7 +30,7 @@ from foragent.merge_owner_reads import Snapshot
 
 def start(ctx, report):
     """Reserve and transfer the owner lock; never wait for network, Git or checks."""
-    if not ctx.config.merge_owner:
+    if not getattr(ctx.config, "merge_owner", False):
         return
     if not admissions(ctx.store) and not any((ctx.store.root / "merge-owner").glob("*.json")):
         return
@@ -489,7 +489,7 @@ def _reconcile(ctx, place, job):
 
 def tick(ctx, report):
     """One owner pass; called only while the independent owner lock is held."""
-    if not ctx.config.merge_owner:
+    if not getattr(ctx.config, "merge_owner", False):
         return
     reads = Snapshot(ctx.tracker)
     owner = runner.RunContext(ctx.repo, ctx.repo_root, reads, ctx.store, ctx.config,

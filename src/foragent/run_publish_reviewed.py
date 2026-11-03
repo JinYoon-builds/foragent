@@ -87,7 +87,7 @@ def _publish_reviewed_head(
         error = exc
         raise
     finally:
-        if not ctx.config.merge_owner and outcome != "merged":
+        if not getattr(ctx.config, "merge_owner", False) and outcome != "merged":
             run_publish.merge_turn.withdraw(ctx, place, reason="publish-stopped",
                                             detail=run_publish.merge_turn.stopped_detail(outcome, error))
 
@@ -115,11 +115,11 @@ def _publish_reviewed_in_turn(
             return "hash-mismatch"
         if ctx.tracker.pr_head_sha(pr.number) != head:
             return run_publish._hold_changed_head(n, ctx, link)
-        current = (ctx.tracker.get_pr(pr.number) if ctx.config.merge_owner else
+        current = (ctx.tracker.get_pr(pr.number) if getattr(ctx.config, "merge_owner", False) else
                    next((item for item in ctx.tracker.list_prs("open", pr.head) if item.number == pr.number), None))
         # A moved target SHA is no stop here: the turn holder refreshes it (#712).
         if (current is None or current.base != pr.base
-                or ctx.config.merge_owner and (current.state != "open" or current.merged_at)):
+                or getattr(ctx.config, "merge_owner", False) and (current.state != "open" or current.merged_at)):
             return run_publish._reviewed_base_changed(n, ctx, pr)
         if not run_publish._acceptance_matches(n, ctx, git, approval):
             return "hash-mismatch"
@@ -144,7 +144,7 @@ def _publish_reviewed_in_turn(
         return None
 
     def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
-        if ctx.config.merge_owner and ctx.merge_authorization is not None:
+        if getattr(ctx.config, "merge_owner", False) and ctx.merge_authorization is not None:
             return None  # This reviewed head was explicitly authorized by orch.merge.
         if decision.kind == "hold":
             run_publish.flag(ctx, n, decision.reason, decision.summary, link)
@@ -189,7 +189,7 @@ def _publish_reviewed_in_turn(
             )
         if stopped:
             return stopped
-        if ctx.config.merge_owner:
+        if getattr(ctx.config, "merge_owner", False):
             from foragent.merge_owner import enqueue
 
             comparison = None

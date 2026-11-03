@@ -32,7 +32,7 @@ def _publish_locked(attempt: Implementation) -> str:
         error = exc
         raise
     finally:
-        if not attempt.ctx.config.merge_owner and outcome != "merged":
+        if not getattr(attempt.ctx.config, "merge_owner", False) and outcome != "merged":
             run_publish.merge_turn.withdraw(attempt.ctx, place, reason="publish-stopped",
                                             detail=run_publish.merge_turn.stopped_detail(outcome, error))
 
@@ -287,7 +287,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if stopped:
             return stopped
         queued_status = None
-        if ctx.config.merge_owner:
+        if getattr(ctx.config, "merge_owner", False):
             from foragent.merge_owner import enqueue
 
             comparison = None

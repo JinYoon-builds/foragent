@@ -177,7 +177,7 @@ def _open_acceptance_owners(attempt: Implementation) -> dict[str, set[int]]:
     ctx = attempt.ctx
     directory = _repo_path(ctx.config.acceptance_dir) + "/"
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
-    if ctx.config.merge_owner:
+    if getattr(ctx.config, "merge_owner", False):
         merged.update(number for number, _ in ctx.store.owner_merge_facts())
     issues = {issue.number: issue for issue in ctx.tracker.list_issues("open")}
     owners: dict[str, set[int]] = {}
