@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from foragent import size_signal
 from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run, carried_contract
 
@@ -78,6 +79,7 @@ class RunRecordsMixin:
                 for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
                     value.pop(key, None)
             self._write_run(run, value)
+            size_signal.freeze(self, number, approval, run, previous, restarted)  # this run's own estimate (#1696)
             if journal is not None:  # The audit event of this record (#107), under the same lock.
                 journal()
             return run

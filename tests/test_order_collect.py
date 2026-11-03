@@ -559,3 +559,278 @@ def test_preread_refusal_starts_no_reader_and_records_nothing(case, monkeypatch)
     with pytest.raises(order.PlanError, match="ModuleNotFoundError"):
         order.preread(plan_with({GOOD: IMPORTS}), root, config, lambda: FakeTracker(), repo="owner/repo", git=git)
     assert not Path(root / ".foragent/preread.json").exists()
+
+
+# --- Tests that import a changed file (#1774) ---------------------------------------------------
+SHARED = "tests/acceptance/test_shared.py"
+SHARED_OK = "NAMES = ('a', 'b')\n\n\ndef case():\n    return list(NAMES)\n"
+USER = "tests/test_user.py"
+USER_TEXT = (
+    "import sys, pathlib\n\nsys.path.insert(0, str(pathlib.Path(__file__).parent / 'acceptance'))\n"
+    "from test_shared import NAMES, case\n\n\n"
+    "class TestNames:\n    def test_two(self):\n        assert len(NAMES) == 2\n\n\n"
+    "def test_case():\n    assert case() == ['a', 'b']\n"
+)
+RED_USER = "tests/test_red_user.py"
+RED_USER_TEXT = (
+    "import sys, pathlib\n\nsys.path.insert(0, str(pathlib.Path(__file__).parent / 'acceptance'))\n"
+    "from test_shared import NAMES\n\n\ndef test_red():\n    assert len(NAMES) == 99\n"
+)
+
+
+@pytest.fixture
+def shared_case(case):
+    _, _, git, history, _ = case
+    history.update({SHARED: SHARED_OK, USER: USER_TEXT, RED_USER: RED_USER_TEXT,
+                    "tests/test_unrelated.py": "raise RuntimeError('only importers run')\n"})
+    git.update_base("main")
+    return case
+
+
+def _runs(monkeypatch):
+    calls = []
+    real = processes.run_logged
+
+    def counted(argv, **kwargs):
+        calls.append(argv[-1])
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(processes, "run_logged", counted)
+    return calls
+
+
+def test_a_change_that_breaks_a_passing_importer_names_each_broken_test(shared_case, monkeypatch):
+    calls = _runs(monkeypatch)
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: SHARED_OK.replace("('a', 'b')", "('a', 'b', 'c')")})
+    message = str(refusal.value)
+    assert f"{USER}::TestNames::test_two" in message and f"{USER}::test_case" in message, message
+    assert RED_USER not in message.split("Broken tests:")[1], "A test red on the base is not a reason"
+    assert "assert 3 == 2" in message, "The refusal shows why the test broke"
+    # Collection, then the importers once on the base and once with the order's files, nothing else.
+    assert len(calls) == 3 and all(USER in call and RED_USER in call for call in calls[1:])
+    assert "test_unrelated" not in "".join(calls)
+
+
+def test_an_importer_that_no_longer_imports_is_named_by_file_with_the_cause(shared_case):
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: "NAMES = ('a', 'b')\n"})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert f"{USER}:\n" in broken and "case" in broken and "ImportError" in broken, broken
+    assert RED_USER not in broken
+
+
+def test_importers_that_keep_passing_publish_and_new_red_locks_are_not_run(shared_case):
+    extended = SHARED_OK + "\n\ndef test_new_lock():\n    assert False, 'red until implemented'\n"
+    assert check(shared_case, {SHARED: extended}) is not None
+
+
+@pytest.mark.parametrize("files", [{SHARED: SHARED_OK}, {GOOD: "def test_alone():\n    pass\n"}])
+def test_unchanged_files_or_files_nobody_imports_run_nothing_more(shared_case, monkeypatch, files):
+    calls = _runs(monkeypatch)
+    assert check(shared_case, files) is not None
+    assert len(calls) == 1, "Only collection ran"
+
+
+def test_the_orders_own_files_are_never_importers(shared_case, monkeypatch):
+    _, _, git, history, _ = shared_case
+    peer = "tests/acceptance/test_peer.py"
+    peer_text = "from test_shared import NAMES\n\n\ndef test_peer():\n    assert len(NAMES) == 2\n"
+    history.update({peer: peer_text})
+    git.update_base("main")
+    calls = _runs(monkeypatch)
+    renamed = SHARED_OK.replace("('a', 'b')", "('x',)")
+    # The order rewrites a lock that imports the shared file too: its own lock, red or not, is not checked.
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: renamed, peer: peer_text + "\n"})
+    assert len(calls) == 3 and all(peer not in call for call in calls[1:])
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert USER in broken and peer not in broken
+
+
+def test_an_importer_run_that_does_not_finish_fails_closed_without_a_slot(shared_case, monkeypatch):
+    real, seen = processes.run_logged, []
+
+    def importers_hang(argv, *, timeout_s, **kwargs):
+        if "--collect-only" in argv[-1]:
+            return real(argv, timeout_s=timeout_s, **kwargs)
+        seen.append(timeout_s)
+        return None, True, ""
+
+    monkeypatch.setattr(processes, "run_logged", importers_hang)
+    held = capacity._take_test_slot(1, wait=False)
+    assert held is not None
+    try:
+        with pytest.raises(order.PlanError) as refusal:
+            check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    finally:
+        held.close()
+    message = str(refusal.value)
+    assert "could not be checked" in message and "120 seconds" in message and USER in message, message
+    assert seen and 0 < seen[0] <= order_collect.IMPORTERS_LIMIT_S
+
+
+def test_an_unreadable_importer_report_fails_closed(shared_case, monkeypatch):
+    # A real result object that says only "this run did not finish": the refusal must come from that.
+    monkeypatch.setattr(order_collect, "_results",
+                        lambda path, tree: order_collect._Run(False, {}, set(), {}, {}))
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    message = str(refusal.value)
+    assert "could not be checked" in message and "did not finish on the base" in message, message
+    assert "TypeError" not in message, message
+
+
+@pytest.mark.parametrize("name,text", [
+    ("tests/test_package_form.py", "from tests.acceptance import test_shared\n\n\n"
+     "def test_names():\n    assert test_shared.NAMES == ('a', 'b')\n"),
+    ("tests/acceptance/test_relative.py", "from . import test_shared\n\n\n"
+     "def test_names():\n    assert test_shared.NAMES == ('a', 'b')\n"),
+    ("tests/acceptance/test_relative_from.py", "from .test_shared import (\n    NAMES,\n)\n\n\n"
+     "def test_names():\n    assert NAMES == ('a', 'b')\n"),
+    ("tests/test_multiline.py", "import os, \\\n    tests.acceptance.test_shared as shared\n\n\n"
+     "def test_names():\n    assert shared.NAMES == ('a', 'b')\n"),
+    ("tests/check_named_by_project.py", "from tests.acceptance.test_shared import NAMES\n\n\n"
+     "def test_names():\n    assert NAMES == ('a', 'b')\n"),
+    ("tests/test_한글.py", "from tests.acceptance.test_shared import NAMES\n\n\n"
+     "def test_names():\n    assert NAMES == ('a', 'b')\n"),
+])
+def test_every_direct_import_form_is_an_importer(shared_case, name, text):
+    """Package, relative, multi-line, by-name imports and files the project names otherwise are all found."""
+    _, _, git, history, _ = shared_case
+    package = {"tests/__init__.py": "", "tests/acceptance/__init__.py": ""}
+    history.update({**package, name: text})
+    git.update_base("main")
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: SHARED_OK.replace("('a', 'b')", "('a', 'z')")})
+    assert f"{name}::test_names" in str(refusal.value).split("Broken tests:")[1], str(refusal.value)
+
+
+def test_a_module_that_only_mentions_the_name_is_not_run(shared_case, monkeypatch):
+    _, _, git, history, _ = shared_case
+    history.update({"tests/test_mentions.py": "# test_shared is documented elsewhere\nWORD = 'test_shared'\n\n\n"
+                    "def test_alone():\n    pass\n"})
+    git.update_base("main")
+    calls = _runs(monkeypatch)
+    with pytest.raises(order.PlanError):
+        check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    assert len(calls) == 3 and all(USER in call and "test_mentions" not in call for call in calls[1:])
+
+
+def test_a_changed_conftest_finds_the_tests_that_import_it_by_name(case, monkeypatch):
+    """A changed conftest.py is a module like any other to a test that imports it by name."""
+    _, _, git, history, _ = case
+    conftest = "tests/acceptance/conftest.py"
+    history.update({conftest: "def case():\n    return 1\n",
+                    "tests/test_case_user.py": "import sys, pathlib\n\n"
+                    "sys.path.insert(0, str(pathlib.Path(__file__).parent / 'acceptance'))\n"
+                    "from conftest import case\n\n\ndef test_case():\n    assert case() == 1\n"})
+    git.update_base("main")
+    calls = _runs(monkeypatch)
+    with pytest.raises(order.PlanError) as refusal:
+        check(case, {conftest: "def case():\n    return 2\n"})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert "tests/test_case_user.py::test_case" in broken and "assert 2 == 1" in broken, broken
+    assert len(calls) == 3
+
+
+def test_a_changed_package_init_finds_the_importers_of_the_package(shared_case):
+    _, _, git, history, _ = shared_case
+    package = "tests/acceptance/shared/__init__.py"
+    history.update({"tests/__init__.py": "", "tests/acceptance/__init__.py": "", package: "VALUE = 1\n",
+                    "tests/test_package_user.py": "from tests.acceptance.shared import VALUE\n\n\n"
+                    "def test_value():\n    assert VALUE == 1\n"})
+    git.update_base("main")
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {package: "VALUE = 2\n"})
+    assert "tests/test_package_user.py::test_value" in str(refusal.value).split("Broken tests:")[1]
+
+
+PARAMETRISED = (
+    "import sys, pathlib\n\nsys.path.insert(0, str(pathlib.Path(__file__).parent / 'acceptance'))\n"
+    "import pytest\nfrom test_shared import LABEL, VALUE, NAMES\n\n\n"
+    "@pytest.mark.parametrize('value', [VALUE], ids=[LABEL])\n"
+    "def test_value(value):\n    assert value == 1\n\n\n"
+    "@pytest.mark.parametrize('name', NAMES)\n"
+    "def test_name(name):\n    assert name in ('a', 'b')\n"
+)
+
+
+@pytest.fixture
+def parametrised_case(shared_case):
+    _, _, git, history, _ = shared_case
+    history.update({SHARED: "LABEL = 'old'\nVALUE = 1\n" + SHARED_OK, "tests/test_params.py": PARAMETRISED})
+    git.update_base("main")
+    return shared_case
+
+
+def test_a_changed_parameter_label_is_still_the_same_test(parametrised_case):
+    with pytest.raises(order.PlanError) as refusal:
+        check(parametrised_case, {SHARED: "LABEL = 'new'\nVALUE = 2\n" + SHARED_OK})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert "tests/test_params.py::test_value[new]" in broken and "assert 2 == 1" in broken, broken
+
+
+def test_a_changed_parameter_label_alone_breaks_nothing(parametrised_case):
+    assert check(parametrised_case, {SHARED: "LABEL = 'new'\nVALUE = 1\n" + SHARED_OK}) is not None
+
+
+def test_a_new_failing_parameter_of_a_passing_test_is_broken(parametrised_case):
+    with pytest.raises(order.PlanError) as refusal:
+        check(parametrised_case, {SHARED: "LABEL = 'old'\nVALUE = 1\n" + SHARED_OK.replace("('a', 'b')", "('a', 'b', 'c')")})
+    assert "tests/test_params.py::test_name[c]" in str(refusal.value).split("Broken tests:")[1]
+
+
+def test_a_passing_parameter_that_no_longer_runs_is_broken(parametrised_case):
+    with pytest.raises(order.PlanError) as refusal:
+        check(parametrised_case, {SHARED: "LABEL = 'old'\nVALUE = 1\n" + SHARED_OK.replace("('a', 'b')", "('a',)")})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert "tests/test_params.py::test_name[b]" in broken and "no longer runs" in broken, broken
+    assert "test_name[a]" not in broken
+
+
+@pytest.mark.parametrize("stop", [
+    "raise KeyboardInterrupt\n",
+    "import pytest\npytest.exit('stopped by the order', returncode=0)\n",
+    "import os\nos._exit(0)\n",
+])
+def test_an_order_that_stops_the_importer_run_is_refused(shared_case, stop):
+    """An incomplete run with the order's files is not a pass, whatever its exit code."""
+    with pytest.raises(order.PlanError) as refusal:
+        # Collecting the shared file alone passes; only the importer loading it stops the run.
+        check(shared_case, {SHARED: SHARED_OK + "\nimport sys\nif {'test_user', 'test_red_user'} & set(sys.modules):\n"
+                            + "".join(f"    {line}\n" for line in stop.splitlines())})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    # Named by test when the run stopped, or by file when pytest reported the stop as that file's error.
+    assert f"{USER}::test_case" in broken or f"{USER}:\n" in broken, broken
+    assert "stopped" in broken, broken
+    assert RED_USER not in broken
+
+
+def test_a_stop_inside_one_test_names_the_tests_it_kept_from_running(shared_case):
+    _, _, git, history, _ = shared_case
+    history.update({USER: USER_TEXT + "\n\ndef test_zz_after():\n    pass\n"})
+    git.update_base("main")
+    stops = SHARED_OK.replace("    return list(NAMES)", "    raise KeyboardInterrupt")
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: stops})
+    broken = str(refusal.value).split("Broken tests:")[1]
+    assert f"{USER}::test_zz_after" in broken and "stopped" in broken, broken
+
+
+def test_a_base_run_that_does_not_finish_is_unavailable_not_a_pass(shared_case):
+    _, _, git, history, _ = shared_case
+    history.update({"tests/test_stops_on_base.py": "from test_shared import NAMES\n\nraise KeyboardInterrupt\n"})
+    git.update_base("main")
+    with pytest.raises(order.PlanError) as refusal:
+        check(shared_case, {SHARED: SHARED_OK.replace("'b'", "'c'")})
+    assert "could not be checked" in str(refusal.value) and "did not finish on the base" in str(refusal.value)
+
+
+def test_korean_importer_refusal_uses_the_catalogue(shared_case):
+    root, config, git, _, _ = shared_case
+    config = replace(config, language="ko")
+    plan = plan_with({SHARED: "NAMES = ()\n"})
+    with pytest.raises(order.PlanError) as refusal:
+        order_collect.check(plan, order.validate_plan(plan, root, config), root, config, git)
+    assert "깨진 시험" in str(refusal.value) and USER in str(refusal.value)

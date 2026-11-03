@@ -196,6 +196,13 @@ def _validate(values: dict[str, Any]) -> None:
                 raise ConfigError(f"tiers.{name}.{key} must be one of {', '.join(_EFFORTS)} or null")
             if key.endswith("_model") and value is not None and not isinstance(value, str):
                 raise ConfigError(f"tiers.{name}.{key} must be a string or null")
+    limits = values["size_limits"]
+    if not isinstance(limits, dict) or set(limits) != {"s", "m", "l"} or any(
+            not isinstance(limit, dict) or set(limit) != {"source_lines", "test_lines", "file_count"}
+            or any(type(value) is not int or value < 0 for value in limit.values()) for limit in limits.values()):
+        from foragent.i18n import text
+        raise ConfigError(text("config_size_limits_invalid",
+                               values["language"] if isinstance(values["language"], str) else "en"))
     ample = values["tiers_headroom_ample"]
     if not isinstance(ample, (int, float)) or isinstance(ample, bool) or not ample >= 0:
         raise ConfigError("tiers_headroom_ample must be a number of at least 0")
