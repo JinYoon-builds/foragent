@@ -590,3 +590,49 @@ def test_shared_machine_services_refuse_inside_a_try(ctx, monkeypatch, tmp_path,
     assert result.exit_code != 0 and not result.timed_out
     assert f"{service} is not available" in result.stderr
     assert not calls.exists(), f"a try command must never reach the person's real {service}"
+
+
+def test_try_starts_empty_even_for_unknown_parent_paths(ctx, monkeypatch, tmp_path):
+    """Unknown roots must be absent too: a denylist can never establish isolation."""
+    real = tmp_path / "real-profile"
+    real.mkdir()
+    marker = real / "launcher"
+    marker.write_text("keep my launcher", encoding="utf-8")
+    roots = ("UNKNOWN_FUTURE_CONFIG_ROOT", "UV_TOOL_BIN_DIR", "XDG_BIN_HOME",
+             "UV_PYTHON_INSTALL_DIR", "BASH_ENV", "PYTHONPATH", "FORAGENT_TEST_SLOT")
+    for name in roots:
+        monkeypatch.setenv(name, str(real))
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "shared-uv-cache"))
+    # A leaked variable permits the same write as an installer targeting a real bin dir.
+    script = ("import json, os; from pathlib import Path; "
+              "[Path(os.environ[k], 'launcher').write_text('overwritten') "
+              f"for k in {roots!r} if k in os.environ]; print(json.dumps(dict(os.environ)))")
+    launched = []
+    popen = subprocess.Popen
+
+    def record(argv, **kwargs):
+        if argv[:2] == ["/bin/sh", "-c"]:
+            launched.append(dict(kwargs["env"]))
+        return popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", record)
+    merged(ctx, 1, card(shlex.join([sys.executable, "-c", script])))
+    assert runtime.prepare(ctx) == [1]
+    [result] = collect(ctx).items[0].prepared.results
+    assert result.exit_code == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "keep my launcher"
+    env = json.loads(result.output)
+    assert not set(roots) & env.keys()
+    assert env["UV_CACHE_DIR"] == str(tmp_path / "shared-uv-cache")
+    assert env["LANG"] == "en_US.UTF-8" and env["TERM"] == "xterm-256color"
+    # Inspect the launch boundary: sh/Python add PWD/SHLVL/_/locale values,
+    # and the suite's Popen wrapper adds FORAGENT_CPU_BUSY after this point.
+    assert len(launched) == 1
+    assert set(launched[0]) <= {
+        "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+        "PATH", "FORAGENT_VIEW", "FORAGENT_UPDATE_CHECK", "FORAGENT_ORCH_SPAWN", "UV_CACHE_DIR",
+        "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM", "COLORTERM",
+        "COLUMNS", "LINES",
+    }

@@ -690,13 +690,9 @@ def _child_environment(cwd: Path) -> dict[str, str]:
     return env
 
 
-# Variables that tie a child to the person's live session or open view.
-_SESSION_VARIABLES = (
-    "FORAGENT_SESSION_ID", "CLAUDE_ENV_FILE", "ORCA_TERMINAL_HANDLE", "FORAGENT_WATCH_LOCK_FD",
-    "TMUX", "TMUX_PANE", "WEZTERM_PANE", "KITTY_WINDOW_ID", "KITTY_LISTEN_ON",
-)
-# Variables that move a config root away from HOME; unset, each root falls back inside the try home.
-_CONFIG_ROOT_VARIABLES = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
+# Only presentation settings may cross from the person's environment into a try.
+_TRY_PRESENTATION = ("LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+                     "TERM", "COLORTERM", "COLUMNS", "LINES")
 # Per-user services a throwaway HOME cannot separate: launchd's gui/<uid> jobs (the
 # person's live gate) and AppleScript (notifications and terminal windows). A try finds
 # these names first on PATH and they refuse, so they never reach the person's own.
@@ -720,20 +716,17 @@ def try_home(home: Path, language: str) -> Path:
     return home
 
 
-def try_environment(home: Path, cwd: Path) -> dict[str, str | None]:
-    """An env overlay that gives a child its own throwaway Foragent state and config under home.
+def try_environment(home: Path, cwd: Path) -> dict[str, str]:
+    """Build the complete try environment, used with run_logged(inherit_env=False).
 
-    Every Foragent state and config path starts from HOME, an XDG folder or one of the
-    config-root variables, so pointing them all inside ``home`` keeps the person's real
-    state unread and unwritten. Tool caches that are not Foragent state stay where they
-    were, so ``uv run`` works offline. Prepare ``home`` with ``try_home`` first.
+    Start empty so even unknown config roots, tool destinations and session handles
+    cannot escape the throwaway home. Only tool lookup, presentation and the uv
+    content cache come from the parent. Prepare home with try_home first.
     """
-    real_home = Path.home()
-    data_home = Path(os.environ.get("XDG_DATA_HOME") or real_home / ".local/share")
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or real_home / ".cache")
-    path = _child_environment(cwd).get("PATH")
-    overlay: dict[str, str | None] = {key: None for key in (*_SESSION_VARIABLES, *_CONFIG_ROOT_VARIABLES)}
-    overlay.update({
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    path = _child_environment(cwd).get("PATH", os.defpath)
+    env = {key: os.environ[key] for key in _TRY_PRESENTATION if key in os.environ}
+    env.update({
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(home / ".config"),
         "XDG_DATA_HOME": str(home / ".local/share"),
@@ -744,9 +737,8 @@ def try_environment(home: Path, cwd: Path) -> dict[str, str | None]:
         "FORAGENT_UPDATE_CHECK": "off",
         "FORAGENT_ORCH_SPAWN": "off",
         "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR") or str(cache_home / "uv"),
-        "UV_PYTHON_INSTALL_DIR": os.environ.get("UV_PYTHON_INSTALL_DIR") or str(data_home / "uv/python"),
     })
-    return overlay
+    return env
 
 
 def run_logged(
@@ -754,9 +746,13 @@ def run_logged(
     prompt: str | None = None, capture_stdout: bool = False,
     stdout_path: Path | None = None, terminate_children: bool = False,
     stderr_path: Path | None = None, env: dict[str, str | None] | None = None,
+    inherit_env: bool = True,
 ) -> tuple[int | None, bool, str]:
-    """Append output without buffering an unbounded session in memory; env adds variables (None removes one)."""
-    child_env = {**_child_environment(cwd), **(env or {})}
+    """Append output without unbounded buffering; env overlays (None removes a key).
+
+    With inherit_env=False, env is the complete environment, with no parent values.
+    """
+    child_env = {**(_child_environment(cwd) if inherit_env else {}), **(env or {})}
     child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
     on_process_tree = _process_tree_callback.get()

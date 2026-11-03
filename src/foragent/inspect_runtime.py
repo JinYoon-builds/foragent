@@ -41,7 +41,7 @@ def run_command(command: str, worktree: Path, log_path: Path, home: Path) -> Pre
         code, timed_out, stdout = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree, timeout_s=60, log_path=log_path,
             terminate_children=True, capture_stdout=True, stderr_path=Path(errors.name),
-            env=try_environment(home, worktree),
+            env=try_environment(home, worktree), inherit_env=False,
         )
         errors.seek(max(0, Path(errors.name).stat().st_size - 6000))
         stderr = errors.read().decode("utf-8", errors="replace")[-1500:]
