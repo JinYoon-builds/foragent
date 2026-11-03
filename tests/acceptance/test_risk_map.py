@@ -161,7 +161,7 @@ def test_reviewer_prompt_contains_only_risks_matching_changed_paths(git_history,
     git_history.update({"docs/old-incident.md": "unchanged\n"})
     case = risk_case(git_history, tmp_path, monkeypatch, entries=[matched, other], changed_paths=(changed,))
     assert run_issue(1, case.ctx) == "merged", "An omitted always_human defaults to false; unrelated risks cannot hold a PR"
-    assert len(case.reviewer.calls) == 5, "Four core perspective reviews and one merge are required"
+    assert len(case.reviewer.calls) == 7, "Six default perspective reviews and one merge are required"
     prompt = case.reviewer.calls[0]["prompt"]
     for note in notes(matched):
         assert note in prompt, f"Matched risk note missing from the reviewer executor's prompt: {note}"
@@ -176,7 +176,7 @@ def test_native_claude_review_receives_only_matching_risk_context(git_history, t
                   incident={"date": "2026-09-01", "summary": "UNMATCHED-INCIDENT"})
     case = risk_case(git_history, tmp_path, monkeypatch, entries=[matched, other],
                      reviewer="claude", review_scope=scope)
-    assert run_issue(1, case.ctx) == "merged" and len(case.review_contexts) == 5, "Four core perspective reviews and one merge are required"
+    assert run_issue(1, case.ctx) == "merged" and len(case.review_contexts) == 7, "Six default perspective reviews and one merge are required"
     for note in notes(matched):
         assert note in case.review_contexts[0], f"Native Claude {scope} review is missing risk context: {note}"
     for note in notes(other):
@@ -193,7 +193,7 @@ def test_risk_context_is_additive_and_keeps_full_review_of_unmapped_changes(
     risk = entry(["src/runtime/**"])
     case = risk_case(git_history, tmp_path, monkeypatch, entries=[risk], reviewer=reviewer,
                      review_scope=scope, changed_paths=(mapped, unmapped))
-    assert run_issue(1, case.ctx) == "merged" and len(case.review_contexts) == 5, "Four core perspective reviews and one merge are required"
+    assert run_issue(1, case.ctx) == "merged" and len(case.review_contexts) == 7, "Six default perspective reviews and one merge are required"
     context = case.review_contexts[0]
     assert FULL_SCOPE_RULES in context, "Risk context must retain all of today's ordinary review scope rules"
     if reviewer == "claude" and scope == "pr-body":
@@ -225,7 +225,7 @@ def test_risk_context_is_additive_and_keeps_full_review_of_unmapped_changes(
 def test_matched_review_uses_l_tier_regardless_of_issue_size(git_history, tmp_path, monkeypatch, reviewer, size):
     case = risk_case(git_history, tmp_path, monkeypatch, entries=[entry()], reviewer=reviewer, size=size)
     assert run_issue(1, case.ctx) == "merged"
-    assert len(case.reviewer.calls) == 5, "Four core perspective reviews and one merge are required"
+    assert len(case.reviewer.calls) == 7, "Six default perspective reviews and one merge are required"
     call = case.reviewer.calls[0]
     key, expected = ("effort", TIERS["l"]["codex_effort"]) if reviewer == "codex" else ("model", TIERS["l"]["claude_model"])
     assert call.get(key) == expected, (
@@ -537,7 +537,7 @@ def test_cli_add_records_fix_and_guard_tests_without_replacing_incident(git_hist
 def test_fixed_risks_keep_incident_context_and_strength_in_review(git_history, tmp_path, monkeypatch):
     risk = entry(fixed_by="owner/repo#261", guard_tests=[PROCESS_GUARD])
     case = risk_case(git_history, tmp_path, monkeypatch, entries=[risk])
-    assert run_issue(1, case.ctx) == "merged" and len(case.reviewer.calls) == 5, "Four core perspective reviews and one merge are required"
+    assert run_issue(1, case.ctx) == "merged" and len(case.reviewer.calls) == 7, "Six default perspective reviews and one merge are required"
     for note in notes(risk):
         assert note in case.reviewer.calls[0]["prompt"], f"Fixed risks must retain incident context in review: {note}"
     assert case.reviewer.calls[0].get("effort") == TIERS["l"]["codex_effort"]

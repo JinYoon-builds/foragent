@@ -16,3 +16,5 @@ On 2026-11-02 #1527's lock forbade every subprocess during a scorecard read, whi
 Run the prototype on clean main alone. On 2026-11-02 the skills order's size locks passed only because its prototype was stacked on the review procedure prototype; on main alone two could not pass.
 
 Run every Done when command, as written, on clean main plus the prototype before publishing. On 2026-11-02 #1640 (S2) listed a whole file whose five cases wait for parked #1186; the draft report said so, and the run still stopped on it.
+
+Before publishing edits to shared acceptance helpers (constants or fixtures other files import), run every test file that imports them on clean main with only the new locks applied. On 2026-11-03 #1651's order changed NAMES in test_review_perspectives.py; the unit file test_review_conflict_paths.py imports it, so main CI went red for every PR (#1733 held). `grep -rln "from test_<helper> import" tests/` finds the importers.
