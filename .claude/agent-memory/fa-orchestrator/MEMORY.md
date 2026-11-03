@@ -14,4 +14,5 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Read result before reporting](read-result-before-reporting.md) — never report an outcome in the same step as the command
 - [rerun-review needs CODEX_HOME](rerun-review-needs-codex-home.md) — export the live account first; empty review plus "Error finding codex home" is this
 - [Lane draft runs load](lane-draft-runs-load.md) — draft agents' pytest sits outside test slots; one file, nice 15, targets only
-- [Merge owner before launch](merge-owner-before-launch.md) — Jin 11-03: #1502 split starts 11-04, first card to Jin; no new merge-path patches
+- [Merge owner before launch](merge-owner-before-launch.md) — Jin 11-03: PM builds it outside FA; orch lane paused, #1491 #1641 #1760 parked until it merges
+- [Order after 11-03](order-after-11-03.md) — merge owner, then 2-3 days cleanup, then features; no new internal-mechanism features
