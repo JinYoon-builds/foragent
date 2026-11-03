@@ -47,7 +47,7 @@ MESSAGES = {
         "watch_terminal": "The dashboard runs live in a terminal. Use --once for plain text.",
         'watch_open_failed': "Couldn't open the dashboard ({error}). Try again.",
         "watch_open_manual": "To open the dashboard, run: {command}",
-        "watch_already_open": "A dashboard is already open for this repository.",
+        "watch_already_open": "The dashboard is already open for this repository, so this view closes.",
         'watch_refresh_failed': "Couldn't refresh ({error}). I'll try again.",
     },
     "ko": {
@@ -96,7 +96,7 @@ MESSAGES = {
         "watch_terminal": "대시보드는 터미널에서 실시간으로 볼 수 있어요. 일반 텍스트는 --once로 확인해요",
         "watch_open_failed": "대시보드를 열지 못했어요({error}). 다시 시도해요",
         "watch_open_manual": "이 명령으로 대시보드를 열어요: {command}",
-        "watch_already_open": "이 저장소의 대시보드가 이미 열려 있어요",
+        "watch_already_open": "이 저장소의 대시보드가 이미 열려 있어서 이 창은 닫을게요",
         "watch_refresh_failed": "새로고침을 못했어요({error}). 다시 시도할게요",
     },
 }
