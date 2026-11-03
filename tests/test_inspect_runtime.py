@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -478,3 +479,114 @@ def test_prepared_stdout_stderr_storage_and_public_rendering(ctx, monkeypatch, e
     else:
         assert result["stderr"] == stored["stderr"]
         assert "error-tail" in rendered and "hidden-prefix" not in rendered
+
+
+ENV_CARD = """## Try it
+kind: cli
+```sh
+printf '%s|%s|%s|%s|%s|%s\\n' "$HOME" "$XDG_STATE_HOME" "${{TMUX-unset}}" "${{FORAGENT_SESSION_ID-unset}}" "$FORAGENT_VIEW" "$UV_CACHE_DIR"
+```
+```sh
+cat "$HOME/.config/foragent/config.yml"; echo {marker} > "$HOME/mark"
+```
+```sh
+ls "$HOME"
+```
+## Expect
+It runs.
+"""
+
+
+def test_each_card_runs_in_its_own_throwaway_home_with_the_persons_language(ctx, monkeypatch, tmp_path):
+    real_config = Path.home() / ".config/foragent/config.yml"
+    real_config.parent.mkdir(parents=True, exist_ok=True)
+    real_config.write_text("language: ko\nnotify: none\n", encoding="utf-8")
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "live-session")
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    merged(ctx, 1, ENV_CARD.format(marker="one"))
+    merged(ctx, 2, ENV_CARD.format(marker="two"))
+    assert runtime.prepare(ctx) == [1, 2]
+    items = {item.number: item for item in collect(ctx).items}
+    homes = []
+    for number, marker in ((1, "one"), (2, "two")):
+        echo, config, listing = items[number].prepared.results
+        home, state, tmux, session, view, uv_cache = echo.output.strip().split("|")
+        homes.append(home)
+        assert Path(home) != Path.home() and Path(home).parent == ctx.store.root / "inspect/wt"
+        assert state == f"{home}/.local/state"
+        assert (tmux, session, view) == ("unset", "unset", "off")
+        # The uv cache is not Foragent state: it stays the person's, so `uv run` works offline.
+        assert uv_cache == str(Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "uv")
+        # Only the person's language is copied in; the rest of the personal config is not.
+        assert json.loads(config.output) == {"language": "ko"}
+        # Commands of one card share one home: the second sees the first one's write.
+        assert "mark" in listing.output.split()
+    assert homes[0] != homes[1]
+    assert not list((ctx.store.root / "inspect/wt").iterdir())
+    assert real_config.read_text(encoding="utf-8") == "language: ko\nnotify: none\n"
+    assert not (Path.home() / "mark").exists()
+
+
+def test_run_logged_env_none_removes_an_inherited_variable(tmp_path, monkeypatch):
+    from foragent.processes import run_logged
+    monkeypatch.setenv("FORAGENT_SESSION_ID", "live-session")
+    monkeypatch.setenv("KEEP_ME", "kept")
+    code, timed_out, out = run_logged(
+        ["/bin/sh", "-c", 'printf "%s|%s|%s" "${FORAGENT_SESSION_ID-unset}" "$KEEP_ME" "$ADDED"'],
+        cwd=tmp_path, timeout_s=10, log_path=tmp_path / "log", capture_stdout=True,
+        env={"FORAGENT_SESSION_ID": None, "ADDED": "yes"},
+    )
+    assert (code, timed_out, out) == (0, False, "unset|kept|yes")
+
+
+FA = shlex.join([sys.executable, "-c", "import sys; from foragent.cli import main; sys.exit(main(sys.argv[1:]))"])
+
+
+def card(*commands):
+    return "## Try it\nkind: cli\n" + "".join(f"```sh\n{command}\n```\n" for command in commands) + "## Expect\nIt runs.\n"
+
+
+def test_config_root_variables_cannot_lead_a_try_to_the_persons_real_profile(ctx, monkeypatch, tmp_path):
+    """CLAUDE_CONFIG_DIR and its kind point past HOME; a try must not follow them to the real files."""
+    from foragent import statusline
+    profile = tmp_path / "claude-profile"
+    profile.mkdir()
+    settings_file = profile / "settings.json"
+    settings_file.write_text(json.dumps(statusline.with_hook({}), indent=2), encoding="utf-8")
+    before = settings_file.read_bytes()
+    assert statusline.has_hook(json.loads(before))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    for name in ("CODEX_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    names = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL")
+    merged(ctx, 1, card(f"{FA} statusline --uninstall",
+                        "printf '%s|' " + " ".join(f'"${{{name}-unset}}"' for name in names)))
+    assert runtime.prepare(ctx) == [1]
+    uninstall, echo = collect(ctx).items[0].prepared.results
+    assert uninstall.exit_code == 0, uninstall.stderr
+    assert settings_file.read_bytes() == before, "the person's real Claude settings must keep their hooks"
+    assert echo.output == "unset|" * len(names)
+
+
+@pytest.mark.parametrize("service", ["launchctl", "osascript"])
+def test_shared_machine_services_refuse_inside_a_try(ctx, monkeypatch, tmp_path, service):
+    """launchd's gui/<uid> jobs and AppleScript are the person's own whatever HOME says."""
+    calls = tmp_path / "calls"
+    real = tmp_path / "real-bin"
+    real.mkdir()
+    for name in ("launchctl", "osascript"):
+        fake = real / name
+        fake.write_text(f'#!/bin/sh\necho "{name} $*" >> {shlex.quote(str(calls))}\n', encoding="utf-8")
+        fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    # `fa gate uninstall` itself, with the repository named (the test origin is a local path).
+    gate_uninstall = shlex.join([sys.executable, "-c", "from pathlib import Path; from foragent import launchd; "
+                                 "print(launchd.Launchd(Path('.'), repo='owner/repo').uninstall())"])
+    command = gate_uninstall if service == "launchctl" else "osascript -e 'display notification \"x\"'"
+    merged(ctx, 1, card(command))
+    assert runtime.prepare(ctx) == [1]
+    [result] = collect(ctx).items[0].prepared.results
+    assert result.exit_code != 0 and not result.timed_out
+    assert f"{service} is not available" in result.stderr
+    assert not calls.exists(), f"a try command must never reach the person's real {service}"
