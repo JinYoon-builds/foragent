@@ -278,7 +278,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         )
         if stopped != "refused":
             _finish_dead_run(ctx, run, report)
-    step_weights.record(ctx.store, ctx.store.active_runs(), ctx.now())
+    step_weights.record(ctx.store)
 
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
