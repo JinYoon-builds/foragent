@@ -20,6 +20,7 @@ from foragent import ci_local, ci_mode, merge_owner, merge_owner_batch as batch,
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError
 from foragent.issue import body_hash
+from foragent.scheduler import TickReport
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker, GhTracker, RejectedEvidence, TrackerError
 
@@ -260,6 +261,39 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
     assert failed and not groups(case) and not case.target_pushes
     assert len(case.merges) == 1
     assert any("workflow diff unavailable" in action for action in report.actions)
+
+
+def test_remote_only_candidate_does_not_block_locally_available_batch(batched, monkeypatch, tmp_path):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=2)
+    case.ctx.config = case.config
+    queue_workers(case, [5, 1, 4])
+    candidates = []
+    for row in merge_owner.admissions(case.store).values():
+        place = merge_owner.queue.Seat(row["n"], row["started_at"], row["target"])
+        job = merge_owner._load(case.ctx, place, row)
+        candidates.append((place, job, case.tracker.get_pr(job["pr"])))
+        case.tracker.set_pr_checks(job["pr"], "pending")
+    fresh = tmp_path / "fresh-owner"
+    fresh.mkdir()
+    git_command(fresh, "init", "-q")
+    git_command(fresh, "remote", "add", "origin", str(case.history.origin))
+    git = case.git.at(fresh)
+    git.fetch("origin", "main")
+    for _, job, _ in candidates[:2]:
+        git._call(["fetch", "origin", job["head"]])
+    missing_head = candidates[2][1]["head"]
+    with pytest.raises(GitError):
+        git._call(["cat-file", "-e", f"{missing_head}^{{commit}}"])
+    monkeypatch.setattr(case.ctx, "git", git)
+    report = TickReport()
+    for _ in range(3):
+        proof = batch.prepare(case.ctx, report, candidates)
+        assert proof, report.actions
+        assert [n for n, *_ in proof.chain] == [5, 1]
+    assert len(groups(case)) == 1
+    assert any("#4" in action and missing_head in action for action in report.actions)
+    assert not batch.retirements(case.ctx)
 
 
 def test_pending_tip_does_not_publish_other_prefixes(batched):
@@ -574,39 +608,7 @@ def test_single_path_final_failure_spends_only_the_failing_member(batched, monke
     assert not case.store.owner_merge_facts()
 
 
-def test_recovered_workflow_changed_train_spends_all_changing_members_and_keeps_single_path(batched, monkeypatch):
-    case = batched
-    edit_member_workflows(case, monkeypatch, {
-        5: ".github/workflows/foragent-acceptance.yml",
-        1: ".github/workflows/foragent-acceptance-extra.yaml",
-    })
-    queue_workers(case, [5, 1, 4, 2])
-    # Recover a train admitted before workflow changes were excluded. The actual
-    # comparison and WorkflowChanged exception run after this publication crash.
-    with monkeypatch.context() as patch:
-        patch.setattr(ci_mode, "changed_workflows", lambda *args: "")
-        published_train(case, patch)
-    tip, = groups(case)
-    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
-    expected = [dict(n=n, head=head, started_at=started)
-                for n, head, _, started in chain if n in {5, 1}]
-    support.gate(case)
-    retirement, = batch.retirements(case.ctx)
-    assert "prefix acceptance workflow differs" in retirement["reason"]
-    assert retirement["spent"] == expected
-    assert not case.target_pushes and not case.merges and not refs(case)
-    support.gate(case)
-    assert len(groups(case)) == 2
-    remaining = groups(case)[-1]
-    _, next_chain = batch._decode(case.git, remaining.head, case.tracker.pr_head_sha(remaining.number))
-    assert [n for n, *_ in next_chain] == [4, 2]
-    support.drain(case)
-    assert len(groups(case)) == 2 and len(case.target_pushes) == 1
-    assert {row["pr"] for row in case.merges} == {support.pr_for(case, n).number for n in [5, 1]}
-    assert len(case.store.owner_merge_facts()) == 4
-
-
-def test_workflow_retirement_attributes_against_the_target_fetched_at_final_check(batched, monkeypatch):
+def test_target_workflow_change_retires_train_without_spending_members(batched, monkeypatch):
     case = batched
     queue_workers(case, [5, 1])
     lock = StateStore.merge_lock
@@ -621,48 +623,13 @@ def test_workflow_retirement_attributes_against_the_target_fetched_at_final_chec
     monkeypatch.setattr(StateStore, "merge_lock", target_changes_under_lock)
     support.gate(case)
     tip, = groups(case)
-    base, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    base, _ = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert base != case.history.tip
     retirement, = batch.retirements(case.ctx)
     assert "prefix acceptance workflow differs" in retirement["reason"]
-    assert retirement["spent"] == [dict(n=n, head=head, started_at=started)
-                                   for n, head, _, started in chain]
+    assert retirement["spent"] == []
     assert not case.target_pushes and not case.merges and not refs(case)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
-
-
-def test_workflow_attribution_failure_retires_without_partial_member_blame(batched, monkeypatch):
-    case = batched
-    edit_member_workflows(case, monkeypatch, {
-        5: ".github/workflows/foragent-acceptance.yml",
-        1: ".github/workflows/foragent-acceptance-extra.yaml",
-    })
-    queue_workers(case, [5, 1])
-    with monkeypatch.context() as patch:
-        patch.setattr(ci_mode, "changed_workflows", lambda *args: "")
-        published_train(case, patch)
-    compare, reads = ci_mode.changed_workflows, []
-
-    def attribution_unavailable(git, target, head):
-        reads.append(head)
-        # First reject the train using the actual workflow diff, then fail after
-        # attribution already found one culprit; partial blame cannot be saved.
-        if len(reads) == 3:
-            raise GitError("workflow attribution diff unavailable")
-        return compare(git, target, head)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(ci_mode, "changed_workflows", attribution_unavailable)
-        report = support.gate(case)
-    retirement, = batch.retirements(case.ctx)
-    assert len(reads) == 3 and retirement["spent"] == []
-    assert "prefix acceptance workflow differs" in retirement["reason"]
-    assert any("workflow attribution diff unavailable" in action for action in report.actions)
-    assert not refs(case) and not case.target_pushes and not case.merges
-    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
-    support.drain(case, count=2)
-    assert len(groups(case)) == 1 and len(case.merges) == 2
-    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_reservation_also_guards_direct_single_path_advancement(batched, monkeypatch):
