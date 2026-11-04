@@ -14,6 +14,7 @@ import json
 import sys
 from typing import Any
 
+from foragent.file_cache import read_jsonl
 from foragent import orch_inbox, presence, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
@@ -53,19 +54,9 @@ def _time(value: Any) -> datetime | None:
 
 
 def _events(store: StateStore) -> list[dict[str, Any]]:
-    events = []
-    try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue  # An append still being written.
-                if isinstance(event, dict) and (at := _time(event.get("at"))) is not None:
-                    events.append({**event, "at": at})
-    except FileNotFoundError:
-        pass
-    return events
+    return [{**event, "at": at}
+            for event in read_jsonl(store.root / "orch-events.jsonl", tolerant=True, errors="replace")
+            if (at := _time(event.get("at"))) is not None]
 
 
 def _merges(store: StateStore) -> dict[int, datetime]:
