@@ -104,3 +104,4 @@ writes this file.
 - lane_concentration re-fire: diff runs.jsonl since the last answer by outcome first (rows key on `number`, `finished_at`); +1 is often a success or a known push-500 restart (r622, r628, r647).
 - Stuck merge-owner: often one long tick (inline 28-min baseline, 11-04); check the merge_owner pid age + pytest child. [detail](lessons_detail.md)
 - idle_lanes_with_backlog: first read `kind=ready` reasons (outbox-wait, exclusive peer, plan_pause, retry burst); facts 'held' can be false for retries (r460-r674). [detail](lessons_detail.md)
+- Each conflicted overlap_record appears once per side (#1915 and #1515 both list state_runs.py), so 48 h row counts double. Count distinct (file, issue pair) events before testing the r389 3+/file trigger (r678: 4 rows = 2 events).
