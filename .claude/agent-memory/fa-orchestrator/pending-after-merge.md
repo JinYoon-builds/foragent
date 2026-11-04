@@ -265,3 +265,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #435 split (drafts/435split/plan.json, preread clean 2026-11-04 13Z): publish --approve right after #1641 merges (both use tests/acceptance/test_silence_watchdog.py). PM r655 item b.
 - #1491 (emergency stop): if its retry runs >3 h again with merge_owner.py peers, add an exclusive: header for merge_owner.py (architect r708, r426 pattern).
 - Accepted docs-role proposals are not applied by themselves: r672/r716/r720 sat accepted until I ordered #2041. After accepting a docs proposal, order it (main lane, small lock) in the next batch.
+- After #2078 (r53 dashboard) merges: re-draft the scene-contract unit-test tidy (#2053's goal) against main's new test names; close PR #2056 if still open (`fa orch close 2056 --superseded-by 2078`).
