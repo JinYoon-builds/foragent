@@ -83,12 +83,10 @@ def socket(tmp_path):
 
 
 def session(store, executor, status="running"):
+    # The runner records its session while running; completion snapshots that fact into history.
+    store.update_run(1, session_id="thread-1", session_executor=executor)
     if status != "running":
         store.finish_run(1, "blocked")
-    path = store.root / "runs/1.json"
-    record = json.loads(path.read_text(encoding="utf-8"))
-    record.update(session_id="thread-1", session_executor=executor)
-    path.write_text(json.dumps(record), encoding="utf-8")
 
 
 def config(**values):
@@ -1002,10 +1000,7 @@ def test_a_run_starting_before_the_lock_still_receives_the_message_exactly_once(
         if not started:  # The tick starts the blocked issue after talk's first read, before its lock.
             started.append(True)
             store.start_run(1, branch="foragent/issue-1", worktree=store.worktree_path(1), pid=None)
-            path = store.root / "runs/1.json"  # Its worker has recorded a live session.
-            record = json.loads(path.read_text(encoding="utf-8"))
-            record.update(session_id="thread-2", session_executor=executor, session_stale=False)
-            path.write_text(json.dumps(record), encoding="utf-8")
+            store.update_run(1, session_id="thread-2", session_executor=executor, session_stale=False)
         return lock(*args, **kwargs)
 
     monkeypatch.setattr(store, "worktree_lock", start_then_lock)

@@ -188,7 +188,10 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = saved_head
     elif ctx.git.remote_branch_sha(branch) is not None:
         ctx.git.fetch("origin", branch)
-        start_ref = f"origin/{branch}"
+        start_ref = ctx.git.ref_sha(f"origin/{branch}")
+    pending = orch_github.pending_push(ctx, n)
+    if pending and (start_ref == pending["head"] or start_ref == pending["lease"]):
+        start_ref = pending["head"]
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
     if not _restore_approved_base(n, ctx, git, approval, target_branch, branch=branch):
@@ -257,12 +260,19 @@ def _implement_and_publish(
     outcome = "error"
     try:
         try:
+            try:
+                pushed = orch_github.resume_push(ctx, n, git)
+            except (GitError, ExecutorStopped):
+                attempt.tracker_available = False  # Preserve locally; this push gave up or lost its lease.
+                raise
+            pushed_head = git.head_sha() if pushed is not None else None
             resume_verified = _resume_implementation(attempt)
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 raise ExecutorStopped("hash-mismatch")
             attempt.approved_ref = git.head_sha()
             # A resumed head that already passed review returns to its checks and publication.
-            reviewed = not resume_verified and not failure and passed_head(n, ctx, git)
+            reviewed = not resume_verified and not failure and (
+                (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
@@ -270,8 +280,9 @@ def _implement_and_publish(
                     attempt.failure = ""
                     resume_verified = False
                 else:
-                    if not reuse:
+                    if not reuse and not (pushed is False and git.head_sha() == pushed_head):
                         _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    pushed = None  # A pre-review push resumes checks/review once, without another worker turn.
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:

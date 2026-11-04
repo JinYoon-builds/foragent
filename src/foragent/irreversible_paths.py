@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from glob import escape
-import json
 import os
 from pathlib import Path
 import re
@@ -20,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from foragent.file_cache import read_jsonl
 from foragent import config as config_module
 from foragent.orch_events import append_event
 from foragent.policy import touched
@@ -96,18 +96,8 @@ def register(ctx: RunContext, n: int, git: GitRepo, changed_paths: list[str]) ->
 
 
 def _announced(ctx: RunContext) -> set[str]:
-    path = ctx.store.root / "orch-events.jsonl"
-    if not path.exists():
-        return set()
-    paths = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get("kind") == EVENT_KIND and isinstance(event.get("path"), str):
-            paths.add(event["path"])
-    return paths
+    return {event["path"] for event in read_jsonl(ctx.store.root / "orch-events.jsonl", tolerant=True)
+            if event.get("kind") == EVENT_KIND and isinstance(event.get("path"), str)}
 
 
 def _detect(files: Iterable[str], read: Callable[[str], str | None], base_branch: str) -> list[str]:

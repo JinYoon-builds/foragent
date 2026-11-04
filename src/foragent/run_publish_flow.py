@@ -43,6 +43,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     from foragent import harness_guard, review_pass_scope, run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_review import _review_implementation
     from foragent.run_waits import activity
+    from foragent.ci_mode import OlderMeasuredBase
 
     # Only metadata is read live; instructions and checks always use the snapshot.
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
@@ -267,6 +268,22 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         verified_base_sha = reused_base = target  # group-reuse: no refresh, recheck or push
         return True
 
+    refreshed_pairs = set()
+
+    def older_base(reported: str) -> bool:
+        try:
+            return ((reported, measured_base_sha) not in refreshed_pairs
+                    and git.is_ancestor(reported, measured_base_sha)
+                    and not git.is_ancestor(verified_base_sha, verified_head_sha))
+        except run_publish.GitError:
+            return False  # Unproved ancestry keeps the existing CI wait.
+
+    def refresh_older(reported: str) -> str | None:
+        refreshed_pairs.add((reported, measured_base_sha))
+        run_publish._append(log, f"CI measured an older base: {reported} (expected {measured_base_sha}); refreshing once")
+        target = refresh_base(run_publish.capture_move(git, verified_base_sha))
+        return publish_refresh(target)
+
     ci_wait = run_publish._CIWait(pr_ready_at)
     queued_status = None
     group_checked: set = set()
@@ -294,11 +311,17 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
             comparison = None
             if run_publish.enabled(ctx, attempt.target_branch):
-                comparison = run_publish.require_comparison(
-                    attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                    base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                    later_base=measured_later,
-                )
+                try:
+                    comparison = run_publish.require_comparison(
+                        attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                        base_sha=measured_base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                        later_base=measured_later,
+                        older_base=older_base,
+                    )
+                except OlderMeasuredBase as moved:
+                    if stopped := refresh_older(moved.reported):
+                        return stopped
+                    continue
                 measured_base_sha = comparison.base_sha
                 if verified_base_sha != measured_base_sha:
                     comparison = comparison.follow(verified_base_sha)
@@ -336,9 +359,15 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                     return stopped
                 continue
         if comparison is None and run_publish.enabled(ctx, attempt.target_branch):
-            comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
-                                                        base_sha=measured_base_sha, status=ci_wait.status,
-                                                        deadline=ci_wait.deadline, later_base=measured_later)
+            try:
+                comparison = run_publish.require_comparison(attempt, pr, verified_head_sha, ci_wait.infrastructure,
+                                                            base_sha=measured_base_sha, status=ci_wait.status,
+                                                            deadline=ci_wait.deadline, later_base=measured_later,
+                                                            older_base=older_base)
+            except OlderMeasuredBase as moved:
+                if stopped := refresh_older(moved.reported):
+                    return stopped
+                continue
             measured_base_sha = comparison.base_sha
             if verified_base_sha != measured_base_sha:
                 comparison = comparison.follow(verified_base_sha)  # only keep_head moves it alone

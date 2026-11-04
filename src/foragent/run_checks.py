@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
@@ -239,8 +241,54 @@ def _record_related_check(
         ctx.store.update_run(n, related_tests=[*run.related_tests, check])
 
 
+def _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit):
+    """Read pytest's exact collection, using the existing structured listing plugin."""
+    from foragent import runner
+    from foragent.run_baseline import COLLECT_PLUGIN, _with_python_path
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="related-collection-", dir=ctx.store.root / "runs") as directory:
+            plugins = Path(directory)
+            listing = plugins / "collected.json"
+            plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
+            (plugins / f"{plugin}.py").write_text(COLLECT_PLUGIN.format(listing=str(listing)), encoding="utf-8")
+            command = _with_python_path(
+                f"{unit_command} --collect-only -q -p {plugin} {shlex.join(unit_tests)}", directory)
+            result = runner._check(command, worktree, ctx.store.log_path(n), limit,
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
+                                   full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            found = json.loads(listing.read_text(encoding="utf-8"))
+            ids = found["ids"]
+            if (result.exit_code != 0 or result.timed_out or found["errors"] != 0
+                    or Path(found["rootdir"]).resolve() != worktree.resolve()
+                    or not isinstance(ids, list) or not ids
+                    or not all(isinstance(node, str) and node for node in ids)):
+                return None
+            return ids
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
+RELATED_SELECTION_PLUGIN = """\
+import json
+import pytest
+
+with open({listing!r}, encoding="utf-8") as stream:
+    passed = set(json.load(stream))
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    yield
+    deselected = [item for item in items if item.nodeid in passed]
+    items[:] = [item for item in items if item.nodeid not in passed]
+    config.hook.pytest_deselected(items=deselected)
+"""
+
+
 def run_related_check(
     n: int, ctx: RunContext, worktree: Path, unit_command: str, unit_tests: list[str], changed: int, limit: int,
+    *, ci_passed: tuple[int, set[str]] | None = None, head_sha: str | None = None,
 ) -> CheckResult:
     """Run the selected related unit tests with their own JUnit report and record the check.
 
@@ -252,11 +300,44 @@ def run_related_check(
     report = ctx.store.root / "runs" / f"issue-{n}-related.xml"
     # A stale report from an earlier check must never supply this check's timings.
     report.unlink(missing_ok=True)
+    skipped = set()
+    if ci_passed is not None:
+        collected = _collect_related_ids(n, ctx, worktree, unit_command, unit_tests, limit)
+        limit = max(1, min(limit, runner._remaining(n, ctx)))
+        if collected is not None:
+            run_id, passed = ci_passed
+            selected = [node for node in collected if node not in passed]
+            skipped = set(collected) & passed
+            _append(ctx.store.log_path(n),
+                    f"related units: skipped {len(collected) - len(selected)} of {len(collected)} "
+                    f"using CI run {run_id} for {head_sha}")
+            if not selected:
+                message = f"related units: all {len(collected)} passed in CI run {run_id} for {head_sha}"
+                _append(ctx.store.log_path(n), message)
+                result = CheckResult(message, 0, False, message, 0)
+                _record_related_check(n, ctx, changed, unit_tests, report, result)
+                _progress(n, ctx)
+                return result
+        else:
+            _append(ctx.store.log_path(n), "Related unit collection unavailable; running all related files locally")
     # The separate-value form keeps "--junitxml=" unique to the baseline capture command.
     junit = f"--junitxml {shlex.quote(str(report))} -o junit_family=legacy"
-    result = runner._check(f"{unit_command} {junit} {shlex.join(unit_tests)}", worktree, ctx.store.log_path(n), limit,
-                           progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                           full_text_dir=cuts.issue_dir(ctx.store.root, n))
+    with ExitStack() as stack:
+        command = f"{unit_command} {junit} {shlex.join(unit_tests)}"
+        if skipped:
+            from foragent.run_baseline import _with_python_path
+
+            directory = stack.enter_context(tempfile.TemporaryDirectory(
+                prefix="related-selection-", dir=ctx.store.root / "runs"))
+            listing = Path(directory) / "passed.json"
+            listing.write_text(json.dumps(sorted(skipped)), encoding="utf-8")
+            plugin = f"_foragent_residual_{secrets.token_hex(8)}"
+            (Path(directory) / f"{plugin}.py").write_text(
+                RELATED_SELECTION_PLUGIN.format(listing=str(listing)), encoding="utf-8")
+            command = _with_python_path(f"{command} -p {plugin}", directory)
+        result = runner._check(command, worktree, ctx.store.log_path(n), limit,
+                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
+                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
     _record_related_check(n, ctx, changed, unit_tests, report, result)
     _progress(n, ctx)
     return result
