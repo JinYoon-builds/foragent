@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
+import fcntl
 import hashlib
 from itertools import count
 import json
@@ -13,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, order, size_signal
+from foragent import cli, main_write, order, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
@@ -698,17 +699,130 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
 
 
 @pytest.mark.parametrize("merge_owner", [False, True])
-def test_immediate_order_pushes_directly_during_a_merge_train(offline_publication, plan, merge_owner):
-    root, config, tracker, git, _calls, origin = offline_publication
+def test_immediate_order_waits_before_committing_during_a_merge_train(
+    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner,
+):
+    root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=merge_owner)
     base = git_command(origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
+    before = git_command(root, "status", "--porcelain")
+    elapsed, sleeps = [0], []
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+
+    def sleep(seconds):
+        assert seconds == 30
+        with open(git.common_dir() / "foragent-publish.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert git.head_sha() == base
+        assert git_command(root, "status", "--porcelain") == before
+        assert not any("commit" in args or args[0] == "push" for args in calls)
+        assert not tracker.issues
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        if len(sleeps) == 2:
+            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+            git_command(origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
 
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
-    assert git_command(origin, "rev-parse", train) == base
+    assert sleeps == ([30, 30] if merge_owner else [])
+    assert capsys.readouterr().err.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
+    if merge_owner:
+        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+        assert (root / "upstream.txt").read_text() == "Train advanced main.\n"
+    else:
+        assert not any(args[0] == "ls-remote" for args in calls)
+        assert git_command(origin, "rev-parse", train) == base
     assert tracker.issues
+
+
+def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
+    offline_publication, plan, monkeypatch, capsys,
+):
+    root, config, tracker, git, calls, origin = offline_publication
+    config = replace(config, merge_owner=True)
+    base = git.head_sha()
+    git_command(origin, "update-ref", f"refs/heads/foragent/batch-merge-{base[:8]}-1", base)
+    unrelated = root / "unrelated.txt"
+    unrelated.write_text("Staged\n")
+    git_command(root, "add", "--", "unrelated.txt")
+    unrelated.write_text("Unstaged\n")
+    before = git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")
+    elapsed, sleeps = [0], []
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+
+    def sleep(seconds):
+        assert seconds == 30
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(GitError, match="timed out after 40 minutes.*retry publication"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert elapsed[0] == 40 * 60 and len(sleeps) == 80
+    assert capsys.readouterr().err.splitlines()[-1] == "waiting for merge train (39 min)"
+    assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
+    assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
+    assert unrelated.read_text() == "Unstaged\n"
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert not tracker.issues
+
+
+def test_immediate_order_train_lookup_failure_stops_before_writes(offline_publication, plan, monkeypatch):
+    root, config, tracker, git, calls, _origin = offline_publication
+    base = git.head_sha()
+    before = git_command(root, "status", "--porcelain")
+    call = git._call
+
+    def unreadable(args):
+        if args[0] == "ls-remote":
+            raise GitError("remote unavailable")
+        return call(args)
+
+    monkeypatch.setattr(git, "_call", unreadable)
+    with pytest.raises(GitError, match="remote unavailable"):
+        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert git.head_sha() == base
+    assert git_command(root, "status", "--porcelain") == before
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert not tracker.issues
+
+
+@pytest.mark.parametrize("change", ["human-edit", "replacement-started"])
+def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_publication, plan, monkeypatch, change):
+    root, config, tracker, git, calls, origin = offline_publication
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    target = report.rows[0]["number"]
+    if change == "replacement-started":
+        target = 41
+        tracker.add_issue(target, "Earlier work", "Earlier body")
+        plan["issues"][0]["replaces"] = [target]
+    base = git.head_sha()
+    calls.clear()
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
+
+    def sleep(seconds):
+        assert seconds == 30
+        if change == "human-edit":
+            issue = tracker.get_issue(target)
+            tracker.update_issue(target, title="Edited while waiting", body=issue.body)
+        else:
+            tracker.add_labels(target, ["running"])
+        git_command(origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(order.PlanError, match=f"#{target}"):
+        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert git.head_sha() == base
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert tracker.get_issue(target).state == "open"
+    if change == "human-edit":
+        assert tracker.get_issue(target).title == "Edited while waiting"
 
 
 @pytest.mark.parametrize("options,approved", [
