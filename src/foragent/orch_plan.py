@@ -35,6 +35,7 @@ from pathlib import Path
 import posixpath
 
 from foragent import orch_events
+from foragent.file_cache import read_lines
 from foragent.state import StateStore
 
 AUTHORS = ("human", "orchestrator")
@@ -156,11 +157,10 @@ def _record_expiry(store: StateStore, plan: dict, now: datetime) -> None:
     expired_at = plan["expires_at"]
     journal = store.root / "orch-events.jsonl"
     if journal.is_file():
-        for line in journal.read_text(encoding="utf-8").splitlines():
-            if line.strip() and '"plan-expired"' in line:
-                event = json.loads(line)
-                if event.get("kind") == "plan-expired" and event.get("expires_at") == expired_at:
-                    return
+        for line in read_lines(journal).require_utf8().matching(b'"plan-expired"'):
+            event = line.parsed()
+            if event.get("kind") == "plan-expired" and event.get("expires_at") == expired_at:
+                return
     _journal(store, now, [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
                            {"expires_at": expired_at, "by": None})])
 

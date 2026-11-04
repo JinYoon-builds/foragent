@@ -1,8 +1,8 @@
 """Standing-role sessions the orchestrator starts with `fa orch role <name> --why`.
 
 `fa orch architect --why` is the architect instance of the same command. A tick also
-calls it when an order finishes (``orch_role_schedule``, D99); no other path starts a role
-session. ``call`` is the only writer of ``<state>/<name>.json`` (pid, process start time, started_at, why)
+calls it for alarms and finished orders; a rejected topic proposal resumes through
+the same launcher. ``call`` owns ``<state>/<name>.json`` (pid, process start time, started_at, why)
 and of the ``<name>-call`` event. The session itself, started as the hidden
 ``fa gate run-architect --role <name>``, is the only writer of its ``<name>-done``
 event. Roles never message a person: proposals reach the orchestrator through
@@ -29,6 +29,7 @@ import sys
 from typing import Iterator
 
 from foragent import capacity, capacity_sessions, executors, processes, review_notes, session_skills
+from foragent import orch_architect_topics
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.launcher import gate_environment
@@ -122,10 +123,12 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
-         role: str = ARCHITECT, short: str | None = None, alarm: str | None = None) -> str:
+         role: str = ARCHITECT, short: str | None = None, alarm: str | None = None, *,
+         topic: bool | str = True, rebuttal: str | None = None) -> str:
     """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused.
 
     ``alarm`` is the gate's request id when the gate calls the role for an alarm.
+    Architect calls start a topic; other roles and explicit ``topic=False`` calls are one-shot.
     """
     language = config.language
     from foragent import orch_stop
@@ -159,40 +162,46 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
         log = log_path(store, started_at, role)
         log.parent.mkdir(parents=True, exist_ok=True)
 
-        # The session's own record exists before the session does, so a session that ends before
-        # this command resumes still finds its alarm and its workload record and delivers both.
-        workload = capacity_sessions.new_path(store, os.getpid())
-        session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
-                   "workload": str(workload), **({"short": short} if short else {}),
-                   **({"alarm": alarm} if alarm else {})}
-        store._write_json(record_path(store, role), session)
-        try:
-            with log.open("ab") as stream:
-                process = subprocess.Popen(
-                    [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
-                     "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
-                    cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
-                    stdout=stream, stderr=stream, env=gate_environment(),
-                )
-        except BaseException:
-            record_path(store, role).unlink(missing_ok=True)
-            raise
-        try:
-            # A session that already ended leaves this record to a dead pid, which counts for no
-            # one; the next start removes it.
-            capacity_sessions.add(store, workload, pid=process.pid, kind="role", role=role)
-            store._write_json(record_path(store, role), {
-                **session, "pid": process.pid, "start_time": _start_time(process.pid)})
-        except BaseException:
-            # No record can count or find this session, so it must not run. It has only just started.
-            process.kill()
-            process.wait()
-            capacity_sessions.remove(workload)
-            record_path(store, role).unlink(missing_ok=True)
-            raise
+        with orch_architect_topics.launch(store, topic if role == ARCHITECT else False,
+                                          started_at, why, config.executor, rebuttal) as context:
+            process = _launch(root, store, role, started_at, why, short, alarm, log, context)
     append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
                  **({"short": short} if short else {}))
     return _say("started", role, language, pid=process.pid, log=log)
+
+
+def _launch(root, store, role, started_at, why, short, alarm, log, context):
+    # The record exists before Popen, including the topic and alarm for a fast child.
+    workload = capacity_sessions.new_path(store, os.getpid())
+    session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
+               "workload": str(workload), **({"short": short} if short else {}),
+               **({"alarm": alarm} if alarm else {}), **context}
+    store._write_json(record_path(store, role), session)
+    try:
+        with log.open("ab") as stream:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "foragent.cli", "gate", "run-architect",
+                 "--repo-root", str(root), "--started-at", started_at, "--why", why, "--role", role],
+                cwd=root, stdin=subprocess.DEVNULL, start_new_session=True,
+                stdout=stream, stderr=stream, env=gate_environment(),
+            )
+    except BaseException:
+        record_path(store, role).unlink(missing_ok=True)
+        raise
+    try:
+        # A session that already ended leaves this record to a dead pid, which counts for no
+        # one; the next start removes it.
+        capacity_sessions.add(store, workload, pid=process.pid, kind="role", role=role)
+        store._write_json(record_path(store, role), {
+            **session, "pid": process.pid, "start_time": _start_time(process.pid)})
+    except BaseException:
+        # No record can count or find this session, so it must not run. It has only just started.
+        process.kill()
+        process.wait()
+        capacity_sessions.remove(workload)
+        record_path(store, role).unlink(missing_ok=True)
+        raise
+    return process
 
 
 def session_options(config: Config, store: StateStore, root: Path | None = None,
@@ -233,14 +242,18 @@ def _keep_message(log: Path, message: str, role: str = ARCHITECT) -> str:
 def run_session(root: Path, store: StateStore, config: Config, why: str, started_at: str,
                 now, role: str = ARCHITECT) -> int:
     """Run the role's turn in the repository root; append one ``<role>-done`` event on exit."""
-    code, message = 1, ""
+    code, message, result = 1, "", None
     log = log_path(store, started_at, role)
+    turn_record = read_record(store, role)
+    if turn_record is not None and turn_record.get("started_at") != started_at:
+        turn_record = None
     try:
         entry = _entry(config, role)
         if entry is None:
             raise ArchitectRefused(text("role_unknown", config.language, role=role,
                                         roles=", ".join(load_roles(config)) or "-"))
         options = session_options(config, store, root, role, entry)
+        options.update(orch_architect_topics.options(store, turn_record))
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
         notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""
@@ -258,19 +271,21 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
     finally:
         first = message.splitlines()[0][:200] if message else ""
         try:
-            # A success covers the input from before the session started; arrivals during it stay due.
-            append_event(store, now(), None, f"{role}-done",
-                         f"exit code {code}" + (f": {first}" if first else ""),
-                         started_at=started_at, exit_code=code, message=message,
-                         **({"covered_until": started_at} if code == 0 else {}))
+            try:
+                record = read_record(store, role)
+                if record is not None and record.get("started_at") == started_at and record.get("alarm"):
+                    _deliver(store, role, record["alarm"], code, message, root)
+                orch_architect_topics.finish(store, turn_record, result, code)
+            finally:
+                # A success covers the input from before the session started; arrivals during it stay due.
+                append_event(store, now(), None, f"{role}-done",
+                             f"exit code {code}" + (f": {first}" if first else ""),
+                             started_at=started_at, exit_code=code, message=message,
+                             **({"covered_until": started_at} if code == 0 else {}))
         finally:
             record = read_record(store, role)
             if record is not None and record.get("started_at") == started_at:
-                try:
-                    if record.get("alarm"):
-                        _deliver(store, role, record["alarm"], code, message, root)
-                finally:
-                    _remove_workload(record)
+                _remove_workload(record)
     return code
 
 
