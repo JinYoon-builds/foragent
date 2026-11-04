@@ -402,7 +402,10 @@ class RecordingTracker:
         # would overwrite concurrent writes before the final version check.
         # Open PRs come last so a new PR wins over an older merged one for the same issue.
         merged, listing = self._merged_prs(store, observed_at)
-        prs = merged + self._tracker.list_prs("open", "foragent/")
+        # GitHub lists every open PR before applying a head prefix locally.
+        # Share that complete observation with the planning briefing.
+        open_prs = self._tracker.list_prs("open", "")
+        prs = merged + [pr for pr in open_prs if pr.head.startswith("foragent/")]
         comments, missing = {}, set()
         for issue in issues:
             if issue.is_pull_request or not (
@@ -451,8 +454,8 @@ class RecordingTracker:
             reason = "remote change" if number in observed else "issue not found"
             self._outbox_dropped(number, reason)
         try:
-            store.record_planning_prs(self._tracker.list_prs("open", "pm/"), observed_at)
-        except (TrackerError, OSError) as exc:
+            store.record_planning_prs([pr for pr in open_prs if pr.head.startswith("pm/")], observed_at)
+        except OSError as exc:
             # This optional briefing observation must not undo a successful issue refresh.
             log.warning("Could not refresh planning PRs: %s", exc)
         return bool(changed or dropped or previous.keys() - observed)
