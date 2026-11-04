@@ -26,7 +26,7 @@ Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_
 [reviewed PR handoff](../src/foragent/run_publish_reviewed.py) (`src/foragent/run_publish_reviewed.py`),
 [owner](../src/foragent/merge_owner.py) (`src/foragent/merge_owner.py`),
 [final reads](../src/foragent/run_publish_merge.py) (`src/foragent/run_publish_merge.py`).
-Origins: #1797 (owner), #1502 (switch-on and measurement); D109 and D95 in [decisions](decisions.md).
+Origins: #1797 (owner), #1502 (switch-on and measurement); D118 and D95 in [decisions](decisions.md).
 
 ## Verification: prove this change still works on its target
 
