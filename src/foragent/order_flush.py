@@ -11,6 +11,7 @@ from foragent import order, order_flush_journal as journal, order_flush_recovery
 from foragent import order_collect, order_notes, order_references, order_reviewed
 from foragent.git import GitError
 from foragent.i18n import text
+from foragent.main_write import wait_for_merge_train
 from foragent.order_files import check_destinations, check_write
 from foragent.ownership import LABEL_COLOR, label_description, owner_label
 from foragent.paths import repo_path
@@ -147,7 +148,12 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         sha = recovery.committed(root, config, git, store, batch, records)
         if sha is None:
             rows, notes = _members(store, batch)
-            prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git)
+            collected = None
+            # committed() fetched the remote; retained local commits need push()'s rebuild.
+            if config.merge_owner and git.is_ancestor("HEAD", f"origin/{config.base_branch}"):
+                collected, base = _collect(rows, root, config, git)
+                order_collect.land(git, config.base_branch, base)
+            prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git, collected)
             if set(files) != set(batch["paths"]):
                 raise order.PlanError(text("order_flush_paths_changed", config.language))
             sha = _write(root, git, files, roots, recovery.title(batch))
@@ -189,8 +195,9 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         pending = [row for row in records if row["kind"] == "selected" and row["batch"] not in done]
         result = {"boundary": boundary, "status": "empty"}
         if pending:
-            with git.publish_lock():
-                for batch in pending:
+            for batch in pending:
+                wait_for_merge_train(git, config)
+                with git.publish_lock():
                     result = _finish(root, config, tracker, git, store, repo, batch, records)
             records = journal.entries(store)
         selected = journal.selected_entries(records)
@@ -202,6 +209,7 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
             return result
         latest = {row["id"]: row for row in orders}
         effective = [row for row in orders if row is latest[row["id"]]]
+        wait_for_merge_train(git, config)
         with git.publish_lock():
             # Every order is collected before the checkout moves, and it moves only onto that base.
             collected, base = _collect(effective, root, config, git)

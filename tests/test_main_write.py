@@ -106,6 +106,48 @@ def test_owner_off_does_not_read_train_refs():
     assert pushed == ["release/v1"]
 
 
+def test_publication_owner_off_does_not_read_train_refs_or_wait(monkeypatch):
+    def unexpected():
+        pytest.fail("owner-off publication must not start a wait")
+
+    monkeypatch.setattr(main_write.time, "monotonic", unexpected)
+    main_write.wait_for_merge_train(SimpleNamespace(), Config())
+
+
+def test_publication_wait_progress_is_written_to_stderr(monkeypatch, capsys):
+    polls, sleeps = iter([True, False]), []
+    monkeypatch.setattr(main_write, "train_in_flight", lambda git: next(polls))
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
+
+    main_write.wait_for_merge_train(SimpleNamespace(), Config(merge_owner=True))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "waiting for merge train (0 min)\n"
+    assert sleeps == [30]
+
+
+def test_publication_wait_bounds_the_final_poll(monkeypatch):
+    elapsed, sleeps = [0], []
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+
+    def in_flight(git):
+        # Ref inspection consumes part of the last polling interval.
+        elapsed[0] += 40 * 60 - 5
+        return True
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(main_write, "train_in_flight", in_flight)
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(GitError, match="timed out after 40 minutes"):
+        main_write.wait_for_merge_train(SimpleNamespace(), Config(merge_owner=True))
+    assert sleeps == [5]
+
+
 def test_only_retryable_base_writers_use_the_train_gate():
     source = Path(main_write.__file__).parent
     direct = {path.name for path in source.rglob("*.py") if ".push_base(" in path.read_text()}
@@ -125,8 +167,9 @@ def test_only_retryable_base_writers_use_the_train_gate():
                 raw[path.name] += 1
             if node.func.attr in {"push", "push_head", "ensure_batch_branch"}:
                 branches[path.name, node.func.attr] += 1
+    # The owner creates/deletes train refs and lands their tip with a target lease.
     # Explicit closure pushes its private commit under main_write_lock with an exact SHA lease.
-    assert raw == {"git.py": 4, "merge_owner_batch.py": 2, "run_group_ci.py": 2, "orch_close.py": 1}
+    assert raw == {"git.py": 4, "merge_owner_batch.py": 3, "run_group_ci.py": 2, "orch_close.py": 1}
     assert branches == {
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         ("run_publish_pr.py", "push"): 2, ("order_flush.py", "push"): 1,
