@@ -131,5 +131,4 @@ def test_only_retryable_base_writers_use_the_train_gate():
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         ("run_publish_pr.py", "push"): 2, ("order_flush.py", "push"): 1,
         ("merge_owner.py", "push_head"): 1, ("run_publish_reviewed.py", "push_head"): 1,
-        ("runner.py", "ensure_batch_branch"): 1, ("run_conflicts.py", "ensure_batch_branch"): 1,
     }
