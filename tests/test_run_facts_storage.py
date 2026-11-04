@@ -84,6 +84,20 @@ def test_restart_on_same_clock_is_new_and_does_not_inherit_its_completion(tmp_pa
     assert store.read_history() == [finished]  # Public history retains its legacy timestamp deduplication.
 
 
+def test_latest_finished_run_detaches_nested_history_values(tmp_path):
+    store, _ = start(tmp_path)
+    regions = {"wait": [NOW.isoformat(), NOW.isoformat()]}
+    store.update_run(1, pause_regions=regions, changed_files=["original.py"])
+    store.finish_run(1, "failed", DETAIL)
+    latest = store.get_run(1)
+    latest.pause_regions["wait"].append("caller mutation")
+    latest.changed_files.append("caller.py")
+    peer = StateStore(tmp_path)
+    for run in (store.get_run(1), peer.get_run(1), *store.read_history(), *peer.read_history()):
+        assert run.pause_regions == regions
+        assert run.changed_files == ["original.py"]
+
+
 @pytest.mark.parametrize("side", [None, "dream", "draft"])
 def test_detail_saved_while_running_keeps_its_original_lines(tmp_path, side):
     store, _ = start(tmp_path)

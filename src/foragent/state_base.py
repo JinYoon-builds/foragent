@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from foragent.file_cache import read_jsonl
+
 if TYPE_CHECKING:
     from foragent.state_records import Run
 
@@ -85,23 +87,12 @@ class StateBase:
         for row in reversed(self._run_history()):
             if (row["number"] == number and row["started_at"] == value["started_at"]
                     and row.get("run_generation") == value.get("run_generation")):
-                return dict(row)
+                return _copy(row)
         return value
 
     def _run_history(self) -> list[dict[str, Any]]:
-        """Completed facts, cached only while the atomically replaced file is unchanged."""
-        path = self.root / "runs.jsonl"
-        try:
-            with path.open(encoding="utf-8") as stream:
-                stat = _state.os.fstat(stream.fileno())
-                key = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
-                cached = getattr(self, "_run_history_cache", None)
-                if cached is None or cached[0] != key:
-                    cached = (key, [_state.json.loads(line) for line in stream])
-                    self._run_history_cache = cached
-        except FileNotFoundError:
-            return []
-        return cached[1]
+        """Completed facts from the shared JSONL cache; callers must detach mutable values."""
+        return read_jsonl(self.root / "runs.jsonl")
 
     def _run_path(self, run: "Run") -> Path:
         """runs/<n>.json for an issue run; dream-<lane>.json or draft-<n>.json for a side run (Run.key)."""
@@ -196,3 +187,4 @@ class StateBase:
 # Bound last: foragent.state imports this module, and lookups happen at call time
 # so names patched on the facade reach this implementation.
 import foragent.state as _state
+from foragent.state_issues import _copy
