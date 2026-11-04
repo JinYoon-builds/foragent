@@ -22,7 +22,6 @@ import pytest
 from conftest import git_command
 from runner_support import run_case  # noqa: F401 -- shared offline runner fixture
 from foragent.executors import ExecResult
-from foragent.reasons import Reason
 from foragent.runner import run_issue
 from foragent import run_merge_turn
 
@@ -157,9 +156,10 @@ def test_completed_run_merges_once_after_wait_exceeds_implementation_budget(
 
 
 def assert_work_timeout(case, outcome):
-    assert outcome == "timeout", "Actual work must still consume the run budget"
-    assert case.store.get_run(1).outcome == "timeout"
-    assert case.store.load_flag(1).reason == Reason.TIMEOUT
+    # #1514: the run's own work used the budget; that fact is named too-large, not timeout.
+    assert outcome == "too-large", "Actual work must still consume the run budget"
+    assert case.store.get_run(1).outcome == "too-large"
+    assert case.store.load_flag(1).reason == "too-large"
     assert "blocked" in case.tracker.get_issue(1).labels
     assert case.tracker.get_issue(1).state == "open"
     assert case.merge_calls == case.tracker.merged_prs == []

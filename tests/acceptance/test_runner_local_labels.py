@@ -185,7 +185,8 @@ def outcome(case, number=RUN):
     }
 
 
-EXPECTED = {"github": ["blocked"], "local": ["blocked"], "history": [("finished", "timeout")]}
+# #1514: the session ran out of its own runtime budget, so the outcome is too-large.
+EXPECTED = {"github": ["blocked"], "local": ["blocked"], "history": [("finished", "too-large")]}
 
 
 def test_runner_local_labels_cli_run_ending_during_a_tick_stays_blocked(
@@ -194,7 +195,7 @@ def test_runner_local_labels_cli_run_ending_during_a_tick_stays_blocked(
     case = gate_case(git_history, tmp_path, monkeypatch)
     report = tick_finishing_runner_midway(case)
     assert case.after_cli == {"local": ["blocked"], "github": ["blocked"],
-                              "run": ("finished", "timeout")}, (
+                              "run": ("finished", "too-large")}, (
         "`fa gate run-issue` must leave blocked and no running in the local snapshot on return")
     assert case.kicks, "The runner must still kick the gate when it ends"
     observed = outcome(case)

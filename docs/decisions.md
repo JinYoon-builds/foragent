@@ -988,3 +988,9 @@ an idle factory may then pull waiting work from other people. They are not v1.
 - 표 나(Foragent 저장소 레인만): orch·review-engine에 + principle-make-operations-idempotent, principle-separate-before-serializing-shared-state. view에 + principle-experience-first, principle-minimize-reader-load. board·skills·roles에 + principle-make-operations-idempotent. 나머지 레인 그대로.
 - 출처를 표에 함께 적는다: ① pstack(Lauren Tan, MIT), ② Anthropic 공식(Apache-2.0, 원본 또는 출처를 밝히고 고친 것), ③ Foragent가 만든 것(fa-state-design). ③은 외부 근거가 없으니 리뷰를 더 엄격히 받는다.
 - 이유: 2026-11-04 오늘 문제와 맞는 설계 원칙 대부분이 기본 표에 없었다. FA 개발에만 맞는 것을 모든 사용자 기본에 넣지 않으려고 두 층으로 나눈다.
+
+## 2026-11-04 D71 보강. '되돌리기 어려운 일'은 데이터·돈·외부 공개·남에게 보내기다 (#1864)
+
+- 계기: PM r462(B). 결함이었던 질문이 Jin에게 갔다. q8은 이미 있는 결정이 답하는 질문이었고, q9는 대체된 코드를 지워도 되는지 묻는 질문이었다(git으로 되돌릴 수 있다).
+- 결정: '되돌리기 어려운 일'은 데이터, 돈, 외부 공개, 남에게 보내기를 뜻한다. git으로 되돌릴 수 있는 변경(대체된 코드 삭제 포함)은 사람에게 묻지 않는다. 이미 있는 결정이 답하는 질문은 사람이 아니라 PM에게 간다. `always_human`·`risk:high`는 그대로 사람에게 묻는다.
+- Supersedes: [D71](#d71-사람에게-묻는-기준-정답이-있는-일은-하고-알린다-2026-10-22-jin)의 4번 "되돌리기 어려운 일 — 삭제, 배포, 외부 공개" 문구만 대체한다. 나머지 네 가지와 D71의 다른 내용은 그대로다.
