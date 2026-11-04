@@ -171,11 +171,29 @@ def set_done_when(case, commands):
     case.store.save_approval(**approval.__dict__)
 
 
+# A scripted reviewer FAIL stands for a real defect: its scoring session (#1651) grounds it and
+# scores it 100, so the finding still blocks. Tests of demotion script their own scorer.
+GROUNDED_SCORE = json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                             "locked_test": None, "breaking_input": "the input the scripted finding names",
+                             "spec_question": None})
+
+
+def scoring_request(prompt):
+    """The scoring session's request object, recognised by its public shape: a leading JSON object with a finding."""
+    try:
+        request = json.JSONDecoder().raw_decode(prompt or "")[0]
+    except ValueError:
+        return None
+    return request if isinstance(request, dict) and isinstance(request.get("finding"), str) else None
+
+
 def enable_reviewer(case, messages, edit=None):
     calls = []
     messages = iter(messages)
 
     def review(**kwargs):
+        if scoring_request(kwargs.get("prompt")) is not None:
+            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
         calls.append(kwargs)
         if edit:
             edit(kwargs["worktree"])
@@ -223,6 +241,8 @@ def enable_native_reviewer(case, messages, edit=None):
     iterator = iter(messages)
 
     def review(**kwargs):
+        if scoring_request(kwargs.get("prompt")) is not None:
+            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
         calls.append(kwargs)
         assert "feature.txt" in git_command(kwargs["worktree"], "diff", "--cached", "--name-only")
         if edit:
