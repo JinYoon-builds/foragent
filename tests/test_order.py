@@ -764,7 +764,7 @@ def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
     with pytest.raises(GitError, match="timed out after 40 minutes.*retry publication"):
         order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert elapsed[0] == 40 * 60 and len(sleeps) == 80
-    assert capsys.readouterr().out.splitlines()[-1] == "waiting for merge train (39 min)"
+    assert capsys.readouterr().err.splitlines()[-1] == "waiting for merge train (39 min)"
     assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
     assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
     assert unrelated.read_text() == "Unstaged\n"
