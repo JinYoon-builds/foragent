@@ -148,3 +148,65 @@ def test_post_merge_errors_are_reported_and_temporary_sources_cleaned(reinstall,
     output = capsys.readouterr().out
     assert len(output.splitlines()) == 1 and output.startswith("reinstall failed:")
     assert failures(c)[0]["kind"] == "reinstall-failed"
+
+
+def follow_context(case):
+    case.ctx.config = SimpleNamespace(base_branch="main")
+    case.ctx.git.fetch("origin", "main")
+    return case.ctx
+
+
+def test_follow_unknown_revision_does_not_install(reinstall, monkeypatch):
+    ctx = follow_context(reinstall)
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: None)
+    def unexpected(*args):
+        pytest.fail("an unknown installation must not read Git")
+    monkeypatch.setattr(ctx.git, "_call", unexpected)
+    orch_reinstall.follow_base(ctx)
+    assert reinstall.calls == []
+    assert not failures(reinstall)
+
+
+def test_follow_other_project_never_compares_or_installs(reinstall, monkeypatch):
+    c = reinstall
+    c.history.update({"pyproject.toml": '[project]\nname = "other"\n'})
+    ctx = follow_context(c)
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: "f" * 40)
+    def unexpected(*args):
+        pytest.fail("other projects must not compare installed and base revisions")
+    monkeypatch.setattr(ctx.git, "ref_sha", unexpected)
+    orch_reinstall.follow_base(ctx)
+    assert c.calls == []
+
+
+def test_follow_failed_sha_is_attempted_once_until_base_moves(reinstall, monkeypatch, capsys):
+    c = reinstall
+    old = c.history.tip
+    c.history.update({"src/foragent/__init__.py": "BUILD = 'new'\n"})
+    ctx = follow_context(c)
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: old)
+    calls = []
+    def fail(ctx, sha):
+        calls.append(sha)
+        raise RuntimeError("broken install")
+    monkeypatch.setattr(orch_reinstall, "_install_sha", fail)
+    orch_reinstall.follow_base(ctx)
+    orch_reinstall.follow_base(ctx)
+    assert calls == [c.history.tip]
+    assert len(failures(c)) == 1
+    assert "reinstall failed: broken install" in capsys.readouterr().err
+    c.history.update({"src/foragent/__init__.py": "BUILD = 'next'\n"})
+    ctx.git.fetch("origin", "main")
+    orch_reinstall.follow_base(ctx)
+    assert calls[-1] == c.history.tip and len(calls) == 2
+
+
+def test_follow_missing_installed_commit_installs_fetched_base(reinstall, monkeypatch):
+    c = reinstall
+    ctx = follow_context(c)
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: "f" * 40)
+    orch_reinstall.follow_base(ctx)
+    installs = [args for args, _ in c.calls if args[:2] == ["tool", "install"]]
+    assert len(installs) == 1
+    assert (c.package / "_build.py").read_text() == f"GIT_SHA = '{c.history.tip}'\n"
+    assert not failures(c)
