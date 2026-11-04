@@ -214,8 +214,15 @@ class RunRecordsMixin:
         with self._state_lock():
             path = self.root / "runs" / f"{number}.json"
             value = _state.json.loads(path.read_text(encoding="utf-8"))
-            if value["started_at"] != started_at:
-                raise ValueError("Merge belongs to a superseded worker generation")
+            current = value["started_at"] == started_at
+            history = self.root / "runs.jsonl"
+            rows = list(read_jsonl(history))
+            if not current:
+                value = next((row for row in reversed(rows)
+                              if row["number"] == number and row["started_at"] == started_at), None)
+                if value is None:
+                    raise ValueError("Merge worker generation is unavailable")
+                value = dict(value)
             value["owner_merge"] = fact
             value["owner_merge_started_at"] = started_at
             value["merged_at"] = fact["merged_at"]
@@ -223,10 +230,9 @@ class RunRecordsMixin:
             value["review_pass_to_merge_seconds"] = (
                 (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
                 if passed else None)
-            self._write_json(path, value)
+            if current:
+                self._write_json(path, value)
             if value["status"] == "finished":
-                history = self.root / "runs.jsonl"
-                rows = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
                 if not any(row["number"] == number and row["started_at"] == started_at
                            and row.get("owner_merge") == fact
                            and row.get("owner_merge_started_at") == started_at for row in rows):
