@@ -12,8 +12,9 @@ import sys
 
 import yaml
 
+from foragent import gh
 from foragent.config import Config, ConfigError, load_config
-from foragent.git import GitError, GitRepo
+from foragent.git import GitError, GitRepo, slug_from_url
 from foragent.processes import kill_process_group, observe_tree, recorded_tree
 
 
@@ -375,6 +376,115 @@ def _proposed_skills(root: Path, tracked: list[str], ci_files: list[str]) -> lis
     return proposals
 
 
+DOC_NAMES = ("CLAUDE.md", "AGENTS.md")
+GH_LIST_LIMIT = 200
+# GitHub's closing keywords; a bare "#N" mention is never evidence.
+_CLOSING = re.compile(
+    r"(?<![\w-])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?::\s*|\s+)"
+    r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _docs(root: Path) -> list[dict]:
+    """The project docs the survey read, each with a short opening excerpt."""
+    names = sorted(path.name for path in root.glob("README*") if path.is_file())
+    docs = []
+    for name in [*names, *(name for name in DOC_NAMES if (root / name).is_file())]:
+        text = (root / name).read_bytes().decode("utf-8", errors="replace")
+        excerpt = ""
+        for line in (line.strip() for line in text.splitlines()):
+            if line:
+                excerpt = f"{excerpt} {line}".strip()
+                if len(excerpt) >= 300:
+                    break
+        docs.append({"path": name, "excerpt": excerpt[:300]})
+    return docs
+
+
+def closing_refs(message: str, slug: str | None) -> set[int]:
+    """Issue numbers that a commit message closes with a GitHub closing keyword."""
+    numbers = set()
+    for match in _CLOSING.finditer(message):
+        repo = match[1]
+        if repo is None or (slug is not None and repo.lower() == slug.lower()):
+            numbers.add(int(match[2]))
+    return numbers
+
+
+def _fixes(git: GitRepo, slug: str | None) -> dict[int, list[dict]]:
+    """Commits reachable from HEAD by the issue numbers they close."""
+    log = git._call(["log", "HEAD", "--format=%H%x00%s%x00%B%x1e"])
+    found: dict[int, list[dict]] = {}
+    for record in log.split("\x1e"):
+        parts = record.lstrip("\n").split("\0", 2)
+        if len(parts) != 3:
+            continue
+        sha, subject, body = parts
+        for number in sorted(closing_refs(body, slug)):
+            found.setdefault(number, []).append({"sha": sha, "subject": subject})
+    return found
+
+
+def _gh_list(args: list[str]) -> tuple[list[dict] | None, str | None]:
+    try:
+        result = gh.run(args, capture_output=True, text=True, timeout=60,
+                        stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None, "gh is not installed"
+    except subprocess.TimeoutExpired:
+        return None, f"gh {args[0]} list timed out"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        return None, f"gh {args[0]} list failed: {detail[0] if detail else f'exit {result.returncode}'}"
+    try:
+        items = json.loads(result.stdout)
+    except ValueError:
+        return None, f"gh {args[0]} list returned unreadable JSON"
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return None, f"gh {args[0]} list returned unexpected JSON"
+    return items, None
+
+
+def _github(git: GitRepo, has_commits: bool) -> dict:
+    """Open issues and pull requests, read only; unavailable without a GitHub remote or gh."""
+    try:
+        slug = slug_from_url(git._call(["remote", "get-url", "origin"]))
+    except GitError:
+        slug = None
+    report = {"repo": slug, "available": False, "reason": None,
+              "issues": [], "pulls": [], "truncated": False}
+    if slug is None:
+        report["reason"] = "no GitHub remote"
+        return report
+    common = ["--repo", slug, "--state", "open", "--limit", str(GH_LIST_LIMIT)]
+    issues, reason = _gh_list(["issue", "list", *common, "--json", "number,title,url,labels"])
+    if issues is None:
+        report["reason"] = reason
+        return report
+    pulls, reason = _gh_list(["pr", "list", *common, "--json", "number,title,url,headRefName"])
+    if pulls is None:
+        report["reason"] = reason
+        return report
+    fixes = _fixes(git, slug) if has_commits else {}
+    report["available"] = True
+    report["truncated"] = len(issues) >= GH_LIST_LIMIT or len(pulls) >= GH_LIST_LIMIT
+    for item in issues:
+        if not isinstance(item.get("number"), int):
+            continue
+        labels = [label.get("name") for label in item.get("labels") or [] if isinstance(label, dict)]
+        report["issues"].append({
+            "number": item["number"], "title": item.get("title", ""), "url": item.get("url", ""),
+            "labels": [name for name in labels if isinstance(name, str)],
+            "fixed_by": fixes.get(item["number"], []),
+        })
+    for item in pulls:
+        if isinstance(item.get("number"), int):
+            report["pulls"].append({"number": item["number"], "title": item.get("title", ""),
+                                    "url": item.get("url", ""), "head": item.get("headRefName", "")})
+    return report
+
+
 def survey(root: Path) -> dict:
     """Describe tracked history and current setup using read-only operations."""
     root = root.resolve()
@@ -401,6 +511,8 @@ def survey(root: Path) -> dict:
         "existing_setup": [name for name in (".claude/", "CLAUDE.md", "AGENTS.md", ".github/workflows/")
                            if ((root / name).is_dir() if name.endswith("/") else (root / name).is_file())],
         "ci": (ci_report := _ci(root, acceptance_dir)),
+        "docs": _docs(root),
+        "github": _github(git, has_commits),
         "proposed_skills": _proposed_skills(root, [path for path in tracked if path],
                                             [item["file"] for item in ci_report]),
     }
@@ -503,6 +615,20 @@ def run(args: argparse.Namespace) -> int:
                 f"{item['file']} (acceptance {'included' if item['runs_acceptance'] else 'excluded'})"
                 for item in report["ci"]
             ) or "no test workflows"))
+            print(f"Docs read: {', '.join(doc['path'] for doc in report['docs']) or 'none'}")
+            github = report["github"]
+            if not github["available"]:
+                print(f"GitHub: not read ({github['reason']})")
+            else:
+                more = " or more" if github["truncated"] else ""
+                fixed = [item for item in github["issues"] if item["fixed_by"]]
+                print(f"Open issues ({len(github['issues'])}{more}, {len(fixed)} already fixed by a commit):")
+                for item in github["issues"]:
+                    evidence = ", ".join(f"{fix['sha'][:12]} {fix['subject']}" for fix in item["fixed_by"])
+                    print(f"  #{item['number']} {item['title']}" + (f" (fixed by {evidence})" if evidence else ""))
+                print(f"Open pull requests ({len(github['pulls'])}{more}):")
+                for item in github["pulls"]:
+                    print(f"  #{item['number']} {item['title']} ({item['head']})")
             for item in report["proposed_skills"]:
                 print(f"Proposed skill: {item['id']} ({item['source']}, {item['license']}): {item['reason']}")
         return 0

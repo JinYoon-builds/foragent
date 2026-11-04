@@ -186,18 +186,21 @@ def baseline(record: dict[str, Any] | None) -> dict[str, Any] | None:
     return facts
 
 
-def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False) -> bool:
+def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(), share: bool = False,
+                 floor: int | None = None) -> bool:
     """``shares`` names the fields of this level that are worse on any rise (derived shares and
     ``orch_facts_kinds.RISING_FACTS``), at a kind's top-level numbers only: a kind's top-level numbers.
     Nested keys are members (lanes, files, issues), whatever they are called, so their counts
-    must double."""
+    must double. With ``floor`` (a window kind inside its window, ``WINDOW_FACTS``), a member
+    absent from the baseline counts as having stood at that threshold, so it must double it."""
     if after is None:
         return False
     if before is None:
         return True  # Present now, absent at the baseline.
     if isinstance(after, dict) and isinstance(before, dict):
-        return any(key not in before
-                   or _worse_value(before[key], value, share=key in shares)
+        return any(_worse_value(floor, value, floor=floor) if key not in before and _count(value) and floor
+                   else key not in before
+                   or _worse_value(before[key], value, share=key in shares, floor=floor)
                    for key, value in after.items())
     if isinstance(after, list) and isinstance(before, list):
         seen = {json.dumps(item, sort_keys=True, default=str) for item in before}
@@ -214,6 +217,18 @@ def _worse_value(before: Any, after: Any, *, shares: frozenset[str] = frozenset(
 DOUBLED = 2  # A count of an existing member is worse once it at least doubles.
 
 
+def _count(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def answered_at(record: dict[str, Any] | None) -> datetime | None:
+    """When a done request was answered: ``answered_at``, stamped with the done mark by both
+    answer paths; a legacy record falls back to its last write, then its raise."""
+    if record is None:
+        return None
+    return _time(record.get("answered_at") or record.get("updated_at") or record.get("created_at"))
+
+
 def _worse_binding(before: Any, after: Any) -> bool:
     """Another constraint binds (a new member, as the locked not-now test requires), or the
     same one stopped being normal; a return to normal is better."""
@@ -224,13 +239,18 @@ def _worse_binding(before: Any, after: Any) -> bool:
     return after.get("kind") != before.get("kind") or (before.get("normal") and not after.get("normal"))
 
 
-def worse(before: dict[str, Any] | None, after: dict[str, Any]) -> bool:
+def worse(before: dict[str, Any] | None, after: dict[str, Any], since: timedelta | None = None) -> bool:
     """Whether ``after`` holds a burden its baseline ``before`` did not (#1469).
 
     Worse is a new member (a matched file, a met kind, a key such as an issue or file, a list
     member such as an idle lane, or a different named lane or binding constraint), a share that
     rises, or a count of an existing member that at least doubles. Smaller rises, the same or
     better numbers, order, elapsed time and context numbers are not worse.
+
+    ``since`` is the time since the baseline was answered. For a kind of
+    ``orch_facts_kinds.WINDOW_FACTS`` within its window, a member newly reaching the threshold is
+    drift of the same window (#1840): it is worse only at double the threshold. Unknown (None)
+    counts as inside the window.
     """
     if before is None:
         return True
@@ -241,9 +261,12 @@ def worse(before: dict[str, Any] | None, after: dict[str, Any]) -> bool:
         prior = (before.get("kinds") or {}).get(kind)
         if not isinstance(prior, dict):
             return True  # A kind present now that the baseline did not hold.
+        window, threshold = orch_facts_kinds.WINDOW_FACTS.get(kind, (None, None))
+        drift = window is not None and (since is None or since < window)
         if _worse_value(prior.get("numbers"), item.get("numbers"),
                         shares=frozenset(orch_facts_kinds.SHARE_FACTS.get(kind, {}))
-                        | frozenset(orch_facts_kinds.RISING_FACTS.get(kind, ()))):
+                        | frozenset(orch_facts_kinds.RISING_FACTS.get(kind, ())),
+                        floor=threshold if drift else None):
             return True
         if _worse_binding(prior.get("binding"), item.get("binding")):
             return True
@@ -334,7 +357,7 @@ def complete_call(store: StateStore, request_id: str, repo_root: Path | None = N
     def called(record: dict[str, Any]) -> None:
         if record.get("status") == "done":
             raise orch_inbox.InboxError(f"request {request_id} is already done")
-        record.update(answer="called",
+        record.update(answer="called", answered_at=store._timestamp(),
                       answer_facts=answered_facts(record, measured))
 
     try:
@@ -347,12 +370,17 @@ def complete_call(store: StateStore, request_id: str, repo_root: Path | None = N
                              signal=record["signal"])
 
 
+def _since(record: dict[str, Any], now: datetime) -> timedelta | None:
+    at = answered_at(record)
+    return now - at if at is not None else None
+
+
 def _gate_due(store: StateStore, now: datetime, name: str, key: str, previous: dict[str, Any] | None,
               answer: dict[str, Any] | None, facts: dict[str, Any]) -> dict[str, Any] | None:
     """The open request a gate call answers, ``{}`` for a new one, or None when no call is due."""
     from foragent import orch_architect
 
-    if answer is not None and not worse(baseline(answer), facts):
+    if answer is not None and not worse(baseline(answer), facts, _since(answer, now)):
         return None  # The same or better than at the last answer.
     if orch_architect.session_alive(orch_architect.read_record(store, name)):
         return None  # The running session already digs; never start a second one.
@@ -426,7 +454,8 @@ def raise_due(store: StateStore, repo_root: Path, now: datetime, start: bool = F
                 if baseline(previous) is not None:
                     # A clear and return is a new episode the locked raise test records as a
                     # request; it never calls by itself (the gate path above has no such rule).
-                    due = (cleared and clear_rearms(facts)) or worse(baseline(previous), facts)
+                    due = (cleared and clear_rearms(facts)) or worse(baseline(previous), facts,
+                                                                     _since(previous, now))
                 else:
                     due = cleared or raised_at is None or now - raised_at >= cooldown(repo_root)
                 if not due:
@@ -474,6 +503,7 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
         if record.get("status") == "done":
             raise orch_inbox.InboxError(f"request {request_id} is already done")
         record["answer"] = how  # Set with the done mark, so a tick never sees done without it.
+        record["answered_at"] = store._timestamp()
         if facts is not None:
             record["answer_facts"] = answered_facts(record, facts)
 

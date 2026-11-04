@@ -29,8 +29,7 @@ its heartbeat is stale, the question waits in the FA inbox for the next planning
 ## Ask only D71 choices
 
 Under D71, ask the user only these five kinds: a goal change, a trade-off between valid options,
-taste or preference, something hard to undo (delete, deploy, public release, `always_human` paths,
-`risk:high` issues), and scope or priority. Everything else has a right answer: confirm the facts
+taste or preference, something hard to undo (data, such as a delete git cannot revert; money; public exposure, such as a deploy or public release; sending to others; `always_human` paths; `risk:high` issues), and scope or priority. Changes git can revert, including deleting superseded code, are not person questions; a question an existing decision answers goes to the PM, not the person. Everything else has a right answer: confirm the facts
 from evidence (code, docs, logs, decision log), fix it first, then report it in one line and record
 it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a test that
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,
@@ -85,6 +84,7 @@ existing verb, always with `--say "<one line for a person>"` in the docs/voice.m
 - `fa orch resolve N --verdict pass|fail --note "<evidence and reasoning>"`: record a verdict on the current PR head. Done when and CI still apply.
 - `fa orch escalate N --summary "<why a human is needed>" --tried "<attempts>" --option "<recommendation>" --option "<alternative>" --recommend 1`: raise a human decision.
 
+For superseded work, `fa orch close N --superseded-by M --why "<reason>"` closes N, its PR and branch, and removes only its unmerged exclusive locks.
 Count attempts by defect class, not by reason code, across `fa orch log` and issue comments. When an issue is held a
 second time for the same defect class, do not retry with another hint; fix the issue itself: redesign its Goal (for
 example one writer per state, D95) through an order edit and re-approval, or split it. Use `fa orch escalate` only

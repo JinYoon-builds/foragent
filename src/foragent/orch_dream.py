@@ -13,10 +13,10 @@ that opened a PR completes when the tick sees that PR merged.
 from __future__ import annotations
 
 from datetime import datetime
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from foragent.file_cache import read_jsonl
 from foragent.i18n import text
 from foragent.orch_events import append_event
 from foragent.state import StateStore
@@ -78,19 +78,8 @@ def awaiting_pr(store: StateStore, lane: str) -> dict | None:
 
 def _lane_events(store: StateStore, lane: str) -> list[dict]:
     """The lane's completed, published and redo dream events, in journal order."""
-    try:
-        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get("kind") in {DONE, PUBLISHED, REDO} and event.get("lane") == lane:
-            events.append(event)
-    return events
+    return [event for event in read_jsonl(store.root / "orch-events.jsonl", tolerant=True)
+            if event.get("kind") in {DONE, PUBLISHED, REDO} and event.get("lane") == lane]
 
 
 def last_dream_at(store: StateStore, lane: str) -> datetime | None:
@@ -166,9 +155,9 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
             continue
         # By its finish, not by its merges: a dream before an order ended leaves that order's turn.
         covered = last_dream_at(store, lane)
-        owner_facts = store.owner_merge_facts() if getattr(config, "merge_owner", False) else {}
+        owner_facts = store.owner_merge_facts()
         merged = {run.number for run, _ in _runs_since(store, lane, None)
-                  if (store.run_merged(run, owner_facts=owner_facts) if getattr(config, "merge_owner", False) else run.outcome == "merged")}
+                  if store.run_merged(run, owner_facts=owner_facts)}
         if any(children & merged and (covered is None or finished > covered) for children, finished in orders):
             due.append(lane)
     return due

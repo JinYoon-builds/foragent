@@ -12,13 +12,16 @@ from test_orch import review_case
 from test_runner import run_case
 from test_scheduler import NOW, approve, ctx
 
+LONG_REASON = "x" * 600 + " tail cause"
+
 
 @pytest.mark.parametrize("entry", ["run", "review"])
 def test_exception_reason_survives_reopening_and_reporting_failure(
     request, monkeypatch, entry,
 ):
     case = request.getfixturevalue("review_case" if entry == "review" else "run_case")
-    message = "arbitrary upstream failure\r\n\t" + "한글 context " * 80
+    message = "arbitrary upstream failure\r\n\t" + "한글 context " * 80 + "\nCause: response decoding failed"
+    expected = "arbitrary upstream failure " + "한글 context " * 80 + "Cause: response decoding failed"
 
     def fail(*args, **kwargs):
         raise RuntimeError(message)
@@ -36,7 +39,7 @@ def test_exception_reason_survives_reopening_and_reporting_failure(
     persisted = StateStore(case.store.root)
     run = persisted.get_run(1)
     assert run.outcome == "error"
-    assert run.detail == " ".join(message.split())[:500]
+    assert len(expected) > 500 and run.detail == expected
     assert persisted.read_history()[-1].detail == run.detail
 
 
@@ -57,40 +60,48 @@ def test_whitespace_exception_keeps_a_reason(request, monkeypatch, entry, expect
     assert persisted.read_history()[-1] == run
 
 
-@pytest.mark.parametrize("operation", ["update_run", "finish_run"])
+@pytest.mark.parametrize("operation", ["update_run", "finish_run", "dream", "draft"])
 @pytest.mark.parametrize("detail,previous,expected", [
     ("new\n\t reason", "old reason", "new reason"),
-    ("x" * 600, "old reason", "x" * 500),
+    (LONG_REASON, "old reason", LONG_REASON),
     ("", "previous\n\t reason", "previous reason"),
     ("\n\t ", "previous\n\t reason", "previous reason"),
-    ("\n\t ", "x" * 600, "x" * 500),
+    ("\n\t ", LONG_REASON, LONG_REASON),
     ("", "", None),
     ("\n\t ", "", None),
     ("\n\t ", "\n\t ", None),
 ], ids=[
-    "new-reason", "new-reason-truncated", "empty-keeps-previous", "whitespace-keeps-previous",
-    "previous-truncated", "empty-default", "whitespace-default", "whitespace-previous-default",
+    "new-reason", "new-reason-complete", "empty-keeps-previous", "whitespace-keeps-previous",
+    "previous-complete", "empty-default", "whitespace-default", "whitespace-previous-default",
 ])
 def test_run_detail_normalizes_before_selecting_a_fallback(
     tmp_path, operation, detail, previous, expected,
 ):
     store = StateStore(tmp_path / "state")
-    store.start_run(1, branch="issue-1", worktree=tmp_path / "worktree")
+    key = 1
+    if operation == "dream":
+        store.start_dream("orch", worktree=tmp_path / "worktree")
+        key = "dream-orch"
+    elif operation == "draft":
+        store.start_draft(1, "orch", worktree=tmp_path / "worktree")
+        key = "draft-1"
+    else:
+        store.start_run(1, branch="issue-1", worktree=tmp_path / "worktree")
     # Older snapshots may contain details that have not been normalized.
-    snapshot_path = store.root / "runs/1.json"
+    snapshot_path = store.root / "runs" / f"{key}.json"
     snapshot = json.loads(snapshot_path.read_text())
     snapshot["detail"] = previous
     snapshot_path.write_text(json.dumps(snapshot))
 
-    if operation == "finish_run":
-        run = store.finish_run(1, "error", detail=detail)
-        expected = expected or "Run finished with outcome error."
-    else:
+    if operation == "update_run":
         run = store.update_run(1, detail=detail)
         expected = expected or "Run detail unavailable."
+    else:
+        run = store.finish_run(key, "error", detail=detail)
+        expected = expected or "Run finished with outcome error."
     assert run.detail == expected
     persisted = StateStore(store.root)
-    assert persisted.get_run(1) == run
+    assert persisted.get_run(key) == run
     assert persisted.read_history() == ([run] if operation == "finish_run" else [])
 
 
@@ -147,11 +158,16 @@ def test_start_failure_is_recoverable_after_reopening_without_a_crash(
 def test_completion_keeps_the_recorded_reason_in_snapshot_and_history(tmp_path, outcome):
     store = StateStore(tmp_path / "state")
     store.start_run(1, branch="issue-1", worktree=tmp_path / "worktree")
-    message = "actual reason\r\n\t" + "long output " * 100
+    message = "actual reason\r\n\t" + "long output " * 100 + "\nCause: upstream unavailable"
+    expected = "actual reason " + "long output " * 100 + "Cause: upstream unavailable"
     store.update_run(1, detail=message)
     finished = store.finish_run(1, outcome)
-    assert finished.detail == " ".join(message.split())[:500]
+    assert len(expected) > 500 and finished.detail == expected
+    snapshot = json.loads((store.root / "runs/1.json").read_text())
+    assert snapshot["status"] == "finished" and snapshot["outcome"] == outcome
+    assert snapshot["detail"] == expected
     rows = [json.loads(line) for line in (store.root / "runs.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
     assert rows[-1]["detail"] == finished.detail
 
 
