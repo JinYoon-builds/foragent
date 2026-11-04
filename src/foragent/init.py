@@ -280,7 +280,7 @@ def init_repo(
             key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
             raise GitError(text(key, preflight_language, error=exc)) from exc
     run = gh_run or _run_gh
-    facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools)
+    facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools, language=preflight_language)
     fixes = [item["fix"] for item in setup.checklist(facts) if not item["ok"]]
     if fixes:
         message = text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes))

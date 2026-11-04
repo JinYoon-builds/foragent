@@ -219,3 +219,72 @@ def test_init_preserves_gh_auth_failure_details(setup, monkeypatch, failure, det
     assert not (setup.root / ".foragent.yml").exists()
     assert not setup.installs and not setup.tracker.labels
     assert not any("commit" in args or "push" in args for args in setup.git_calls)
+
+
+@pytest.mark.parametrize("gh_installed,prerequisite,count", [
+    (False, "gh-installed", 2),
+    (True, "gh-logged-in", 1),
+])
+@pytest.mark.parametrize("language_source", ["flag", "config"])
+def test_init_waiting_fixes_use_selected_language(
+    setup, monkeypatch, gh_installed, prerequisite, count, language_source,
+):
+    config = setup.root / ".foragent.yml"
+    config.write_text("language: " + ("en" if language_source == "flag" else "ko") + "\n")
+    before = config.read_bytes(), config.stat().st_mtime_ns
+    monkeypatch.setattr(checklist_setup, "installed_tools", lambda: {
+        "git": True, "gh": gh_installed, "uv": True})
+    calls = []
+
+    def logged_out(args, input=None):
+        calls.append(args)
+        raise subprocess.CalledProcessError(1, ["gh", *args], stderr="not logged in")
+
+    monkeypatch.setattr(setup, "run_gh", logged_out)
+    with pytest.raises(TrackerError) as raised:
+        setup.init(**({"language": "ko"} if language_source == "flag" else {}))
+    message = str(raised.value)
+    expected = f"{prerequisite} 항목을 마친 뒤 fa doctor --setup을 다시 실행하세요"
+    assert message.count(expected) == count
+    assert "설정 점검을 통과하지 못했어요" in message
+    assert "Wait for" not in message
+    assert calls == ([["auth", "status"]] if gh_installed else [])
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == before
+    assert not setup.installs and not setup.tracker.labels
+    assert not any("commit" in args or "push" in args for args in setup.git_calls)
+
+
+@pytest.mark.parametrize("gh_installed,prerequisite,count", [
+    (False, "gh-installed", 2),
+    (True, "gh-logged-in", 1),
+])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_doctor_waiting_fixes_use_project_language(
+    setup, monkeypatch, capsys, gh_installed, prerequisite, count, as_json,
+):
+    config = setup.root / ".foragent.yml"
+    config.write_text("language: ko\n")
+    before = config.read_bytes(), config.stat().st_mtime_ns
+    monkeypatch.setattr(checklist_setup, "installed_tools", lambda: {
+        "git": True, "gh": gh_installed, "uv": True})
+    calls = []
+
+    def logged_out(args, **kwargs):
+        calls.append(args)
+        raise subprocess.CalledProcessError(1, ["gh", *args], stderr="not logged in")
+
+    monkeypatch.setattr(gh, "run", logged_out)
+    argv = ["doctor", "--setup", "--repo-root", str(setup.root)] + (["--json"] if as_json else [])
+    assert cli.main(argv) == 1
+    output = capsys.readouterr().out
+    expected = f"{prerequisite} 항목을 마친 뒤 fa doctor --setup을 다시 실행하세요"
+    if as_json:
+        items = json.loads(output)["items"]
+        fixes = [item["fix"] for item in items if not item["ok"]]
+        assert fixes.count(expected) == count
+        assert not any("Wait for" in fix for fix in fixes)
+    else:
+        assert output.count(expected) == count
+        assert "Wait for" not in output
+    assert calls == ([["auth", "status"]] if gh_installed else [])
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == before

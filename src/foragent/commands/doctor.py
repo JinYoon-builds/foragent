@@ -26,7 +26,11 @@ def run(args) -> int:
             result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=True, timeout=10)
             return result.stdout + "\n" + result.stderr
 
-        items = setup.checklist(setup.collect(read_auth))
+        try:
+            language = cli.load_config(args.repo_root).language
+        except (cli.ConfigError, OSError):
+            language = "en"
+        items = setup.checklist(setup.collect(read_auth, language=language))
         if args.json:
             print(cli.json.dumps({"items": items}))
         else:

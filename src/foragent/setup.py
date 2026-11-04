@@ -53,10 +53,13 @@ def gh_project_scope(auth_status: str) -> SetupItem:
 
 @dataclass(frozen=True)
 class Facts:
+    """Machine facts and the reader's display language; never persisted."""
+
     installed: dict[str, bool]
     auth_status: str = ""
     logged_in: bool = False
     auth_error: str = ""
+    language: str = "en"
 
 
 def installed_tools() -> dict[str, bool]:
@@ -73,17 +76,18 @@ def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
     return "\n".join(parts)
 
 
-def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None) -> Facts:
+def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None,
+            language: str = "en") -> Facts:
     """Read prerequisites once; never invoke an auth command without gh on PATH."""
     tools = installed if installed is not None else installed_tools()
     if not tools["gh"]:
-        return Facts(tools, auth_error="gh not found on PATH")
+        return Facts(tools, auth_error="gh not found on PATH", language=language)
     try:
-        return Facts(tools, auth_status=read_auth(), logged_in=True)
+        return Facts(tools, auth_status=read_auth(), logged_in=True, language=language)
     except FileNotFoundError as exc:
-        return Facts({**tools, "gh": False}, auth_error=_auth_error(exc))
+        return Facts({**tools, "gh": False}, auth_error=_auth_error(exc), language=language)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        return Facts(tools, auth_error=_auth_error(exc))
+        return Facts(tools, auth_error=_auth_error(exc), language=language)
 
 
 INSTALL_PAGES = {
@@ -114,7 +118,7 @@ def uv_installed(facts: Facts) -> SetupItem:
 
 def gh_logged_in(facts: Facts) -> SetupItem:
     if not facts.installed["gh"]:
-        return {"id": "gh-logged-in", "ok": False, "fix": text("setup_wait_for", prerequisite="gh-installed")}
+        return {"id": "gh-logged-in", "ok": False, "fix": text("setup_wait_for", facts.language, prerequisite="gh-installed")}
     item: SetupItem = {"id": "gh-logged-in", "ok": facts.logged_in}
     if not item["ok"]:
         item["fix"] = "gh auth login"
@@ -125,7 +129,7 @@ def project_scope(facts: Facts) -> SetupItem:
     for prerequisite in (gh_installed(facts), gh_logged_in(facts)):
         if not prerequisite["ok"]:
             return {"id": "gh-project-scope", "ok": False,
-                    "fix": text("setup_wait_for", prerequisite=prerequisite["id"])}
+                    "fix": text("setup_wait_for", facts.language, prerequisite=prerequisite["id"])}
     return gh_project_scope(facts.auth_status)
 
 
