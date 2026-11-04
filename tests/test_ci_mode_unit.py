@@ -1754,3 +1754,21 @@ def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, mo
     with pytest.raises(TrackerError):
         accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
     assert _evidence_rows(ctx.store) == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_report_pins_reject_changed_reports_on_the_same_head(tmp_path, monkeypatch, legacy):
+    from dataclasses import asdict
+    from foragent import ci_mode
+    from foragent.records import load_record
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    recorded = ci_mode.serialize_reports([{'shard': 0}]) if legacy else ci_mode.reports_digest([{'shard': 0}])
+    stored = {**asdict(accepted), 'reports': recorded, 'reports_by_head': {'head': recorded}}
+    accepted = load_record(ci_mode.ComparisonEvidence, json.loads(json.dumps(stored)))
+    reads += [[{'shard': 0}], [{'shard': 1}], []]
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert not accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['reports-changed', 'missing']
+    assert accepted.reports == accepted.reports_by_head['head'] == ci_mode.reports_digest([{'shard': 0}])

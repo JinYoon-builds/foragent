@@ -260,3 +260,28 @@ def test_owner_process_compacts_at_start_even_during_backoff(tmp_path, monkeypat
                                  "committed_config": False}, os.dup(lock.fileno()))
     assert "comparison" not in queue._rows(store)[0]["publication"]
     assert len(list(path.parent.glob(f"{queue.QUEUE}.bak-*"))) == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_job_report_pin_survives_restart_without_new_comparison(proto, monkeypatch, legacy):
+    case = proto
+    support.queue_workers(case, [5])
+    path = merge_owner._path(case.ctx, 5)
+    job = json.loads(path.read_text())
+    head = job["head"]
+    reports = case.tracker.pr_acceptance_reports(head)
+    assert job["comparison"]["reports"] == ci_mode.reports_digest(reports)
+    if legacy:
+        job["comparison"]["reports"] = ci_mode.serialize_reports(reports)
+        case.store._write_json(path, job)
+    rounds = len(case.ci.by_head)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("The persisted comparison must survive a restart")
+
+    monkeypatch.setattr(ci_mode, "require_comparison", unexpected)
+    support.drain(case, count=1)
+    assert case.tracker.merged_prs == [job["pr"]]
+    assert case.merges[-1]["head"] == head and len(case.ci.by_head) == rounds
+    saved = json.loads(path.read_text())
+    assert saved["comparison"]["reports"] == ci_mode.reports_digest(reports)
