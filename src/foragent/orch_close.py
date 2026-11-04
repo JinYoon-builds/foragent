@@ -16,7 +16,7 @@ from foragent.git import GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.orch_events import append_event
 from foragent.scheduler_stop import unfinished_runs
-from foragent.tracker import RecordingTracker
+from foragent.tracker import RecordingTracker, pr_issue_number
 
 
 def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
@@ -75,6 +75,8 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
                 raise OrchError(text("orch_close_running", language, n=n))
             merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
             merged.update(number for number, _ in ctx.store.merge_times())
+            merged.update(number for pr in ctx.tracker.list_prs("merged", "foragent/")
+                          if (number := pr_issue_number(pr.head)) is not None)
             if n in merged:
                 raise OrchError(text("orch_close_merged", language, n=n))
             if issue.is_pull_request:
@@ -89,6 +91,9 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
                 tracker.close_pr(pr, delete_branch=True)
             if issue.state == "closed" and published:
                 return summary
-            tracker.close_issue(n, None if published else comment)
+            if not published:
+                tracker.comment(n, comment)
+            if issue.state != "closed":
+                tracker.close_issue(n)
             append_event(ctx.store, ctx.now(), n, "closed", summary)
             return summary
