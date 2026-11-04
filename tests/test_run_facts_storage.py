@@ -11,7 +11,8 @@ from foragent.state import StateStore
 
 
 NOW = datetime(2026, 11, 4, tzinfo=UTC)
-DETAIL = "Command: " + "test_node " * 150 + "\nCause: protected check timed out."
+DETAIL = "Command: " + "test_node " * 150 + "Cause: protected check timed out."
+INPUT_DETAIL = "Command: " + "test_node " * 150 + "\r\n\tCause: protected check timed out."
 
 
 def start(root):
@@ -46,7 +47,7 @@ def test_every_finish_write_boundary_survives_reopening(tmp_path, monkeypatch, l
         with monkeypatch.context() as patch:
             patch.setattr(os, "replace", interrupted)
             try:
-                store.finish_run(1, "failed", DETAIL)
+                store.finish_run(1, "failed", INPUT_DETAIL)
             except OSError:
                 pass
         reopened = StateStore(store.root, now=lambda: NOW)
@@ -62,14 +63,14 @@ def test_every_finish_write_boundary_survives_reopening(tmp_path, monkeypatch, l
                 assert json.loads(before)["future_metadata"] == {"keep": [1, 2]}
         else:
             assert latest.status == "running" and history == []
-            finished = reopened.finish_run(1, "failed", DETAIL)
+            finished = reopened.finish_run(1, "failed", INPUT_DETAIL)
             assert reopened.get_run(1) == finished
             assert reopened.read_history() == [finished]
 
 
 def test_restart_on_same_clock_is_new_and_does_not_inherit_its_completion(tmp_path):
     store, first = start(tmp_path)
-    store.update_run(1, detail=DETAIL)
+    store.update_run(1, detail=INPUT_DETAIL)
     store.finish_run(1, "limit-wait")
     previous_generation = json.loads((tmp_path / "runs/1.json").read_text())["run_generation"]
     new = store.start_run(1, branch="branch", worktree=tmp_path / "worktree")
@@ -88,7 +89,7 @@ def test_latest_finished_run_detaches_nested_history_values(tmp_path):
     store, _ = start(tmp_path)
     regions = {"wait": [NOW.isoformat(), NOW.isoformat()]}
     store.update_run(1, pause_regions=regions, changed_files=["original.py"])
-    store.finish_run(1, "failed", DETAIL)
+    store.finish_run(1, "failed", INPUT_DETAIL)
     latest = store.get_run(1)
     latest.pause_regions["wait"].append("caller mutation")
     latest.changed_files.append("caller.py")
@@ -99,7 +100,7 @@ def test_latest_finished_run_detaches_nested_history_values(tmp_path):
 
 
 @pytest.mark.parametrize("side", [None, "dream", "draft"])
-def test_detail_saved_while_running_keeps_its_original_lines(tmp_path, side):
+def test_detail_saved_while_running_keeps_the_complete_reason(tmp_path, side):
     store, _ = start(tmp_path)
     if side == "dream":
         store.start_dream("orch", worktree=tmp_path / "dream")
@@ -109,7 +110,7 @@ def test_detail_saved_while_running_keeps_its_original_lines(tmp_path, side):
         key, read = "draft-2", lambda: store.get_draft(2)
     else:
         key, read = 1, lambda: store.get_run(1)
-    store.update_run(key, detail=DETAIL)
+    store.update_run(key, detail=INPUT_DETAIL)
     assert read().detail == DETAIL
     store.finish_run(key, "failed")
     assert read().detail == DETAIL

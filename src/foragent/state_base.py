@@ -172,7 +172,8 @@ class StateBase:
 
             # As finish_run: observe the recorded tree once more, so its descendants stay owned.
             finished = _state.replace(run, status="finished", outcome=outcome,
-                                      detail=detail.strip() or run.detail or f"Run finished with outcome {outcome}.",
+                                      detail=(" ".join(detail.split()) or " ".join(run.detail.split())
+                                              or f"Run finished with outcome {outcome}."),
                                       process_identities=observe_tree(run.process_identities))
             self._write_run(finished, {**self._run_value(finished), "finished_at": self._timestamp()})
             return finished

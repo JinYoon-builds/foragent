@@ -128,8 +128,8 @@ class RunRecordsMixin:
                 return run
             if "detail" in fields:
                 fields["detail"] = (
-                    fields["detail"].strip()
-                    or run.detail
+                    " ".join(fields["detail"].split())
+                    or " ".join(run.detail.split())
                     or "Run detail unavailable."
                 )
             if "phase" in fields and fields["phase"] != run.phase:
@@ -299,9 +299,9 @@ class RunRecordsMixin:
                 # Adopt old running files before committing completion. A crash here leaves
                 # their running state intact; old history cannot finish this generation.
                 self._write_run(run, {**self._run_value(run), "run_generation": uuid4().hex})
-            detail = detail.strip()
+            detail = " ".join(detail.split())
             if not detail and outcome != "merged":
-                detail = run.detail or f"Run finished with outcome {outcome}."
+                detail = " ".join(run.detail.split()) or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
             # Every run exit closes its last open phase segment; an open talk ends at finished_at (derived).
