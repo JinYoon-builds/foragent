@@ -212,9 +212,22 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     return lane_decisions_section([str(line) for line in (proposal or {}).get("decisions") or []])
 
 
-@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
+    """One review round; a standing PASS is marked on the run's own context.
+
+    A reviewer at its limit reviews on a copy of the context (``moving_review``), so the
+    mark for timeout attribution (#1514) is set here, never inside the session.
+    """
+    review = _review_session(n, ctx, git, parsed, base_ref, round_number=round_number, pr=pr)
+    if review.verdict == "PASS" and not review.conflicts:
+        ctx._budget_review_pass = n
+    return review
+
+
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
+def _review_session(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
+                    *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
     rebuttals = _read_rebuttals(git.root)
@@ -251,7 +264,6 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
-        ctx._budget_review_pass = n
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)

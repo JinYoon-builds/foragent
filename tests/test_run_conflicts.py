@@ -378,7 +378,7 @@ def test_interrupted_conflict_keeps_single_parent_wip_and_rechecks_on_restart(co
         return result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     saved = git_command(c.history.clone, "rev-parse", branch)
     assert len(git_command(c.history.clone, "show", "-s", "--format=%P", saved).split()) == 1
@@ -429,7 +429,7 @@ def test_interrupted_conflict_is_rechecked_when_target_is_already_an_ancestor(co
         return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
     assert c.store.get_run(1).merge_conflicts == ["cli.py"]
@@ -459,7 +459,7 @@ def test_remote_conflicted_wip_is_rechecked_without_local_state(conflicting_lane
         return replace(result, timed_out=True) if len(c.executor.calls) == 3 else result
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     branch = "foragent/issue-1"
     assert git_command(c.history.origin, "show", f"{branch}:cli.py") == "<<<<<<< HEAD\n||||||| ancestor\n=======\n>>>>>>> target"
     assert c.ctx.git.is_ancestor(c.history.tip, git_command(c.history.clone, "rev-parse", branch))
@@ -664,8 +664,13 @@ def test_fresh_base_done_when_failure_returns_to_implementer(run_case, monkeypat
 
 
 def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
-    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it."""
+    """The merge-turn rule (#712): no merge-count cap, only the run's time budget stops it.
+
+    The budget went to following a moving base after a review PASS, so the run
+    reports ``base-changed`` and returns to ready by itself (#1514).
+    """
     c = run_case
+    enable_reviewer(c, ["VERDICT: PASS"])
     moves = []
 
     def ci(pr):
@@ -675,13 +680,45 @@ def test_moving_base_times_out_after_three_merges(run_case, monkeypatch):
         return "pass"
 
     monkeypatch.setattr(c.tracker, "pr_checks", ci)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "base-changed"
     # Every result-affecting move is merged and re-verified once, past the old cap of three.
     assert len(moves) == 5
     assert len([args for _, args in c.operations if "--no-edit" in args]) == len(moves)
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "blocked" not in labels and "running" not in labels
+    assert c.store.load_flag(1) is None
     assert not any("base kept moving" in comment.body for comment in c.tracker.list_comments(1))
     assert c.tracker.merged_prs == []
+
+
+def test_moving_base_after_a_moved_reviewers_pass_is_base_changed(run_case, monkeypatch):
+    """A reviewer at its limit reviews on a copy of the run context (#186). Its PASS must
+    still stand for the run, so a budget spent following the base is base-changed (#1514)."""
+    from foragent import quota_reviewer
+
+    c = run_case
+    enable_reviewer(c, ["VERDICT: PASS"])
+    copies = []
+
+    def moved(n, ctx):
+        copies.append(replace(ctx))
+        return copies[-1]
+
+    monkeypatch.setattr(quota_reviewer, "review_moved", moved)
+    moves = []
+
+    def ci(pr):
+        moves.append(pr)
+        c.now[0] += timedelta(minutes=20)
+        c.history.update({f"parallel-{len(moves)}.txt": "fresh"})
+        return "pass"
+
+    monkeypatch.setattr(c.tracker, "pr_checks", ci)
+    assert run_issue(1, c.ctx) == "base-changed"
+    assert copies and all(copy is not c.ctx for copy in copies)
+    labels = c.tracker.get_issue(1).labels
+    assert "ready" in labels and "blocked" not in labels
+    assert c.store.load_flag(1) is None
 
 
 def test_bug_steps_are_left_out_of_the_conflict_resolution_turn(conflicting_lanes, monkeypatch):

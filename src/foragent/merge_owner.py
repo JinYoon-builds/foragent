@@ -129,6 +129,10 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
         "base": base, "approval": asdict(approval), "ready_at": ready_at,
         "comparison": asdict(comparison) if comparison is not None else None,
         "authorization": ctx.merge_authorization,
+        # The worker's standing review PASS travels with the handoff: the owner's
+        # turns run in other contexts and must still name a budget spent following
+        # a moved base as base-changed (#1514).
+        "review_pass": getattr(ctx, "_budget_review_pass", None) == n,
         "phase": "waiting",
     }
     with ctx.store._state_lock():
@@ -526,6 +530,9 @@ def advance_members(ctx, members, comparison=None):
     advanced = False
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
+        # Each turn starts its own budget: only the handed-off PASS stands, no base was followed yet.
+        ctx._budget_review_pass = place.n if job.get("review_pass") else None
+        ctx._budget_base_changed = None
         with _track_checks(ctx, place, job):
             advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
     return advanced

@@ -287,7 +287,7 @@ def test_review_entries_merge_verified_head_without_implementation(review_case, 
     ("VERDICT: FAIL\nfeature.txt:1 broken", "review-failed", Reason.RETRIES_EXCEEDED),
     ("Ambiguous reviewer output", "review-failed", Reason.RETRIES_EXCEEDED),
     (ExecResult(1, False, "review process failed", Path("unused")), "review-failed", Reason.RETRIES_EXCEEDED),
-    (ExecResult(0, True, "review timed out", Path("unused")), "timeout", Reason.TIMEOUT),
+    (ExecResult(0, True, "review timed out", Path("unused")), "too-large", Reason.TOO_LARGE),
 ])
 def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_case, message, outcome, reason):
     c = review_case
@@ -588,7 +588,7 @@ def test_rerun_early_verification_failures_remain_blocked(review_case, monkeypat
     c = review_case
     if failure == "runtime":
         monkeypatch.setattr(runner, "_remaining", lambda *args: 0)
-        reason = Reason.TIMEOUT
+        reason = Reason.TOO_LARGE
     elif failure == "head-before-review":
         c.tracker.set_pr_head_sha(c.pr, "f" * 40)
         reason = Reason.RISK_HIGH
@@ -741,7 +741,7 @@ def test_hint_survives_unavailable_or_interrupted_executor_until_next_implementa
     else:
         outcome = runner.run_issue(1, c.ctx)
         assert outcome == {"limit": "limit-wait", "transient": "retries-exceeded",
-                           "transient-timeout": "timeout"}.get(failure, "error")
+                           "transient-timeout": "too-large"}.get(failure, "error")
     assert calls and all("Orchestrator hint:\n" + hint in call["prompt"] for call in calls)
     assert c.tracker.merged_prs == []
     assert path.read_text() == hint

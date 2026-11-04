@@ -296,3 +296,39 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     assert not store.run_merged(new), "A later timestamp cannot move a fact between generations"
     assert (1, new.started_at) not in store.merge_times()
     assert store.merge_times()[1, old.started_at] == fact["merged_at"]
+
+
+def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(proto, monkeypatch):
+    """PASS -> owner handoff -> non-neutral main move: the owner's turn spends its budget
+    re-verifying the refreshed head and the last check is cut at the remaining time.
+    That budget went to following the base, so the run is base-changed, not too-large (#1514)."""
+    from foragent import run_checks
+    from foragent.run_checks import CheckResult
+
+    case = proto
+    support.queue_workers(case, [5])
+    assert json.loads(merge_owner._path(case.ctx, 5).read_text())["review_pass"] is True
+    case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"})
+    reverify = merge_owner._reverify
+    limits = []
+
+    def most_budget_used(ctx, place, job, git, head):
+        # Earlier full-length checks on the refreshed head left 300 s of the turn's budget.
+        case.clock[0] += timedelta(seconds=case.config.max_runtime_minutes * 60 - 300)
+        return reverify(ctx, place, job, git, head)
+
+    def cut_at_remaining(n, ctx, command, worktree, log, timeout_s, **kwargs):
+        limits.append(timeout_s)
+        case.clock[0] += timedelta(seconds=timeout_s)
+        return CheckResult(command, None, True, "killed at the run's remaining time", timeout_s)
+
+    monkeypatch.setattr(merge_owner, "_reverify", most_budget_used)
+    monkeypatch.setattr(run_checks, "run_done_when", cut_at_remaining)
+    support.gate(case)
+    assert limits == [300]
+    labels = case.tracker.get_issue(5).labels
+    assert "ready" in labels and not labels & {"blocked", "needs-human"}
+    bodies = [comment.body for comment in case.tracker.list_comments(5)]
+    assert not any("reason=too-large" in body or "split it" in body for body in bodies)
+    assert not any("reason=timeout" in body for body in bodies)
+    assert any("Refreshed head verification: base-changed" in body for body in bodies)

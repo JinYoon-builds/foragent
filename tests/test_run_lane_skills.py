@@ -342,7 +342,7 @@ def test_resumed_injected_skill_becomes_target_owned(run_case, monkeypatch, sele
         return replace(execute(**kwargs), timed_out=True)
 
     monkeypatch.setattr(c.executor, "run", interrupt)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     assert c.store.get_run(1).local_skill_paths == [relative]
     official = "Official repository skill\n"
     c.history.update({path: official})

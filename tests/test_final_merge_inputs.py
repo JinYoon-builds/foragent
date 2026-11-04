@@ -145,7 +145,7 @@ def test_final_hold_reads_ci_exactly_once(queued_publish, monkeypatch):
     ("approval-removed", "hash-mismatch"),
     ("acceptance-head", "hash-mismatch"),
     ("acceptance-base", "hash-mismatch"),
-    ("runtime-budget", "timeout"),
+    ("runtime-budget", "too-large"),
     ("publication", "retries-exceeded"),
 ])
 def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monkeypatch, changed, outcome):
