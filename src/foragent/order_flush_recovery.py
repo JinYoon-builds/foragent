@@ -2,6 +2,7 @@
 
 from foragent import order_flush_journal as journal
 from foragent.i18n import text
+from foragent.main_write import push_base
 from foragent.order import PlanError
 from foragent.order_files import check_write
 from foragent.paths import repo_path
@@ -110,6 +111,6 @@ def push(config, git, store, batch, sha, *, recovering):
             _install(git, config, sha, rebuilt)
             journal.append(store, "rebased", batch["batch"], old=sha, sha=rebuilt)
             sha = rebuilt
-    git.push_base(config.base_branch)
+    push_base(git, config)
     journal.append(store, "pushed", batch["batch"], sha=sha)
     return sha

@@ -166,9 +166,9 @@ def dream_due(store: StateStore, config: Config, tracker, now: datetime) -> list
             continue
         # By its finish, not by its merges: a dream before an order ended leaves that order's turn.
         covered = last_dream_at(store, lane)
-        owner_facts = store.owner_merge_facts() if getattr(config, "merge_owner", False) else {}
+        owner_facts = store.owner_merge_facts()
         merged = {run.number for run, _ in _runs_since(store, lane, None)
-                  if (store.run_merged(run, owner_facts=owner_facts) if getattr(config, "merge_owner", False) else run.outcome == "merged")}
+                  if store.run_merged(run, owner_facts=owner_facts)}
         if any(children & merged and (covered is None or finished > covered) for children, finished in orders):
             due.append(lane)
     return due
