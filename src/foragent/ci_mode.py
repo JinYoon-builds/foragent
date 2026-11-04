@@ -85,7 +85,8 @@ class ComparisonEvidence:
     status: str
     infrastructure: str
     reports: str | None = None
-    # A local fallback pins the CI reports it saw; new reports must be compared again.
+    # A local fallback pins what it fell back from (reports it saw, or why it read none);
+    # None is a fallback of unknown origin (an older record) and is never current.
     fallback_reports: str | None = None
     # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
     accepted_sha: str | None = None
@@ -120,7 +121,7 @@ class ComparisonEvidence:
                 if not getattr(logs, "not_started", False) or str(logs) != self.infrastructure:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
-                return self._fallback_refused(ctx, head)  # Local evidence is pinned to base/head and scope.
+                return self._fallback_refused(ctx, git, head)  # Local evidence is pinned to base/head and scope.
             reports = ctx.tracker.pr_acceptance_reports(head)
             if self.reports == serialize_reports(reports):
                 return None
@@ -133,10 +134,20 @@ class ComparisonEvidence:
                 raise
             return _refusal(exc), str(exc)
 
-    def _fallback_refused(self, ctx, head):
-        """CI reports that changed after a local fallback replace it; only a failed read adds nothing."""
+    def _fallback_refused(self, ctx, git, head):
+        """A local fallback stays current only while what it fell back from still holds."""
         if self.fallback_reports is None:
-            return None  # A changed acceptance workflow makes every artifact untrusted.
+            return "unpinned-fallback", "a local fallback that names no reason must be measured again"
+        if self.fallback_reports == UNTRUSTED:
+            return None  # The head's acceptance workflow differs from the pinned default branch.
+        if self.fallback_reports == UNCHECKED:
+            try:
+                changed = changed_workflows(git, self.trusted_sha, head)
+            except GitError:
+                return None  # The workflow check still cannot run: artifacts stay unproven.
+            if changed:
+                return None
+            return "workflow-checked", "the acceptance workflow now matches; compare the CI reports"
         try:
             reports = ctx.tracker.pr_acceptance_reports(head)
         except TrackerError as exc:
@@ -149,6 +160,8 @@ class ComparisonEvidence:
 
 
 UNSERIALIZABLE = "<unserializable acceptance reports>"  # never equal to a JSON serialization
+UNTRUSTED = "<acceptance workflow changed>"  # artifacts were not read: the head's workflow differs
+UNCHECKED = "<acceptance workflow check failed>"  # artifacts were not read: the check itself failed
 
 
 def _pinned(reports):
@@ -416,17 +429,16 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         try:
             ci_local.fallback_comparison(attempt, base_sha)
             _note_evidence(ctx, n, base_sha, head)
-            return evidence
+            return replace(evidence, fallback_reports=UNTRUSTED)
         except ci_local.LocalComparisonUnavailable as exc:
             flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Local acceptance comparison unavailable", str(exc))
             raise ExecutorStopped("held", str(exc)) from exc
-    reports = attempted = None  # A fallback pins only reports it actually tried to read.
+    reports = None
     try:
         if workflow_error:
             raise UnusableComparison(workflow_error)
         # Measurement and artifact registration share ordinary CI's deadline.
         while True:
-            attempted = True
             reports = ctx.tracker.pr_acceptance_reports(head)
             try:
                 lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
@@ -469,8 +481,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             try:
                 ci_local.fallback_comparison(attempt, base_sha)
                 _note_evidence(ctx, n, base_sha, head)
-                # Untrusted inputs (no artifact read) stay guarded by the trusted-branch recheck.
-                return _fallback_evidence(evidence, reports) if attempted else evidence
+                # A failed workflow check read no artifact; the locked read repeats the check.
+                return (replace(evidence, fallback_reports=UNCHECKED) if workflow_error
+                        else _fallback_evidence(evidence, reports))
             except ci_local.LocalComparisonUnavailable as fallback:
                 detail += f"\n{fallback}"
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "Acceptance comparison unavailable", detail)
