@@ -12,6 +12,8 @@ Foragent built itself: 397 merged PRs in 15 days (counted from `git log` on 2026
 
 [한국어 README](#한국어)
 
+Contributors: read [docs/mechanisms.md](docs/mechanisms.md) first. It maps what each mechanism does to its code, issues and decisions, starting with the current merge path.
+
 ## Install
 
 Before you install, have these ready:
@@ -161,6 +163,8 @@ Codex CLI는 선택이에요. Codex CLI에 로그인되어 있으면 gate가 Cod
 - **업데이트 확인은 늘 원래 저장소를 봐요.** 포크도 `JinYoon-builds/foragent`에서 업데이트를 확인하고 설치해요. `src/foragent/update_check.py`에서 시작해요.
 
 ### 문서
+
+기여할 때는 [docs/mechanisms.md](docs/mechanisms.md)를 먼저 읽어요. 병합 경로부터 각 장치의 역할, 코드, 이슈와 결정을 찾을 수 있어요.
 
 - [docs/rules.md](docs/rules.md) — 지금 지키는 규칙
 - [docs/decisions.md](docs/decisions.md) — 확정된 결정과 이유 (지난 기록)

@@ -945,3 +945,10 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 - 결정: Anthropic code-review 플러그인 절차(Apache 2.0)를 거의 그대로 들인다. 모든 라운드의 FAIL 지적마다 새 채점 세션 하나가 0–100 점수와 근거(Goal·Out of scope 인용 줄, 잠긴 인수 시험, 실제로 깨지는 입력)를 낸다. 근거가 있고 80점 이상이면 막고, 근거 있는 치명 경로는 경로가 있으면 점수와 상관없이 막는다. 나머지는 점수와 함께 NOTE로 남긴다. Goal이 정하지 않은 점은 재작업이 아니라 spec-question으로 기획에 묻는다. 패널은 지금처럼 위험 메모가 있는 첫 라운드에서만 돌고 기본 관점은 플러그인 다섯 개와 fatal-path다. `review_scoring: false`로 끈다.
 - 근거: 2026-11-02 최근 FAIL 30건 중 실제 결함 11건, 취향·Goal 밖 요구 9건, Goal·잠긴 시험 결함 9건; 22건이 2라운드 이후.
+
+## 2026-11-04
+
+### D109. 이 저장소의 merge owner를 켠다 (2026-11-04, Jin)
+
+- 결정: PM이 이 저장소의 `.foragent.yml`에서 `merge_owner: true`를 켜고 결과를 측정해요. 구현 작업자는 검증한 PR을 넘기고, 별도 merge owner가 최신 기준선 반영과 마지막 확인, 병합을 맡아요.
+- 근거: #1797이 기본값이 꺼진 merge owner를 넣었고, #1502의 전환·측정에 따라 2026-11-04에 이 저장소에서 켰어요. 설정의 날짜와 근거 이슈를 기록해 두고, 측정 결과는 실제 기록으로 확인해요.
