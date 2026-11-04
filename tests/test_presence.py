@@ -434,6 +434,51 @@ def test_a_lone_surrogate_in_one_field_replaces_only_that_character(stall_store,
         assert "bad?.json" in error
 
 
+def test_new_orchestrator_requests_are_unique_and_ordered_even_without_times():
+    from foragent import presence
+
+    def row(identifier, at, source="orchestrator", status="new"):
+        return {"id": identifier, "created_at": at, "from": source, "status": status}
+
+    early = "2026-11-04T01:00:00+00:00"
+    late = "2026-11-04T02:00:00+00:00"
+    rows = [row("bad", "broken"), row("late", late), row("early", early),
+            row("tie", early), row("early", early), row("naive", "2026-11-04T00:00:00"),
+            row("missing", None)]
+    rows += [row(source, early, source=source) for source in ("gate", "architect", "runner", "planning")]
+    rows += [row(status, early, status=status) for status in ("processing", "done")]
+    selected = presence.new_requests(rows)
+    assert [item[0]["id"] for item in selected] == ["early", "tie", "late", "bad", "naive", "missing"]
+    assert [item[1].isoformat() if item[1] else None for item in selected] == [
+        early, early, late, None, None, None]
+
+
+def test_prompt_context_keeps_new_requests_without_times_and_isolates_render_failures(stall_store, monkeypatch):
+    import json
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    bad_time = orch_inbox.add_request(store, "orchestrator", "No readable time")
+    path = store.root / "inbox/requests" / f"{bad_time['id']}.json"
+    record = json.loads(path.read_text())
+    record["created_at"] = "broken"
+    path.write_text(json.dumps(record))
+    broken = orch_inbox.add_request(store, "orchestrator", "Unrenderable")
+    real = presence._quote
+
+    def fragile(value):
+        if value == "Unrenderable":
+            raise RuntimeError("cannot render")
+        return real(value)
+
+    monkeypatch.setattr(presence, "_quote", fragile)
+    context, problems = presence.prompt_context(root, now)
+    assert context.count(f'- "{bad_time["id"]}" from "orchestrator", new: "No readable time"') == 1
+    assert '"opaque"' in context and "Visible question" in context
+    assert problems == [f'request "{broken["id"]}": could not be shown (RuntimeError)']
+
+
 def test_a_row_that_cannot_be_rendered_is_left_out_alone_and_named(stall_store, monkeypatch):
     from foragent import orch_inbox, presence
 
@@ -889,10 +934,23 @@ def test_a_failed_title_only_drops_the_title(titled, monkeypatch, capsys):
     def broken(cwd, agent_type):
         raise RuntimeError("no title")
 
+    titled_result = _session_start_output(root, None)
+    assert titled_result["hookSpecificOutput"]["sessionTitle"] == "PM · reports"
     monkeypatch.setattr(presence, "session_title", broken)
     result = _session_start_output(root, None)
-    assert set(result) == {"systemMessage"}
+    assert result["systemMessage"] == titled_result["systemMessage"]
+    assert result["hookSpecificOutput"] == {
+        key: value for key, value in titled_result["hookSpecificOutput"].items() if key != "sessionTitle"}
+    assert result["hookSpecificOutput"]["additionalContext"]
     assert capsys.readouterr().err == ""
+
+
+def test_session_start_puts_the_title_beside_the_planning_context(titled):
+    result = _session_start_output(titled[0], None)
+    specific = result["hookSpecificOutput"]
+    assert specific["hookEventName"] == "SessionStart"
+    assert specific["sessionTitle"] == "PM · reports"
+    assert specific["additionalContext"]
 
 
 @pytest.mark.parametrize(("lanes", "roles", "agent_type", "expected"), [
@@ -917,3 +975,26 @@ def test_session_title_reads_agents_from_the_lane_and_role_settings(titled, monk
     (root / ".foragent.yml").write_text(yaml.safe_dump(settings), encoding="utf-8")
     monkeypatch.setenv("FORAGENT_ROLE", "launched")
     assert presence.session_title(root, agent_type) == expected
+
+
+@pytest.mark.parametrize("columns", [None, "", "unknown", "0", "-10", "60", "83", "84", "120"])
+def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(project, monkeypatch, columns):
+    from datetime import UTC, datetime
+
+    from foragent import presence, watch_art
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(presence, "_started_at", lambda path: now)
+    if columns is None:
+        monkeypatch.delenv("COLUMNS", raising=False)
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    output = presence.squirrel(project, "greeting", now)
+    rows = output.splitlines()
+    assert len(rows) == 8
+    widths = [len(re.sub(r"\x1b\[[0-9;]*m", "", row)) for row in rows]
+    if columns in ("84", "120"):
+        assert max(widths) == 84
+    else:
+        assert rows == watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE)
+        assert max(widths) == 18

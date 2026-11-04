@@ -21,3 +21,6 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Publish moves main, stale heads](publish-moves-main-stale-heads.md) — many publishes mid-wave → CI "lost tests" on PASS runs; batch publishes, park not retry
 - [Keep approved supply](keep-approved-supply.md) — Jin 11-04: approved ready ≥ 2x run slots; refill from priority list without waiting for PM
 - [Only /fa for people](only-fa-for-people.md) — Jin 11-04: people learn /fa only; PM opens dashboard/issue view; help & README lead with /fa
+- [Unpark needs re-approval](unpark-and-reapprove.md) — park removes approved; unpark+retry leaves issues "ready" but never started; re-approve by edit
+- [CI timeout loop, parser defect (11-04)](ci-timeout-loop-and-review-parser.md) — green CI held = runner saturation; resolve loops; issue ≠ its PR
+- [No main writes during a train](no-main-writes-during-train.md) — check batch-merge refs before publish/memory push; wait until empty

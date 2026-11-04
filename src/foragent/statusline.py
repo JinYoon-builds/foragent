@@ -285,11 +285,11 @@ def _pm_moved_notice(payload: dict) -> str | None:
 
 
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for the SessionStart hook: one JSON object with the summary line, or nothing.
+    """Entry point for SessionStart: one JSON object with the summary and PM context, or nothing.
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
-    Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
-    Beside the line, hookSpecificOutput.sessionTitle names the session's role and the project.
+    Claude. The summary follows presence.session_start; PM context is independent.
+    hookSpecificOutput.sessionTitle names the session's role and the project (presence.session_start too).
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -317,13 +317,24 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
                                                  datetime.now(UTC))
     except Exception:  # A failed summary must never disturb the session that is starting.
         message = None
+    output: dict[str, Any] = {"systemMessage": message} if message else {}
+    specific: dict[str, Any] = {}
+    try:
+        project = presence._project(folder)
+        if project is not None and presence._planning_session(folder, project[1]):
+            from foragent.commands import _pm_table
+
+            specific["additionalContext"] = _pm_table.render()
+    except Exception:  # Optional context must never disturb the session that is starting.
+        pass
     try:
         title = presence.session_title(folder, payload.get("agent_type"))
     except Exception:  # A failed title only drops the title.
         title = None
-    output: dict[str, Any] = {"systemMessage": message} if message else {}
     if title:
-        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "sessionTitle": title}
+        specific["sessionTitle"] = title
+    if specific:
+        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", **specific}
     if output:
         stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()

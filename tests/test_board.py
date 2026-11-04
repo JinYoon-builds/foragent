@@ -597,3 +597,121 @@ def test_waiting_refresh_uses_issue_body_to_repair_a_manual_board_edit(recording
     assert ctx.tracker.board_value(1, project.id, "Waiting") == WAITING
     board.refresh_cards(ctx)
     assert waiting_value(remote, project.id) == WAITING
+
+
+_SCOPE_MESSAGE = "field requires one of the following scopes: ['project'], but token has ['repo']"
+
+
+@pytest.mark.parametrize(('message', 'stdout', 'expected'), [
+    (_SCOPE_MESSAGE, '', {'project'}),
+    ('gh failed', json.dumps({'errors': [{'type': 'INSUFFICIENT_SCOPES',
+                                        'message': _SCOPE_MESSAGE}]}), {'project'}),
+    ('gh failed', json.dumps({'errors': [{'type': 'OTHER', 'message': _SCOPE_MESSAGE}]}), set()),
+    ('HTTP 502', '', set()),
+    ('API rate limit exceeded', '', set()),
+    ('INSUFFICIENT_SCOPES', '', set()),
+    ('gh failed', 'not JSON', set()),
+    ("requires one of the following scopes: ['read:project']", '', {'read:project'}),
+])
+def test_missing_scopes_reads_gh_facts(message, stdout, expected):
+    assert TrackerError(message, stdout=stdout).missing_scopes == expected
+
+
+@pytest.mark.parametrize('scope', ['project', 'read:project'])
+def test_scope_error_survives_successful_graphql_transport(scope):
+    tracker = GhTracker('owner/repo', lambda *args, **kwargs: json.dumps({
+        'errors': [{'type': 'INSUFFICIENT_SCOPES', 'message': _SCOPE_MESSAGE.replace("'project'", repr(scope))}],
+    }))
+    with pytest.raises(TrackerError) as caught:
+        tracker.graphql('query {}', {})
+    assert caught.value.missing_scopes == {scope}
+
+
+@pytest.mark.parametrize('path', ['sync', 'refresh', 'waiting'])
+@pytest.mark.parametrize('scope', ['project', 'read:project'])
+@pytest.mark.parametrize('diagnostic', ['stderr', 'stdout'])
+def test_board_scope_notice_once_across_contexts(recording_board, monkeypatch, path, scope, diagnostic):
+    from foragent import notify
+
+    ctx, remote, clock = recording_board
+    sent = []
+
+    def deliver(config, title, line, **kwargs):
+        sent.append((config.repo, title, line, kwargs))
+
+    message = _SCOPE_MESSAGE.replace("'project'", repr(scope))
+    error = (TrackerError(message) if diagnostic == 'stderr' else TrackerError(
+        'gh failed', stdout=json.dumps({'errors': [{'type': 'INSUFFICIENT_SCOPES', 'message': message}]})))
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(notify, 'deliver', deliver)
+    if path == 'waiting':
+        board.add_issue(ctx.tracker, ctx.repo, ctx.config.board, 1)
+        record_wait(ctx, remote, '## Waiting\n' + WAITING)
+        graphql = ctx.tracker.graphql
+
+        def fail_waiting(query, variables):
+            if 'ForagentSetBoardValue' in query:
+                raise error
+            return graphql(query, variables)
+
+        monkeypatch.setattr(ctx.tracker, 'graphql', fail_waiting)
+    else:
+        monkeypatch.setattr(ctx.tracker, 'graphql', fail)
+    for _ in range(3):
+        fresh = SimpleNamespace(**vars(ctx))
+        if path == 'sync':
+            board.sync_status(fresh, 1, 'Running')
+        else:
+            board.refresh_cards(fresh)
+    assert len(sent) == 1
+    repo, title, line, options = sent[0]
+    assert repo == ctx.repo and options == {'kind': 'status'}
+    assert 'gh auth refresh -h github.com -s project' in line
+    assert '\n' not in title + line
+    assert json.loads((StateStore.for_repo(ctx.repo).root / 'board-scope-notice.json').read_text())['at']
+
+
+@pytest.mark.parametrize('failure', ['delivery', 'marker'])
+def test_scope_notice_failure_does_not_stop_work_or_acknowledge(recording_board, monkeypatch, failure):
+    from pathlib import Path
+    from foragent import notify
+
+    ctx, remote, clock = recording_board
+    calls = []
+
+    def deliver(*args, **kwargs):
+        calls.append(1)
+        return 'offline' if failure == 'delivery' else None
+
+    original = Path.write_text
+
+    def write(path, *args, **kwargs):
+        if path.name == 'board-scope-notice.json':
+            raise OSError('disk unavailable')
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(notify, 'deliver', deliver)
+    if failure == 'marker':
+        monkeypatch.setattr(Path, 'write_text', write)
+    for _ in range(2):
+        board._report_failure(ctx, TrackerError(_SCOPE_MESSAGE))
+    assert calls == [1, 1]
+    assert not (StateStore.for_repo(ctx.repo).root / 'board-scope-notice.json').exists()
+
+
+def test_other_board_errors_never_notify(recording_board, monkeypatch):
+    from foragent import notify
+
+    ctx, remote, clock = recording_board
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('Unrelated errors must not send a scope notice')
+
+    monkeypatch.setattr(notify, 'deliver', unexpected)
+    for error in (TrackerError('HTTP 502'), TrackerError('API rate limit exceeded'), ValueError('project'),
+                  TrackerError("field requires one of the following scopes: ['read:org']"),
+                  TrackerError("field requires one of the following scopes: ['repo'], but token has ['project']")):
+        board._report_failure(ctx, error)

@@ -128,6 +128,7 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
@@ -169,6 +170,25 @@ class TrackerError(RuntimeError):
             r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
             diagnostic, re.I,
         ))
+
+    @property
+    def missing_scopes(self) -> frozenset[str]:
+        """Scope names required by gh's diagnostics, never inferred from an HTTP code."""
+        diagnostics = [str(self)]
+        try:
+            payload = json.loads(self.stdout)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            diagnostics.extend(
+                error.get("message", "") for error in payload.get("errors", [])
+                if isinstance(error, dict) and error.get("type") == "INSUFFICIENT_SCOPES"
+            )
+        scopes = set()
+        for diagnostic in diagnostics:
+            for required in re.findall(r"requires one of the following scopes: \[([^\]]*)\]", diagnostic):
+                scopes.update(re.findall(r"['\"]([^'\"]+)['\"]", required))
+        return frozenset(scopes)
 
     @property
     def is_not_found(self) -> bool:
@@ -772,6 +792,7 @@ class FakeTracker:
         self.created_prs: list[PullRequest] = []
         self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
+        self.cancelled_workflow_runs: list[tuple[str, str]] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
@@ -983,6 +1004,9 @@ class FakeTracker:
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
+        self.cancelled_workflow_runs.append((head, branch))
+
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
 
@@ -1086,6 +1110,7 @@ class GhTracker:
         self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
+        self._checks_started: dict[int, datetime | None] = {}
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
         try:
@@ -1164,7 +1189,7 @@ class GhTracker:
             if not isinstance(result, dict):
                 raise TrackerError("invalid GraphQL response: expected an object")
             if result.get("errors"):
-                raise TrackerError(f"GraphQL errors: {result['errors']}")
+                raise TrackerError(f"GraphQL errors: {result['errors']}", stdout=output)
             if not isinstance(result.get("data"), dict):
                 raise TrackerError("invalid GraphQL response: missing data")
             return result
@@ -1464,9 +1489,14 @@ class GhTracker:
         ]))
         return next((item["number"] for item in data), None)
 
+    def pr_checks_started(self, pr: int) -> datetime | None:
+        """Earliest actual start in the last checks listing; never makes a GitHub call."""
+        return self._checks_started.get(pr)
+
     def pr_checks(self, pr: int) -> CheckStatus:
+        self._checks_started[pr] = None
         try:
-            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link"])
+            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
@@ -1475,11 +1505,18 @@ class GhTracker:
             try:
                 if exc.returncode not in {1, 8} or not exc.stdout.strip():
                     raise ValueError("not a checks exit")
-                buckets = {item["bucket"] for item in _items(exc.stdout)}
+                items = _items(exc.stdout)
+                buckets = {item["bucket"] for item in items}
             except (TrackerError, ValueError, TypeError, KeyError):
                 raise exc from exc.__cause__
         else:
-            buckets = {item["bucket"] for item in _items(output)}
+            items = _items(output)
+            buckets = {item["bucket"] for item in items}
+        starts = [when for item in items
+                  if item.get("state") != "QUEUED"
+                  and (when := _parse_time(item.get("startedAt"))) is not None
+                  and when.year > 1]
+        self._checks_started[pr] = min(starts, default=None)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1496,6 +1533,19 @@ class GhTracker:
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
+
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
+        """Cancel unfinished runs belonging to this repository's exact ref and head."""
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        for run in runs:
+            if (run["head_sha"] == head and run["head_branch"] == branch
+                    and run["repository"]["full_name"] == self.repo
+                    and run["head_repository"]["full_name"] == self.repo
+                    and run["status"] != "completed"):
+                self._call(["api", "-X", "POST", f"{self._path}/actions/runs/{run['id']}/cancel"])
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
