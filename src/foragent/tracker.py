@@ -128,6 +128,7 @@ class Tracker(Protocol):
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
@@ -791,6 +792,7 @@ class FakeTracker:
         self.created_prs: list[PullRequest] = []
         self.merged_prs: list[int] = []
         self.deleted_branches: list[str] = []
+        self.cancelled_workflow_runs: list[tuple[str, str]] = []
         self._events: dict[int, list[LabelEvent]] = {}
         self._body_edits: dict[int, str] = {}
         self._dependencies: dict[int, list[Dependency]] = {}
@@ -1001,6 +1003,9 @@ class FakeTracker:
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
+
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
+        self.cancelled_workflow_runs.append((head, branch))
 
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
@@ -1528,6 +1533,19 @@ class GhTracker:
             "api", "--paginate", "--jq", ".workflow_runs",
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
+
+    def cancel_workflow_runs(self, head: str, *, branch: str) -> None:
+        """Cancel unfinished runs belonging to this repository's exact ref and head."""
+        runs = _items(self._call([
+            "api", "--paginate", "--jq", ".workflow_runs",
+            f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+        ]))
+        for run in runs:
+            if (run["head_sha"] == head and run["head_branch"] == branch
+                    and run["repository"]["full_name"] == self.repo
+                    and run["head_repository"]["full_name"] == self.repo
+                    and run["status"] != "completed"):
+                self._call(["api", "-X", "POST", f"{self._path}/actions/runs/{run['id']}/cancel"])
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
