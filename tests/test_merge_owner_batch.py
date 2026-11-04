@@ -231,6 +231,9 @@ def test_green_tip_lands_members_whose_own_ci_is_pending(batched):
 
 def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(batched, monkeypatch):
     case = batched
+    # Worker worktrees share this repository's objects and local Git identity.
+    git_command(case.root, "config", "--local", "user.name", "Offline Tests")
+    git_command(case.root, "config", "--local", "user.email", "tests@example.com")
     queue_workers(case, [1])
     ancestor = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
     model = case.ctx.executor_factory("claude")
