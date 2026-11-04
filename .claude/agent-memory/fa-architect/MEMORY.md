@@ -108,4 +108,4 @@ writes this file.
 - lane_concentration re-fire: diff runs.jsonl since the last answer by outcome first (rows key on `number`, `finished_at`); +1 is often a success or a known push-500 restart (r622, r628, r647).
 - Stuck merge-owner: often one long tick (inline 28-min baseline, 11-04); check the merge_owner pid age + pytest child. [detail](lessons_detail.md)
 
-- idle_lanes in lane_concentration: list each idle lane's open approved issues with open PRs; roles idle on 11-04 = 5 PASSed PRs waiting at merge, not scope (r644).
+- idle_lanes in lane_concentration: list each idle lane's open approved issues with open PRs; roles idle on 11-04 = 5 PASSed PRs waiting at merge, not scope (r644).- idle_lanes_with_backlog seconds after a mass `kind=retry` burst is the orchestrator's hand retry. Replay holds by patching `overlap_files.admits` (local import in orch_facts_resources), then look for the merge stall that caused the retries: `merge_owner_batch.prepare` returning False ends the owner tick before the single path (r662, 11-04).
