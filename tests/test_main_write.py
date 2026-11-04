@@ -114,6 +114,20 @@ def test_publication_owner_off_does_not_read_train_refs_or_wait(monkeypatch):
     main_write.wait_for_merge_train(SimpleNamespace(), Config())
 
 
+def test_publication_wait_progress_is_written_to_stderr(monkeypatch, capsys):
+    polls, sleeps = iter([True, False]), []
+    monkeypatch.setattr(main_write, "train_in_flight", lambda git: next(polls))
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
+
+    main_write.wait_for_merge_train(SimpleNamespace(), Config(merge_owner=True))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "waiting for merge train (0 min)\n"
+    assert sleeps == [30]
+
+
 def test_publication_wait_bounds_the_final_poll(monkeypatch):
     elapsed, sleeps = [0], []
     monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])

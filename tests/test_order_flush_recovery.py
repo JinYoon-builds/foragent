@@ -140,7 +140,8 @@ def test_flush_train_timeout_preserves_files_index_head_and_journal(waiting, git
     intact(case)
 
 
-def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, git_history, monkeypatch):
+@pytest.mark.parametrize("unpushed", [False, True], ids=["published-head", "unpushed-commit"])
+def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, git_history, monkeypatch, unpushed):
     root, config, tracker, git, store = waiting
 
     def stop(*_args):
@@ -151,7 +152,15 @@ def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, g
         with pytest.raises(Interrupted):
             flush(waiting)
     case = root, replace(config, merge_owner=True), tracker, git, store
-    base, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    base = git.head_sha()
+    memory = ".claude/agent-memory/fa-docs/MEMORY.md"
+    if unpushed:
+        path = root / memory
+        path.parent.mkdir(parents=True)
+        path.write_text("Retained local lesson.\n")
+        git.ensure_tracked([memory])
+        git.commit_paths([memory], "Retained role memory")
+    local, index = git.head_sha(), git_command(root, "ls-files", "--stage")
     partial = (root / "docs/decisions.md").read_bytes()
     records = journal.entries(store)
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
@@ -160,7 +169,7 @@ def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, g
     def finish_train(seconds):
         assert seconds == 30
         assert_train_can_publish(git)
-        assert git.head_sha() == base
+        assert git.head_sha() == local
         assert git_command(root, "ls-files", "--stage") == index
         assert (root / "docs/decisions.md").read_bytes() == partial
         assert journal.entries(store) == records
@@ -171,6 +180,9 @@ def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, g
     assert flush(case)["status"] == "published"
     assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
     assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
+    if unpushed:
+        assert (root / memory).read_text() == "Retained local lesson.\n"
+        assert git_command(git_history.origin, "show", f"main:{memory}") == "Retained local lesson."
     assert len([row for row in journal.entries(store) if row["kind"] == "selected"]) == 1
     intact(case)
 

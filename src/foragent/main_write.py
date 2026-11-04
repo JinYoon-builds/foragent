@@ -4,6 +4,7 @@ Publication waits leave the shared main-write lock available to the owner.
 The owner can still create a train between the ref lookup and the push.
 """
 
+import sys
 import time
 
 from foragent.git import GitError
@@ -29,7 +30,7 @@ def wait_for_merge_train(git, config):
         if elapsed >= 40 * 60:
             raise GitError("timed out after 40 minutes waiting for merge train; "
                            "no publication commit created; retry publication")
-        print(f"waiting for merge train ({int(elapsed // 60)} min)", flush=True)
+        print(f"waiting for merge train ({int(elapsed // 60)} min)", file=sys.stderr, flush=True)
         time.sleep(min(30, 40 * 60 - elapsed))
 
 

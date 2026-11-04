@@ -149,7 +149,8 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         if sha is None:
             rows, notes = _members(store, batch)
             collected = None
-            if config.merge_owner:
+            # committed() fetched the remote; retained local commits need push()'s rebuild.
+            if config.merge_owner and git.is_ancestor("HEAD", f"origin/{config.base_branch}"):
                 collected, base = _collect(rows, root, config, git)
                 order_collect.land(git, config.base_branch, base)
             prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git, collected)
