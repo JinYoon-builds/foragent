@@ -19,14 +19,19 @@ policy and evidence again. It merges only the checked head. Failed checks return
 repair; a lost response is reconciled against the PR before another action.
 
 This repository has `merge_owner: true` in `.foragent.yml` (switched on 2026-11-04).
-The product default remains off. The owner's current advancement handles one PR at a time;
-the worker-side merge-group path still exists for configurations with the owner off.
+The product default remains off. This repository also enables `merge_batch`: the owner builds
+a combined candidate for eligible PRs, checks its tip with CI and each member's completion
+commands, then repeats the final checks and updates the target once if its base is unchanged. PRs that
+change CI workflows take the single-PR path. The worker-side merge-group path still exists
+for configurations with the owner off.
 
 Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_flow.py`),
 [reviewed PR handoff](../src/foragent/run_publish_reviewed.py) (`src/foragent/run_publish_reviewed.py`),
 [owner](../src/foragent/merge_owner.py) (`src/foragent/merge_owner.py`),
+[combined candidate](../src/foragent/merge_owner_batch.py) (`src/foragent/merge_owner_batch.py`),
 [final reads](../src/foragent/run_publish_merge.py) (`src/foragent/run_publish_merge.py`).
-Origins: #1797 (owner), #1502 (switch-on and measurement); D118 and D95 in [decisions](decisions.md).
+Origins: #1797 (owner), #1502 (switch-on and measurement), #1970 (one tip CI),
+#1989 (workflow changes take the single path); D118 and D95 in [decisions](decisions.md).
 
 ## Verification: prove this change still works on its target
 

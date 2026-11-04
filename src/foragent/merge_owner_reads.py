@@ -55,7 +55,8 @@ class Snapshot:
 
     def __getattr__(self, name):
         call = getattr(self.tracker, name)
-        if name in {"close_pr", "merge_pr", "update_pr", "close_issue", "add_labels", "remove_labels"}:
+        if name in {"close_pr", "merge_pr", "update_pr", "close_issue", "add_labels", "remove_labels",
+                    "cancel_workflow_runs"}:
             def write(*args, **kwargs):
                 try:
                     return call(*args, **kwargs)
