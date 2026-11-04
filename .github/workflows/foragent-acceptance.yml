@@ -11,7 +11,8 @@ concurrency:
 jobs:
   acceptance:
     if: github.event.pull_request.head.repo.full_name == github.repository && (startsWith(github.event.pull_request.head.ref,
-      'foragent/issue-') || startsWith(github.event.pull_request.head.ref, 'foragent/group-'))
+      'foragent/issue-') || startsWith(github.event.pull_request.head.ref, 'foragent/group-')
+      || startsWith(github.event.pull_request.head.ref, 'foragent/batch-merge-'))
       && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
