@@ -842,6 +842,141 @@ def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_questio
     assert asked["question"] not in (presence.prompt_context(root, later(6))[0] or "")
 
 
+@pytest.fixture
+def titled(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    monkeypatch.delenv("FORAGENT_SESSION_ID", raising=False)
+    root = tmp_path / "project"
+    root.mkdir()
+    settings = {"repo": "offline/reports", "lanes": {"api": {}, "decision": {}}}
+    (root / ".foragent.yml").write_text(yaml.safe_dump(settings), encoding="utf-8")
+    return root, settings
+
+
+@pytest.mark.parametrize(("role", "agent_type", "expected"), [
+    (None, None, "PM · reports"),
+    ("orchestrator", None, "orchestrator · reports"),
+    ("orchestrator", "fa-orchestrator", "orchestrator · reports"),
+    ("launched", "fa-architect", "architect · reports"),
+    ("launched", "fa-docs", "docs · reports"),
+    ("launched", "fa-api", "lane api · reports"),
+    ("orchestrator", "fa-decision", "lane decision · reports"),
+    (None, "fa-api", "lane api · reports"),
+    ("launched", None, None),
+    ("launched", "fa-unknown", None),
+    ("launched", "api", None),
+    ("", None, None),
+])
+def test_session_title_names_the_role_from_the_agent_then_the_environment(titled, monkeypatch, role, agent_type,
+                                                                            expected):
+    from foragent import presence
+
+    root, _settings = titled
+    if role is not None:
+        monkeypatch.setenv("FORAGENT_ROLE", role)
+    assert presence.session_title(root, agent_type) == expected
+
+
+def test_session_title_is_none_outside_a_project_or_with_presence_off(titled, tmp_path):
+    from foragent import presence
+
+    root, settings = titled
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    assert presence.session_title(elsewhere, "fa-api") is None
+    settings["presence"] = {"session_start": False}
+    (root / ".foragent.yml").write_text(yaml.safe_dump(settings), encoding="utf-8")
+    assert presence.session_title(root, "fa-api") is None
+
+
+def test_session_title_without_a_repository_uses_the_project_folder_and_stays_one_line(titled, monkeypatch):
+    from foragent import presence
+
+    root, settings = titled
+    del settings["repo"]
+    (root / ".foragent.yml").write_text(yaml.safe_dump(settings), encoding="utf-8")
+    monkeypatch.setenv("FORAGENT_ROLE", "orchestrator")
+    assert presence.session_title(root, None) == "orchestrator · project"
+    monkeypatch.setattr(presence, "_repo", lambda config, root: "offline/re\nports\x1b")
+    assert presence.session_title(root, None) == "orchestrator · re ports"
+
+
+def _session_start_output(root, agent_type):
+    import json
+
+    payload = {"session_id": "title-session", "cwd": str(root)}
+    if agent_type:
+        payload["agent_type"] = agent_type
+    out = io.BytesIO()
+    assert statusline.session_start(io.BytesIO(json.dumps(payload).encode()), out) == 0
+    lines = out.getvalue().decode().splitlines()
+    assert len(lines) <= 1
+    return json.loads(lines[0]) if lines else None
+
+
+def test_session_start_hook_adds_the_title_beside_the_message(titled, monkeypatch):
+    from foragent import presence
+
+    root, _settings = titled
+    monkeypatch.setenv("FORAGENT_ROLE", "launched")
+    result = _session_start_output(root, "fa-api")
+    assert result["hookSpecificOutput"] == {"hookEventName": "SessionStart", "sessionTitle": "lane api · reports"}
+    assert result["systemMessage"] == presence.session_start_message(root, None, __import__("datetime").datetime.now())
+    assert "hookSpecificOutput" not in _session_start_output(root, "fa-review")
+
+
+def test_a_failed_title_only_drops_the_title(titled, monkeypatch, capsys):
+    from foragent import presence
+
+    root, _settings = titled
+
+    def broken(cwd, agent_type):
+        raise RuntimeError("no title")
+
+    titled_result = _session_start_output(root, None)
+    assert titled_result["hookSpecificOutput"]["sessionTitle"] == "PM · reports"
+    monkeypatch.setattr(presence, "session_title", broken)
+    result = _session_start_output(root, None)
+    assert result["systemMessage"] == titled_result["systemMessage"]
+    assert result["hookSpecificOutput"] == {
+        key: value for key, value in titled_result["hookSpecificOutput"].items() if key != "sessionTitle"}
+    assert result["hookSpecificOutput"]["additionalContext"]
+    assert capsys.readouterr().err == ""
+
+
+def test_session_start_puts_the_title_beside_the_planning_context(titled):
+    result = _session_start_output(titled[0], None)
+    specific = result["hookSpecificOutput"]
+    assert specific["hookEventName"] == "SessionStart"
+    assert specific["sessionTitle"] == "PM · reports"
+    assert specific["additionalContext"]
+
+
+@pytest.mark.parametrize(("lanes", "roles", "agent_type", "expected"), [
+    ({"api": {"agent": "fa-backend"}}, None, "fa-backend", "lane api · reports"),
+    ({"api": {"agent": "fa-backend"}}, None, "fa-api", None),
+    ({"api": {"agent": "Backend Agent"}}, None, "Backend Agent", None),
+    ({"api": {"agent": "Backend Agent"}}, None, "fa-api", None),
+    ({"api": {"agent": ""}}, None, "fa-api", "lane api · reports"),
+    ({}, {"architect": {"agent": "fa-design-lead"}}, "fa-design-lead", "architect · reports"),
+    ({}, {"architect": {"agent": "fa-design-lead"}}, "fa-architect", None),
+    ({}, {"security": {"agent": "fa-sec"}}, "fa-sec", "security · reports"),
+    ({}, {"security": {"agent": "fa-sec"}}, "fa-docs", None),
+])
+def test_session_title_reads_agents_from_the_lane_and_role_settings(titled, monkeypatch, lanes, roles, agent_type,
+                                                                    expected):
+    from foragent import presence
+
+    root, settings = titled
+    settings["lanes"] = lanes
+    if roles is not None:
+        settings["roles"] = roles
+    (root / ".foragent.yml").write_text(yaml.safe_dump(settings), encoding="utf-8")
+    monkeypatch.setenv("FORAGENT_ROLE", "launched")
+    assert presence.session_title(root, agent_type) == expected
+
+
 @pytest.mark.parametrize("columns", [None, "", "unknown", "0", "-10", "60", "83", "84", "120"])
 def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(project, monkeypatch, columns):
     from datetime import UTC, datetime
