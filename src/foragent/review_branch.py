@@ -51,31 +51,46 @@ def _cleanup(action: Callable[[], None]) -> Iterator[None]:
 
 
 @contextmanager
-def _no_repository_programs(source: GitRepo) -> Iterator[None]:
-    """Run every Git command of this review without programs the repository configures.
+def _isolated_git() -> Iterator[None]:
+    """Run every Git process of the review with no setting the caller brought along.
 
-    Hooks (post-checkout, reference-transaction), fsmonitor and attribute-driven filters can
-    write the person's files; the review must change nothing, so Git sees no hooks directory,
-    no fsmonitor and no attributes. The settings travel in the environment, so they reach the
-    panel's own Git calls too, and the previous environment returns afterwards.
+    Inherited ``GIT_*`` variables (``GIT_CONFIG_PARAMETERS``, ``GIT_CONFIG_COUNT``, ``GIT_DIR``...)
+    are removed and user and system config are off, so only a repository's own config applies.
+    The variables live in the process environment, so they reach the panel's and the reviewers'
+    Git calls too; the caller's environment returns afterwards.
     """
-    empty_tree = source._call(["hash-object", "-t", "tree", os.devnull]).strip()
-    count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
-    settings = {"core.hooksPath": os.devnull, "core.fsmonitor": "false", "core.attributesFile": os.devnull}
-    added = {"GIT_CONFIG_COUNT": str(count + len(settings)), "GIT_ATTR_SOURCE": empty_tree}
-    for index, (key, value) in enumerate(settings.items(), start=count):
-        added[f"GIT_CONFIG_KEY_{index}"] = key
-        added[f"GIT_CONFIG_VALUE_{index}"] = value
-    previous = {name: os.environ.get(name) for name in added}
-    os.environ.update(added)
+    saved = {name: value for name, value in os.environ.items() if name.startswith("GIT_")}
+    for name in saved:
+        del os.environ[name]
+    os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
     try:
         yield
     finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        for name in [name for name in os.environ if name.startswith("GIT_")]:
+            del os.environ[name]
+        os.environ.update(saved)
+
+
+def _scratch_checkout(source: GitRepo, head: str, temporary: Path) -> GitRepo:
+    """A new repository outside the caller's worktrees holding ``head``'s tree.
+
+    It borrows the caller's objects read-only through an alternates file and has no hooks, no
+    config and no info/attributes of its own, so no hook, filter driver or fsmonitor is defined
+    for any Git call in it. The caller's repository gets only read-only plumbing calls.
+    """
+    common = Path(source._call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip())
+    object_format = source._call(["rev-parse", "--show-object-format"]).strip()
+    templates = temporary / "templates"
+    templates.mkdir()
+    checkout = temporary / "checkout"
+    GitRepo(temporary)._call(["init", "-q", f"--template={templates}", f"--object-format={object_format}", str(checkout)])
+    (checkout / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (checkout / ".git" / "objects" / "info" / "alternates").write_text(f"{common / 'objects'}\n")
+    git = GitRepo(checkout)
+    git._call(["update-ref", "--no-deref", "HEAD", head])
+    git._call(["read-tree", head])
+    git._call(["checkout-index", "--all"])
+    return git
 
 
 def goal_for(root: Path, config, goal: str | None, issue: int | None) -> ParsedIssue:
@@ -114,10 +129,10 @@ def resolve_target(source: GitRepo, target: str) -> tuple[str, bool]:
 
 def review(target: str, base: str = "main", *, goal: str | None = None,
            issue: int | None = None) -> tuple[ReviewResult, str, bool]:
-    source = GitRepo(Path.cwd())
-    root = Path(source._call(["rev-parse", "--show-toplevel"]).strip())
-    source = GitRepo(root)
-    with _no_repository_programs(source):
+    with _isolated_git():
+        source = GitRepo(Path.cwd())
+        root = Path(source._call(["rev-parse", "--show-toplevel"]).strip())
+        source = GitRepo(root)
         head, worktree_target = resolve_target(source, target)
         base_sha = source._call(["rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}"]).strip()
         fork = source._call(["merge-base", head, base_sha]).strip()
@@ -126,17 +141,14 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
         directory = TemporaryDirectory(prefix="fa-review-")
         with _cleanup(directory.cleanup):
             temporary = Path(directory.name)
-            checkout = temporary / "worktree"
-            source._call(["worktree", "add", "--detach", str(checkout), head])
-            with _cleanup(lambda: source._call(["worktree", "remove", "--force", str(checkout)])):
-                git = GitRepo(checkout)
-                store = StateStore(temporary / "state")
-                store.start_run(0, branch=target, worktree=checkout)
-                ctx = LocalReviewContext(repo="", repo_root=checkout, tracker=NoPublication(), store=store,
-                                         config=config, git=git, now=lambda: datetime.now(UTC))
-                result = _panel_review(
-                    0, ctx, git, parsed, fork, resolved_reviewer(config), "",
-                    text("branch_review_scope", config.language), review_perspectives.shares(config), 1,
-                    workers=config.review_reviewers, journal=False,
-                )
+            git = _scratch_checkout(source, head, temporary)
+            store = StateStore(temporary / "state")
+            store.start_run(0, branch=target, worktree=git.root)
+            ctx = LocalReviewContext(repo="", repo_root=git.root, tracker=NoPublication(), store=store,
+                                     config=config, git=git, now=lambda: datetime.now(UTC))
+            result = _panel_review(
+                0, ctx, git, parsed, fork, resolved_reviewer(config), "",
+                text("branch_review_scope", config.language), review_perspectives.shares(config), 1,
+                workers=config.review_reviewers, journal=False,
+            )
     return result, config.language, worktree_target

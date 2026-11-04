@@ -8,7 +8,6 @@ import pytest
 from foragent import review_branch, run_review
 from foragent.commands import review as command
 from foragent.config import Config
-from foragent.git import GitError
 from foragent.run_review import ReviewResult
 from foragent.state import StateStore
 from foragent.tracker import GhTracker
@@ -84,11 +83,11 @@ def test_errors_are_not_pass_or_fail(monkeypatch, capsys, result, code):
     assert f"VERDICT: {result.verdict}" in out
 
 
-@pytest.mark.parametrize("failed_cleanup", ["worktree", "directory", "both"])
+@pytest.mark.parametrize("failed_cleanup", ["none", "directory"])
 def test_cleanup_failures_preserve_the_original_review_error(tmp_path, monkeypatch, failed_cleanup):
     original = ValueError("panel original error")
     real_temporary = review_branch.TemporaryDirectory
-    paths, removed = [], []
+    paths = []
 
     class Directory:
         def __init__(self, **kwargs):
@@ -98,7 +97,7 @@ def test_cleanup_failures_preserve_the_original_review_error(tmp_path, monkeypat
 
         def cleanup(self):
             self.inner.cleanup()
-            if failed_cleanup in {"directory", "both"}:
+            if failed_cleanup == "directory":
                 raise OSError("directory cleanup failed")
 
     class Git:
@@ -108,10 +107,6 @@ def test_cleanup_failures_preserve_the_original_review_error(tmp_path, monkeypat
         def _call(self, args):
             if args == ["rev-parse", "--show-toplevel"]:
                 return str(tmp_path)
-            if args[:2] == ["worktree", "remove"]:
-                removed.append(args[-1])
-                if failed_cleanup in {"worktree", "both"}:
-                    raise GitError("worktree cleanup failed")
             return "commit"
 
     def fail(*args, **kwargs):
@@ -125,12 +120,10 @@ def test_cleanup_failures_preserve_the_original_review_error(tmp_path, monkeypat
     with pytest.raises(ValueError) as caught:
         review_branch.review("feature")
     assert caught.value is original
-    assert len(removed) == 1
     assert len(paths) == 1
-    assert not Path(paths[0]).exists()
-    notes = " ".join(original.__notes__)
-    assert ("worktree cleanup failed" in notes) == (failed_cleanup in {"worktree", "both"})
-    assert ("directory cleanup failed" in notes) == (failed_cleanup in {"directory", "both"})
+    assert not Path(paths[0]).exists(), "the scratch checkout goes with its temporary directory"
+    notes = " ".join(getattr(original, "__notes__", ()))
+    assert ("directory cleanup failed" in notes) == (failed_cleanup == "directory")
 
 
 def test_a_cleanup_failure_after_success_is_still_an_error():
@@ -164,12 +157,12 @@ def test_cli_prints_original_error_and_cleanup_diagnostic(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("target_kind", ["branch", "worktree"])
-def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch, target_kind):
-    """Hooks, fsmonitor and filters configured in the person's repository never run during `fa review`."""
+def test_review_runs_no_program_any_caller_setup_configures(tmp_path, monkeypatch, target_kind):
+    """No hook, filter or fsmonitor from any config source the caller has runs during `fa review`."""
     import os
     import subprocess
 
-    repo, log = tmp_path / "repo", tmp_path / "repo" / "side-effects.log"
+    repo = tmp_path / "repo"
     git = lambda *args, cwd=repo: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
     repo.mkdir()
     git("init", "-q", "-b", "main")
@@ -186,7 +179,6 @@ def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch,
 
     (repo / ".gitattributes").write_text("*.txt filter=mark\n")
     (repo / "a.txt").write_text("base\n")
-    (repo / ".gitignore").write_text("side-effects.log\n")
     base = commit("refs/heads/main", "base")
     (repo / "a.txt").write_text("feature\n")
     commit("refs/heads/feature", "feature", base)
@@ -196,14 +188,60 @@ def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch,
     if target_kind == "worktree":
         target = str(tmp_path / "feature-tree")
         git("worktree", "add", "-q", target, "feature")
-    for hook in ("post-checkout", "reference-transaction", "pre-commit", "post-index-change"):
-        path = repo / ".git" / "hooks" / hook
-        path.write_text(f"#!/bin/sh\necho {hook} >> '{log}'\n")
-        path.chmod(0o755)
-    record = lambda what: f"sh -c 'echo {what} >> \"{log}\"; cat'"
-    git("config", "filter.mark.smudge", record("smudge"))
-    git("config", "filter.mark.clean", record("clean"))
-    git("config", "core.fsmonitor", f"{repo}/.git/hooks/post-checkout")
+    marks = tmp_path / "marks"  # each source writes its own marker file here
+    marks.mkdir()
+
+    def program(label, filter_command=False):
+        script = tmp_path / "programs" / label
+        script.parent.mkdir(exist_ok=True)
+        script.write_text(f"#!/bin/sh\ntouch '{marks}/{label}'\n" + ("cat\n" if filter_command else ""))
+        script.chmod(0o755)
+        return str(script)
+
+    def hooks(label):
+        directory = tmp_path / f"hooks-{label}"
+        directory.mkdir()
+        for hook in ("post-checkout", "reference-transaction", "post-index-change", "pre-commit"):
+            (directory / hook).write_text(f"#!/bin/sh\ntouch '{marks}/{label}-{hook}'\n")
+            (directory / hook).chmod(0o755)
+        return str(directory)
+
+    def driver(label):
+        return {f"filter.{label}.smudge": program(f"{label}-smudge", True),
+                f"filter.{label}.clean": program(f"{label}-clean", True), f"filter.{label}.required": "true"}
+
+    # 1. The repository's own config, hooks directory and tracked .gitattributes (filter=mark).
+    for hook in ("post-checkout", "reference-transaction", "post-index-change", "pre-commit"):
+        (repo / ".git" / "hooks" / hook).write_text(f"#!/bin/sh\ntouch '{marks}/repo-{hook}'\n")
+        (repo / ".git" / "hooks" / hook).chmod(0o755)
+    for key, value in {**driver("mark"), "core.fsmonitor": program("repo-fsmonitor")}.items():
+        git("config", key, value)
+    # 2. .git/info/attributes naming a filter the repository config defines.
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("* filter=info\n")
+    for key, value in driver("info").items():
+        git("config", key, value)
+    # 3. User (global) and system config files.
+    for scope, name in (("global", "GIT_CONFIG_GLOBAL"), ("system", "GIT_CONFIG_SYSTEM")):
+        settings = {"core.hooksPath": hooks(scope), "core.fsmonitor": program(f"{scope}-fsmonitor"),
+                    "core.attributesFile": str(tmp_path / f"{scope}-attributes"), **driver(scope)}
+        (tmp_path / f"{scope}-attributes").write_text(f"* filter={scope}\n")
+        lines = "".join(f"[{key.rsplit('.', 1)[0].replace('.', ' \"', 1) + ('\"' if key.count('.') > 1 else '')}]\n"
+                        f"\t{key.rsplit('.', 1)[1]} = {value}\n" for key, value in settings.items())
+        (tmp_path / f"{scope}.gitconfig").write_text(lines)
+        monkeypatch.setenv(name, str(tmp_path / f"{scope}.gitconfig"))
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    # 4. Inherited command-line style overrides: GIT_CONFIG_PARAMETERS and GIT_CONFIG_COUNT.
+    parameters = {"core.hooksPath": hooks("parameters"), "core.fsmonitor": program("parameters-fsmonitor"),
+                  **driver("mark")}
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", " ".join(f"'{key}={value}'" for key, value in parameters.items()))
+    counted = {"core.hooksPath": hooks("count"), "core.fsmonitor": program("count-fsmonitor")}
+    monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(counted)))
+    for index, (key, value) in enumerate(counted.items()):
+        monkeypatch.setenv(f"GIT_CONFIG_KEY_{index}", key)
+        monkeypatch.setenv(f"GIT_CONFIG_VALUE_{index}", value)
+    probe = subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=repo, capture_output=True, text=True)
+    assert probe.stdout.strip().endswith("hooks-parameters"), "the overrides are live for an ordinary Git call"
     before = dict(os.environ)
     seen = {}
 
@@ -212,6 +250,7 @@ def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch,
         checkout._call(["update-ref", "HEAD", checkout.head_sha()])
         (checkout.root / "a.txt").write_text("edited by a reviewer\n")
         checkout._call(["add", "-A"])
+        checkout._call(["status", "--porcelain"])
         checkout.restore_review_state(state)
         seen["file"] = (checkout.root / "a.txt").read_text()
         return ReviewResult("PASS", "")
@@ -222,5 +261,5 @@ def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch,
     result, _language, _worktree = review_branch.review(target)
     assert result.verdict == "PASS"
     assert seen["file"] == "feature\n", "the checkout holds the branch's blob, unfiltered"
-    assert not log.exists() or log.read_text() == "", f"repository programs ran: {log.read_text()!r}"
+    assert sorted(path.name for path in marks.iterdir()) == [], "caller-configured programs ran"
     assert dict(os.environ) == before
