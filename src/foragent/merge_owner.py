@@ -32,7 +32,8 @@ def start(ctx, report):
     """Reserve and transfer the owner lock; never wait for network, Git or checks."""
     if not getattr(ctx.config, "merge_owner", False):
         return
-    if not admissions(ctx.store) and not any((ctx.store.root / "merge-owner").glob("*.json")):
+    if (not getattr(ctx.config, "merge_batch", False) and not admissions(ctx.store)
+            and not any((ctx.store.root / "merge-owner").glob("*.json"))):
         return
     lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
     if lock is None:
@@ -276,7 +277,7 @@ def _reverify(ctx, place, job, git, head):
         ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"))
 
 
-def _advance(ctx, place, job, pr):
+def _advance(ctx, place, job, pr, comparison=None):
     n = place.n
     remote = pr.head_sha or ctx.tracker.pr_head_sha(pr.number)
     publishing = job["phase"] == "publishing"
@@ -341,17 +342,22 @@ def _advance(ctx, place, job, pr):
                     return False
                 job.update(phase="waiting", head=head)
                 _save(ctx, place, job)
-                return  # The changed head needs its own CI round on a later tick.
+                return  # The changed head reaches CI handling on a later tick.
             status = inputs.status
+            if comparison:
+                if comparison.current(n, ctx, git, pr.number, job["head"], base, status):
+                    status = "pass"
+                else:
+                    comparison = None
             if status == "pending":
                 return False
             if status == "fail":
                 logs = ctx.tracker.pr_failed_logs(pr.number)
                 run_publish._hold_if_not_started(n, ctx, pr.number, logs)
                 raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
-            comparison = None
             if ci_mode.enabled(ctx, pr.base):
-                comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job["comparison"] else None
+                comparison = comparison or (load_record(ci_mode.ComparisonEvidence, job["comparison"])
+                                            if job["comparison"] else None)
                 if comparison is None or not comparison.current(n, ctx, git, pr.number, job["head"], base, status):
                     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
                                               target_branch=pr.base, baseline=None, approval=approval,
@@ -368,7 +374,10 @@ def _advance(ctx, place, job, pr):
                 # Check issue closure here as well as when selecting the queue.
                 issue = ctx.tracker.get_issue(n)
                 closed = issue.state == "closed"
-                ready = (not closed and inputs.stop is None and inputs.base_sha == base
+                held = bool(issue.labels & {BLOCKED, NEEDS_HUMAN})
+                run = ctx.store.get_run(n)
+                superseded = run is None or run.started_at != place.started_at
+                ready = (not (closed or held or superseded) and inputs.stop is None and inputs.base_sha == base
                          and inputs.comparison_current and inputs.status in {"pass", "none"}
                          and run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
                                                         authorization=job.get("authorization")))
@@ -379,15 +388,15 @@ def _advance(ctx, place, job, pr):
                         current_title=pr.title, base=pr.base, body=lambda: pr.body,
                         note=lambda line: runner._append(ctx.store.log_path(n), line),
                     )
-                    job["phase"] = "merging"
+                    job.update(phase="merging", base=base)
                     _save(ctx, place, job)
                     ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
             if ready:
                 with ctx.reads.fresh():
                     _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
                 return True
-            elif closed:
-                _end(ctx, place, job, "closed")
+            elif closed or held or superseded:
+                _end(ctx, place, job, "superseded" if superseded else "closed" if closed else "held")
             elif inputs.stop:
                 inputs.stop()  # Flags/approval invalidation happen outside the lock.
                 _end(ctx, place, job, "held")
@@ -424,16 +433,13 @@ def _try_admission(ctx, place, job, step):
         return False
 
 
-def advance_members(ctx, members):
-    """List boundary for N>1: add combined evidence/preparation here, not workers.
-
-    Only N=1 is implemented. Each member still needs the same final locked read.
-    """
+def advance_members(ctx, members, comparison=None):
+    """Advance normal single admissions, including a discarded batch's members."""
     advanced = False
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
         with _track_checks(ctx, place, job):
-            advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr))
+            advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
     return advanced
 
 
@@ -499,7 +505,12 @@ def tick(ctx, report):
     if ctx.store.github_wait_until(ctx.now()):
         return
     with reads.fresh():
-        _tick(owner, report)
+        try:
+            _tick(owner, report)
+        except TrackerError as exc:
+            if not exc.waits:
+                raise
+            orch_github.pause(owner, exc)
 
 
 def _tick(owner, report):
@@ -523,12 +534,22 @@ def _tick(owner, report):
                 candidates[key] = (place, job, pr)
 
         _try_admission(owner, place, job, reconcile)
+    if ctx.store.github_wait_until(ctx.now()):
+        return
     # Reuse cross-lane priority + stable join order, including legacy holders
     # while old workers drain during migration.
     rows = queue._rows(ctx.store)
     waiting = {key: row for target in {row["target"] for row in entries.values()}
                for key, row in queue._waiting(rows, target).items()}
-    for key in queue._turn_order(waiting, orch_queue.get_global(ctx.store)):
+    turn_order = queue._turn_order(waiting, orch_queue.get_global(ctx.store))
+    batch = None
+    from foragent import merge_owner_batch
+
+    if getattr(ctx.config, "merge_batch", False):
+        batch = merge_owner_batch.prepare(ctx, report, [candidates[k] for k in turn_order if k in candidates])
+    else:
+        merge_owner_batch.retire(ctx, report)
+    for key in turn_order:
         if ctx.store.github_wait_until(ctx.now()):
             return
         run = ctx.store.get_run(key[0])
@@ -536,7 +557,14 @@ def _tick(owner, report):
                 if waiting[key].get("merge_owner") else queue._live(ctx.store, key))
         if live:
             if key in candidates:
-                if advance_members(owner, [candidates[key]]):
+                proof = batch if batch and key[0] == batch.chain[batch.index][0] else None
+                advanced = advance_members(owner, [candidates[key]], proof)
+                if ctx.store.github_wait_until(ctx.now()):
+                    return
+                if proof:
+                    proof.finish(ctx, report, candidates[key][1])
+                    batch = None
+                if advanced:
                     report.actions.append(f"#{key[0]} merge owner advanced")
                     break
             elif not waiting[key].get("merge_owner"):
