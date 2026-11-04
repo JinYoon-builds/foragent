@@ -2,7 +2,7 @@ repo: JinYoon-builds/foragent  # 2026-10-30: pushes failed 255x with 'claude-pus
 review: fast
 merge_owner: true  # 2026-11-04 Jin: PM switches the merge owner on and measures (#1502, #1797)
 test_command: uv run pytest -q  # required by merge_owner (pytest-only owner refresh)
-merge_batch: true  # 2026-11-04 Jin: prefix CI evidence for queued owner admissions (#1920, D110)
+merge_batch: false  # 2026-11-04 21:00 PM: off briefly so the single path lands #1923 (it edits CI workflows, which a batch cannot use as evidence); back on right after
 merge_batch_size: 6  # 2026-11-04 Jin: back to 6 after v4 (#1970): a v4 batch runs ONE tip CI (9 jobs) at any size, so the r615 reason (66 jobs per v3 batch) no longer holds; raise further after measured failure rate
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
