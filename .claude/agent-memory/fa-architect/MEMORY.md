@@ -105,3 +105,4 @@ writes this file.
 - Stuck merge-owner: often one long tick (inline 28-min baseline, 11-04); check the merge_owner pid age + pytest child. [detail](lessons_detail.md)
 - idle_lanes_with_backlog: first read `kind=ready` reasons (outbox-wait, exclusive peer, plan_pause, retry burst); facts 'held' can be false for retries (r460-r674). [detail](lessons_detail.md)
 - Each conflicted overlap_record appears once per side (#1915 and #1515 both list state_runs.py), so 48 h row counts double. Count distinct (file, issue pair) events before testing the r389 3+/file trigger (r678: 4 rows = 2 events).
+- 'CI did not finish' can be GitHub run finalization lag: compare each check's completed_at with the workflow run's updated_at (normal lag 1-6 s). On 11-04 15:50-16:11Z it was 10-23 min, and #2014/#1854 timed out with every job green (r682).
