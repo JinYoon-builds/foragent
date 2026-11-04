@@ -519,11 +519,13 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     execute = c.executor.run
     latest = []
     leases = []
+    rebuild_offsets = []
 
     def implement(**kwargs):
         index = len(c.executor.calls)
         root = kwargs["worktree"]
         if index == 4:
+            rebuild_offsets.append(len(c.operations))
             leases.append(c.ctx.git.remote_branch_sha("foragent/issue-1") or "")
             assert (root / "cli.py").read_text() == "commands = ['help', 'base', 'newbase']\n"
             assert (root / "latest.txt").read_text() == "latest\n"
@@ -561,10 +563,10 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     assert "Conflict attempt 2/2" in log
     assert log.count("Done when command:") == 3
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'newbase', 'issue']"
-    pushes = [args for _, args in c.operations if args[0] == "push"]
-    first_rewrite = next(i for i, args in enumerate(pushes) if args[1].startswith("--force-with-lease="))
-    assert all(args[1].startswith("--force-with-lease=") for args in pushes[first_rewrite:])
-    assert pushes[first_rewrite][1] == f"--force-with-lease=refs/heads/foragent/issue-1:{leases[0]}"
+    pushes = [args for _, args in c.operations[rebuild_offsets[0]:] if args[0] == "push"]
+    assert pushes
+    assert all(args[1].startswith("--force-with-lease=") for args in pushes)
+    assert pushes[0][1] == f"--force-with-lease=refs/heads/foragent/issue-1:{leases[0]}"
     assert len(c.tracker.created_prs) == 1
 
 
