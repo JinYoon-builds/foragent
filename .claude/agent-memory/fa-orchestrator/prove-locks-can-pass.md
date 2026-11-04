@@ -18,3 +18,5 @@ Run the prototype on clean main alone. On 2026-11-02 the skills order's size loc
 Run every Done when command, as written, on clean main plus the prototype before publishing. On 2026-11-02 #1640 (S2) listed a whole file whose five cases wait for parked #1186; the draft report said so, and the run still stopped on it.
 
 Before publishing edits to shared acceptance helpers (constants or fixtures other files import), run every test file that imports them on clean main with only the new locks applied. On 2026-11-03 #1651's order changed NAMES in test_review_perspectives.py; the unit file test_review_conflict_paths.py imports it, so main CI went red for every PR (#1733 held). `grep -rln "from test_<helper> import" tests/` finds the importers.
+
+Outcome check (2026-11-04, #1651 merged after orders #1746, #1751, #1767): two of the three edits repaired locks that broke importers of a shared perspective helper. #1774 (merged 11-03) now refuses such orders at publish, so this class should not need hand checks any more; if one slips through, file it against the importer scan, not a new rule here.

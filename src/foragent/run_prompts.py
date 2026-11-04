@@ -58,6 +58,9 @@ CONFIRM_PROMPT = (
     "instances beyond the cited lines and files. Use all the first-round evidence and affected "
     "instances as the starting point for your own search. Judge the implementer's rebuttals. "
     "This is one confirmation task, not another perspective review or findings merge. "
+    "A newly found instance of a first-round defect class is a FAIL only when it quotes a Goal line, "
+    "names a locked acceptance test that fails or states a concrete input that really breaks if this merges; "
+    "otherwise report it as a NOTE line. "
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
     "every remaining finding, each one line with file:line and the concrete failure."
 )

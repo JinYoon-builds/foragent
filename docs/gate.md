@@ -169,3 +169,7 @@ Claude 구현 세션은 `/goal`과 실행별 deny 규칙·Stop 훅을 쓴다. St
 - **OpenAI Symphony** (스타 약 2.8만, 2026-02 공개, 0.0.3, 월 1~2커밋): 같은 발상(이슈 보드 = 컨트롤 플레인). gate의 차이는 **입구와 출구의 관문**: 승인된 본문만 실행, Done when 직접 실행, 검수 강도·항상 사람 경로. 가운데 스케줄러는 빌리거나 참고할 대상. SPEC과 코드는 아직 직접 읽지 않았다.
 - **orwa-mahmoud/nightshift, marcus/nightshift**: 이슈 큐를 외부 검증하며 당겨 오지 않는다 ([research/nightshift-scan-raw.md](research/nightshift-scan-raw.md)).
 - **공식 `/goal`** (Claude Code, Codex 실험): 작업 하나를 끝까지 돌리는 것은 흡수됐다. 큐에서 새 컨텍스트로 하나씩 꺼내는 것은 흡수되지 않았다. gate는 후자만 한다.
+
+```yaml
+review_scoring: true   # 리뷰 FAIL 지적마다 채점 세션 하나. 근거(Goal 인용 줄·잠긴 시험·깨지는 입력)가 있고 80점 이상이거나, 근거 있는 치명 경로가 실제로 있으면 막음. 나머지는 점수와 함께 NOTE. Goal이 정하지 않은 점은 spec-question. false면 채점 없이 모든 FAIL이 막음
+```
