@@ -27,3 +27,10 @@ idle_lanes_with_backlog during a `plan_pause` (facts 'Binding: plan_pause') is t
 
 ## hot_overlap_files with wait 0 (r426, 11-03)
 For hot_overlap_files with in-run overlap wait 0, the cost is conflicts on long runs. List conflicted overlap_records for *all* outcomes in runs.jsonl, because the facts 'Overlap conflicts (merged)' line hides unmerged runs. One wide refactor that runs for hours (#1641: 3 conflicts, 88 min, a PASS lost) is the usual peer. The fix is that issue's `exclusive:` header, not a split or a cap change. (r426, 11-03)
+
+## files_over_limit by date (r389)
+For a files_over_limit alarm, list the big file's conflicts by date from runs.jsonl `overlap_records` (conflicted, resolution_seconds), not only the 7-day total. order.py's 5/22 all fell on 11-01, during one order-lane batch. After that, 15 commits had 0 conflicts because new work went to new order_*.py modules. Executors split on their own, so a stale total is not a split case. (r389)
+
+
+## Plan pause released by a blocked green fix (r584, 11-04)
+idle_lanes_with_backlog during a plan pause whose release is 'fix X merged': check whether X is green but `blocked`. #1924 (r584, 11-04) timed out on the 1200 s CI wait after a refresh push. The jobs queued 26 min and ran at most 15.5 min. The 08:21 resolve quoted the superseded head (f2eb03 vs PR head bd82a6). Compare the resolve sha with `gh pr view --json headRefOid`, and use job created/started times to split queue from run.
