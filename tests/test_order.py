@@ -81,9 +81,12 @@ class PublishingGit:
         self.pushed = False
 
     def _call(self, args):
-        # Recovery's history search: this fake keeps no history, so it finds no batch commit.
-        assert args[0] == "log"
-        return ""
+        assert args[0] in {"log", "for-each-ref"}
+        if args[0] == "for-each-ref" or args[-1].startswith("origin/") and not self.pushed:
+            return ""
+        title = next(arg.removeprefix("--grep=") for arg in args if arg.startswith("--grep="))
+        return "\n".join(f"published\0{event[1]}" for event in self.events
+                         if event[0] == "commit" and event[1] == title)
 
     def is_ancestor(self, ancestor, head):
         # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
@@ -3834,6 +3837,9 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert [event[0] for event in events] == ["commit", "push", "issue", "issue", "issue"]
     saved = list(events)
     checkpoint = (store.root / "flush-journal.jsonl").read_bytes()
+    records = [json.loads(line) for line in checkpoint.splitlines() if line.strip()]
+    assert {row["kind"] for row in records} == {"selected", "issues", "done"}
+    assert all("sha" not in row and "old" not in row for row in records)
     assert flush_waiting(publishing)["status"] == "empty"
     assert events == saved and (store.root / "flush-journal.jsonl").read_bytes() == checkpoint
     for item in plan["issues"]:
