@@ -1,5 +1,7 @@
 """Recovery cases around the plumbing rebuild, in addition to locked edge checks."""
 
+from dataclasses import replace
+
 import pytest
 
 from conftest import git_command
@@ -36,6 +38,47 @@ def waiting(offline_publication, git_history):
 def flush(case, boundary="chosen"):
     root, config, tracker, git, store = case
     return order_flush.flush(root, config, tracker, git, store, repo="owner/repo", boundary=boundary)
+
+
+@pytest.mark.parametrize("with_order", [False, True], ids=["notes", "orders-and-notes"])
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history, monkeypatch, with_order, merge_owner):
+    from foragent import order, order_submissions
+
+    root, config, tracker, git, store = waiting
+    case = root, replace(config, merge_owner=merge_owner), tracker, git, store
+    if with_order:
+        monkeypatch.setattr(order, "require_clean_preread", lambda *args, **kwargs: None)
+        plan = {"id": "2026-11-04-train-wait", "title": "Retained", "summary": "Retained", "spec_markdown": "# Retained\n",
+                "new_lanes": [], "edits": [], "issues": [
+                    {"key": "api", "title": "API", "goal": "Do it.", "out_of_scope": "Other.", "done_when": ["true"],
+                     "checklist": [], "lane": "main", "size": "s", "blocked_by": [], "acceptance_files": {}}]}
+        order_submissions.retain(plan, "owner/repo", "chosen", approve=True, approve_keys=[], approve_numbers=[],
+                                 language=config.language, files={"docs/specs/2026-11-04-train-wait.md": "# Retained\n"})
+    base = git_command(git_history.origin, "rev-parse", "main")
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(git_history.origin, "update-ref", train, base)
+    if merge_owner:
+        for attempt in range(2):
+            with pytest.raises(GitError, match="waiting for merge train"):
+                flush(case)
+            assert git_command(git_history.origin, "rev-parse", "main") == base
+            assert not tracker.issues
+            assert not any(row["kind"] in {"pushed", "issues", "done"} for row in journal.entries(store))
+            if attempt == 0:
+                committed = git.head_sha()
+                assert committed != base
+            assert git.head_sha() == committed
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+        git_command(git_history.origin, "update-ref", "-d", train)
+    assert flush(case)["status"] == "published"
+    assert git_command(git_history.origin, "rev-parse", "main") == git.head_sha()
+    if merge_owner:
+        assert git.head_sha() != committed
+        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+        assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
+    assert bool(tracker.issues) == with_order
+    intact(case)
 
 
 def fail_push(case, monkeypatch):

@@ -1,6 +1,7 @@
 """Recover a single publication intent from Git facts, without undoing commits."""
 
 from foragent.i18n import text
+from foragent.main_write import push_base
 from foragent.order import PlanError
 from foragent.order_files import check_write
 from foragent.paths import repo_path
@@ -100,5 +101,5 @@ def push(config, git, batch, sha, *, recovering):
             _install(git, config, sha, rebuilt)
             git._call(["update-ref", "-d", ref, rebuilt])
             sha = rebuilt
-    git.push_base(config.base_branch)
+    push_base(git, config)
     return sha

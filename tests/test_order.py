@@ -700,6 +700,20 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
     assert publishing[2].issues == {}
 
 
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_immediate_order_pushes_directly_during_a_merge_train(offline_publication, plan, merge_owner):
+    root, config, tracker, git, _calls, origin = offline_publication
+    config = replace(config, merge_owner=merge_owner)
+    base = git_command(origin, "rev-parse", "main")
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
+
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
+    assert git_command(origin, "rev-parse", train) == base
+    assert tracker.issues
+
+
 @pytest.mark.parametrize("options,approved", [
     ({}, set()), ({"approve": True}, {5, 6, 3}),
     ({"approve_keys": ["client"]}, {6}), ({"approve_numbers": [3]}, {3}),
