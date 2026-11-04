@@ -1323,13 +1323,13 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했어요" in captured.err
+    assert "대시보드를 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
     # Every failure kind is retried once the spacing has passed.
     ctx.now = lambda: NOW + timedelta(minutes=5)
     tick(ctx)
-    assert "레인 화면을 열지 못했어요" in capsys.readouterr().err
+    assert "대시보드를 열지 못했어요" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failure", [
@@ -1355,7 +1355,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
     assert {action for action in report.actions if "started running" in action} == {
         "#1 started running (pid=7001)", "#2 started running (pid=7002)",
     }
-    assert report.actions[-1] == "Couldn't open the lane view (" + " ".join(str(failure).split()) + "). Try again."
+    assert report.actions[-1] == "Couldn't open the dashboard (" + " ".join(str(failure).split()) + "). Try again."
     assert opened == [(ctx.repo_root, ctx.store, ctx.config.language)]
     assert tick(ctx).actions == []
     assert len(opened) == 1
