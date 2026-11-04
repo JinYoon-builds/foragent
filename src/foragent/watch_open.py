@@ -342,6 +342,18 @@ def _launch(repo_root: Path, store: StateStore, language: str, record_at: dateti
                     attempt["manual"] = True
                 return
             quoted = json.dumps(command, ensure_ascii=False)
+            if os.environ.get("TERM_PROGRAM") == "ghostty":
+                directory = json.dumps(str(root), ensure_ascii=False)
+                lines = [
+                    'tell application "Ghostty"',
+                    'set cfg to new surface configuration',
+                    'set command of cfg to ' + quoted,
+                    'set initial working directory of cfg to ' + directory,
+                    'split (focused terminal of selected tab of front window) direction right with configuration cfg',
+                    'end tell',
+                ]
+                final([osascript, *[arg for line in lines for arg in ("-e", line)]], root)
+                return
             if os.environ.get("TERM_PROGRAM") == "iTerm.app":
                 script = ('tell application "iTerm2" to tell current session of current window'
                           ' to split vertically with default profile command ' + quoted)
