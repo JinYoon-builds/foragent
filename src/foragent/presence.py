@@ -151,6 +151,17 @@ def _processing_since(row: dict):
     return _parse_at(selected)
 
 
+def new_requests(rows: list[dict]) -> list[tuple[dict, datetime | None]]:
+    """Untaken orchestrator requests, once per id, oldest first; unreadable times last."""
+    selected, seen = [], set()
+    for row in rows:
+        if row.get("status") != "new" or row.get("from") != "orchestrator" or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        selected.append((row, _parse_at(row.get("created_at"))))
+    return sorted(selected, key=lambda item: (item[1] is None, item[1]))
+
+
 def stalled(rows: list[dict], now: datetime) -> tuple[list[tuple[dict, datetime]], list[str]]:
     """Processing requests stuck over STALL_AFTER, oldest first, with when each entered processing.
 
@@ -330,8 +341,8 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     """Box facts for a planning turn, and a note for each part that could not be read.
 
     Only a planning session in the bound checkout of a Foragent project gets them,
-    and not when presence.session_start is off. The text is stalled requests, open
-    questions and recent notices, quoted as data. Nothing here takes a lock.
+    and not when presence.session_start is off. The text is new orchestrator requests,
+    stalled requests, open questions and recent notices, quoted as data. Nothing here takes a lock.
     """
     project = _project(cwd)
     if project is None or not project[0].presence["session_start"]:
@@ -369,6 +380,12 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
         if shown:
             lines.extend([title, *shown])
 
+    def new_request(item) -> str:
+        row, since = item
+        return (f"- {_quote(row['id'])} from {_quote(row.get('from'))}, new"
+                + (f" since {since.isoformat()}" if since is not None else "")
+                + f": {_quote(row.get('text'))}")
+
     def request(item) -> str:
         row, since = item
         hours = int((now - since) // timedelta(hours=1))
@@ -390,6 +407,8 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
                 + (f" #{event['issue']}" if type(event.get("issue")) is int else "")
                 + f": {_quote(event['summary'])}")
 
+    rows("New orchestrator requests (waiting for the planning session to take them):",
+         "request", new_requests(requests), new_request)
     rows(f"Stalled requests (processing for over {STALL_AFTER // timedelta(minutes=1)} min):",
          "request", stuck, request)
     if unreadable:
