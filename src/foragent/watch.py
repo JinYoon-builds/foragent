@@ -126,7 +126,10 @@ def run(
             return
         # Curses and PID registration unwind before exec; the inherited lock leaves no gap.
         os.environ[LOCK_FD_ENV] = str(lock)
-        if Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
+        if isinstance(reload_requested, Path):
+            # The fa the gate installed, with this view's own arguments.
+            os.execv(str(reload_requested), [str(reload_requested), *argv[1:]])
+        elif Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
             os.execv(sys.executable, [sys.executable, "-m", "foragent.cli", *argv[1:]])
         else:
             os.execv(argv[0], argv)
