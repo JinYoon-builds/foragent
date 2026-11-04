@@ -25,6 +25,14 @@ class StaleComparison(UnusableComparison):
     """Every check passed except the base or measurement producer is no longer current."""
 
 
+class OlderMeasuredBase(StaleComparison):
+    """The caller can refresh this head onto the expected base."""
+
+    def __init__(self, reported):
+        self.reported = reported
+        super().__init__(reported)
+
+
 class WorkflowChanged(UnusableComparison):
     """The measuring workflow differs from the default branch, so its artifacts are not trusted."""
 
@@ -366,10 +374,11 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, wait=True):
+                       later_base=None, older_base=None, wait=True):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
-    later base it approves instead of waiting for a measurement that never comes."""
+    later base it approves. ``older_base(sha)`` requests an existing base refresh
+    by raising OlderMeasuredBase instead of waiting for an impossible report."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
@@ -427,6 +436,9 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                     scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
                     evidence = ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure)
                     continue
+                if (older_base is not None and reported is not None and reported != base_sha
+                        and older_base(reported)):
+                    raise OlderMeasuredBase(reported)
                 if not wait:
                     raise
                 # Fresh CI replaces stale evidence; it never costs a worker turn.
@@ -441,7 +453,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
-        if not wait and isinstance(exc, (MissingComparison, StaleComparison)):
+        if isinstance(exc, OlderMeasuredBase) or (not wait and isinstance(exc, (MissingComparison, StaleComparison))):
             raise
         if isinstance(exc, TrackerError) and (exc.waits or (
                 not wait and not isinstance(exc, RejectedEvidence))):

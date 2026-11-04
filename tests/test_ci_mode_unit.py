@@ -225,6 +225,58 @@ def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkey
                                        later_base=later_base)
         assert asked == ["base"]
 
+@pytest.mark.parametrize("case", ["older", "declined", "later", "missing", "same-base", "invalid"])
+def test_older_base_callback_only_refreshes_valid_stale_base(tmp_path, monkeypatch, case):
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks="ci", checks_fallback=None, test_command="pytest", ci_shards=2)
+    values = [report(), report(1)]
+    for value in values:
+        value["report"]["scope"] = measurement_scope(config, tmp_path, [])
+    if case == "missing":
+        values.pop()
+    if case == "same-base":
+        values[1]["run"]["id"] += 1  # A stale producer alone cannot request a base refresh.
+        values[1]["artifact"]["workflow_run"]["id"] += 1
+    if case == "invalid":
+        values[0]["report"]["head"]["complete"] = False
+    asked, flags, sleeps = [], [], []
+    git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
+    tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
+                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
+                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
+
+    def older(sha):
+        asked.append(sha)
+        return case != "declined"
+
+    def require():
+        return ci_mode.require_comparison(
+            attempt, 99, "head", base_sha="base" if case == "same-base" else "expected",
+            deadline=BASE_TIME.timestamp(), later_base=lambda sha: case == "later", older_base=older)
+
+    if case == "older":
+        with pytest.raises(ci_mode.OlderMeasuredBase) as caught:
+            require()
+        assert caught.value.reported == "base"
+        assert flags == []
+    elif case == "later":
+        assert require().base_sha == "base"
+        assert flags == []
+    else:
+        with pytest.raises(ExecutorStopped):
+            require()
+        assert len(flags) == 1
+    assert asked == (["base"] if case in {"older", "declined"} else [])
+    assert sleeps == []
+
+
 @pytest.mark.parametrize("damage", ["non-json-extra", "circular-extra", "overflow-duration",
                                    "transport-key", "transport-type", "transport-json", "transport-recursion", "transport-overflow"])
 def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(tmp_path, monkeypatch, damage):
