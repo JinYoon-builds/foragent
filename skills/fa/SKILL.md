@@ -71,6 +71,8 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
 
 4. **Open the lane view at session start.** Run `fa gate watch --open` in the project
    folder beside this planning session, once at the start of every session.
+   When the person asks about one issue, open that issue's dashboard yourself: run
+   `fa dashboard <N> --once` and tell them its phase, latest step, last review and CI state.
 
 5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as
