@@ -254,3 +254,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1040 (D58 skill lifecycle) next edit: add evidence from PM r510/r514 — 236-skill catalog buries relevant ones; PRs 1830 1814 1813 1864 1863 report "Skills used: none".
 - New machine: no orca codex-accounts dir; rerun-review uses default ~/.codex (the c7c83cab export is obsolete).
 - D112 plan ready (preread clean): drafts/2026-11-04-d112/plan.json; publish with --approve right after #1882 (PM's merge-owner branch) merges.
+- #1873 (PM r532, Jin): when retrying after #1833, first edit its Goal: purpose is reviewing human-written branches and external contributors' PRs with the full panel (open source), not PM out-of-lane work; lower priority.
