@@ -263,3 +263,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1914 got 3 push 500s (10:00, 10:15, 10:42Z). If a 4th: fa orch park 1914 until the push-wait fix (architect r618, plan drafts/2026-11-04-batch-push) merges, then unpark + re-approve by edit.
 - Candidate order (11-04 #1952): a PR that is CONFLICTING with main gets no GitHub merge ref, so no CI runs; the gate waited and held 'missing acceptance shards: observed []' instead of noticing mergeable=CONFLICTING and rebasing. Ask the architect for the reading point (ci_mode missing shards vs tracker pr mergeable) before ordering.
 - #435 split (drafts/435split/plan.json, preread clean 2026-11-04 13Z): publish --approve right after #1641 merges (both use tests/acceptance/test_silence_watchdog.py). PM r655 item b.
+- #1491 (emergency stop): if its retry runs >3 h again with merge_owner.py peers, add an exclusive: header for merge_owner.py (architect r708, r426 pattern).
