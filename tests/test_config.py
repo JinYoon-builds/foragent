@@ -77,7 +77,7 @@ def test_exact_defaults(repo):
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
-        "skill_roles": {}, "default_skills": {},
+        "skill_roles": {}, "preferred_skills": [], "default_skills": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,

@@ -256,6 +256,124 @@ def ci(root: Path, exclude_acceptance: bool = False) -> dict:
     return report
 
 
+# Conditional skills (#1653): each concern names the catalogue skills that answer it, preferred first.
+# A proposal names a skill only; nothing is attached until a person confirms it in fa-init.
+_CONCERN_SKILLS = {
+    "screen": ("ux-copy", "fa-ux-copy"),
+    "shared_state": ("fa-state-design", "state-design"),
+    "heavy_tests": ("testing-strategy",),
+}
+_UI_PACKAGES = ("react", "react-dom", "react-native", "vue", "svelte", "@angular/core", "preact", "solid-js",
+                "next", "nuxt", "electron", "ink", "blessed")
+_UI_SUFFIXES = (".jsx", ".tsx", ".vue", ".svelte")
+_UI_IMPORTS = re.compile(r"^\s*(?:from|import)\s+(textual|tkinter|curses|urwid|PyQt5|PyQt6|PySide6|kivy|streamlit|gradio)\b",
+                         re.M)
+_STATE_IMPORTS = re.compile(
+    r"^\s*(?:from|import)\s+(threading|multiprocessing|concurrent\.futures|fcntl)\b"
+    r"|require\(['\"]worker_threads['\"]\)|from\s+['\"]worker_threads['\"]|^\s*\"sync\"\s*$|^import\s+\"sync\"", re.M)
+_TEST_FILE = re.compile(r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.(?:py|go)|[^/]*\.(?:test|spec)\.[cm]?[jt]sx?)$")
+_TEST_CASE = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^func\s+Test\w*\(|^\s*(?:it|test)\s*\(", re.M)
+_HEAVY_TEST_COUNT = 500
+_HEAVY_CI_MINUTES = 60
+_READ_LIMIT = 1 << 20
+
+
+def _read(root: Path, path: str) -> str:
+    file = root / path
+    try:
+        if not file.is_file() or file.is_symlink() or file.stat().st_size > _READ_LIMIT:
+            return ""
+        return file.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _listed(paths: list[str], limit: int = 3) -> str:
+    shown = ", ".join(paths[:limit])
+    return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
+
+
+def _screen_evidence(root: Path, tracked: list[str]) -> str | None:
+    found = []
+    for path in tracked:
+        if PurePosixPath(path).name != "package.json" or "node_modules/" in path:
+            continue
+        try:
+            data = json.loads(_read(root, path) or "{}")
+        except ValueError:
+            continue
+        names = {name for key in ("dependencies", "devDependencies") if isinstance(data.get(key), dict)
+                 for name in data[key]} if isinstance(data, dict) else set()
+        packages = [name for name in _UI_PACKAGES if name in names]
+        if packages:
+            found.append(f"{path} depends on {', '.join(packages)}")
+    files = [path for path in tracked if path.endswith(_UI_SUFFIXES) and "node_modules/" not in path]
+    if files:
+        found.append(f"screen files {_listed(files)}")
+    terminal = [path for path in tracked if path.endswith(".py") and not _TEST_FILE.search(path)
+                and _UI_IMPORTS.search(_read(root, path))]
+    if terminal:
+        found.append(f"UI libraries imported in {_listed(terminal)}")
+    return "People read screens here: " + "; ".join(found) + "." if found else None
+
+
+def _state_evidence(root: Path, tracked: list[str]) -> str | None:
+    files = [path for path in tracked if path.endswith((".py", ".js", ".mjs", ".cjs", ".ts", ".go"))
+             and not _TEST_FILE.search(path) and _STATE_IMPORTS.search(_read(root, path))]
+    if not files:
+        return None
+    return f"Threads, processes or file locks share state in {_listed(files)}."
+
+
+def _tests_evidence(root: Path, tracked: list[str], ci_files: list[str]) -> str | None:
+    counts: Counter = Counter()
+    total = 0
+    for path in tracked:
+        if _TEST_FILE.search(path):
+            found = len(_TEST_CASE.findall(_read(root, path)))
+            total += found
+            counts[str(PurePosixPath(path).parent)] += found
+    found = []
+    if total >= _HEAVY_TEST_COUNT:
+        places = [place for place, _ in counts.most_common(3)]
+        found.append(f"{total} tests, most in {_listed(places)}")
+    for name in ci_files:
+        minutes = [int(value) for value in re.findall(r"^\s*timeout-minutes:\s*(\d+)\s*$", _read(root, name), re.M)]
+        if minutes and max(minutes) >= _HEAVY_CI_MINUTES:
+            found.append(f"{name} allows a test job {max(minutes)} minutes")
+    return "The test suite is large or slow: " + "; ".join(found) + "." if found else None
+
+
+def _proposed_skills(root: Path, tracked: list[str], ci_files: list[str]) -> list[dict]:
+    """Trusted catalogue skills for the concerns this project's code shows, each with its evidence."""
+    from foragent.config import load_global_config
+    from foragent.skills import SkillError, SkillManager, trusted_source, with_vendored_library
+
+    reasons = {"screen": _screen_evidence(root, tracked), "shared_state": _state_evidence(root, tracked),
+               "heavy_tests": _tests_evidence(root, tracked, ci_files)}
+    if not any(reasons.values()):
+        return []
+    try:
+        manager = SkillManager(with_vendored_library(load_global_config(), root))
+        # A first run has no library caches yet; fetch the trusted ones, as `fa skills catalog` would.
+        manager.fetch_missing(lambda library: trusted_source(library.repo))
+        skills = manager.skills(available_only=True)
+    except (ConfigError, SkillError, OSError):
+        return []
+    trusted = [skill for skill in skills if trusted_source(skill.library.repo)]
+    proposals, seen = [], set()
+    for concern, names in _CONCERN_SKILLS.items():
+        if not reasons[concern]:
+            continue
+        skill = next((skill for name in names for skill in trusted if skill.name == name), None)
+        if skill is None or skill.id in seen:
+            continue
+        seen.add(skill.id)
+        proposals.append({"id": skill.id, "name": skill.name, "source": skill.library.repo,
+                          "license": skill.license, "reason": reasons[concern]})
+    return proposals
+
+
 def survey(root: Path) -> dict:
     """Describe tracked history and current setup using read-only operations."""
     root = root.resolve()
@@ -281,7 +399,9 @@ def survey(root: Path) -> dict:
         "hot_paths": _hot_paths(git) if has_commits else [],
         "existing_setup": [name for name in (".claude/", "CLAUDE.md", "AGENTS.md", ".github/workflows/")
                            if ((root / name).is_dir() if name.endswith("/") else (root / name).is_file())],
-        "ci": _ci(root, acceptance_dir),
+        "ci": (ci_report := _ci(root, acceptance_dir)),
+        "proposed_skills": _proposed_skills(root, [path for path in tracked if path],
+                                            [item["file"] for item in ci_report]),
     }
 
 
@@ -382,6 +502,8 @@ def run(args: argparse.Namespace) -> int:
                 f"{item['file']} (acceptance {'included' if item['runs_acceptance'] else 'excluded'})"
                 for item in report["ci"]
             ) or "no test workflows"))
+            for item in report["proposed_skills"]:
+                print(f"Proposed skill: {item['id']} ({item['source']}, {item['license']}): {item['reason']}")
         return 0
     print(f"not implemented yet: {args.action}", file=sys.stderr)
     return 2

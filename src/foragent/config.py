@@ -57,6 +57,9 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Catalogue skill IDs a person confirmed from `fa adopt survey` proposals (#1653); lane agents see
+    # them first when they pick skills per issue. Written only by add_preferred_skill.
+    preferred_skills: list[str] = field(default_factory=list)
     # Session role -> skills it receives; written by a person, read through session_skills (#1619).
     default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
@@ -464,6 +467,9 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
 def _validate(values: dict[str, Any]) -> None:
     """Every setting's checks, plus the repository's legacy_owner login."""
     _validate_settings(values)
+    preferred = values.get("preferred_skills", [])
+    if not isinstance(preferred, list) or not all(isinstance(item, str) and item for item in preferred):
+        raise ConfigError("preferred_skills must be a list of skill IDs")
     if values.get("legacy_owner") is not None:
         from foragent.ownership import OwnershipError, normalize_login
 
@@ -676,6 +682,17 @@ def add_always_human(repo_root: Path, glob: str) -> list[str]:
         settings.set_list("always_human", [*current, glob])
         settings.save()
     return [*current] if glob in current else [*current, glob]
+
+
+def add_preferred_skill(repo_root: Path, skill_id: str) -> list[str]:
+    """Append one confirmed skill ID to the project's `preferred_skills`, keeping every other line."""
+    settings = LaneSettings(Path(repo_root) / ".foragent.yml")
+    current = list(load_config(Path(repo_root)).preferred_skills)
+    if skill_id in current:
+        return current
+    settings.set_list("preferred_skills", [*current, skill_id])
+    settings.save()
+    return [*current, skill_id]
 
 
 def config_key_names(repo_root: Path) -> list[str]:

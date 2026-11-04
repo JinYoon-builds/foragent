@@ -5,8 +5,10 @@ import os
 import shlex
 import sys
 import time
+from pathlib import Path
 
 import pytest
+import yaml
 
 from foragent import adopt, cli
 
@@ -256,3 +258,182 @@ def test_baseline_timeout_stops_shell_and_runner(tmp_path, capsys, monkeypatch, 
     assert report["failing"] == []
     assert not {42000, 42001} & fake_process_table.live
     assert all(kind == "pid" and sig != 0 for kind, _, sig in fake_process_table.calls)
+
+
+def _skill_library(tmp_path, repo, names):
+    library = tmp_path / "library"
+    for name in names:
+        path = library / "skills" / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"---\nname: {name}\ndescription: {name} guidance\n---\nBody.\n", encoding="utf-8")
+    (library / "LICENSE").write_text("SPDX-License-Identifier: MIT\n", encoding="utf-8")
+    config = Path.home() / ".config/foragent/config.yml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(yaml.safe_dump({"skill_libraries": [{"name": "lib", "repo": repo, "path": str(library)}],
+                                      "skill_roles": {"lib:voice": "style"}}), encoding="utf-8")
+
+
+def test_confirmed_proposal_is_recorded_once_and_offered_first(tmp_path, capsys, monkeypatch):
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    # An unknown source: without a person's confirmation the per-run catalogue offers nothing from it.
+    _skill_library(tmp_path, "https://github.com/someone/skills", ["alpha", "beta", "voice"])
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".foragent.yml").write_text("# keep me\nlanes:\n  app:\n    paths: [src/**]\n    skills: []\n",
+                                        encoding="utf-8")
+    monkeypatch.chdir(root)
+    assert available_skills(load_config(root), []) == []
+
+    for identity in ("lib:beta", "lib:beta", "lib:voice"):
+        assert cli.main(["skills", "prefer", identity, "--repo-root", str(root)]) == 0
+    capsys.readouterr()
+    text = (root / ".foragent.yml").read_text(encoding="utf-8")
+    assert text.startswith("# keep me\nlanes:\n  app:\n    paths: [src/**]\n    skills: []\n")
+    config = load_config(root)
+    assert config.preferred_skills == ["lib:beta", "lib:voice"]
+    assert config.lanes["app"]["skills"] == []  # Preferring never pins a skill on a lane.
+    # A preferred style skill stays a person's per-lane pin, so only beta is offered.
+    assert [name for name, _, _ in available_skills(config, [])] == ["beta"]
+
+    assert cli.main(["skills", "prefer", "lib:missing", "--repo-root", str(root)]) != 0
+    assert load_config(root).preferred_skills == ["lib:beta", "lib:voice"]
+
+    assert cli.main(["skills", "catalog", "--json"]) == 0
+    ids = [entry["id"] for entry in json.loads(capsys.readouterr().out) if entry["id"].startswith("lib:")]
+    assert ids == ["lib:beta", "lib:voice", "lib:alpha"]
+
+
+def test_preferred_skills_come_before_other_offered_skills(tmp_path, monkeypatch):
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    _skill_library(tmp_path, "https://github.com/anthropics/skills", ["alpha", "beta", "gamma"])
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".foragent.yml").write_text("preferred_skills: [lib:gamma, lib:beta]\n", encoding="utf-8")
+    monkeypatch.chdir(root)
+    offered = [name for name, _, _ in available_skills(load_config(root), [])]
+    assert [name for name in offered if name in {"alpha", "beta", "gamma"}] == ["gamma", "beta", "alpha"]
+    assert offered[:2] == ["gamma", "beta"]
+
+
+def _signal_project(tmp_path, name, files):
+    from conftest import GitHistory, git_command
+
+    origin, clone = tmp_path / f"{name}.git", tmp_path / name
+    git_command(tmp_path, "init", "--bare", "--initial-branch=main", str(origin))
+    GitHistory(origin, clone).update({"README.md": f"# {name}\n", **files})
+    git_command(tmp_path, "clone", str(origin), str(clone))
+    return clone
+
+
+def test_first_run_fetches_missing_trusted_libraries_for_its_proposals(tmp_path, capsys, monkeypatch):
+    from foragent import skills
+
+    # Fresh machine: the default trusted libraries have no local copy yet; an unknown one is never fetched.
+    source = tmp_path / "upstream"
+    (source / "design/skills/ux-copy").mkdir(parents=True)
+    (source / "design/skills/ux-copy/SKILL.md").write_text(
+        "---\nname: ux-copy\ndescription: Interface copy\n---\nBody.\n", encoding="utf-8")
+    (source / "LICENSE").write_text("SPDX-License-Identifier: MIT\n", encoding="utf-8")
+    config = Path.home() / ".config/foragent/config.yml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(yaml.safe_dump({"skill_libraries": [
+        {"name": "community", "repo": "https://github.com/unknown-publisher/skills"},
+        {"name": "knowledge-work-plugins", "repo": "https://github.com/anthropics/knowledge-work-plugins"},
+    ]}), encoding="utf-8")
+    cloned = []
+
+    def fake_run(args):
+        assert args[:2] == ["git", "clone"], args
+        cloned.append(args[3])
+        import shutil
+        shutil.copytree(source, args[4])
+        return ""
+
+    monkeypatch.setattr(skills, "_run", fake_run)
+    root = _signal_project(tmp_path, "screen", {"src/App.jsx": "export const App = () => <b>Hi</b>;\n"})
+    report = adopt.survey(root)
+    assert cloned == ["https://github.com/anthropics/knowledge-work-plugins"]
+    assert [item["id"] for item in report["proposed_skills"]] == ["kwp:design/ux-copy"]
+    assert "src/App.jsx" in report["proposed_skills"][0]["reason"]
+    # The copy now exists, so a second survey fetches nothing.
+    assert adopt.survey(root)["proposed_skills"] == report["proposed_skills"] and len(cloned) == 1
+
+
+def test_default_catalogue_gives_shared_state_foragents_own_state_design(tmp_path, capsys, monkeypatch):
+    from foragent import skills
+    from foragent.skills import FORAGENT_REPO
+
+    # Default settings whose two default libraries hold no matching skill; Foragent's own skills serve.
+    def empty_clone(args):
+        assert args[:2] == ["git", "clone"], args
+        Path(args[4]).mkdir(parents=True)
+        return ""
+
+    monkeypatch.setattr(skills, "_run", empty_clone)
+    root = _signal_project(tmp_path, "state", {"src/store.py": "import threading\n\nLOCK = threading.Lock()\n"})
+    found = adopt.survey(root)["proposed_skills"]
+    assert [(item["id"], item["source"]) for item in found] == [("foragent:fa-state-design", FORAGENT_REPO)]
+    assert "src/store.py" in found[0]["reason"]
+    monkeypatch.chdir(root)
+    assert cli.main(["skills", "catalog", "--json"]) == 0
+    entries = {entry["id"]: entry for entry in json.loads(capsys.readouterr().out)}
+    assert found[0]["license"] == entries["foragent:fa-state-design"]["license"]
+    # A screen still gets Foragent's own UX copy skill.
+    screen = _signal_project(tmp_path, "screen", {"src/App.tsx": "export const App = () => <b>Hi</b>;\n"})
+    assert [item["id"] for item in adopt.survey(screen)["proposed_skills"]] == ["foragent:fa-ux-copy"]
+
+    # A person's own library list replaces the default catalogue, Foragent's own skills included.
+    config = Path.home() / ".config/foragent/config.yml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(yaml.safe_dump({"skill_libraries": []}), encoding="utf-8")
+    assert adopt.survey(root)["proposed_skills"] == []
+
+
+def test_confirmed_own_skill_reaches_the_lane_catalogue_with_added_libraries(tmp_path, capsys, monkeypatch):
+    from foragent import skills
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    def empty_clone(args):
+        assert args[:2] == ["git", "clone"], args
+        Path(args[4]).mkdir(parents=True)
+        return ""
+
+    monkeypatch.setattr(skills, "_run", empty_clone)
+    addon = tmp_path / "addon"
+    (addon / "skills/extra").mkdir(parents=True)
+    (addon / "skills/extra/SKILL.md").write_text("---\nname: extra\ndescription: Extra\n---\nBody.\n", encoding="utf-8")
+    # Both default libraries kept, one approved library added.
+    config = Path.home() / ".config/foragent/config.yml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(yaml.safe_dump({"skill_libraries": [
+        {"name": "knowledge-work-plugins", "repo": "https://github.com/anthropics/knowledge-work-plugins"},
+        {"name": "skills", "repo": "https://github.com/anthropics/skills"},
+        {"name": "addon", "repo": "https://example.test/addon", "path": str(addon)},
+    ], "skill_roles": {"addon:extra": "tool"}}), encoding="utf-8")
+    root = _signal_project(tmp_path, "state", {
+        "src/store.py": "import threading\n\nLOCK = threading.Lock()\n",
+        ".foragent.yml": "lanes:\n  app:\n    paths: [src/**]\n    skills: []\n",
+    })
+    found = adopt.survey(root)["proposed_skills"]
+    assert [item["id"] for item in found] == ["foragent:fa-state-design"]
+
+    monkeypatch.chdir(root)
+    assert cli.main(["skills", "prefer", "foragent:fa-state-design", "--repo-root", str(root)]) == 0
+    offered = [name for name, _, _ in available_skills(load_config(root), [])]
+    assert offered[0] == "fa-state-design" and "extra" in offered
+
+    # Later the person drops every default library: the confirmed skill stays offered, first.
+    config.write_text(yaml.safe_dump({"skill_libraries": [
+        {"name": "addon", "repo": "https://example.test/addon", "path": str(addon)},
+    ], "skill_roles": {"addon:extra": "tool"}}), encoding="utf-8")
+    offered = [name for name, _, _ in available_skills(load_config(root), [])]
+    assert offered == ["fa-state-design", "extra"]
+    capsys.readouterr()
+    assert cli.main(["skills", "catalog", "--json"]) == 0
+    listed = [entry["id"] for entry in json.loads(capsys.readouterr().out) if not entry["id"].startswith("pstack:")]
+    assert listed == ["foragent:fa-state-design", "addon:extra"]

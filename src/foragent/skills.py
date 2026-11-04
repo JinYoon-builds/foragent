@@ -63,9 +63,14 @@ def _source_key(repo: str) -> str:
     return key.rstrip("/").removesuffix(".git").casefold()
 
 
+# Foragent's own skills (for example fa-state-design) count as trusted (PM 2026-11-04, q8).
+FORAGENT_REPO = "https://github.com/JinYoon-builds/foragent"
+
+
 def trusted_source(repo: str) -> bool:
-    """Whether a library comes from one of the repositories Foragent ships as its defaults."""
-    return _source_key(repo) in {_source_key(entry["repo"]) for entry in DEFAULTS["skill_libraries"]}
+    """Whether a library comes from Foragent itself or one of the repositories it ships as its defaults."""
+    trusted = [FORAGENT_REPO, *(entry["repo"] for entry in DEFAULTS["skill_libraries"])]
+    return _source_key(repo) in {_source_key(entry) for entry in trusted}
 
 
 def entry_directory(entry: str) -> str:
@@ -366,6 +371,17 @@ class SkillManager:
                 self._clone(library)
             synced.append(library.name)
         return synced
+
+    def fetch_missing(self, keep: Callable[[Library], bool]) -> list[str]:
+        """Clone the kept libraries that have no local copy yet; return the names that could not be fetched."""
+        failed = []
+        for library in self.libraries:
+            if keep(library) and not library.path.exists():
+                try:
+                    self._clone(library)
+                except SkillError:
+                    failed.append(library.name)
+        return failed
 
     def _clone(self, library: Library) -> None:
         try:
@@ -693,12 +709,45 @@ def vendored_library(*roots: Path | None) -> dict[str, Any] | None:
     return None
 
 
+# Foragent's own general skills in the catalogue (#1653); trusted through FORAGENT_REPO (PM 2026-11-04, q8).
+OWN_LIBRARY = "foragent"
+OWN_SKILLS = ("fa-state-design", "fa-ux-copy")
+
+
+def own_library() -> dict[str, Any] | None:
+    """The library entry for Foragent's own catalogue skills, from its source checkout or installed data."""
+    from foragent import __version__
+
+    for base in (_CHECKOUT, Path(sysconfig.get_path("data")) / "share/foragent"):
+        members = [name for name in OWN_SKILLS if (base / "skills" / name / "SKILL.md").is_file()]
+        if members:
+            return {"name": OWN_LIBRARY, "repo": FORAGENT_REPO, "path": str(base), "revision": f"v{__version__}",
+                    "skills": members}
+    return None
+
+
+def _library_keys(entries: list[Any]) -> list[str]:
+    return [_source_key(entry if isinstance(entry, str) else str(entry.get("repo", ""))) for entry in entries]
+
+
 def with_vendored_library(config: Config, *roots: Path | None) -> Config:
-    """Put the vendored library before the configured ones, so a configured name cannot take its IDs."""
+    """Put the built-in libraries before the configured ones, so a configured name cannot take their IDs."""
+    configured = config.skill_libraries
+    built_in = []
     entry = vendored_library(*roots)
-    if entry is None or any(isinstance(item, dict) and item.get("revision") for item in config.skill_libraries):
-        return config
-    return replace(config, skill_libraries=[entry, *config.skill_libraries])
+    if entry is not None and not any(isinstance(item, dict) and item.get("revision") for item in configured):
+        built_in.append(entry)
+    # Foragent's own skills travel with the default libraries: they stay while a person keeps any default
+    # library (added libraries change nothing), and a skill a person preferred keeps its source reachable.
+    # A list that drops every default library drops them too.
+    own = own_library()
+    if own is not None and not set(_library_keys(DEFAULTS["skill_libraries"])).intersection(_library_keys(configured)):
+        preferred = {str(identity).removeprefix(f"{OWN_LIBRARY}:") for identity in config.preferred_skills
+                     if str(identity).startswith(f"{OWN_LIBRARY}:")}
+        own["skills"] = [name for name in own["skills"] if name in preferred]
+    if own is not None and own["skills"]:
+        built_in.append(own)
+    return replace(config, skill_libraries=[*built_in, *configured]) if built_in else config
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:

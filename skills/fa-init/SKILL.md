@@ -109,7 +109,19 @@ description: Set up a project folder for Foragent.
    - `existing_setup`: settings already present that will NOT be touched,
      including existing CLAUDE.md, AGENTS.md, .claude/ files and skills.
    - `ci`: workflow files, detected test commands, and `runs_acceptance` findings.
+   - `proposed_skills`: catalogue skills this project's code calls for. Show each
+     `id` with its `reason` (the evidence it points at), `source` and `license`.
+     The survey fetches the trusted skill libraries itself when this project
+     shows evidence, so proposals do not wait for a later catalogue command.
+     An empty list means no proposal; say nothing about skills then.
    Preserve existing agent setup; the only CI edit is the approved step 8 change.
+   When `proposed_skills` is not empty, ask which proposals to keep with
+   AskUserQuestion (or the available question tool): Keep all (recommended), Keep
+   some, or None. A proposal attaches nothing by itself. Only for each confirmed
+   proposal, run `fa skills prefer <id> --repo-root .`; it records a
+   project-preferred skill that lane agents see first when they pick skills per
+   issue. It never pins the skill on a lane: lanes still pin only one style skill
+   (step 9).
 
 6. Propose lanes from `hot_paths`, showing each name and path globs. Reuse
    existing lanes where they fit and keep overlapping paths in the same lane.
