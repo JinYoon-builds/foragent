@@ -107,12 +107,17 @@ def test_native_goal_condition_scopes_outside_edits_to_the_implementer(acceptanc
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case, enabled):
+def test_codex_goal_opt_in_preserves_other_options_and_acceptance_rule(run_case, enabled, monkeypatch):
     c = run_case
-    c.ctx.config = replace(c.ctx.config, codex_goal=enabled)
+    c.ctx.config = replace(c.ctx.config, codex_goal=enabled, skill_libraries=[])
+
+    def no_library_fetch(args):
+        pytest.fail(f"Goal option coverage must not fetch skill libraries: {args!r}")
+
+    monkeypatch.setattr("foragent.skills._run", no_library_fetch)
     assert run_issue(1, c.ctx) == "merged"
     call = c.executor.calls[0]
-    # No skill library is present here, so the implementer gets the empty catalog section.
+    # This case explicitly has no configured libraries; HOME isolation alone no longer implies that.
     original = build_prompt(1, parse_body(BODY), c.ctx.config.acceptance_dir, skill_catalog=catalog_section([]))
     assert call["prompt"] == (f"/goal {goal_condition(c.ctx.config.acceptance_dir)}\n\n" if enabled else "") + original
     assert set(call) == {"worktree", "prompt", "model", "timeout_s", "log_path", "effort"}
