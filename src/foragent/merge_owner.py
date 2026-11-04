@@ -257,6 +257,15 @@ def _end(ctx, place, job, phase):
     queue.withdraw(ctx, place)
 
 
+def _stop(ctx, place, job, outcome):
+    if outcome == "base-changed" and getattr(ctx, "_budget_base_changed", None) == place.n:
+        # Ready must be startable: an open PR otherwise removes it on the next tick.
+        job["repair_outcome"] = outcome
+        _repair(ctx, place, job, "Run budget spent following a changed base; retry implementation.")
+    else:
+        _end(ctx, place, job, outcome)
+
+
 def _repair_intent(ctx, place, job, detail):
     # Every fallible read and label side effect must follow durable intent.
     job.update(phase="repair", failure=detail)
@@ -272,10 +281,14 @@ def _repair(ctx, place, job, detail):
     if pr.merged_at:
         _complete(ctx, place, job, pr)
         return
+    if (job.get("repair_outcome") == "base-changed"
+            and ctx.tracker.get_issue(place.n).labels & {BLOCKED, NEEDS_HUMAN}):
+        _end(ctx, place, job, "base-changed")
+        return  # A real base/target hold is not budget recovery, including on replay.
     with ctx.reads.fresh():
         _retry(ctx, place.n, detail, expected_pr=pr.number, expected_head_sha=job["head"],
                expected_target=job["target"])
-    _end(ctx, place, job, "repair-requested")
+    _end(ctx, place, job, job.get("repair_outcome", "repair-requested"))
 
 
 def close_for_repair(ctx, n, pr_number, head, target, *, branch=None, comment=None):
@@ -338,6 +351,8 @@ def _reverify(ctx, place, job, git, head):
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
     if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link):
+        if stopped in {"timeout", "too-large", "base-changed", "runtime-exceeded"}:
+            return stopped
         raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
     attempt = ci_mode.review_checks(n, ctx, git, target)  # local_only stays on the machine in either mode.
     if not ci_mode.enabled(ctx, target):
@@ -368,8 +383,7 @@ def _advance(ctx, place, job, pr, comparison=None):
                     approval, job["ready_at"], approved_body_sha=approval.body_sha,
                 )
                 if inputs.stop:
-                    inputs.stop()
-                    _end(ctx, place, job, "held")
+                    _stop(ctx, place, job, inputs.stop())
                     return False
                 if not run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
                                                   authorization=job.get("authorization")):
@@ -424,10 +438,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                         ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
                 )
                 if stopped:
-                    if stopped == "base-changed":
+                    if stopped == "base-changed" and job["phase"] == "repair":
                         _repair(ctx, place, job, f"Base refresh failed ({stopped}); repair the PR on {base}.")
                     else:
-                        _end(ctx, place, job, "held")
+                        _stop(ctx, place, job, stopped)
                     return False
                 job.update(phase="waiting", head=head)
                 _save(ctx, place, job)
@@ -490,8 +504,7 @@ def _advance(ctx, place, job, pr, comparison=None):
             elif closed or held or superseded:
                 _end(ctx, place, job, "superseded" if superseded else "closed" if closed else "held")
             elif inputs.stop:
-                inputs.stop()  # Flags/approval invalidation happen outside the lock.
-                _end(ctx, place, job, "held")
+                _stop(ctx, place, job, inputs.stop())  # Flags/approval invalidation happen outside the lock.
             elif inputs.status == "fail":
                 raise AttemptFailure("CI failed at final merge recheck", pr.base)
             return False
@@ -509,8 +522,8 @@ def _try_admission(ctx, place, job, step):
             return False
     except (ci_mode.MissingComparison, ci_mode.StaleComparison):
         return False  # No waiting process or arbitrary healthy-run wait limit.
-    except ExecutorStopped:
-        _end(ctx, place, job, "held")
+    except ExecutorStopped as exc:
+        _stop(ctx, place, job, exc.outcome)
         return False
     except Exception as exc:
         if isinstance(exc, TrackerError):
@@ -539,6 +552,9 @@ def advance_members(ctx, members, comparison=None):
 
 
 def _reconcile(ctx, place, job):
+    if job["phase"] not in {"repair", "waiting", "publishing", "merging"}:
+        queue.withdraw(ctx, place)
+        return None  # A saved terminal result survives an interrupted withdrawal.
     if any(processes.recorded_identity_evidence(item["pid"], item["start_time"], fresh=True).alive is not False
            for item in job.get("process_identities", [])):
         return None  # Cleanup was refused or could not establish absence.
@@ -576,9 +592,6 @@ def _reconcile(ctx, place, job):
         return None
     if job.get("merge_failure"):
         _repair(ctx, place, job, f"Merge failed: {job['merge_failure']}")
-        return None
-    if job["phase"] in {"held", "closed", "repair-requested", "merged", "superseded"}:
-        queue.withdraw(ctx, place)
         return None
     if issue.labels & {BLOCKED, NEEDS_HUMAN}:
         _end(ctx, place, job, "held")

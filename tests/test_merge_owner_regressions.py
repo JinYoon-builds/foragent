@@ -298,7 +298,9 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     assert store.merge_times()[1, old.started_at] == fact["merged_at"]
 
 
-def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(proto, monkeypatch):
+@pytest.mark.parametrize("reviewer", ["codex", "none"])
+@pytest.mark.parametrize("budget", [300, 900])
+def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(proto, monkeypatch, reviewer, budget):
     """PASS -> owner handoff -> non-neutral main move: the owner's turn spends its budget
     re-verifying the refreshed head and the last check is cut at the remaining time.
     That budget went to following the base, so the run is base-changed, not too-large (#1514)."""
@@ -306,15 +308,17 @@ def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(pr
     from foragent.run_checks import CheckResult
 
     case = proto
+    case.config = replace(case.config, reviewer=reviewer)
+    case.ctx.config = case.config
     support.queue_workers(case, [5])
-    assert json.loads(merge_owner._path(case.ctx, 5).read_text())["review_pass"] is True
+    assert json.loads(merge_owner._path(case.ctx, 5).read_text())["review_pass"] is (reviewer != "none")
     case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"})
     reverify = merge_owner._reverify
     limits = []
 
     def most_budget_used(ctx, place, job, git, head):
         # Earlier full-length checks on the refreshed head left 300 s of the turn's budget.
-        case.clock[0] += timedelta(seconds=case.config.max_runtime_minutes * 60 - 300)
+        case.clock[0] += timedelta(seconds=case.config.max_runtime_minutes * 60 - budget)
         return reverify(ctx, place, job, git, head)
 
     def cut_at_remaining(n, ctx, command, worktree, log, timeout_s, **kwargs):
@@ -325,10 +329,158 @@ def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(pr
     monkeypatch.setattr(merge_owner, "_reverify", most_budget_used)
     monkeypatch.setattr(run_checks, "run_done_when", cut_at_remaining)
     support.gate(case)
-    assert limits == [300]
+    assert limits == [budget]
+    expected = "timeout" if budget == 900 else "base-changed" if reviewer != "none" else "too-large"
+    path = merge_owner._path(case.ctx, 5)
+    assert json.loads(path.read_text())["phase"] == expected
+    assert not merge_owner.pending(case.store, 5)
+    assert retry_marker(case.store.root, 5).exists() is (expected == "base-changed")
     labels = case.tracker.get_issue(5).labels
-    assert "ready" in labels and not labels & {"blocked", "needs-human"}
+    assert labels & {"ready", "blocked", "needs-human"} == ({"ready"} if expected == "base-changed" else {"blocked"})
+    assert case.tracker.get_pr(support.pr_for(case, 5).number).state == ("closed" if expected == "base-changed" else "open")
     bodies = [comment.body for comment in case.tracker.list_comments(5)]
-    assert not any("reason=too-large" in body or "split it" in body for body in bodies)
-    assert not any("reason=timeout" in body for body in bodies)
-    assert any("Refreshed head verification: base-changed" in body for body in bodies)
+    assert any("split it" in body for body in bodies) is (expected == "too-large")
+    assert [reason for reason in ("too-large", "timeout") if any(f"reason={reason}" in body for body in bodies)] == (
+        [] if expected == "base-changed" else [expected])
+    # A later owner process must not resume a terminal job or erase its ready/blocked decision.
+    support.gate(case)
+    assert json.loads(path.read_text())["phase"] == expected
+    assert case.tracker.get_issue(5).labels & {"ready", "blocked", "needs-human"} == labels & {"ready", "blocked", "needs-human"}
+
+
+@pytest.mark.parametrize('boundary', ['initial-inputs', 'final-inputs', 'exception', 'withdraw'])
+@pytest.mark.parametrize('outcome', ['too-large', 'base-changed', 'runtime-exceeded'])
+def test_owner_keeps_terminal_outcome_through_later_handlers(proto, monkeypatch, boundary, outcome):
+    from foragent.actions import flag
+    from foragent.reasons import Reason
+    from foragent.run_attempt import ExecutorStopped
+
+    case = proto
+    support.queue_workers(case, [5])
+    original = run_publish._final_merge_inputs
+    calls = []
+
+    def stopped(n, ctx):
+        if outcome == 'runtime-exceeded':
+            flag(ctx, n, Reason.RUNTIME_EXCEEDED, 'Runner exceeded its runtime limit.')
+            return outcome
+        ctx._budget_base_changed = n if outcome == 'base-changed' else None
+        return runner._timeout(n, ctx)
+
+    def inputs(n, ctx, *args, **kwargs):
+        result = original(n, ctx, *args, **kwargs)
+        calls.append(n)
+        if len(calls) == (2 if boundary == 'final-inputs' else 1):
+            if boundary == 'exception':
+                raise ExecutorStopped(stopped(n, ctx))
+            return replace(result, stop=lambda: stopped(n, ctx))
+        return result
+
+    monkeypatch.setattr(run_publish, '_final_merge_inputs', inputs)
+    if boundary == 'withdraw':
+        withdraw = merge_owner.queue.withdraw
+        interrupted = []
+
+        def lost_withdraw(ctx, place, **kwargs):
+            if not interrupted:
+                interrupted.append(True)
+                raise OSError('Queue withdrawal interrupted')
+            return withdraw(ctx, place, **kwargs)
+
+        monkeypatch.setattr(merge_owner.queue, 'withdraw', lost_withdraw)
+    support.gate(case)
+    path = merge_owner._path(case.ctx, 5)
+    assert json.loads(path.read_text())['phase'] == outcome
+    assert merge_owner.pending(case.store, 5) is (boundary == 'withdraw')
+    assert retry_marker(case.store.root, 5).exists() is (outcome == 'base-changed')
+    assert not case.tracker.merged_prs
+    assert case.tracker.get_pr(support.pr_for(case, 5).number).state == ('closed' if outcome == 'base-changed' else 'open')
+    expected_labels = {'ready'} if outcome == 'base-changed' else {'blocked'}
+    assert case.tracker.get_issue(5).labels & {'ready', 'blocked', 'needs-human'} == expected_labels
+    bodies = [comment.body for comment in case.tracker.list_comments(5)]
+    assert any('split it' in body for body in bodies) is (outcome == 'too-large')
+    assert [name for name in ('too-large', 'runtime-exceeded') if any(f'reason={name}' in body for body in bodies)] == (
+        [] if outcome == 'base-changed' else [outcome])
+    support.gate(case)
+    assert not merge_owner.pending(case.store, 5)
+    assert json.loads(path.read_text())['phase'] == outcome
+    assert case.tracker.get_issue(5).labels & {'ready', 'blocked', 'needs-human'} == expected_labels
+
+
+@pytest.mark.parametrize("boundary", ["close", "read"])
+def test_owner_base_budget_repair_keeps_its_result_after_lost_close_response(proto, monkeypatch, boundary):
+    from foragent import run_checks
+    from foragent.run_checks import CheckResult
+
+    case = proto
+    support.queue_workers(case, [5])
+    case.history.update({'src/neighbor.py': 'VALUE = 19\n'})
+    verify, close = merge_owner._reverify, case.tracker.close_pr
+    closes = []
+
+    def remaining(ctx, place, job, git, head):
+        case.clock[0] += timedelta(seconds=case.config.max_runtime_minutes * 60 - 300)
+        return verify(ctx, place, job, git, head)
+
+    def cut(n, ctx, command, worktree, log, timeout_s, **kwargs):
+        case.clock[0] += timedelta(seconds=timeout_s)
+        return CheckResult(command, None, True, 'run budget exhausted', timeout_s)
+
+    def lost(*args, **kwargs):
+        close(*args, **kwargs)
+        closes.append(args[0])
+        if boundary == 'close':
+            raise TrackerError('Close response lost')
+
+    monkeypatch.setattr(merge_owner, '_reverify', remaining)
+    monkeypatch.setattr(run_checks, 'run_done_when', cut)
+    monkeypatch.setattr(case.tracker, 'close_pr', lost)
+    if boundary == 'read':
+        read, failures = case.tracker.get_issue, []
+
+        def interrupted_read(n):
+            job = json.loads(merge_owner._path(case.ctx, 5).read_text())
+            if job['phase'] == 'repair' and not failures:
+                failures.append(True)
+                raise OSError('Issue read interrupted')
+            return read(n)
+
+        monkeypatch.setattr(case.tracker, 'get_issue', interrupted_read)
+    support.gate(case)
+    path = merge_owner._path(case.ctx, 5)
+    assert json.loads(path.read_text())['phase'] == 'repair'
+    assert json.loads(path.read_text())['repair_outcome'] == 'base-changed'
+    assert merge_owner.pending(case.store, 5)
+    support.gate(case)
+    assert json.loads(path.read_text())['phase'] == 'base-changed'
+    assert not merge_owner.pending(case.store, 5)
+    assert len(closes) == 1
+    assert retry_marker(case.store.root, 5).exists()
+    assert case.tracker.get_issue(5).labels & {'ready', 'blocked', 'needs-human'} == {'ready'}
+
+
+def test_owner_keeps_real_base_block_even_after_following_main(proto, monkeypatch):
+    from foragent.actions import flag
+    from foragent.reasons import Reason
+
+    case = proto
+    support.queue_workers(case, [5])
+    original = run_publish._final_merge_inputs
+
+    def inputs(n, ctx, *args, **kwargs):
+        result = original(n, ctx, *args, **kwargs)
+        ctx._budget_base_changed = n
+
+        def changed_target():
+            flag(ctx, n, Reason.RISK_HIGH, 'PR targets an unexpected base; retry implementation.')
+            return 'base-changed'
+
+        return replace(result, stop=changed_target)
+
+    monkeypatch.setattr(run_publish, '_final_merge_inputs', inputs)
+    support.gate(case)
+    assert json.loads(merge_owner._path(case.ctx, 5).read_text())['phase'] == 'base-changed'
+    assert not merge_owner.pending(case.store, 5)
+    assert case.tracker.get_issue(5).labels & {'ready', 'blocked', 'needs-human'} == {'blocked'}
+    assert not retry_marker(case.store.root, 5).exists()
+    assert case.tracker.get_pr(support.pr_for(case, 5).number).state == 'open'
