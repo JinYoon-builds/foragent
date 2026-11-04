@@ -946,6 +946,49 @@ an idle factory may then pull waiting work from other people. They are not v1.
 - 결정: Anthropic code-review 플러그인 절차(Apache 2.0)를 거의 그대로 들인다. 모든 라운드의 FAIL 지적마다 새 채점 세션 하나가 0–100 점수와 근거(Goal·Out of scope 인용 줄, 잠긴 인수 시험, 실제로 깨지는 입력)를 낸다. 근거가 있고 80점 이상이면 막고, 근거 있는 치명 경로는 경로가 있으면 점수와 상관없이 막는다. 나머지는 점수와 함께 NOTE로 남긴다. Goal이 정하지 않은 점은 재작업이 아니라 spec-question으로 기획에 묻는다. 패널은 지금처럼 위험 메모가 있는 첫 라운드에서만 돌고 기본 관점은 플러그인 다섯 개와 fatal-path다. `review_scoring: false`로 끈다.
 - 근거: 2026-11-02 최근 FAIL 30건 중 실제 결함 11건, 취향·Goal 밖 요구 9건, Goal·잠긴 시험 결함 9건; 22건이 2라운드 이후.
 
+## 2026-11-04
+
+### D109. git과 GitHub가 원본이다 (단일 진실 원천) (2026-11-04, Jin)
+- 결정: 커밋, 브랜치, 바뀐 파일, PR 상태, 머지 여부, 이슈 라벨은 git과 GitHub에서 읽는다. Foragent 장부는 그들이 모르는 것만 관리한다: 사람의 승인과 결정, 측정값, LLM 리뷰 결과, 이 기계의 프로세스 상태. GitHub 사실의 로컬 사본은 캐시로만 둔다: 쓰는 곳 하나, GitHub에서 언제든 다시 만들 수 있고, 누구도 따로 사실을 써넣지 않는다.
+- 판단은 안 바뀌는 사실(커밋, 조상 관계, 차이) 위에서 한다. 바뀌는 상태(라벨, 이슈 열림, PR 머리)는 쓰는 순간에 다시 읽는다(TOCTOU). 실패하거나 결과를 모르면 버리고 기본 길로 돌아간다(crash-only).
+- 이유: 2026-11-04 머지 판단과 묶음 설계가 자기 장부(시험 기록, 묶음 상태)를 믿다가 리뷰마다 결함이 나왔다. git 사실로 바꾸자 결함 종류가 통째로 사라졌다. 장부 전수 조사에서 상위 셋이 모두 '머지됐나'를 따로 적는 장부였다.
+- D95(상태마다 쓰는 곳은 하나)를 git/GitHub까지 넓힌다. 제품 원칙으로 README와 CONTRIBUTING에도 쓴다.
+
+### D110. 새 구조를 제안하기 전에 묻는 세 질문 (2026-11-04, Jin)
+- 결정: 느린 곳이 정확히 무엇인가? 업계는 이것을 어떻게 하나? 기존 길을 대신하나, 덧붙이나? 새 부품은 기존 길을 대신하지 않고 하나만 더한다. 증거를 만드는 쪽과 행동하는 쪽을 나눈다.
+- 같은 종류의 결함이 두 번째로 나오면 땜질하지 않고 설계를 다시 본다(D95 보강의 '두 번 보류면 재설계'를 PM이 레인 밖에서 만드는 일에도 적용).
+- pstack 원칙과 잇는다: principle-attack-the-premise(같은 전제의 고침이 두 번 실패하면 전제를 시험), principle-exhaust-the-design-space(경쟁안 2~3개 비교), principle-redesign-from-first-principles, principle-separate-before-serializing-shared-state, principle-subtract-before-you-add. 아키텍트와 리뷰어, PM이 레인 밖에서 쓰는 지시서에 붙인다.
+- 이유: 머지 묶음 v1(묶음이 직접 머지, 쪼개기·자동 크기)과 v2는 원래 머지 길의 확인을 다시 만들다 리뷰마다 결함이 나왔다. v3은 GitHub 머지 큐처럼 단계별 후보 CI를 동시에 돌려 증거만 만들고, 머지는 원래 길이 하나씩 한다.
+
+### D111. 머지 담당은 레인 기억 커밋만 결과에 영향 없는 변화로 본다 (2026-11-04, PM, 정답 있는 결정)
+- 결정: main이 앞으로만 갔고, 바뀐 파일이 모두 `.claude/agent-memory/`의 추가·수정이며, PR이 건드리지 않았고, checks: ci일 때만 기존 증거를 다시 쓴다. `docs/`와 다른 이슈의 잠긴 시험 파일 추가는 다시 검사한다(시험이 읽을 수 있음, 소유자 상태는 바뀜).
+
+### D112. 대시보드: 한 화면에 정보 하나 (2026-11-04, Jin; D64 보강 5와 10-30 r53을 잇는다)
+- 결정: 메인 화면은 '지금 무엇을 하나'만 보여 준다: 큰 다람쥐와 말풍선 요약, 진행률 막대, 역할 한 줄, 레인(다람쥐와 도토리, 도토리 안 단계 이름). 이슈 하나에 대한 것(기다리는 이유, 다음 조건, 리뷰, CI, 멈춘 듯 경고, 앞 이슈)은 도토리를 누르면 말풍선에 뜬다. 메인 화면은 게이트가 틱마다 쓰는 작은 요약 파일만 읽는다.
+- 좁은 화면에서는 큰 다람쥐를 말풍선 위에 쌓는다. 큰 다람쥐는 빠지지 않는다.
+- 도토리를 누르면 말풍선만 뜬다. GitHub 링크는 말풍선 안 한 줄에만 둔다(D64 보강 5의 '도토리 번호에 링크'를 바꾼다).
+- 메인 화면에 무엇을 더하는 것은 취향이라 사람의 승인을 받는다. 기본은 말풍선에 넣는다.
+- 원칙의 원본은 `docs/design/CONTRACT.md`이고 잠긴 시험이 지킨다.
+
+### D113. 단계 이름 (2026-11-04, Jin; 10-27 승인 목록을 바꾼다)
+- 전체 이름 / 도토리 짧은 이름: 코드 쓰는 중 / 작성, 기준 재는 중 / 준비, **목표 시험 중 / 목표**(옛 로컬 시험 중), 리뷰 받는 중 / 리뷰, **전체 시험 중 / 전체**(옛 CI 시험 중), 머지 전 재확인 중 / 머지, 차례 기다리는 중 / 차례. 머지 담당 줄에서 기다리는 PR은 '차례'다. 이름은 위치가 아니라 무엇을 확인하는지로 짓는다.
+
+### D114. 사람의 결정은 저장소에 바로 넣는다 (2026-11-04, Jin)
+- 결정: PM이 사람과 정한 것은 그 세션에서 이 기록(과 지금 규칙인 rules.md)에 넣는다. PM 기억에는 연결만 둔다. 승인할 때 사람에게서 온 근거는 이 기록에 있어야 한다(#1474에 포함).
+- 이유: 10-27 단계 이름, 10-30 화면, 11-02 UX 리서처 순서가 PM 기억에만 있어 레인이 다르게 만들었다.
+
+### D115. 대체된 코드를 지울지는 사람에게 묻지 않는다 (2026-11-04, Jin)
+- 결정: 같은 일을 하는 새 코드가 돌고 있으면 옛 코드는 결함으로 보고 지운다(원칙: 기능은 삭제로 없앤다). D71의 '되돌리기 어려운 것'은 데이터, 돈, 외부 공개, 남에게 보내기다. git으로 되돌릴 수 있는 코드 변경은 아니다.
+
+### D116. UX 리서처는 머지 담당 다음 순서로 당긴다 (2026-11-02 결정, 2026-11-04 Jin 재확인)
+- 결정: 페르소나로 실제 제품을 써 보며 기능 사이의 이음새를 찾는 기본 역할(#1654). 처음 흐름: 대시보드가 업데이트를 따라가나, 휴대폰 폭에서 보이나, 머지 대기가 맞는 이름으로 보이나, /fa 한 번으로 PM과 대시보드가 뜨나. 2주 뒤 평가한다.
+
+### D117. 기본 스킬 표를 두 층으로 나눈다 (2026-11-04, Jin; D58·#1652를 넓힌다)
+- 표 가(모든 프로젝트에 fa init이 까는 역할의 기본, 일반 원칙만): 오케스트레이터 = principle-prove-it-works, principle-attack-the-premise, + principle-never-block-on-the-human, principle-encode-lessons-in-structure. 아키텍트 = principle-attack-the-premise, principle-redesign-from-first-principles, + principle-exhaust-the-design-space, principle-separate-before-serializing-shared-state, principle-subtract-before-you-add, principle-foundational-thinking. 문서 담당 = principle-minimize-reader-load. 리뷰어 = principle-prove-it-works, review-procedure, + principle-attack-the-premise, principle-test-behavior-not-implementation. 레인 작업자 = 그대로(prove-it-works, fix-root-causes, attack-the-premise, sequence-verifiable-units).
+- 표 나(Foragent 저장소 레인만): orch·review-engine에 + principle-make-operations-idempotent, principle-separate-before-serializing-shared-state. view에 + principle-experience-first, principle-minimize-reader-load. board·skills·roles에 + principle-make-operations-idempotent. 나머지 레인 그대로.
+- 출처를 표에 함께 적는다: ① pstack(Lauren Tan, MIT), ② Anthropic 공식(Apache-2.0, 원본 또는 출처를 밝히고 고친 것), ③ Foragent가 만든 것(fa-state-design). ③은 외부 근거가 없으니 리뷰를 더 엄격히 받는다.
+- 이유: 2026-11-04 오늘 문제와 맞는 설계 원칙 대부분이 기본 표에 없었다. FA 개발에만 맞는 것을 모든 사용자 기본에 넣지 않으려고 두 층으로 나눈다.
+
 ## 2026-11-04 D71 보강. '되돌리기 어려운 일'은 데이터·돈·외부 공개·남에게 보내기다 (#1864)
 
 - 계기: PM r462(B). 결함이었던 질문이 Jin에게 갔다. q8은 이미 있는 결정이 답하는 질문이었고, q9는 대체된 코드를 지워도 되는지 묻는 질문이었다(git으로 되돌릴 수 있다).

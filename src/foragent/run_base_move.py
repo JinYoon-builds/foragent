@@ -11,10 +11,17 @@ The decision reads only the move it will merge: the fixed commit range
 paths of every commit in that range, and the exclusion set the acceptance
 baseline actually used. The caller then merges that same ``target_sha``.
 Approvals and merge history may only narrow the neutral set further.
+
+The merge owner uses the strict variant: the range starts at the measured base,
+must move forward, and permits only additions or modifications under
+.claude/agent-memory/. Deletions and renames require refresh, as do docs changes
+because tests can read docs. Unavailable Git proof also requires refresh.
+It never consults acceptance ownership, baseline exclusions or config contents.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from copy import deepcopy
 from dataclasses import dataclass
 import subprocess
@@ -30,6 +37,7 @@ from foragent.issue import acceptance_paths, parse_body
 if TYPE_CHECKING:
     from foragent.git import GitRepo
     from foragent.run_attempt import Implementation
+    from foragent.runner import RunContext
 
 REUSED = "base moved: only result-neutral paths; verification reused"
 REVERIFY = "base moved: result-affecting paths; re-verifying"
@@ -91,16 +99,22 @@ def _blob_exists(git: GitRepo, sha: str, path: str) -> bool:
 
 def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
     """Paths touched by each commit in the fixed range, not only by the net diff."""
+    return {path for _, path in _moved_changes(git, move)}
+
+
+def _moved_changes(git: GitRepo, move: BaseMove) -> set[tuple[str, str]]:
+    """Exact status/path pairs for every commit, with renames reported as D + A."""
     commits = _git_bytes(git, ["rev-list", f"{move.head_sha}..{move.target_sha}"]).decode("ascii").split()
-    paths: set[str] = set()
+    changes: set[tuple[str, str]] = set()
     for commit in commits:
         # -m compares merge commits with every parent; --root covers parentless
         # commits; --no-renames keeps both sides of a rename.
-        paths.update(_nul_paths(_git_bytes(git, [
-            "diff-tree", "-r", "-m", "--root", "--no-commit-id", "--name-only", "--no-renames", "-z",
+        fields = _nul_paths(_git_bytes(git, [
+            "diff-tree", "-r", "-m", "--root", "--no-commit-id", "--name-status", "--no-renames", "-z",
             commit,
-        ])))
-    return paths
+        ]))
+        changes.update(zip(fields[::2], fields[1::2], strict=True))
+    return changes
 
 
 def _repo_config(git: GitRepo, sha: str) -> dict[str, Any] | None:
@@ -168,13 +182,12 @@ def _repo_path(path: str) -> str:
     return path.rstrip("/")
 
 
-def _open_acceptance_owners(attempt: Implementation) -> dict[str, set[int]]:
+def _open_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     """Locked path -> open, unmerged issues that own it, this one included (#514).
 
     Owners come from approval snapshots of open issues, or from open issues
     carrying an approval label whose Files or acceptance links name the path.
     """
-    ctx = attempt.ctx
     directory = _repo_path(ctx.config.acceptance_dir) + "/"
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
     if getattr(ctx.config, "merge_owner", False):
@@ -209,13 +222,37 @@ def _own_paths(git: GitRepo, target_sha: str) -> set[str]:
 
 
 def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
-    paths = moved_paths(attempt.git, move)
-    own = _own_paths(attempt.git, move.target_sha)
+    return move_is_neutral(
+        attempt.git, move, ctx=attempt.ctx, n=attempt.n, own_locked=attempt.approval.acceptance_blobs,
+        excluded=attempt.baseline.excluded if attempt.baseline else (),
+        baseline_sha=attempt.baseline.base_sha if attempt.baseline else None,
+    )
+
+
+def move_is_neutral(git: GitRepo, move: BaseMove, *, ctx: RunContext, n: int,
+                    own_locked: Collection[str], excluded: Collection[str] = (),
+                    baseline_sha: str | None = None, strict: bool = False) -> bool:
+    """Shared path rules; strict owner ranges start at the evidence's measured base."""
+    if strict:
+        try:
+            if move.head_sha == move.target_sha or not git.is_ancestor(move.head_sha, move.target_sha):
+                return False
+            changes = _moved_changes(git, move)
+            if any(status not in {"A", "M"} or not path.startswith(".claude/agent-memory/")
+                   for status, path in changes):
+                return False
+            return not {path for _, path in changes} & _own_paths(git, move.target_sha)
+        except GitError:
+            # A recorded evidence SHA may have been pruned. Failed proof must
+            # reach the normal refresh path rather than retry the same read.
+            return False
+    paths = moved_paths(git, move)
+    own = _own_paths(git, move.target_sha)
     if paths & own:
         return False
     rest = {path for path in paths if not path.startswith(NEUTRAL_DIRECTORIES)}
     if CONFIG_PATH in rest:
-        if not config_move_is_neutral(attempt.git, move):
+        if not config_move_is_neutral(git, move):
             return False
         rest.discard(CONFIG_PATH)
     if not rest:
@@ -224,12 +261,12 @@ def base_move_is_neutral(attempt: Implementation, move: BaseMove) -> bool:
     # skipped, or those missing from the commit it ran on (#514). An earlier
     # neutral move may already have brought such a file into the verified head.
     # An issue approved later does not remove a test from what was already verified.
-    skipped = set(attempt.baseline.excluded) if attempt.baseline else set()
-    ran_on = (attempt.baseline.base_sha if attempt.baseline else None) or move.head_sha
+    skipped = set(excluded)
+    ran_on = baseline_sha or move.head_sha
     unverified = {path for path in rest
-                  if path in skipped or not _blob_exists(attempt.git, ran_on, path)}
+                  if path in skipped or not _blob_exists(git, ran_on, path)}
     # This issue's own locked files are verified by Done when.
-    if not rest <= unverified - set(attempt.approval.acceptance_blobs):
+    if not rest <= unverified - set(own_locked):
         return False
-    owners = _open_acceptance_owners(attempt)
-    return all(owners.get(path) and attempt.n not in owners[path] for path in rest)
+    owners = _open_acceptance_owners(ctx)
+    return all(owners.get(path) and n not in owners[path] for path in rest)
