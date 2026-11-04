@@ -384,7 +384,7 @@ def test_a_stopped_run_keeps_its_phase_in_row_and_box(tmp_path):
     assert "지금: 차례 기다리는 중" in watch.issue_box(10, store, config), "a reopened issue is not done"
 
 
-def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
+def paint_terminal(tmp_path, monkeypatch, keys, sizes=((40, 100),), *, repo="owner/repo", colors=False):
     import curses
     from io import StringIO
     from types import SimpleNamespace
@@ -393,24 +393,118 @@ def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
     from foragent import watch_terminal
 
     snapshot, config = lane_case()
+    config = replace(config, repo=repo)
     screen = Mock()
-    screen.getmaxyx.return_value = (40, 100)
-    screen.getch.return_value = ord("q")
+    screen.getmaxyx.side_effect = list(sizes)
+    screen.getch.side_effect = keys
     output = StringIO()
     monkeypatch.setattr(watch.sys, "stdout", output)
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
     monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
-    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    monkeypatch.setattr(curses, "has_colors", lambda: colors)
+    if colors:
+        monkeypatch.setattr(curses, "COLORS", 256, raising=False)
+        monkeypatch.setattr(curses, "COLOR_PAIRS", 256, raising=False)
+        monkeypatch.setattr(curses, "start_color", lambda: None)
+        monkeypatch.setattr(curses, "use_default_colors", lambda: None)
+        monkeypatch.setattr(curses, "color_pair", lambda index: index << 8)
     monkeypatch.setattr(curses, "curs_set", lambda *args: None)
     monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
     monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
     watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
                              lambda: snapshot.captured_at, StateStore(tmp_path))
-    written = output.getvalue()
-    assert "\x1b]8;;https://github.com/owner/repo/issues/3" in written
+    return screen, output.getvalue()
+
+
+def test_main_screen_acorn_numbers_never_write_osc8_links(tmp_path, monkeypatch):
+    screen, written = paint_terminal(tmp_path, monkeypatch, [ord("q")])
+    painted = "".join(call.args[2] for call in screen.addstr.call_args_list)
+    assert all(f"#{number}" in painted for number in (3, 4, 5, 6))
+    assert "\x1b]8;" not in written
+
+
+def test_selected_acorn_without_repo_keeps_its_bubble_but_writes_no_osc8(tmp_path, monkeypatch):
+    screen, written = paint_terminal(tmp_path, monkeypatch, [10, ord("q")],
+                                     sizes=((40, 100),) * 2, repo=None)
+    assert any("#3 Current" in call.args[2] for call in screen.addstr.call_args_list)
+    assert "\x1b]8;" not in written
+
+
+def test_acorn_numbers_keep_their_foreground_background_and_bold(tmp_path, monkeypatch):
+    import curses
+
+    pairs = {}
+    monkeypatch.setattr(curses, "init_pair", lambda index, fg, bg: pairs.update({index: (fg, bg)}))
+    screen, written = paint_terminal(tmp_path, monkeypatch, [ord("q")], colors=True)
+    snapshot, config = lane_case()
+    expected = {value: style for line in watch._frame(
+        snapshot, config, tmp_path, tick=0, width=100, selected=None,
+        now=snapshot.captured_at, state={}) for value, style in line
+        if "#" in value and isinstance(style, tuple) and style[2] is not None}
+    assert expected, "exercise the coloured acorn bodies"
+    painted = {call.args[2]: call.args[3] for call in screen.addstr.call_args_list if call.args[2] in expected}
+    assert painted.keys() == expected.keys()
+    for value, attribute in painted.items():
+        _, fg, bg = expected[value]
+        assert pairs[(attribute >> 8) & 255] == (fg, bg)
+        assert attribute & curses.A_BOLD
+    assert "\x1b]8;" not in written
+
+
+def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
+    _, written = paint_terminal(tmp_path, monkeypatch, [10, ord("q")], sizes=((40, 100),) * 2)
+    url = "https://github.com/owner/repo/issues/3"
+    assert written.count(watch.osc8(url, url)) == 1
+    assert written.count("\x1b]8;;https://") == 1, "only the selected issue URL is linked"
     # Every cursor move for a link sits between one save and its restore.
     assert written.startswith("\x1b7") and written.endswith("\x1b8")
     assert written.count("\x1b7") == written.count("\x1b8") == 1
+
+
+@pytest.mark.parametrize("number", [3, 4])
+@pytest.mark.parametrize("width", [30, 79, 100, 160])
+def test_selected_acorn_bubble_contains_exactly_one_issue_link_line(tmp_path, number, width):
+    from foragent.watch_sections import lane_bubble
+
+    snapshot, config = lane_case()
+    state = {"explanation_target": ("acorn", number)}
+    lines = lane_bubble.render(snapshot, config, tmp_path, width=width, now=snapshot.captured_at, state=state)
+    linked = [(y, value) for y, line in enumerate(lines) for value, style in line if style == "issue-link"]
+    url = f"https://github.com/owner/repo/issues/{number}"
+    assert len(linked) == 1
+    y, label = linked[0]
+    assert label and url.startswith(label), "narrow bubbles may clip the label"
+    assert "│" in "".join(value for value, _ in lines[y]), "the link is inside the bubble"
+    if width >= 79:
+        assert label == url
+    without_repo = lane_bubble.render(snapshot, replace(config, repo=None), tmp_path, width=width,
+                                     now=snapshot.captured_at, state=state)
+    assert not any(style == "issue-link" for line in without_repo for _, style in line)
+
+
+@pytest.mark.parametrize("width", [60, 100])
+def test_bubble_link_keeps_all_six_authored_explanation_rows(tmp_path, width):
+    from foragent.watch_sections import lane_bubble
+
+    snapshot, config = lane_case()
+    # A queued authored wait actually uses the canonical three-field explanation.
+    # The lane's paths wrap into two rows, filling the six-row explanation budget.
+    config = replace(config, lanes={"work": {**config.lanes["work"], "paths": ["source/" + "a" * 74]}})
+    snapshot = replace(snapshot, waiting_facts={4: {"authored": {
+        "text": "Review pending", "reason": "Review pending", "next_condition": "Record locale",
+        "responsible_role": "planner"}}})
+    context = dict(width=width, now=snapshot.captured_at, state={"explanation_target": ("acorn", 4)})
+    without_link = lane_bubble.render(snapshot, replace(config, repo=None), tmp_path, **context)
+    lines = lane_bubble.render(snapshot, config, tmp_path, **context)
+    body = "\n".join("".join(value for value, _ in line) for line in lines)
+    for value in ("#4 Task 4", "work", "Review pending", "Record locale", "planner",
+                  "https://github.com/owner/repo/issues/4"):
+        assert value in body
+    assert sum(style == "issue-link" for line in lines for _, style in line) == 1
+    assert len(lines) == len(without_link) + 1
+    # The URL is an extra row: every pre-existing explanation span stays in order.
+    for line in without_link[1:7]:
+        assert line in lines
 
 
 def test_footers_list_the_new_keys_from_their_own_feature_file(tmp_path):
@@ -582,29 +676,14 @@ def test_issue_box_drops_terminal_controls_but_not_spaces(tmp_path):
 def test_links_are_written_after_every_refresh_even_when_text_is_unchanged(tmp_path, monkeypatch, sizes, first_key):
     """Class: repaint-cache invalidation. No cache, so no repaint can lose the links."""
     import curses
-    from io import StringIO
-    from types import SimpleNamespace
-    from unittest.mock import Mock
 
-    from foragent import watch_terminal
-
-    snapshot, config = lane_case()
-    screen = Mock()
-    screen.getmaxyx.side_effect = list(sizes)
-    screen.getch.side_effect = [curses.KEY_RESIZE if first_key == "resize" else -1, ord("q")]
-    output = StringIO()
-    monkeypatch.setattr(watch.sys, "stdout", output)
-    monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
-    monkeypatch.setattr(watch, "_installed_build", lambda: "unknown")
-    monkeypatch.setattr(curses, "has_colors", lambda: False)
-    monkeypatch.setattr(curses, "curs_set", lambda *args: None)
-    monkeypatch.setattr(curses, "mousemask", lambda *args: None, raising=False)
-    monkeypatch.setattr(curses, "mouseinterval", lambda *args: None, raising=False)
-    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
-                             lambda: snapshot.captured_at, StateStore(tmp_path))
-    written = output.getvalue()
-    link = "\x1b]8;;https://github.com/owner/repo/issues/3\x1b\\#3"
-    assert screen.refresh.call_count == 2
+    # Enter selects the first acorn; both following frames must restore its bubble link.
+    screen, written = paint_terminal(tmp_path, monkeypatch,
+                                     [10, curses.KEY_RESIZE if first_key == "resize" else -1, ord("q")],
+                                     sizes=(sizes[0], *sizes))
+    url = "https://github.com/owner/repo/issues/3"
+    link = watch.osc8(url, url)
+    assert screen.refresh.call_count == 3
     assert written.count("\x1b7") == written.count("\x1b8") == 2
     assert written.count(link) == 2, "each refresh writes the link again"
 

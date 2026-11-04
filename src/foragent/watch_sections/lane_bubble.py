@@ -1,8 +1,9 @@
-"""The big orchestrator squirrel, its eight-row speech bubble and the r57 progress bar (lane-view m2).
+"""The big orchestrator squirrel, its speech bubble and the r57 progress bar (lane-view m2).
 
 The bubble says what the lanes are doing (work, waiting, the finish estimate, questions,
 the planning request being handled, today's newest merges and a hint), or explains the
-selected target through watch_explanations; acorns are explained here. From 80 columns
+selected target through watch_explanations; acorns have an extra URL row that preserves
+all six explanation rows. From 80 columns
 the sprite stands left of the bubble with its mouth on row 3; narrower, or without
 pixels (ASCII, a non-UTF-8 terminal or animation off), the bubble takes the whole width.
 The bar under the bubble counts today's merges against them plus the approved work left.
@@ -214,7 +215,7 @@ def _box(body: list[Line], width: int, mouth: bool, glyphs: str) -> list[Line]:
     corners, edge, side, opening = BOX[glyphs]
     inside = max(0, width - 4)
     rows = [[(corners[0] + edge * max(0, width - 2) + corners[1], "edge")]]
-    for index in range(BODY_ROWS):
+    for index in range(max(BODY_ROWS, len(body))):
         line = body[index] if index < len(body) else []
         left = opening if mouth and index + 1 == MOUTH_ROW else side
         rows.append([(left, "edge"), (" ", ""), *watch._fit(line, inside), (" ", ""), (side, "edge")])
@@ -239,8 +240,12 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     target = state.get("explanation_target") if state is not None else None
     found = (watch_explanations.explain(target, snapshot, config, repo_root, now=now, width=inside, state=state)
              if target is not None else None)
+    url = watch.issue_url(config, target[1]) if found is not None and target[0] == "acorn" else None
     body = (_explanation_rows(found, inside, mark) if found is not None
             else _summary_rows(summary(snapshot, config, now), inside, mark))
+    if url:
+        # Only this explicit link span becomes an OSC 8 link in the terminal.
+        body.append([(url, "issue-link")])
     if width < 4:
         # Too narrow for borders: the sentences alone, cut to the width.
         from foragent import watch_scene
@@ -251,9 +256,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     box = _box(body, box_width, sprite, glyph_mode(config))
     if sprite:
         art = pixel_rows(ORCHESTRATOR)
-        box = [[*art[index], (" " * (SPRITE_CELLS - len(art[index]) + SPRITE_GAP), ""), *row]
-               for index, row in enumerate(box)]
-        hits.append((0, top, SPRITE_CELLS, top + len(box), ("orchestrator", None)))
+        box = [[*pixels, (" " * (SPRITE_CELLS - len(pixels) + SPRITE_GAP), ""), *row]
+               for pixels, row in watch.zip_longest(art, box, fillvalue=[])]
+        hits.append((0, top, SPRITE_CELLS, top + len(art), ("orchestrator", None)))
     return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
 
 
