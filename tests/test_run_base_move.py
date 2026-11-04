@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent.git import GitRepo
+from foragent.git import GitError, GitRepo
 from foragent.run_baseline import AcceptanceBaseline
-from foragent.run_base_move import BaseMove, base_move_is_neutral, capture_move, config_move_is_neutral, moved_paths
+from foragent.run_base_move import BaseMove, base_move_is_neutral, capture_move, config_move_is_neutral, move_is_neutral, moved_paths
 
 
 def git(root: Path, *args: str, env: dict | None = None) -> str:
@@ -359,3 +359,85 @@ def test_cyclic_value_change_in_neutral_key_stays_neutral(repo):
     before = BASE_CONFIG + "profile: &p {self: *p, kind: a}\n"
     after = BASE_CONFIG + "profile: &p {self: *p, kind: b}\n"
     assert _config_case(repo, before, after) is True
+
+
+def owner_neutral(work, measured: str, target: str) -> bool:
+    return move_is_neutral(work.git, BaseMove(measured, target), ctx=work.ctx, n=work.n,
+                           own_locked=work.approval.acceptance_blobs, strict=True)
+
+
+@pytest.mark.parametrize(("change", "expected"), [
+    pytest.param({".claude/agent-memory/new.md": "memory\n"}, True, id="added-memory"),
+    pytest.param({".claude/agent-memory/role.md": "updated\n"}, True, id="modified-memory"),
+    pytest.param({".claude/agent-memory/role.md": None}, False, id="deleted-memory"),
+    pytest.param({".claude/agent-memory/role.md": None,
+                  ".claude/agent-memory/renamed.md": "memory\n"}, False, id="renamed-memory"),
+    pytest.param({"docs/a.md": "updated\n"}, False, id="docs"),
+    pytest.param({"docs/a.md": "updated\n", ".claude/agent-memory/role.md": "memory\n"}, False, id="docs-memory"),
+    pytest.param({"src/new.py": "VALUE = 1\n"}, False, id="source"),
+    pytest.param({NEW_LOCKED: "new\n"}, False, id="added-acceptance"),
+    pytest.param({OTHER: "updated\n"}, False, id="modified-acceptance"),
+    pytest.param({OTHER: None}, False, id="deleted-acceptance"),
+    pytest.param({OTHER: None, NEW_LOCKED: "x\n"}, False, id="renamed-acceptance"),
+    pytest.param({".foragent.yml": BASE_CONFIG}, False, id="config"),
+])
+def test_owner_strict_paths_do_not_depend_on_exclusions(repo, change, expected):
+    move(repo, {".claude/agent-memory/role.md": "memory\n"})
+    measured = git(repo, "rev-parse", "main")
+    git(repo, "update-ref", "refs/heads/feature", measured)
+    on_feature(repo)
+    target = move(repo, change)
+    for skipped in ((), (OTHER, NEW_LOCKED)):
+        work = attempt(repo, {2: [OTHER, NEW_LOCKED]}, skipped=skipped)
+        assert owner_neutral(work, measured, target) is expected
+
+
+def test_owner_rejects_pr_overlap(repo):
+    measured = git(repo, "rev-parse", "main")
+    memory = ".claude/agent-memory/role.md"
+    commit(repo, "feature", {memory: "PR change\n"})
+    on_feature(repo)
+    target = move(repo, {memory: "base change\n"})
+    assert not owner_neutral(attempt(repo, {}), measured, target)
+
+
+def test_owner_checks_source_commits_even_when_reverted(repo):
+    measured = git(repo, "rev-parse", "main")
+    move(repo, {"src/a.py": "A = 1\n"})
+    target = move(repo, {"src/a.py": "A = 0\n", ".claude/agent-memory/new.md": "memory\n"})
+    assert not owner_neutral(attempt(repo, {}), measured, target)
+
+
+def test_owner_requires_a_strict_forward_measurement_range(repo):
+    ancestor = git(repo, "rev-parse", "main")
+    measured = move(repo, {"src/a.py": "A = 1\n"})
+    git(repo, "update-ref", "refs/heads/side", ancestor)
+    diverged = commit(repo, "side", {".claude/agent-memory/side.md": "different history\n"})
+    work = attempt(repo, {})
+    assert not owner_neutral(work, measured, measured)
+    assert not owner_neutral(work, measured, ancestor)
+    assert not owner_neutral(work, measured, diverged)
+
+
+def test_owner_rejects_memory_deletion_even_when_restored(repo):
+    memory = ".claude/agent-memory/role.md"
+    measured = move(repo, {memory: "memory\n"})
+    move(repo, {memory: None})
+    target = move(repo, {memory: "memory\n"})
+    assert not owner_neutral(attempt(repo, {}), measured, target)
+
+
+def test_owner_rejects_an_unavailable_measured_base(repo):
+    target = move(repo, {".claude/agent-memory/role.md": "memory\n"})
+    assert not owner_neutral(attempt(repo, {}), "0" * 40, target)
+
+
+def test_owner_rejects_unknown_ancestry(repo, monkeypatch):
+    measured = git(repo, "rev-parse", "main")
+    target = move(repo, {".claude/agent-memory/role.md": "memory\n"})
+
+    def unavailable(*args):
+        raise GitError("Ancestry is unavailable")
+
+    monkeypatch.setattr(GitRepo, "is_ancestor", unavailable)
+    assert not owner_neutral(attempt(repo, {}), measured, target)
