@@ -68,7 +68,16 @@ def changed_workflows(git, trusted_sha, head):
     if trusted_sha is None:
         raise GitError("Default branch reference unavailable")
     return git._call([
-        "diff", "--name-only", "-z", trusted_sha, head, "--",
+        "diff", "--name-only", "-z", f"{trusted_sha}..{head}", "--",
+        ".github/workflows/foragent-acceptance*.yml",
+        ".github/workflows/foragent-acceptance*.yaml",
+    ])
+
+
+def pr_changes_workflows(git, base, head):
+    """Return acceptance workflows changed by the PR since its merge base."""
+    return git._call([
+        "diff", "--name-only", "-z", f"{base}...{head}", "--",
         ".github/workflows/foragent-acceptance*.yml",
         ".github/workflows/foragent-acceptance*.yaml",
     ])
@@ -390,13 +399,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     # when all acceptance workflows match the default branch exactly.
     workflow_error = None
     try:
-        workflows_changed = changed_workflows(attempt.git, trusted_sha, head)
+        workflows_changed = changed_workflows(attempt.git, trusted_sha, head) if source is None else False
     except GitError as exc:
         workflows_changed = False
         workflow_error = str(exc)
     if workflows_changed:
-        if source is not None:
-            raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
         try:
             ci_local.fallback_comparison(attempt, base_sha)
@@ -421,6 +428,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 reports = ctx.tracker.pr_acceptance_reports(head)
             else:
                 measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
+                if changed_workflows(attempt.git, trusted_sha, measured_head):
+                    raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
             try:
                 lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
                                            expected_scope=scope,
