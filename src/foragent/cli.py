@@ -65,7 +65,7 @@ except ImportError:
 
 
 # The commands a person types; every other discovered command is for Foragent's own sessions.
-PERSON = ("init", "doctor", "inspect", "gate")
+PERSON = ("init", "doctor", "inspect", "gate", "dashboard")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -96,7 +96,9 @@ def _command_list(groups) -> str:
 
     person = [name for name in PERSON if name in groups.choices]
     internal = [name for name in names if name not in PERSON]
-    return "\n".join(["Start with fa init, then /fa.", "", *block("Person commands:", person), "",
+    return "\n".join(["Start with fa init, then /fa.",
+                      "After that, /fa in Claude Code is the one thing to type; fa dashboard opens the dashboard.",
+                      "", *block("Person commands:", person), "",
                       *block("Internal commands:", internal)])
 
 
@@ -258,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     if refused:
         print(f"foragent: {refused}", file=sys.stderr)
         return 1
-    if args.command == "gate":
+    if args.command in {"gate", "dashboard"}:
         _leave_background()
     if (args.command == "order" and getattr(args, "action", None) in PM_ONLY_ORDER_ACTIONS
             and not getattr(args, "dry_run", False)):
