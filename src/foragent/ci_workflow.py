@@ -102,7 +102,8 @@ def workflow_text(config):
         "if": ("github.event_name == 'pull_request' && "
                "github.event.pull_request.head.repo.full_name == github.repository && "
                "(startsWith(github.event.pull_request.head.ref, 'foragent/issue-') || "
-               "startsWith(github.event.pull_request.head.ref, 'foragent/group-')) && "
+               "startsWith(github.event.pull_request.head.ref, 'foragent/group-') || "
+               "startsWith(github.event.pull_request.head.ref, 'foragent/batch-merge-')) && "
                f"github.event.pull_request.base.ref == '{base}'"),
         "runs-on": config.ci_runs_on,
         "timeout-minutes": MEASUREMENT_TIMEOUT_MINUTES,

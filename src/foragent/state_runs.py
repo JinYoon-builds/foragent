@@ -32,6 +32,20 @@ def _owner_fact_matches(value):
         return False
 
 
+def owner_facts_of(values) -> dict[tuple[int, str], dict]:
+    """Detached valid owner merge facts among raw run records, by (number, started_at)."""
+    return {(value["number"], value["started_at"]): _copy(value["owner_merge"]) for value in values
+            if _owner_fact_matches(value)}
+
+
+def record_merged(value, owner_facts) -> bool:
+    """The one merge rule on a raw run record: outcome merged, or a recorded owner merge of it."""
+    if not isinstance(value, dict) or type(value.get("number")) is not int:
+        return False  # No usable identity: nothing to count, whatever else the record says.
+    return value.get("outcome") == "merged" or (
+        isinstance(value.get("started_at"), str) and (value["number"], value["started_at"]) in owner_facts)
+
+
 class RunRecordsMixin:
     def _close_phase(self, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
         """Journal the ended phase; called under the state lock (see state_phases.close_phase)."""
@@ -200,8 +214,15 @@ class RunRecordsMixin:
         with self._state_lock():
             path = self.root / "runs" / f"{number}.json"
             value = _state.json.loads(path.read_text(encoding="utf-8"))
-            if value["started_at"] != started_at:
-                raise ValueError("Merge belongs to a superseded worker generation")
+            current = value["started_at"] == started_at
+            history = self.root / "runs.jsonl"
+            rows = list(read_jsonl(history))
+            if not current:
+                value = next((row for row in reversed(rows)
+                              if row["number"] == number and row["started_at"] == started_at), None)
+                if value is None:
+                    raise ValueError("Merge worker generation is unavailable")
+                value = dict(value)
             value["owner_merge"] = fact
             value["owner_merge_started_at"] = started_at
             value["merged_at"] = fact["merged_at"]
@@ -209,10 +230,9 @@ class RunRecordsMixin:
             value["review_pass_to_merge_seconds"] = (
                 (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
                 if passed else None)
-            self._write_json(path, value)
+            if current:
+                self._write_json(path, value)
             if value["status"] == "finished":
-                history = self.root / "runs.jsonl"
-                rows = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
                 if not any(row["number"] == number and row["started_at"] == started_at
                            and row.get("owner_merge") == fact
                            and row.get("owner_merge_started_at") == started_at for row in rows):
@@ -227,14 +247,13 @@ class RunRecordsMixin:
                 values.append(_state.json.loads(path.read_text()))
             except (OSError, ValueError):
                 continue  # Optional owner facts must not break readers of completed history.
-        return {(value["number"], value["started_at"]): _copy(value["owner_merge"]) for value in values
-                if _owner_fact_matches(value)}
+        return owner_facts_of(values)
 
     def run_merged(self, run: Run, *, owner_facts=None) -> bool:
         if run.outcome == "merged":
             return True
         facts = self.owner_merge_facts() if owner_facts is None else owner_facts
-        return (run.number, run.started_at) in facts
+        return record_merged({"number": run.number, "started_at": run.started_at}, facts)
 
     def active_runs(self) -> list[Run]:
         paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
@@ -336,8 +355,12 @@ class RunRecordsMixin:
         """When the gate merged each execution's PR, by (number, started_at).
 
         A record keeps the key of an earlier execution of the same issue until its
-        own merge replaces it, so a time before the execution's start is not its own."""
-        return self._history_times("merged_at")
+        own merge replaces it, so a time before the execution's start is not its own.
+        A recorded owner merge dates its own generation, also when only runs/<n>.json holds it."""
+        times = self._history_times("merged_at")
+        for key, fact in self.owner_merge_facts().items():
+            times[key] = fact["merged_at"]
+        return times
 
     def _history_times(self, key: str) -> dict[tuple[int, str], str]:
         times: dict[tuple[int, str], str] = {}
