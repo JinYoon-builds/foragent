@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from foragent.file_cache import read_jsonl
 from foragent import capacity, orch_facts_machine, orch_plan, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
@@ -26,19 +27,10 @@ def _time(value: Any) -> datetime | None:
 
 def _jsonl(path) -> list[dict[str, Any]]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError):
-        # A missing journal or a non-directory ancestor both mean no records exist.
+        return read_jsonl(path, tolerant=True)
+    except NotADirectoryError:
+        # A non-directory ancestor also means no records exist.
         return []
-    rows = []
-    for line in text.splitlines():
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
 
 
 def _seconds(value: Any) -> float | None:
