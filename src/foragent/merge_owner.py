@@ -17,7 +17,8 @@ import sys
 
 from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
-from foragent.git import main_write_lock
+from foragent.ci_workflow import read_exclusions
+from foragent.git import GitError, main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -276,6 +277,63 @@ def _reverify(ctx, place, job, git, head):
         ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"))
 
 
+def _measured_base(job):
+    """The base the head's CI measured; only proved neutral moves advance job["base"] past it."""
+    if job.get("comparison"):
+        return job["comparison"]["base_sha"]
+    return job.get("measured_base", job["base"])
+
+
+def _measurement(ctx, git, job, target):
+    """What the head's acceptance measurement ran: its base and the excluded locked files.
+
+    CI measures the selection the head's own trailer names (#521); the worker and
+    an owner refresh both commit it. Local checks record each capture in the shared
+    baseline cache instead, so a file counts as unmeasured only when every capture
+    on that base excluded it. A missing or unreadable record excludes nothing, so
+    every locked file then counts as verified and a move of it refreshes.
+    """
+    measured = _measured_base(job)
+    if ci_mode.enabled(ctx, target):
+        try:
+            excluded = read_exclusions(git, measured) or []
+        except (ValueError, GitError):
+            excluded = []
+        return SimpleNamespace(excluded=tuple(excluded), base_sha=measured)
+    repository, sets = str(ctx.repo_root.resolve()), []
+    for path in (ctx.store.root.parent / "baselines").glob("*.json"):
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(saved, dict) and saved.get("repository") == repository
+                and saved.get("base_sha") == measured):
+            names = saved.get("excluded")
+            sets.append(set(names) if isinstance(names, list) and all(isinstance(name, str) for name in names)
+                        else set())
+    return SimpleNamespace(excluded=tuple(sorted(set.intersection(*sets))) if sets else (), base_sha=measured)
+
+
+def _keep_head(ctx, place, job, git, approval, base):
+    """A result-neutral move keeps the PR head and its passed CI (#1688, #1860).
+
+    The run's own classifier judges every commit from the queued head to the new
+    base against the measurement that head's CI ran; nothing is merged or pushed,
+    only the accepted base moves.
+    """
+    measurement = _measurement(ctx, git, job, job["target"])
+    view = SimpleNamespace(n=place.n, ctx=ctx, git=git, approval=approval, baseline=measurement)
+    if not run_publish.base_move_is_neutral(view, run_publish.BaseMove(job["head"], base)):
+        return False
+    runner._append(ctx.store.log_path(place.n), f"{run_publish.REUSED}: {base}")
+    job["measured_base"] = measurement.base_sha
+    job["base"] = base
+    if job.get("comparison"):
+        job["comparison"] = asdict(load_record(ci_mode.ComparisonEvidence, job["comparison"]).follow(base))
+    _save(ctx, place, job)
+    return True
+
+
 def _advance(ctx, place, job, pr):
     n = place.n
     remote = pr.head_sha or ctx.tracker.pr_head_sha(pr.number)
@@ -314,12 +372,12 @@ def _advance(ctx, place, job, pr):
                 _save(ctx, place, job)
                 return
             base = git.ref_sha(f"origin/{pr.base}")
-            if base != job["base"]:
+            if base != job["base"] and not _keep_head(ctx, place, job, git, approval, base):
                 def before_push(head):
                     # A progress SHA alone is not a Git reachability root.
                     ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
                     job.update(phase="publishing", previous_head=job["head"], head=head,
-                               base=base, comparison=None, ready_at=ctx.now().timestamp())
+                               base=base, measured_base=base, comparison=None, ready_at=ctx.now().timestamp())
                     _save(ctx, place, job)
                     ctx.reads.clear()  # The following leased push changes the PR fact.
 
@@ -356,8 +414,13 @@ def _advance(ctx, place, job, pr):
                     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
                                               target_branch=pr.base, baseline=None, approval=approval,
                                               log=ctx.store.log_path(n))
+                    # Compare against the base CI measured, then follow it to a base
+                    # that only proved result-neutral moves advanced (#1860).
+                    measured = _measured_base(job)
                     comparison = ci_mode.require_comparison(attempt, pr.number, job["head"],
-                                                           base_sha=base, status=status, wait=False)
+                                                           base_sha=measured, status=status, wait=False)
+                    if comparison.base_sha != base:
+                        comparison = comparison.follow(base)
                     job["comparison"] = asdict(comparison)
                     _save(ctx, place, job)
             with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():

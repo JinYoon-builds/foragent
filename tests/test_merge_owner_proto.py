@@ -1249,3 +1249,147 @@ def test_forty_pending_admissions_read_each_github_fact_once(proto, monkeypatch)
                 or "/files?" in args[-1] or "/check-runs?" in args[-1] or "/actions/runs?" in args[-1]]
     assert len(ci_calls) == 80
     print("40 pending admissions: 200 gh calls total, 80 CI-related, no duplicate reads")
+
+
+def test_neutral_move_after_refresh_keeps_the_refreshed_heads_ci(proto):
+    """A refreshed head's CI measures the refresh base; a later bookkeeping move
+    follows that evidence instead of refreshing or waiting for a new round (#1860)."""
+    case = proto
+    queue_workers(case, [5])
+    pr = pr_for(case, 5).number
+    rounds = len(case.ci.by_head)
+    case.tracker.set_pr_checks(pr, "pending")
+    case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"}, message="Source")
+    gate(case)
+    refreshed = git_command(case.history.origin, "rev-parse", "refs/heads/foragent/issue-5")
+    case.history.update({"docs/specs/2026-11-04-later.md": "# Later\n"}, message="Bookkeeping")
+    gate(case)
+    assert git_command(case.history.origin, "rev-parse", "refs/heads/foragent/issue-5") == refreshed
+    case.tracker.set_pr_checks(pr, "pass")
+    drain(case, count=1)
+    assert case.tracker.merged_prs == [pr]
+    assert case.merges[-1]["head"] == refreshed
+    assert len(case.ci.by_head) == rounds + 1
+    assert git_command(case.history.origin, "show", "main:docs/specs/2026-11-04-later.md") == "# Later"
+
+
+def _remote_head(case, n):
+    return git_command(case.history.origin, "rev-parse", f"refs/heads/foragent/issue-{n}")
+
+
+def _edit_lock(case, path, *, reapprove):
+    """A comment-only main edit of a locked file; an order edit re-approves its owner."""
+    old = git_command(case.history.origin, "show", f"main:{path}")
+    case.history.update({path: old + "\n# comment-only change\n"}, message="Locked edit")
+    if reapprove:
+        git_command(case.root, "fetch", "origin")
+        approval = case.store.load_approval(1)
+        case.store.save_approval(1, body=approval.body, body_sha=approval.body_sha,
+                                 acceptance_blobs=case.git.blob_shas("origin/main", [path]),
+                                 approved_by=approval.approved_by, approved_at=approval.approved_at)
+
+
+@pytest.mark.parametrize("path, neutral", [
+    ("tests/acceptance/test_own_1.py", True),  # Excluded from the measurement: #1 is open and approved.
+    (contract.CONTRACT, False),  # The measurement ran it, so its change can change the result.
+])
+def test_locked_move_follows_the_heads_measured_exclusions(proto, path, neutral):
+    """The classifier reads the exclusions the head's CI measured with (#1860)."""
+    case = proto
+    queue_workers(case, [5])
+    pr = pr_for(case, 5).number
+    queued = _remote_head(case, 5)
+    rounds = len(case.ci.by_head)
+    case.tracker.set_pr_checks(pr, "pending")
+    _edit_lock(case, path, reapprove=neutral)
+    gate(case)
+    assert (_remote_head(case, 5) == queued) is neutral
+    case.tracker.set_pr_checks(pr, "pass")
+    drain(case, count=1)
+    assert case.tracker.merged_prs == [pr]
+    assert len(case.ci.by_head) == rounds + (0 if neutral else 1)
+
+
+def test_excluded_locked_move_after_a_refresh_keeps_the_refreshed_head(proto):
+    """The refreshed head carries its own measured exclusions; they still apply (#1860)."""
+    case = proto
+    queue_workers(case, [5])
+    pr = pr_for(case, 5).number
+    rounds = len(case.ci.by_head)
+    case.tracker.set_pr_checks(pr, "pending")
+    case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"}, message="Source")
+    gate(case)
+    refreshed = _remote_head(case, 5)
+    _edit_lock(case, "tests/acceptance/test_own_1.py", reapprove=True)
+    gate(case)
+    assert _remote_head(case, 5) == refreshed
+    case.tracker.set_pr_checks(pr, "pass")
+    drain(case, count=1)
+    assert case.tracker.merged_prs == [pr]
+    assert case.merges[-1]["head"] == refreshed
+    assert len(case.ci.by_head) == rounds + 1
+
+
+def test_a_lock_landed_by_an_earlier_neutral_move_is_judged_on_the_measured_base(proto):
+    """The measurement ran on its own base, not on the base a neutral move accepted:
+    a lock that only arrived later was never run, so its next edit stays neutral (#1860)."""
+    from foragent.issue import body_hash
+
+    case = proto
+    queue_workers(case, [5])
+    pr = pr_for(case, 5).number
+    queued = _remote_head(case, 5)
+    rounds = len(case.ci.by_head)
+    case.tracker.set_pr_checks(pr, "pending")
+    path = "tests/acceptance/test_order_602.py"
+    body = ("<!-- foragent:v1 -->\n## Goal\nLater order.\n## Out of scope\nNone.\n## Files\n"
+            f"- {path}\n## Done when\n```sh\npytest -q {path}\n```\n")
+    case.tracker.add_issue(602, "Later order", body)
+    case.tracker.record_label(602, "approved", "human")
+    for content in ("def test_order():\n    pass\n", "def test_order():\n    pass  # edited\n"):
+        case.history.update({path: content}, message="Order lock")
+        git_command(case.root, "fetch", "origin")
+        case.store.save_approval(602, body=body, body_sha=body_hash(body),
+                                 acceptance_blobs=case.git.blob_shas("origin/main", [path]),
+                                 approved_by="human", approved_at=case.clock[0].isoformat())
+        gate(case)
+        assert _remote_head(case, 5) == queued
+    case.tracker.set_pr_checks(pr, "pass")
+    drain(case, count=1)
+    assert case.tracker.merged_prs == [pr]
+    assert len(case.ci.by_head) == rounds
+
+
+@pytest.mark.parametrize("records, excluded", [
+    # Every capture on the measured base excluded test_a; only one excluded test_b.
+    ([["tests/acceptance/test_a.py", "tests/acceptance/test_b.py"], ["tests/acceptance/test_a.py"]],
+     ("tests/acceptance/test_a.py",)),
+    ([], ()),  # No recorded capture: nothing counts as unmeasured.
+])
+def test_local_checks_judge_moves_against_the_recorded_captures(tmp_path, monkeypatch, records, excluded):
+    """With checks: local the measurement is the shared baseline cache record (#1860)."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    store = StateStore(tmp_path / "state")
+    cache = tmp_path / "baselines"
+    cache.mkdir()
+    rows = [{"repository": str(root.resolve()), "base_sha": "measured", "excluded": names} for names in records]
+    rows += [{"repository": str(root.resolve()), "base_sha": "accepted", "excluded": []},
+             {"repository": str(tmp_path / "other"), "base_sha": "measured", "excluded": []}]
+    for index, row in enumerate(rows):
+        (cache / f"{index}.json").write_text(json.dumps(row))
+    ctx = SimpleNamespace(config=SimpleNamespace(checks="local"), repo_root=root, store=store)
+    seen = []
+
+    def classify(view, move):
+        seen.append((view.baseline.excluded, view.baseline.base_sha, move))
+        return True
+
+    monkeypatch.setattr(merge_owner.ci_mode, "enabled", lambda ctx, target: False)
+    monkeypatch.setattr(merge_owner.run_publish, "base_move_is_neutral", classify)
+    job = {"head": "head", "base": "accepted", "measured_base": "measured", "target": "main",
+           "comparison": None}
+    place = SimpleNamespace(n=5, started_at="2026-11-04T00:00:00+00:00")
+    assert merge_owner._keep_head(ctx, place, job, None, None, "later")
+    assert seen == [(excluded, "measured", merge_owner.run_publish.BaseMove("head", "later"))]
+    assert job["base"] == "later" and job["measured_base"] == "measured"
