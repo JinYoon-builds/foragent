@@ -24,3 +24,10 @@ jobs:
         env:
           FA_SHARD: ${{ matrix.shard }}
           FA_SHARDS: 4
+          FA_REPORT_FILE: ${{ runner.temp }}/unit-${{ matrix.shard }}.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-${{ matrix.shard }}
+          path: ${{ runner.temp }}/unit-${{ matrix.shard }}.xml
+          if-no-files-found: error
