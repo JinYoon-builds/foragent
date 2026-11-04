@@ -767,6 +767,20 @@ def test_init_push_ignores_origin_push_destination_override(setup):
     assert git_command(origin, "rev-parse", "main") == git_command(setup.root, "rev-parse", "HEAD")
 
 
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_setup_pushes_directly_during_a_merge_train(setup, merge_owner):
+    origin = setup.root.parent / "origin.git"
+    base = git_command(origin, "rev-parse", "main")
+    ref = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", ref, base)
+    (setup.root / ".foragent.yml").write_text(yaml.safe_dump({
+        "merge_owner": merge_owner, "test_command": "uv run pytest",
+    }))
+    assert setup.init().pushed
+    assert git_command(origin, "rev-parse", "main") == git_command(setup.root, "rev-parse", "HEAD") != base
+    assert git_command(origin, "rev-parse", ref) == base
+
+
 def test_rerun_recovers_rejected_push_without_another_commit(setup):
     setup.push_fails = True
     with pytest.raises(GitError, match="push rejected"):
