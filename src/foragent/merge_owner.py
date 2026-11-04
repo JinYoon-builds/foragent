@@ -7,6 +7,8 @@ Merge prerequisites still come from run_publish's fresh locked read.
 
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -56,7 +58,6 @@ def start(ctx, report):
 
 
 def run_process(request, lock_fd):
-    from datetime import UTC, datetime
     from foragent.config import Config
     from foragent.git import GitRepo
     from foragent.scheduler import TickReport
@@ -71,6 +72,8 @@ def run_process(request, lock_fd):
                                   GitRepo(root), lambda: datetime.now(UTC))
         owner.committed_config = request["committed_config"]
         report = TickReport()
+        if owner.config.merge_owner:
+            compact_queue(owner.store)
         # Reap under the independent owner lock, even during GitHub backoff.
         reap_checks(owner, report)
         if not owner.store.github_wait_until(owner.now()):
@@ -119,19 +122,74 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
             or inputs.base_sha == base and not inputs.comparison_current):
         raise AttemptFailure("Publication evidence changed before queue admission", target)
     place = queue.seat(ctx, n, target)
-    queue.join(ctx, place, head, merge_owner=True, publication={
+    job = {
         "pr": pr, "branch": branch, "target": target, "head": head,
         "base": base, "approval": asdict(approval), "ready_at": ready_at,
         "comparison": asdict(comparison) if comparison is not None else None,
         "authorization": ctx.merge_authorization,
         "phase": "waiting",
-    })
+    }
+    with ctx.store._state_lock():
+        if place.key not in queue._waiting(queue._rows(ctx.store), place.target):
+            # The durable evidence must exist before the admission becomes visible.
+            ctx.store._write_json(_path(ctx, n), {"started_at": place.started_at, **job})
+            publication = {key: value for key, value in job.items() if key != "comparison"}
+            queue._append(ctx.store, queue._row(ctx, place, "ready", head_sha=head,
+                                              merge_owner=True, publication=publication))
     ctx.tracker.remove_labels(n, [RUNNING, READY])
     return "merge-queued"
 
 
 def _path(ctx, n):
     return ctx.store.root / "merge-owner" / f"{n}.json"
+
+
+def compact_queue(store):
+    """Strip duplicated evidence only after finding it in the matching job.
+
+    Admission/append and compaction share state.lock. Keep a durable backup
+    before the store's fsynced temporary-file + replace publishes the rewrite.
+    Unchanged lines (including unreadable ones) retain their original bytes.
+    """
+    path = store.root / queue.QUEUE
+    with store._state_lock():
+        if not any(isinstance(row.get("publication"), dict)
+                   and row["publication"].get("comparison") is not None for row in queue._rows(store)):
+            return 0
+        with path.open(encoding="utf-8", newline="") as stream:
+            original = stream.read()
+        lines = []
+        stripped = 0
+        jobs = {}
+        # Match the universal-newline boundaries used by the queue reader.
+        for line in StringIO(original, newline=""):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                lines.append(line)
+                continue
+            publication = row.get("publication") if isinstance(row, dict) else None
+            if (isinstance(publication, dict) and publication.get("comparison") is not None
+                    and isinstance(row.get("n"), int) and "started_at" in row):
+                n = row["n"]
+                if n not in jobs:
+                    try:
+                        jobs[n] = json.loads((store.root / "merge-owner" / f"{n}.json").read_text())
+                    except (OSError, ValueError):
+                        jobs[n] = None
+                job = jobs[n]
+                if (isinstance(job, dict) and "started_at" in job and job["started_at"] == row["started_at"]
+                        and job.get("comparison") is not None):
+                    del publication["comparison"]
+                    line = json.dumps(row) + "\n"
+                    stripped += 1
+            lines.append(line)
+        if stripped:
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+            store._atomic_write(path.with_name(f"{queue.QUEUE}.bak-{timestamp}"), original)
+            store._atomic_write(path, "".join(lines))
+            queue.invalidate(path)
+        return stripped
 
 
 def _save(ctx, place, job):
@@ -181,7 +239,10 @@ def _load(ctx, place, row):
         job = json.loads(_path(ctx, place.n).read_text())
     except FileNotFoundError:
         job = {}
-    return job if job.get("started_at") == place.started_at else dict(row["publication"])
+    if "started_at" in job and job["started_at"] == place.started_at:
+        return {**job, "comparison": job.get("comparison")}
+    # Queue metadata can reconstruct the job, but never supplies comparison evidence.
+    return {**row["publication"], "comparison": None}
 
 
 def _end(ctx, place, job, phase):
@@ -351,7 +412,7 @@ def _advance(ctx, place, job, pr):
                 raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
             comparison = None
             if ci_mode.enabled(ctx, pr.base):
-                comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job["comparison"] else None
+                comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job.get("comparison") else None
                 if comparison is None or not comparison.current(n, ctx, git, pr.number, job["head"], base, status):
                     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
                                               target_branch=pr.base, baseline=None, approval=approval,
