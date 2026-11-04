@@ -376,6 +376,43 @@ def test_fetch_stops_on_a_different_error_after_a_ref_race(tmp_path, monkeypatch
     assert calls == [["fetch", "upstream", "+refs/heads/release/v1:refs/remotes/upstream/release/v1"]] * 2
 
 
+@pytest.mark.parametrize("race", [
+    "error: fetching ref refs/remotes/origin/main failed: incorrect old value provided\n",
+    "error: cannot lock ref 'refs/remotes/origin/main': is at aac3d2a81b3dcded9b1fcc8663e72cc4d255c7c7 "
+    "but expected c9f227ac8ef53cf0bcdf7abcb9b55676b8f09206\n ! c9f227a..aac3d2a  main -> origin/main  "
+    "(unable to update local ref)\n",
+], ids=["old-value", "is-at-but-expected"])
+def test_fetch_retries_each_git_wording_of_a_concurrent_ref_update(git_history, monkeypatch, race):
+    calls = []
+    monkeypatch.setattr("foragent.git.time.sleep", lambda _: None)
+    git_history.update({"moving.txt": "new remote tip\n"})
+
+    def run(args):
+        if args[:1] == ["fetch"]:
+            calls.append(args)
+            if len(calls) == 1:
+                raise subprocess.CalledProcessError(1, ["git", *args], stderr=race)
+        return git_command(git_history.clone, *args)
+
+    GitRepo(git_history.clone, run).fetch("origin", "main")
+    assert len(calls) == 2
+    assert git_command(git_history.clone, "rev-parse", "refs/remotes/origin/main") == git_history.tip
+
+
+def test_fetch_does_not_retry_a_lock_error_without_a_moved_ref(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("foragent.git.time.sleep", lambda _: None)
+    stale = "error: cannot lock ref 'refs/remotes/origin/main': Unable to create '.git/refs/remotes/origin/main.lock': File exists.\n"
+
+    def run(args):
+        calls.append(args)
+        raise subprocess.CalledProcessError(1, ["git", *args], stderr=stale)
+
+    with pytest.raises(GitError):
+        GitRepo(tmp_path, run).fetch("origin", "main")
+    assert len(calls) == 1
+
+
 def test_commit_before_selects_approval_time_history(git_history):
     git = GitRepo(git_history.clone)
     initial = git_history.tip

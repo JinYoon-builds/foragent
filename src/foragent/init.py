@@ -12,7 +12,7 @@ import sys
 
 import yaml
 
-from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills
+from foragent import board, gh, lane_memory, launchd, role_agents, roles, session_skills, setup
 from foragent.ci_workflow import LEGACY_PUBLISH_WORKFLOW, WORKFLOW, initial_checks, obsolete_workflow_paths, workflow_text, write_workflow
 from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate, load_config, load_global_config
 from foragent.git import GitError, GitRepo, main_write_lock
@@ -120,7 +120,8 @@ class InitReport:
 
 
 def _run_gh(args: list[str], input: str | None = None) -> str:
-    return gh.run(args, input=input, check=True, capture_output=True, text=True).stdout
+    result = gh.run(args, input=input, check=True, capture_output=True, text=True)
+    return result.stdout + "\n" + result.stderr if args == ["auth", "status"] else result.stdout
 
 
 def _gh_call(run: Callable[..., str], args: list[str]) -> str:
@@ -277,12 +278,16 @@ def init_repo(
         raise GitError(text(key, preflight_language, error=exc)) from exc
     run = gh_run or _run_gh
     try:
-        run(["auth", "status"], input=None)
+        auth_status = run(["auth", "status"], input=None)
     except (OSError, subprocess.CalledProcessError) as exc:
         # OSError: gh cannot be started (not installed); non-zero exit: not logged in.
         message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
         key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
         raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
+
+    fixes = [item["fix"] for item in setup.checklist(auth_status) if not item["ok"]]
+    if fixes:
+        raise TrackerError(text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes)))
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}

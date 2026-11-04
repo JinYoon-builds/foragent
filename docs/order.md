@@ -178,3 +178,23 @@ and body it wrote as the next base, before labels, links or comments are updated
 If a later publication step fails, retrying can continue from those writes. The local `.foragent/order-observed.json` stores these
 observations by plan id and issue number. Legacy targets without a recorded base
 publish as before. Labels, comments and native dependency edges are not compared.
+
+Before the first write, `fa order publish` (with or without `--approve`, and with
+`--dry-run`), `--defer`, `fa order preread` and flush run a collection check. It
+collects the order's acceptance files in a temporary copy of the current base plus
+only those files, using the project's test command. An import or collection error
+refuses publication and names the file and the error. A test that collects but fails
+still publishes. If the check cannot run (no base, no test command, runner missing,
+or timeout), publication is refused as unavailable. The same check also runs the
+test files that import a changed locked test file by a literal import statement. If
+such a test passes on the base and breaks with the order's files, publication is
+refused and that test is named. Tests that already fail on the base are ignored.
+Dynamic or indirect imports are not checked.
+
+Run `fa order red PLAN.json` before preread to check that each lane's test draft
+fails on the fetched base for a real reason. It changes no files and no GitHub state.
+
+Preread shows each lane's expected change size (source lines, test lines and files),
+or `size: unknown` when the lane gave no estimate. An estimate above the size label
+limit is a note for the person, not a refusal. After merge, `fa order sizes --json`
+compares the expected size with the real size.

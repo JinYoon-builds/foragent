@@ -19,6 +19,8 @@ from test_order_machine_budget import fake_workloads  # noqa: F401
 from test_review_pass_scope import (
     FIRST_FINDING, NEW_FINDING, OLD_FINDING, PASS, capture_review, case_for, content, implement,
 )
+from foragent.review_perspectives import DEFAULT_PERSPECTIVES
+from runner_support import GROUNDED_SCORE, scoring_request
 from test_review_perspectives import review_offline  # noqa: F401
 from test_risk_map import entry, offline  # noqa: F401
 from test_skills_autosync import isolated_home  # noqa: F401
@@ -42,7 +44,7 @@ def passed_case(git_history, tmp_path, monkeypatch, **settings):
     """One published PASS held open for a person, ready for review_only in a new store."""
     case = case_for(git_history, tmp_path, monkeypatch, review="careful", **settings)
     case.implementer.steps = [implement(content())]
-    capture_review(case, [PASS] * 5)  # A mapped change also needs its perspectives and merger.
+    capture_review(case, [PASS] * (len(DEFAULT_PERSPECTIVES) + 1))  # A mapped change also needs its perspectives and merger.
     assert run_issue(1, case.ctx) == "pr-open"
     case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now),
                        config=replace(case.ctx.config, review="fast"))
@@ -159,6 +161,16 @@ def test_only_a_real_reviewer_pass_makes_a_boundary(git_history, tmp_path, monke
 CONFIRMING = "Limit this review to confirming"
 
 
+def scored(texts):
+    """Reviewer replies in order; every scoring session (#1651) grounds the scripted FAIL instead."""
+    texts = iter(texts)
+
+    def reply(call):
+        return GROUNDED_SCORE if scoring_request(call["prompt"]) else next(texts)
+
+    return [reply] * 32
+
+
 def anchored_case(git_history, tmp_path, monkeypatch, *, replies=("VERDICT: FAIL\n" + FIRST_FINDING, PASS), **settings):
     """FAIL then PASS on one body, published and held open, ready for review_only after a restart."""
     case = case_for(git_history, tmp_path, monkeypatch, review="careful", review_max=1, **settings)
@@ -173,7 +185,7 @@ def anchored_case(git_history, tmp_path, monkeypatch, *, replies=("VERDICT: FAIL
 def test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence(git_history, tmp_path, monkeypatch):
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"], pass_scope_exempt=True)])})
     # A mapped first review is a panel: four perspectives and a merger.
-    case = anchored_case(git_history, tmp_path, monkeypatch, replies=["VERDICT: FAIL\n" + FIRST_FINDING] * 5 + [PASS])
+    case = anchored_case(git_history, tmp_path, monkeypatch, replies=scored(["VERDICT: FAIL\n" + FIRST_FINDING] * (len(DEFAULT_PERSPECTIVES) + 1) + [PASS]))
     head = case.tracker.pr_head_sha(2)
     exempt = capture_review(case, ["VERDICT: PASS"])
     review_only(1, case.ctx)
