@@ -1571,6 +1571,34 @@ def test_tracker_rejects_damaged_or_ambiguous_artifacts(damage):
         GhTracker('owner/repo', damaged).pr_acceptance_reports('head')
 
 
+@pytest.mark.parametrize('workflow', [WORKFLOW, '.github/workflows/foragent-acceptance-extra.yaml'])
+@pytest.mark.parametrize('main_changed,pr_changed', [(True, False), (False, True), (True, True)],
+                         ids=['main-only', 'pr-only', 'both'])
+def test_changed_workflows_only_counts_pr_changes(git_history, workflow, main_changed, pr_changed):
+    from conftest import git_command
+    from foragent.ci_mode import changed_workflows
+    from foragent.git import GitRepo
+
+    git_history.update({workflow: 'name: original\n'})
+    base = git_history.tip
+    pr_files = {'feature.txt': 'PR change\n'}
+    if pr_changed:
+        pr_files[workflow] = 'name: updated\n'
+    git_history.update(pr_files)
+    head = git_history.tip
+
+    git_command(git_history.origin, 'update-ref', 'refs/heads/main', base)
+    git_history.tip = base
+    main_files = {'main.txt': 'Main change\n'}
+    if main_changed:
+        # Identical edits on both branches still count as the PR's own change.
+        main_files[workflow] = 'name: updated\n'
+    git_history.update(main_files)
+
+    changed = changed_workflows(GitRepo(git_history.origin), git_history.tip, head)
+    assert changed == (workflow + '\0' if pr_changed else '')
+
+
 def test_trusted_workflow_revision_uses_repository_default_branch():
     from foragent.ci_mode import _trusted_sha
     from foragent.tracker import GhTracker

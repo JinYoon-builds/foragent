@@ -626,7 +626,7 @@ def test_target_workflow_change_retires_train_without_spending_members(batched, 
     base, _ = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert base != case.history.tip
     retirement, = batch.retirements(case.ctx)
-    assert "prefix acceptance workflow differs" in retirement["reason"]
+    assert retirement["reason"] == "member head or target changed"
     assert retirement["spent"] == []
     assert not case.target_pushes and not case.merges and not refs(case)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
