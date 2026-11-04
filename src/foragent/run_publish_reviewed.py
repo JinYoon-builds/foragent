@@ -14,6 +14,14 @@ if TYPE_CHECKING:
     from foragent.state import Approval
 
 
+def push_refresh(ctx: RunContext, n: int, git: GitRepo, branch: str, lease: str, head: str) -> None:
+    """The one leased refresh push; GitHub server errors wait with this head and lease."""
+    from foragent import orch_github
+
+    orch_github.wait_out_push(ctx, n, lambda: git.push_head(branch, lease=lease),
+                              head=head, lease=lease, branch=branch, kind="refresh")
+
+
 def _reviewed_base_changed(n: int, ctx: RunContext, pr) -> str:
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
     run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
@@ -60,7 +68,7 @@ def _refresh_reviewed_head(
     run_publish._check_publication(git, pr.base, target_sha)
     if before_push is not None:
         before_push(new_head)
-    git.push_head(pr.head, lease=head)
+    push_refresh(ctx, n, git, pr.head, head, new_head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
     if ctx.tracker.pr_head_sha(pr.number) != new_head:
