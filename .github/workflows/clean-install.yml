@@ -1,0 +1,26 @@
+name: clean-install
+# Run the checked-out install.sh on clean runners (no uv set up beforehand), then `fa doctor`.
+# No logins and no secrets: Claude Code is not on these runners, so the plugin step only prints how to register it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run install.sh from this checkout
+        run: sh ./install.sh --yes
+        env:
+          FORAGENT_SOURCE: ${{ github.workspace }}
+      - name: Second run changes nothing and still succeeds
+        run: sh ./install.sh --yes
+        env:
+          FORAGENT_SOURCE: ${{ github.workspace }}
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: fa doctor
