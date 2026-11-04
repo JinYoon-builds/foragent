@@ -106,7 +106,7 @@ def test_exceeding_review_max_opens_pr_with_risk_high_hold(run_case, review_max,
     assert run_issue(1, c.ctx) == "held"
     assert len(c.tracker.created_prs) == 1 and not c.tracker.merged_prs
     assert c.store.get_run(1).attempts == rounds
-    assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+    assert c.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
     comment = c.tracker.list_comments(1)[-1].body
     assert f"Reviewer still found defects after {rounds} rounds" in comment
     assert finding in comment and "https://github.com/owner/repo/pull/2" in comment
