@@ -117,16 +117,33 @@ def test_lane_view_d76_bubble_reads_processing_request_and_stops_showing_it_afte
     assert case.gh_calls == []
 
 
-def test_lane_view_d76_request_line_counts_processing_and_done_and_is_absent_for_empty_box(
-    tmp_path, monkeypatch, capsys,
+
+def test_lane_view_d76_dashboard_bubble_names_the_processing_request_after_a_tick(
+    git_history, tmp_path, monkeypatch, capsys,
 ):
-    case = lane_d76_case(tmp_path, monkeypatch)
-    assert "요청 " not in plain_frame(lane_d76_frame(case))
-    for index, status in enumerate(("processing", "done", "new", "processing")):
-        row = add_request(case, capsys, f"요청 {index}")
-        if status != "new":
-            assert inbox_command(case, "request-status", str(row["id"]), status) == 0
-    frame = plain_frame(lane_d76_frame(case))
-    line = "요청 2개 처리 중 · 1개 끝"
-    assert line in frame and frame.count(line) == 1
-    assert case.gh_calls == []
+    """The printed dashboard (`fa gate watch --once`, fed by the gate's tick) names the
+    planning request being handled, once, and drops it when the request is done."""
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+    from test_view_status import status_case
+
+    case, main = status_case(git_history, tmp_path, monkeypatch, language="ko")
+    root = ["--repo-root", str(case.root)]
+
+    def dashboard():
+        tick(tick_context(case, start_runs=False))
+        capsys.readouterr()
+        assert main(["gate", "watch", "--once", *root]) == 0
+        return plain_frame(capsys.readouterr().out)
+
+    assert main(["orch", "request", "--from", "planning", "--text", "D75", *root]) == 0
+    capsys.readouterr()
+    assert main(["orch", "inbox", "--json", *root]) == 0
+    import json
+    request = [row for row in json.loads(capsys.readouterr().out) if row["text"] == "D75"][-1]
+    text = "기획 세션 요청: D75"
+    assert text not in dashboard()
+    assert main(["orch", "request-status", str(request["id"]), "processing", *root]) == 0
+    assert dashboard().count(text) == 1, "the dashboard bubble must name the processing request"
+    assert main(["orch", "request-status", str(request["id"]), "done", *root]) == 0
+    assert text not in dashboard()
