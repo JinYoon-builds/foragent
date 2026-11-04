@@ -254,3 +254,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1040 (D58 skill lifecycle) next edit: add evidence from PM r510/r514 — 236-skill catalog buries relevant ones; PRs 1830 1814 1813 1864 1863 report "Skills used: none".
 - New machine: no orca codex-accounts dir; rerun-review uses default ~/.codex (the c7c83cab export is obsolete).
 - #1873 (PM r532, Jin): when retrying after #1833, first edit its Goal: purpose is reviewing human-written branches and external contributors' PRs with the full panel (open source), not PM out-of-lane work; lower priority.
+- After #1914 (fa orch close) merges: fa orch close 1860 --superseded-by 1882 --why 'PM r531: #1882 replaced the exclusion-record classifier'.
