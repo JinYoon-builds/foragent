@@ -27,8 +27,8 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
 2. **Brief.** Run `FORAGENT_UPDATE_CHECK=off fa brief --json` in the project folder for the
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
-   - If it prints `"setup": false` (no config in this folder), run
-     `fa doctor --setup --json` before the init interview. Read the `items` array
+   - If it prints `"setup": false` (no config in this folder), follow the init flow
+     below. Run `fa doctor --setup --json` before the init interview. Read the `items` array
      top to bottom in the returned order; the JSON is the shared setup checklist.
      A nonzero exit with checklist JSON means setup needs attention.
      - For each failing install item, show its exact `fix` for this OS. Ask whether
