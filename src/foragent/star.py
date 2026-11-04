@@ -20,6 +20,7 @@ from typing import Any, Iterator
 from foragent import capacity, gh
 from foragent.brief import STAR_PROMPT_MERGE_THRESHOLD
 from foragent.i18n import text
+from foragent.state_runs import owner_facts_of, record_merged
 
 FORAGENT_REPO = "JinYoon-builds/foragent"
 RECORD = "star-prompt.json"
@@ -80,12 +81,20 @@ def local_merges(root: Path | None = None) -> int:
             lines = history.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
+        runs = []
         for line in lines:
             try:
-                run = json.loads(line)
+                runs.append(json.loads(line))
             except ValueError:
                 continue
-            if isinstance(run, dict) and run.get("outcome") == "merged" and isinstance(run.get("number"), int):
+        for path in (history.parent / "runs").glob("[0-9]*.json"):
+            try:
+                runs.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue  # A run record being rewritten adds nothing its history row lacks.
+        owner_facts = owner_facts_of(runs)
+        for run in runs:
+            if record_merged(run, owner_facts):
                 merged.add((history.parent.name, run["number"]))
     return len(merged)
 

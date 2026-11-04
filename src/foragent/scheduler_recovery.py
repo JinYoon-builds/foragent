@@ -127,6 +127,27 @@ def _restore_after_crash(ctx: TickContext, issue: Issue, report: TickReport) -> 
                      "Runner crashed; returned to ready for restart.")
 
 
+def _waits_on_owner(ctx: TickContext, run: Run, report: TickReport, *, finish: bool) -> bool:
+    """A recorded owner admission of this generation waits on the merge owner: never a crash.
+
+    The admission is a store fact, read here after the caller's run read, so a worker that
+    handed off after any earlier check is still seen; the merge_owner switch does not matter."""
+    from foragent.merge_owner import pending
+
+    if not pending(ctx.store, run.number):
+        return False
+    ctx.git.remove_worktree(Path(run.worktree))
+    if finish:
+        ctx.store.finish_run(run.number, outcome="merge-queued")
+    try:
+        ctx.tracker.remove_labels(run.number, [scheduler.RUNNING, scheduler.READY])
+    except TrackerError as exc:
+        # The durable admission keeps ownership. Owner reconciliation
+        # retries stale worker labels without blocking other admissions.
+        report.actions.append(f"#{run.number} admitted worker label cleanup deferred: {exc}")
+    return True
+
+
 def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue:
     issue = scheduler._local_issue(ctx, issue.number) or issue
     run = ctx.store.get_run(issue.number)
@@ -141,11 +162,14 @@ def _recover_orphan(ctx: TickContext, issue: Issue, report: TickReport) -> Issue
         ctx.store.clear_run_start(issue.number)
     if scheduler.RUNNING not in issue.labels or (run is not None and run.status == "running"):
         return issue
+    if run is not None and _waits_on_owner(ctx, run, report, finish=False):
+        report.actions.append(f"#{issue.number} running label left by a worker the merge owner admitted")
+        return ctx.tracker.get_issue(issue.number)
     scheduler._remove_run_worktree(
         ctx, issue.number, scheduler.Path(run.worktree) if run is not None else ctx.store.worktree_path(issue.number),
         report, outcome=(run.outcome or "crashed") if run is not None else "crashed",
     )
-    if run is not None and (ctx.store.run_merged(run) if getattr(ctx.config, "merge_owner", False) else run.outcome == "merged"):
+    if run is not None and ctx.store.run_merged(run):
         ctx.tracker.remove_labels(issue.number, [scheduler.READY, scheduler.RUNNING])
         return ctx.tracker.get_issue(issue.number)
     if run is not None and run.outcome == "limit-wait":
@@ -259,19 +283,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:
     if registered_since(ctx, run):  # The runner registered or progressed during the stop.
         return
-    if getattr(ctx.config, "merge_owner", False) and run.kind == "issue":
-        from foragent.merge_owner import pending
-
-        if pending(ctx.store, run.number):
-            ctx.git.remove_worktree(Path(run.worktree))
-            ctx.store.finish_run(run.number, outcome="merge-queued")
-            try:
-                ctx.tracker.remove_labels(run.number, [scheduler.RUNNING, scheduler.READY])
-            except TrackerError as exc:
-                # The durable admission keeps ownership. Owner reconciliation
-                # retries stale worker labels without blocking other admissions.
-                report.actions.append(f"#{run.number} admitted worker label cleanup deferred: {exc}")
-            return
+    if run.kind == "issue" and _waits_on_owner(ctx, run, report, finish=True):
+        return
     outcome = (run.outcome or "crashed") if run.kind == "issue" else "error"  # A dead dream: error, no labels.
     if run.executor_pgid is not None:
         ctx.store.update_run(run.key, executor_pgid=None)
