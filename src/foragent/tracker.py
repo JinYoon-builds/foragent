@@ -1105,6 +1105,7 @@ class GhTracker:
         self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
+        self._checks_started: dict[int, datetime | None] = {}
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
         try:
@@ -1483,9 +1484,14 @@ class GhTracker:
         ]))
         return next((item["number"] for item in data), None)
 
+    def pr_checks_started(self, pr: int) -> datetime | None:
+        """Earliest actual start in the last checks listing; never makes a GitHub call."""
+        return self._checks_started.get(pr)
+
     def pr_checks(self, pr: int) -> CheckStatus:
+        self._checks_started[pr] = None
         try:
-            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link"])
+            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
@@ -1494,11 +1500,18 @@ class GhTracker:
             try:
                 if exc.returncode not in {1, 8} or not exc.stdout.strip():
                     raise ValueError("not a checks exit")
-                buckets = {item["bucket"] for item in _items(exc.stdout)}
+                items = _items(exc.stdout)
+                buckets = {item["bucket"] for item in items}
             except (TrackerError, ValueError, TypeError, KeyError):
                 raise exc from exc.__cause__
         else:
-            buckets = {item["bucket"] for item in _items(output)}
+            items = _items(output)
+            buckets = {item["bucket"] for item in items}
+        starts = [when for item in items
+                  if item.get("state") != "QUEUED"
+                  and (when := _parse_time(item.get("startedAt"))) is not None
+                  and when.year > 1]
+        self._checks_started[pr] = min(starts, default=None)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
