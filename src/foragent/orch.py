@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 import time
 import xml.etree.ElementTree as ET
 
-from foragent import capacity, orch_advice, orch_inbox, orch_seat
+from foragent import capacity, orch_advice, orch_inbox, orch_seat, orch_stop
 from foragent import run_merge_turn as merge_turn
 from foragent.git import GitError, PublicationError
 from foragent.kick import kick_tick
@@ -22,7 +22,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.order import detect_test_commands
 from foragent.orch_events import append_event
 from foragent.orch_reinstall import after_merge
-from foragent.orch_stop import stop  # noqa: F401 - `fa orch stop` (orch_stop.py)
+from foragent.orch_stop import release, stop, stop_all  # noqa: F401 - `fa orch stop [--all]`, `fa orch release`
 from foragent.processes import claude_session, run_logged
 from foragent.reasons import current_blocker
 from foragent.run_attempt import AttemptFailure
@@ -687,9 +687,11 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
                 ctx, n, title=_merge_title(ctx, current), current_title=current.title, base=current.base,
                 body=lambda: merge_retitle_body(current.head, ctx), note=print,
             )
-            merge_turn.record_turn(ctx, place, checked.base, "merged")
+            refused = lambda why: OrchError(orch_stop.text("orch_stop_merge_refused", ctx.config.language, n=n, why=why))  # noqa: E731
             try:
-                ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
+                with orch_stop.merging(ctx, n, refused):  # No merge during a project stop (#1491).
+                    merge_turn.record_turn(ctx, place, checked.base, "merged")
+                    ctx.tracker.merge_pr(n, expected_head_sha=checked.head, **subject)
             except TrackerError:
                 merge_turn.record_turn(ctx, place, checked.base, "failed")
                 raise

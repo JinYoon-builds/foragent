@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, runner
+from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
@@ -38,6 +38,8 @@ def start(ctx, report):
     if (not getattr(ctx.config, "merge_batch", False) and not admissions(ctx.store)
             and not any((ctx.store.root / "merge-owner").glob("*.json"))):
         return
+    if orch_stop.active(ctx.store) is not None:
+        return  # A project stop starts no owner process; its queued jobs wait for the release (#1491).
     lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
     if lock is None:
         return
@@ -401,6 +403,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 runner._append(ctx.store.log_path(n), f"{REUSED}: {base}")
             if needs_proof and not neutral:
                 def before_push(head):
+                    if (why := orch_stop.active(ctx.store)) is not None:
+                        orch_stop.halt(ctx, n, why)  # A stop during the refresh checks pushes nothing.
                     # A progress SHA alone is not a Git reachability root.
                     ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
                     job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
@@ -476,9 +480,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                         current_title=pr.title, base=pr.base, body=lambda: pr.body,
                         note=lambda line: runner._append(ctx.store.log_path(n), line),
                     )
-                    job.update(phase="merging", merge_base=base)
-                    _save(ctx, place, job)
-                    ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
+                    with orch_stop.merging(ctx, n):  # Under a stop the job stays queued for the release (#1491).
+                        job.update(phase="merging", merge_base=base)
+                        _save(ctx, place, job)
+                        ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
             if ready:
                 with ctx.reads.fresh():
                     _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
@@ -505,9 +510,10 @@ def _try_admission(ctx, place, job, step):
             return False
     except (ci_mode.MissingComparison, ci_mode.StaleComparison):
         return False  # No waiting process or arbitrary healthy-run wait limit.
-    except ExecutorStopped:
-        _end(ctx, place, job, "held")
-        return False
+    except ExecutorStopped as exc:
+        if exc.outcome != "stopped":
+            _end(ctx, place, job, "held")
+        return False  # A project stop keeps the job queued for after the release (#1491).
     except Exception as exc:
         if isinstance(exc, TrackerError):
             if exc.waits:
