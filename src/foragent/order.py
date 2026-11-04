@@ -20,6 +20,7 @@ from foragent import order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
+from foragent.main_write import push_base
 from foragent.i18n import text
 from foragent.inspect_data import DECISION_MARKER, comment_key, has_marker, latest_flag
 from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
@@ -552,7 +553,7 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     if missing:
         raise PlanError(f"published commit is missing files: {', '.join(sorted(missing))}")
     # Also retry a previously failed push when the files already match HEAD.
-    git.push_base(config.base_branch)
+    push_base(git, config)
     return published_blobs
 
 

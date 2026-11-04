@@ -697,6 +697,30 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
     assert publishing[2].issues == {}
 
 
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_immediate_order_waits_for_merge_train_and_retries(offline_publication, plan, merge_owner):
+    root, config, tracker, git, calls, origin = offline_publication
+    config = replace(config, merge_owner=merge_owner)
+    base = git_command(origin, "rev-parse", "main")
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
+
+    if merge_owner:
+        for attempt in range(2):
+            with pytest.raises(GitError, match="waiting for merge train"):
+                order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+            assert tracker.issues == {} and not any(args[0] == "push" for args in calls)
+            assert git_command(origin, "rev-parse", "main") == base
+            if attempt == 0:
+                committed = git.head_sha()
+                assert committed != base
+            assert git.head_sha() == committed
+        git_command(origin, "update-ref", "-d", train)
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert git_command(origin, "rev-parse", "main") == git.head_sha()
+    assert tracker.issues
+
+
 @pytest.mark.parametrize("options,approved", [
     ({}, set()), ({"approve": True}, {5, 6, 3}),
     ({"approve_keys": ["client"]}, {6}), ({"approve_numbers": [3]}, {3}),
