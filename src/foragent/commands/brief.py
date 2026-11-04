@@ -8,6 +8,7 @@ ORDER = 150
 def add(commands) -> None:
     cli = facade()
     briefing = commands.add_parser("brief", help="Show the start-of-session facts for planning")
+    briefing.set_defaults(pm_task="see the state")
     briefing.add_argument("--json", action="store_true")
     briefing.add_argument("--report", action="store_true",
                           help="Print one report of what finished since the previous report, and record it")

@@ -26,6 +26,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
+from foragent.main_write import wait_for_merge_train
 from foragent.order_files import check_destinations, check_write, issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -868,6 +869,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             defer: str | None = None, urgent: bool = False) -> PublishReport:
     waiting = defer is not None and not urgent and not plan.get("new_lanes")
+    if config.merge_owner and not dry_run and not waiting:
+        git = git or GitRepo(root)
+        # Let the train take the shared write lock, then read publication's mutable facts.
+        wait_for_merge_train(git, config)
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,

@@ -1074,3 +1074,75 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
     log = c.store.log_path(1).read_text()
     assert "retitle failed" in log and "HTTP 500" in log
+
+
+@pytest.mark.parametrize("queued,running,budget,fallback,outcome,elapsed,polls", [
+    (1800, 600, 20000, False, None, 2400, 20),
+    (None, None, 20000, False, "timeout", 10800, 0),
+    (0, None, 20000, False, "timeout", 1200, 40),
+    (-600, None, 20000, False, "timeout", 1200, 40),
+    (1800, None, 20000, False, "timeout", 3000, 40),
+    (None, None, 600, False, "work-budget", 600, 0),
+    (None, None, 20000, True, None, 10800, 0),
+])
+def test_ci_wait_counts_running_time_and_keeps_work_budget(
+    tmp_path, monkeypatch, queued, running, budget, fallback, outcome, elapsed, polls,
+):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+
+    clock, flags = [BASE_TIME], []
+    start = BASE_TIME.timestamp()
+    def seconds():
+        return clock[0].timestamp() - start
+    def sleep(value):
+        clock[0] += timedelta(seconds=value)
+    def started(pr):
+        return BASE_TIME + timedelta(seconds=queued) if queued is not None and seconds() >= queued else None
+    def checks(pr):
+        return "pass" if running is not None and seconds() >= queued + running else "pending"
+    tracker = SimpleNamespace(pr_checks=checks, pr_checks_started=started, pr_head_sha=lambda pr: "head")
+    ctx = SimpleNamespace(tracker=tracker, now=lambda: clock[0], sleep=sleep, repo="owner/repo",
+                          config=SimpleNamespace(checks_fallback="local" if fallback else "none"))
+    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: budget - seconds())
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_publish, "flag", lambda *args: flags.append(args))
+    monkeypatch.setattr(run_publish, "_timeout", lambda *args: "work-budget")
+    wait = run_publish._CIWait(start)
+    result = run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", start, wait,
+                                      lambda: pytest.fail("pending CI is not a code failure"), comparison_mode=fallback)
+    assert result == outcome
+    assert seconds() == elapsed
+    assert wait.polls == polls
+    assert bool(flags) == (outcome == "timeout")
+    if outcome == "timeout":
+        assert ("never left the queue" if queued is None else "ran past") in flags[0][-1]
+    if running is not None:
+        assert wait.deadline == start + queued + 1200  # also passed to acceptance comparison
+    if fallback:
+        assert wait.infrastructure
+
+
+def test_ci_wait_running_deadline_obeys_queue_ceiling():
+    from foragent.run_publish_ci import _CIWait
+
+    wait = _CIWait(100, queue_aware=True, running_since=100)
+    assert wait.deadline == 1300
+    wait.running_since = 100 + 10700
+    assert wait.deadline == 100 + 10800
+
+
+@pytest.mark.parametrize("status", ["pass", "none"])
+def test_finished_checks_without_start_metadata_keep_the_comparison_window(monkeypatch, status):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+
+    start = BASE_TIME.timestamp()
+    ctx = SimpleNamespace(repo="owner/repo", now=lambda: BASE_TIME,
+                          tracker=SimpleNamespace(pr_checks_started=lambda pr: None,
+                                                  pr_head_sha=lambda pr: "head"))
+    monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    wait = run_publish._CIWait(start)
+    assert run_publish._wait_for_ci(1, ctx, None, 2, "head", start, wait, pytest.fail, status=status) is None
+    assert wait.deadline == start + 1200
