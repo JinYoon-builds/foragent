@@ -151,6 +151,17 @@ def _processing_since(row: dict):
     return _parse_at(selected)
 
 
+def new_requests(rows: list[dict]) -> list[tuple[dict, datetime | None]]:
+    """Untaken orchestrator requests, once per id, oldest first; unreadable times last."""
+    selected, seen = [], set()
+    for row in rows:
+        if row.get("status") != "new" or row.get("from") != "orchestrator" or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        selected.append((row, _parse_at(row.get("created_at"))))
+    return sorted(selected, key=lambda item: (item[1] is None, item[1]))
+
+
 def stalled(rows: list[dict], now: datetime) -> tuple[list[tuple[dict, datetime]], list[str]]:
     """Processing requests stuck over STALL_AFTER, oldest first, with when each entered processing.
 
@@ -330,8 +341,8 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     """Box facts for a planning turn, and a note for each part that could not be read.
 
     Only a planning session in the bound checkout of a Foragent project gets them,
-    and not when presence.session_start is off. The text is stalled requests, open
-    questions and recent notices, quoted as data. Nothing here takes a lock.
+    and not when presence.session_start is off. The text is new orchestrator requests,
+    stalled requests, open questions and recent notices, quoted as data. Nothing here takes a lock.
     """
     project = _project(cwd)
     if project is None or not project[0].presence["session_start"]:
@@ -369,6 +380,12 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
         if shown:
             lines.extend([title, *shown])
 
+    def new_request(item) -> str:
+        row, since = item
+        return (f"- {_quote(row['id'])} from {_quote(row.get('from'))}, new"
+                + (f" since {since.isoformat()}" if since is not None else "")
+                + f": {_quote(row.get('text'))}")
+
     def request(item) -> str:
         row, since = item
         hours = int((now - since) // timedelta(hours=1))
@@ -390,6 +407,8 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
                 + (f" #{event['issue']}" if type(event.get("issue")) is int else "")
                 + f": {_quote(event['summary'])}")
 
+    rows("New orchestrator requests (waiting for the planning session to take them):",
+         "request", new_requests(requests), new_request)
     rows(f"Stalled requests (processing for over {STALL_AFTER // timedelta(minutes=1)} min):",
          "request", stuck, request)
     if unreadable:
@@ -471,6 +490,70 @@ def session_start_message(cwd: Path, session_id: str | None, now: datetime) -> s
     return text("presence_session_start", config.language, merged=merged, turns=turns)
 
 
+def _session_role(config, store, cwd: Path, agent_type) -> tuple[str, str | None] | None:
+    """(role, lane slug) for the session starting in ``cwd``, else None (a launched helper).
+
+    The ``--agent`` Claude Code reports wins when it is an agent the launchers would pass:
+    a role's configured agent (roles.load_roles) or a lane's (``_lane_agents``). Without
+    one, the orchestrator launcher's FORAGENT_ROLE=orchestrator mark is the orchestrator and
+    a planning session (no FORAGENT_ROLE at all) is the PM.
+    """
+    import os
+
+    from foragent import roles
+
+    if isinstance(agent_type, str) and agent_type:
+        for name, entry in roles.load_roles(config).items():
+            if entry["agent"] == agent_type:
+                return "role", name
+        for slug, agent in _lane_agents(config).items():
+            if agent == agent_type:
+                return "lane", slug
+    if os.environ.get("FORAGENT_ROLE") == "orchestrator":
+        return "role", "orchestrator"
+    if _planning_session(cwd, store):
+        return "pm", None
+    return None
+
+
+def _lane_agents(config) -> dict[str, str]:
+    """Each lane's agent: its ``agent`` setting as executors read it, else the ``fa-<lane>`` default.
+
+    A lane with an ``agent`` setting the executors refuse (lane_memory.lane_agent) has none.
+    """
+    from foragent import lane_memory
+
+    agents = {}
+    for slug, settings in config.lanes.items():
+        explicit = (settings or {}).get("agent")
+        agent = lane_memory.lane_agent(config, slug) if explicit else f"fa-{slug}"
+        if agent:
+            agents[slug] = agent
+    return agents
+
+
+def session_title(cwd: Path, agent_type) -> str | None:
+    """One-line terminal title naming the session's role and the project; None when there is none.
+
+    None outside a Foragent project, with presence.session_start off, and for a
+    launched session without a role agent (a review, for example).
+    """
+    from foragent.i18n import text
+
+    project = _project(cwd)
+    if project is None or not project[0].presence["session_start"]:
+        return None
+    config, store = project
+    role = _session_role(config, store, cwd, agent_type)
+    if role is None:
+        return None
+    root = project_root(cwd)
+    repo = _repo(config, root)
+    name = repo.rstrip("/").rsplit("/", 1)[-1] if repo else root.name
+    title = text(f"presence_title_{role[0]}", config.language, project=name, name=role[1] or "")
+    return " ".join("".join(c if c.isprintable() else " " for c in title).split()) or None
+
+
 def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
     """The big squirrel's ANSI rows during a session's first minute, else None."""
     from foragent import watch_art
@@ -482,7 +565,11 @@ def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
         started = _started_at(_session_path(session_id))
         if started is None or not timedelta(0) <= now - started < SQUIRREL_FOR:
             return None
-        return "\n".join(watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE))
+        try:
+            columns = int(os.environ.get("COLUMNS", ""))
+        except ValueError:
+            columns = None
+        return "\n".join(watch_art.greeting_rows(columns))
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
 

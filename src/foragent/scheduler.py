@@ -13,7 +13,7 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_reinstall, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
@@ -133,6 +133,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     report, ctx._budget_sample = TickReport(), None
     started = ctx.now()  # The tick's own time; the fetch below can take seconds.
     timed("fetch_base", fetch_base, ctx)  # Also applies origin's committed .foragent.yml for fa gate tick.
+    timed("tool_follow", orch_reinstall.follow_base, ctx)
     base_ref = f"origin/{ctx.config.base_branch}"
     ctx._refresh_failed = False
     with step("github_refresh"):
@@ -203,17 +204,19 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
-        if getattr(ctx.config, "merge_owner", False):
-            from foragent.merge_owner import pending
+        from foragent.merge_owner import pending
 
-            if pending(ctx.store, issue.number):
-                board.sync_status(ctx, issue, "PR open")
-                return
+        repaired = False
         if processes_available:  # Cleans a left-over worktree; board writes skip parents.
             repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
-            if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
-                return  # Its repair read GitHub; a second read before a start waits for the next tick.
+        # After the repair's run read: a worker that handed off meanwhile waits on the merge
+        # owner (a store fact, whatever the switch says now) and is never promoted again.
+        if pending(ctx.store, issue.number):
+            board.sync_status(ctx, issue, "PR open")
+            return
+        if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
+            return  # Its repair read GitHub; a second read before a start waits for the next tick.
         if ctx._refresh_failed and issue.number in recovered:
             return
         if issue.number in parents:
@@ -302,6 +305,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
         scheduler_flow.considered(ctx, ready)
+        timed("lane_reconcile", board.reconcile_lanes, ctx, report)  # After recovery: lane paths -> labels, board Lane (#1230).
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
