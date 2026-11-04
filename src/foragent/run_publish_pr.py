@@ -12,13 +12,16 @@ if TYPE_CHECKING:
     from foragent.state import Run
 
 
-def _push_branch(attempt: Implementation) -> None:
+def _push_branch(attempt: Implementation) -> str | None:
+    """Publish with a lease and return the head that successful push replaced."""
+    lease = attempt.rebuild_lease if attempt.rebuilt else attempt.git.remote_branch_sha(attempt.branch)
     if attempt.rebuilt:
-        attempt.git.push(attempt.branch, lease=attempt.rebuild_lease)
+        attempt.git.push(attempt.branch, lease=lease)
         attempt.rebuild_lease = attempt.git.head_sha()
     else:
-        attempt.git.push(attempt.branch)
+        attempt.git.push(attempt.branch, lease=lease or "")
     attempt.pushed_head = attempt.git.head_sha()
+    return lease
 
 
 def _skills_line(run: Run) -> str:

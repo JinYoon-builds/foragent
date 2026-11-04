@@ -310,6 +310,10 @@ def _advance(ctx, place, job, pr):
             if publishing:
                 if remote == job["previous_head"]:
                     git.push_head(pr.head, lease=remote)
+                    if not run_publish._head_after_push(ctx, pr.number, job["head"], remote):
+                        run_publish._hold_changed_head(n, ctx, pr.url)
+                        _end(ctx, place, job, "held")
+                        return False
                 job["phase"] = "waiting"
                 _save(ctx, place, job)
                 return
