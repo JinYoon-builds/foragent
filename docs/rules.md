@@ -28,7 +28,7 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 ## When to ask the person
 
-- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Do anything with a right answer, then report it. ([D71](decisions.md#d71-사람에게-묻는-기준-정답이-있는-일은-하고-알린다-2026-10-22-jin))
+- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Hard to undo means data, money, public exposure or sending to others; changes git can revert, including deleting superseded code, are not person questions. A question an existing decision answers goes to the PM, not the person. Do anything with a right answer, then report it. ([D71](decisions.md#d71-사람에게-묻는-기준-정답이-있는-일은-하고-알린다-2026-10-22-jin))
 - The person talks to the planning session. The orchestrator works in the back and sends its questions through planning. ([D76](decisions.md#d76-왼쪽은-기획-세션-오케스트레이터는-뒤에서-2026-10-23-jin))
 - Only the orchestrator adds `needs-human`, with what it tried, why a person is needed, and options. The gate and lanes add `blocked` with a reason. ([D45](decisions.md#d45-사람-필요는-오케스트레이터만-띄운다-2026-10-21-jin))
 - What the person says now beats old docs. Ask once about a conflict, and record a change as a new decision. ([D58](decisions.md#d58-인터뷰는-ouroboros-설계를-가져와-native로-돌리고-그-위에-레인을-얹는다-2026-10-22-jin))
