@@ -256,3 +256,130 @@ def test_baseline_timeout_stops_shell_and_runner(tmp_path, capsys, monkeypatch, 
     assert report["failing"] == []
     assert not {42000, 42001} & fake_process_table.live
     assert all(kind == "pid" and sig != 0 for kind, _, sig in fake_process_table.calls)
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("Fix crash (fixes #12)", {12}),
+    ("Closes: #3 and resolved #4", {3, 4}),
+    ("FIXED example/demo#7", {7}),
+    ("close #1, fix #2, resolves #5", {1, 2, 5}),
+    ("see #14 for a later flag", set()),
+    ("Refs #9; prefix#10; unfixes #11", set()),
+    ("fixes other/repo#8", set()),
+    ("fixes#6", set()),
+])
+def test_closing_refs_need_a_closing_keyword_for_this_repo(message, expected):
+    assert adopt.closing_refs(message, "example/demo") == expected
+
+
+class GitStub:
+    def __init__(self, remote="https://github.com/example/demo.git", log=""):
+        self.remote, self.log = remote, log
+
+    def _call(self, args):
+        if args[:2] == ["remote", "get-url"]:
+            if self.remote is None:
+                raise adopt.GitError("no origin")
+            return self.remote
+        assert args[:2] == ["log", "HEAD"]
+        return self.log
+
+
+def fake_gh(monkeypatch, outputs):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        result = outputs[args[0]]
+        if isinstance(result, BaseException):
+            raise result
+        code, stdout = result
+        return adopt.subprocess.CompletedProcess(["gh", *args], code, stdout, "boom\n")
+
+    monkeypatch.setattr(adopt.gh, "run", run)
+    return calls
+
+
+def test_github_marks_only_issues_closed_by_a_commit(monkeypatch):
+    log = ("a" * 40 + "\0Fix crash\0Fix crash\n\nfixes #12\n\x1e\n"
+           + "b" * 40 + "\0Mention\0Mention\n\nsee #14\n\x1e\n")
+    issues = [{"number": 12, "title": "Crash", "url": "u12", "labels": [{"name": "bug"}]},
+              {"number": 14, "title": "Flag", "url": "u14", "labels": []}]
+    calls = fake_gh(monkeypatch, {"issue": (0, json.dumps(issues)),
+                                  "pr": (0, json.dumps([{"number": 20, "title": "Docs", "url": "u20",
+                                                         "headRefName": "docs"}]))})
+    report = adopt._github(GitStub(log=log), True)
+    assert report["available"] and report["repo"] == "example/demo" and not report["truncated"]
+    assert report["issues"] == [
+        {"number": 12, "title": "Crash", "url": "u12", "labels": ["bug"],
+         "fixed_by": [{"sha": "a" * 40, "subject": "Fix crash"}]},
+        {"number": 14, "title": "Flag", "url": "u14", "labels": [], "fixed_by": []},
+    ]
+    assert report["pulls"] == [{"number": 20, "title": "Docs", "url": "u20", "head": "docs"}]
+    assert [args[:2] for args in calls] == [["issue", "list"], ["pr", "list"]]
+    assert all("--jq" not in args and "open" in args for args in calls)
+
+
+@pytest.mark.parametrize("outputs, reason", [
+    ({"issue": FileNotFoundError()}, "gh is not installed"),
+    ({"issue": adopt.subprocess.TimeoutExpired("gh", 60)}, "gh issue list timed out"),
+    ({"issue": (4, "")}, "gh issue list failed: boom"),
+    ({"issue": (0, "not json")}, "gh issue list returned unreadable JSON"),
+    ({"issue": (0, "[]"), "pr": (0, "{}")}, "gh pr list returned unexpected JSON"),
+])
+def test_github_failure_is_reported_not_raised(monkeypatch, outputs, reason):
+    fake_gh(monkeypatch, outputs)
+    report = adopt._github(GitStub(), True)
+    assert report["available"] is False and report["reason"] == reason
+    assert report["issues"] == [] and report["pulls"] == []
+
+
+@pytest.mark.parametrize("remote", [None, "/tmp/origin.git", "https://gitlab.com/a/b.git"])
+def test_github_without_a_github_remote_never_calls_gh(monkeypatch, remote):
+    calls = fake_gh(monkeypatch, {})
+    report = adopt._github(GitStub(remote=remote), True)
+    assert report["reason"] == "no GitHub remote" and calls == []
+
+
+def test_github_full_page_is_marked_truncated(monkeypatch):
+    issues = [{"number": n, "title": "t", "url": "u", "labels": []} for n in range(adopt.GH_LIST_LIMIT)]
+    fake_gh(monkeypatch, {"issue": (0, json.dumps(issues)), "pr": (0, "[]")})
+    assert adopt._github(GitStub(), False)["truncated"] is True
+
+
+def test_docs_lists_readme_claude_and_agents_with_excerpts(tmp_path):
+    (tmp_path / "README.md").write_text("\n# Demo\n\nCounts words.\n" + "x" * 400, encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_bytes(b"Keep \xff small.\n")
+    (tmp_path / "notes.md").write_text("not a project doc\n", encoding="utf-8")
+    docs = adopt._docs(tmp_path)
+    assert [doc["path"] for doc in docs] == ["README.md", "CLAUDE.md"]
+    assert docs[0]["excerpt"].startswith("# Demo Counts words. x") and len(docs[0]["excerpt"]) == 300
+    assert docs[1]["excerpt"] == "Keep � small."
+
+
+def test_survey_text_names_docs_and_fixed_issues(monkeypatch, tmp_path, capsys):
+    report = {"kind": "existing", "hot_paths": [], "existing_setup": [], "ci": [],
+              "docs": [{"path": "README.md", "excerpt": "x"}],
+              "github": {"repo": "example/demo", "available": True, "reason": None, "truncated": False,
+                         "issues": [{"number": 12, "title": "Crash", "url": "", "labels": [],
+                                     "fixed_by": [{"sha": "a" * 40, "subject": "Fix crash"}]}],
+                         "pulls": [{"number": 20, "title": "Docs", "url": "", "head": "docs"}]}}
+    monkeypatch.setattr(adopt, "survey", lambda root: report)
+    assert cli.main(["adopt", "survey", "--repo-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Docs read: README.md" in out
+    assert "Open issues (1, 1 already fixed by a commit):" in out
+    assert "#12 Crash (fixed by aaaaaaaaaaaa Fix crash)" in out
+    assert "#20 Docs (docs)" in out
+
+
+def test_fa_init_lane_skill_commands_keep_the_lanes_current_skills():
+    """`fa lanes skills` replaces the whole list, so every example passes the current ids."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "skills/fa-init/SKILL.md").read_text(encoding="utf-8")
+    commands = [command for command in re.findall(r"`(fa lanes skills [^`]+)`", text)]
+    assert commands, "fa-init must show how to fix a skill on a reused lane"
+    for command in commands:
+        assert "<current-ids>" in command, f"would drop the lane's existing skills: {command}"

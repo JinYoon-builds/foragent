@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import processes, scheduler, scheduler_reconcile, sleep_credit
+from foragent import processes, scheduler, scheduler_reconcile, sleep_credit, step_weights
 from foragent.scheduler_stop import (
     DECISION_FIELDS, LIVENESS_FIELDS, _flag_stop_refused, _stop_unconfirmed, _restore_stopped, _pid_exists, _run_processes_exist,
     _stop_already_refused, _stop_run_processes, registered_since, runner_alive,
@@ -278,6 +278,7 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
         )
         if stopped != "refused":
             _finish_dead_run(ctx, run, report)
+    step_weights.record(ctx.store)
 
 
 def _finish_dead_run(ctx: TickContext, run: Run, report: TickReport) -> None:

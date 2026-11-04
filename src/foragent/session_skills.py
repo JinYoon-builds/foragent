@@ -14,7 +14,7 @@ from foragent.config import DEFAULT_SKILL_ROLES
 from foragent.i18n import text
 from foragent.skills import (
     OPEN_SOURCE_LICENSES, Skill, SkillError, SkillManager, copy_license, entry_directory, reached_through_symlink,
-    redistributable_license, skill_summary,
+    redistributable_license, skill_source, skill_summary,
     with_vendored_library,
 )
 
@@ -49,17 +49,20 @@ class _Finder:
         self.config, self.root, self.worktree = config, root, worktree
         self._library = None
 
-    def _local(self, directory: str, origin: Skill | None) -> tuple[Path, str] | None:
+    def _local(self, directory: str, origin: Skill | None) -> tuple[Path, str, str] | None:
         for base, relative in ((self.worktree, True), (self.root, False)):
             for folder in (f".claude/skills/{directory}", f"skills/{directory}"):
                 path = base / folder / "SKILL.md"
                 try:  # A copy that cannot be looked at is not offered.
-                    usable = (path.is_file() and not reached_through_symlink(base / folder)
-                              and copy_license(base / folder, base, origin) in OPEN_SOURCE_LICENSES)
+                    if not path.is_file() or reached_through_symlink(base / folder):
+                        continue
+                    license_id = copy_license(base / folder, base, origin)
+                    usable = license_id in OPEN_SOURCE_LICENSES
                 except OSError:
                     usable = False
                 if usable:
-                    return path, f"{folder}/SKILL.md" if relative else str(path.absolute())
+                    source = skill_source(directory, origin.library if origin else None, license=license_id)
+                    return path, f"{folder}/SKILL.md" if relative else str(path.absolute()), source
         return None
 
     def _select(self, entry: str) -> Skill | None:
@@ -71,17 +74,23 @@ class _Finder:
         except (SkillError, OSError):
             return None
 
-    def find(self, entry: str) -> tuple[Path, str] | None:
-        """The file to read and the path to show, or None when no permitted copy is reachable."""
+    def find(self, entry: str) -> tuple[Path, str, str] | None:
+        """The file to read, displayed path and source, or None when no permitted copy is reachable."""
         skill = self._select(entry)
         directory = skill.path.name if skill is not None else entry_directory(entry)
         if (found := self._local(directory, skill)) is not None:
             return found
-        if (skill is None or redistributable_license(skill.path, skill.library.path)[0] not in OPEN_SOURCE_LICENSES
-                or reached_through_symlink(skill.path)):
+        if skill is None:
+            return None
+        license_id, _ = redistributable_license(skill.path, skill.library.path)
+        if license_id not in OPEN_SOURCE_LICENSES or reached_through_symlink(skill.path):
             return None
         path = (skill.path / "SKILL.md").resolve()
-        return path, str(path)
+        return path, str(path), skill_source(directory, skill.library, license=license_id)
+
+    def source(self, entry: str) -> str:
+        skill = self._select(entry)
+        return skill_source(skill.path.name, skill.library, license=skill.license) if skill else skill_source(entry_directory(entry))
 
 
 def _cut(description: str, limit: int) -> str:
@@ -101,29 +110,29 @@ def section(config: Config, role: str, root: Path, worktree: Path | None = None)
     if not entries:
         return ""
     finder = _Finder(config, root, worktree or root)
-    rows: list[tuple[str, str, str | None]] = []
+    rows: list[tuple[str, str, str | None, str]] = []
     for entry in entries:
         found = finder.find(entry)
         if found is None:
-            rows.append((entry, "", None))
+            rows.append((entry, "", None, finder.source(entry)))
             continue
         try:
             name, description = skill_summary(found[0])
         except SkillError:
             name, description = entry_directory(entry), ""
-        rows.append((name, " ".join(description.split()), found[1]))
+        rows.append((name, " ".join(description.split()), found[1], found[2]))
     head = [text("default_skills_heading"), text("default_skills_intro")]
 
-    def item(name: str, description: str, path: str | None) -> str:
+    def item(name: str, description: str, path: str | None, source: str) -> str:
         if path is None:
-            return text("default_skills_missing", name=name)
+            return text("default_skills_missing", name=name, source=source)
         if not description:
-            return text("default_skills_bare_item", name=name, path=path)
-        return text("default_skills_item", name=name, description=description, path=path)
+            return text("default_skills_bare_item", name=name, path=path, source=source)
+        return text("default_skills_item", name=name, description=description, path=path, source=source)
 
-    fixed = "\n".join([*head, *(item(name, "", path) for name, _, path in rows)])
+    fixed = "\n".join([*head, *(item(name, "", path, source) for name, _, path, source in rows)])
     # The final line end, the two leading ones, and ": " each description adds to its bare line.
-    described = sum(1 for _, description, path in rows if description and path)
+    described = sum(1 for _, description, path, _ in rows if description and path)
     share = max(0, SECTION_BYTES - len(fixed.encode("utf-8")) - 3) // described - 2 if described else 0
-    lines = [item(name, _cut(description, share), path) for name, description, path in rows]
+    lines = [item(name, _cut(description, share), path, source) for name, description, path, source in rows]
     return "\n\n" + "\n".join([*head, *lines]) + "\n"

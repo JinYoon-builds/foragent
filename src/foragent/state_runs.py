@@ -3,9 +3,9 @@
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from foragent import size_signal
-from foragent.file_cache import read_jsonl
 from foragent.state_issues import _copy
 from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run, carried_contract
@@ -49,6 +49,9 @@ def record_merged(value, owner_facts) -> bool:
 class RunRecordsMixin:
     def _close_phase(self, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
         """Journal the ended phase; called under the state lock (see state_phases.close_phase)."""
+        from foragent import step_weights
+
+        step_weights.transition(self, run, closed_at, next_step)
         return close_phase(self.root, run, closed_at, next_step)
 
     def start_run(
@@ -93,6 +96,8 @@ class RunRecordsMixin:
                       executor=executor, reviewer=reviewer, executor_model=executor_model, **session, **contract)
             self._merge_lock_seconds.pop((number, timestamp), None)
             value = self._run_value(run)
+            value["run_generation"] = uuid4().hex  # Distinguishes starts even on an unchanged injected clock.
+            value.pop("finished_at", None)
             # Owner completion fields belong to an execution, not to the issue.
             if "owner_merge" in value:
                 for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
@@ -140,8 +145,8 @@ class RunRecordsMixin:
                 return run
             if "detail" in fields:
                 fields["detail"] = (
-                    " ".join(fields["detail"].split())[:500]
-                    or " ".join(run.detail.split())[:500]
+                    " ".join(fields["detail"].split())
+                    or " ".join(run.detail.split())
                     or "Run detail unavailable."
                 )
             if "phase" in fields and fields["phase"] != run.phase:
@@ -179,10 +184,10 @@ class RunRecordsMixin:
 
     def get_run(self, number: int) -> Run | None:
         try:
-            value = (self.root / "runs" / f"{number}.json").read_text(encoding="utf-8")
+            data = self._read_issue_run(number)
         except FileNotFoundError:
             return None
-        data = _state.json.loads(value)  # Talk is derived from the events (D95), never stored.
+        # Talk is derived from the events (D95), never stored.
         return self._with_talk(_state.load_record(_state.Run, data), data.get("finished_at"))
 
     def record_merge_lock(self, number: int, seconds: float) -> None:
@@ -212,17 +217,18 @@ class RunRecordsMixin:
     def record_owner_merge(self, number: int, started_at: str, fact: dict) -> None:
         """Attach a validated GitHub merge fact to the admitted worker generation."""
         with self._state_lock():
-            path = self.root / "runs" / f"{number}.json"
-            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            value = self._read_issue_run(number)
             current = value["started_at"] == started_at
-            history = self.root / "runs.jsonl"
-            rows = list(read_jsonl(history))
             if not current:
-                value = next((row for row in reversed(rows)
+                value = next((row for row in reversed(self._run_history())
                               if row["number"] == number and row["started_at"] == started_at), None)
                 if value is None:
                     raise ValueError("Merge worker generation is unavailable")
-                value = dict(value)
+                value = _copy(value)
+            # A legacy snapshot alone does not prove that the fact reached history.
+            if (value.get("owner_merge") == fact and value.get("owner_merge_started_at") == started_at
+                    and (not current or value.get("run_generation"))):
+                return
             value["owner_merge"] = fact
             value["owner_merge_started_at"] = started_at
             value["merged_at"] = fact["merged_at"]
@@ -230,21 +236,18 @@ class RunRecordsMixin:
             value["review_pass_to_merge_seconds"] = (
                 (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
                 if passed else None)
-            if current:
-                self._write_json(path, value)
-            if value["status"] == "finished":
-                if not any(row["number"] == number and row["started_at"] == started_at
-                           and row.get("owner_merge") == fact
-                           and row.get("owner_merge_started_at") == started_at for row in rows):
-                    with history.open("a", encoding="utf-8") as stream:
-                        stream.write(_state.json.dumps(value, ensure_ascii=False) + "\n")
+            self._write_run(_state.load_record(Run, value), value, snapshot=current)
 
     def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
         """One completion fact, independent of the finished worker outcome."""
-        values = list(read_jsonl(self.root / "runs.jsonl"))
+        values = list(self._run_history())
         for path in (self.root / "runs").glob("[0-9]*.json"):
             try:
-                values.append(_state.json.loads(path.read_text()))
+                value = _state.json.loads(path.read_text())
+                if (isinstance(value, dict) and value.get("run_generation")
+                        and isinstance(value.get("started_at"), str)):
+                    value = self._read_issue_run(int(path.stem))
+                values.append(value)
             except (OSError, ValueError):
                 continue  # Optional owner facts must not break readers of completed history.
         return owner_facts_of(values)
@@ -319,28 +322,25 @@ class RunRecordsMixin:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
-            detail = " ".join(detail.split())[:500]
+            detail = " ".join(detail.split())
             if not detail and outcome != "merged":
-                detail = " ".join(run.detail.split())[:500] or f"Run finished with outcome {outcome}."
+                detail = " ".join(run.detail.split()) or f"Run finished with outcome {outcome}."
             from foragent.processes import observe_tree
 
             # Every run exit closes its last open phase segment; an open talk ends at finished_at (derived).
             finished = _state.replace(run, **self._close_phase(run, self._now(), outcome))
             finished = _state.replace(finished, status="finished", outcome=outcome, detail=detail,
                                       process_identities=observe_tree(run.process_identities))
-            history_path = self.root / "runs.jsonl"
-            history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
             # The finish time is saved beside the record's fields, so the Run schema
             # stays as it was; finish_times() reads it back.
             snapshot = {**self._run_value(finished), "finished_at": self._timestamp()}
-            self._atomic_write(history_path, history + _state.json.dumps(snapshot, ensure_ascii=False) + "\n")
             self._write_run(finished, snapshot)
             return finished
 
     def read_history(self) -> list[Run]:
         """Return each execution once, retaining its latest completion entry."""
         runs: dict[tuple[int, str], _state.Run] = {}
-        for value in read_jsonl(self.root / "runs.jsonl"):
+        for value in self._run_history():
             run = _state.load_record(_state.Run, _copy(value))
             runs[run.number, run.started_at] = run
         return list(runs.values())
@@ -364,7 +364,7 @@ class RunRecordsMixin:
 
     def _history_times(self, key: str) -> dict[tuple[int, str], str]:
         times: dict[tuple[int, str], str] = {}
-        for value in read_jsonl(self.root / "runs.jsonl"):
+        for value in self._run_history():
             stamp = value.get(key)
             if (key == "merged_at" and not isinstance(stamp, str)
                     and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):

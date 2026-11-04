@@ -15,7 +15,28 @@ from foragent.config import load_config
 from foragent.git import GitRepo
 
 
-def measure(root, command, acceptance, excluded, directory, side, *, cached_results=None, full_selection=False):
+TIMES = "scripts/shard_times.json"  # refreshed by scripts/shard_times.py
+
+
+def base_times(base_root, directory):
+    """Copy the exact base's per-file times (files present at base only); None without any."""
+    try:
+        value = json.loads((base_root / TIMES).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    kept = {path: seconds for path, seconds in value.items()
+            if isinstance(path, str) and (base_root / path).is_file()}
+    if not kept:
+        return None
+    target = directory / "shard_times.json"
+    target.write_text(json.dumps(kept, sort_keys=True), encoding="utf-8")
+    return target
+
+
+def measure(root, command, acceptance, excluded, directory, side, times=None, *, cached_results=None,
+            full_selection=False):
     if not (root / acceptance).is_dir():
         return {"complete": True, "collected_ids": [], "passing_ids": []}
     report = directory / f"{side}.json"
@@ -23,9 +44,11 @@ def measure(root, command, acceptance, excluded, directory, side, *, cached_resu
                    if key not in {"VIRTUAL_ENV", "PYTHONPATH", "UV_PROJECT", "UV_PROJECT_ENVIRONMENT",
                                   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
                                   "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "GITHUB_OUTPUT",
-                                  "GITHUB_ENV", "GITHUB_PATH", "FA_REPORT_FILE", "FA_BASE_CACHE_FILE",
-                                  "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS"}}
+                                  "GITHUB_ENV", "GITHUB_PATH", "FA_REPORT_FILE", "FA_SHARD_TIMES",
+                                  "FA_BASE_CACHE_FILE", "FA_BASE_CACHE_MODE", "FA_CACHED_RESULTS"}}
     environment.update(PYTHONPATH=str(directory), FA_REPORT=str(report), PYTHONDONTWRITEBYTECODE="1")
+    if times is not None:
+        environment["FA_SHARD_TIMES"] = str(times)
     if cached_results:
         cached = directory / "cached-results.json"
         cached.write_text(json.dumps(cached_results), encoding="utf-8")
@@ -120,9 +143,13 @@ def main():
             if int(os.environ["FA_SHARDS"]) != config.ci_shards:
                 raise ValueError("workflow shard layout does not match trusted base configuration")
             cached = read_results(os.environ.get("FA_BASE_CACHE_FILE"), os.environ["FA_REPOSITORY"], base, scope)
+            # Both sides balance by the base's times only, so a moved test is never "lost".
+            times = base_times(base_root, directory)
+            balance = {"times": times} if times is not None else {}
             base_result = measure(base_root, scope["command"], config.acceptance_dir, excluded, directory, "base",
-                                  **({"cached_results": cached} if cached else {}))
-            head_result = measure(root, scope["command"], config.acceptance_dir, excluded, directory, "head")
+                                  **balance, **({"cached_results": cached} if cached else {}))
+            head_result = measure(root, scope["command"], config.acceptance_dir, excluded, directory, "head",
+                                  **balance)
             # A passing run proves only the requested revisions, never a tree
             # rewritten by the checks (including changes staged by a test).
             for checkout, revision, result in ((base_root, base, base_result), (root, head, head_result)):

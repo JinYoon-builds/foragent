@@ -115,6 +115,28 @@ def queue_workers(case, numbers):
             case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
 
 
+def batch_candidates(case):
+    candidates = []
+    for row in merge_owner.admissions(case.store).values():
+        place = merge_owner.queue.Seat(row["n"], row["started_at"], row["target"])
+        job = merge_owner._load(case.ctx, place, row)
+        candidates.append((place, job, case.tracker.get_pr(job["pr"])))
+    return candidates
+
+
+def edit_member_shared_file(case, monkeypatch, numbers):
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def edit(**kwargs):
+        result = implement(**kwargs)
+        if case.worker.number in numbers:
+            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
+        return result
+
+    monkeypatch.setattr(model, "run", edit)
+
+
 def edit_member_workflows(case, monkeypatch, paths):
     model = case.ctx.executor_factory("claude")
     implement = model.run
@@ -165,6 +187,264 @@ def published_train(case, monkeypatch):
     assert not case.target_pushes and not events(case)
 
 
+@pytest.fixture
+def retry_case(request, monkeypatch):
+    from acceptance import test_merge_path_real_settings as contract
+
+    monkeypatch.setattr(contract, "NUMBERS", (5, 1, 4, 2, 6, 3, 7))
+    case = request.getfixturevalue("batched")
+    case.config = replace(case.config, merge_batch_size=6)
+    case.ctx.config = case.config
+    case.pending_batch = True
+    return case
+
+
+def composed_numbers(case, pr=None):
+    pr = pr or groups(case)[-1]
+    _, chain = batch._decode(case.git, pr.head, case.tracker.pr_head_sha(pr.number))
+    return [n for n, *_ in chain]
+
+
+def fail_tip(case):
+    case.tracker.set_pr_checks(groups(case)[-1].number, "fail")
+    support.gate(case)
+    assert not refs(case)
+    assert events(case)[-1]["reason"] == "tip CI red"
+
+
+def test_red_train_retries_ordered_half_then_whole_remainder_and_halves_again(retry_case):
+    case = retry_case
+    numbers = [5, 1, 4, 2, 6, 3]
+    queue_workers(case, numbers)
+    orch_queue.set_global(case.store, numbers)
+    support.gate(case)
+    assert composed_numbers(case) == numbers
+    fail_tip(case)
+    assert not case.target_pushes and not case.merges
+    queue_workers(case, [7])
+    orch_queue.set_global(case.store, [7, *reversed(numbers)])
+    support.gate(case)
+    assert composed_numbers(case) == numbers[:3]
+    assert len(groups(case)) == 2 and not case.target_pushes
+    support.gate(case)  # Pending CI reserves the same half across owner restarts.
+    assert len(groups(case)) == 2
+    green(case)
+    support.gate(case)
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert {n for n, _ in case.store.owner_merge_facts()} == set(numbers[:3])
+    case.pending_batch = True
+    support.gate(case)
+    assert composed_numbers(case) == numbers[3:]
+    fail_tip(case)
+    support.gate(case)
+    assert composed_numbers(case) == numbers[3:5]
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert [row["reason"] for row in batch.retirements(case.ctx)].count("tip CI red") == 2
+
+
+def test_red_singleton_is_spent_and_returns_to_the_existing_single_path(batched):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    fail_tip(case)
+    support.gate(case)
+    assert composed_numbers(case) == [5]
+    assert not case.target_pushes and not case.merges
+    fail_tip(case)
+    spent = [member for row in batch.retirements(case.ctx) for member in row["spent"]]
+    assert [(member["n"], member["started_at"]) for member in spent] == [
+        (5, case.store.get_run(5).started_at)]
+    green(case)
+    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "fail")
+    support.gate(case)
+    support.gate(case)
+    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "fail")
+    support.gate(case)
+    assert (5, spent[0]["started_at"]) not in merge_owner.admissions(case.store)
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert case.tracker.get_issue(5).state == "open"
+    assert "tip CI red" in {row["reason"] for row in batch.retirements(case.ctx)}
+
+
+def test_timed_out_retry_releases_unrelated_batch_on_next_tick(batched):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=2)
+    case.ctx.config = case.config
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    fail_tip(case)
+    support.gate(case)
+    assert composed_numbers(case) == [5]
+    case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
+    support.gate(case)
+    assert not refs(case) and events(case)[-1]["reason"] == "three CI rounds elapsed"
+
+    queue_workers(case, [4, 2])
+    support.gate(case)
+    assert len(groups(case)) == 3 and composed_numbers(case) == [4, 2]
+    assert case.history.tip == case.base and not case.target_pushes and not case.merges
+    assert {p.n for p, _, _ in batch_candidates(case)} == {5, 1, 4, 2}
+    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+    support.gate(case)
+    assert len(groups(case)) == 3 and composed_numbers(case) == [4, 2]
+
+
+@pytest.mark.parametrize("reason", ["target changed", "prefix PR changed"])
+def test_non_green_retry_retirement_resolves_failed_set_across_bases(batched, reason):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=2)
+    case.ctx.config = case.config
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    fail_tip(case)
+    support.gate(case)
+    assert composed_numbers(case) == [5]
+    if reason == "target changed":
+        update_base(case, {"src/neighbor.py": "VALUE = 'moved during retry'\n"})
+    else:
+        case.tracker.set_pr_head_sha(groups(case)[-1].number, case.base)
+    support.gate(case)
+    assert events(case)[-1]["reason"] == reason
+    # A fresh identity on a newer target must not revive the failed-set restriction.
+    update_base(case, {"src/neighbor.py": "VALUE = 'moved after retirement'\n"})
+    queue_workers(case, [4, 2])
+    orch_queue.set_global(case.store, [4, 2, 5, 1])
+    support.gate(case)
+    assert len(groups(case)) == 3 and composed_numbers(case) == [4, 2]
+    assert {p.n for p, _, _ in batch_candidates(case)} == {5, 1, 4, 2}
+    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+    assert not case.target_pushes and not case.merges
+    support.gate(case)
+    assert len(groups(case)) == 3 and composed_numbers(case) == [4, 2]
+    assert case.git.remote_branch_sha(groups(case)[-1].head)
+
+
+def test_uncomposable_failed_half_falls_through_to_normal_batching(batched, monkeypatch):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=2)
+    case.ctx.config = case.config
+    case.pending_batch = True
+    edit_member_shared_file(case, monkeypatch, {5})
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    fail_tip(case)
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    queue_workers(case, [4, 2])
+    report = support.gate(case)
+    assert len(groups(case)) == 2 and composed_numbers(case) == [1, 4], report.actions
+    assert any("#5 merge batch excluded" in action for action in report.actions)
+    assert len(batch.retirements(case.ctx)) == 1
+    assert {p.n for p, _, _ in batch_candidates(case)} == {5, 1, 4, 2}
+    assert not case.target_pushes and not case.merges
+
+
+def test_retired_composed_half_falls_through_to_normal_batching(batched):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1, 4, 2])
+    support.gate(case)
+    fail_tip(case)
+    support.gate(case)
+    assert composed_numbers(case) == [5, 1]
+    tip = groups(case)[-1]
+    base, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    # Green CI with no landing leaves the parent unresolved, but this identity is retired.
+    batch._close(case.ctx, TickReport(), base, chain, "final check stopped", passed=True)
+    case.config = replace(case.config, merge_batch_size=2)
+    case.ctx.config = case.config
+    support.gate(case)
+    assert len(groups(case)) == 3 and composed_numbers(case) == [4, 2]
+    assert not case.target_pushes and not case.merges
+
+
+def test_failed_half_uses_join_exclusions_without_filling_from_outsiders(retry_case, monkeypatch):
+    case = retry_case
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4, 2, 6, 3, 7])
+    support.gate(case)
+    assert composed_numbers(case) == [5, 1, 4, 2, 6, 3]
+    fail_tip(case)
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    green(case)
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    assert proof, report.actions
+    assert [n for n, *_ in proof.chain] == [5, 4]
+    assert any("#1 merge batch excluded" in action for action in report.actions)
+    excluded = case.tracker.pr_acceptance_reports(proof.chain[-1][2])[0]["report"]["excluded"]
+    assert "tests/acceptance/test_own_1.py" in excluded
+    assert all(f"tests/acceptance/test_own_{n}.py" not in excluded for n in [5, 4])
+
+
+@pytest.mark.parametrize("resolution", ["landed", "left"])
+def test_resolved_failed_set_does_not_constrain_normal_composition(retry_case, resolution):
+    case = retry_case
+    numbers = [5, 1, 4, 2]
+    queue_workers(case, numbers)
+    support.gate(case)
+    fail_tip(case)
+    if resolution == "landed":
+        case.config = replace(case.config, merge_batch=False)
+        case.ctx.config = case.config
+        green(case)
+        support.drain(case, count=4)
+        assert len(case.merges) == 4
+        case.config = replace(case.config, merge_batch=True)
+        case.ctx.config = case.config
+    else:
+        for n in numbers:
+            case.tracker.close_issue(n)
+    case.pending_batch = True
+    queue_workers(case, [6, 3])
+    support.gate(case)
+    assert composed_numbers(case) == [6, 3]
+    assert all(member["n"] in numbers for row in batch.retirements(case.ctx)
+               if row["reason"] == "tip CI red" for member in row["members"])
+
+
+@pytest.mark.parametrize("later", ["same-base", "partial", "changed-head", "full"])
+def test_only_a_later_green_full_set_on_moved_main_resolves_a_failure(retry_case, later):
+    case = retry_case
+    numbers = [5, 1, 4, 2]
+    queue_workers(case, numbers)
+    support.gate(case)
+    fail_tip(case)
+    failed, = batch.retirements(case.ctx)
+    old_base = case.base
+    update_base(case, {"src/neighbor.py": "VALUE = 'new target'\n"})
+    members = [dict(member) for member in failed["members"]]
+    if later == "partial":
+        members = members[:2]
+    elif later == "changed-head":
+        members[0]["head"] = case.base
+    # Known green CI remains useful even when a fresh final check stopped landing.
+    batch._record_retirement(case.ctx, "later-green", case.base, base=old_base if later == "same-base" else case.base,
+                             reason="member #1: single path final check waiting", members=members,
+                             refs={}, spent=[], passed=True)
+    queue_workers(case, [6])
+    candidates = batch_candidates(case)
+    candidates.sort(key=lambda candidate: candidate[0].n != 6)
+    assert batch.prepare(case.ctx, TickReport(), candidates) is False
+    assert composed_numbers(case) == ([6, *numbers] if later == "full" else numbers[:2])
+    assert not case.target_pushes and not case.merges
+    assert next(row for row in batch.retirements(case.ctx) if row["identity"] == failed["identity"])["reason"] == "tip CI red"
+
+
+def test_newest_failure_wins_over_git_ref_sort_order(retry_case):
+    case = retry_case
+    queue_workers(case, [5, 1, 4, 2, 6, 3])
+    support.gate(case)
+    fail_tip(case)
+    failed, = batch.retirements(case.ctx)
+    batch._record_retirement(case.ctx, "000-newer-failure", failed["candidate"], base=case.base,
+                             reason="tip CI red", members=failed["members"][3:], refs={}, spent=[])
+    assert batch.prepare(case.ctx, TickReport(), batch_candidates(case)) is False
+    assert composed_numbers(case) == [2, 6]
+
+
 
 @pytest.mark.parametrize("numbers", [[5, 1], [2, 4, 1, 5], [5, 1, 4, 2, 6, 3]])
 def test_only_tip_published_and_reused_by_single_path_across_restart(request, monkeypatch, numbers):
@@ -207,6 +487,42 @@ def test_green_tip_lands_members_whose_own_ci_is_pending(batched):
     assert len(case.store.owner_merge_facts()) == 2
 
 
+def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(batched, monkeypatch):
+    case = batched
+    # Worker worktrees share this repository's objects and local Git identity.
+    git_command(case.root, "config", "--local", "user.name", "Offline Tests")
+    git_command(case.root, "config", "--local", "user.email", "tests@example.com")
+    queue_workers(case, [1])
+    ancestor = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def with_dependency(**kwargs):
+        if case.worker.number == 5:
+            git_command(kwargs["worktree"], "merge", "--no-commit", "--no-ff", ancestor)
+        return implement(**kwargs)
+
+    monkeypatch.setattr(model, "run", with_dependency)
+    queue_workers(case, [5, 4])
+    orch_queue.set_global(case.store, [5, 1, 4])
+    dependent = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
+    assert case.git.is_ancestor(ancestor, dependent)
+    case.tracker.set_pr_checks(support.pr_for(case, 1).number, "fail")
+    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pending")
+
+    report = support.gate(case)
+
+    assert not case.target_attempts and not case.target_pushes and not case.merges, report.actions
+    assert case.history.tip == case.base and not case.store.owner_merge_facts()
+    assert not case.batch_pushes and not groups(case) and not refs(case)
+    assert not any("#1 merge batch excluded" in action for action in report.actions)
+    retired, = batch.retirements(case.ctx)
+    assert retired["reason"] == "member already reachable" and retired["spent"] == []
+    assert events(case)[-1]["reason"] == "member already reachable"
+    assert events(case)[-1]["result"] == "unused"
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
+
+
 @pytest.mark.parametrize("path", [".github/workflows/foragent-acceptance.yml",
                                  ".github/workflows/foragent-acceptance-extra.yaml"])
 def test_workflow_changing_member_uses_single_fallback_while_remaining_members_batch(batched, monkeypatch, path):
@@ -245,10 +561,33 @@ def test_nonacceptance_workflow_change_remains_a_batch_member(batched, monkeypat
     assert len(case.target_pushes) == 1 and not case.merges
 
 
+@pytest.mark.parametrize('path', ['.github/workflows/foragent-acceptance.yml',
+                                 '.github/workflows/foragent-acceptance-extra.yaml'])
+def test_main_only_workflow_change_keeps_old_members_in_batch(batched, monkeypatch, path):
+    case = batched
+    queue_workers(case, [5, 1])
+    workflow = 'name: updated-main-workflow\non: [pull_request]\njobs: {}\n'
+    case.history.update({path: workflow})
+    base = case.history.tip
+
+    def unexpected(*args):
+        pytest.fail('The batch tip uses the current main workflow and must use its CI evidence')
+
+    monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
+    report = support.gate(case)
+    pr, = groups(case)
+    tip = case.tracker.pr_head_sha(pr.number)
+    decoded_base, chain = batch._decode(case.git, pr.head, tip)
+    assert decoded_base == base and [n for n, *_ in chain] == [5, 1]
+    assert git_command(case.history.origin, 'show', f'{tip}:{path}') == workflow.strip()
+    assert len(case.target_pushes) == 1 and not case.merges, report.actions
+    assert len(case.store.owner_merge_facts()) == 2
+
+
 def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypatch):
     case = batched
     queue_workers(case, [5, 1])
-    compare, failed = ci_mode.changed_workflows, []
+    compare, failed = ci_mode.pr_changes_workflows, []
 
     def unavailable_once(*args):
         if not failed:
@@ -256,7 +595,7 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
             raise GitError("workflow diff unavailable")
         return compare(*args)
 
-    monkeypatch.setattr(ci_mode, "changed_workflows", unavailable_once)
+    monkeypatch.setattr(ci_mode, "pr_changes_workflows", unavailable_once)
     report = support.gate(case)
     assert failed and not groups(case) and not case.target_pushes
     assert len(case.merges) == 1
@@ -268,11 +607,8 @@ def test_remote_only_candidate_does_not_block_locally_available_batch(batched, m
     case.config = replace(case.config, merge_batch_size=2)
     case.ctx.config = case.config
     queue_workers(case, [5, 1, 4])
-    candidates = []
-    for row in merge_owner.admissions(case.store).values():
-        place = merge_owner.queue.Seat(row["n"], row["started_at"], row["target"])
-        job = merge_owner._load(case.ctx, place, row)
-        candidates.append((place, job, case.tracker.get_pr(job["pr"])))
+    candidates = batch_candidates(case)
+    for _, job, _ in candidates:
         case.tracker.set_pr_checks(job["pr"], "pending")
     fresh = tmp_path / "fresh-owner"
     fresh.mkdir()
@@ -285,6 +621,7 @@ def test_remote_only_candidate_does_not_block_locally_available_batch(batched, m
     missing_head = candidates[2][1]["head"]
     with pytest.raises(GitError):
         git._call(["cat-file", "-e", f"{missing_head}^{{commit}}"])
+    candidates = [candidates[2], *candidates[:2]]
     monkeypatch.setattr(case.ctx, "git", git)
     report = TickReport()
     for _ in range(3):
@@ -626,7 +963,7 @@ def test_target_workflow_change_retires_train_without_spending_members(batched, 
     base, _ = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert base != case.history.tip
     retirement, = batch.retirements(case.ctx)
-    assert "prefix acceptance workflow differs" in retirement["reason"]
+    assert retirement["reason"] == "member head or target changed"
     assert retirement["spent"] == []
     assert not case.target_pushes and not case.merges and not refs(case)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
@@ -705,49 +1042,108 @@ def test_restart_recreates_missing_prefix_prs_from_refs_without_republishing(bat
     assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2 and not refs(case)
 
 
-def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
+def test_main_conflict_skips_member_and_fills_batch_from_later_candidates(batched, monkeypatch):
     case = batched
-    model = case.ctx.executor_factory("claude")
-    implement = model.run
-
-    def incompatible(**kwargs):
-        result = implement(**kwargs)
-        if case.worker.number in {5, 4}:
-            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
-        return result
-
-    monkeypatch.setattr(model, "run", incompatible)
-    queue_workers(case, [5, 1, 4, 2])
-    support.gate(case)
-    assert not groups(case) and not refs(case)
-    assert events(case)[-1]["result"] == "unused"
-    assert [m["n"] for m in events(case)[-1]["members"]] == [5, 1, 4, 2]
-    support.drain(case)
-    assert not groups(case)  # Even the healthy suffix never forms a retry batch.
-
-def test_incomplete_train_retirements_have_distinct_member_identities(batched, monkeypatch):
-    case = batched
-    case.config = replace(case.config, merge_batch_size=2)
+    case.config = replace(case.config, merge_batch_size=3)
     case.ctx.config = case.config
-    model = case.ctx.executor_factory("claude")
-    implement = model.run
-
-    def incompatible(**kwargs):
-        result = implement(**kwargs)
-        (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
-        return result
-
-    monkeypatch.setattr(model, "run", incompatible)
+    edit_member_shared_file(case, monkeypatch, {1})
     queue_workers(case, [5, 1, 4, 2])
-    for n in [5, 1, 4, 2]:
-        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    candidates = batch_candidates(case)
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, candidates)
+    assert proof, report.actions
+    assert [n for n, *_ in proof.chain] == [5, 4, 2]
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert chain == proof.chain
+    skipped = [action for action in report.actions if "#1" in action]
+    assert len(skipped) == 1 and ("conflict" in skipped[0].lower() or "status 1" in skipped[0])
+    excluded = case.tracker.pr_acceptance_reports(proof.chain[-1][2])[0]["report"]["excluded"]
+    assert "tests/acceptance/test_own_1.py" in excluded
+    assert all(f"tests/acceptance/test_own_{n}.py" not in excluded for n in [5, 4, 2])
+    assert not batch.retirements(case.ctx)
+    assert set(merge_owner.admissions(case.store)) == {(p.n, p.started_at) for p, _, _ in candidates}
+
+
+def test_conflict_with_earlier_member_skips_only_that_member(batched, monkeypatch):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    edit_member_shared_file(case, monkeypatch, {5, 1})
+    queue_workers(case, [5, 1, 4, 2])
+    candidates = batch_candidates(case)
+    for _, job, _ in candidates:
+        case.git._call(["merge-tree", "--write-tree", case.base, job["head"]])
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, candidates)
+    assert proof, report.actions
+    assert [n for n, *_ in proof.chain] == [5, 4, 2]
+    assert len([action for action in report.actions if "#1" in action]) == 1
+    assert not batch.retirements(case.ctx)
+
+
+def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {5, 1, 4, 2})
+    queue_workers(case, [5, 1, 4, 2])
+    candidates = batch_candidates(case)
     for _ in range(3):
-        support.gate(case)
-    retired = batch.retirements(case.ctx)
-    assert len(retired) == 2
-    assert {tuple(m["n"] for m in row["members"]) for row in retired} == {(5, 1), (4, 2)}
-    assert all(row["candidate"] == case.base and not row["spent"] for row in retired)
-    assert not groups(case) and len(events(case)) == 2
+        report = TickReport()
+        assert batch.prepare(case.ctx, report, candidates) is None, report.actions
+        assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
+    assert not groups(case) and not refs(case) and not events(case)
+    assert not batch.retirements(case.ctx)
+    assert len(merge_owner.admissions(case.store)) == 4
+
+
+def test_member_composition_failure_leaves_single_path_available(batched, monkeypatch):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    queue_workers(case, [5, 1, 4, 2])
+    failed_head = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    call = case.git._call
+
+    def unavailable(args):
+        if args[:2] == ["merge-tree", "--write-tree"] and args[-1] == failed_head:
+            raise GitError("member tree unavailable")
+        return call(args)
+
+    monkeypatch.setattr(case.git, "_call", unavailable)
+    report = support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2]
+    assert len([a for a in report.actions if "#1" in a and "member tree unavailable" in a]) == 1
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+    assert [place[0] for place in merge_owner.admissions(case.store)] == [1]
+    monkeypatch.setattr(case.git, "_call", call)
+    support.drain(case, count=1)
+    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+
+
+def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {5, 1})
+    queue_workers(case, [5, 1, 4, 2])
+    case.pending_batch = True
+    first = support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2], first.actions
+    case.tracker.set_pr_checks(tip.number, "fail")
+    support.gate(case)
+    retired, = batch.retirements(case.ctx)
+    assert retired["identity"] == batch._identity(case.base, chain)
+    assert [member["n"] for member in retired["members"]] == [5, 4, 2]
+    assert retired["candidate"] == chain[-1][2] and retired["spent"] == []
+    assert batch.prepare(case.ctx, TickReport(), batch_candidates(case)) is False
+    assert len(groups(case)) == 2 and refs(case)
+    assert composed_numbers(case) == [5, 4]
+    assert len(merge_owner.admissions(case.store)) == 4
+
 
 def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
     case = proto
@@ -846,6 +1242,43 @@ def update_base(case, files):
     git_command(case.root, "fetch", "origin")
     git_command(case.root, "merge", "--ff-only", "origin/main")
     case.base = case.history.tip
+
+
+def test_train_related_units_use_published_tip_receipt_and_keep_locked_commands(batched, monkeypatch):
+    from foragent import runner
+
+    case = batched
+    paths = [f"tests/test_member_{n}.py" for n in (5, 1)]
+    update_base(case, {path: "def test_member():\n    pass\n" for path in paths})
+    queue_workers(case, [5, 1])
+    member_heads = {case.tracker.pr_head_sha(support.pr_for(case, n).number) for n in (5, 1)}
+    lookups, commands = [], []
+
+    def receipt(head):
+        lookups.append(head)
+        return 42, {f"{path}::test_member" for path in paths}
+
+    check = runner._check
+
+    def observed(command, *args, **kwargs):
+        commands.append(command)
+        return check(command, *args, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "pr_unit_passed_tests", receipt)
+    monkeypatch.setattr(runner, "_check", observed)
+    support.gate(case)
+
+    tip = case.tracker.pr_head_sha(groups(case)[0].number)
+    assert lookups and set(lookups) == {tip}
+    assert not member_heads.intersection(lookups)
+    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2
+    assert not any("--junitxml " in command for command in commands)
+    assert any("--collect-only" in command and all(path in command for path in paths)
+               for command in commands)
+    for n in (5, 1):
+        assert any(f"tests/acceptance/test_own_{n}.py" in command and "--collect-only" not in command
+                   for command in commands)
+    assert f"related units: all 2 passed in CI run 42 for {tip}" in case.store.log_path(5).read_text()
 
 
 def test_train_ci_includes_every_members_done_when_and_excludes_only_outsiders(batched):
@@ -1110,7 +1543,9 @@ def test_retired_attempt_is_not_rebuilt_after_flow_log_rotation(batched):
     assert not events(case)
     green(case)
     support.gate(case)
-    assert len(groups(case)) == 1 and not case.target_pushes
+    assert len(groups(case)) == 2 and len(case.target_pushes) == 1
+    assert composed_numbers(case) == [5]
+    assert len(case.store.owner_merge_facts()) == 1
 
 
 def test_prefix_creation_identity_survives_temporary_listing_lag(batched, monkeypatch):
