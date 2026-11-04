@@ -947,3 +947,26 @@ def test_fresh_session_follows_each_presence_setting(project, large_transcript, 
     assert presence.fresh_session(project, str(large_transcript), channel=channel) is None
     other = "session_start" if channel == "statusline" else "statusline"
     assert presence.fresh_session(project, str(large_transcript), channel=other)
+
+
+@pytest.mark.parametrize("columns", [None, "", "unknown", "0", "-10", "60", "83", "84", "120"])
+def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(project, monkeypatch, columns):
+    from datetime import UTC, datetime
+
+    from foragent import presence, watch_art
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(presence, "_started_at", lambda path: now)
+    if columns is None:
+        monkeypatch.delenv("COLUMNS", raising=False)
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    output = presence.squirrel(project, "greeting", now)
+    rows = output.splitlines()
+    assert len(rows) == 8
+    widths = [len(re.sub(r"\x1b\[[0-9;]*m", "", row)) for row in rows]
+    if columns in ("84", "120"):
+        assert max(widths) == 84
+    else:
+        assert rows == watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE)
+        assert max(widths) == 18

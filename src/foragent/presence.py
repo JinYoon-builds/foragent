@@ -521,7 +521,11 @@ def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
         started = _started_at(_session_path(session_id))
         if started is None or not timedelta(0) <= now - started < SQUIRREL_FOR:
             return None
-        return "\n".join(watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE))
+        try:
+            columns = int(os.environ.get("COLUMNS", ""))
+        except ValueError:
+            columns = None
+        return "\n".join(watch_art.greeting_rows(columns))
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
 

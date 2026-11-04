@@ -310,8 +310,18 @@ def prepare(ctx, report, candidates):
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-            eligible = [(p, j) for p, j, _ in candidates if (p.n, p.started_at) not in spent
-                        and j["phase"] == "waiting" and j["target"] == ctx.config.base_branch]
+            eligible = []
+            for p, j, _ in candidates:
+                if ((p.n, p.started_at) in spent or j["phase"] != "waiting"
+                        or j["target"] != ctx.config.base_branch):
+                    continue
+                try:
+                    if not ci_mode.changed_workflows(ctx.git, base, j["head"]):
+                        eligible.append((p, j))
+                except Exception as exc:
+                    if isinstance(exc, TrackerError) and exc.waits:
+                        raise
+                    report.actions.append(f"#{p.n} merge batch workflow comparison unavailable: {exc}")
             selected = []
             for start in range(0, len(eligible), ctx.config.merge_batch_size):
                 group = eligible[start:start + ctx.config.merge_batch_size]

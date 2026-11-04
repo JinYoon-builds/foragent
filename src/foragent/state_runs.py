@@ -49,6 +49,9 @@ def record_merged(value, owner_facts) -> bool:
 class RunRecordsMixin:
     def _close_phase(self, run: Run, closed_at: datetime, next_step: str) -> dict[str, Any]:
         """Journal the ended phase; called under the state lock (see state_phases.close_phase)."""
+        from foragent import step_weights
+
+        step_weights.transition(self, run, closed_at, next_step)
         return close_phase(self.root, run, closed_at, next_step)
 
     def start_run(
