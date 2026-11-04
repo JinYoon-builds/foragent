@@ -101,7 +101,7 @@ writes this file.
 - 'CI did not finish': 20-job cap vs 11 jobs/PR head; the 1200 s wait counts queue time (r599). [detail](lessons_detail.md)
 - For a 'CI did not finish' storm, read `kind=merge-batch` flow-records first: size-6 batches used 1 member and cost 66 jobs vs a 20 cap (r615). [detail](lessons_detail.md)
 - Push 500s: count landed pushes from Actions runs, not repo events. Rate was not the cause; a git push 5xx skips #1644's wait (r618). [detail](lessons_detail.md)
-- lane_concentration re-fire: diff runs.jsonl since the last answer by outcome first (rows key on `number`, `finished_at`); +1 is often a success or a known push-500 restart (r622, r628, r647).
+- lane_concentration counts run *starts* in 6 h (CONCENTRATION_WINDOW), running included; a +1 is a new start (r714: #2035), not a finish. List starts by lane, not finishes.
 - Stuck merge-owner: often one long tick (inline 28-min baseline, 11-04); check the merge_owner pid age + pytest child. [detail](lessons_detail.md)
 - idle_lanes_with_backlog: first read `kind=ready` reasons (outbox-wait, exclusive peer, plan_pause, retry burst); facts 'held' can be false for retries (r460-r674). [detail](lessons_detail.md)
 - Each conflicted overlap_record appears once per side (#1915 and #1515 both list state_runs.py), so 48 h row counts double. Count distinct (file, issue pair) events before testing the r389 3+/file trigger (r678: 4 rows = 2 events).

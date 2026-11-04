@@ -34,8 +34,8 @@ def test_section_names_the_skill_description_and_a_path_the_session_can_read(tmp
     config = Config(default_skills={"docs": ["in-checkout", "in-project", "in-checkout"]}, skill_libraries=[])
     value = section(config, "docs", root, worktree)
     assert value.startswith("\n\n## Default skills") and value.endswith("\n")
-    assert "- in-checkout: About it (skills/in-checkout/SKILL.md)" in value
-    assert f"- in-project: About it ({root}/skills/in-project/SKILL.md)" in value
+    assert "- in-checkout: About it (skills/in-checkout/SKILL.md; source: project (MIT))" in value
+    assert f"- in-project: About it ({root}/skills/in-project/SKILL.md; source: project (MIT))" in value
     assert value.count("in-checkout:") == 1, "A repeated entry lists once"
 
 
@@ -54,7 +54,7 @@ def test_a_cached_library_copy_needs_license_facts_but_a_full_id_reaches_a_permi
                     default_skills={"docs": ["lib:allowed", "restricted"]})
     value = section(config, "docs", tmp_path / "project")
     assert str(allowed.resolve()) in value
-    assert "- restricted: not available here" in value and "Source-Available" not in value
+    assert "- restricted: not available here" in value and "source: lib (LicenseRef-Source-Available)" in value
 
 
 def test_twelve_long_descriptions_stay_within_the_bound_and_all_remain_listed(tmp_path):
@@ -190,7 +190,7 @@ def test_a_restricted_copy_does_not_hide_a_permitted_one_further_along(tmp_path)
     write_skill(worktree, "both", license="LicenseRef-Source-Available")
     write_skill(root, "both")
     value = section(Config(default_skills={"docs": ["both"]}, skill_libraries=[]), "docs", root, worktree)
-    assert f"({root}/skills/both/SKILL.md)" in value
+    assert f"({root}/skills/both/SKILL.md; source: project (MIT))" in value
 
 
 def test_an_installed_copy_without_its_own_file_keeps_its_librarys_license_facts(tmp_path):
@@ -581,7 +581,7 @@ def test_the_project_license_over_a_copy_applies_even_beside_a_same_name_mit_lib
     root.mkdir(exist_ok=True)
     entry = {"name": "lib", "repo": "unused", "path": str(library)}
     config = Config(skill_libraries=[entry], default_skills={"docs": ["example"]})
-    shown = f"({folder}/example/SKILL.md)" if where == "checkout" else str(base / folder / "example/SKILL.md")
+    shown = f"({folder}/example/SKILL.md; source: lib (MIT))" if where == "checkout" else str(base / folder / "example/SKILL.md")
     value = section(config, "docs", root, worktree)
     assert shown not in value, "The banned copy never reaches a session"
     assert str((library / "skills/example/SKILL.md").resolve()) in value, "The MIT original itself still may"
@@ -663,3 +663,56 @@ def test_a_license_the_default_judge_accepts_installs_without_another_veto_or_wa
     assert (copy / "LICENSE").read_text() == text
     config = Config(skill_libraries=[entry] if where == "library" else [], default_skills={"docs": ["noticed"]})
     assert ".claude/skills/noticed/SKILL.md" in section(config, "docs", project)
+
+
+@pytest.mark.parametrize('folder', ['skills', '.claude/skills'])
+@pytest.mark.parametrize('name,source', [
+    ('principle-prove-it-works', 'pstack (MIT)'),
+    ('review-procedure', 'Anthropic official (Apache-2.0)'),
+    ('fa-local-procedure', 'Foragent-made'),
+])
+def test_local_default_rows_show_the_original_source(folder, name, source, tmp_path):
+    base = tmp_path / '.claude' if folder.startswith('.claude') else tmp_path
+    write_skill(base, name)
+    config = Config(default_skills={'docs': [name]}, skill_libraries=[])
+    row = next(line for line in section(config, 'docs', tmp_path).splitlines() if line.startswith('- '))
+    assert f'{folder}/{name}/SKILL.md; source: {source})' in row
+
+
+@pytest.mark.parametrize('repo,source', [
+    ('git@github.com:anthropics/claude-plugins-official.git', 'Anthropic official (MIT)'),
+    ('https://github.com/Anthropics/skills/', 'Anthropic official (MIT)'),
+    ('https://github.com/anthropics-independent/skills', 'independent (MIT)'),
+    ('https://github.com/independent/skills', 'independent (MIT)'),
+])
+def test_cached_default_and_catalog_share_the_actual_library_source(repo, source, tmp_path):
+    library = tmp_path / 'library'
+    write_skill(library, 'principle-prove-it-works')  # Same directory as pstack; this is another source.
+    config = Config(default_skills={'docs': ['independent:principle-prove-it-works']}, skill_libraries=[
+        {'name': 'independent', 'repo': repo, 'path': str(library)}])
+    value = section(config, 'docs', tmp_path / 'project')
+    assert f'source: {source})' in value
+    assert SkillManager(config).catalog()[0]['source'] == source
+
+
+def test_default_rows_without_a_description_or_a_readable_copy_still_name_the_source(tmp_path):
+    write_skill(tmp_path, 'fa-bare', description='')
+    library = tmp_path / 'library'
+    write_skill(library, 'restricted', license='LicenseRef-No-Redistribution')
+    config = Config(default_skills={'docs': ['fa-bare', 'lib:restricted']}, skill_libraries=[
+        {'name': 'lib', 'repo': 'https://example.org/lib', 'path': str(library)}])
+    value = section(config, 'docs', tmp_path)
+    assert '- fa-bare (skills/fa-bare/SKILL.md; source: Foragent-made)' in value
+    assert '- lib:restricted: not available here (source: lib (LicenseRef-No-Redistribution))' in value
+    assert 'restricted/SKILL.md' not in value
+
+
+def test_cached_default_source_shows_the_license_that_permitted_the_selected_copy(tmp_path):
+    library = tmp_path / 'library'
+    path = write_skill(library, 'noticed', license=None)
+    (path.parent / 'LICENSE').write_text('Attribution: Independent example\n' + STANDARD_LICENSES['MIT'])
+    config = Config(default_skills={'docs': ['noticed']}, skill_libraries=[
+        {'name': 'official', 'repo': 'https://github.com/anthropics/skills', 'path': str(library)}])
+    value = section(config, 'docs', tmp_path / 'project')
+    assert str(path.resolve()) in value
+    assert 'source: Anthropic official (MIT)' in value
