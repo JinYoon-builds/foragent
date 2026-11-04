@@ -66,7 +66,6 @@ def load_roles(config: Config) -> dict[str, dict[str, Any]]:
         scope = entry.get("scope", [])
         roles[name] = {
             "agent": entry.get("agent") or f"fa-{name}",
-            "model": entry.get("model"),
             "skills": list(entry.get("skills", [])),
             "memory": memory_dir(name, entry.get("agent"), entry.get("memory")),
             "signals": deepcopy(entry.get("signals", [])),
@@ -74,6 +73,8 @@ def load_roles(config: Config) -> dict[str, dict[str, Any]]:
             "created_at": entry.get("created_at"),
             "idle_days": entry.get("idle_days", IDLE_DAYS),
         }
+        if entry.get("model") is not None:
+            roles[name]["model"] = entry["model"]
     return roles
 
 
