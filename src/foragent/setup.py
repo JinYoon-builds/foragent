@@ -4,11 +4,16 @@ Checks read facts; they never repair credentials or persist results.
 Add later checks here in setup order (tools, login, scopes, repository, ...).
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 from typing import NotRequired, TypedDict
 
+from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 
 
@@ -19,11 +24,11 @@ class SetupItem(TypedDict):
     advice: NotRequired[bool]
 
 
-def gh_project_scope(auth_status: str, *, language: str = "en") -> SetupItem:
+def gh_project_scope(auth_status: str) -> SetupItem:
     """Check the active github.com account; an undisclosed scope list is unknown.
 
-    Environment tokens don't expose scopes. Missing gh and login failures belong
-    to future checklist items, so neither is treated as a missing project scope.
+    Environment tokens don't expose scopes. Tool and login prerequisites are
+    checked separately before this parser is called.
     """
     accounts = []
     host = ""
@@ -49,6 +54,90 @@ def gh_project_scope(auth_status: str, *, language: str = "en") -> SetupItem:
     return item
 
 
+@dataclass(frozen=True)
+class Facts:
+    """Read-only machine observations shared by every checklist reader."""
+
+    installed: dict[str, bool]
+    auth_status: str = ""
+    logged_in: bool = False
+    auth_error: str = ""
+    language: str = "en"
+
+
+def installed_tools() -> dict[str, bool]:
+    return {tool: shutil.which(tool) is not None for tool in ("git", "gh", "uv")}
+
+
+def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
+    parts = [str(exc)]
+    if isinstance(exc, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        for output in (exc.stdout, exc.stderr):
+            if output:
+                parts.append(output.decode(errors="replace") if isinstance(output, bytes) else output)
+    return "\n".join(parts)
+
+
+def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None,
+            language: str = "en") -> Facts:
+    """Observe prerequisites once, without invoking gh until it is installed."""
+    tools = installed if installed is not None else installed_tools()
+    if not tools["gh"]:
+        return Facts(tools, auth_error="gh not found on PATH", language=language)
+    try:
+        return Facts(tools, auth_status=read_auth(), logged_in=True, language=language)
+    except FileNotFoundError as exc:
+        return Facts({**tools, "gh": False}, auth_error=_auth_error(exc), language=language)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return Facts(tools, auth_error=_auth_error(exc), language=language)
+
+
+INSTALL_PAGES = {
+    "git": "https://git-scm.com/downloads/linux",
+    "gh": "https://github.com/cli/cli/blob/trunk/docs/install_linux.md#installing-gh-on-linux-and-bsd",
+    "uv": "https://docs.astral.sh/uv/getting-started/installation/",
+}
+
+
+def installed_item(facts: Facts, tool: str) -> SetupItem:
+    item: SetupItem = {"id": f"{tool}-installed", "ok": facts.installed[tool]}
+    if not item["ok"]:
+        item["fix"] = f"brew install {tool}" if sys.platform == "darwin" else INSTALL_PAGES[tool]
+    return item
+
+
+def git_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "git")
+
+
+def gh_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "gh")
+
+
+def uv_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "uv")
+
+
+def waiting_item(item_id: str, prerequisite: str, language: str) -> SetupItem:
+    return {"id": item_id, "ok": False, "fix": text("setup_wait_for", language, prerequisite=prerequisite)}
+
+
+def gh_logged_in(facts: Facts) -> SetupItem:
+    if not facts.installed["gh"]:
+        return waiting_item("gh-logged-in", "gh-installed", facts.language)
+    item: SetupItem = {"id": "gh-logged-in", "ok": facts.logged_in}
+    if not item["ok"]:
+        item["fix"] = "gh auth login"
+    return item
+
+
+def project_scope(facts: Facts) -> SetupItem:
+    for prerequisite in (gh_installed(facts), gh_logged_in(facts)):
+        if not prerequisite["ok"]:
+            return waiting_item("gh-project-scope", prerequisite["id"], facts.language)
+    return gh_project_scope(facts.auth_status)
+
+
 def _standing_blocker(assertions: str) -> bool:
     """Keep each assertion's type and lifetime together, even for a shared pid.
 
@@ -72,7 +161,7 @@ def _standing_blocker(assertions: str) -> bool:
     return False
 
 
-def no_idle_sleep(auth_status: str, *, language: str = "en") -> SetupItem | None:
+def no_idle_sleep(facts: Facts) -> SetupItem | None:
     """Read macOS power configuration through the same subprocess probe as init tools."""
     item: SetupItem = {"id": "no-idle-sleep", "ok": True, "advice": True}
     if sys.platform != "darwin":
@@ -95,13 +184,46 @@ def no_idle_sleep(auth_status: str, *, language: str = "en") -> SetupItem | None
         return None
     item["ok"] = _standing_blocker(assertions.stdout)
     if not item["ok"]:
-        item["fix"] = text("setup_no_idle_sleep_fix", language)
+        item["fix"] = text("setup_no_idle_sleep_fix", facts.language)
     return item
 
 
-CHECKS = (gh_project_scope, no_idle_sleep)
+CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
 
 
-def checklist(auth_status: str, *, language: str = "en") -> list[SetupItem]:
-    """Return fresh items in check order; missing advice marks mean blocking."""
-    return [item for check in CHECKS if (item := check(auth_status, language=language)) is not None]
+def repository_fix(key: str, error: GitError, language: str = "en") -> str:
+    """Share recovery text with init's early, before-auth repository preflight."""
+    return text(key, language, error=error, choices=text("init_repository_choices", language))
+
+
+def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en") -> SetupItem:
+    """Describe the repository's next step without creating or linking anything."""
+    git = git or GitRepo(root)
+    try:
+        git.check_worktree()
+    except GitError as exc:
+        return {"id": "repository-linked", "ok": False,
+                "fix": repository_fix("init_git_missing", exc, language)}
+    try:
+        git.remote_slug()
+    except GitError as exc:
+        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+        return {"id": "repository-linked", "ok": False,
+                "fix": repository_fix(key, exc, language)}
+    return {"id": "repository-linked", "ok": True}
+
+
+def checklist(facts: Facts, *, root: Path | None = None,
+              git: GitRepo | None = None) -> list[SetupItem]:
+    """Return fresh items in check order from the same facts for every reader.
+
+    Items without the advice mark are blocking; init stops on them.
+    """
+    items = [check(facts) for check in CHECKS]
+    if facts.installed["git"]:
+        items.append(repository_linked(root if root is not None else Path.cwd(), git=git, language=facts.language))
+    else:
+        items.append(waiting_item("repository-linked", "git-installed", facts.language))
+    if (sleep := no_idle_sleep(facts)) is not None:
+        items.append(sleep)
+    return items

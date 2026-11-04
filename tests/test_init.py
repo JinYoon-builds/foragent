@@ -12,7 +12,7 @@ import yaml
 from foragent.config import ConfigError, load_config
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
-from foragent.init import init_repo
+from foragent.init import ROLE_DEFAULT_SKILLS, init_repo
 from foragent import role_agents, roles
 from foragent.issue import parse_body
 from foragent.labels import LABELS
@@ -26,7 +26,7 @@ PATHS = [".foragent.yml", ".github/ISSUE_TEMPLATE/foragent-task.md", "tests/acce
 ROLE_PATHS = list(role_agents.missing_files(Path("/nonexistent-foragent-project"))[0])
 ALL_PATHS = [*PATHS, *ROLE_PATHS]
 # Init also installs the pending lane-memory union line (#1000); it is published, not "created".
-PUBLISHED_PATHS = [*ALL_PATHS, ".gitattributes"]
+PUBLISHED_PATHS = [*ALL_PATHS, ".gitattributes", ".gitignore"]
 def without_roles(text):
     """Settings text without the roles block init writes (#769); each default role must be in it."""
     lines, kept, inside = text.splitlines(keepends=True), [], False
@@ -97,11 +97,16 @@ class Setup:
                 raise subprocess.CalledProcessError(1, ["git", *args], stderr="pre-commit hook failed")
             # Import only the requested setup paths, retaining unrelated index entries.
             title = args[args.index("-m") + 1]
-            parent = git_command(root, "rev-parse", "HEAD")
+            try:
+                parent = git_command(root, "rev-parse", "--verify", "--quiet", "HEAD")
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                parent = None  # The first setup commit has no parent.
             branch = git_command(root, "symbolic-ref", "HEAD")
             stream = [
                 f"commit {branch}\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-                f"data {len(title.encode())}\n{title}\n", f"from {parent}\n",
+                f"data {len(title.encode())}\n{title}\n", *([f"from {parent}\n"] if parent else []),
             ]
             for setup_path in args[args.index("--") + 1:]:
                 if setup_path == ":!CLAUDE.local.md":
@@ -186,7 +191,8 @@ def setup(tmp_path, monkeypatch):
 def test_init_creates_exact_files_labels_and_commits_only_setup_paths(setup):
     report = setup.init()
     assert report.created == ALL_PATHS and report.existed == []
-    assert without_roles((setup.root / PATHS[0]).read_text()) == EXPECTED_CONFIG
+    assert without_roles((setup.root / PATHS[0]).read_text()) == (
+        EXPECTED_CONFIG + yaml.safe_dump({"default_skills": ROLE_DEFAULT_SKILLS}, sort_keys=False))
     assert (setup.root / PATHS[1]).read_text() == EXPECTED_TEMPLATE
     assert (setup.root / PATHS[2]).read_bytes() == b""
     body = EXPECTED_TEMPLATE.split("---\n", 2)[2]
@@ -423,7 +429,7 @@ def test_only_nondefault_keys_and_explicit_approvers_are_written(setup):
     setup.init(review="fast", executor="claude", run_hours="22-08", approvers=["alice", "bob"])
     assert fresh_config_values(setup.root / PATHS[0]) == {
         "review": "fast", "executor": "claude", "approvers": ["alice", "bob"], "run_hours": "22-08",
-        "reviewer": "claude", "checks": "local",
+        "reviewer": "claude", "checks": "local", "default_skills": ROLE_DEFAULT_SKILLS,
     }
     # No pytest command here, so the repository's visibility is not needed (#419).
     assert setup.gh_calls == [(["auth", "status"], None)]
@@ -769,6 +775,20 @@ def test_init_push_ignores_origin_push_destination_override(setup):
     assert git_command(origin, "rev-parse", "main") == git_command(setup.root, "rev-parse", "HEAD")
 
 
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_setup_pushes_directly_during_a_merge_train(setup, merge_owner):
+    origin = setup.root.parent / "origin.git"
+    base = git_command(origin, "rev-parse", "main")
+    ref = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", ref, base)
+    (setup.root / ".foragent.yml").write_text(yaml.safe_dump({
+        "merge_owner": merge_owner, "test_command": "uv run pytest",
+    }))
+    assert setup.init().pushed
+    assert git_command(origin, "rev-parse", "main") == git_command(setup.root, "rev-parse", "HEAD") != base
+    assert git_command(origin, "rev-parse", ref) == base
+
+
 def test_rerun_recovers_rejected_push_without_another_commit(setup):
     setup.push_fails = True
     with pytest.raises(GitError, match="push rejected"):
@@ -853,7 +873,7 @@ def test_explicit_default_options_override_global_config(setup):
     setup.init(executor="codex", run_hours="always", review="fast", approvers=["human"])
     assert fresh_config_values(setup.root / PATHS[0]) == {
         "executor": "codex", "run_hours": "always", "review": "fast", "approvers": ["human"],
-        "checks": "local",
+        "checks": "local", "default_skills": ROLE_DEFAULT_SKILLS,
     }
     config = load_config(setup.root)
     assert (config.executor, config.run_hours, config.review, config.approvers) == (
@@ -1149,6 +1169,9 @@ def recording_commit(commits):
 
 def test_role_add_uses_an_installed_skill_copy_and_records_why_without_github(setup, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    global_config = Path.home() / ".config/foragent/config.yml"
+    global_config.parent.mkdir(parents=True)
+    global_config.write_text("skill_libraries: []\n")  # This local-copy test must not clone a library.
     setup.init()
     commits = []
     monkeypatch.setattr(GitRepo, "commit_paths", recording_commit(commits))
@@ -1772,6 +1795,135 @@ def test_fa_allow_preserves_invalid_nested_settings(tmp_path, monkeypatch, setti
     assert not fa_allow_record_path().exists()
 
 
+def test_new_default_skills_install_offline_once_and_keep_the_shipped_bytes(setup, monkeypatch):
+    from foragent import skills
+    from foragent.session_skills import assigned_entries
+
+    def no_transport(argv):
+        pytest.fail(f"Default installation must stay offline: {argv}")
+
+    monkeypatch.setattr(skills, "_run", no_transport)
+    installed = []
+    install = skills.SkillManager.install_default
+
+    def record_install(self, identity, skill, root):
+        installed.append(identity)
+        return install(self, identity, skill, root)
+
+    monkeypatch.setattr(skills.SkillManager, "install_default", record_install)
+    setup.init(no_push=True, no_launchd=True)
+    table = yaml.safe_load((setup.root / '.foragent.yml').read_text())['default_skills']
+    assert set(table) == {'workers', 'reviewers', 'orchestrator', 'architect', 'docs'}
+    assert all(table.values())
+    names = assigned_entries(load_config(setup.root))
+    assert installed == names, 'Shared defaults install only once across roles'
+    shipped = Path(__file__).resolve().parents[1] / 'skills'
+    for name in names:
+        target = setup.root / '.claude/skills' / name
+        for filename in ('SKILL.md', 'LICENSE'):
+            assert (target / filename).read_bytes() == (shipped / name / filename).read_bytes()
+        assert 'Revision: unknown' not in (target / 'SOURCE').read_text()
+    before = (setup.root / '.foragent.yml').read_bytes()
+    setup.init(no_push=True, no_launchd=True)
+    assert installed == names, 'A second init must not install the defaults again'
+    assert (setup.root / '.foragent.yml').read_bytes() == before
+
+
+@pytest.mark.parametrize('table', [{}, None, {'docs': []}, {'docs': ['custom-guide']}])
+def test_new_project_keeps_an_explicit_global_default_table_including_empty(setup, table, monkeypatch):
+    from foragent import skills
+
+    library = setup.root.parent / 'library'
+    source = library / 'skills/custom-guide'
+    source.mkdir(parents=True)
+    (source / 'SKILL.md').write_text('---\nname: custom-guide\ndescription: My guide\n---\nPersonal guidance.\n')
+    (source / 'LICENSE').write_text('SPDX-License-Identifier: MIT\n')
+    config = Path.home() / '.config/foragent/config.yml'
+    config.parent.mkdir(parents=True)
+    config.write_text(yaml.safe_dump({'default_skills': table, 'skill_libraries': [
+        {'name': 'own', 'repo': 'https://example.org/own', 'path': str(library)}]}))
+    monkeypatch.setattr(skills, '_run', lambda argv: pytest.fail(f'Unexpected transport: {argv}'))
+    setup.init(no_push=True, no_launchd=True)
+    written = yaml.safe_load((setup.root / '.foragent.yml').read_text())
+    assert 'default_skills' in written and written['default_skills'] == table
+    folders = {path.name for path in (setup.root / '.claude/skills').iterdir()}
+    assert not any(name.startswith('principle-') or name == 'review-procedure' for name in folders)
+    assert ('custom-guide' in folders) == bool(table and table.get('docs'))
+    if table and table.get('docs'):
+        assert (setup.root / '.claude/skills/custom-guide/SKILL.md').read_bytes() == (source / 'SKILL.md').read_bytes()
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_reinit_keeps_ignore_edits_outside_its_generated_output(setup, interrupted):
+    setup.commit_fails = interrupted
+    if interrupted:
+        with pytest.raises(GitError, match='pre-commit hook failed'):
+            setup.init(no_push=True, no_launchd=True)
+    else:
+        setup.init(no_push=True, no_launchd=True)
+    path = setup.root / '.gitignore'
+    changed = path.read_bytes() + b'# My project rules\nprivate-work/\n'
+    path.write_bytes(changed)
+    setup.commit_fails = False
+    setup.git_calls.clear()
+    setup.init(no_push=True, no_launchd=True)
+    assert path.read_bytes() == changed
+    assert all('.gitignore' not in args[args.index('--') + 1:]
+               for args in setup.git_calls if 'commit' in args)
+    assert '.gitignore' in git_command(setup.root, 'status', '--porcelain')
+
+
+@pytest.mark.parametrize('initial', ['existing-ignore', 'interrupted-setup'])
+def test_init_installs_defaults_before_the_first_commit(setup, initial):
+    root = setup.root.parent / 'unborn'
+    root.mkdir()
+    git_command(root, 'init', '--initial-branch=main')
+    git_command(root, 'remote', 'add', 'origin', 'https://github.com/owner/repo.git')
+    fresh = Setup(root)
+    if initial == 'existing-ignore':
+        (root / '.gitignore').write_text('# Project ignores\nbuild/\n')
+    else:
+        fresh.commit_fails = True
+        with pytest.raises(GitError, match='pre-commit hook failed'):
+            fresh.init(no_push=True, no_launchd=True)
+        fresh.commit_fails = False
+        assert (root / '.claude/skills/review-procedure/SKILL.md').is_file()
+    probe = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], cwd=root, capture_output=True)
+    assert probe.returncode == 1, 'This scenario must still have no commit'
+    report = fresh.init(no_push=True, no_launchd=True)
+    assert report.committed
+    assert git_command(root, 'rev-list', '--count', 'HEAD') == '1'
+    assert yaml.safe_load((root / '.foragent.yml').read_text())['default_skills'] == ROLE_DEFAULT_SKILLS
+    shipped = Path(__file__).resolve().parents[1] / 'skills'
+    for name in {name for names in ROLE_DEFAULT_SKILLS.values() for name in names}:
+        assert (root / '.claude/skills' / name / 'SKILL.md').read_bytes() == (shipped / name / 'SKILL.md').read_bytes()
+    assert git_command(root, 'show', 'HEAD:.gitignore') == (root / '.gitignore').read_text().strip()
+    if initial == 'existing-ignore':
+        assert (root / '.gitignore').read_text().startswith('# Project ignores\nbuild/\n')
+    assert git_command(root, 'status', '--porcelain') == ''
+    assert not fresh.init(no_push=True, no_launchd=True).committed
+    assert git_command(root, 'rev-list', '--count', 'HEAD') == '1'
+
+
+@pytest.mark.parametrize('step', ['probe', 'tree', 'blob'])
+def test_init_ignore_recovery_propagates_git_errors_other_than_missing_head(setup, monkeypatch, step):
+    setup.init(no_push=True, no_launchd=True)
+    run = setup.run_git
+
+    def fail_read(args):
+        targeted = ((step == 'probe' and args == ['rev-parse', '--verify', '--quiet', 'HEAD'])
+                    or (step == 'tree' and args[:2] == ['ls-tree', '--name-only'])
+                    or (step == 'blob' and args[:1] == ['show'] and args[1].endswith(':.gitignore')))
+        if targeted:
+            raise subprocess.CalledProcessError(128 if step == 'probe' else 1, ['git', *args],
+                                                stderr='injected Git read failure')
+        return run(args)
+
+    monkeypatch.setattr(setup, 'run_git', fail_read)
+    with pytest.raises(GitError, match='injected Git read failure'):
+        setup.init(no_push=True, no_launchd=True)
+
+
 @pytest.mark.parametrize("language_source", ["default", "flag", "config"])
 @pytest.mark.parametrize("blocked", [False, True])
 def test_sleep_advice_does_not_block_init(setup, monkeypatch, language_source, blocked):
@@ -1795,7 +1947,7 @@ def test_sleep_advice_does_not_block_init(setup, monkeypatch, language_source, b
         monkeypatch.setattr(setup, "run_gh", lambda args, input=None:
                             "github.com\n  ✓ Logged in to github.com account human\n  - Token scopes: 'repo'\n"
                             if args == ["auth", "status"] else gh_run(args, input))
-    item = checklist.checklist("", language=language)[-1]
+    item = checklist.no_idle_sleep(checklist.Facts({}, language=language))
     assert item == {"id": "no-idle-sleep", "ok": False, "advice": True,
                     "fix": text("setup_no_idle_sleep_fix", language)}
     kwargs = {"language": language} if language_source == "flag" else {}

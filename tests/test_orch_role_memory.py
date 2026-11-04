@@ -1,6 +1,7 @@
 """Role memory publication: local commit before any remote read, byte-exact paths, moved base."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -88,6 +89,37 @@ def test_offline_fetch_still_commits_locally_and_a_later_tick_delivers(case):
     case.offline.clear()
     assert publish(case) == ["role memory published to main"]
     assert origin_file(case, f"{FOLDER}/MEMORY.md") == b"Old lesson.\nNew lesson.\n"
+
+
+@pytest.mark.parametrize("merge_owner", [True, False])
+def test_merge_train_wait_rebuilds_memory_after_main_advances(case, merge_owner):
+    case.ctx.config = replace(case.ctx.config, merge_owner=merge_owner)
+    before = run(case.origin, "rev-parse", "main").strip()
+    train = f"refs/heads/foragent/batch-merge-{before[:8]}-1"
+    run(case.origin, "update-ref", train, before)
+    path = f"{FOLDER}/MEMORY.md"
+    (case.root / path).write_text("Old lesson.\nNew lesson.\n")
+    actions = publish(case)
+    local = run(case.root, "rev-parse", "HEAD").strip()
+    assert local != before
+    assert head_file(case, path) == b"Old lesson.\nNew lesson.\n"
+    if merge_owner:
+        assert len(actions) == 1 and "waiting for merge train" in actions[0]
+        assert origin_file(case, path) == b"Old lesson.\n"
+        assert "waiting for merge train" in " ".join(publish(case))
+        assert run(case.root, "rev-parse", "HEAD").strip() == local
+        case.history.update({"README.md": "Train advanced main.\n"}, message="Train merged")
+        run(case.origin, "update-ref", "-d", train)
+        assert publish(case) == ["role memory published to main"]
+        assert run(case.root, "rev-parse", "HEAD").strip() != local
+        assert run(case.root, "rev-parse", "HEAD^").strip() == case.history.tip
+        assert origin_file(case, "README.md") == b"Train advanced main.\n"
+    else:
+        assert actions == ["role memory published to main"]
+        assert run(case.origin, "rev-parse", "main").strip() == local
+    assert run(case.origin, "rev-parse", "main") == run(case.root, "rev-parse", "HEAD")
+    assert origin_file(case, path) == b"Old lesson.\nNew lesson.\n"
+    assert publish(case) == []
 
 
 def test_non_ascii_memory_file_is_committed_and_retried(case):
