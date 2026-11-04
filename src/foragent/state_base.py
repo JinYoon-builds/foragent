@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from uuid import uuid4
 
 from foragent.file_cache import read_jsonl
 
@@ -65,14 +66,23 @@ class StateBase:
             saved = {}
         return _state.write_back(type(run), saved, _state.asdict(run))
 
-    def _write_run(self, run: "Run", value: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _write_run(self, run: "Run", value: dict[str, Any] | None = None,
+                   *, snapshot: bool = True) -> dict[str, Any]:
         """History commits completion; runs/ keeps a compatibility snapshot, never the authority."""
         value = self._run_value(run) if value is None else value
         if run.kind == "issue" and run.status == "finished":
+            if snapshot and not value.get("run_generation"):
+                saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
+                generation = saved.get("run_generation") or uuid4().hex
+                if not saved.get("run_generation"):
+                    # Adopt the old snapshot before committing any changed completion fields.
+                    self._write_json(self._run_path(run), {**saved, "run_generation": generation})
+                value = {**value, "run_generation": generation}
             path = self.root / "runs.jsonl"
             history = path.read_text(encoding="utf-8") if path.exists() else ""
             self._atomic_write(path, history + _state.json.dumps(value, ensure_ascii=False) + "\n")
-        self._write_json(self._run_path(run), value)
+        if snapshot:
+            self._write_json(self._run_path(run), value)
         return value
 
     def _read_issue_run(self, number: int) -> dict[str, Any]:

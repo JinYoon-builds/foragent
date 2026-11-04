@@ -1,6 +1,7 @@
 """Completion is committed once; the per-issue snapshot is a compatibility view."""
 
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -148,3 +149,133 @@ def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch
     store.record_owner_merge(1, run.started_at, fact)
     assert (tmp_path / "runs.jsonl").read_bytes() == before
     assert peer.get_run(1) == peer.read_history()[0]
+
+
+def completed_record(root, legacy):
+    store, run = start(root)
+    store.update_run(1, last_review_pass_at=NOW.isoformat())
+    store.finish_run(1, "pr-open", INPUT_DETAIL)
+    value = json.loads((root / "runs/1.json").read_text())
+    value.update(process_identities=[{"pid": 42000, "start_time": 10}], future_metadata={"keep": [1, 2]})
+    if legacy:
+        value.pop("run_generation")
+    store._write_json(root / "runs/1.json", value)
+    store._atomic_write(root / "runs.jsonl", json.dumps(value) + "\n")
+    return store, run
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("action", ["owner", "ownership"])
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_finished_metadata_crashes_keep_latest_and_history_equal(tmp_path, monkeypatch, legacy, action, after_replace):
+    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "head"}
+    real_replace = os.replace
+    for fail_at in range(1, 5):
+        root = tmp_path / str(fail_at)
+        store, run = completed_record(root, legacy)
+        writes = []
+
+        def update(store):
+            if action == "owner":
+                store.record_owner_merge(1, run.started_at, fact)
+            elif store.get_run(1).process_identities:
+                with store._state_lock():
+                    store._write_run(replace(store.get_run(1), process_identities=[]))
+
+        def interrupted(source, destination):
+            writes.append(destination)
+            if len(writes) == fail_at and not after_replace:
+                raise OSError("before finished metadata write")
+            real_replace(source, destination)
+            if len(writes) == fail_at and after_replace:
+                raise OSError("after finished metadata write")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "replace", interrupted)
+            try:
+                update(store)
+            except OSError:
+                pass
+        reopened = StateStore(root, now=lambda: NOW)
+        latest, = reopened.read_history()
+        assert reopened.get_run(1) == latest
+        assert json.loads((root / "runs.jsonl").read_text().splitlines()[-1])["future_metadata"] == {"keep": [1, 2]}
+        assert latest.detail == DETAIL
+        if action == "owner":
+            assert latest.review_pass_to_merge_seconds in (None, 60.0)
+        update(reopened)
+        assert reopened.get_run(1) == reopened.read_history()[0]
+        if action == "owner":
+            assert reopened.get_run(1).review_pass_to_merge_seconds == 60.0
+        else:
+            assert reopened.get_run(1).process_identities == []
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_owner_readers_use_committed_fact_when_snapshot_is_stale(tmp_path, monkeypatch, legacy):
+    store, run = completed_record(tmp_path, legacy)
+    first = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "first"}
+    second = {"merged_at": (NOW + timedelta(minutes=2)).isoformat(), "head": "second"}
+    store.record_owner_merge(1, run.started_at, first)
+    write = store._write_json
+
+    def fail_snapshot(path, value):
+        if path == tmp_path / "runs/1.json":
+            raise OSError("snapshot failed")
+        return write(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_write_json", fail_snapshot)
+        with pytest.raises(OSError, match="snapshot failed"):
+            store.record_owner_merge(1, run.started_at, second)
+    reopened = StateStore(tmp_path)
+    latest, = reopened.read_history()
+    assert reopened.get_run(1) == latest
+    assert latest.review_pass_to_merge_seconds == 120.0
+    assert reopened.owner_merge_facts() == {(1, run.started_at): second}
+    assert reopened.merge_times() == {(1, run.started_at): second["merged_at"]}
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_historical_owner_write_preserves_current_generation(tmp_path, monkeypatch, legacy):
+    store, old = completed_record(tmp_path, legacy)
+    store._now = lambda: NOW + timedelta(minutes=2)
+    current = store.start_run(1, branch="new", worktree=tmp_path / "new")
+    snapshot = tmp_path / "runs/1.json"
+    before = snapshot.read_bytes()
+    write = store._write_json
+
+    def refuse_current(path, value):
+        assert path != snapshot, "An old completion must not write the current snapshot"
+        return write(path, value)
+
+    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old"}
+    monkeypatch.setattr(store, "_write_json", refuse_current)
+    store.record_owner_merge(1, old.started_at, fact)
+    reopened = StateStore(tmp_path)
+    assert snapshot.read_bytes() == before
+    assert reopened.get_run(1) == current
+    recorded, = reopened.read_history()
+    assert recorded.review_pass_to_merge_seconds == 60.0
+    assert reopened.owner_merge_facts() == {(1, old.started_at): fact}
+    history = (tmp_path / "runs.jsonl").read_bytes()
+    reopened.record_owner_merge(1, old.started_at, fact)
+    assert (tmp_path / "runs.jsonl").read_bytes() == history
+    assert snapshot.read_bytes() == before
+
+
+def test_legacy_owner_replay_commits_a_fact_previously_saved_only_in_snapshot(tmp_path):
+    store, run = completed_record(tmp_path, True)
+    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old-writer"}
+    path = tmp_path / "runs/1.json"
+    value = json.loads(path.read_text())
+    value.update(owner_merge=fact, owner_merge_started_at=run.started_at, merged_at=fact["merged_at"],
+                 review_pass_to_merge_seconds=60.0)
+    store._write_json(path, value)  # An older writer crashed after its snapshot, before history.
+    store.record_owner_merge(1, run.started_at, fact)
+    reopened = StateStore(tmp_path)
+    assert reopened.get_run(1) == reopened.read_history()[0]
+    assert reopened.get_run(1).review_pass_to_merge_seconds == 60.0
+    before = (tmp_path / "runs.jsonl").read_bytes()
+    reopened.record_owner_merge(1, run.started_at, fact)
+    assert (tmp_path / "runs.jsonl").read_bytes() == before

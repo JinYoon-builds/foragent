@@ -215,9 +215,16 @@ class RunRecordsMixin:
         """Attach a validated GitHub merge fact to the admitted worker generation."""
         with self._state_lock():
             value = self._read_issue_run(number)
-            if value["started_at"] != started_at:
-                raise ValueError("Merge belongs to a superseded worker generation")
-            if value.get("owner_merge") == fact and value.get("owner_merge_started_at") == started_at:
+            current = value["started_at"] == started_at
+            if not current:
+                value = next((row for row in reversed(self._run_history())
+                              if row["number"] == number and row["started_at"] == started_at), None)
+                if value is None:
+                    raise ValueError("Merge worker generation is unavailable")
+                value = _copy(value)
+            # A legacy snapshot alone does not prove that the fact reached history.
+            if (value.get("owner_merge") == fact and value.get("owner_merge_started_at") == started_at
+                    and (not current or value.get("run_generation"))):
                 return
             value["owner_merge"] = fact
             value["owner_merge_started_at"] = started_at
@@ -226,14 +233,18 @@ class RunRecordsMixin:
             value["review_pass_to_merge_seconds"] = (
                 (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
                 if passed else None)
-            self._write_run(_state.load_record(Run, value), value)
+            self._write_run(_state.load_record(Run, value), value, snapshot=current)
 
     def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
         """One completion fact, independent of the finished worker outcome."""
         values = list(self._run_history())
         for path in (self.root / "runs").glob("[0-9]*.json"):
             try:
-                values.append(_state.json.loads(path.read_text()))
+                value = _state.json.loads(path.read_text())
+                if (isinstance(value, dict) and value.get("run_generation")
+                        and isinstance(value.get("started_at"), str)):
+                    value = self._read_issue_run(int(path.stem))
+                values.append(value)
             except (OSError, ValueError):
                 continue  # Optional owner facts must not break readers of completed history.
         return owner_facts_of(values)
@@ -308,10 +319,6 @@ class RunRecordsMixin:
                 raise KeyError(number)
             if run.status == "finished":
                 return run
-            if not self._run_value(run).get("run_generation"):
-                # Adopt old running files before committing completion. A crash here leaves
-                # their running state intact; old history cannot finish this generation.
-                self._write_run(run, {**self._run_value(run), "run_generation": uuid4().hex})
             detail = " ".join(detail.split())
             if not detail and outcome != "merged":
                 detail = " ".join(run.detail.split()) or f"Run finished with outcome {outcome}."
