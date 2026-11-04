@@ -5,7 +5,8 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 ## People and questions
 
-- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Hard to undo means data, money, public exposure or sending to others; changes git can revert, including deleting superseded code, are not person questions. A question an existing decision answers goes to the PM, not the person. Do anything with a right answer, then report it. (D71)
+- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Hard to undo means data, money, public exposure or sending to others; changes git can revert, including deleting superseded code, are not person questions. A question an existing decision answers goes to the PM, not the person. Do anything with a right answer, then report it. (D71, D115)
+- Decisions made with the person go into decisions.md and this file in the same session; memory keeps only a link. (D114)
 - A bug fix with no choice: the orchestrator publishes and approves it after a clean preread. Anything with a choice goes through planning to Jin. (D101)
 - The person talks to the planning session. The orchestrator works in the back and sends its questions through planning. (D76)
 - Only the orchestrator adds `needs-human`, with what it tried, why a person is needed, and options. The gate and lanes add `blocked` with a reason. (D45)
@@ -25,6 +26,8 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - When a parent changes after approval, only children not yet started follow it. (D103)
 - An issue that adds or changes shared state names the one writer of each state in its Goal. Two writers means redesign before approval. (D95)
 - Before asking, the interview reads the docs and confirms the decision ledger. It asks only the gaps. (D28, D58)
+- Before proposing new structure, ask what exactly is slow, how the industry does it, and whether it replaces or adds to the existing path; add one part, and keep evidence makers apart from actors. (D110)
+- A PM fix merges when the latest three-seat review finds no P1; a P2 that can stop the target or let unverified code in counts as P1, other P2s go to a cleanup issue. (D119)
 
 ## Gate and lanes
 
@@ -38,6 +41,9 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - Acceptance tests that passed before the run must still pass. A test gone from main is not guarded. (D53, D66)
 - With CI, the runner runs Done when, the baseline and the changed files' own tests. CI runs the rest. (D81)
 - New main commits that change only files without effect on the result don't restart verification. (D85)
+- The merge owner reuses old evidence only when main moved forward by additions or edits under `.claude/agent-memory/` that the PR did not touch, with `checks: ci`. (D111)
+- A merge batch moves main to its tip in one step when the tip's CI and member checks pass; a failed batch retries with the front half of its members. (D120)
+- Locked tests of closed issues must stay green on main; a failure is reported, not excused, and is rechecked from CI's existing main results. (D122)
 - Urgent work goes to the front of its lane queue by the orchestrator. Planning builds outside the gate only when the gate itself is broken. (D83)
 - The gate raises no macOS permission prompts. Access to protected folders fails quietly. (D97)
 - A lane is one agent definition: paths, skills and memory, no persona. (D22)
@@ -57,6 +63,8 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 - GitHub issues own the facts about work. Local state is a copy. Memory keeps only lessons. (D102)
 - One writer per state; others leave a request. Compute what records can derive. Append, don't overwrite. (D95)
+- git and GitHub are the source of truth; local copies are caches with one writer, changing state is re-read at write time, and on failure Foragent falls back to the default path. (D109)
+- The merge owner is the only writer of main; others request, and it writes between batches under the main write lock. (D118)
 - GitHub writes go through `fa` commands, with one permission ask at install. (D104)
 - Every word on screen carries its evidence and that evidence's age. "Alive" needs fresh evidence. (D67)
 - `docs/rules.md` holds the rules in force. `docs/decisions.md` is append-only history. (D108)
@@ -69,6 +77,8 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - Cleanup is an order kind, put in the lane that owns the files. Its goal is issues that touch different files, not a rulebook. (D68, D82)
 - A dream updates its lane's memory: add, drop stale, merge, and settle conflicts by the decisions. (D75)
 - One orchestrator per project. The gate opens one when work runs and none is alive. (D36, D66)
+- The UX researcher is a default role, next after the merge owner: it uses the real product as a persona to find seams between features. (D116)
+- Default skills come in two tiers: general principle skills for every project's roles, and extra ones for Foragent's own lanes. (D117)
 
 ## Product
 
@@ -76,7 +86,9 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - Machine formats stay English. Text for people follows the `language` setting. (D17)
 - Claude + Codex and Claude only both work without setup. (D63)
 - Review strength follows reversibility. `always_human` paths, `risk:high`, deploys and public releases go to a person. (D10)
-- Library skills are copied in at run time, not committed. (D37)
+- The default `principle-*` skills are vendored and committed with their source, and installed by `fa init`. (D117)
+- The dashboard's main screen shows only what is happening now; details for one issue open in a bubble when you tap its acorn. (D112)
+- Stage names say what is being checked, not where: 작성, 준비, 목표, 리뷰, 전체, 머지, 차례. (D113)
 - Each person's factory works only the orders that person published (`by:<login>`). (D78)
 
 ## Review findings are scored (#1651)
