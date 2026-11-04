@@ -20,8 +20,9 @@ force.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import fcntl
 import json
 from typing import TYPE_CHECKING
 
@@ -208,6 +209,47 @@ def raise_if_requested(ctx: RunContext, n: int) -> None:
     raise ExecutorStopped("stopped", why)
 
 
+def halt(ctx: RunContext, n: int, why: str) -> None:
+    """The deferred stop of the shared final merge read: no merge starts during a project stop.
+
+    A live run finishes "stopped" through its owner's save; the merge owner keeps its job queued.
+    """
+    if (run := ctx.store.get_run(n)) is not None and run.status == "running":
+        _note(ctx, n, run, "stopped", "project-stop", why)
+    raise ExecutorStopped("stopped", why)
+
+
+@contextmanager
+def merging(ctx: RunContext, n: int, refused: Callable[[str], BaseException] | None = None) -> Iterator[None]:
+    """Hold the stop record lock around every merge call, after its last check.
+
+    `stop_all` records a stop under the same lock, so a stop recorded before this read merges
+    nothing, and a stop that arrives during the merge call waits for that call to return.
+    """
+    with record_lock(ctx.store):
+        if (why := active(ctx.store)) is not None:
+            if refused is not None:
+                raise refused(why)
+            halt(ctx, n, why)
+        yield
+
+
+@contextmanager
+def record_lock(store) -> Iterator[None]:
+    """The lock a stop is recorded under; held briefly by each irreversible step that reads it.
+
+    Merge calls, worktree removal and branch moves read the stop and act inside it, so a stop
+    lands either before the read or after the step. Never take it twice in one thread.
+    """
+    store.root.mkdir(parents=True, exist_ok=True)
+    with (store.root / "stop.lock").open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def stop_all(ctx: RunContext, why: str) -> str:
     """Record one project-wide stop and hold every lane not held yet; each run's owner stops its run.
 
@@ -230,7 +272,8 @@ def stop_all(ctx: RunContext, why: str) -> str:
         held = [lane for lane in lanes if lane not in paused]  # A lane held before keeps its own hold.
         for lane in held:
             orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"{STOP_PREFIX}{why}")
-        _append(ctx.store, {"at": now.isoformat(), "kind": "stop", "why": why, "held": held})
+        with record_lock(ctx.store):  # A merge call or removal in flight finishes first; no later one starts.
+            _append(ctx.store, {"at": now.isoformat(), "kind": "stop", "why": why, "held": held})
         running = sorted(run.number for run in unfinished_runs(ctx.store))
     lines = [text("orch_stop_all_held", language, lanes=", ".join(lanes), why=why)]
     lines += [text("orch_stop_all_owner", language, n=n) for n in running]

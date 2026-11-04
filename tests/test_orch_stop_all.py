@@ -130,3 +130,17 @@ def test_the_run_owner_stops_only_while_a_stop_is_in_force(case):
     assert (stopped.value.outcome, str(stopped.value)) == ("stopped", WHY)
     case.store.finish_run(1, outcome="stopped", detail=WHY)
     orch_stop.raise_if_requested(case.ctx, 1)  # A finished run has nothing left to stop.
+
+
+def test_a_stop_waits_for_a_merge_call_in_flight_and_then_holds_every_later_one(case):
+    import threading
+
+    with orch_stop.record_lock(case.store):  # A merge call past its last check.
+        stopper = threading.Thread(target=orch.stop_all, args=(case.ctx, WHY))
+        stopper.start()
+        stopper.join(0.3)
+        assert stopper.is_alive() and orch_stop.active(case.store) is None, "The call in flight returns first"
+    stopper.join(5)
+    assert orch_stop.active(case.store) == WHY
+    with pytest.raises(ExecutorStopped), orch_stop.merging(case.ctx, 1):
+        pytest.fail("No merge call starts after the stop")

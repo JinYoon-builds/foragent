@@ -141,3 +141,71 @@ def test_fa_orch_release_needs_no_argument_and_keeps_a_given_why(case, monkeypat
     assert invoke(capsys, "orch", "release", "--why", "Jin is back").code == 0
     journal = (case.store.root / "orch-events.jsonl").read_text()
     assert '"kind": "release"' in journal and "Jin is back" in journal
+
+
+def _saved_branch(case):
+    """An issue branch holding one saved WIP commit beyond main, like an earlier stopped run."""
+    path = _worktree(case, "issue-1", "foragent/issue-1")
+    (path / "unsaved.txt").rename(path / "prior-wip.txt")
+    orch.stop_all(case.ctx, WHY)
+    case.git.remove_worktree(path)
+    assert git_command(case.root, "show", "foragent/issue-1:prior-wip.txt") == "unfinished"
+    return path, git_command(case.root, "rev-parse", "foragent/issue-1")
+
+
+def test_a_stop_waits_for_a_removal_that_already_read_no_stop(case, monkeypatch):
+    import threading
+
+    from foragent.git import GitRepo
+
+    path = _worktree(case, "issue-1", "foragent/issue-1")
+    real, stopped = GitRepo._discardable, []
+
+    def discardable(self, *args):
+        answer = real(self, *args)  # No stop yet: this removal goes ahead.
+        stopper = threading.Thread(target=lambda: stopped.append(orch.stop_all(case.ctx, WHY)))
+        stopper.start()
+        stopper.join(0.3)
+        assert not stopped, "The stop waits until the removal that read no stop is done"
+        self.stopper = stopper
+        return answer
+
+    monkeypatch.setattr(GitRepo, "_discardable", discardable)
+    case.git.remove_worktree(path)
+    case.git.stopper.join(5)
+    assert stopped and not path.exists()
+
+
+def test_a_detached_review_at_an_older_head_never_moves_the_issue_branch_back(case):
+    _, saved = _saved_branch(case)
+    orch.release(case.ctx)
+    path = _worktree(case, "issue-1")  # A review rerun at the PR's older head.
+    orch.stop_all(case.ctx, WHY)
+    case.git.remove_worktree(path)
+    assert git_command(case.root, "rev-parse", "foragent/issue-1") == saved, "The saved WIP stays on the branch"
+    assert (path / "unsaved.txt").read_text() == "unfinished\n", "The review's own files stay on disk"
+
+
+def test_attaching_a_branch_never_drops_its_commits_during_a_stop(case):
+    from foragent.run_attempt import ExecutorStopped
+
+    _, saved = _saved_branch(case)
+    path = _worktree(case, "issue-1")
+    with pytest.raises(ExecutorStopped):
+        case.git.at(path).attach_branch("foragent/issue-1")
+    assert git_command(case.root, "rev-parse", "foragent/issue-1") == saved
+
+
+def test_a_rebuild_during_a_stop_never_resets_the_saved_branch(case):
+    from types import SimpleNamespace
+
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_conflicts import _recreate_worktree
+
+    path = _worktree(case, "issue-1", "foragent/issue-1")
+    orch.stop_all(case.ctx, WHY)
+    attempt = SimpleNamespace(n=1, ctx=case.ctx, git=case.git.at(path), worktree=path,
+                              start_ref="origin/main", branch="foragent/issue-1")
+    with pytest.raises(ExecutorStopped):
+        _recreate_worktree(attempt)
+    assert git_command(case.root, "show", "foragent/issue-1:unsaved.txt") == "unfinished"
