@@ -190,7 +190,7 @@ def test_follow_failed_sha_is_attempted_once_until_base_moves(reinstall, monkeyp
     orch_reinstall.follow_base(ctx)
     assert calls == [c.history.tip]
     assert len(failures(c)) == 1
-    assert "reinstall failed: broken install" in capsys.readouterr().out
+    assert "reinstall failed: broken install" in capsys.readouterr().err
     c.history.update({"src/foragent/__init__.py": "BUILD = 'next'\n"})
     ctx.git.fetch("origin", "main")
     orch_reinstall.follow_base(ctx)

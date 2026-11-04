@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import re
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from time import sleep
 import tomllib
@@ -94,7 +95,7 @@ def _installed_revision() -> str | None:
 
 
 def follow_base(ctx) -> None:
-    """Follow the fetched base under the tick lock, regardless of who merged it."""
+    """Follow the fetched base under the tick lock; keep diagnostics off tick JSON stdout."""
     sha = None
     try:
         base = f"refs/remotes/origin/{ctx.config.base_branch}"
@@ -122,10 +123,10 @@ def follow_base(ctx) -> None:
             return
         message = _install_sha(ctx, sha)
         if message is not None:
-            print(message)
+            print(message, file=sys.stderr)
     except Exception as exc:
         if sha is not None:
             ctx.store._write_json(ctx.store.root / "tool-follow.json", {"failed_sha": sha})
         reason = " ".join(str(exc).split()) or type(exc).__name__
-        print(f"reinstall failed: {reason}")
+        print(f"reinstall failed: {reason}", file=sys.stderr)
         append_event(ctx.store, ctx.now(), None, "reinstall-failed", f"base {sha}: {reason}")
