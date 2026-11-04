@@ -864,6 +864,49 @@ def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
     assert len(merge_owner.admissions(case.store)) == 4
 
 
+def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
+    """A member that conflicts with main is left out whole: no part of it reaches the tip, tried once."""
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4, 2])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    assert proof, report.actions
+    assert 1 not in [n for n, *_ in proof.chain]
+    tip = proof.chain[-1][2]
+    assert git_command(case.root, "show", f"{tip}:src/shared.py") == "VALUE = -1"
+    tip_files = git_command(case.root, "ls-tree", "-r", "--name-only", tip).split()
+    assert all(f"src/member_{n}.py" in tip_files for n in [5, 4, 2])
+    assert not [path for path in tip_files if "member_1" in path]
+    assert len([action for action in report.actions if "#1" in action]) == 1
+
+
+def test_incomplete_train_retirements_have_distinct_member_identities(batched, monkeypatch):
+    """A retired train without a left-out member is identified by its composed members, not the queue."""
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4, 2])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    candidates = {place.n: (place, job) for place, job, _ in batch_candidates(case)}
+    case.pending_batch = True
+    support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2]
+    case.tracker.set_pr_checks(tip.number, "fail")
+    support.gate(case)
+    retired, = batch.retirements(case.ctx)
+    place, job = candidates[1]
+    with_left_out = [*chain[:1], (1, job["head"], chain[0][2], place.started_at), *chain[1:]]
+    assert retired["identity"] == batch._identity(case.base, chain)
+    assert retired["identity"] != batch._identity(case.base, with_left_out)
+    assert [member["n"] for member in retired["members"]] == [5, 4, 2]
+    assert 1 in [place[0] for place in merge_owner.admissions(case.store)]
+
+
 def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
     case = proto
     monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch was consulted"))
