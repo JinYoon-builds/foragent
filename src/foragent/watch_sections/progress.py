@@ -75,7 +75,7 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     The merge starts at the issue's latest recorded run that began before it, for
     gate and outside merges alike. Each merge uses the facts recorded when it was
     first seen, so a later reopening, re-approval or relabelling never adds, removes
-    or changes one. A gate merge is a run that finished as merged. A merged PR
+    or changes one. A gate merge is a run the store merge rule accepts (run_merged). A merged PR
     counts when, first seen, it closed an approved issue with a recorded run. The
     gate run's own PR is the same merge seen from GitHub (same run, merged seconds
     from the run's finish), and the issue counts once, so it adds no second sample;
@@ -92,9 +92,9 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
         if number not in latest or end > latest[number][0]:
             latest[number] = (end, size, start)
 
-    finish_times, merge_times = store.finish_times(), store.merge_times()
+    finish_times, merge_times, owner_facts = store.finish_times(), store.merge_times(), store.owner_merge_facts()
     for run in history:
-        if run.outcome != "merged":
+        if not store.run_merged(run, owner_facts=owner_facts):
             continue
         if (end := _finished(run, merge_times.get(key := (run.number, run.started_at)), finish_times.get(key))) is not None:
             row = rows.get(run.number, {})
