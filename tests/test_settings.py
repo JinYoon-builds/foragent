@@ -36,7 +36,7 @@ def test_list_has_exactly_the_eleven_keys_in_scope_order(root, capsys):
     items = json.loads(out(root, capsys, "list", "--json"))
     assert [(item["scope"], item["key"]) for item in items] == [
         ("team", "review"), ("team", "always_human"), ("team", "executor"), ("team", "reviewer"),
-        ("team", "runner_unit_tests"), ("team", "orch_silent_alert_minutes"),
+        ("team", "runner_unit_tests"), ("team", "scheduled_roles"), ("team", "orch_silent_alert_minutes"),
         ("me", "claude_quota.mode"), ("me", "notify"), ("me", "notify_filter"), ("me", "animation"), ("me", "language"),
         ("me", "view_glyphs"), ("machine", "max_parallel"), ("machine", "memory_pressure_limit"), ("machine", "log_retention_days")]
     values = {item["key"]: item["value"] for item in items}
@@ -45,8 +45,8 @@ def test_list_has_exactly_the_eleven_keys_in_scope_order(root, capsys):
 
 def test_plain_list_and_get_print_scope_key_value_description(root, capsys):
     lines = out(root, capsys, "list").splitlines()
-    assert len(lines) == 15
-    assert lines[0] == "team  review  batch  " + settings.item(settings.BY_KEY["review"], root, "en")["description"]
+    assert len(lines) == 16
+    assert lines[0] == "team  review  fast  " + settings.item(settings.BY_KEY["review"], root, "en")["description"]
     assert out(root, capsys, "get", "always_human") == "-\n"
     assert run(root, "set", "always_human", "docs/**, LICENSE") == 0
     assert out(root, capsys, "get", "always_human") == "docs/**,LICENSE\n"
@@ -177,11 +177,11 @@ def test_a_change_that_itself_breaks_loading_is_refused_and_an_old_problem_is_no
     from foragent.config import ConfigError
     from foragent.settings_write import _check
 
-    good, broken = {"review": "batch"}, {"review": "batch", "notify_summary_hour": 99}
+    good, broken = {"review": "fast"}, {"review": "fast", "notify_summary_hour": 99}
     with pytest.raises(ConfigError, match="notify_summary_hour"):
-        _check(({}, good), ({}, broken), "review", "batch", "en")
+        _check(({}, good), ({}, broken), "review", "fast", "en")
     _check(({}, broken), ({}, {**broken, "review": "careful"}), "review", "careful", "en")
-    _check(({}, good), ({}, {**good, "log_retention_days": 3}), "review", "batch", "en")
+    _check(({}, good), ({}, {**good, "log_retention_days": 3}), "review", "fast", "en")
 
 
 @pytest.mark.parametrize("key,lines", [

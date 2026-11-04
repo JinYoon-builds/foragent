@@ -206,9 +206,12 @@ def claude_command(
     return args + (["--model", model] if model is not None else [])
 
 
-def claude_review_command(level: str, model: str | None = None, *, pr: int | None = None) -> list[str]:
+def claude_review_command(level: str, model: str | None = None, *, pr: int | None = None,
+                          append_system_prompt: str | None = None) -> list[str]:
     target = f"{pr} " if pr is not None else ""
     args = ["claude", "-p", f"/code-review {target}{level}", "--permission-mode", "auto", "--output-format", "json"]
+    if append_system_prompt:  # A slash-command review has no prompt of its own to carry added text.
+        args += ["--append-system-prompt", append_system_prompt]
     return args + (["--model", model] if model is not None else [])
 
 
@@ -257,7 +260,7 @@ class CodexExecutor:
             code, timed_out, _ = run_logged(
                 codex_command(worktree, output_path, model, effort, **options), cwd=worktree, prompt=prompt,
                 timeout_s=timeout_s, log_path=log_path,
-                capture_stdout=True, stdout_path=events_path,
+                capture_stdout=True, stdout_path=events_path, env=LAUNCHED_ENV,
             )
             last_message = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
             error_kind = _structured_error_kind(events_path, "codex")
@@ -269,8 +272,13 @@ class CodexExecutor:
                           error_kind=error_kind, session_id=session_id, num_turns=turns)
 
 
+# Every session Foragent launches carries this fact; `fa` refuses person-only commands there
+# (#1736). It replaces an inherited orchestrator mark: a session the orchestrator starts is
+# a launched session, never the orchestrator.
+LAUNCHED_ENV = {"FORAGENT_ROLE": "launched"}
+
 # A headless session that backgrounds a long command ends its turn and stalls (#712, #466).
-CLAUDE_SESSION_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+CLAUDE_SESSION_ENV = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", **LAUNCHED_ENV}
 
 
 class ClaudeExecutor:
@@ -282,6 +290,7 @@ class ClaudeExecutor:
         resume_session_id: str | None = None,
         goal: str | None = None, read_only: bool = False, effort: str | None = None,
         permission_mode: str | None = None, setting_sources: str | None = None,
+        append_system_prompt: str | None = None,
     ) -> ExecResult:
         output_path = log_path.with_suffix(".stdout")
         options = {key: value for key, value in (("permission_mode", permission_mode),
@@ -295,7 +304,8 @@ class ClaudeExecutor:
         if resume_session_id is not None:
             options["resume_session_id"] = resume_session_id
             options["prompt"] = prompt
-        command = (claude_review_command(review_level, model, pr=review_pr) if review_level is not None
+        added = {"append_system_prompt": append_system_prompt} if append_system_prompt else {}
+        command = (claude_review_command(review_level, model, pr=review_pr, **added) if review_level is not None
                    else claude_command(model, settings_path, **options))
         if review_level is None and resume_session_id is None and goal is not None:
             # Text stdin is one message: blank lines do not end /goal's argument.

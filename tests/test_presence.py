@@ -215,14 +215,18 @@ def test_statusline_counts_open_questions_only_in_the_planning_session(stall_sto
     root, store, now = stall_store
     assert presence.statusline_segment(root, now) == STALL_BASE
     first = orch_inbox.ask(store, "One?", ["a", "b"], 1)
+    # An open question with no issue is the person's: every session names the recipient,
+    # only the planning session adds where to answer.
     assert presence.statusline_segment(root, now) == (
-        STALL_BASE + " · 1 question needs your answer in the planning session")
+        STALL_BASE + " · questions: you 1 · 1 question needs your answer in the planning session")
     orch_inbox.ask(store, "Two?", ["a", "b"], 1)
-    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 2 · 2 questions need your answer in the planning session")
     orch_inbox.answer(store, first["id"], "a")
-    assert presence.statusline_segment(root, now).endswith(" · 1 question needs your answer in the planning session")
+    assert presence.statusline_segment(root, now).endswith(
+        " · questions: you 1 · 1 question needs your answer in the planning session")
     monkeypatch.setenv("FORAGENT_ROLE", "orchestrator")
-    assert presence.statusline_segment(root, now) == STALL_BASE
+    assert presence.statusline_segment(root, now) == STALL_BASE + " · questions: you 1"
 
 
 def test_prompt_context_carries_recent_notices_and_names_unreadable_ones(stall_store):
@@ -265,7 +269,7 @@ def test_a_corrupt_question_file_hides_no_valid_question_count(stall_store, brok
     orch_inbox.ask(store, "Valid?", ["a", "b"], 1, issues=[5])
     (store.root / "inbox" / "questions" / "broken.json").write_text(broken, encoding="utf-8")
     # The last case is an object with wrong field types: skipped alone like the others.
-    question = " · 1 question needs your answer in the planning session"
+    question = " · questions: you 1 · 1 question needs your answer in the planning session"
     assert presence.statusline_segment(root, now) == "🐿 0 lanes working · ✋ 1 · 0 merged today" + question
     assert presence.session_start_message(root, None, now) == (
         "since the last report: 0 merges · ✋ 1 · /fa for the report")
@@ -428,6 +432,51 @@ def test_a_lone_surrogate_in_one_field_replaces_only_that_character(stall_store,
     assert "bad?text" in context or "bad?.json" in context, "only the unencodable character is replaced"
     if field == "filename":
         assert "bad?.json" in error
+
+
+def test_new_orchestrator_requests_are_unique_and_ordered_even_without_times():
+    from foragent import presence
+
+    def row(identifier, at, source="orchestrator", status="new"):
+        return {"id": identifier, "created_at": at, "from": source, "status": status}
+
+    early = "2026-11-04T01:00:00+00:00"
+    late = "2026-11-04T02:00:00+00:00"
+    rows = [row("bad", "broken"), row("late", late), row("early", early),
+            row("tie", early), row("early", early), row("naive", "2026-11-04T00:00:00"),
+            row("missing", None)]
+    rows += [row(source, early, source=source) for source in ("gate", "architect", "runner", "planning")]
+    rows += [row(status, early, status=status) for status in ("processing", "done")]
+    selected = presence.new_requests(rows)
+    assert [item[0]["id"] for item in selected] == ["early", "tie", "late", "bad", "naive", "missing"]
+    assert [item[1].isoformat() if item[1] else None for item in selected] == [
+        early, early, late, None, None, None]
+
+
+def test_prompt_context_keeps_new_requests_without_times_and_isolates_render_failures(stall_store, monkeypatch):
+    import json
+
+    from foragent import orch_inbox, presence
+
+    root, store, now = _bound_stall_store(stall_store)
+    bad_time = orch_inbox.add_request(store, "orchestrator", "No readable time")
+    path = store.root / "inbox/requests" / f"{bad_time['id']}.json"
+    record = json.loads(path.read_text())
+    record["created_at"] = "broken"
+    path.write_text(json.dumps(record))
+    broken = orch_inbox.add_request(store, "orchestrator", "Unrenderable")
+    real = presence._quote
+
+    def fragile(value):
+        if value == "Unrenderable":
+            raise RuntimeError("cannot render")
+        return real(value)
+
+    monkeypatch.setattr(presence, "_quote", fragile)
+    context, problems = presence.prompt_context(root, now)
+    assert context.count(f'- "{bad_time["id"]}" from "orchestrator", new: "No readable time"') == 1
+    assert '"opaque"' in context and "Visible question" in context
+    assert problems == [f'request "{broken["id"]}": could not be shown (RuntimeError)']
 
 
 def test_a_row_that_cannot_be_rendered_is_left_out_alone_and_named(stall_store, monkeypatch):
@@ -758,3 +807,36 @@ def test_well_formed_events_of_other_kinds_are_not_diagnosed(stall_store):
     append_event(store, now - timedelta(minutes=2), 201, "retry", "Retry", say="Retried.", verdict="ok")
     notices, problems = orch_inbox.recent_notices(store, now - timedelta(hours=24))
     assert notices == [] and problems == []
+
+
+def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_question(stall_store):
+    """Defect class: planning display paths counting open questions the projection no longer awaits."""
+    import os
+    from datetime import timedelta
+
+    from foragent import orch_inbox, presence
+    from foragent.tracker import FakeTracker
+
+    root, store, now = _bound_stall_store(stall_store)  # One open question with no issue: still awaited.
+    tracker = FakeTracker(now=lambda: now)
+    tracker.add_issue(7, "Storage", labels=["approved", "blocked", "lane:api"])
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")
+    store.save_flag(7, "spec-question", flagged_at=now.isoformat())
+    store.finish_run(7, outcome="spec-question")
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, now)
+    asked = orch_inbox.ask(store, "Run 1: which region?", ["a", "b"], 1, issues=[7])
+    later = lambda minutes: now + timedelta(minutes=minutes)
+    os.utime(store.root / "flags" / "7.json", (now.timestamp(),) * 2)
+    assert presence.statusline_segment(root, now).endswith(" · 2 questions need your answer in the planning session")
+    assert asked["question"] in presence.prompt_context(root, now)[0]
+    store._now = lambda: later(5)
+    store.start_run(7, branch="issue-7", worktree="unused", lane="api")  # The retry starts a new episode.
+    segment = presence.statusline_segment(root, later(5))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(5))[0] or "")
+    store.finish_run(7, outcome="merged")
+    tracker.close_issue(7)  # Merged and closed: still not awaited.
+    store.refresh_local_issues(tracker.list_issues("all"), [], {"api": {}}, later(6))
+    segment = presence.statusline_segment(root, later(6))
+    assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
+    assert asked["question"] not in (presence.prompt_context(root, later(6))[0] or "")

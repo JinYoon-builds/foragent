@@ -22,6 +22,7 @@ class Flag:
     number: int
     reason: str
     flagged_at: str
+    local_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,8 +113,8 @@ class Run:
 
     @property
     def key(self) -> int | str:
-        """The record's name in runs/: the issue number, or dream-<lane> for a dream run."""
-        return f"dream-{self.lane}" if self.kind == "dream" else self.number
+        """The record's name in runs/: the issue number, dream-<lane> for a dream, draft-<n> for a draft."""
+        return f"dream-{self.lane}" if self.kind == "dream" else f"draft-{self.number}" if self.kind == "draft" else self.number
     # Identity of the work the current phase does (e.g. "baseline:<sha>"), journaled when it ends;
     # work_events maps each finished work identity to its first phase event, across executions.
     phase_work_id: str | None = None
@@ -136,6 +137,9 @@ class Run:
     # The recorded session is not the running worker's (a fresh thread is starting, or it was
     # inherited from an earlier run and not resumed yet); nothing may be sent to it.
     session_stale: bool = False
+    # Merge queue waits and refused-merge pauses share a separate, per-run bound.
+    merge_waited_seconds: float = 0
+    merge_wait_polls: int = 0
 
     # A person's talk terminal is open (fa lanes talk): derived on every read from the talk
     # events by StateStore (D95), never stored; stall and runtime checks pause meanwhile.

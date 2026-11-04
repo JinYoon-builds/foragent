@@ -20,10 +20,10 @@ def test_note_journals_each_named_issue_once_and_keeps_earlier_responses(tmp_pat
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
     assert acknowledged_at(store, 1) is None
     orch_inbox.write_note(store, "Diagnosed #1", "#2 reproduces on main; #1 waits", "Wait for #3", {})
-    events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
-    assert [(event["issue"], event["kind"]) for event in events] == [
-        (1, "acknowledged"), (2, "acknowledged"), (3, "acknowledged"),
-    ]
+    rows = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    events = [event for event in rows if event["kind"] == "acknowledged"]
+    assert [event["issue"] for event in events] == [1, 2, 3]
+    assert [event["kind"] for event in rows] == ["acknowledged"] * 3 + ["note"]
     assert all(event["summary"] == "Diagnosed #1 #2 reproduces on main; #1 waits Wait for #3"
                for event in events)
     first = clock[0]
@@ -35,13 +35,43 @@ def test_note_journals_each_named_issue_once_and_keeps_earlier_responses(tmp_pat
     assert acknowledged_at(store, 4) is None
     latest = orch_inbox.write_note(store, "General monitoring", None, None, {})
     assert orch_inbox.read_note(store) == latest
-    assert len((store.root / "orch-events.jsonl").read_text().splitlines()) == 4
+    rows = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert len([event for event in rows if event["kind"] == "acknowledged"]) == 4
+    assert len([event for event in rows if event["kind"] == "note"]) == 3
+
+
+def test_a_note_event_keeps_its_fields_as_given_on_one_journal_line(store):
+    text = "first\nsecond\u2028third\x85fourth\u2029fifth"
+    orch_inbox.write_note(store, text, "why\nit", "next", {"kind": "tmux", "pane": "%1"}, retrospective=True)
+    orch_inbox.write_note(store, "Status", None, None, {"kind": "terminal"})
+    raw = (store.root / "orch-events.jsonl").read_text(encoding="utf-8")
+    assert len(raw.splitlines()) == 2, "A separator in a note must not split the record for any reader"
+    marked, plain = [json.loads(line) for line in raw.splitlines()]
+    assert (marked["kind"], marked["now"], marked["why"], marked["next"], marked["where"], marked["retrospective"]) == (
+        "note", text, "why\nit", "next", {"kind": "tmux", "pane": "%1"}, True)
+    assert plain["kind"] == "note" and plain["why"] is None and "retrospective" not in plain
+    assert orch_inbox.read_note(store)["now"] == "Status", "The latest note stays the projection"
+
+
+def test_a_failed_note_appends_no_event(store, monkeypatch):
+    with pytest.raises(InboxError):
+        orch_inbox.write_note(store, " ", None, None, {}, retrospective=True)
+    assert not (store.root / "orch-events.jsonl").exists()
+
+    def broken(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_write_json", broken)
+    with pytest.raises(OSError):
+        orch_inbox.write_note(store, "Lessons", None, None, {}, retrospective=True)
+    assert not (store.root / "orch-events.jsonl").exists()
 
 
 def test_requests_keep_order_and_pending_hides_done(store):
     first = orch_inbox.add_request(store, "planning", "one")
     second = orch_inbox.add_request(store, "planning", "two")
-    orch_inbox.set_request_status(store, first["id"], "done", "finished")
+    orch_inbox.set_request_status(store, first["id"], "done", "finished", answer="Completed one", require_answer=True)
+    assert orch_inbox.requests(StateStore(store.root))[0]["answer"] == "Completed one"
     assert [row["id"] for row in orch_inbox.requests(store)] == [first["id"], second["id"]]
     assert [row["id"] for row in orch_inbox.requests(store, pending=True)] == [second["id"]]
     events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()]
@@ -91,24 +121,6 @@ def test_planning_alive_needs_a_fresh_valid_heartbeat(tmp_path):
                    json.dumps({})):
         orch_inbox.plan_heartbeat_path(store).write_text(broken)
         assert not orch_inbox.planning_alive(store)
-
-
-def test_route_question_pushes_only_without_live_planning(tmp_path, monkeypatch):
-    from datetime import UTC, datetime
-
-    from foragent.config import Config
-
-    clock = [datetime(2026, 10, 24, tzinfo=UTC)]
-    store = _clocked(tmp_path, clock)
-    sent = []
-    monkeypatch.setattr(orch_inbox.notify, "send", lambda config, title, line, link=None: sent.append(
-        (config.repo, title, line)) or True)
-    record = orch_inbox.ask(store, "Widen scope?", ["yes", "no"], 1)
-    assert orch_inbox.route_question(store, Config(language="ko"), "o/r", record)
-    assert sent == [("o/r", "답할 질문이 있어요", f"{record['id']}: Widen scope?")]
-    orch_inbox.write_plan_heartbeat(store)
-    assert not orch_inbox.route_question(store, Config(), "o/r", record)
-    assert len(sent) == 1
 
 
 def test_brief_counts_open_questions_and_hides_zero_line(store):
@@ -202,3 +214,118 @@ def test_follow_events_fall_back_to_timestamps_when_the_start_read_fails(tmp_pat
     at_start = orch_inbox.add_request(store, "planning", "at start")
     assert [event["id"] for event in events.poll(store)] == [at_start["id"]]
     assert before["id"] != at_start["id"] and events.poll(store) == []
+
+
+@pytest.mark.parametrize("answer", [None, "", " \n\t"])
+def test_completion_requires_answer_without_writing_request_or_journal(store, answer):
+    request = orch_inbox.add_request(store, "planning", "one")
+    journal = store.root / "orch-events.jsonl"
+    before = journal.read_bytes()
+    request_path = store.root / "inbox" / "requests" / f"{request['id']}.json"
+    request_before = request_path.read_bytes()
+    with pytest.raises(InboxError, match="--answer"):
+        orch_inbox.set_request_status(store, request["id"], "done", answer=answer, require_answer=True)
+    assert request_path.read_bytes() == request_before
+    assert journal.read_bytes() == before
+
+
+def test_generic_completion_cannot_overwrite_a_signal_answer(store):
+    request = orch_inbox.add_request(store, "gate", "signal", {"role": "docs", "signal": {"id": "docs"}})
+    journal = store.root / "orch-events.jsonl"
+    before = journal.read_bytes()
+    request_path = store.root / "inbox" / "requests" / f"{request['id']}.json"
+    request_before = request_path.read_bytes()
+    with pytest.raises(InboxError, match="signal-answer"):
+        orch_inbox.set_request_status(store, request["id"], "done", answer="finished", require_answer=True)
+    assert request_path.read_bytes() == request_before
+    assert journal.read_bytes() == before
+
+
+def test_legacy_completion_keeps_an_explicit_empty_answer_reason(store):
+    request = orch_inbox.add_request(store, "planning", "one")
+    reason = "Legacy request-status completion: --answer was omitted."
+    orch_inbox.set_request_status(store, request["id"], "done", require_answer=True, empty_answer_reason=reason)
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["status"] == "done"
+    assert closed["empty_answer_reason"] == reason
+    orch_inbox.set_request_status(store, request["id"], "done", require_answer=True, answer="Completed")
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["answer"] == "Completed"
+    assert "empty_answer_reason" not in closed
+
+
+@pytest.mark.parametrize("initial_status", ["processing", "done"])
+def test_completion_without_new_answer_preserves_the_recorded_answer(store, initial_status):
+    request = orch_inbox.add_request(store, "planning", "one")
+    orch_inbox.set_request_status(store, request["id"], initial_status, answer="Published #7", require_answer=True)
+    for _ in range(2):
+        orch_inbox.set_request_status(store, request["id"], "done", require_answer=True,
+                                      empty_answer_reason="Legacy completion")
+        closed = orch_inbox.requests(StateStore(store.root))[0]
+        assert closed["status"] == "done"
+        assert closed["answer"] == "Published #7"
+        assert "empty_answer_reason" not in closed
+    before = (store.root / "inbox/requests" / f"{request['id']}.json").read_bytes()
+    with pytest.raises(InboxError, match="--answer"):
+        orch_inbox.set_request_status(store, request["id"], "done", answer=" ", require_answer=True)
+    assert (store.root / "inbox/requests" / f"{request['id']}.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("source,role", [("architect", None), ("security", None), ("gate", "security"),
+                                         ("orchestrator", "security")])
+@pytest.mark.parametrize("answer", [None, "Recorded outcome"])
+def test_request_status_cli_requires_an_explicit_proposal_decision(store, source, role, answer):
+    from types import SimpleNamespace
+    from foragent.commands._orch_box import _orch_inbox
+    from foragent.config import Config
+
+    config = Config(roles={"architect": {}, "security": {}})
+    request = orch_inbox.add_request(store, source, "proposal", {"role": role} if role else None)
+    request_path = store.root / "inbox/requests" / f"{request['id']}.json"
+    before, journal = request_path.read_bytes(), (store.root / "orch-events.jsonl").read_bytes()
+    args = SimpleNamespace(action="request-status", id=request["id"], status="done", note=None, answer=answer)
+    with pytest.raises(InboxError, match="role-decision"):
+        _orch_inbox(args, store, config, "owner/repo")
+    assert request_path.read_bytes() == before
+    assert (store.root / "orch-events.jsonl").read_bytes() == journal
+
+
+@pytest.mark.parametrize("legacy_role", [False, True])
+@pytest.mark.parametrize("take_first", [False, True])
+def test_orchestrator_request_cli_can_be_taken_and_closed_as_an_ordinary_request(store, legacy_role, take_first):
+    from types import SimpleNamespace
+    from foragent.commands._orch_box import _orch_inbox
+    from foragent.config import Config
+
+    config = Config()
+    if legacy_role:
+        request = orch_inbox.add_request(store, "orchestrator", "handoff", {"role": "orchestrator"})
+    else:
+        _orch_inbox(SimpleNamespace(action="request", source="orchestrator", text="handoff"),
+                    store, config, "owner/repo")
+        request = orch_inbox.requests(store)[0]
+        assert "role" not in request
+    if take_first:
+        _orch_inbox(SimpleNamespace(action="request-status", id=request["id"], status="processing",
+                                   note=None, answer=None), store, config, "owner/repo")
+        assert orch_inbox.requests(StateStore(store.root))[0]["status"] == "processing"
+    _orch_inbox(SimpleNamespace(action="request-status", id=request["id"], status="done",
+                               note=None, answer="Handled by planning"), store, config, "owner/repo")
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["status"] == "done"
+    assert closed["answer"] == "Handled by planning"
+
+
+def test_role_request_cli_keeps_its_identity_after_the_role_is_removed(store):
+    from types import SimpleNamespace
+    from foragent.commands._orch_box import _orch_inbox
+    from foragent.config import Config
+
+    _orch_inbox(SimpleNamespace(action="request", source="security", text="proposal"), store,
+                Config(roles={"security": {}}), "owner/repo")
+    request = orch_inbox.requests(StateStore(store.root))[0]
+    assert request["role"] == "security"
+    args = SimpleNamespace(action="request-status", id=request["id"], status="done", note=None, answer="Applied")
+    with pytest.raises(InboxError, match="role-decision"):
+        _orch_inbox(args, store, Config(roles={"docs": {}}), "owner/repo")
+    assert orch_inbox.requests(store) == [request]

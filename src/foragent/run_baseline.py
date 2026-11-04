@@ -172,6 +172,8 @@ def _baseline_environment(root: Path) -> dict:
 def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     """Locked file -> approved issues that own it and have not merged (#327)."""
     merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
+    if getattr(ctx.config, "merge_owner", False):
+        merged.update(number for number, _ in ctx.store.owner_merge_facts())
     owners: dict[str, set[int]] = {}
     for path in (ctx.store.root / "approvals").glob("*.json"):
         approval = ctx.store.load_approval(int(path.stem))
@@ -280,15 +282,18 @@ def _capture_acceptance_baseline(
         _credited_wait(n, ctx, acquire, "baseline-wait")
 
     previous = phase_identity(ctx.store.get_run(n))
+    completed = False
     try:
-        return _capture_baseline(
+        result = _capture_baseline(
             ctx, test_command, target_ref, log=ctx.store.log_path(n),
             report=ctx.store.root / "runs" / f"issue-{n}-acceptance-baseline.xml", check=check,
             prepare=lambda: _phase(n, ctx, "baseline"), wait=wait,
         )
+        completed = True
+        return result
     finally:
         # The capture ends here: close it and give back the phase (and work) it interrupted.
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
 def _capture_baseline(

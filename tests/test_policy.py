@@ -26,12 +26,13 @@ def test_recursive_glob_matches_zero_directories_and_deduplicates():
 
 
 def test_review_mode_uses_strictest_match_including_default():
-    config = Config(review="fast", review_paths={"src/**": "batch", "**/auth/**": "careful"})
+    config = Config(review="fast", review_paths={"src/**": "fast", "**/auth/**": "careful"})
     assert review_mode_for([], config) == "fast"
-    assert review_mode_for(["src/a.py"], config) == "batch"
+    assert review_mode_for(["src/a.py"], config) == "fast"
+    assert review_mode_for(["src/auth/login.py"], config) == "careful"
     assert review_mode_for(["src/a.py", "auth/login.py"], config) == "careful"
     assert review_mode_for(["src/a.py"], replace(config, review="careful")) == "careful"
-    assert review_mode_for(["src/a.py"], Config(review="batch", review_paths={"src/**": "fast"})) == "batch"
+    assert review_mode_for(["src/a.py"], Config(review="careful", review_paths={"src/**": "fast"})) == "careful"
 
 
 @pytest.mark.parametrize("paths,labels,config,kind,reason", [
@@ -41,7 +42,6 @@ def test_review_mode_uses_strictest_match_including_default():
     (["accept/test.sh"], [], Config(review="fast", acceptance_dir="./accept"), "hold", Reason.ACCEPTANCE_TOUCHED),
     (["auth/login.py"], [], Config(review="fast", always_human=["auth/**"]), "hold", Reason.ALWAYS_HUMAN_PATH),
     (["app.py"], ["risk:high"], Config(review="fast"), "hold", Reason.RISK_HIGH),
-    (["app.py"], [], Config(review="batch"), "hold_mode", None),
     (["src/a.py"], [], Config(review="fast", review_paths={"src/**": "careful"}), "hold_mode", None),
     (["tests/acceptance/a.py"], [], Config(review="careful"), "hold", Reason.ACCEPTANCE_TOUCHED),
 ])

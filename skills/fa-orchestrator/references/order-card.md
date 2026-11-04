@@ -19,12 +19,12 @@ This handoff is for D71 choices and real preread questions (see below). Use the 
 with SendMessage. That session asks the person and, only after approval there, publishes with
 `fa order publish --approve PLAN.json`. The planning session records the answer with
 `fa orch answer ID --text "<choice>"`; a relayed [add] alone does not authorize publication.
-When the planning heartbeat is stale, `fa orch ask` already pushes the question to the person
-(#970), including its durable plan path and content hash, so a closed planning session does
-not hide the plan. Keep that existing route; no new notification mechanism is needed.
+When the planning heartbeat is stale, `fa orch ask` keeps the question with its durable plan path and content hash in the fa inbox until the next planning session (PM) can ask the person,
+so a closed planning session does not hide the plan. Do not push it yourself; no new notification
+mechanism is needed.
 
 After the planning session successfully publishes the orchestrator-drafted plan, it marks
-the originating request done with `fa orch request-status ID done --note "<issues>"`, using
+the originating request done with `fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using
 the originating request ID (not the question ID) and the published issue numbers.
 A failed publication leaves the request processing.
 

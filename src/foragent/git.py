@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager, ExitStack
+from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
 import fcntl
 import os
@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 
 from foragent.state import StateStore
@@ -22,6 +23,7 @@ REVIEW_SCOPE_FILE = "CLAUDE.local.md"
 SPLIT_MIN_LINES = 5
 SPLIT_MIN_LINE = 4
 ARTIFACT_PATHS = (".foragent",)
+ABSENT_BLOB = "missing"  # blob_shas value of a path the ref does not have.
 
 
 def _conflict_marker_numbers(content: str, widths: set[int]) -> list[int]:
@@ -96,8 +98,12 @@ class GitRepo:
                 self._call(["fetch", remote, *([refspec] if refspec is not None else [])])
                 return
             except GitError as exc:
-                # Another fetch can update the shared remote ref after Git reads it.
-                if "incorrect old value provided" not in str(exc) or attempt == 2:
+                # Another fetch can update the shared remote ref after Git reads it; Git reports
+                # that as an incorrect old value or, in newer versions, as a ref at another commit.
+                text = str(exc)
+                moved = "incorrect old value provided" in text or (
+                    "cannot lock ref" in text and "but expected" in text)
+                if not moved or attempt == 2:
                     raise
                 time.sleep(0.1 * (attempt + 1))
 
@@ -650,17 +656,22 @@ class GitRepo:
         self._exclude_artifacts()
         self._call([*identity, "commit", "--only", "-m", title, "--", *paths, f":!{REVIEW_SCOPE_FILE}"])
 
-    @contextmanager
-    def publish_lock(self) -> Iterator[None]:
-        """Serialize base-branch publication across processes sharing this repository."""
-        path = Path(self._call(["rev-parse", "--git-common-dir"]).strip())
-        path = (path if path.is_absolute() else self.root / path) / "foragent-publish.lock"
-        with path.open("a", encoding="utf-8") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    def publish_lock(self) -> AbstractContextManager[None]:
+        """The one main-write lock for this repository; see ``main_write_lock``."""
+        return main_write_lock(self)
+
+    def common_dir(self) -> Path:
+        """The repository's common Git directory, as Git itself reports it; GitError when it cannot."""
+        try:
+            answer = self._call(["rev-parse", "--path-format=absolute", "--git-common-dir"]).strip()
+        except GitError as exc:
+            raise GitError(f"cannot find the Git directory of {self.root} for the main-write lock; "
+                           f"main is not written without it: {exc}") from exc
+        path = Path(answer)
+        if not answer or not path.is_absolute() or not path.is_dir():
+            raise GitError(f"cannot find the Git directory of {self.root} for the main-write lock "
+                           f"(git reported {answer!r}); main is not written without it")
+        return path.resolve()
 
     def update_base(self, branch: str) -> None:
         """Fetch the remote base and fast-forward to it, keeping unrelated local edits."""
@@ -703,13 +714,51 @@ class GitRepo:
             return None
 
     def blob_shas(self, ref: str, paths: Iterable[str]) -> dict[str, str]:
-        return {path: self.blob_sha(ref, path) or "missing" for path in paths}
+        return {path: self.blob_sha(ref, path) or ABSENT_BLOB for path in paths}
 
     def remote_slug(self, remote: str = "origin") -> str:
         slug = slug_from_url(self._call(["remote", "get-url", remote]))
         if slug is None:
             raise GitError(f"cannot determine owner/name from remote {remote}; set repo in .foragent.yml")
         return slug
+
+
+_MAIN_WRITES = threading.local()  # Per-thread holds of the main-write lock, by lock path.
+
+
+@contextmanager
+def main_write_lock(git: object) -> Iterator[None]:
+    """The one main-write lock: every Foragent write that advances local or remote main holds it.
+
+    Merges take it after the store merge lock and keep it from their final check through the
+    merge; publishers take it after their own gates and refresh the base once they hold it.
+    It lives in the common Git directory that Git reports for the repository being written, so
+    every checkout of it (linked, bare, ``GIT_DIR``) shares one lock; when Git cannot report it,
+    the write is refused (``GitRepo.common_dir``). An injected Git double that is not a
+    ``GitRepo`` writes no Git history, so there is no main to exclude. A writer nested in another
+    main write of the same thread reuses the hold.
+    """
+    if not isinstance(git, GitRepo):
+        yield
+        return
+    common = git.common_dir()
+    key = os.path.realpath(common / "foragent-publish.lock")
+    held = _MAIN_WRITES.__dict__.setdefault("held", Counter())
+    if held[key]:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    with open(key, "a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        held[key] = 1
+        try:
+            yield
+        finally:
+            del held[key]
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def slug_from_url(url: str) -> str | None:
@@ -722,14 +771,19 @@ def slug_from_url(url: str) -> str | None:
 
 
 def _common_git_dir(root: Path) -> Path:
-    """The git dir holding ``config``; a linked worktree's ``.git`` file names it via ``commondir``."""
+    """The git dir holding ``config``; a linked worktree's git dir names it via ``commondir``.
+
+    ``.git`` is a directory, a symlink to a git dir (possibly a linked worktree's), or a
+    ``gitdir:`` file; each reaches a git dir whose ``commondir``, when present, is followed.
+    """
     dot_git = root / ".git"
     if dot_git.is_dir():
-        return dot_git
-    line = dot_git.read_text(encoding="utf-8").strip()
-    if not line.startswith("gitdir:"):
-        raise OSError(f"not a git dir file: {dot_git}")
-    gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
+        gitdir = dot_git.resolve()
+    else:
+        line = dot_git.read_text(encoding="utf-8").strip()
+        if not line.startswith("gitdir:"):
+            raise OSError(f"not a git dir file: {dot_git}")
+        gitdir = (root / line.removeprefix("gitdir:").strip()).resolve()
     commondir = gitdir / "commondir"
     if commondir.is_file():
         return (gitdir / commondir.read_text(encoding="utf-8").strip()).resolve()

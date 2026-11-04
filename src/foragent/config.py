@@ -19,12 +19,14 @@ class ConfigError(ValueError):
 
 
 SKILL_ROLES = {"style", "review", "tool", "domain"}
+# The sessions `default_skills` assigns to; one role never falls back to another (#1619).
+DEFAULT_SKILL_ROLES = ("workers", "reviewers", "orchestrator", "architect", "docs")
 PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
 
 
 @dataclass(frozen=True)
 class Config:
-    review: str = "batch"
+    review: str = "fast"
     review_paths: dict[str, str] = field(default_factory=dict)
     always_human: list[str] = field(default_factory=list)
     executor: str = "codex"
@@ -38,6 +40,13 @@ class Config:
         "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
         "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None},
     })
+    # Expected-size limits per size label (#1696): an estimate strictly above one suggests a split.
+    # Nearest-rank p90 of merged PRs (docs/specs/2026-11-02-size-signal.md); never a refusal.
+    size_limits: dict[str, dict[str, int]] = field(default_factory=lambda: {
+        "s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
+        "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
+        "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25},
+    })
     # Usable quota share of the run's executor at which s and m issues start at tier l (#238).
     tiers_headroom_ample: float = 0.5
     skill_libraries: list[Any] = field(default_factory=lambda: [{
@@ -48,6 +57,8 @@ class Config:
         "repo": "https://github.com/anthropics/skills",
     }])
     skill_roles: dict[str, str] = field(default_factory=dict)
+    # Session role -> skills it receives; written by a person, read through session_skills (#1619).
+    default_skills: dict[str, Any] | None = field(default_factory=dict)
     max_parallel: int | None = None  # Optional ceiling; AIMD sets the value (D60).
     # Cautious start: one conflict (#196) in 231 runs; the orchestrator
     # changes this only from conflict facts (fa orch facts).
@@ -64,6 +75,8 @@ class Config:
     reviewer_model: str | None = None
     review_max: int = 2
     review_level: str = "low"
+    review_pass_scope: bool = True  # False restores full/confirmation review after a saved PASS.
+    review_scoring: bool = True  # False lets every reviewer FAIL finding block without a scoring session (#1651).
     review_scope: str = "claude-local"
     review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
     review_reviewers: int = 1
@@ -81,6 +94,8 @@ class Config:
     # Personal push filter (#1030): all pushes every kind; decisions pushes only decision kinds.
     notify_filter: str = "all"
     run_hours: str = "always"
+    # D99: the architect, docs role and retrospective wake when an order finishes; false holds them.
+    scheduled_roles: bool = True
     stall_minutes: int = 30
     orchestrator_timeout_minutes: int = 30
     # A live orchestrator silent this long pushes once per silence episode (#952); 0 turns the push off.
@@ -94,6 +109,7 @@ class Config:
     conflict_retries: int = 2
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
+    merge_owner: bool = False  # Prototype: gate ticks own queued PRs after workers exit.
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
     merge_group_max: int | Literal["auto"] = "auto"
     base_branch: str = "main"
@@ -156,7 +172,7 @@ DEFAULTS: dict[str, Any] = asdict(Config())
 IGNORED_KEYS = frozenset({"test_slots_floor", "parallel_floor", "role_signal_cooldown_hours"})
 # Keys a settings file may hold that Config stores under another name (#786: executors -> executor_list).
 FILE_KEYS = frozenset({"executors"})
-_REVIEW_LEVELS = {"fast", "batch", "careful"}
+_REVIEW_LEVELS = {"fast", "careful"}
 _EXECUTORS = {"codex", "claude"}
 
 
@@ -585,6 +601,11 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    limits = overrides.get("size_limits")
+    if isinstance(limits, dict) and isinstance(values["size_limits"], dict):
+        overrides = {**overrides, "size_limits": {**values["size_limits"], **{
+            label: {**values["size_limits"].get(label, {}), **limit} if isinstance(limit, dict) else limit
+            for label, limit in limits.items()}}}
     quota = overrides.get("claude_quota")
     if isinstance(quota, dict) and isinstance(values["claude_quota"], dict):
         overrides = {**overrides, "claude_quota": {**values["claude_quota"], **quota}}

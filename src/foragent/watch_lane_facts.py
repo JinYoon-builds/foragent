@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import order_waiting
+from foragent import orch_events, order_waiting
 from foragent.config import Config
 from foragent.labels import BLOCKED, NEEDS_HUMAN, RUNNING, WAITING_PERSON, issue_lane
 from foragent.state import StateStore
@@ -23,7 +23,7 @@ from foragent.status import issue_state, local_group
 # The recorded wait phases and the waiting kind each one establishes (None: cause unknown).
 PHASE_KINDS: dict[str, str | None] = {
     "overlap-wait": "file-overlap", "test-slot-wait": "capacity", "limit-wait": "quota",
-    "baseline-wait": None, "executor-wait": None,
+    "baseline-wait": None, "executor-wait": None, "run-slot-wait": "capacity",
 }
 HELD = {"waiting-human", "blocked"}
 
@@ -54,21 +54,9 @@ def _iso(value: Any) -> bool:
 def journal(store: StateStore) -> list[dict[str, Any]] | None:
     """Every complete journal event in file order; None when the journal is unreadable."""
     try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            lines = stream.readlines()
-    except FileNotFoundError:
-        return []
+        return orch_events.read_events(store)
     except OSError:
         return None
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # An append still being written.
-        if isinstance(event, dict):
-            events.append(event)
-    return events
 
 
 def park_facts(events: list[dict[str, Any]] | None) -> dict[int, dict[str, Any]]:

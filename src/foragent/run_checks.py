@@ -26,8 +26,9 @@ from foragent.issue import ParsedIssue, has_machine_check, parse_body
 from foragent.reasons import Reason
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, WholeFailure, ExecutorStopped
+from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatches, run_done_when
 from foragent.run_execution import _claude_run_dir
-from foragent.run_waits import _phase, _progress, _test_slot, _timeout, in_phase
+from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
 
 if TYPE_CHECKING:
@@ -82,8 +83,8 @@ def _check(
 
     def execute():
         # The slot covers only the command; timeout_s counts execution, not the queue.
-        if slot is None:
-            return timed(environment)
+        if slot is None:  # A caller that holds the slot itself (the Stop hook) marks it in this environment.
+            return timed({**environment, **(capacity.HELD_ENV if os.environ.get(capacity.TEST_SLOT_ENV) == "held" else {})})
         with slot:
             # A nested `fa test` in the command shares this slot instead of waiting for another.
             return timed({**environment, **capacity.HELD_ENV})
@@ -345,7 +346,7 @@ def _related_unit_tests(
 
 def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
     """Stop hook: re-use independent checks, allowing at most eight blocked stops."""
-    from foragent import runner
+    from foragent import runner, run_check_slot
 
     directory = _claude_run_dir(snapshot)
     directory.mkdir(parents=True, exist_ok=True)
@@ -372,17 +373,18 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
         parsed = parse_body(approval.body)
         if not has_machine_check(parsed):
             raise ValueError("Done when has no machine check")
-        # Every failing command is reported, each with its own limited tail and cut notice.
-        for command in parsed.done_when_commands:
-            result = runner._check(command, worktree, directory / "check-done.log", 900)
+        budget = run_check_slot.StopHookBudget(directory, worktree)  # One deadline inside the hook timeout.
+        for command in parsed.done_when_commands:  # Each holds the machine test slot; every failure is reported.
+            with budget.slot():  # The command runs only for what the hook has left after the wait.
+                result = runner._check(command, worktree, directory / "check-done.log", budget.timeout())
             if result.exit_code != 0 or result.timed_out:
                 failures.append(result)
         if failures:
             return report()
-    except (OSError, ValueError, TypeError) as exc:
-        # Malformed snapshots and check-launch failures must also block a stop,
-        # still reporting the failures gathered before the error.
-        return report(f"Done when failed: {exc}")
+    except (OSError, ValueError, TypeError, KeyboardInterrupt) as exc:
+        # Malformed snapshots, check-launch failures, a slot wait past its deadline (TimeoutError)
+        # and an interruption must also block a stop, still reporting the failures gathered before.
+        return report(f"Done when failed: {str(exc) or type(exc).__name__}")
     print(f"Done when: all {len(parsed.done_when_commands)} commands passed; acceptance lock: {acceptance_dir}.")
     return 0
 
@@ -390,8 +392,7 @@ def check_done(snapshot: Path, worktree: Path, acceptance_dir: str) -> int:
 def _acceptance_matches(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, ref: str = "HEAD",
 ) -> bool:
-    blobs = git.blob_shas(ref, approval.acceptance_blobs)
-    mismatches = [path for path, sha in approval.acceptance_blobs.items() if blobs.get(path) != sha]
+    mismatches = acceptance_mismatches(git, approval, ref)
     if mismatches:
         invalidate_approval(
             ctx, n, "Approval invalidated: worktree acceptance files changed. Re-approve to run it.",
@@ -453,7 +454,10 @@ def _keep_gathered(state_root: Path, n: int, checks: list[CheckResult]) -> None:
 
 def _verify_implementation(attempt: Implementation) -> str:
     try:
-        return _verify_contents(attempt)
+        if getattr(attempt, "base_refresh", False):  # Inside the refresh's own record, not a second interval.
+            return _verify_contents(attempt)
+        with activity(attempt.n, attempt.ctx, "checking", "initial"):
+            return _verify_contents(attempt)
     except BaseException:
         _keep_gathered(attempt.ctx.store.root, attempt.n, attempt.checks)
         raise
@@ -529,8 +533,8 @@ def _verify_contents(attempt: Implementation) -> str:
         attempt.checks = []
         for command in attempt.parsed.done_when_commands:
             harness_guard.guard_staged(attempt)  # a Done when command can commit
-            attempt.checks.append(runner._check(command, worktree, log, 900, progress=lambda: _progress(n, ctx),
-                                 slot=_test_slot(n, ctx), full_text_dir=cuts.issue_dir(ctx.store.root, n)))
+            attempt.checks.append(run_done_when(n, ctx, command, worktree, log, DONE_WHEN_SECONDS,
+                                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx)))
             _progress(n, ctx)
         if attempt.baseline and attempt.baseline.node_ids:
             harness_guard.guard_staged(attempt)
@@ -621,9 +625,8 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
-            check = runner._check(command, worktree, log, min(900, runner._remaining(n, ctx)),
-                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx),
-                                  full_text_dir=cuts.issue_dir(ctx.store.root, n))
+            check = run_done_when(n, ctx, command, worktree, log, min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
+                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
             if stopped := harness_guard.before_measurement(worktree):
                 return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)

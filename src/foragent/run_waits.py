@@ -6,8 +6,9 @@ from collections.abc import Callable
 from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 import threading
-from typing import TYPE_CHECKING
+from typing import NoReturn, TYPE_CHECKING
 from uuid import uuid4
 
 from foragent import capacity, orch_github
@@ -17,6 +18,10 @@ from foragent.tracker import TrackerError
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
+
+# A returning run that holds no merge turn gives up its slot wait after this long, or sooner
+# when its work allowance ends. The run is handed back to the queue and keeps its open PR.
+RUN_SLOT_WAIT_SECONDS = 600
 
 
 def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
@@ -36,7 +41,39 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
         watcher.join()
 
 
+def note_activity(n: int, ctx: RunContext, name: str, cause: str, started: datetime, finished: datetime) -> None:
+    """Keep one known interval's cause in the local flow record; an instant one explains no time."""
+    try:
+        if finished <= started:
+            return
+        run = ctx.store.get_run(n)
+        ctx.store.record_flow("activity", issue=n, run_started_at=run.started_at if run is not None else None,
+                              activity=name, cause=cause, started_at=started.astimezone(UTC).isoformat(),
+                              finished_at=finished.astimezone(UTC).isoformat())
+    except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
+        return
+
+
+@contextmanager
+def activity(n: int, ctx: RunContext, name: str, cause: str):
+    """Record the block as one ``name`` interval caused by ``cause``, however it ends."""
+    try:
+        started = ctx.now()
+    except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
+        started = None
+    try:
+        yield
+    finally:
+        try:
+            if started is not None:
+                note_activity(n, ctx, name, cause, started, ctx.now())
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _remaining(n: int, ctx: RunContext) -> int:
+    if getattr(ctx.config, "merge_owner", False) and (started := getattr(ctx, "merge_owner_started_at", None)):
+        return max(0, int(ctx.config.max_runtime_minutes * 60 - (ctx.now() - started).total_seconds()))
     run = _with_open_talk(ctx.store.get_run(n), ctx.now())  # An open talk pauses as it happens (D55).
     if run is None:
         raise KeyError(n)
@@ -90,13 +127,15 @@ def _test_slot(n: int, ctx: RunContext):
         ctx.store.update_run(n, waiting_until=(now + timedelta(seconds=60)).astimezone(UTC).isoformat())
 
     with ExitStack() as stack:
+        acquired = False
         try:
             stack.enter_context(capacity.hold_test_slot(ctx.config.test_slots, waiting=waiting))
+            acquired = True
         finally:
             if waited:
                 now = credit(close=True)
                 ctx.store.update_run(n, waiting_until=None)
-                wait.close(now)
+                wait.close(now, resume=acquired)
         yield
 
 
@@ -110,10 +149,81 @@ def phase_identity(run) -> dict:
             "phase_work_started_at": run.phase_work_started_at}
 
 
-def restore_phase(n: int, ctx: RunContext, identity: dict) -> None:
+def restore_phase(n: int, ctx: RunContext, identity: dict, *, resume: bool = True) -> None:
+    """Restore interrupted work; ``resume=False`` takes a free slot but never queues for one."""
     run = ctx.store.get_run(n)
     if phase_identity(run) != identity:
-        ctx.store.update_run(n, **identity, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+        _set_phase(n, ctx, identity, resume=resume)
+
+
+def _set_phase(
+    n: int, ctx: RunContext, identity: dict, *, started: datetime | None = None, resume: bool = True,
+) -> bool:
+    """Every exit from an idle phase must acquire capacity before doing work, unless it holds a merge turn.
+
+    ``resume=False`` tries once, for an exit that must not block, and reports whether it took the phase.
+    Otherwise the wait is bounded: when no slot opens, this attempt stops recoverably.
+    """
+    from foragent import run_merge_turn
+
+    run = ctx.store.get_run(n)
+    owner = partial(run_merge_turn.holds_run_turn, ctx.store, n)
+    if capacity.phase_holds_slot(run.phase) or not capacity.phase_holds_slot(identity["phase"]):
+        ctx.store.update_run(n, **identity, phase_started_at=(started or ctx.now()).astimezone(UTC).isoformat())
+        return True
+    if not resume:
+        try:
+            capacity.admit_run(
+                ctx.store, n, identity, deadline=capacity.time.monotonic(),
+                now=lambda: started or ctx.now(), waiting=lambda: None, owner=owner,
+            )
+        except Exception:  # Full or unreadable: another exception may be unwinding, so never replace it.
+            return False
+        return True
+    began, mono = ctx.now(), ctx.monotonic()
+    key = f"run-slot-{uuid4().hex}"
+    limit = min(RUN_SLOT_WAIT_SECONDS, _remaining(n, ctx))
+    queued = False
+
+    def credit(close: bool = False) -> None:
+        now = ctx.now()
+        ctx.store.add_waited(
+            n, key=key, start=began, end=began + timedelta(seconds=max(0, ctx.monotonic() - mono)),
+            close=close, last_progress_at=now.astimezone(UTC).isoformat(),
+            waiting_until=None if close else (now + timedelta(seconds=60)).astimezone(UTC).isoformat(),
+        )
+
+    def waiting() -> None:
+        nonlocal queued
+        if not queued:
+            ctx.store.update_run(n, phase=capacity.RUN_SLOT_WAIT_PHASE,
+                                 phase_started_at=ctx.now().astimezone(UTC).isoformat())
+        queued = True
+        credit()
+
+    admitted = False
+    try:
+        # Queue time is paused runtime, not a separate wall-clock time budget.
+        capacity.admit_run(ctx.store, n, identity, deadline=capacity.time.monotonic() + limit,
+                           now=ctx.now, waiting=waiting, owner=owner)
+        admitted = True
+    except TimeoutError:
+        pass
+    finally:
+        if queued:
+            credit(close=True)
+    if not admitted:
+        _leave_without_slot(n, ctx, max(0, ctx.monotonic() - mono), limit)
+    return True
+
+
+def _leave_without_slot(n: int, ctx: RunContext, waited: float, limit: int) -> NoReturn:
+    """End this attempt for a later retry: unwinding releases its waits, claims and queue position."""
+    from foragent.run_execution import _limit_wait
+
+    ctx.store.record_flow("run-slot-exit", issue=n, run_started_at=ctx.store.get_run(n).started_at,
+                          waited_seconds=waited, limit_seconds=limit)
+    _limit_wait(n, ctx, f"No machine run slot opened within {limit}s; the issue goes back to the queue.")
 
 
 class WaitPhase:
@@ -130,18 +240,17 @@ class WaitPhase:
         self.previous = phase_identity(ctx.store.get_run(n))
         self.opened = False
 
-    def open(self) -> None:
+    def open(self, *, resume: bool = True) -> None:
         if not self.opened and self.previous["phase"] != self.phase:
-            self.ctx.store.update_run(self.n, phase=self.phase,
-                                      phase_started_at=self.started.astimezone(UTC).isoformat())
-            self.opened = True
+            self.opened = _set_phase(self.n, self.ctx, {"phase": self.phase}, started=self.started, resume=resume)
 
-    def close(self, now: datetime | None = None) -> None:
+    def close(self, now: datetime | None = None, *, resume: bool = True) -> None:
+        """Close the wait; ``resume=False`` restores the phase only into a free slot, without queueing."""
         now = now or self.ctx.now()
         if not self.opened and now > self.started:
-            self.open()
+            self.open(resume=resume)
         if self.opened:
-            self.ctx.store.update_run(self.n, **self.previous, phase_started_at=now.astimezone(UTC).isoformat())
+            _set_phase(self.n, self.ctx, self.previous, started=now, resume=resume)
             self.opened = False
 
 
@@ -153,22 +262,24 @@ def in_phase(n: int, ctx: RunContext, phase: str):
         yield
         return
     _phase(n, ctx, phase)
+    completed = False
     try:
         yield
+        completed = True
     finally:
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
-def _phase(n: int, ctx: RunContext, phase: str) -> None:
+def _phase(n: int, ctx: RunContext, phase: str, *, resume: bool = True) -> None:
     if ctx.store.get_run(n).phase != phase:
-        ctx.store.update_run(n, phase=phase, phase_started_at=ctx.now().astimezone(UTC).isoformat())
+        _set_phase(n, ctx, {"phase": phase}, resume=resume)
 
 
 def wait_for_rate_limit(n: int, ctx: RunContext, error: TrackerError) -> bool:
-    """Persist a resumable wait through the shared GitHub availability mechanism."""
-    if not error.is_rate_limit:
+    """Persist a resumable wait (rate limit or brief outage) through the shared GitHub pause."""
+    if not error.waits:
         return False
-    orch_github.wait_run(ctx, n, orch_github.pause(ctx, error))
+    orch_github.wait_run(ctx, n, orch_github.pause(ctx, error), error)
     return True
 
 
@@ -187,8 +298,10 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
         waiting_until=(started + timedelta(seconds=seconds)).astimezone(UTC).isoformat(),
         last_progress_at=started.astimezone(UTC).isoformat(),
     )
+    completed = False
     try:
         ctx.sleep(seconds)
+        completed = True
     finally:
         elapsed = max(0, ctx.monotonic() - started_mono)
         ctx.store.add_waited(
@@ -196,16 +309,18 @@ def _executor_wait(n: int, ctx: RunContext, seconds: float) -> None:
             executor_waited_seconds=run.executor_waited_seconds + elapsed,
             waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat(),
         )
-        wait.close()
+        wait.close(resume=completed)
 
 
 def _credited_wait(
     n: int, ctx: RunContext, acquire: Callable[[], object], phase: str, *, eager: bool = True,
+    resume: bool = True,
 ) -> None:
     """Block in acquire as the ``phase`` wait; credit the time as waited and keep tick informed.
 
     ``eager=False`` opens the wait phase only once the wait lasts (a lock that is usually
     free adds no phase events when it is acquired at once).
+    ``resume=False`` never queues while holding the resource; its owner checks the phase and releases it.
     """
     from foragent import runner
 
@@ -228,8 +343,10 @@ def _credited_wait(
         credit(waiting_until=(now + timedelta(seconds=60)).isoformat(), last_progress_at=now.isoformat())
 
     progress(polled=False)
+    acquired = False
     try:
         runner.poll_executor(acquire, progress)
+        acquired = True
     finally:
         credit(close=True, waiting_until=None, last_progress_at=ctx.now().astimezone(UTC).isoformat())
-        wait.close()
+        wait.close(resume=acquired and resume)

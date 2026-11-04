@@ -15,6 +15,7 @@
   guidance: Read only; never execute signal-sending code, including tests that send
     real signals. Check ownership with fake process tables only. Treat any weakened
     kill-safety check (ownership, PID reuse, group membership) as a defect.
+  pass_scope_exempt: true
   fixed_by: '#261'
   guard_tests:
   - tests/acceptance/test_stop_whole_tree.py
@@ -34,6 +35,7 @@
   guidance: Treat a missing or empty baseline as unknown, never as a pass. Check that
     every previously passing acceptance test still has to keep passing, and that no
     merge-policy hold was weakened.
+  pass_scope_exempt: true
   guard_tests:
   - tests/acceptance/test_acceptance_baseline.py
   added:

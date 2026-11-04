@@ -64,17 +64,18 @@ def gate_merges(store) -> dict[tuple[int, str], str]:
 
 def counts(store, now: datetime) -> tuple[int, int, int]:
     """(working lanes, person's-turn issues, merges on the local calendar day of ``now``)."""
-    from foragent.orch_inbox import scan
+    from foragent import watch_questions
 
     lanes = {run.lane for run in store.active_runs()}
-    turns = {row["number"] for row in store.local_issues()
-             if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())}
-    # Issues an open question waits on; the tolerant scan skips a corrupt question file
-    # alone, so it cannot hide the other questions or the rest of the line.
-    for row in scan(store, "questions")[0]:
-        linked = row.get("issues")
-        if row["status"] == "open" and isinstance(linked, list):
-            turns.update(number for number in linked if type(number) is int)
+    # Issues an open question waits on (the tolerant scan skips a corrupt question file
+    # alone) and person-labelled issues, less those whose question was answered.
+    questions = watch_questions.collect(store)
+    found = questions.issues
+    # Open questions name issues with no local record too; each still counts once.
+    turns = {number for number, who in found.items() if who == watch_questions.PERSON} | questions.strays
+    turns.update(row["number"] for row in store.local_issues()
+                 if row.get("state") == "open" and PERSON_LABELS & set(row.get("labels") or ())
+                 and found.get(row["number"]) != watch_questions.ANSWERED)
     today = now.astimezone().date()
     merged = 0
     for (_, started), value in gate_merges(store).items():
@@ -150,6 +151,17 @@ def _processing_since(row: dict):
     return _parse_at(selected)
 
 
+def new_requests(rows: list[dict]) -> list[tuple[dict, datetime | None]]:
+    """Untaken orchestrator requests, once per id, oldest first; unreadable times last."""
+    selected, seen = [], set()
+    for row in rows:
+        if row.get("status") != "new" or row.get("from") != "orchestrator" or row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        selected.append((row, _parse_at(row.get("created_at"))))
+    return sorted(selected, key=lambda item: (item[1] is None, item[1]))
+
+
 def stalled(rows: list[dict], now: datetime) -> tuple[list[tuple[dict, datetime]], list[str]]:
     """Processing requests stuck over STALL_AFTER, oldest first, with when each entered processing.
 
@@ -189,6 +201,18 @@ def renew_planning(cwd: Path) -> bool:
         return False
 
 
+def _question_groups(store, language: str) -> str:
+    """" · questions: <recipient> <count> ..." for each recipient with an open question, else ""."""
+    from foragent import watch_questions
+    from foragent.i18n import text
+
+    questions = watch_questions.collect(store)
+    counts_by = watch_questions.waiting(questions.issues, questions.unlinked)
+    groups = [text("presence_question_group", language, who=text(f"question_{who}", language), count=count)
+              for who, count in counts_by.items() if count]
+    return " · " + text("presence_questions", language, groups=" · ".join(groups)) if groups else ""
+
+
 def statusline_segment(cwd: Path, now: datetime) -> str | None:
     """The segment for a Foragent project, else None (and when the project config cannot be read)."""
     from foragent.i18n import text
@@ -204,12 +228,18 @@ def statusline_segment(cwd: Path, now: datetime) -> str | None:
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
     try:
+        segment += _question_groups(store, config.language) if store and store.root.is_dir() else ""
+    except Exception:  # An unreadable question fact leaves out only the groups.
+        pass
+    try:
         # Only the planning session, where the person answers, is told about open questions.
         if not (_planning_session(cwd, store) and store.root.is_dir()):
             return segment
-        from foragent.orch_inbox import scan
+        from foragent import watch_questions
 
-        waiting = sum(row["status"] == "open" for row in scan(store, "questions")[0])
+        # The same projection as the groups: an earlier run's or a closed issue's open
+        # question no longer asks anything.
+        waiting = len(watch_questions.collect(store).open_ids)
         if not waiting:
             return segment
         key = "presence_open_question" if waiting == 1 else "presence_open_questions"
@@ -311,8 +341,8 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
     """Box facts for a planning turn, and a note for each part that could not be read.
 
     Only a planning session in the bound checkout of a Foragent project gets them,
-    and not when presence.session_start is off. The text is stalled requests, open
-    questions and recent notices, quoted as data. Nothing here takes a lock.
+    and not when presence.session_start is off. The text is new orchestrator requests,
+    stalled requests, open questions and recent notices, quoted as data. Nothing here takes a lock.
     """
     project = _project(cwd)
     if project is None or not project[0].presence["session_start"]:
@@ -350,6 +380,12 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
         if shown:
             lines.extend([title, *shown])
 
+    def new_request(item) -> str:
+        row, since = item
+        return (f"- {_quote(row['id'])} from {_quote(row.get('from'))}, new"
+                + (f" since {since.isoformat()}" if since is not None else "")
+                + f": {_quote(row.get('text'))}")
+
     def request(item) -> str:
         row, since = item
         hours = int((now - since) // timedelta(hours=1))
@@ -371,13 +407,20 @@ def prompt_context(cwd: Path, now: datetime) -> tuple[str | None, list[str]]:
                 + (f" #{event['issue']}" if type(event.get("issue")) is int else "")
                 + f": {_quote(event['summary'])}")
 
+    rows("New orchestrator requests (waiting for the planning session to take them):",
+         "request", new_requests(requests), new_request)
     rows(f"Stalled requests (processing for over {STALL_AFTER // timedelta(minutes=1)} min):",
          "request", stuck, request)
     if unreadable:
         lines.append("Processing requests with an unreadable time (left out): "
                      + ", ".join(map(_quote, unreadable)))
+    # Only questions that still await the person: the projection drops an earlier run's or a
+    # closed issue's open question, as the statusline and lane view do.
+    from foragent import watch_questions
+
+    awaited = watch_questions.collect(store).open_ids
     rows("Open questions waiting for the person:", "question",
-         [row for row in questions if row["status"] == "open"], question)
+         [row for row in questions if row["status"] == "open" and row["id"] in awaited], question)
     rows(f"Notification notices (last {NOTICE_WINDOW // timedelta(hours=1)} h):", "notice",
          notices[-NOTICE_LIMIT:], notice)
     if len(notices) > NOTICE_LIMIT:

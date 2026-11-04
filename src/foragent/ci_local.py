@@ -65,10 +65,13 @@ def capture_local_only(n, ctx, git, test_command, base_sha, excluded):
     previous = phase_identity(ctx.store.get_run(n))
     _phase(n, ctx, "baseline")
     ctx.store.update_run(n, phase_work_id=f"baseline-local:{base_sha}")
+    completed = False
     try:
-        return _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        result = _capture_local_only(n, ctx, git, command, base_sha, excluded)
+        completed = True
+        return result
     finally:
-        restore_phase(n, ctx, previous)
+        restore_phase(n, ctx, previous, resume=completed)
 
 
 def _capture_local_only(n, ctx, git, command, base_sha, excluded):
@@ -150,13 +153,20 @@ class LocalComparisonUnavailable(ValueError):
 
 
 def fallback_comparison(attempt, base_sha):
-    from foragent import harness_guard
+    from foragent import harness_guard, runner
     from foragent.run_baseline import _capture_acceptance_baseline
 
     n, ctx = attempt.n, attempt.ctx
     started = ctx.monotonic()
+    if getattr(ctx.config, "merge_owner", False):
+        command = (ctx.config.test_command or getattr(attempt.baseline, "command", None)
+                   or next(iter(runner.detect_test_commands(attempt.worktree)), None))
+        if command is None:
+            raise LocalComparisonUnavailable("fallback acceptance test command unavailable")
+    else:
+        command = ctx.config.test_command or attempt.baseline.command
     try:
-        baseline = _capture_acceptance_baseline(n, ctx, ctx.config.test_command or attempt.baseline.command, base_sha)
+        baseline = _capture_acceptance_baseline(n, ctx, command, base_sha)
     except AttemptFailure as exc:
         raise LocalComparisonUnavailable(str(exc)) from exc
     if baseline is None:

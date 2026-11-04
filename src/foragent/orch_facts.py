@@ -15,11 +15,10 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import shutil
 import tempfile
 from typing import Any
 
-from foragent import capacity, machine_budget, orch_facts_baselines, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, resource_sample
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -27,6 +26,7 @@ from foragent.orch_facts_runs import (
     _slowest_files, _test_slots, _waiting_issues,
 )
 from foragent.state import Run, StateStore
+from foragent.state_logs import FLOW_LOCK
 
 HUMAN_RUNS = 6
 HUMAN_ITEMS = 4
@@ -90,12 +90,12 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
 
     def discover() -> list[Path]:
         try:
-            found = {path for path in parent.iterdir() if path.is_dir() and (
-                (path / "runs").is_dir() or (path / "run-starts").is_dir())}
+            found = {path for path in parent.iterdir() if path.is_dir() and capacity._holds_anything(path)}
         except OSError:
             found = set()
-        # Stores under the machine root are read for the machine-wide test-slot queue.
-        return sorted(found | {store.root} | set(resource_sample.machine_stores(store)))
+        # Stores under the machine root are read for the machine-wide test-slot queue and merge samples.
+        return sorted(found | {store.root} | set(resource_sample.machine_stores(store))
+                      | orch_facts_machine.merge_store_roots(store))
 
     def lock_set(stores: list[Path]) -> list[Path]:
         return [*(path / "state.lock" for path in stores), parent / capacity.LOCK_FILE,
@@ -111,24 +111,21 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             return None
         for source in stores:
             orch_facts_machine.freeze_slot_store(store, source, into, _copy)
+            orch_facts_machine.freeze_merge_store(store, source, into, _copy)
             if source != store.root and source.parent != parent:
                 continue
             target = into / "data" / source.name
-            names = [*source.glob("*.json"), *source.glob("*.jsonl")] if source == store.root else [
+            # flow.lock too: a store without it reads as one that never recorded a flow record.
+            names = [*source.glob("*.json"), *source.glob("*.jsonl"), source / FLOW_LOCK] if source == store.root else [
                 source / "runs.jsonl"]
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
-            for directory in ("runs", "run-starts", *(("approvals",) if source == store.root else ())):
+            for directory in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR,
+                              *(("approvals",) if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
             if source == store.root:
-                # Review artifacts keep their modification time: it places each in its execution.
-                for path in (source / "runs").glob("issue-*/review-*.txt"):
-                    (target / "runs" / path.parent.name).mkdir(parents=True, exist_ok=True)
-                    try:
-                        shutil.copy2(path, target / "runs" / path.parent.name / path.name)
-                    except FileNotFoundError:
-                        pass
+                orch_facts_machine.copy_reviews(source, target)
         _copy(parent / capacity.STATE_FILE, into / "data" / capacity.STATE_FILE)
         # Config files: the global config and the checkout's .foragent.yml, read once like the records.
         _copy(Path.home() / ".config/foragent/config.yml", into / GLOBAL_CONFIG)
@@ -146,8 +143,11 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
                 continue
             if record.get("status") == "running" and type(record.get("pid")) is int:
                 alive[record["pid"]] = _probe(record["pid"])
+        if (into / "data").is_dir():
+            alive.update(orch_facts_machine.probe_workloads(into / "data", _probe))
         machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
-                   "stored": stored, "slot_stores": into / orch_facts_machine.SLOT_STORES, "now": store._now(), "alive": alive}
+                   "stored": stored, "slot_stores": into / orch_facts_machine.SLOT_STORES,
+                   "merge_stores": into / orch_facts_machine.MERGE_STORES, "now": store._now(), "alive": alive}
         # A lock file created meanwhile (a first write under it) means the read was not covered.
         if discover() != stores or [path.exists() for path in lock_set(stores)] != held:
             return None
@@ -198,6 +198,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
                   if execution.run.status == "running" or execution.started >= now - RECENT]
     rows = [_row(execution, now) for execution in executions]
     reviews = orch_facts_reviews.attach(store, executions, rows)
+    areas = orch_facts_reviews.attach_project_review(store, root, executions, rows, machine)
     history = _history(rows)
     for row in rows:
         row["comparisons"] = _comparisons(row, history["medians"])
@@ -210,6 +211,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,
         "runs": rows,
+        "areas": areas,
         "history": history,
         "test_slots": slots,
         "slowest_test_files": _slowest_files(rows),
@@ -220,6 +222,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
         "binding": _binding(resources),
+        "role_schedule": orch_role_schedule.facts(store, config, now),
+        **orch_facts_decided.collect(store, now, RECENT),
         **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
     }
 
@@ -234,6 +238,30 @@ def _n(value: int | None) -> str:
 
 def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value * 100:.1f}%"
+
+
+def _waiting_text(facts: dict[str, Any]) -> str:
+    """The waiting-on-a-person numbers, appended to the kinds line so the block keeps its lines."""
+    waiting = facts.get("kind_numbers", {}).get("waiting_on_person")
+    if not waiting:
+        return ""
+    hours = waiting["oldest_waiting_seconds"] / 3600
+    return f"; waiting on a person: {waiting['waiting']}, oldest {waiting['oldest_issue']} ({hours:.1f} h)"
+
+
+def _decided_lines(facts: dict[str, Any], language: str) -> list[str]:
+    """Decided issues waiting for tests, and decision-to-approval time, as two lines."""
+    from foragent.i18n import text
+
+    waiting, approval = facts["tests_waiting"], facts["decision_to_approval"]
+    issues = waiting["issues"] or []
+    shown = (" (" + ", ".join(f"#{n}" for n in issues[:HUMAN_ITEMS]) + (", ..." if len(issues) > HUMAN_ITEMS else "")
+             + ")") if issues else ""
+    minutes = approval["median_minutes"]
+    return [text("facts_tests_waiting", language, count=_n(waiting["count"]), issues=shown),
+            text("facts_decision_to_approval", language, days=facts["window_days"],
+                 median="?" if minutes is None else f"{minutes:.0f}", approved=approval["approved"],
+                 unknown=approval["unknown"])]
 
 
 def human(facts: dict[str, Any], language: str = "en") -> str:
@@ -282,8 +310,12 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     reasons = list(facts["failure_reasons"].items())
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
-    blocks = [runs + ["  " + line for line in orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS)], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}",
-                                    orch_facts_baselines.human_line(facts, language)]]
+    blocks = [runs + ["  " + line for line in [*orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS),
+                                               *orch_facts_reviews.project_review_lines(facts, language, HUMAN_ITEMS)]], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}"
+                                    + _waiting_text(facts),
+                                    orch_facts_baselines.human_line(facts, language),
+                                    *orch_role_schedule.human_lines(facts["role_schedule"], language),
+                                    *_decided_lines(facts, language)]]
     return "\n\n".join("\n".join(block) for block in blocks)
 
 

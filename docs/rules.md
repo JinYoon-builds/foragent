@@ -78,3 +78,11 @@ This file lists the rules in force now, one line each. Each line cites a live de
 - Review strength follows reversibility. `always_human` paths, `risk:high`, deploys and public releases go to a person. (D10)
 - Library skills are copied in at run time, not committed. (D37)
 - Each person's factory works only the orders that person published (`by:<login>`). (D78)
+
+## Review findings are scored (#1651)
+
+- Every reviewer FAIL finding, in any round (single reviewer, panel merge or confirmation), gets one fresh scoring session with the reviewer, run one at a time. The scorer follows skills/review-procedure (the code-review plugin's 0-100 table and false-positive list, Apache-2.0).
+- Grounding rule: a finding blocks only when it is grounded (a line quoted from the Goal or Out of scope, a locked acceptance test file that exists under the acceptance directory, or a concrete breaking input) and scores 80 or more. A grounded fatal-path finding (data loss, breaking main, merge without approval, a person-only permission handed to an agent) blocks whenever the path exists, whatever its score. Everything else is a NOTE with its score, kept as a `review-score` event and `runs/issue-N/score-R-K.txt`. A reply without a valid score keeps the FAIL.
+- When the scorer says the Goal does not decide the point (`spec_question`), the run stops with a spec-question to the planning side, like a locked-test conflict; it is not rework.
+- Panel fact: the perspective panel still runs only on a first round with a risk note; its defaults are rule-documents, obvious-bugs, git-history, earlier-pr-comments, code-comments and fatal-path.
+- `review_scoring: false` in .foragent.yml turns scoring off.

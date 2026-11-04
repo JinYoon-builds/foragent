@@ -13,14 +13,14 @@ import re
 import subprocess
 import time
 
-from foragent import board, board_parents, gh, lane_talk, launchd, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_raise, orch_spawn, orch_waits, scheduler_housekeeping, tidy, usage_recheck, watch_open
+from foragent import board, board_parents, gh, lane_talk, launchd, orch_draft, orch_dream, orch_github, orch_plan, orch_push, orch_queue, orch_role_memory, orch_role_raise, orch_role_schedule, orch_spawn, orch_waits, scheduler_flow, scheduler_housekeeping, tidy, usage_recheck, watch_open
 from foragent.actions import flag, invalidate_approval
 from foragent.config import Config, in_run_hours
 from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 from foragent.issue import acceptance_paths, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issue_lane, issue_size, lane_order
-from foragent.orch_dream import DREAM_EVERY_MERGES, dream_due  # noqa: F401
+from foragent.orch_dream import dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
@@ -69,7 +69,9 @@ class TickReport:
 
 
 # Facade bindings for callers and monkeypatches; split modules call each other through here.
-from foragent.scheduler_approval import _check_integrity, _invalidate_approval, _latest_approval, _snapshot  # noqa: E402
+from foragent.scheduler_approval import (  # noqa: E402
+    _check_integrity, _invalidate_approval, _latest_approval, _record_held_approval, _snapshot,
+)
 from foragent.scheduler_recovery import (  # noqa: E402
     _crash_detail, _kill_executor, _kill_run, _local_issue, _recover_orphan, _recover_runs, _remove_run_worktree,
     _restore_after_crash, _restore_stalled, _reap_inactive_runs,
@@ -85,17 +87,23 @@ from foragent.scheduler_lanes import (  # noqa: E402
 
 
 def tick(ctx: TickContext) -> TickReport:
-    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep:
+    with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
         with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
+            memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
+            timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
             with tick_processes(ctx.store) as snapshot:
-                cleanup, ctx._budget_sample = TickReport(), None  # machine.yml applies once in every tick.
+                cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
                 if snapshot.available:
                     with step("reap_inactive_runs"):
                         _reap_inactive_runs(ctx, cleanup)
+                if getattr(ctx.config, "merge_owner", False):
+                    from foragent import merge_owner
+
+                    merge_owner.start(ctx, cleanup)
                 timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
                 timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
                 if skipped := _github_wait(ctx, {}, "github_wait_check"):
@@ -109,7 +117,8 @@ def tick(ctx: TickContext) -> TickReport:
                     if not exc.is_rate_limit:
                         raise
                     return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
-                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language)  # Met role signals (#794).
+                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
+                                     start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
                 return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
@@ -172,6 +181,9 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     else:
         recovered = set()
     optional = gh.Budget(OPTIONAL_GH_SECONDS, GH_CALL_SECONDS)  # Batch and parent gh work share it.
+    if listing_current:  # Parents first: batch reads repeat every tick, while parent work ends.
+        with step("parent_sync"):
+            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
     with step("batch_reconcile"):
         _optional_step(ctx, report, optional, "batch_reconcile", lambda: _reconcile_batches(ctx, report))
     ready: dict[str, list[int]] = {}
@@ -191,6 +203,12 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
+        if getattr(ctx.config, "merge_owner", False):
+            from foragent.merge_owner import pending
+
+            if pending(ctx.store, issue.number):
+                board.sync_status(ctx, issue, "PR open")
+                return
         if processes_available:  # Cleans a left-over worktree; board writes skip parents.
             repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
@@ -210,6 +228,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         if waiting_labels and (
             previous_flag is None or previous_flag.reason != Reason.HASH_MISMATCH
         ):
+            _record_held_approval(ctx, issue, previous_flag, base_ref, report, confirmed=listing_current)
             board.sync_status(ctx, issue, "Needs human" if NEEDS_HUMAN in waiting_labels else "Blocked")
             return
         if APPROVED not in issue.labels and not waiting_labels:
@@ -282,8 +301,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
                     raise
                 report.actions.append(text("tick_issue_deferred", ctx.config.language,
                                            number=issue.number, error=_one_line(exc)))
-        if listing_current:  # Children change only through observed facts and this tick's writes.
-            _optional_step(ctx, report, optional, "parent_sync", lambda: board_parents.follow_children(ctx, report))
+        scheduler_flow.considered(ctx, ready)
     if skipped := _github_wait(ctx, ready, "github_wait_before_start"):
         report.skipped = skipped
         return report
@@ -291,12 +309,20 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         sample = _apply_budgets(ctx, ready, workers=False)  # The worker budget is sized below with this sample.
     if sample[0] != "critical":  # Critical memory also holds the baseline prebuild (#497).
         timed("baseline_prebuild", prebuild_acceptance_baseline, ctx, base_ref, ctx.baseline_launcher)
+    timed("order_finish_check", orch_role_schedule.observe, ctx)  # Facts only; a no-start tick records them too.
     if not ctx.start_runs or not in_run_hours(ctx.now().astimezone(), ctx.config.run_hours):
+        scheduler_flow.hold(ctx, (number for numbers in ready.values() for number in numbers),
+                            "outside-run-hours" if ctx.start_runs else "starts-off")
         timed("machine_budget", _machine_budget, ctx, ready, sample)  # A tick that starts nothing still applies machine.yml and pressure.
         return report
     dreams = timed("dream_check", orch_dream.startable, ctx, sample)  # Worker demand like a ready issue.
+    roles = timed("role_check", orch_role_schedule.startable, ctx, sample)  # So is a due role session.
+    drafts = timed("draft_check", orch_draft.startable, ctx, sample)  # Each placeholder issue's test draft too (#1729).
     if not ready:
-        orch_dream.start(ctx, dreams, timed("machine_budget", _machine_budget, ctx, ready, sample), report)
+        budget = timed("machine_budget", _machine_budget, ctx, ready, sample)
+        orch_dream.start(ctx, dreams, budget, report)
+        orch_role_schedule.dispatch(ctx, roles, budget, report)
+        orch_draft.start(ctx, drafts, budget, report)
         _reopen_view(ctx, report)
         return report
 
@@ -306,6 +332,8 @@ def _tick_steps(ctx: TickContext) -> TickReport:
     if started is None:
         return report
     orch_dream.start(ctx, dreams, ctx._tick_budget, report)  # Only a slot the ready issues left free.
+    orch_role_schedule.dispatch(ctx, roles, ctx._tick_budget, report)  # Then what the dream left.
+    orch_draft.start(ctx, drafts, ctx._tick_budget, report)  # Drafts never hold a ready issue's slot.
     _reopen_view(ctx, report)
     return report
 

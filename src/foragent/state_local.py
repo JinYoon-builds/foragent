@@ -82,13 +82,42 @@ class LocalRecordsMixin:
         with self._state_lock():
             (self.root / "approvals" / f"{number}.json").unlink(missing_ok=True)
 
-    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None) -> None:
+    def save_flag(self, number: int, reason: str, *, flagged_at: str | None = None,
+                  local_only: bool = False) -> None:
         self._write_mapping(self.root / "flags" / f"{number}.json", _state.Flag, {
             "number": number, "reason": reason,
             "flagged_at": flagged_at if flagged_at is not None else self._timestamp(),
+            **({"local_only": True} if local_only else {}),
         })
 
     def load_flag(self, number: int) -> Flag | None:
+        """Project the current shared blocker from the latest observation of the issue.
+
+        Without a current marker, a stored record shows only what the observation still allows.
+        ``local_only`` is an explicit machine fact about an open issue and never means blockage.
+        Saved error text is detail while the issue still waits; it is not a marker reason.
+        """
+        from foragent.reasons import current_blocker, is_reason_code, waiting_labels
+
+        snapshot = self._issue_record()
+        row = snapshot["issues"].get(str(number))
+        visible = self._visible(snapshot, row) if row is not None else None
+        if visible is not None and (marker := current_blocker(visible, self._pending(snapshot))) is not None:
+            comment, reason = marker
+            return _state.Flag(number, reason, comment["created_at"])
+        local = self.load_local_flag(number)
+        if local is None:
+            return None
+        if visible is None:  # Compatibility before the first observation only.
+            return None if snapshot.get("complete_at") or str(number) in snapshot.get("absent", {}) else local
+        if visible.get("state") != "open" or visible.get("is_pull_request", False):
+            return None
+        if local.local_only or (waiting_labels(visible) and not is_reason_code(local.reason)):
+            return local
+        return None
+
+    def load_local_flag(self, number: int) -> Flag | None:
+        """Read stored local facts or error history; this does not establish shared blockage."""
         try:
             value = (self.root / "flags" / f"{number}.json").read_text(encoding="utf-8")
         except FileNotFoundError:

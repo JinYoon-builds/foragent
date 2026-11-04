@@ -8,14 +8,20 @@ Stock Claude Code is already good at finishing one task. Foragent automates the 
 task ends → done-when commands → adversarial review → merge → next issue
 ```
 
-<!-- GIF placeholder: lane view and statusline recording, coming soon (Jin records it). -->
-**GIF placeholder:** a recording of the lane view and the statusline is coming soon.
-
-Foragent built itself: 208 merged PRs in 10 days (counted from `git log` on 2026-10-29).
+Foragent built itself: 397 merged PRs in 15 days (counted from `git log` on 2026-11-03).
 
 [한국어 README](#한국어)
 
 ## Install
+
+Before you install, have these ready:
+
+- **A local Git repository** for your project, with its GitHub repository connected as `origin`.
+- **GitHub CLI (`gh`)**, installed and logged in with `gh auth login`.
+- **Claude Code**, installed and logged in.
+- **uv**, the Python tool installer that the install command uses. Follow the official guide: https://docs.astral.sh/uv/getting-started/installation/
+
+Codex CLI is optional.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
@@ -23,6 +29,8 @@ fa init
 ```
 
 Foragent needs Python 3.12 or newer. You do not have to install it first: if no suitable Python is on your machine, uv fetches one automatically and installs the `fa` command with it. Run `fa init` inside the project folder you want Foragent to work on.
+
+When this project already has Claude Code settings (`.claude/settings.json` or `.claude/settings.local.json`), `fa init` also asks once whether Claude may run Foragent commands here without a prompt each time. Without them, the summary marks this permission as not yet decided, and the `/fa` setup flow asks you with Yes/No choices and runs `fa init --fa-allow yes|no` with your answer. It asks again on each setup run until you answer; it never chooses for you. If you accept, it adds exactly one rule, `Bash(fa:*)`, to this project's `.claude/settings.local.json`; your other settings and your account-wide settings stay unchanged. If you decline, nothing changes. Either answer is remembered; run `fa init --fa-allow yes|no` to revise it. Choosing No leaves existing Claude settings, including any existing rules, unchanged. `--dry-run` never asks. FA commands do not expose permanent deletion, money transactions, sending to others, or widening permissions.
 
 At the end, `fa init` offers one optional starter order: a tiny task (about 10 minutes) that shows the whole flow from order to approval to a merged PR. Nothing is created then. To try it, type `/fa` and say `starter: add a --version flag`, or name another tiny task from your project.
 
@@ -84,12 +92,23 @@ These limits are known. Each item names the file where a change would start.
 
 ### 설치
 
+설치하기 전에 이것들을 준비해요.
+
+- **로컬 Git 저장소.** 프로젝트의 GitHub 저장소가 `origin`으로 연결되어 있어야 해요.
+- **GitHub CLI (`gh`).** 설치하고 `gh auth login`으로 로그인해요.
+- **Claude Code.** 설치하고 로그인해요.
+- **uv.** 설치 명령이 쓰는 Python 도구 설치기예요. 공식 안내를 따라 설치해요: https://docs.astral.sh/uv/getting-started/installation/
+
+Codex CLI는 선택이에요.
+
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
 fa init
 ```
 
 Foragent는 Python 3.12 이상이 필요해요. 먼저 설치하지 않아도 돼요. 알맞은 Python이 없으면 uv가 자동으로 받아서 `fa` 명령을 함께 설치해요. `fa init`은 Foragent가 일할 프로젝트 폴더 안에서 실행해요.
+
+이 프로젝트에 Claude Code 설정(`.claude/settings.json`이나 `.claude/settings.local.json`)이 이미 있으면, `fa init`은 Claude가 여기서 Foragent 명령을 매번 묻지 않고 실행해도 되는지 한 번 물어요. 설정이 없으면 요약에 아직 결정하지 않았다고 표시하고, `/fa` 설정 흐름이 예/아니요로 물은 뒤 그 답으로 `fa init --fa-allow yes|no`를 실행해요. 답하기 전에는 설정할 때마다 다시 묻고, 대신 선택하지 않아요. 수락하면 이 프로젝트의 `.claude/settings.local.json`에 규칙 `Bash(fa:*)` 하나만 넣어요. 다른 설정과 계정 전체 설정은 그대로예요. 거절하면 아무것도 바꾸지 않아요. 어느 답이든 기억하며, `fa init --fa-allow yes|no`로 답을 바꿀 수 있어요. 아니요를 선택해도 이미 있는 규칙을 포함한 Claude 설정은 그대로예요. `--dry-run`은 묻지 않아요. FA 명령으로는 영구 삭제, 돈 거래, 남에게 보내기, 권한 넓히기를 할 수 없어요.
 
 마지막에 `fa init`이 선택 사항인 starter 주문 하나를 제안해요. 약 10분짜리 작은 일로 주문, 승인, PR 병합까지 전체 흐름을 보여 줘요. 이때는 아무것도 만들지 않아요. 해 보려면 `/fa`를 입력하고 `starter: --version 플래그 추가`라고 말해요. 프로젝트의 다른 작은 일을 말해도 돼요.
 

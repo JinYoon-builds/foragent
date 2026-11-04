@@ -9,13 +9,10 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from foragent import notify
-from foragent.config import Config
 from foragent.orch_events import append_event
 from foragent.state import StateStore
 
@@ -23,14 +20,10 @@ REQUEST_STATUSES = ("new", "processing", "done")
 # What a person's question decides (#970): a D71 question, a merge approval or an order card.
 QUESTION_KINDS = ("question", "merge", "order")
 # A planning session that renewed its heartbeat this recently can still read a
-# cross-session message, so a new question does not need a push.
+# cross-session message; otherwise a question waits in the box for the next one.
 PLAN_HEARTBEAT_SECONDS = 120
 # The statusline renews an existing planning heartbeat only once it is this old.
 PLAN_RENEW_SECONDS = 60
-_QUESTION_PUSH = {
-    "en": ("A question needs your answer", "{id}: {question}"),
-    "ko": ("답할 질문이 있어요", "{id}: {question}"),
-}
 
 
 class InboxError(ValueError):
@@ -200,14 +193,39 @@ def requests(store: StateStore, *, pending: bool = False) -> list[dict[str, Any]
 
 
 def set_request_status(store: StateStore, request_id: str, status: str, note: str | None = None,
-                       check=None) -> dict[str, Any]:
-    """Set one request's status; ``check(record)`` runs inside the same state lock and may raise InboxError."""
+                       check=None, *, answer: str | None = None, require_answer: bool = False,
+                       empty_answer_reason: str | None = None) -> dict[str, Any]:
+    """Set status and optional answer atomically; ``check(record)`` runs under the same lock.
+
+    CLI completion requires an answer or explicit empty reason; signals use their own check hook.
+    """
     if status not in REQUEST_STATUSES:
         raise InboxError(f"status must be one of: {', '.join(REQUEST_STATUSES)}")
 
+    has_answer = bool(answer and answer.strip())
+    has_reason = bool(empty_answer_reason and empty_answer_reason.strip())
+    if require_answer and answer is not None and not has_answer:
+        raise InboxError("closing a request needs a non-empty --answer")
+
     def change(record: dict[str, Any]) -> None:
+        if require_answer and (status == "done" or answer is not None):
+            from foragent.orch_role_raise import is_signal_request
+
+            if is_signal_request(record):
+                raise InboxError("close role signals with fa orch signal-answer")
         if check is not None:
             check(record)
+        stored_answer = record.get("answer")
+        has_stored_answer = isinstance(stored_answer, str) and bool(stored_answer.strip())
+        if status == "done" and require_answer and not (has_answer or has_stored_answer or has_reason):
+            raise InboxError("closing a request needs a non-empty --answer")
+        if answer is not None:
+            record["answer"] = answer
+            record.pop("empty_answer_reason", None)
+        elif status == "done" and has_stored_answer:
+            record.pop("empty_answer_reason", None)
+        elif status == "done" and has_reason:
+            record.setdefault("empty_answer_reason", empty_answer_reason)
         record["status"] = status
         record.setdefault("notes", []).append(
             {"at": store._timestamp(), "status": status, "note": note or ""})
@@ -296,20 +314,6 @@ def renew_plan_heartbeat(store: StateStore) -> bool:
     if age is not None and age <= timedelta(seconds=PLAN_RENEW_SECONDS):
         return False
     write_plan_heartbeat(store)
-    return True
-
-
-def route_question(store: StateStore, config: Config, repo: str, record: dict[str, Any]) -> bool:
-    """Push a new question to the person only when no planning session is alive.
-
-    Returns whether a push was attempted. A live planning session reads the box
-    through a cross-session message instead.
-    """
-    if planning_alive(store):
-        return False
-    title, line = _QUESTION_PUSH.get(config.language, _QUESTION_PUSH["en"])
-    with notify.sending("question"):
-        notify.send(replace(config, repo=repo), title, line.format(**record))
     return True
 
 
@@ -496,11 +500,20 @@ def note_location(environ: dict[str, str], title: str | None = None,
     return {"kind": "terminal"}
 
 
-def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
-               where: dict[str, Any]) -> dict[str, Any]:
-    """Replace the latest note and journal a response for each issue it names."""
+def require_note_text(now: str) -> None:
     if not now.strip():
         raise InboxError("--now must not be empty")
+
+
+def write_note(store: StateStore, now: str, why: str | None, next_step: str | None,
+               where: dict[str, Any], *, retrospective: bool = False) -> dict[str, Any]:
+    """Replace the latest note, journal a response for each issue it names, and append its ``note`` event.
+
+    The latest note is a projection for the screens; the events are the history. Only
+    ``retrospective`` marks a note as a finished retrospective, and an unmarked note never
+    changes one. The event is the last write, so a failed note leaves no event behind.
+    """
+    require_note_text(now)
     record = {"now": now, "why": why, "next": next_step, "at": store._timestamp(), "where": where}
     store.root.mkdir(parents=True, exist_ok=True)
     summary = "\n".join(text for text in (now, why, next_step) if text)
@@ -509,6 +522,9 @@ def write_note(store: StateStore, now: str, why: str | None, next_step: str | No
         for number in sorted({int(n) for n in re.findall(r"#(\d+)", summary)}):
             append_event(store, datetime.fromisoformat(record["at"]), number, "acknowledged", summary,
                          locked=True)
+        marked = {"retrospective": True} if retrospective else {}
+        append_event(store, datetime.fromisoformat(record["at"]), None, "note", now, locked=True,
+                     now=now, why=why, next=next_step, where=where, **marked)
     return record
 
 

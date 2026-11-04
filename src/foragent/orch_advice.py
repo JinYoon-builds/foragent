@@ -19,10 +19,10 @@ def publish(tracker, context, n: int, body: str) -> str | None:
     ``context`` needs ``store``, ``config`` and ``now``.
     """
     try:
-        RecordingTracker(tracker, context, queue_writes=True).comment(n, body)
+        RecordingTracker(tracker, context, queue_writes=True).comment(n, body, evidence=True)
         return None
     except (TrackerError, ValueError, OSError) as exc:
-        context.store.queue_github_write(n, "comment", lanes=context.config.lanes, body=body)
+        context.store.queue_github_write(n, "comment", lanes=context.config.lanes, body=body, evidence=True)
         return " ".join(str(exc).split())[:200] or type(exc).__name__
 
 

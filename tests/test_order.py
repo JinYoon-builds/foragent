@@ -3,7 +3,9 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
+from itertools import count
 import json
+import os
 import re
 import subprocess
 from types import SimpleNamespace
@@ -11,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, order
+from foragent import cli, order, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
@@ -42,6 +44,7 @@ class PublishingGit:
         self.root, self.events = root, events
         self.saved = {}
         self.branch = "main"
+        self.pushed = False
 
     def current_branch(self):
         return self.branch
@@ -74,8 +77,19 @@ class PublishingGit:
         contents = {path: (self.root / path).read_text() for path in paths}
         self.events.append(("commit", title, contents))
         self.saved.update(contents)
+        self.pushed = False
+
+    def _call(self, args):
+        # Recovery's history search: this fake keeps no history, so it finds no batch commit.
+        assert args[0] == "log"
+        return ""
+
+    def is_ancestor(self, ancestor, head):
+        # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
+        return self.pushed if head.startswith("origin/") else ancestor in {"published", "origin/main"}
 
     def push_base(self, branch):
+        self.pushed = True
         self.events.append(("push", branch))
 
     @contextmanager
@@ -113,8 +127,10 @@ def offline_publication(git_history):
         calls.append(args)
         if "commit" in args:
             parent = git_command(root, "rev-parse", "HEAD")
+            title = args[args.index("-m") + 1]
             stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-                      "data 7\nPublish\n", f"from {parent}\n"]
+                      f"data {len(title.encode())}\n{title}\n",
+                      f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
                 if name == ":!CLAUDE.local.md":
                     continue
@@ -332,7 +348,7 @@ def test_publish_preserves_issue_files_as_metadata(publishing, plan, kind):
     if kind == "edits":
         publish(publishing, plan)
         item = {"number": 2, "goal": "Updated login.", "out_of_scope": "Payments.",
-                "done_when": ["true"], "checklist": ["Looks right"], "files": paths}
+                "done_when": [f"uv run pytest -q {FILE}", "true"], "checklist": ["Looks right"], "files": paths}
         plan["id"] = "2026-10-21-login-update"
         plan["issues"], plan["edits"] = [], [item]
     else:
@@ -542,7 +558,7 @@ def test_reapproval_of_preexisting_acceptance_change_passes_gate(offline_publica
     root, config, tracker, git, _, _ = offline_publication
     config = replace(config, approvers=["human"])
     tracker._now = lambda: BASE_TIME + timedelta(hours=1)
-    plan["issues"][0]["done_when"] = [f"pytest '{FILE}::test_login[token=valid]'"]
+    plan["issues"][0]["done_when"] = [f"uv run pytest '{FILE}::test_login[token=valid]'"]
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git, approve=True)
     ctx = TickContext(repo="owner/repo", repo_root=root, tracker=tracker, store=StateStore(root / ".foragent/state"),
                       config=config, git=git, now=lambda: tracker._now(), launcher=lambda number: None,
@@ -1341,6 +1357,23 @@ def test_preread_proposal_is_recorded_and_bound_to_the_published_issue(publishin
     assert _handover(root, 7, body, {}) is None, "a run without the acceptance file did not get what preread read"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_proposal_survives_the_decision_marker_publish_appends(publishing, plan, monkeypatch, newline):
+    """Decision links are bookkeeping like the plan-child marker; they are not what preread read (#1025)."""
+    from foragent import decisions
+
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    item = plan["issues"][0]
+    child = decisions.with_marker(_child_body(plan, item, config), ["D79"], None)
+    assert child.rstrip().endswith(decisions.marker(["D79"]))
+    assert _handover(root, 7, child.replace("\n", newline), API_FILES)["approach"] == ["Reuse the writer."]
+    assert _handover(root, 7, decisions.with_marker(child, [], None).replace("\n", newline), API_FILES) is not None
+    changed = decisions.with_marker(_child_body(plan, {**item, "goal": item["goal"] + " More."}, config), ["D79"], None)
+    assert _handover(root, 7, changed, API_FILES) is None, "the marker never hides a changed WHAT"
+
+
 @pytest.mark.parametrize("section", ["goal", "out_of_scope"])
 def test_preread_proposal_binds_authored_github_links_byte_for_byte(publishing, plan, monkeypatch, section):
     """An authored link is part of the WHAT: approving a changed link must not hand over the old proposal."""
@@ -1548,7 +1581,8 @@ def test_preread_setup_matches_the_implementation_setup(publishing, plan, tmp_pa
         assert ("agent" in setup.options) == (executor == "claude")
     # The lane-memory notice (the writer contract, D95) follows the task in both prompts.
     expected_prefix, _, notice = implementation["prompt"].partition("PROMPT")
-    assert prompt == expected_prefix + order.preread_prompt(plan, item) + notice
+    # The size request is sent beside the preread prompt; the evidence key binds neither it nor memory.
+    assert prompt == expected_prefix + order.preread_prompt(plan, item) + size_signal.PROMPT + notice
     if executor == "codex" and lane == "api":
         assert "API lane rules." in expected_prefix and "polish" in expected_prefix
 
@@ -2246,6 +2280,8 @@ def test_unlabelled_order_gets_new_children_for_its_legacy_owner(publishing, pla
     publish(publishing, plan)
     for number in (1, 2, 3):  # An order published before owner labels existed.
         make_legacy(tracker, number)
+    # This pre-team fixture also predates locally observed issue bases.
+    (root / ".foragent/order-observed.json").unlink()
     tracker.login = "bob"
     plan["issues"].append({**deepcopy(plan["issues"][1]), "key": "late", "title": "Late child"})
     order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
@@ -2384,7 +2420,7 @@ def test_statement_issue_without_reviewed_tests_is_refused_before_writes(
 
 def test_legacy_issue_beside_a_statement_issue_keeps_the_preread_gate(publishing, plan, monkeypatch):
     monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT]
     with pytest.raises(order.PlanError, match=r"no preread of the current content for issue\(s\) client;"):
         publish(publishing, plan, approve=True)
@@ -2398,7 +2434,7 @@ def test_invalid_statements_name_the_field(publishing, plan, value):
 
 
 def test_statements_appear_verbatim_in_the_issue_body(publishing, plan, monkeypatch):
-    monkeypatch.setattr(order, "require_reviewed_tests", lambda plan: None)
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: None)
     plan["issues"][0]["statements"] = [STATEMENT, "Nothing else changes."]
     publish(publishing, plan)
     body = publishing[2].get_issue(2).body
@@ -2420,6 +2456,8 @@ def test_retry_of_a_legacy_partial_order_keeps_it_with_the_legacy_owner(publishi
         tracker.update_issue(1, title=parent.title, body=body)
         for number in (1, 2, 3):
             make_legacy(tracker, number)
+        # The interrupted legacy publisher did not record an observed base.
+        (root / ".foragent/order-observed.json").unlink()
     tracker.login = "bob"
     report = order.publish(plan, root, replace(config, legacy_owner="Jin"), tracker, repo="owner/repo", git=git)
     assert report.parent == 1, "The legacy parent is kept"
@@ -2524,6 +2562,216 @@ def test_preread_turns_notice_when_no_slot_is_free(publishing, plan, tmp_path, m
     assert "Waiting for machine capacity" in err
     order.preread(plan, root, config)  # A free slot: no notice.
     assert "own turn" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", [
+    "MODE=test local-check && unavailable-later",
+    "./bin/local-check; unavailable-later",
+    "'./bin/local-check' | unavailable-later",
+    "true", "cd .", "test -f x", "[ -f x ]", ":", "if true; then unavailable; fi",
+    "for x in a; do unavailable; done", "(unavailable)", "! unavailable",
+    "MODE=test", "local-check 'unterminated",
+])
+def test_done_when_executable_resolves_first_command_only(tmp_path, monkeypatch, command):
+    from foragent import processes
+
+    binary = tmp_path / "bin" / "local-check"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\nexit 91\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, tmp_path)
+
+
+def test_done_when_executable_reports_edits_without_runner(tmp_path, monkeypatch):
+    from foragent import processes
+
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\nexit 99\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": str(tmp_path)})
+    plan = {"issues": [{"key": "one", "done_when": ["FLAG=yes missing-check --first"]}],
+            "edits": [{"number": 42, "done_when": ["missing-check --second"]}]}
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(plan, tmp_path)
+    assert caught.value.lines == [
+        "one: missing executable missing-check: FLAG=yes missing-check --first",
+        "#42: missing executable missing-check: missing-check --second",
+    ]
+
+
+def test_done_when_executable_uses_gate_environment_not_repo_venv(tmp_path, monkeypatch):
+    from foragent import processes
+
+    binary = tmp_path / ".venv/bin/check-in-venv"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary.parent))
+    seen = []
+    def environment(root):
+        seen.append(root)
+        return {"PATH": str(tmp_path / "empty")}
+    monkeypatch.setattr(processes, "_child_environment", environment)
+    with pytest.raises(order.DoneWhenExecutableError, match="check-in-venv"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["check-in-venv"]}]}, tmp_path)
+    assert seen == [tmp_path]
+
+
+@pytest.mark.parametrize("executable", ["./missing", "./not-executable", "./directory"])
+def test_done_when_executable_path_requires_executable_file(tmp_path, executable):
+    (tmp_path / "not-executable").write_text("echo no\n")
+    (tmp_path / "not-executable").chmod(0o644)
+    (tmp_path / "directory").mkdir()
+    with pytest.raises(order.DoneWhenExecutableError, match=re.escape(executable)):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": [executable]}]}, tmp_path)
+
+
+def test_done_when_executable_uv_suggestion_from_dependency_groups(tmp_path, monkeypatch):
+    from foragent import processes
+
+    binary = tmp_path / "uv"
+    binary.write_text("#!/bin/sh\nexit 99\n")
+    binary.chmod(0o755)
+    (tmp_path / "pyproject.toml").write_text('[dependency-groups]\ndev = ["pytest"]\n')
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": str(tmp_path)})
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python3 -m pytest -q test_x.py"]}]}, tmp_path, "ko")
+    assert len(caught.value.lines) == 1
+    assert "uv run pytest -q test_x.py" in caught.value.lines[0]
+    assert "찾을 수 없어요" in caught.value.lines[0]
+
+
+def test_observed_change_outside_known_fields_shows_the_raw_body_once():
+    from foragent import order_observed
+
+    base = "## Goal\nKeep.\n\n## Contracts\nThe API stays.\n"
+    assert list(order_observed._changes({"title": "T", "body": base},
+                                        {"title": "T", "body": base + "More.\n"})) == [
+        ("body", base, base + "More.\n")]
+    changed = list(order_observed._changes({"title": "T", "body": base},
+                                           {"title": "T", "body": base.replace("Keep.", "Move.") + "More.\n"}))
+    assert [field for field, _, _ in changed] == ["goal", "other_content"]
+
+
+def test_observed_fields_preserve_raw_changes_and_keep_plans_separate(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import order_observed
+
+    issue = SimpleNamespace(number=7, title="Initial", body="Unstructured original")
+    order_observed.save(tmp_path, "first", {"7": order_observed.fields(issue)}, "en")
+    issue.title, issue.body = "Revised", "Unstructured current"
+    with pytest.raises(order.PlanError) as refusal:
+        order_observed.check(tmp_path, "first", [issue], "en")
+    for value in ("#7", "Title", "Body", "Initial", "Revised", "Unstructured original", "Unstructured current"):
+        assert value in str(refusal.value)
+    order_observed.check(tmp_path, "other", [issue], "en")
+    order_observed.save(tmp_path, "first", {"7": order_observed.fields(issue)}, "en")
+    order_observed.check(tmp_path, "first", [issue], "en")
+
+
+def test_observed_storage_refuses_links(tmp_path):
+    from foragent import order_observed
+
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    (tmp_path / ".foragent").mkdir()
+    (tmp_path / order_observed.FILE).symlink_to(outside)
+    with pytest.raises(order.PlanError):
+        order_observed.save(tmp_path, "plan", {"7": {"title": "Title", "body": "Body"}}, "en")
+    assert outside.read_text() == "{}"
+
+
+@pytest.mark.parametrize("route,stop", [
+    ("create", "confirmation"), ("create", "parent_map"),
+    ("republish", "labels"), ("republish", "next_child"), ("edit", "comment"),
+])
+def test_partial_publication_records_each_written_target_before_followup_failure(publishing, plan, monkeypatch, route, stop):
+    from foragent import order_observed
+    from foragent.tracker import TrackerError
+
+    root, config, tracker, _, _ = publishing
+    if route != "create":
+        publish(publishing, plan)
+    number = 2
+    if route == "edit":
+        item = plan["issues"][0]
+        plan["issues"] = []
+        plan["edits"] = [{"number": number, **{key: item[key] for key in ("goal", "out_of_scope", "done_when", "checklist")}}]
+        plan["edits"][0]["goal"] = "Revised edit goal."
+        plan["id"] += "-edit"
+        monkeypatch.setattr(order, "executor_for", lambda name: _NoUnknowns())
+        order.preread(plan, root, config, lambda: tracker)
+    elif route == "republish":
+        plan["issues"][0].update(title="Revised child title", goal="Revised child goal.")
+    get_issue, update_issue = tracker.get_issue, tracker.update_issue
+    failed = False
+
+    def interrupt():
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise TrackerError("follow-up failed")
+
+    def get(n):
+        if stop == "confirmation" and n == number:
+            interrupt()
+        return get_issue(n)
+
+    def update(n, *, title, body):
+        if (stop == "parent_map" and n == 1 and '"api": 2' in body
+                or stop == "next_child" and n == 3):
+            interrupt()
+        return update_issue(n, title=title, body=body)
+
+    remove_labels, comment = tracker.remove_labels, tracker.comment
+
+    def labels(n, values):
+        if stop == "labels" and n == number and "Revised child goal." in get_issue(n).body:
+            interrupt()
+        return remove_labels(n, values)
+
+    def commented(n, body):
+        if stop == "comment" and n == number:
+            interrupt()
+        return comment(n, body)
+
+    monkeypatch.setattr(tracker, "get_issue", get)
+    monkeypatch.setattr(tracker, "update_issue", update)
+    monkeypatch.setattr(tracker, "remove_labels", labels)
+    monkeypatch.setattr(tracker, "comment", commented)
+    with pytest.raises(TrackerError, match="follow-up failed"):
+        publish(publishing, plan)
+    written = get_issue(number)
+    order_observed.check(root, plan["id"], [written], "en")
+    # Even a newly created target must already have a base when its follow-up fails.
+    update_issue(number, title=written.title + " external", body=written.body)
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        order_observed.check(root, plan["id"], [get_issue(number)], "en")
+    update_issue(number, title=written.title, body=written.body)
+    report = publish(publishing, plan)
+    assert number in {row["number"] for row in report.rows}
+    assert get_issue(number).title == written.title
+
+
+def test_observed_section_diagnostic_omits_unchanged_body(tmp_path):
+    from types import SimpleNamespace
+
+    from foragent import order_observed
+
+    body = "<!-- foragent:v1 -->\n## Goal\nA long unchanged goal.\n## Done when\n```sh\nold check\n```\n"
+    issue = SimpleNamespace(number=7, title="Same", body=body)
+    order_observed.save(tmp_path, "plan", {"7": order_observed.fields(issue)}, "en")
+    issue.body = body.replace("old check", "new check")
+    with pytest.raises(order.PlanError) as refusal:
+        order_observed.check(tmp_path, "plan", [issue], "en")
+    message = str(refusal.value)
+    assert "Done when" in message and "old check" in message and "new check" in message
+    assert "A long unchanged goal." not in message and "Body\n" not in message
 
 
 @pytest.fixture
@@ -3109,7 +3357,13 @@ def test_failed_edit_dependency_sync_leaves_no_revision_comment(publishing, plan
     assert tracker.blocked_by(child) != []
 
 
-def test_republished_child_clears_a_hand_written_wait_with_no_marker(publishing, plan):
+def reread_publication(case, plan, monkeypatch):
+    """Refresh the observed GitHub base before intentionally replacing a hand edit."""
+    monkeypatch.setattr(order, "executor_for", lambda name: _NoUnknowns())
+    order.preread(plan, case[0], case[1], lambda: case[2], repo="owner/repo")
+
+
+def test_republished_child_clears_a_hand_written_wait_with_no_marker(publishing, plan, monkeypatch):
     root, config, tracker, git, _ = publishing
     plan["issues"] = plan["issues"][:1]
     publish(publishing, plan)
@@ -3117,6 +3371,7 @@ def test_republished_child_clears_a_hand_written_wait_with_no_marker(publishing,
     published = tracker.get_issue(child).body
     tracker.update_issue(child, title="Login API", body=published + "\n## Waiting\nThe person asked to hold.\n")
     assert not any("foragent:waiting" in c.body for c in tracker.list_comments(child))
+    reread_publication(publishing, plan, monkeypatch)
     publish(publishing, plan)
     lines = [c.body for c in tracker.list_comments(child) if "foragent:waiting" in c.body]
     assert len(lines) == 1 and lines[0].startswith("Waiting cleared.")
@@ -3152,6 +3407,7 @@ def test_cleared_hand_written_wait_is_announced_after_a_failed_comment(publishin
         changed = {**deepcopy(plan), "id": "2026-10-21-edit", "issues": [], "edits": [edit]}
     issue = tracker.get_issue(number)
     tracker.update_issue(number, title=issue.title, body=issue.body + "\n## Waiting\nThe person asked to hold.\n")
+    reread_publication(publishing, changed, monkeypatch)
     real = _fail_waiting_comments(tracker, monkeypatch)
     with pytest.raises(TrackerError):
         publish(publishing, changed)
@@ -3191,7 +3447,7 @@ def test_repeated_clearing_after_a_hand_restore_comments_each_time():
 
 
 @pytest.mark.parametrize("path", ["child", "edit"])
-def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan, path):
+def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan, path, monkeypatch):
     root, config, tracker, git, _ = publishing
     a, b = "\n\n## Waiting\nReason: A\n", "\n\n## Waiting\nReason: B\n"
     if path == "child":
@@ -3210,6 +3466,7 @@ def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan
     publish(publishing, changed)
     issue = tracker.get_issue(number)
     tracker.update_issue(number, title=issue.title, body=issue.body.replace("Reason: B", "Reason: A"))
+    reread_publication(publishing, changed, monkeypatch)
     publish(publishing, changed)
     lines = [c.body.split(" <!--")[0] for c in tracker.list_comments(number) if "foragent:waiting" in c.body]
     assert lines == ["Waiting: Reason: A", "Waiting: Reason: B", "Waiting: Reason: B"]
@@ -3217,7 +3474,7 @@ def test_publication_repeats_a_wait_change_after_a_hand_restore(publishing, plan
     assert len([c for c in tracker.list_comments(number) if "foragent:waiting" in c.body]) == 3
 
 
-def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(publishing, plan):
+def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(publishing, plan, monkeypatch):
     """The edit comment names this write; rewriting over a hand edit is not the old revision."""
     root, config, tracker, git, _ = publishing
     body = "<!-- foragent:v1 -->\n## Goal\nShip.\n## Out of scope\nOther.\n## Done when\n```sh\ntrue\n```\n"
@@ -3231,11 +3488,132 @@ def test_edit_written_back_over_a_hand_edit_posts_its_revision_comment_again(pub
     issue = tracker.get_issue(70)
     tracker.update_issue(70, title=issue.title, body=issue.body.replace("Ship it.", "Ship it by hand."))
     tracker.add_labels(70, ["approved"])
+    reread_publication(publishing, changed, monkeypatch)
     publish(publishing, changed)
     assert "Ship it.\n" in tracker.get_issue(70).body and "approved" not in tracker.get_issue(70).labels
     assert len(revisions()) == 2
     publish(publishing, changed)
     assert len(revisions()) == 2
+
+
+@pytest.mark.parametrize("value", [None, 41, "41", [True], [0], [-1], [41, 41], [{}]])
+def test_replacements_reject_invalid_numbers_before_writes(publishing, plan, value):
+    plan["issues"][0]["replaces"] = value
+    with pytest.raises(order.PlanError, match=r"issues\[0\].replaces"):
+        publish(publishing, plan, approve=True)
+    assert publishing[-1] == []
+
+
+@pytest.mark.parametrize("target", ["missing", "pr", "running", "edited"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_replacement_conflicts_are_checked_together_before_writes(publishing, plan, target, dry_run):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    if target != "missing":
+        tracker.add_issue(42, "Conflicting work", "body", ["running"] if target == "running" else [],
+                          is_pull_request=target == "pr")
+    if target == "edited":
+        plan["edits"] = [{"number": 42, "goal": "Edit it", "out_of_scope": "Other work",
+                          "done_when": ["true"]}]
+    plan["issues"][0]["replaces"] = [41, 42]
+    with pytest.raises(order.PlanError, match="#42"):
+        publish(publishing, plan, approve=True, dry_run=dry_run)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == []
+    assert publishing[-1] == []
+
+
+def test_replacement_partial_approval_links_every_successor_and_respects_reopen(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Shared old work", "body")
+    tracker.add_issue(42, "Client old work", "body")
+    plan["issues"][0]["replaces"] = [41]
+    plan["issues"][1]["replaces"] = [41, 42]
+    report = publish(publishing, plan, approve_keys=["api"])
+    children = {row["title"]: row["number"] for row in report.rows}
+    old = tracker.get_issue(41)
+    assert old.state == "closed" and old.state_reason == "not_planned"
+    comments = tracker.list_comments(41)
+    assert len(comments) == 1
+    assert all(f"#{number}" in comments[0].body for number in children.values())
+    assert tracker.get_issue(42).state == "open"
+    tracker.issues[41] = replace(old, state="open", state_reason=None)
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open"
+    assert tracker.list_comments(41) == comments
+    assert tracker.get_issue(42).state_reason == "not_planned"
+    assert len(tracker.list_comments(42)) == 1
+
+
+def test_replacement_leaves_an_issue_closed_before_this_order_alone(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    tracker.close_issue(41, reason="completed")
+    plan["issues"][0]["replaces"] = [41]
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state_reason == "completed" and tracker.list_comments(41) == []
+
+
+@pytest.mark.parametrize("route", ["immediate", "batch"])
+def test_replacement_published_twice_behind_a_queued_write_closes_once(publishing, plan, route):
+    from foragent.tracker import RecordingTracker
+
+    root, config, remote, git, events = publishing
+    remote.add_issue(41, "Old work", "body")
+    ticks = count()
+
+    def now():  # Store and context share one moving clock, so reads and writes keep their real order.
+        return BASE_TIME + timedelta(seconds=next(ticks))
+
+    store = StateStore.for_repo("owner/repo", now=now)
+    store.record_issue(remote.get_issue(41), {})
+    store.queue_github_write(41, "add_labels", labels=["later"])
+    tracker = RecordingTracker(remote, SimpleNamespace(store=store, config=config, now=now))
+    case = (root, config, tracker, git, events)
+    plan["issues"][0]["replaces"] = [41]
+
+    def deliver():
+        if route == "immediate":
+            publish(case, plan, approve=True)
+        else:
+            plan["summary"] += " Revised."
+            publish(case, plan, defer="chosen", approve=True)
+            flush_waiting(case)
+
+    deliver()
+    deliver()
+    assert [entry["action"] for entry in store.github_outbox() if entry["issue"] == 41].count("close_issue") == 1
+    tracker.flush_outbox()
+    assert remote.get_issue(41).state_reason == "not_planned" and len(remote.list_comments(41)) == 1
+    remote.issues[41] = replace(remote.get_issue(41), state="open", state_reason=None)
+    tracker.flush_outbox()
+    deliver()
+    tracker.flush_outbox()
+    assert remote.get_issue(41).state == "open" and len(remote.list_comments(41)) == 1
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["whole", "resumed"])
+def test_replacement_closes_through_a_batch_flush_and_its_resume(publishing, plan, monkeypatch, interrupted):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Old work", "body")
+    plan["issues"][0]["replaces"] = [41]
+    publish(publishing, plan, defer="chosen", approve=True)
+    assert tracker.get_issue(41).state == "open"
+    if interrupted:
+        create = tracker.create_issue
+
+        def interrupted_create(*args, **kwargs):
+            raise TrackerError("interrupted after the push")
+
+        monkeypatch.setattr(tracker, "create_issue", interrupted_create)
+        with pytest.raises(TrackerError):
+            flush_waiting(publishing)
+        assert tracker.get_issue(41).state == "open"
+        monkeypatch.setattr(tracker, "create_issue", create)
+    assert flush_waiting(publishing)["status"] == "published"
+    old = tracker.get_issue(41)
+    assert old.state == "closed" and old.state_reason == "not_planned"
+    assert len(tracker.list_comments(41)) == 1
 
 
 def test_planning_notes_replacement_and_interrupted_tail(tmp_path):
@@ -3275,6 +3653,26 @@ def test_planning_notes_reject_invalid_replacement_without_writing(tmp_path, kin
                            replaces=first["id"] if replaces == "earlier" else replaces)
     assert path.read_bytes() == before
 
+
+@pytest.mark.parametrize("kind", ["issues", "edits"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_missing_done_when_is_a_plan_error_before_executable_preflight(
+        publishing, plan, monkeypatch, kind, dry_run):
+    root, config, tracker, git, events = publishing
+    if kind == "edits":
+        plan["edits"] = [{"number": 70, "goal": "Update the goal.", "out_of_scope": "Other work."}]
+    else:
+        del plan["issues"][0]["done_when"]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Malformed plans must stop before executable checks or tracker reads")
+
+    monkeypatch.setattr(order, "check_done_when_executables", forbidden)
+    monkeypatch.setattr(tracker, "list_issues", forbidden)
+    with pytest.raises(order.PlanError, match=rf"{kind}\[0\]: missing fields: done_when"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git, dry_run=dry_run)
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
+    assert not (root / "docs").exists()
 
 def flush_waiting(case, boundary="chosen"):
     from foragent import order_flush
@@ -3321,6 +3719,41 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert identities == {issue.title: issue.number for issue in tracker.list_issues()}
     assert all("approved" not in issue.labels for issue in tracker.list_issues())
     assert len([event for event in events if event[0] == "commit"]) == 2
+
+
+@pytest.mark.parametrize("via_cli", [False, True])
+def test_flush_missing_executables_keep_each_diagnostic_before_writes(
+        publishing, plan, monkeypatch, capsys, via_cli):
+    from foragent import processes
+
+    root, config, tracker, git, events = publishing
+    plan["issues"][0]["done_when"] = [f"uv run pytest -q {FILE}"] * 2
+    publish(publishing, plan, defer="chosen")
+    store = StateStore.for_repo("owner/repo")
+    before = (store.root / "orders.jsonl").read_bytes()
+    # Availability can change between retaining the order and flushing it.
+    monkeypatch.setattr(processes, "_child_environment", lambda cwd: {"PATH": str(root / "no-tools")})
+    if via_cli:
+        monkeypatch.setattr(cli, "load_config", lambda root: config)
+        monkeypatch.setattr(cli, "GitRepo", lambda root: git)
+        monkeypatch.setattr(git, "remote_slug", lambda: "owner/repo", raising=False)
+        monkeypatch.setattr(cli, "GhTracker", lambda repo: tracker)
+        monkeypatch.setattr(cli, "RunContext", lambda **kwargs: SimpleNamespace(tracker=tracker))
+        capsys.readouterr()
+        assert cli.main(["order", "flush", "--boundary", "chosen", "--repo-root", str(root)]) == 1
+        output = capsys.readouterr()
+        assert output.out == ""
+        lines = output.err.splitlines()
+    else:
+        with pytest.raises(order.DoneWhenExecutableError) as caught:
+            flush_waiting(publishing)
+        lines = caught.value.lines
+    assert len(lines) == 2
+    assert all("uv" in line and "api" in line for line in lines)
+    assert (store.root / "orders.jsonl").read_bytes() == before
+    assert not (store.root / "flush-journal.jsonl").exists()
+    assert not (root / FILE).exists()
+    assert events == [] and tracker.issues == {} and tracker.labels == {}
 
 
 @pytest.mark.parametrize("refusal", ["map", "approve", "owner", "preread", "rule", "conflict"])
@@ -3509,6 +3942,87 @@ def test_flush_pushes_before_reading_only_required_issue_blob_metadata(publishin
         assert [event[0] for event in events] == ["commit", "push"]
 
 
+@pytest.mark.parametrize("route", ["direct", "flush"])
+def test_shared_publication_preflight_refuses_stale_targets_before_writes(publishing, plan, route):
+    root, config, tracker, git, events = publishing
+    report = publish(publishing, plan, approve=True)
+    number = report.rows[0]["number"]
+    if route == "flush":
+        publish(publishing, plan, defer="chosen")
+    original = tracker.get_issue(number)
+    tracker.update_issue(number, title=original.title + " external", body=original.body)
+    expected = dict(tracker.issues)
+    before = list(events)
+    contents = {name: (root / name).read_bytes() for name in git.saved}
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        if route == "flush":
+            flush_waiting(publishing)
+        else:
+            publish(publishing, plan)
+    assert tracker.issues == expected and events == before
+    assert "approved" in tracker.get_issue(number).labels
+    assert {name: (root / name).read_bytes() for name in contents} == contents
+    assert not (StateStore.for_repo("owner/repo").root / "flush-journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_preread_preparation_failure_propagates_without_refreshing_failed_target(publishing, plan, monkeypatch, failed_index):
+    from foragent import order_observed
+
+    root, config, tracker, _, _ = publishing
+    report = publish(publishing, plan)
+    numbers = [row["number"] for row in report.rows]
+    for number in numbers:
+        issue = tracker.get_issue(number)
+        tracker.update_issue(number, title=issue.title + " external", body=issue.body)
+    original_target, original_save = order.preread_target, order_observed.save
+    worker, saved = _NoUnknowns(), []
+    failure = RuntimeError("preread preparation failed")
+
+    def prepare(plan, item, *args):
+        if item["key"] == plan["issues"][failed_index]["key"]:
+            raise failure
+        return original_target(plan, item, *args)
+
+    def save(root, identity, values, language):
+        saved.extend(values)
+        return original_save(root, identity, values, language)
+
+    monkeypatch.setattr(order, "preread_target", prepare)
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    monkeypatch.setattr(order_observed, "save", save)
+    with pytest.raises(RuntimeError) as caught:
+        order.preread(plan, root, config, lambda: tracker)
+    assert caught.value is failure
+    assert len(worker.calls) == failed_index
+    assert saved == [str(number) for number in numbers[:failed_index]]
+    # A failed read must still refuse the changed issue, including after an earlier successful read.
+    with pytest.raises(order.PlanError, match=f"#{numbers[failed_index]}"):
+        order_observed.check(root, plan["id"], [tracker.get_issue(numbers[failed_index])], "en")
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_stale_publication_dry_run_previews_without_checking_or_refreshing_base(publishing, plan, monkeypatch, approve):
+    from foragent import order_observed
+
+    root, _, tracker, _, events = publishing
+    report = publish(publishing, plan)
+    number = report.rows[0]["number"]
+    issue = tracker.get_issue(number)
+    tracker.update_issue(number, title=issue.title + " external", body=issue.body)
+    before, facts = list(events), dict(tracker.issues)
+    observed = (root / order_observed.FILE).read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(order_observed, "check", lambda *args: pytest.fail("dry-run reached the stale guard"))
+        preview = publish(publishing, plan, dry_run=True, approve=approve)
+    assert preview.dry_run is True and preview.rows[0]["number"] == number
+    assert events == before and tracker.issues == facts
+    assert (root / order_observed.FILE).read_bytes() == observed
+    # Preview neither refreshes the base nor disables protection for the following real publish.
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        publish(publishing, plan, approve=approve)
+
+
 @pytest.mark.parametrize("kind", ["plan", "unpushed", "notes-only"])
 def test_shared_lock_flush_refuses_before_checkpoint_or_publication(shared_order, monkeypatch, kind):
     from foragent import order_flush, order_flush_journal, order_notes
@@ -3541,3 +4055,820 @@ def test_shared_lock_flush_refuses_before_checkpoint_or_publication(shared_order
     assert before == (git_command(case.origin, "rev-parse", "refs/heads/main"),
                       (case.root / FILE).read_bytes(), dict(case.tracker.issues), dict(case.tracker.labels),
                       {n: case.store.load_approval(n) for n in (2, 3)})
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_observed_diagnostic_labels_cover_every_real_parser_field(tmp_path, language):
+    from dataclasses import asdict, fields
+
+    from foragent import order_observed
+    from foragent.issue import ParsedIssue
+    from foragent.messages.order_observed import MESSAGES
+
+    body = ("<!-- foragent:v1 -->\nexclusive: [src/login.py]\n"
+            "## Goal\nShip login.\n## Out of scope\nPayments.\n"
+            "## Done when\n```sh\ntrue\n```\n- [x] Visible result\n"
+            "## Files\n- src/login.py\n")
+    names = {field.name for field in fields(ParsedIssue)}
+    old, new = asdict(parse_body("")), asdict(parse_body(body))
+    assert {name for name in names if old[name] != new[name]} == names
+    required = {"observed_field_" + name for name in names | {"title", "body"}}
+    assert required <= MESSAGES[language].keys()
+    issue = SimpleNamespace(number=7, title="Old title", body="")
+    order_observed.save(tmp_path, "plan", {"7": order_observed.fields(issue)}, language)
+    issue.title, issue.body = "New title", body
+    with pytest.raises(order.PlanError) as refusal:
+        order_observed.check(tmp_path, "plan", [issue], language)
+    diagnostic = str(refusal.value)
+    for name in names | {"title"}:
+        assert MESSAGES[language]["observed_field_" + name] in diagnostic
+    assert "#7" in diagnostic and "Old title" in diagnostic and "New title" in diagnostic
+    issue.body = "Unstructured current body"
+    with pytest.raises(order.PlanError) as fallback:
+        order_observed.check(tmp_path, "plan", [issue], language)
+    assert MESSAGES[language]["observed_field_body"] in str(fallback.value)
+    assert issue.body in str(fallback.value)
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_preread_binding_ignores_decision_marker_line_endings(publishing, plan, newline):
+    from foragent import decisions
+
+    config = publishing[1]
+    item = plan["issues"][0]
+    plain = {**item, "goal": "Observable behaviour" + newline + "Remaining behaviour"}
+    marked = {**item, "goal": "Observable behaviour" + newline + decisions.marker([]) + newline + "Remaining behaviour"}
+    assert order._binding(plan, marked, config, REPO, {}) == order._binding(plan, plain, config, REPO, {})
+
+
+@pytest.mark.parametrize("route", ["child", "edit"])
+def test_observed_base_holds_the_decision_marker_publish_wrote(publishing, plan, route):
+    """Publish compares against what it wrote: its own marker is no conflict, a changed one is."""
+    from foragent import decisions
+
+    tracker = publishing[2]
+    if route == "edit":
+        tracker.add_issue(9, "Existing", "old", [])
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                          "decisions": ["D79"]}]
+    else:
+        plan["issues"][0]["decisions"] = ["D79"]
+    publish(publishing, plan)
+    item = plan["edits"][0] if route == "edit" else plan["issues"][0]
+    number = 9 if route == "edit" else next(i.number for i in tracker.list_issues() if i.title == item["title"])
+    assert decisions.explicit(tracker.get_issue(number).body) == ["D79"]
+    item["goal"] += " Republished."
+    publish(publishing, plan)
+    written = tracker.get_issue(number)
+    assert "Republished." in written.body and decisions.explicit(written.body) == ["D79"]
+    item["goal"] += " Again."
+    tracker.update_issue(number, title=written.title, body=decisions.with_marker(written.body, ["D80"], None))
+    changed = tracker.get_issue(number).body
+    with pytest.raises(order.PlanError) as refusal:
+        publish(publishing, plan)
+    assert f"#{number}" in str(refusal.value) and "D79" in str(refusal.value) and "D80" in str(refusal.value)
+    assert tracker.get_issue(number).body == changed
+
+
+@pytest.mark.parametrize("route", ["child", "edit"])
+def test_statement_issue_refused_as_stale_can_be_reread_without_a_reader(publishing, plan, monkeypatch, route):
+    """Statement issues get no preread turn; the refusal's way back must still reach them."""
+    from foragent import order_observed
+
+    root, config, tracker = publishing[:3]
+    monkeypatch.setattr(order, "require_reviewed_tests", lambda *args, **kwargs: {})
+    monkeypatch.setattr(order, "executor_for", lambda name: pytest.fail("a statement issue has no reader turn"))
+    if route == "edit":
+        tracker.add_issue(9, "Existing", "old", [])
+        plan["issues"] = []
+        plan["edits"] = [{"number": 9, "goal": "Fixed goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                          "statements": ["Sending prints nothing."]}]
+    else:
+        plan["issues"] = plan["issues"][:1]
+        plan["issues"][0]["statements"] = ["Sending prints nothing."]
+    publish(publishing, plan)
+    item = plan["edits"][0] if route == "edit" else plan["issues"][0]
+    number = 9 if route == "edit" else next(i.number for i in tracker.list_issues() if i.title == item["title"])
+    key = "#9" if route == "edit" else item["key"]
+    written = tracker.get_issue(number)
+    tracker.update_issue(number, title=written.title, body=written.body + "\nChanged on GitHub.\n")
+    with pytest.raises(order.PlanError, match=f"#{number}"):
+        publish(publishing, plan)
+    changed = tracker.get_issue(number).body
+    assert changed == written.body + "\nChanged on GitHub.\n"
+    rows = order.preread(plan, root, config, lambda: tracker, repo=REPO)
+    assert [(row["key"], row["unknowns"]) for row in rows] == [(key, [])]
+    assert "Changed on GitHub." in rows[0]["current"] and written.title in rows[0]["current"]
+    order_observed.check(root, plan["id"], [tracker.get_issue(number)], config.language)
+    item["goal"] += " Reconciled."
+    publish(publishing, plan)
+    assert "Reconciled." in tracker.get_issue(number).body
+
+
+# Done when lines an edit may not lose silently (#1556).
+
+DONE_WHEN_BODY = ("<!-- foragent:v1 -->\n## Goal\nKeep it.\n\n## Out of scope\nNothing.\n\n"
+                  "## Done when\n```sh\ntrue\n```\n```sh\ntest  -s kept.txt\n```\n- [x] Stay checked.\n- [ ] Stay open.\n")
+
+
+def _edit_plan(identity="keep-lines", **fields):
+    edit = {"number": 40, "goal": "Keep it.", "out_of_scope": "Nothing.", "done_when": ["true", "test  -s kept.txt"],
+            "checklist": ["Stay checked.", "Stay open."], **fields}
+    return {"id": identity, "title": "Keep lines", "summary": "Keep.", "spec_markdown": "# Keep\n",
+            "issues": [], "edits": [edit]}
+
+
+def _edit_case(publishing, body=DONE_WHEN_BODY):
+    root, config, tracker, git, _ = publishing
+    tracker.add_issue(40, "Keep lines", body, labels=["lane:api", "size:m"])
+    return root, config, tracker, git
+
+
+def _publish_edit(case, plan, **options):
+    root, config, tracker, git = case
+    return order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **options)
+
+
+def _drop_command(reason="A newer proof covers it."):
+    return {"done_when": ["true"], "done_when_removals": [{"line": "test  -s kept.txt", "reason": reason}]}
+
+
+def test_removal_record_survives_later_edits_and_never_reads_as_done_when(publishing):
+    case = _edit_case(publishing)
+    tracker = case[2]
+    _publish_edit(case, _edit_plan(**_drop_command("Line one.\n  Line two.")))
+    body = tracker.get_issue(40).body
+    assert parse_body(body).done_when_commands == ["true"]
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
+    # A later order that names nothing keeps the history, and adds its own after it.
+    _publish_edit(case, _edit_plan("keep-lines-2", goal="Keep it better.", done_when=["true"]))
+    body = tracker.get_issue(40).body
+    assert parse_body(body).goal == "Keep it better."
+    assert order.order_done_when.records(body) == [
+        {"line": "test  -s kept.txt", "order": "keep-lines", "reason": "Line one. Line two."}]
+    _publish_edit(case, _edit_plan("keep-lines-3", done_when=["true"], checklist=["Stay open."], done_when_removals=[
+        {"line": "Stay checked.", "reason": "Done elsewhere."}]))
+    assert [entry["line"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
+        "test  -s kept.txt", "Stay checked."]
+
+
+@pytest.mark.parametrize("line", [
+    "printf '## Goal\\n'\n\n```\nsecond  line", "```", "<!-- foragent:done-when-removed -->",
+])
+def test_removal_record_round_trips_lines_that_look_like_structure(line):
+    written = order.order_done_when.with_record(DONE_WHEN_BODY, None, [{"line": line, "reason": "## Goal"}], "an-order")
+    assert order.order_done_when.records(written) == [{"line": line, "order": "an-order", "reason": "## Goal"}]
+    assert order.order_done_when.without_record(written).strip() == DONE_WHEN_BODY.strip()
+    assert parse_body(written) == parse_body(DONE_WHEN_BODY)
+
+
+def test_body_without_removals_stays_byte_identical():
+    assert order.order_done_when.with_record(DONE_WHEN_BODY, DONE_WHEN_BODY, []) == DONE_WHEN_BODY
+    assert order.order_done_when.without_record(DONE_WHEN_BODY) == DONE_WHEN_BODY
+
+
+def test_republishing_an_applied_removal_keeps_the_body_and_its_approval(publishing):
+    """Publish, preread, then approve the same plan: the applied line is gone but the record names it."""
+    case = _edit_case(publishing)
+    tracker = case[2]
+    plan = _edit_plan(**_drop_command())
+    _publish_edit(case, plan)
+    body = tracker.get_issue(40).body
+    _publish_edit(case, plan, approve=True)
+    assert tracker.get_issue(40).body == body and "approved" in tracker.get_issue(40).labels
+    _publish_edit(case, plan)
+    issue = tracker.get_issue(40)
+    assert issue.body == body and "approved" in issue.labels
+    assert len(order.order_done_when.records(body)) == 1
+
+
+@pytest.mark.parametrize("route", ["publish", "dry-run", "preread"])
+def test_a_new_order_cannot_reuse_a_removal_another_order_recorded(publishing, route):
+    """History authorizes nothing: the line is absent from the current Done when, so it is refused."""
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    before = tracker.get_issue(40).body
+    plan = _edit_plan("another-order", **_drop_command())
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        if route == "preread":
+            order.preread(plan, root, config, lambda: tracker, repo="owner/repo")
+        else:
+            _publish_edit(case, plan, dry_run=route == "dry-run")
+    assert "absent from the current Done when" in refused.value.lines[0]
+    assert refused.value.lines[0].endswith("test  -s kept.txt") and "#40" in refused.value.lines[0]
+    assert tracker.get_issue(40).body == before
+
+
+def test_a_later_order_records_its_own_removal_of_a_line_put_back(publishing):
+    """The same line and reason from another order is a new removal, so its record is not merged away."""
+    case = _edit_case(publishing)
+    tracker = case[2]
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    restored = "keep-lines-back"
+    _publish_edit(case, _edit_plan(restored))
+    _publish_edit(case, _edit_plan("keep-lines-again", **_drop_command()))
+    assert [entry["order"] for entry in order.order_done_when.records(tracker.get_issue(40).body)] == [
+        "keep-lines", "keep-lines-again"]
+
+
+def test_a_recorded_line_with_a_different_reason_is_still_absent(publishing):
+    case = _edit_case(publishing)
+    _publish_edit(case, _edit_plan(**_drop_command()))
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        _publish_edit(case, _edit_plan(**_drop_command("Another story.")))
+    assert "#40" in refused.value.lines[0] and "test  -s kept.txt" in refused.value.lines[0]
+
+
+@pytest.mark.parametrize("fields,line", [
+    ({"done_when_removals": [{"line": "true", "reason": "Not actually gone."}]}, "true"),
+    ({"done_when": ["true", "test  -s kept.txt", "test -s new"],
+      "done_when_removals": [{"line": "test -s new", "reason": "Added by this very edit."}]}, "test -s new"),
+])
+def test_declaring_a_line_the_edit_keeps_is_refused(publishing, fields, line):
+    """A record must never claim a removal that did not happen."""
+    case = _edit_case(publishing)
+    before = case[2].get_issue(40).body
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        _publish_edit(case, _edit_plan(**fields))
+    assert refused.value.lines[0].endswith(line) and "still keeps" in refused.value.lines[0]
+    assert case[2].get_issue(40).body == before
+
+
+def test_moving_a_command_to_the_checklist_needs_a_reason(publishing):
+    case = _edit_case(publishing)
+    moved = {"done_when": ["true"], "checklist": ["Stay checked.", "Stay open.", "test  -s kept.txt"]}
+    with pytest.raises(order.DoneWhenRemovalError, match="test  -s kept.txt"):
+        _publish_edit(case, _edit_plan(**moved))
+    _publish_edit(case, _edit_plan(**moved, done_when_removals=[{"line": "test  -s kept.txt", "reason": "Manual now."}]))
+    assert parse_body(case[2].get_issue(40).body).done_when_commands == ["true"]
+
+
+def test_every_issue_and_line_is_reported_at_once_in_the_configured_language(publishing):
+    root, config, tracker, git = _edit_case(publishing)
+    tracker.add_issue(41, "Other", DONE_WHEN_BODY, labels=["lane:api", "size:m"])
+    plan = _edit_plan(done_when=["true"], checklist=[])
+    plan["edits"].append({**plan["edits"][0], "number": 41})
+    with pytest.raises(order.DoneWhenRemovalError) as refused:
+        order.publish(plan, root, replace(config, language="ko"), tracker, repo="owner/repo", git=git, dry_run=True)
+    lines = refused.value.lines
+    assert [line.split(":")[0] for line in lines[:-1]] == ["#40"] * 3 + ["#41"] * 3
+    assert lines[0].endswith("test  -s kept.txt") and "이유 없이" in lines[0]
+
+
+def test_a_line_added_after_the_first_check_is_refused_under_the_publication_lock(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    update_base = git.update_base
+
+    def someone_adds_a_line(branch):
+        update_base(branch)
+        tracker.update_issue(40, title="Keep lines", body=DONE_WHEN_BODY + "- [ ] Added meanwhile.\n")
+
+    git.update_base = someone_adds_a_line
+    with pytest.raises(order.DoneWhenRemovalError, match="Added meanwhile."):
+        _publish_edit(case, _edit_plan())
+    assert ("push", "main") not in publishing[4]
+
+
+def test_a_deferred_order_is_refused_before_it_is_retained_and_a_landed_batch_is_not_rechecked(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    plan = _edit_plan(done_when=["true"])
+    with pytest.raises(order.DoneWhenRemovalError):
+        _publish_edit(case, plan, defer="merge-group")
+    from foragent import order_submissions
+    assert order_submissions.pending(StateStore.for_repo("owner/repo")) == []
+    # A batch whose commit landed resumes only its issue effects; its checks already passed.
+    publication = order._publication_checks(plan, root, config, tracker, repo="owner/repo", git=git, landed=True)
+    assert publication.edit_numbers == {40}
+
+
+@pytest.mark.parametrize("value,message", [
+    ("line", "must be an array"),
+    (["line"], "exactly line and reason"),
+    ([{"line": "true"}], "exactly line and reason"),
+    ([{"line": "true", "reason": 1}], "must be strings"),
+    ([{"line": "true", "reason": "a"}, {"line": "true", "reason": "b"}], "names a line twice"),
+])
+def test_removal_declarations_have_one_shape(publishing, value, message):
+    case = _edit_case(publishing)
+    with pytest.raises(order.PlanError, match=message):
+        _publish_edit(case, _edit_plan(done_when_removals=value), dry_run=True)
+
+
+def test_new_issues_do_not_take_removal_declarations(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    plan["issues"][0]["done_when_removals"] = []
+    with pytest.raises(order.PlanError, match="done_when_removals"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git, dry_run=True)
+
+
+def test_preread_prompt_gains_the_removals_only_when_declared(publishing):
+    root, config, tracker, _ = _edit_case(publishing)
+    plain = _edit_plan()
+    item = order.edit_view(plain["edits"][0], tracker.get_issue(40), config)
+    assert "Removed from Done when" not in order.preread_prompt(plain, item, root)
+    plan = _edit_plan(**_drop_command("Covered.\nElsewhere."))
+    item = order.edit_view(plan["edits"][0], tracker.get_issue(40), config)
+    assert "- test  -s kept.txt\n  Reason: Covered. Elsewhere.\n" in order.preread_prompt(plan, item, root)
+
+
+def test_a_republished_child_keeps_the_removal_record_written_on_it(publishing, plan):
+    root, config, tracker, git, _ = publishing
+    for item in plan["issues"]:
+        item["out_of_scope"] = "Nothing."
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    report_number = next(issue.number for issue in tracker.list_issues() if issue.title == plan["issues"][0]["title"])
+    child = tracker.get_issue(report_number)
+    marked = order.order_done_when.with_record(child.body, child.body, [{"line": "old", "reason": "Why."}], "earlier")
+    tracker.update_issue(report_number, title=child.title, body=marked)
+    order.order_observed.save(root, plan["id"], {str(report_number): order.order_observed.fields(tracker.get_issue(report_number))}, "en")
+    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert order.order_done_when.records(tracker.get_issue(report_number).body) == [
+        {"line": "old", "order": "earlier", "reason": "Why."}]
+
+
+def test_seed_carries_the_sections_an_edit_would_otherwise_lose(publishing):
+    case = _edit_case(publishing)
+    root, config, tracker, git = case
+    edit = _edit_plan(goal="Keep it.\n\n## Waiting\nReason: a release.", exclusive=["src/x.py"], files=["src/**"],
+                      statements=["It keeps going.", "It stays."])["edits"][0]
+    body = order.issue_body(edit, "owner/repo", "main").replace("\n", "\r\n")
+    seeded = order.order_done_when.seed(SimpleNamespace(number=40, body=body))
+    assert {key: seeded[key] for key in ("goal", "exclusive", "files", "statements", "done_when", "checklist")} == {
+        key: edit[key] for key in ("goal", "exclusive", "files", "statements", "done_when", "checklist")}
+    plain = order.order_done_when.seed(tracker.get_issue(40))
+    assert set(plain) == {"number", "goal", "out_of_scope", "files", "done_when", "checklist"}
+    assert plain["checklist"] == ["Stay checked.", "Stay open."]
+
+
+def test_preread_proposal_reaches_the_implementer_of_an_edit_with_a_removal_record(publishing, plan, monkeypatch):
+    root, config = publishing[0], publishing[1]
+    monkeypatch.setattr(order, "executor_for", lambda name: _Proposing())
+    order.preread(plan, root, config, repo=REPO)
+    body = _child_body(plan, plan["issues"][0], config)
+    head, marker = body.split("<!-- foragent:plan-child", 1)
+    recorded = order.order_done_when.with_record(head.removesuffix("\n"), None, [{"line": "old", "reason": "Why."}])
+    assert _handover(root, 7, recorded + "\n<!-- foragent:plan-child" + marker, API_FILES) == _handover(root, 7, body, API_FILES)
+    assert _handover(root, 7, body, API_FILES) is not None
+
+
+@pytest.mark.parametrize("executor", ["codex", "claude"])
+def test_preread_reader_gets_current_memory_while_only_lane_instructions_move_the_key(
+    publishing, plan, tmp_path, executor,
+):
+    repo = tmp_path / "repo"
+    agent = repo / ".claude/agents/fa-api.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules.\n")
+    memory = repo / ".claude/agent-memory/fa-api"
+    memory.mkdir(parents=True)
+    skill = repo / ".claude/skills/polish/SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: polish\ndescription: Polish text\n---\nBody\n")
+    config = replace(publishing[1], executor=executor,
+                     lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["polish"]}})
+    item = plan["issues"][0]
+
+    def target():
+        return order.preread_target(plan, item, config, repo)
+
+    (memory / "MEMORY.md").write_text("Curated before.\n")
+    _, prompt, digest = target()
+    assert "Curated before." in prompt
+    (memory / "MEMORY.md").write_text("Curated after.\n")
+    (memory / "MEMORY.new.md").write_text("- [id:after] Pending after.\n")
+    _, prompt, same = target()
+    assert "Curated after." in prompt and "Pending after." in prompt and "Curated before." not in prompt
+    assert same == digest
+
+    skill.write_text("---\nname: polish\ndescription: Polish every text\n---\nBody\n")
+    skilled = target()[2]
+    assert skilled != digest
+    agent.write_text("---\nname: fa-api\n---\nAPI lane rules changed.\n")
+    assert target()[2] not in (digest, skilled)
+
+
+
+def _git_commit(repo, files, message, date, parents=None):
+    """Write ``files`` and commit them at ``date`` with ``parents`` (default: HEAD); returns the commit."""
+    import os
+    import subprocess
+
+    for name, content in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_AUTHOR_DATE": date,
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com", "GIT_COMMITTER_DATE": date}
+    run = lambda *args: subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,  # noqa: E731
+                                       text=True, env=env).stdout.strip()
+    run("add", "-A")
+    if parents is None:
+        parents = [p for p in [subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=repo,
+                                              capture_output=True, text=True).stdout.strip()] if p]
+    commit = run("commit-tree", run("write-tree"), *[arg for p in parents for arg in ("-p", p)], "-m", message)
+    run("update-ref", "HEAD", commit)
+    return commit
+
+
+def _start_and_merge(store, number, body, blobs, repo, base, head, *, start=True,
+                     approved_at="2026-11-01T10:30:00+00:00"):
+    """Approve ``body``, start its run (where the estimate is fixed) and record the merge."""
+    from types import SimpleNamespace
+
+    from foragent.issue import body_hash
+
+    store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs=blobs,
+                        approved_by="human", approved_at=approved_at)
+    if start:
+        store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    return lambda: size_signal.record(number, SimpleNamespace(store=store), GitRepo(repo),
+                                      store.load_approval(number), base, head, 12, pytest.fail)
+
+
+def _merge_repo(tmp_path, name, history):
+    """A real repository: an approved base, the run's commit and, for some histories, a refreshed head."""
+    import subprocess
+
+    repo = tmp_path / "merge-repo"
+    repo.mkdir()
+    git = lambda *args: subprocess.run(["git", *args], cwd=repo, check=True)  # noqa: E731
+    git("init", "-q", "-b", "main")
+    approved = _git_commit(repo, {**API_FILES, name: "approved handoff\n"}, "approved", "2026-11-01T10:00:00Z")
+    base = approved
+    if history == "side-branch-from-before-approval-merged-later":
+        side = _git_commit(repo, {name: "side branch handoff\n"}, "side", "2026-11-01T10:15:00Z",
+                           parents=[approved])
+        base = _git_commit(repo, {}, "merge side", "2026-11-01T12:00:00Z", parents=[approved, side])
+    git("update-ref", "refs/remotes/origin/main", base)
+    head = _git_commit(repo, {name: "updated by the run\n", "src/login.py": "A = 1\nB = 2\n"}, "run",
+                       "2026-11-01T11:00:00Z", parents=[approved])
+    if base != approved:  # The refresh merges the newer main; the run keeps its own handoff.
+        head = _git_commit(repo, {}, "refresh", "2026-11-01T13:00:00Z", parents=[head, base])
+    return repo, base, head
+
+
+WRITE_MARK = "<!-- foragent:write id=" + "a" * 32 + " -->"
+WAITING_MARK = "<!-- foragent:waiting-prior sha256=" + "b" * 64 + " id=" + "c" * 32 + " -->"
+
+
+@pytest.mark.parametrize("approved_reply, later, history, approval_change, expected", [
+    ("SIZE: source=2 tests=0 files=2", "reread-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "reread-other-estimate-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "publication-after-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "reread-same-estimate-before-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", "same-inputs-reread-new-estimate-before-start", "run", None, (9, 9, 9)),
+    ("SIZE: source=2 tests=0 files=2", None, "approved-by-label-later", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "side-branch-from-before-approval-merged-later", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "write-marker", (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "waiting-prior-marker", (2, 0, 2)),
+    ("", None, "run", None, None),
+    ("SIZE: source=2 tests=0 files=2", "reread-other-estimate-before-start", "run", None, (2, 0, 2)),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "acceptance-snapshot", None),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "body", None),
+    ("SIZE: source=2 tests=0 files=2", None, "run", "no-run-start", None),
+], ids=["reread-after-start", "reread-other-estimate-after-start", "publication-after-start",
+        "reread-same-estimate-before-start", "same-inputs-reread-new-estimate", "approved-by-label-later", "side-branch-merged-later",
+        "write-marker", "waiting-prior-marker", "approved-without-estimate",
+        "unpublished-reread-before-start", "approval-snapshot-differs", "approved-body-differs", "no-run-start"])
+def test_merge_record_keeps_the_estimate_the_approval_stood_on(
+        publishing, plan, tmp_path, monkeypatch, approved_reply, later, history, approval_change, expected):
+    """The run fixes its own estimate once at start from the preread the approved body was published
+    with. An unpublished reread, rereads and publications after the start, history merged from a side
+    branch, the run's edits and gate markers never change or drop it; no start reads unknown (#1696)."""
+    root, config, tracker, item = publishing[0], publishing[1], publishing[2], plan["issues"][0]
+    name = "docs/design/a/HANDOFF.md"
+    plan["reference_files"] = {name: "approved handoff\n"}
+    item["references"] = [name]
+    plan["summary"] = "s"  # _proposals prereads the plan with this summary
+    _proposals(root, config, plan, [("s", f"APPROACH: Update the handoff.\n{approved_reply}")])
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    publish(publishing, plan, approve=history != "approved-by-label-later")
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+
+    def reread(reply):  # same body, changed references
+        _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
+
+    if later == "reread-same-estimate-before-start":
+        reread("SIZE: source=2 tests=0 files=2")
+    elif later == "reread-other-estimate-before-start":
+        reread("SIZE: source=9 tests=9 files=9")
+    elif later == "same-inputs-reread-new-estimate-before-start":  # a clean reread of the very same plan, approved
+        _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
+        publish(publishing, plan, approve=True)
+    repo, base, head = _merge_repo(tmp_path, name, history)
+    body = child.body
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    if approval_change == "body":
+        body = _child_body(plan, {**item, "goal": item["goal"] + " Also more."}, config)
+    elif approval_change == "acceptance-snapshot":
+        blobs = {FILE: order._blob(b"assert 1 == 1\n")}
+    elif approval_change in {"write-marker", "waiting-prior-marker"}:
+        body = body.rstrip("\n") + "\n" + (WRITE_MARK if approval_change == "write-marker" else WAITING_MARK) + "\n"
+    store = order._workload_store(root, REPO)
+    merge = _start_and_merge(store, child.number, body, blobs, repo, base, head,
+                             start=approval_change != "no-run-start")
+    if later == "reread-after-start":
+        reread("")
+    elif later == "reread-other-estimate-after-start":
+        reread("SIZE: source=9 tests=9 files=9")
+    elif later == "publication-after-start":
+        reread("SIZE: source=9 tests=9 files=9")
+        publish(publishing, changed, approve=True)
+    merge()
+    report = size_signal.report(store.root)
+    record, = report["records"]
+    assert (record["issue"], record["pr"]) == (child.number, 12)
+    # Measured from the merge base: the base's own change is not the run's size.
+    assert record["actual_size"] == {"source_lines": 2, "test_lines": 0, "file_count": 2}
+    assert record["expected_size"] == (None if expected is None else dict(zip(size_signal.COUNTS, expected)))
+    assert (report["compared"], report["unknown"]) == ((1, 0) if expected else (0, 1))
+
+
+def test_merge_record_keeps_an_edited_issue_estimate_through_its_write_marker(publishing, plan, tmp_path, monkeypatch):
+    """An edit is published with a foragent:write marker; its estimate is still fixed at run start (#1696)."""
+    root, config, tracker = publishing[0], publishing[1], publishing[2]
+    tracker.add_issue(3, "Keep this title", "old", ["size:s", "lane:api"])
+    plan["issues"] = []
+    plan["edits"] = [{"number": 3, "goal": "New goal", "out_of_scope": "Payments.", "done_when": ["true"],
+                      "checklist": [], "acceptance_files": {}}]
+    worker = _Proposing()
+    worker.reply = "APPROACH: Edit it.\nSIZE: source=2 tests=0 files=2"
+    monkeypatch.setattr(order, "executor_for", lambda name: worker)
+    order.preread(plan, root, config, lambda: tracker, repo=REPO)
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    publish(publishing, plan, approve_numbers=[3])
+    body = tracker.get_issue(3).body
+    assert "foragent:write" in body
+    repo, base, head = _merge_repo(tmp_path, "docs/design/a/HANDOFF.md", "run")
+    store = order._workload_store(root, REPO)
+    _start_and_merge(store, 3, body, {}, repo, base, head)()
+    record, = size_signal.report(store.root)["records"]
+    assert record["expected_size"] == {"source_lines": 2, "test_lines": 0, "file_count": 2}
+
+
+def _published_with_estimate(publishing, plan, monkeypatch, reply="SIZE: source=2 tests=0 files=2"):
+    root, config, tracker, item = publishing[0], publishing[1], publishing[2], plan["issues"][0]
+    name = "docs/design/a/HANDOFF.md"
+    plan["reference_files"] = {name: "approved handoff\n"}
+    item["references"] = [name]
+    plan["summary"] = "s"  # _proposals prereads the plan with this summary
+    _proposals(root, config, plan, [("s", f"APPROACH: Update the handoff.\n{reply}")])
+    monkeypatch.setattr(order, "require_clean_preread", REQUIRE_CLEAN_PREREAD)
+    return root, config, tracker, item, name
+
+
+def _approve(store, number, body, blobs, approved_at):
+    from foragent.issue import body_hash
+
+    store.save_approval(number, body=body, body_sha=body_hash(body), acceptance_blobs=blobs,
+                        approved_by="human", approved_at=approved_at)
+
+
+def _merged(store, number, repo, base, head):
+    from types import SimpleNamespace
+
+    size_signal.record(number, SimpleNamespace(store=store), GitRepo(repo), store.load_approval(number),
+                       base, head, 12, pytest.fail)
+    return size_signal.report(store.root)["records"][-1]["expected_size"]
+
+
+def _reread_and_republish(publishing, plan, name, reply):
+    """Republish the same body with changed references after a preread answering ``reply``."""
+    root, config = publishing[0], publishing[1]
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    _proposals(root, config, changed, [("s", f"APPROACH: Changed handoff.\n{reply}")])
+    publish(publishing, changed)
+
+
+def _first_run(publishing, plan, tmp_path, monkeypatch):
+    """A published, approved issue whose run started with the estimate 2/0/2."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    publish(publishing, plan, approve=True)
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    store = order._workload_store(root, REPO)
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    _approve(store, child.number, child.body, blobs, "2026-11-01T10:30:00+00:00")
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    repo, base, head = _merge_repo(tmp_path, name, "run")
+    return store, tracker, child, name, blobs, (repo, base, head)
+
+
+TWO, NINE = dict(zip(size_signal.COUNTS, (2, 0, 2))), dict(zip(size_signal.COUNTS, (9, 9, 9)))
+
+
+def test_reapproving_the_same_body_fixes_the_new_estimate_at_its_run_start(publishing, plan, tmp_path, monkeypatch):
+    """A reapproval during a run changes nothing; the next run fixes its own record from the latest
+    publication, which a reread of changed references (9) was published with (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    _reread_and_republish(publishing, plan, name, "SIZE: source=9 tests=9 files=9")
+    body = tracker.get_issue(child.number).body
+    assert size_signal.body_key(body) == size_signal.body_key(child.body), "same authored body"
+    _approve(store, child.number, body, blobs, "2026-11-01T14:00:00+00:00")  # reapproved while running
+    assert _merged(store, child.number, *merge) == TWO
+    store.finish_run(child.number, "merged")
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *merge) == NINE
+
+
+def test_republishing_without_a_matching_preread_reads_unknown_not_the_old_estimate(
+        publishing, plan, tmp_path, monkeypatch):
+    """A publication of changed references that no preread read leaves its body's estimate unknown (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    publish(publishing, plan)
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    publish(publishing, changed)  # no reread of the changed references
+    store = order._workload_store(root, REPO)
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    _approve(store, child.number, tracker.get_issue(child.number).body, blobs, "2026-11-01T14:00:00+00:00")  # by label
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *_merge_repo(tmp_path, name, "run")) is None
+
+
+def test_a_restarted_run_keeps_the_estimate_fixed_at_its_first_start(publishing, plan, tmp_path, monkeypatch):
+    """A crash or stall restart continues the same run, so it carries that run's own record (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    _reread_and_republish(publishing, plan, name, "SIZE: source=9 tests=9 files=9")
+    store.finish_run(child.number, "crashed")
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *merge) == TWO
+
+
+def test_a_restart_of_a_run_without_a_record_stays_unknown(publishing, plan, tmp_path, monkeypatch):
+    """A restart never captures later data: the resumed run had no record, so neither does this one (#1696)."""
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(size_signal, "_approved_estimate", fail)
+        store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    assert list((store.root / size_signal.FROZEN).glob("*.json")) == []
+    store.finish_run(child.number, "stalled-restart")
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *merge) is None
+
+
+def test_a_new_run_whose_record_failed_never_reads_the_previous_run(publishing, plan, tmp_path, monkeypatch):
+    """A failed record leaves the new run unknown; the previous run's record is not its estimate (#1696)."""
+    store, tracker, child, name, blobs, merge = _first_run(publishing, plan, tmp_path, monkeypatch)
+    assert _merged(store, child.number, *merge) == TWO
+    store.finish_run(child.number, "merged")
+    monkeypatch.setattr(size_signal, "_approved_estimate", lambda *args: (_ for _ in ()).throw(OSError("full")))
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *merge) is None
+
+
+def test_a_gate_starting_the_run_at_approval_already_has_the_estimate(publishing, plan, tmp_path, monkeypatch):
+    """The gate may start a run the moment the approved label lands; the estimate already exists (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    store = order._workload_store(root, REPO)
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    label = tracker.add_labels
+    started = []
+
+    def approve_and_start(number, labels):
+        label(number, labels)
+        if "approved" in labels and not started:  # a gate awakened right now starts the run
+            _approve(store, number, tracker.get_issue(number).body, blobs, "2026-11-01T10:30:00+00:00")
+            store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+            started.append(number)
+
+    monkeypatch.setattr(tracker, "add_labels", approve_and_start)
+    publish(publishing, plan, approve_keys=[item["key"]])
+    number, = started
+    assert _merged(store, number, *_merge_repo(tmp_path, name, "run")) == TWO
+
+
+def test_run_start_reads_the_preread_the_approved_body_was_published_with(tmp_path):
+    """The latest publication fact of the approved body names the exact preread record; only its note counts (#1696)."""
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(root=tmp_path / "store")
+    body = "## Goal\nShip it.\n"
+    approval = SimpleNamespace(body=body, body_sha="x", approved_at="t", acceptance_blobs={FILE: "a"})
+
+    def published(digest, record):
+        size_signal._append(store.root, size_signal.PUBLISHED, {
+            "issue": 5, "phase": "published", "body": size_signal.body_key(body), "digest": digest, "record": record})
+
+    def noted(digest, record, size, files=None):
+        size_signal.note(store, {"id": record, "key": "#5", "files": files or {FILE: "a"},
+                                 "size": dict(zip(size_signal.COUNTS, size))}, digest)
+
+    assert size_signal._approved_estimate(store, 5, approval) is None, "no publication fact"
+    noted("d1", "r2", (2, 0, 2))
+    noted("d2", "r7", (7, 7, 7))
+    published("d1", "r2")
+    assert size_signal._approved_estimate(store, 5, approval) == TWO, "the published preread, not the other one"
+    noted("d1", "r9", (9, 9, 9))  # an overlapping reread whose record publication did not see
+    assert size_signal._approved_estimate(store, 5, approval) == TWO, "only the record publication saw"
+    published("d1", "r9")
+    assert size_signal._approved_estimate(store, 5, approval) == NINE, "a republication of the newer record"
+    published("d1", "missing")
+    assert size_signal._approved_estimate(store, 5, approval) is None, "a record with no note reads unknown"
+    published(None, None)
+    assert size_signal._approved_estimate(store, 5, approval) is None, "the latest publication had no preread"
+    published("d1", "r9")
+    approval.acceptance_blobs = {FILE: "b"}
+    assert size_signal._approved_estimate(store, 5, approval) is None, "the snapshot disagrees"
+    approval.acceptance_blobs = {FILE: "a"}
+    size_signal._append(store.root, size_signal.PUBLISHED, {"issue": 5, "phase": "publishing"})
+    assert size_signal._approved_estimate(store, 5, approval) is None, "a republication without a recorded outcome"
+    published("d1", "r9")
+    with (store.root / size_signal.PUBLISHED).open("a", encoding="utf-8") as journal:
+        journal.write('\n{"issue": 5, "phase": "publish')  # a write cut off mid-line
+    assert size_signal._approved_estimate(store, 5, approval) is None, "a damaged later line never lets an older one answer"
+
+
+def test_a_short_write_is_continued_and_a_stalled_one_raises(tmp_path, monkeypatch):
+    """An estimate line is either fully written or reported as failed, never silently cut (#1696)."""
+    real = os.write
+    monkeypatch.setattr(size_signal.os, "write", lambda fd, data: real(fd, bytes(data[:3])))  # three bytes at a time
+    size_signal._append(tmp_path, "j.jsonl", {"digest": "d", "size": TWO})
+    assert size_signal._entries(tmp_path, "j.jsonl") == [{"digest": "d", "size": TWO}]
+    monkeypatch.setattr(size_signal.os, "write", lambda fd, data: 0)
+    with pytest.raises(OSError):
+        size_signal._append(tmp_path, "j.jsonl", {"digest": "e"})
+
+
+def test_a_reread_whose_record_cannot_be_written_leaves_the_approved_estimate(publishing, plan, tmp_path, monkeypatch):
+    """The 9/9/9 note of a reread whose preread record fails is never read: approval stands on 2/0/2 (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as failing:
+        failing.setattr(order, "_record_preread", fail)
+        with pytest.raises(OSError):
+            _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
+    publish(publishing, plan, approve=True)
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    store = order._workload_store(root, REPO)
+    _approve(store, child.number, child.body, {FILE: order._blob(API_FILES[FILE].encode())}, "2026-11-01T10:30:00+00:00")
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *_merge_repo(tmp_path, name, "run")) == TWO
+
+
+def test_a_republication_whose_outcome_was_not_recorded_reads_unknown(publishing, plan, tmp_path, monkeypatch):
+    """If recording an unread-reference republication fails, label approval never freezes the older 2/0/2 (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    publish(publishing, plan)
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    changed = deepcopy(plan)
+    changed["reference_files"][name] = "changed handoff\n"
+    with monkeypatch.context() as failing:
+        failing.setattr(size_signal, "published", lambda *args: None)  # the outcome write fails
+        publish(publishing, changed)
+    store = order._workload_store(root, REPO)
+    blobs = {FILE: order._blob(API_FILES[FILE].encode())}
+    _approve(store, child.number, tracker.get_issue(child.number).body, blobs, "2026-11-01T14:00:00+00:00")  # by label
+    store.start_run(child.number, branch="b", worktree=store.worktree_path(child.number))
+    assert _merged(store, child.number, *_merge_repo(tmp_path, name, "run")) is None
+
+
+def test_a_publication_that_cannot_mark_itself_writes_nothing(publishing, plan, monkeypatch):
+    """The republication mark comes before any issue write; if it fails, nothing is written (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    publish(publishing, plan)
+    child, = [issue for issue in tracker.list_issues() if issue.title == item["title"]]
+    before = tracker.get_issue(child.number)
+    changed = deepcopy(plan)
+    changed["issues"][0] = {**changed["issues"][0], "goal": item["goal"] + " More."}
+
+    def full(*args, **kwargs):
+        raise OSError("disk full")
+
+    writes = []
+    monkeypatch.setattr(tracker, "update_issue", lambda *a, **k: writes.append(a))
+    monkeypatch.setattr(size_signal, "_append", full)
+    with pytest.raises(order.PlanError, match="disk full"):
+        publish(publishing, changed)
+    assert writes == [] and tracker.get_issue(child.number).body == before.body
+
+
+def test_a_same_input_reread_whose_estimate_cannot_be_kept_records_nothing(publishing, plan, monkeypatch):
+    """If the new 9/9/9 cannot be noted, the reread fails and records nothing: the preread record and the
+    note both still hold the approved 2/0/2, so no superseded value stands in for a newer one (#1696)."""
+    root, config, tracker, item, name = _published_with_estimate(publishing, plan, monkeypatch)
+    records = (root / order.PREREAD_FILE).read_bytes()
+    original = size_signal._append
+
+    def refuse_notes(directory, journal, entry):
+        if journal == size_signal.ESTIMATES:
+            raise OSError("disk full")
+        original(directory, journal, entry)
+
+    monkeypatch.setattr(size_signal, "_append", refuse_notes)
+    with pytest.raises(order.PlanError, match="disk full"):
+        _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
+    assert (root / order.PREREAD_FILE).read_bytes() == records

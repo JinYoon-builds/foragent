@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import fcntl
+import json
 import os
 
 from foragent import order_notes
@@ -15,7 +16,13 @@ def entries(store) -> list[dict]:
 
 
 def append(store, kind: str, batch: str, **values) -> None:
-    order_notes.append_entry(store, {"kind": kind, "batch": batch, **values}, journal=JOURNAL)
+    # Flush owns this file under locked(); planning's logs use their own single-write path.
+    payload = "\n" + json.dumps({"kind": kind, "batch": batch, **values}, ensure_ascii=False) + "\n"
+    store.root.mkdir(parents=True, exist_ok=True)
+    with (store.root / JOURNAL).open("a", encoding="utf-8") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 @contextmanager

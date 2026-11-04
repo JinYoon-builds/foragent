@@ -30,7 +30,7 @@ from foragent import board, capacity, harness_guard, orch_github
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
-from foragent.git import GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
+from foragent.git import ABSENT_BLOB, GitError, GitRepo, PublicationError, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, body_hash, has_machine_check, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, attempt_tier, issue_lane, issue_size
@@ -131,7 +131,7 @@ from foragent.run_conflicts import (
 )
 from foragent.run_implementation import _implement, _prepare_implementation
 from foragent.run_publish import _publish, _push_branch
-from foragent.run_review import _review_implementation
+from foragent.run_review import _review_implementation, passed_head, unchanged_since_pass
 
 
 @dataclass
@@ -148,9 +148,19 @@ class RunContext:
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
     lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
+    merge_owner_started_at: datetime | None = None  # A gate turn has its own work budget, excluding queue time.
+    merge_authorization: dict | None = None  # Explicit orch.merge decision, scoped to this reviewed handoff.
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
+
+
+def _handed_off(n: int, ctx: RunContext) -> bool:
+    if not getattr(ctx.config, "merge_owner", False):
+        return False
+    from foragent.merge_owner import pending
+
+    return pending(ctx.store, n)
 
 
 def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
@@ -196,31 +206,45 @@ def _restore_approved_base(
     n: int, ctx: RunContext, git: GitRepo, approval: Approval, target_branch: str,
     *, branch: str,
 ) -> bool:
-    """Distinguish inherited old locks from edits belonging to the saved issue branch."""
+    """Bring the saved branch onto the approved base, then require the approved locked bytes.
+
+    After the base merge, a locked file that still differs from approval (or conflicts) can
+    only be the branch's own edit, so no history needs tracing: a WIP commit that saved an
+    earlier base merge as an ordinary commit merges cleanly and takes the approved bytes.
+    """
     locks = approval.acceptance_blobs
     if git.blob_shas("HEAD", locks) == locks:
         return True
     base = f"origin/{ctx.config.base_branch}"
-    own_edits = git._call([
-        "rev-list", "HEAD", f"^origin/{target_branch}", f"^{base}", "--", *locks,
-    ]).strip()
-    if own_edits:
-        return _acceptance_matches(n, ctx, git, approval)
     if git.is_ancestor("HEAD", base):
         # No own commits: recreate at the approved base without a merge commit.
         ctx.git.remove_worktree(git.root)
         ctx.git.add_worktree(git.root, branch, base)
-    else:
-        try:
-            git.merge_base(base)
-        except GitError:
-            conflicts = git.conflict_paths()
-            if not conflicts:
-                raise
-            # Resume's resolver can finish this merge, including a stale batch's base update.
-            pending = ctx.store.get_run(n).merge_conflicts
-            ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+        return True
+    try:
+        git.merge_base(base)
+    except GitError:
+        conflicts = git.conflict_paths()
+        if not conflicts:
+            raise
+        if _staged_blobs(git, locks) != locks:
+            return _acceptance_matches(n, ctx, git, approval)  # A conflicted or edited lock stops the retry.
+        # Resume's resolver can finish this merge, including a stale batch's base update.
+        pending = ctx.store.get_run(n).merge_conflicts
+        ctx.store.update_run(n, merge_conflicts=sorted(set(pending) | set(conflicts)))
+    # A clean merge leaves only the branch's own lock edits; the check before implementation rejects them.
     return True
+
+
+def _staged_blobs(git: GitRepo, paths: dict[str, str]) -> dict[str, str | None]:
+    """Index blob of each path: ABSENT_BLOB when missing, None while it is still conflicted."""
+    staged: dict[str, str | None] = {path: ABSENT_BLOB for path in paths}
+    output = git._call(["--literal-pathspecs", "ls-files", "-s", "-z", "--", *paths])
+    for entry in filter(None, output.split("\0")):
+        meta, path = entry.split("\t", 1)
+        _mode, sha, stage = meta.split()
+        staged[path] = sha if stage == "0" else None
+    return staged
 
 
 def _implement_and_publish(
@@ -235,19 +259,29 @@ def _implement_and_publish(
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 raise ExecutorStopped("hash-mismatch")
             attempt.approved_ref = git.head_sha()
+            # A resumed head that already passed review returns to its checks and publication.
+            reviewed = not resume_verified and not failure and passed_head(n, ctx, git)
+            passed = git.head_sha() if reviewed else None
             while True:
+                reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
                     attempt.failure = ""
                     resume_verified = False
                 else:
-                    _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    if not reuse:
+                        _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
                     try:
                         attempt.failure = _verify_implementation(attempt)
                     except PatchReplayError as exc:
                         attempt.failure = _recover_replay(attempt, exc)
                 attempt.reviewer_text = None
                 run = ctx.store.get_run(n)
-                if not attempt.failure and ctx.config.reviewer != "none":
+                if reuse and not attempt.failure and not unchanged_since_pass(git, passed):
+                    _append(attempt.log, f"Checks changed head {passed} after its PASS: reviewing the new contents")
+                    reuse = False
+                if reuse and not attempt.failure:
+                    _append(attempt.log, f"Head {passed} already passed review: resuming its publication")
+                elif not attempt.failure and ctx.config.reviewer != "none":
                     if _remaining(n, ctx) <= 0:
                         outcome = _timeout(n, ctx)
                         return outcome
@@ -300,13 +334,13 @@ def _implement_and_publish(
         raise
     except TrackerError as exc:
         attempt.tracker_available = False
-        outcome = "limit-wait" if exc.is_rate_limit else "error"
+        outcome = "limit-wait" if exc.waits else "error"
         raise
     except (SystemExit, KeyboardInterrupt):
         outcome = "killed"
         raise
     finally:
-        if outcome != "merged":
+        if outcome not in {"merged", "merge-queued"} and not _handed_off(n, ctx):
             run = ctx.store.get_run(n)
             _cleanup_after(n, ctx, outcome, "WIP preservation", lambda: _preserve_failed_implementation(
                 n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
@@ -338,6 +372,7 @@ def review_only(
     detail = ""
     previous = ctx.store.get_run(n)
     started = False
+    admission = ExitStack()
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -347,6 +382,10 @@ def review_only(
             started = True
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
+        # The shared machine budget admits this review before any label or run-record change; a
+        # start the tick reserved reuses its slot. Once the run records this pid, the run holds it.
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind="review", issue=n, now=ctx.now))
         issue = ctx.tracker.get_issue(n)
         if issue.state != "open" or issue.is_pull_request:
             raise ValueError(f"#{n} must be an open issue")
@@ -355,6 +394,7 @@ def review_only(
         ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree, pid=os.getpid(),
                             lane=issue_lane(issue.labels, ctx.config.lanes))
         started = True
+        admission.close()
         ctx.tracker.add_labels(n, [RUNNING])
         ctx.tracker.remove_labels(n, [BLOCKED, NEEDS_HUMAN, READY])
         ctx.git.remove_worktree(worktree)
@@ -375,21 +415,22 @@ def review_only(
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
         if not started:
-            if not isinstance(exc, TrackerError) or not exc.is_rate_limit:
+            if not isinstance(exc, TrackerError) or not exc.waits:
                 raise
             ctx.store.start_run(n, branch=f"foragent/issue-{n}", worktree=worktree,
                                 lane=previous.lane if previous is not None else "main")
             started = True
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
-        else:
+            outcome, detail = "limit-wait", orch_github.cause(exc)
+        elif not _handed_off(n, ctx):
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Review runner exited: {exc}"
         raise
     finally:
+        admission.close()
         if started:
             try:
                 _cleanup_after(n, ctx, outcome, "Worktree removal", lambda: ctx.git.remove_worktree(worktree))
@@ -398,14 +439,14 @@ def review_only(
                     # A rate-limit wait is discoverable locally; defer label repair.
                     if outcome != "limit-wait":
                         current = ctx.tracker.current_issue(n)
-                        if current.state == "open" and not current.labels & {BLOCKED, READY}:
+                        if (not _handed_off(n, ctx) and outcome != "remote-ended" and current.state == "open"
+                                and not current.labels & {BLOCKED, READY}):
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
                 except TrackerError as exc:
                     if not wait_for_rate_limit(n, ctx, exc):
                         raise
-                    detail = str(exc) or type(exc).__name__
-                    outcome = "limit-wait"
+                    detail, outcome = orch_github.cause(exc), "limit-wait"
                 finally:
                     try:
                         ctx.store.finish_run(n, outcome=outcome, detail=detail)
@@ -414,14 +455,46 @@ def review_only(
     return outcome
 
 
+def _admission_seconds(ctx: RunContext) -> int:
+    """A direct start waits for a slot as long as one run may take: the work ahead of it is valid."""
+    return int(ctx.config.max_runtime_minutes) * 60
+
+
 def run_issue(n: int, ctx: RunContext) -> str:
+    """Run issue N once the shared budget admits it, before it claims the run record's pid.
+
+    Admission reads the live slot holders, never the record's status: a record the tick
+    launched this process for (its pid is this one) or a fresh reservation is reused at once;
+    a finished record, or a running one whose pid has died, must fit the budget. Once the
+    run is started (or its running record claims this pid), that record holds the slot
+    and the temporary admission is released.
+    """
+    with ExitStack() as admission:
+        admission.enter_context(capacity.hold_workload(ctx.store, ctx.config, wait_s=_admission_seconds(ctx),
+                                                       kind=capacity.RUN_KIND, issue=n, now=ctx.now))
+        return _run_issue(n, ctx, admission)
+
+
+def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
     outcome = "error"
     detail = ""
     worktree = ctx.store.worktree_path(n)
     log = ctx.store.log_path(n)
     try:
-        run = ctx.store.update_run(n, pid=os.getpid(),
-                                   process_identities=observe_tree(roots=(os.getpid(),)))
+        run = ctx.store.get_run(n)
+        if run is not None and run.status == "finished":
+            # update_run deliberately leaves finished records untouched. A direct retry needs
+            # a new lifecycle, including the running identity the merge queue admits.
+            run = ctx.store.start_run(
+                n, branch=run.branch, worktree=worktree, pid=os.getpid(), lane=run.lane,
+                tier=run.tier, implementer=run.implementer, executor=run.executor,
+                reviewer=run.reviewer, executor_model=run.executor_model,
+            )
+        else:
+            run = ctx.store.update_run(n, pid=os.getpid(),
+                                       process_identities=observe_tree(roots=(os.getpid(),)))
+        if run.status == "running":
+            admission.close()  # The record now names this live process: it holds the slot.
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome
@@ -450,15 +523,16 @@ def run_issue(n: int, ctx: RunContext) -> str:
         detail = str(exc) or type(exc).__name__
         _append(log, traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
-            outcome = "limit-wait"
+            outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
+            if not _handed_off(n, ctx):
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
         stopped = ctx.store.get_run(n)
-        if stopped is None or stopped.outcome != "stalled-restart":
+        if not _handed_off(n, ctx) and (stopped is None or stopped.outcome != "stalled-restart"):
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])

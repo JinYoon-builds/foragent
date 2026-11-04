@@ -12,6 +12,7 @@ from test_base_move_reuse import (  # noqa: E402,F401
     REUSED, REVERIFY, UNOWNED, assert_verifications, locked_test, move_during_publish, publish_case,
     run_to_merge,
 )
+from test_neutral_move_order import neutral_case  # noqa: E402,F401
 from test_skills_autosync import isolated_home  # noqa: E402,F401
 from test_state_split import offline_acceptance  # noqa: E402,F401
 
@@ -114,3 +115,58 @@ def test_reverify_recaptures_with_the_baselines_command_when_detection_would_fai
         "The refreshed baseline must keep the command the protected set was captured with"
     )
 
+
+
+def _move_during_push(case, monkeypatch, files, push_index):
+    """Move main after our fetch, while the given push (0-based) is under way (#1688)."""
+    from foragent.git import GitRepo
+
+    push, pushes, moved = GitRepo.push, [], []
+
+    def moving_push(git, branch, *, lease=None):
+        if len(pushes) == push_index and not moved:
+            case.history.update(files)
+            moved.append(case.history.tip)
+        pushes.append(branch)
+        return push(git, branch, lease=lease)
+
+    monkeypatch.setattr(GitRepo, "push", moving_push)
+    return moved
+
+
+def test_neutral_move_during_first_push_reads_ci_on_the_base_it_measured(neutral_case, monkeypatch):
+    from foragent import runner
+
+    case = neutral_case
+    moved = _move_during_push(case, monkeypatch, {"docs/raced.md": "Raced\n"}, 0)
+    assert runner.run_issue(1, case.ctx) == "merged", case.store.log_path(1).read_text()
+    assert moved and case.publications == [case.original_head]
+    assert case.reports[case.original_head][0]["report"]["base_sha"] == moved[0]
+    assert case.sleeps == [], "Passed CI on the later main needs no wait"
+    assert case.landed[0][:2] == (moved[0], case.original_head)
+
+
+
+@pytest.mark.parametrize("files, refreshed", [
+    pytest.param({"src/widget.py": "VALUE = 1\n"}, True, id="source"),
+    pytest.param({"docs/raced.md": "Raced\n"}, False, id="neutral"),
+])
+def test_ci_failure_on_a_base_moved_during_push(neutral_case, monkeypatch, files, refreshed):
+    """A failure measured on an unverified source move refreshes; one on a neutral move fails (#1688)."""
+    from dataclasses import replace
+    from foragent import runner
+
+    case = neutral_case
+    case.ctx.config = replace(case.ctx.config, max_retries=0)
+    case.status = lambda head: "fail" if head == case.original_head else "pass"
+    moved = _move_during_push(case, monkeypatch, files, 0)
+    outcome = runner.run_issue(1, case.ctx)
+    assert moved and case.reports[case.original_head][0]["report"]["base_sha"] == moved[0]
+    if refreshed:
+        assert outcome == "merged", case.store.log_path(1).read_text()
+        assert len(case.publications) == 2
+        assert len(case.checked.read_text().splitlines()) == 2, "Re-verify the source move once"
+        assert case.landed[0][:2] == (moved[0], case.publications[-1])
+    else:
+        assert outcome != "merged" and case.publications == [case.original_head]
+        assert case.landed == []

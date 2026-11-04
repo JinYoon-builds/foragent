@@ -14,7 +14,7 @@ from foragent import run_checks, runner, scheduler, scheduler_recovery
 from foragent.issue import body_hash
 from test_base_move_reuse import (  # noqa: F401
     MERGED, PENDING, SHARED_DOC, SHARED_SOURCE, UNOWNED,
-    locked_test, publish_case,
+    locked_test, publish_case, squash_main,
 )
 from test_orch_review_handoff import tick_context
 from test_skills_autosync import isolated_home  # noqa: F401
@@ -117,8 +117,7 @@ def short_case(publish_case, monkeypatch):
               **({"expected_base_sha": expected_base_sha} if expected_base_sha is not None else {}))
         # FakeTracker records GitHub metadata; also advance the real offline
         # origin so the other runner must actually refresh its base.
-        git_command(case.history.origin, "update-ref", "refs/heads/main", expected_head_sha)
-        case.history.tip = expected_head_sha
+        squash_main(case.history, expected_head_sha)
         case.merges.append(event("merge", pr=pr, head=expected_head_sha))
 
     case.advance = advance
@@ -234,7 +233,7 @@ def assert_merge_facts(case, number=1):
     assert 0 < held <= elapsed
 
 
-def test_pending_ci_allows_another_ready_run_to_merge_first(short_case, monkeypatch):
+def test_pending_ci_allows_another_ready_run_to_merge_first(short_case, monkeypatch, fake_process_table):
     case = short_case
     # Use tick_context's fake launcher to start a ready run in another lane;
     # invoke its fake-executor runner cooperatively during A's fake CI sleep.
@@ -263,10 +262,17 @@ def test_pending_ci_allows_another_ready_run_to_merge_first(short_case, monkeypa
     )
     launched = []
 
+    def launch(number):
+        pid = 7000 + number
+        fake_process_table.add(pid, cwd=case.store.worktree_path(number), start_time=case.clock[0].timestamp())
+        return pid
+
     def run_b():
         if launched:
             return
-        report = scheduler.tick(tick_context(case, baseline_launcher=lambda ctx, build, lock: lock.close()))
+        context = tick_context(case, baseline_launcher=lambda ctx, build, lock: lock.close())
+        context.launcher = launch
+        report = scheduler.tick(context)
         assert report.skipped is None
         assert case.store.get_run(4) is not None, report.actions
         launched.append(run(case, 4))

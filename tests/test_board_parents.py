@@ -1,5 +1,4 @@
 import json
-import re
 
 import pytest
 
@@ -55,10 +54,6 @@ def test_messages_have_both_languages():
         assert comment.index(gone) < comment.index("#13")
         assert gone not in closing_comment(language, [11], []) and done not in closing_comment(language, [], [13])
     assert "#9" in text("parent_child_not_planned", "ko", number=1, children="#9")
-    closing = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+#\d+", re.I)
-    lines = {language: text("batch_pr_parent", language, parent=99) for language in ("en", "ko")}
-    assert lines["en"] != lines["ko"] and all("#99" in line for line in lines.values())
-    assert not any(closing.search(line) for line in lines.values()), "Only the gate closes an order parent"
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
@@ -73,9 +68,10 @@ def test_follow_children_closes_labeled_parent_and_reports_in_repo_language(
 
     flags, events, closed, synced = {}, [], [], []
     store = SimpleNamespace(
+        confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None,
         local_issues=lambda: [{"number": 1, "state": "open", "labels": own_labels, "children": [2, 3, 4]}],
-        load_flag=lambda n: flags.get(n),
-        save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
+        load_local_flag=lambda n: flags.get(n),
+        save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned"),
                     child(4)]}
@@ -120,32 +116,21 @@ def test_work_state_writes_skip_an_open_order_parent_card(monkeypatch):
     assert written == [(3, "Needs human"), (5, "Needs human"), (7, "Needs human"), (1, "Running")]
 
 
-@pytest.mark.parametrize("batch_rows", [
-    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True}],
-                 id="child-merged-no-batch-pr"),
-    pytest.param([{"number": 2, "pr_base": "foragent/batch-9", "pr_number": 50, "merged": True},
-                  {"number": 9, "pr_head": "foragent/batch-9", "pr_number": 51, "merged": False}],
-                 id="batch-pr-open"),
+@pytest.mark.parametrize("child_rows", [
     pytest.param([], id="no-batch"),
 ])
-def test_batch_parent_completes_when_its_children_are_done(monkeypatch, batch_rows):
-    """Batch finalization continues for a closed parent, so completion never waits for it."""
+def test_batch_parent_completes_when_its_children_are_done(monkeypatch, child_rows):
+    """An ordinary parent completes as soon as all of its children are done."""
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
     from foragent import board, board_parents
 
-    rows = [{"number": 9, "state": "open", "labels": [], "children": [2]}]
-    for row in batch_rows:
-        target = next((r for r in rows if r["number"] == row["number"]), None)
-        if target is None:
-            rows.append({"state": "closed", "labels": [], **row})
-        else:
-            target.update(row)
+    rows = [{"number": 9, "state": "open", "labels": [], "children": [2]}] + child_rows
     synced, closed = [], []
     tracker = SimpleNamespace(sub_issues=lambda n: [child(2, state="closed", reason="completed")],
                               close_issue=lambda n, comment: closed.append((n, comment)))
-    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows), tracker=tracker,
+    ctx = SimpleNamespace(store=SimpleNamespace(local_issues=lambda: rows, confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None), tracker=tracker,
                           config=SimpleNamespace(language="en"),
                           now=lambda: datetime(2026, 1, 1, tzinfo=UTC))
     monkeypatch.setattr(board, "sync_status", lambda ctx, n, state, parent=False: synced.append((n, state)))
@@ -176,8 +161,8 @@ def _record_ctx(monkeypatch, rows, remote, children=None, root=None, clock=None)
         return issue
 
     store = SimpleNamespace(
-        root=root, local_issues=lambda: rows, load_flag=lambda n: flags.get(n),
-        save_flag=lambda n, reason, flagged_at: flags.__setitem__(n, SimpleNamespace(reason=reason)),
+        root=root, confirmed_read=lambda n, name: None, read_baseline=lambda: {}, record_read=lambda *a, **k: None, local_issues=lambda: rows, load_local_flag=lambda n: flags.get(n),
+        save_flag=lambda n, reason, flagged_at, local_only: flags.__setitem__(n, SimpleNamespace(reason=reason)),
     )
     tracker = SimpleNamespace(sub_issues=lambda n: (children or {}).get(n, []), get_issue=get_issue,
                               close_issue=lambda n, comment: out.closed.append((n, comment)))
@@ -284,9 +269,9 @@ def test_every_unlisted_reference_is_read_fresh_in_one_tick_without_a_cap(monkey
     rows = [_record(1, edited=edited), _record(2, edited=[100])]
     ctx, out = _record_ctx(monkeypatch, rows, {n: child(n, state="closed") for n in edited}, root=tmp_path)
     board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
-    assert out.reads == [*edited, 100], "Each record reads its unlisted references fresh"
-    assert out.closed == [(1, board_parents.closing_comment("en", edited, [])),
-                          (2, board_parents.closing_comment("en", [100], []))]
+    assert sorted(out.reads) == sorted([*edited, 100]), "Each record reads its unlisted references fresh"
+    assert sorted(out.closed) == [(1, board_parents.closing_comment("en", edited, [])),
+                                  (2, board_parents.closing_comment("en", [100], []))]
     assert list(tmp_path.iterdir()) == [], "Nothing about references is stored between ticks"
 
 
@@ -349,9 +334,9 @@ def test_not_planned_sub_issue_flags_even_while_a_reference_is_open(monkeypatch)
 
     from foragent import board_parents
 
-    rows = [_record(1, {"a": 2}, edited=[3], children=[2]), _row(2, "closed"), _row(3, "open")]
-    ctx, out = _record_ctx(monkeypatch, rows, {},
-                           children={1: [child(2, state="closed", reason="not_planned")]})
+    rows = [_record(1, {"a": 2}, edited=[3], children=[2]), {**_row(2, "closed"), "state_reason": "not_planned"},
+            _row(3, "open")]
+    ctx, out = _record_ctx(monkeypatch, rows, {})
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert report.actions == [text("parent_child_not_planned", "en", number=1, children="#2")]
@@ -389,12 +374,154 @@ def test_order_whose_last_child_was_cancelled_closes_without_a_decision_flag(mon
 
     from foragent import board_parents
 
-    rows = [_record(1, {"a": 2, "b": 3}, children=[2, 3]), _row(2, "closed"), _row(3, "closed")]
-    children = {1: [child(2, state="closed", reason="completed"), child(3, state="closed", reason="not_planned")]}
-    ctx, out = _record_ctx(monkeypatch, rows, {}, children=children)
+    rows = [_record(1, {"a": 2, "b": 3}, children=[2, 3]), _row(2, "closed"),
+            {**_row(3, "closed"), "state_reason": "not_planned"}]
+    ctx, out = _record_ctx(monkeypatch, rows, {})
     report = SimpleNamespace(actions=[])
     board_parents.follow_children(ctx, report)
     assert out.closed == [(1, board_parents.closing_comment("en", [2], [3]))]
-    assert out.events == [] and ctx.store.load_flag(1) is None, "A closed order needs no decision"
+    assert out.events == [] and ctx.store.load_local_flag(1) is None, "A closed order needs no decision"
     assert report.actions == [text("parent_closed_report", "en", number=1, completed=1, cancelled=1)]
     assert out.synced == [(1, "Done", True)]
+
+
+def _parent_row(number, children, summary=None, **fields):
+    observed = {"sub_issues": summary} if summary else {}
+    return {"number": number, "state": "open", "labels": [], "body": "", "children": children,
+            "observed": observed, **fields}
+
+
+def _counting_ctx(monkeypatch, rows, remote=None):
+    ctx, out = _record_ctx(monkeypatch, rows, {})
+    out.child_reads = []
+
+    def sub_issues(n):
+        out.child_reads.append(n)
+        return (remote or {}).get(n, [])
+
+    ctx.tracker.sub_issues = sub_issues
+    return ctx, out
+
+
+def test_listed_child_facts_decide_without_a_read_and_keep_closing_groups(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_parent_row(1, [2, 3], {"total": 2, "completed": 1}), _row(2, "closed"), _row(3, "open"),
+            _parent_row(4, [5, 6], {"total": 2, "completed": 2}), _row(5, "closed"),
+            {**_row(6, "closed"), "state_reason": "not_planned"}]
+    ctx, out = _counting_ctx(monkeypatch, rows)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.child_reads == [], "The listing already shows every child"
+    assert out.closed == [(4, board_parents.closing_comment("en", [5], [6]))], "Only the ended parent closes"
+    assert sorted(out.synced) == [(1, "Running", True), (4, "Done", True)]
+
+
+def test_child_only_change_closes_a_parent_whose_own_row_is_unchanged(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_parent_row(1, [2], {"total": 1, "completed": 1}), _row(2, "open")]
+    ctx, out = _counting_ctx(monkeypatch, rows)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == []
+    rows[1] = _row(2, "closed")  # The summary was already full; only the child's row tells.
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.closed == [(1, board_parents.closing_comment("en", [2], []))] and out.child_reads == []
+
+
+@pytest.mark.parametrize(("summary", "reads", "closed"), [
+    pytest.param({"total": 2, "completed": 1}, [], False, id="open-work-keeps-it-open-without-a-read"),
+    pytest.param({"total": 2, "completed": 2}, [1], True, id="full-summary-is-checked-by-a-read"),
+    pytest.param(None, [1], True, id="no-summary-is-no-evidence"),
+    pytest.param({"total": 3, "completed": 3}, [1], True, id="total-disagrees-with-known-children"),
+])
+def test_summary_never_closes_by_itself_when_a_child_has_no_row(monkeypatch, summary, reads, closed):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_parent_row(1, [2, 3], summary), _row(2, "closed")]
+    remote = {1: [child(2, state="closed"), child(3, state="closed")]}
+    ctx, out = _counting_ctx(monkeypatch, rows, remote)
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.child_reads == reads
+    assert bool(out.closed) is closed
+    if not closed:
+        assert out.synced == [(1, "Running", True)], "The unlisted open child counts as open work"
+
+
+def test_read_showing_only_ended_children_does_not_hide_counted_open_work(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_parent_row(1, [2], {"total": 2, "completed": 1}), _row(2, "closed")]
+    ctx, out = _counting_ctx(monkeypatch, rows, {1: [child(2, state="closed")]})
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert out.child_reads == [1] and out.closed == []
+
+
+def test_closes_come_first_and_one_failure_defers_only_its_parent(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+    from foragent.tracker import TrackerError
+
+    rows = [_parent_row(1, [10]), _parent_row(2, [20]), _parent_row(3, [30]), _row(30, "closed")]
+    ctx, out = _counting_ctx(monkeypatch, rows)
+    seen = []
+
+    def sub_issues(n):
+        seen.append(("read", n))
+        raise TrackerError("gh call timed out")
+
+    ctx.tracker.sub_issues = sub_issues
+    ctx.tracker.close_issue = lambda n, comment: seen.append(("close", n))
+    with pytest.raises(TrackerError, match="timed out"):
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert seen[0] == ("close", 3), "A parent ready to close does not wait behind reads"
+    assert sorted(seen[1:]) == [("read", 1), ("read", 2)], "A failed read does not stop the other parents"
+
+
+def test_rate_limit_stops_the_step_at_once(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+    from foragent.tracker import TrackerError
+
+    rows = [_parent_row(1, [10]), _parent_row(2, [20]), _row(10, "closed"), _row(20, "closed")]
+    ctx, out = _counting_ctx(monkeypatch, rows)
+    closes = []
+
+    def close_issue(n, comment):
+        closes.append(n)
+        raise TrackerError("API rate limit exceeded")
+
+    ctx.tracker.close_issue = close_issue
+    with pytest.raises(TrackerError, match="rate limit"):
+        board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert closes == [1], "Lowest number first, and the rate limit reaches the tick immediately"
+
+
+def test_card_moves_once_and_before_the_reference_read(monkeypatch):
+    from types import SimpleNamespace
+
+    from foragent import board_parents
+
+    rows = [_record(1, edited=[4], children=[2]), _row(2, "closed")]
+    ctx, out = _record_ctx(monkeypatch, rows, {4: child(4, state="closed")})
+    order, get_issue = [], ctx.tracker.get_issue
+
+    def reading(number):
+        order.append(list(out.synced))
+        return get_issue(number)
+
+    ctx.tracker.get_issue = reading
+    board_parents.follow_children(ctx, SimpleNamespace(actions=[]))
+    assert order == [[(1, "Done", True)]], "The card is already moved when the reference read starts"
+    assert out.closed == [(1, board_parents.closing_comment("en", [2, 4], []))]
+    assert out.synced == [(1, "Done", True)], "The close writes the same column only once"
+

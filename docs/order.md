@@ -99,6 +99,8 @@ order는 질문하기 전에 스스로 찾을 수 있는 것을 먼저 찾는다
 - 되먹임 이슈는 처리 결과에 따라 닫거나, 새 이슈로 바꾸거나, Done when을 고친다. Done when을 고치면 재승인이 필요하다.
 - 기존 이슈를 고치는 `edits[]`는 `## Waiting` 구역과 `blocked_by`(이번 계획의 key)를 함께 바꾼다. `blocked_by: []`는 의존을 지우고, 빼면 기존 의존을 둔다. 의존만 바꿔도 재승인이 필요하다.
 - `## Waiting` 구역이 바뀌면 그 이슈에 설정 언어로 댓글 한 줄을 남긴다. 사람이 손으로 쓴 대기를 지워도 마찬가지다. 그대로면 댓글을 남기지 않는다.
+- `edits[]`는 기존 Done when 명령과 체크리스트 글을 열린 이슈든 닫힌 이슈든 그대로 둔다. 줄을 지우려면 `done_when_removals`에 `{"line": "정확한 글", "reason": "이유"}`로 한 줄씩 적는다. 빠졌거나, 이유가 비었거나, 지금 Done when에 없는 줄을 적으면 발행·`--dry-run`·preread가 쓰기와 모델 호출 전에 이슈 번호와 그 줄을 보여 주고 거절한다. 이유는 판단하지 않는다. 지운 줄, 지운 주문, 이유는 이슈 본문의 `## Removed from Done when`에 남고 이후 수정에도 이어진다. 이 기록은 그 줄을 지운 주문의 재발행(발행, preread, `--approve`)에만 통하고, 다른 주문이 같은 줄과 이유를 적으면 거절한다.
+- `fa order edit NUMBER --json`은 이슈의 지금 구역을 `edits[]` 항목 하나로 출력한다(읽기만 한다). 이것을 고쳐서 계획에 넣는다.
 
 ## 결정 대기
 
@@ -158,3 +160,41 @@ no new interpretation of issue meaning or conflict-resolution policy is added.
 
 - Accepted limit (#448): scheduler admission can race the final late check (TOCTOU); a soft-lock breach costs one merge conflict, which the runner resolves.
 - Accepted limit (#448): multi-way glob intersections do not guarantee Unicode literal-alias equivalence such as Straße/STRASSE.
+
+Publication checks the current GitHub title and body against the fields this plan
+last read, for both existing children and explicit edits. If either changed,
+`fa order publish` stops before changing files, issues, labels or approvals. The
+diagnostic identifies each issue and shows the old and current values, including
+changed Done when commands. This applies with or without `--approve`; `--dry-run`
+remains a preview.
+
+Run `fa order preread PLAN.json` to explicitly re-read: the implementer sees the
+current GitHub title and full body before the observed base is refreshed. A statement
+issue has no reader turn, so the command itself prints those fields for the agent that
+ran it (`current` with `--json`) and refreshes the base. Resolve
+the requirements in the plan before publishing again; no automatic merge chooses
+which requirement wins. Each successful issue write immediately records the title
+and body it wrote as the next base, before labels, links or comments are updated.
+If a later publication step fails, retrying can continue from those writes. The local `.foragent/order-observed.json` stores these
+observations by plan id and issue number. Legacy targets without a recorded base
+publish as before. Labels, comments and native dependency edges are not compared.
+
+Before the first write, `fa order publish` (with or without `--approve`, and with
+`--dry-run`), `--defer`, `fa order preread` and flush run a collection check. It
+collects the order's acceptance files in a temporary copy of the current base plus
+only those files, using the project's test command. An import or collection error
+refuses publication and names the file and the error. A test that collects but fails
+still publishes. If the check cannot run (no base, no test command, runner missing,
+or timeout), publication is refused as unavailable. The same check also runs the
+test files that import a changed locked test file by a literal import statement. If
+such a test passes on the base and breaks with the order's files, publication is
+refused and that test is named. Tests that already fail on the base are ignored.
+Dynamic or indirect imports are not checked.
+
+Run `fa order red PLAN.json` before preread to check that each lane's test draft
+fails on the fetched base for a real reason. It changes no files and no GitHub state.
+
+Preread shows each lane's expected change size (source lines, test lines and files),
+or `size: unknown` when the lane gave no estimate. An estimate above the size label
+limit is a note for the person, not a refusal. After merge, `fa order sizes --json`
+compares the expected size with the real size.

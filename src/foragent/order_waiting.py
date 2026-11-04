@@ -78,6 +78,11 @@ def _prior(body: str | None) -> tuple[str, str] | None:
     return (match[1], match[2]) if match else None
 
 
+def on_own_line(body: str) -> str:
+    """`body` ready for a marker appended after it: the marker gets a line of its own."""
+    return body if not body or body.endswith("\n") else body + "\n"
+
+
 def stamp(before: str | None, after: str) -> str:
     """`after` as it is written over `before`, carrying the wait change it makes.
 
@@ -96,7 +101,7 @@ def stamp(before: str | None, after: str) -> str:
         prior, ident = _prior(before) or (_digest(old), "")
     if prior == _digest(new):
         return after
-    return f"{after}<!-- foragent:waiting-prior sha256={prior} id={ident} -->\n"
+    return f"{on_own_line(after)}<!-- foragent:waiting-prior sha256={prior} id={ident} -->\n"
 
 
 def mark_write(before: str, after: str) -> str:
@@ -107,9 +112,9 @@ def mark_write(before: str, after: str) -> str:
     """
     after = _WRITE.sub("", after)
     kept = _WRITE.search(before or "")
-    if _WRITE.sub("", before or "") == after:
-        return f"{after}<!-- foragent:write id={kept[1]} -->\n" if kept else after
-    return f"{after}<!-- foragent:write id={uuid.uuid4().hex} -->\n"
+    if on_own_line(_WRITE.sub("", before or "")) == on_own_line(after):
+        return f"{on_own_line(after)}<!-- foragent:write id={kept[1]} -->\n" if kept else after
+    return f"{on_own_line(after)}<!-- foragent:write id={uuid.uuid4().hex} -->\n"
 
 
 def comment_line(prior: str, ident: str, text: str | None, language: str = "en") -> str:

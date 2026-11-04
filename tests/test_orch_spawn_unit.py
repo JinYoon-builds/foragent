@@ -498,3 +498,73 @@ def test_freshness_is_read_again_where_the_episode_is_decided(tmp_path, monkeypa
     store.write_heartbeat("orchestrator", NOW + timedelta(hours=3))
     assert not orch_silent.check(repo, store, config, NOW + timedelta(hours=3))
     assert not (store.root / "orch-silent-alert.json").exists() and len(pushes) == 2
+
+
+def _spawn_rows(store):
+    return [row["data"] for row in store.flow_records() if row["kind"] == "spawn"]
+
+
+def test_spawn_records_each_changed_skip_and_the_opened_session(tmp_path, monkeypatch):
+    store, repo, calls, _ = _setup(tmp_path, monkeypatch, claude=False)
+    config = Config(repo="owner/repo")
+    for _ in range(2):
+        assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert [row["reason"] for row in _spawn_rows(store)] == ["launch-unavailable"]
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/offline/bin/{name}" if name == "claude" else None)
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW + timedelta(minutes=5)) == "background"
+    opened = _spawn_rows(store)[-1]
+    assert opened["decision"] == "opened" and opened["detail"] == "background" and opened["session_id"]
+    assert len(calls) == 1
+
+
+def test_spawn_records_no_work_spacing_and_failed_launch(tmp_path, monkeypatch):
+    store, repo, _, _ = _setup(tmp_path, monkeypatch, fail=True)
+    config = Config(repo="owner/repo")
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert orch_spawn.ensure_orchestrator(repo, store, config, now=NOW) is None
+    assert [row["reason"] for row in _spawn_rows(store)] == ["launch-failed", "spacing"]
+
+    empty = StateStore(tmp_path / "empty", now=lambda: NOW)
+    assert orch_spawn.ensure_orchestrator(repo, empty, config, now=NOW) is None
+    assert [row["reason"] for row in _spawn_rows(empty)] == ["no-work"]
+
+
+def test_explicit_ensure_uses_the_same_reason_codes(tmp_path, monkeypatch):
+    store, repo, _, _ = _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("FORAGENT_ORCH_SPAWN", "off")
+    why = []
+    assert orch_ensure.ensure_explicit(repo, store, Config(repo="owner/repo"), NOW, why) is None
+    assert why == ["off"]
+    assert _spawn_rows(store) == [{"decision": "skipped", "reason": "disabled", "detail": None}]
+
+
+def test_a_spawn_error_is_recorded_and_raised_unchanged(tmp_path, monkeypatch):
+    import pytest
+
+    store, repo, _, _ = _setup(tmp_path, monkeypatch)
+
+    def broken(*args):
+        raise OSError("plan unreadable")
+
+    monkeypatch.setattr(orch_spawn, "_live_reason", broken)
+    with pytest.raises(OSError, match="plan unreadable"):
+        orch_spawn.ensure_orchestrator(repo, store, Config(repo="owner/repo"), now=NOW)
+    assert _spawn_rows(store) == [{"decision": "skipped", "reason": "error", "detail": "OSError: plan unreadable"}]
+
+
+def test_a_refused_refresh_is_a_recorded_skip(tmp_path, monkeypatch):
+    import pytest
+
+    from foragent import orch_refresh
+
+    store, repo, calls, _ = _setup(tmp_path, monkeypatch)
+
+    def refused(store, language):
+        raise orch_refresh.RefreshRefused("no handoff")
+
+    monkeypatch.setattr(orch_refresh, "_fresh_handoff", refused)
+    with pytest.raises(orch_refresh.RefreshRefused):
+        orch_refresh.refresh(repo, store, Config(repo="owner/repo"), NOW)
+    assert calls == []
+    assert _spawn_rows(store) == [{"decision": "skipped", "reason": "refresh-refused", "detail": "no handoff"}]

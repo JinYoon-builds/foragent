@@ -22,7 +22,7 @@ class IssueRefreshMixin:
         equal start times, and keeps the PR and comment records of a row
         written during the refresh. Returns issues whose intents were dropped.
         """
-        from foragent.state_observations import EARLIEST, issue_facts, stamp
+        from foragent.state_observations import EARLIEST, NOT_LISTED, edges_after, history_baseline, issue_facts, stamp
         from foragent.tracker import pr_issue_number
 
         at = observed_at or now
@@ -30,6 +30,7 @@ class IssueRefreshMixin:
         with self._state_lock():
             snapshot = self._issue_snapshot()
             previous = dict(snapshot["issues"])
+            before = history_baseline(snapshot)
             if (stamp(snapshot.get("complete_at")) or EARLIEST) <= at:
                 snapshot["complete_at"] = at.isoformat()
             observed = {issue.number for issue in issues if not issue.is_pull_request}
@@ -39,7 +40,8 @@ class IssueRefreshMixin:
                     continue
                 key, old = str(issue.number), previous.get(str(issue.number)) or {}
                 outcome = self._observe(snapshot, issue.number, issue_facts(issue), at, lanes,
-                                        since_revision=since_revision)
+                                        since_revision=since_revision,
+                                        created_at=getattr(issue, "created_at", None))
                 if outcome == "stale":
                     continue
                 if outcome == "dropped":
@@ -56,16 +58,22 @@ class IssueRefreshMixin:
                     row["comments"] = comments[issue.number]
             from foragent.state_observations import known_numbers
 
+            gone = {}
             for number in sorted(known_numbers(snapshot) - observed):
-                if self._observe(snapshot, number, None, at, lanes, since_revision=since_revision) == "dropped":
+                outcome = self._observe(snapshot, number, None, at, lanes, since_revision=since_revision)
+                if outcome != "stale":
+                    gone[number] = NOT_LISTED
+                if outcome == "dropped":
                     dropped.add(number)
             rows = snapshot["issues"]
+            # A row with a newer edge write keeps those edges, and this read stays out of its history.
+            behind = {number for number in fresh if edges_after(snapshot, int(number), at, since_revision)}
             for number in fresh:
                 row = rows[number]
                 # Order edges and dependencies are observations, never local intent.
                 if parents is not None:
                     row["parent"] = parents.get(int(number))
-                if blocked_by is not None:
+                if blocked_by is not None and number not in behind:
                     row["blocked_by"] = blocked_by.get(int(number), [])
                 if children is not None:
                     row["children"] = children.get(int(number), [])
@@ -85,8 +93,9 @@ class IssueRefreshMixin:
                     if pr.merged_at is not None:
                         _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
                     pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+            owner_facts = self.owner_merge_facts()
             for run in history:
-                if run.outcome == "merged" and str(run.number) in fresh:
+                if self.run_merged(run, owner_facts=owner_facts) and str(run.number) in fresh:
                     # A gate merge's size is the issue's size when the merge is first seen.
                     row = rows[str(run.number)]
                     sizes = dict(row.get("run_sizes") or {})
@@ -108,6 +117,8 @@ class IssueRefreshMixin:
             last = stamp(snapshot.get("refreshed_at"))
             snapshot["refreshed_at"] = (now if last is None or now >= last else last).isoformat()
             self._write_json(self.root / "issues.json", snapshot)
+            self._record_issue_states(snapshot, before, at, {int(number) for number in fresh},
+                                     edges=blocked_by, gone=gone, since_revision=since_revision)
             return sorted(dropped)
 
     def merged_pr_listing(self) -> dict[str, Any] | None:

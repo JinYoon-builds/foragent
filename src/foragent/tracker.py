@@ -17,6 +17,7 @@ from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile
 
 from foragent import cuts, gh
+from foragent.records import load_record
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ class Issue:
     dependencies_summary: tuple[tuple[str, int], ...] | None = None
     # Why GitHub closed the issue ("completed", "not_planned", ...); None while open or unknown.
     state_reason: str | None = None
+    # When GitHub created the issue; None when the read did not carry it.
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,14 @@ class PullRequest:
     url: str = ""
 
 
+@dataclass(frozen=True)
+class OwnerPullRequest(PullRequest):
+    """Exact publication resource; legacy PR listings keep their original record shape."""
+
+    state: str = "open"
+    head_sha: str | None = None
+
+
 class Tracker(Protocol):
     def rate_limit_reset(self) -> datetime | None: ...
     def authenticated_login(self, *, refresh: bool = False) -> str: ...
@@ -107,30 +118,49 @@ class Tracker(Protocol):
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
-    def close_issue(self, n: int, comment: str | None = None) -> None: ...
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
-    def close_pr(self, pr: int, comment: str | None = None) -> None: ...
+    def retitle_pr(self, pr: int, *, title: str) -> None: ...
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch: bool = True) -> None: ...
     def find_pr(self, head: str) -> int | None: ...
+    def get_pr(self, pr: int) -> OwnerPullRequest: ...
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]: ...
     def pr_changed_files(self, pr: int) -> list[str]: ...
     def pr_checks(self, pr: int) -> CheckStatus: ...
-    def pr_acceptance_checks(self, pr: int) -> list[dict]: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None: ...
+                 subject: str | None = None, delete_branch: bool = True) -> None: ...
 
 
 class TrackerError(RuntimeError):
     """A gh operation failed; the message contains its stderr."""
 
-    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None):
+    def __init__(self, message: str, *, stdout: str = "", returncode: int | None = None,
+                 transport: bool = False):
         super().__init__(message)
         self.stdout = stdout
         self.returncode = returncode
+        self.transport = transport  # set only where gh's own failure is converted (see GhTracker._call)
+
+    @property
+    def is_unavailable(self) -> bool:
+        """GitHub was briefly unavailable to this gh call; the diagnosis is gh's own output."""
+        return self.transport
+
+    @property
+    def diagnostic(self) -> str:
+        """One line of the failure, at most 500 characters: its start and its end, where gh's error is."""
+        text = " ".join(str(self).split())
+        return text if len(text) <= 500 else f"{text[:200]} ... {text[-295:]}"
+
+    @property
+    def waits(self) -> bool:
+        """A run waits and resumes for this error instead of failing."""
+        return self.is_rate_limit or self.is_unavailable
 
     @property
     def is_rate_limit(self) -> bool:
@@ -139,6 +169,25 @@ class TrackerError(RuntimeError):
             r"(?:API rate limit (?:already )?exceeded|secondary rate limit|\bHTTP(?:/\S+)?\s+429\b)",
             diagnostic, re.I,
         ))
+
+    @property
+    def missing_scopes(self) -> frozenset[str]:
+        """Scope names required by gh's diagnostics, never inferred from an HTTP code."""
+        diagnostics = [str(self)]
+        try:
+            payload = json.loads(self.stdout)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            diagnostics.extend(
+                error.get("message", "") for error in payload.get("errors", [])
+                if isinstance(error, dict) and error.get("type") == "INSUFFICIENT_SCOPES"
+            )
+        scopes = set()
+        for diagnostic in diagnostics:
+            for required in re.findall(r"requires one of the following scopes: \[([^\]]*)\]", diagnostic):
+                scopes.update(re.findall(r"['\"]([^'\"]+)['\"]", required))
+        return frozenset(scopes)
 
     @property
     def is_not_found(self) -> bool:
@@ -155,8 +204,27 @@ class TrackerError(RuntimeError):
         return None
 
 
+# A definite request error: GitHub answered and refused this request, either with an HTTP 4xx
+# status or with a GraphQL error answer. Every other gh failure (5xx, a cut connection, a
+# timeout, any text gh prints) is GitHub being unavailable, and the run waits. A rate limit
+# is a 4xx too; it waits through ``is_rate_limit``.
+_REQUEST_ERROR = re.compile(r"\bHTTP(?:/\S+)?\s+4\d\d\b|^GraphQL: ", re.I | re.M)
+# On stdout only gh's own response status line counts: stdout otherwise carries data
+# (checks JSON, error bodies with user text) that may mention any status.
+_STATUS_LINE = re.compile(r"^HTTP/\S+\s+\d\d\d\b", re.I)
 _FAILED_CONCLUSIONS = {"failure", "cancelled", "timed_out", "action_required", "startup_failure", "stale"}
 _NOT_STARTED = re.compile(r"\bjob was not started\b", re.I)
+# Colour codes and any other terminal control a CI log printed; tabs and newlines stay.
+_TERMINAL_CONTROL = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
+
+
+def _unavailable(what: str, exc: TrackerError) -> str:
+    """The notice for CI evidence that could not be read; a rate limit keeps its own handling."""
+    if exc.is_rate_limit:
+        raise exc
+    return f"(CI evidence unavailable: {what}: {str(exc).strip()})"
 
 
 class IdentityError(TrackerError):
@@ -165,6 +233,10 @@ class IdentityError(TrackerError):
     def __init__(self, login: str, kind: str):
         super().__init__(f"GitHub credential belongs to {login} ({kind}), not a person")
         self.login, self.kind = login, kind
+
+
+class RejectedEvidence(TrackerError):
+    """The completed producer or artifact is invalid; another transport read cannot fix it."""
 
 
 class CIEvidence(str):
@@ -260,7 +332,7 @@ class RecordingTracker:
         return issue
 
     def _pending_issues(self):
-        pending = {entry["issue"] for entry in self._context.store.github_outbox()}
+        pending = {entry["issue"] for entry in self._context.store.github_blocking_outbox()}
         if not pending:
             return {}
         return {issue.number: issue for issue in local_issue_models(self._context.store)
@@ -462,8 +534,13 @@ class RecordingTracker:
         store = self._context.store
         premise = self._premise(n)
         pending = store.github_outbox()
-        if (any(entry["issue"] == n for entry in pending)
-                or self.queue_writes and (store.github_wait_until(self._context.now()) is not None or pending)):
+        evidence = action == "comment" and payload.get("evidence", False)
+        if evidence:
+            preceding = [entry for entry in pending if entry.get("evidence")]
+        else:
+            preceding = store.github_blocking_outbox()
+        if (any(entry["issue"] == n for entry in preceding) or self.queue_writes and
+                (store.github_wait_until(self._context.now()) is not None or preceding and not evidence)):
             return None, self._queue(n, action, started, premise, {**payload, **(queued or {})})
         # A direct combined close exposes only its field effect to concurrent flushes.
         # Its comment is send-only; the composite payload enters the retry queue only on failure.
@@ -534,7 +611,8 @@ class RecordingTracker:
                     store.record_github_attempt(entry["id"], started, True)
                 else:
                     payload = entry["labels"] if action == "add_labels" else entry["body"]
-                    result = getattr(self._tracker, action)(number, payload)
+                    options = {"reason": entry["reason"]} if action == "close_issue" and entry.get("reason") else {}
+                    result = getattr(self._tracker, action)(number, payload, **options)
                     if action == "comment":
                         store.acknowledge_github_comment(entry, result)
                     else:
@@ -551,6 +629,9 @@ class RecordingTracker:
                 except TrackerError as lookup_error:
                     exc = lookup_error
                 if not exc.is_rate_limit:
+                    if queued.get("evidence") and not exc.is_not_found:
+                        log.warning("Could not publish issue #%s evidence: %s", number, exc)
+                        continue
                     raise exc
                 pause(self._context, exc)
                 return
@@ -593,9 +674,14 @@ class RecordingTracker:
         self._context.store.record_comments(n, [asdict(comment) for comment in comments])
         return comments
 
-    def comment(self, n, body):
+    def close_queued(self, n):
+        """Whether a close of this issue waits to be sent, which a read of the issue cannot show."""
+        return any(entry["issue"] == n and entry["action"] == "close_issue"
+                   for entry in self._context.store.github_outbox())
+
+    def comment(self, n, body, *, evidence=False):
         identity, queued = self._write(n, "comment", lambda: self._tracker.comment(n, body), self._started(),
-                                       body=body)
+                                       body=body, **({"evidence": True} if evidence else {}))
         if queued:
             return -queued["id"]
         self._context.store.record_comments(n, [{"id": identity, "body": body,
@@ -615,10 +701,11 @@ class RecordingTracker:
                                 started, title=title, body=body)
         del queued  # Sent or pending, the intent carries the edit until a read shows it.
 
-    def close_issue(self, n, comment=None):
+    def close_issue(self, n, comment=None, *, reason=None):
         started = self._started()
-        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n) if comment is None
-                               else self._tracker.close_issue(n, comment), started, body=comment)
+        options = {"reason": reason} if reason is not None else {}
+        _, queued = self._write(n, "close_issue", lambda: self._tracker.close_issue(n, **options) if comment is None
+                               else self._tracker.close_issue(n, comment, **options), started, body=comment, **options)
         del queued  # Sent or pending, the intent carries the close until a read shows it.
 
     def record_board_value(self, n, project, field, value):
@@ -656,21 +743,27 @@ class RecordingTracker:
         self._tracker.update_pr(pr, base=base, title=title, body=body)
         self._record_pr_state(pr, pr_base=base)
 
+    def retitle_pr(self, pr, *, title):
+        self._tracker.retitle_pr(pr, title=title)
+
     def _record_pr_state(self, pr, **fields):
         for row in self._context.store.local_issues():
             if row["pr_number"] == pr:
                 self._context.store.update_local_issue(row["number"], **fields)
 
-    def close_pr(self, pr, comment=None):
-        self._tracker.close_pr(pr, comment)
+    def close_pr(self, pr, comment=None, *, delete_branch=True):
+        options = {} if delete_branch else {"delete_branch": False}
+        self._tracker.close_pr(pr, comment, **options)
         self._record_pr_state(pr, pr_number=None, merged=False)
 
-    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None):
+    def merge_pr(self, pr, *, expected_head_sha, method="squash", subject=None, delete_branch=True):
+        options = {} if delete_branch else {"delete_branch": False}
         if subject is None:
-            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method)
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, **options)
         else:
-            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject)
-        self._record_pr_state(pr, merged=True)
+            self._tracker.merge_pr(pr, expected_head_sha=expected_head_sha, method=method, subject=subject, **options)
+        if not getattr(getattr(self._context, "config", None), "merge_owner", False):
+            self._record_pr_state(pr, merged=True)
 
 
 def _merge_flag(method: str) -> str:
@@ -845,10 +938,13 @@ class FakeTracker:
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         self.labels.update((spec.name, spec) for spec in specs)
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
+        self._close(n, comment, reason=reason)
+
+    def _close(self, n: int, comment: str | None, *, reason: str | None = None) -> None:
         if comment is not None:
             self.comment(n, comment)
-        self.issues[n] = replace(self.get_issue(n), state="closed", updated_at=self._timestamp())
+        self.issues[n] = replace(self.get_issue(n), state="closed", state_reason=reason, updated_at=self._timestamp())
 
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int:
         number = max([*self.issues, *(pr.number for pr in self.created_prs)], default=0) + 1
@@ -866,13 +962,18 @@ class FakeTracker:
                             for item in self.created_prs]
         self.issues[pr] = replace(self.get_issue(pr), title=title, body=body)
 
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self.created_prs = [replace(item, title=title) if item.number == pr else item for item in self.created_prs]
+        self.issues[pr] = replace(self.get_issue(pr), title=title)
+
     def find_pr(self, head: str) -> int | None:
         return next((pr.number for pr in self.created_prs
                      if pr.head == head and self.get_issue(pr.number).state == "open"), None)
 
-    def close_pr(self, pr: int, comment: str | None = None) -> None:
-        self.close_issue(pr, comment)
-        self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch=True) -> None:
+        self._close(pr, comment)
+        if delete_branch:
+            self.deleted_branches.append(next(item.head for item in self.created_prs if item.number == pr))
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
         if state not in {"open", "merged"}:
@@ -881,6 +982,13 @@ class FakeTracker:
             pr.merged_at is not None if state == "merged"
             else self.get_issue(pr.number).state == "open" and pr.merged_at is None
         )]
+
+    def get_pr(self, pr: int) -> OwnerPullRequest:
+        item = next((item for item in self.created_prs if item.number == pr), None)
+        if item is None:
+            raise TrackerError(f"PR #{pr}: HTTP 404")
+        return load_record(OwnerPullRequest, {**asdict(item), "state": self.get_issue(pr).state,
+                                             "head_sha": self.pr_head_sha(pr)})
 
     def set_pr_files(self, pr: int, files: list[str]) -> None:
         self._pr_files[pr] = list(files)
@@ -893,9 +1001,6 @@ class FakeTracker:
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
-
-    def pr_acceptance_checks(self, pr: int) -> list[dict]:
-        return []
 
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
@@ -916,7 +1021,7 @@ class FakeTracker:
         return self._pr_heads.get(pr, "0" * 40)
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None:
+                 subject: str | None = None, delete_branch=True) -> None:
         _merge_flag(method)
         if self.pr_head_sha(pr) != expected_head_sha:
             raise TrackerError("PR head changed after verification")
@@ -972,7 +1077,7 @@ def _issue(data: dict[str, Any]) -> Issue:
         frozenset(label["name"] for label in data.get("labels", [])),
         data["state"], "pull_request" in data, data.get("updated_at"),
         _summary(data.get("sub_issues_summary")), _summary(data.get("issue_dependencies_summary")),
-        data.get("state_reason"),
+        data.get("state_reason"), data.get("created_at"),
     )
 
 
@@ -991,6 +1096,8 @@ def _parse_time(value: Any) -> datetime | None:
 
 
 class GhTracker:
+    _artifact_error = TrackerError
+
     def __init__(self, repo: str, run: Callable[..., str | bytes] | None = None,
                  sleep: Callable[[float], None] = time.sleep):
         self.repo = repo
@@ -1011,10 +1118,22 @@ class GhTracker:
         except subprocess.CalledProcessError as exc:
             stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr
             stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout
+            message = stderr or str(exc)
+            # A response status gh printed only on stdout is still the failure: it leads the message,
+            # so every reader of the error (logs, run details, waits) keeps it.
+            status = next((line.strip() for line in (stdout or "").splitlines() if _STATUS_LINE.search(line)), None)
+            if status and status not in message:
+                message = f"{status}\n{message}"
             raise TrackerError(
-                stderr or str(exc), stdout=stdout or "", returncode=exc.returncode,
+                message, stdout=stdout or "", returncode=exc.returncode,
+                transport=not _REQUEST_ERROR.search(message),
             ) from exc
-        except (OSError, subprocess.TimeoutExpired, gh.DeadlineExhausted) as exc:
+        except subprocess.TimeoutExpired as exc:
+            # The failure leads; the argv (titles, bodies, repository names) follows and may be cut.
+            raise TrackerError(f"gh timed out after {exc.timeout:g} seconds: {exc}", transport=True) from exc
+        except OSError as exc:
+            raise TrackerError(f"gh could not run: {exc}", transport=True) from exc
+        except gh.DeadlineExhausted as exc:
             raise TrackerError(str(exc)) from exc
 
     def authenticated_login(self, *, refresh: bool = False) -> str:
@@ -1064,7 +1183,7 @@ class GhTracker:
             if not isinstance(result, dict):
                 raise TrackerError("invalid GraphQL response: expected an object")
             if result.get("errors"):
-                raise TrackerError(f"GraphQL errors: {result['errors']}")
+                raise TrackerError(f"GraphQL errors: {result['errors']}", stdout=output)
             if not isinstance(result.get("data"), dict):
                 raise TrackerError("invalid GraphQL response: missing data")
             return result
@@ -1252,8 +1371,10 @@ class GhTracker:
                     input=payload,
                 )
 
-    def close_issue(self, n: int, comment: str | None = None) -> None:
+    def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         args = ["issue", "close", str(n), "-R", self.repo]
+        if reason is not None:
+            args.extend(["--reason", reason.replace("_", " ")])
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
@@ -1277,6 +1398,14 @@ class GhTracker:
             input=json.dumps({"title": title, "body": body, "labels": list(labels)}),
         )
         return json.loads(output)["number"]
+
+    def get_pr(self, pr: int) -> OwnerPullRequest:
+        item = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))
+        return OwnerPullRequest(
+            item["number"], item["head"]["ref"], item["base"]["ref"],
+            item["title"], item.get("body") or "", item.get("merged_at"), item["html_url"], item["state"],
+            item["head"].get("sha"),
+        )
 
     def list_prs(self, state: PRState = "open", head_prefix: str = "") -> list[PullRequest]:
         if state not in {"open", "merged"}:
@@ -1326,8 +1455,8 @@ class GhTracker:
             raise TrackerError(f"cannot parse PR number: {output.strip()}")
         return int(match[1])
 
-    def close_pr(self, pr: int, comment: str | None = None) -> None:
-        args = ["pr", "close", str(pr), "-R", self.repo, "--delete-branch"]
+    def close_pr(self, pr: int, comment: str | None = None, *, delete_branch=True) -> None:
+        args = ["pr", "close", str(pr), "-R", self.repo, *(["--delete-branch"] if delete_branch else [])]
         if comment is not None:
             args.extend(["--comment", comment])
         self._call(args)
@@ -1337,6 +1466,9 @@ class GhTracker:
             ["pr", "edit", str(pr), "-R", self.repo, "--base", base,
              "--title", title, "--body-file", "-"], input=body,
         )
+
+    def retitle_pr(self, pr: int, *, title: str) -> None:
+        self._call(["pr", "edit", str(pr), "-R", self.repo, "--title", title])
 
     def pr_changed_files(self, pr: int) -> list[str]:
         data = _items(self._call(["api", "--paginate", f"{self._path}/pulls/{pr}/files?per_page=100"]))
@@ -1357,17 +1489,16 @@ class GhTracker:
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
-            # gh uses exit 1 for failed checks and exit 8 for pending checks.
-            if exc.returncode not in {1, 8} or not exc.stdout.strip():
-                raise
-            output = exc.stdout
-        checks = _items(output)
-        # gh supplies workflow only for CheckRun entries, never StatusContext.
-        # Commit-status target URLs are caller-controlled and confer no identity.
-        candidates = [item for item in checks if item.get("workflow") and "/job/" in (item.get("link") or "")]
-        excluded = self._acceptance_check_keys(pr) if candidates else set()
-        buckets = {item["bucket"] for item in checks
-                   if not (item.get("workflow") and (item.get("name"), item.get("link")) in excluded)}
+            # gh uses exit 1 for failed checks and exit 8 for pending checks; only a checks
+            # listing on stdout is that answer. Any other output is the failure itself.
+            try:
+                if exc.returncode not in {1, 8} or not exc.stdout.strip():
+                    raise ValueError("not a checks exit")
+                buckets = {item["bucket"] for item in _items(exc.stdout)}
+            except (TrackerError, ValueError, TypeError, KeyError):
+                raise exc from exc.__cause__
+        else:
+            buckets = {item["bucket"] for item in _items(output)}
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1378,45 +1509,6 @@ class GhTracker:
             return "pass"
         raise TrackerError(f"unknown check buckets: {sorted(buckets)}")
 
-    def _acceptance_check_keys(self, pr: int) -> set[tuple[str, str]]:
-        """Exclude only Actions checks with API-verified workflow provenance."""
-        from foragent.ci_workflow import WORKFLOW
-
-        try:
-            if any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
-                return set()
-            checks = self.pr_acceptance_checks(pr)
-            suites = {}
-            excluded = set()
-            counted = set()
-            for check in checks:
-                key = (check.get("name"), check.get("details_url"))
-                suite = (check.get("check_suite") or {}).get("id")
-                if ((check.get("app") or {}).get("slug") != "github-actions"
-                        or type(suite) is not int or suite <= 0):
-                    counted.add(key)
-                    continue
-                if suite not in suites:
-                    runs = _items(self._call([
-                        "api", "--paginate", "--jq", ".workflow_runs",
-                        f"{self._path}/actions/runs?check_suite_id={suite}&per_page=100",
-                    ]))
-                    suites[suite] = bool(runs) and all(
-                        run.get("check_suite_id") == suite and run.get("path") == WORKFLOW
-                        and (run.get("repository") or {}).get("full_name") == self.repo
-                        for run in runs
-                    )
-                if suites[suite] and all(key):
-                    excluded.add(key)
-                else:
-                    counted.add(key)
-            # gh exposes display keys, so an ambiguous match must count too.
-            return excluded - counted
-        except (TrackerError, AttributeError, TypeError, KeyError) as exc:
-            if isinstance(exc, TrackerError) and exc.is_rate_limit:
-                raise
-            return set()  # Unverifiable checks remain ordinary CI.
-
     def _pr_workflow_runs(self, pr: int) -> list[dict]:
         head = self.pr_head_sha(pr)
         return _items(self._call([
@@ -1424,25 +1516,8 @@ class GhTracker:
             f"{self._path}/actions/runs?head_sha={head}&per_page=100",
         ]))
 
-    def _acceptance_run_ids(self, pr: int, runs: list[dict]) -> set[int]:
-        """Only unchanged measurement workflows may be separated from ordinary CI."""
-        from foragent.ci_workflow import WORKFLOW
-
-        candidates = {run["id"] for run in runs if run.get("path") == WORKFLOW}
-        if candidates and any(path.startswith(".github/workflows/") for path in self.pr_changed_files(pr)):
-            return set()
-        return candidates
-
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
-
-    def pr_acceptance_checks(self, pr: int) -> list[dict]:
-        """Display data only; check runs cannot establish measurement provenance."""
-        head = self.pr_head_sha(pr)
-        return _items(self._call([
-            "api", "--paginate", "--jq", ".check_runs",
-            f"{self._path}/commits/{head}/check-runs?per_page=100&filter=latest",
-        ]))
 
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""
@@ -1475,10 +1550,10 @@ class GhTracker:
             run = max(candidates, key=lambda value: value["id"])
             if run.get("status") in {"queued", "in_progress"}:
                 return []  # No evidence yet; ci_mode retains its existing polling budget.
-            if (run.get("status") != "completed" or run.get("conclusion") != "success"
+            if (run.get("status") != "completed"
                     or run["repository"]["full_name"] != self.repo
                     or run["head_repository"]["full_name"] != self.repo):
-                raise ValueError("measurement run is foreign or unsuccessful")
+                raise ValueError("measurement run is foreign or unfinished")
             artifacts = _items(self._call([
                 "api", "--paginate", "--jq", ".artifacts",
                 f"{self._path}/actions/runs/{run['id']}/artifacts?per_page=100",
@@ -1514,57 +1589,98 @@ class GhTracker:
             # API/rate-limit errors retain their TrackerError classification.
             if isinstance(exc, TrackerError):
                 raise
-            raise TrackerError(f"Unusable acceptance artifacts: {exc}") from exc
+            raise self._artifact_error(f"Unusable acceptance artifacts: {exc}") from exc
 
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.
 
+        A failed job counts as soon as it has failed, even while its run is unfinished.
+        Each part is read on its own: one that cannot be read leaves an "unavailable"
+        line and the others survive; a rate limit still propagates.
         ``not_started`` is true only when every failed job never ran (no steps or a
         "job was not started" annotation); such jobs have no code failure to repair.
         """
-        runs = self._pr_workflow_runs(pr)
-        excluded_runs = self._acceptance_run_ids(pr, runs)
+        try:
+            runs = self._pr_workflow_runs(pr)
+        except TrackerError as exc:
+            return CIEvidence(_unavailable("workflow runs", exc))
         parts = []
         failed_runs = 0
         code_failure = False
         for run in runs:
-            if run["id"] in excluded_runs or run["conclusion"] not in _FAILED_CONCLUSIONS:
+            if run.get("conclusion") is not None and run["conclusion"] not in _FAILED_CONCLUSIONS:
+                continue
+            evidence = self._run_evidence(run, full_text_dir)
+            if evidence is None:
                 continue
             failed_runs += 1
+            parts.append(evidence[0])
+            code_failure = code_failure or evidence[1]
+        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+
+    def _run_evidence(self, run: dict[str, Any], full_text_dir: Path | None) -> tuple[str, bool] | None:
+        """One run's text and whether it may hold a code failure; None if nothing failed yet."""
+        run_id = run["id"]
+        unfinished = run.get("conclusion") is None
+        state = run.get("conclusion") or run.get("status") or "unfinished"
+        url = run.get("html_url") or run.get("url") or ""
+        lines = [f"Actions run {run_id} ({run.get('name') or 'workflow'}) {state} {url}".rstrip()]
+        run_logs = ["run", "view", str(run_id), "-R", self.repo, "--log-failed"]
+        try:
             jobs = _items(self._call([
                 "api", "--paginate", "--jq", ".jobs",
-                f"{self._path}/actions/runs/{run['id']}/jobs?per_page=100",
+                f"{self._path}/actions/runs/{run_id}/jobs?per_page=100",
             ]))
-            url = run.get("html_url") or run.get("url") or ""
-            lines = [f"Actions run {run['id']} ({run.get('name') or 'workflow'}) {run['conclusion']} {url}".rstrip()]
-            started_failure = False
-            failed_jobs = 0
-            for job in jobs:
-                if job.get("conclusion") not in _FAILED_CONCLUSIONS:
-                    continue
-                failed_jobs += 1
-                steps = job.get("steps") or []
+        except TrackerError as exc:
+            # Unknown jobs do not prove that nothing started. gh refuses run-wide
+            # logs until the run completes, so only a completed run can still try them.
+            lines.append(_unavailable(f"jobs of run {run_id}", exc))
+            if not unfinished:
+                lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                            full_text_dir, f"ci-run-{run_id}.log"))
+            return "\n".join(lines), True
+        failed = [job for job in jobs if job.get("conclusion") in _FAILED_CONCLUSIONS]
+        if unfinished and not failed:
+            return None
+        started_failure = False
+        for job in failed:
+            steps = job.get("steps") or []
+            try:
                 messages = self._job_annotations(job)
-                job_url = job.get("html_url") or job.get("url") or ""
-                if not steps or any(_NOT_STARTED.search(message) for message in messages):
-                    lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
-                else:
-                    started_failure = True
-                    lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
-                lines.extend(f"  annotation: {message}" for message in messages)
-            # A failed run without failed jobs (e.g. an invalid workflow file) is
-            # still a failure the implementer may be able to repair.
-            if started_failure or not failed_jobs:
-                code_failure = True
-                try:
-                    output = self._call(["run", "view", str(run["id"]), "-R", self.repo, "--log-failed"])
-                except TrackerError as exc:
-                    if "log not found" not in f"{exc}\n{exc.stdout}".lower():
-                        raise
-                    output = f"(failed log unavailable: {str(exc).strip()})"
-                lines.append(cuts.tail(output, 4000, full_text_dir, f"ci-run-{run['id']}.log"))
-            parts.append("\n".join(lines))
-        return CIEvidence("\n\n".join(parts), not_started=bool(failed_runs) and not code_failure)
+                annotations = [f"  annotation: {message}" for message in messages]
+            except TrackerError as exc:
+                messages = []
+                annotations = ["  " + _unavailable(f"annotations of job {job.get('name')}", exc)]
+            job_url = job.get("html_url") or job.get("url") or ""
+            if not steps or any(_NOT_STARTED.search(message) for message in messages):
+                lines.append(f"Job {job.get('name')} did not start ({len(steps)} steps) {job_url}".rstrip())
+                lines.extend(annotations)
+                continue
+            started_failure = True
+            lines.append(f"Job {job.get('name')} failed {job_url}".rstrip())
+            lines.extend(annotations)
+            # gh also refuses one job's log until its run completes; the REST log does not.
+            # gh api prints a log with colour codes only with the flag; _log_tail removes them.
+            job_logs = (["api", "--allow-escape-sequences", f"{self._path}/actions/jobs/{job['id']}/logs"] if unfinished
+                        else [*run_logs[:-1], "--job", str(job["id"]), "--log-failed"])
+            lines.append(self._log_tail(job_logs, f"log of job {job.get('name')}",
+                                        full_text_dir, f"ci-job-{job['id']}.log"))
+        # A failed run without failed jobs (e.g. an invalid workflow file) is
+        # still a failure the implementer may be able to repair.
+        if not failed:
+            lines.append(self._log_tail(run_logs, f"failed log of run {run_id}",
+                                        full_text_dir, f"ci-run-{run_id}.log"))
+        return "\n".join(lines), started_failure or not failed
+
+    def _log_tail(self, args: list[str], what: str, full_text_dir: Path | None, name: str) -> str:
+        try:
+            output = self._call(args)
+        except TrackerError as exc:
+            return _unavailable(what, exc)
+        output = _TERMINAL_CONTROL.sub("", output)
+        if not output.strip():
+            return f"(CI evidence unavailable: {what}: GitHub returned an empty log)"
+        return cuts.tail(output, 4000, full_text_dir, name)
 
     def _job_annotations(self, job: dict[str, Any]) -> list[str]:
         check_run = job.get("check_run_url") or f"{self._path}/check-runs/{job['id']}"
@@ -1572,13 +1688,14 @@ class GhTracker:
         return [item["message"] for item in annotations if isinstance(item.get("message"), str)]
 
     def merge_pr(self, pr: int, *, expected_head_sha: str, method: str = "squash",
-                 subject: str | None = None) -> None:
+                 subject: str | None = None, delete_branch=True) -> None:
         # Explicit subject/body prevent GitHub's defaults from copying branch
         # messages, including runner-only trailers, into the squash commit.
         if subject is None and method == "squash":
             subject = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "title"]))["title"]
         self._call([
-            "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method), "--delete-branch",
+            "pr", "merge", str(pr), "-R", self.repo, _merge_flag(method),
+            *(["--delete-branch"] if delete_branch else []),
             "--match-head-commit", expected_head_sha,
             *(["--subject", subject] if subject is not None else []),
             *(["--body", ""] if method == "squash" else []),

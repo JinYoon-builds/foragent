@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from foragent import capacity, orch_facts_machine, orch_queue
+from foragent import capacity, orch_facts_machine, orch_plan, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
 from foragent.state import Run, StateStore
@@ -120,23 +120,25 @@ def _alive(run: Run, now: datetime, alive: dict[int, bool]) -> bool:
 
 
 def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: dict[int, bool]) -> int:
-    """capacity.machine_runs without its signal probe: this store's runs and live sibling runs."""
-    numbers = {run.number for run in running}
-    count = len(running) + sum(1 for number, prepared in store.run_starts().items()
-                               if number not in numbers and capacity._within_grace(prepared, now))
+    """capacity.machine_runs without its signal probe: this store's runs, live sibling runs and live workloads."""
+
+    def slots(source: StateStore, counted: list[Run], runs: list[Run]) -> int:
+        numbers = {run.number for run in runs}
+        starts = [number for number, prepared in source.run_starts().items()
+                  if number not in numbers and capacity._within_grace(prepared, now)]
+        return len(counted) + len(starts) + orch_facts_machine.workload_slots(source.root, counted, starts, alive)
+
+    count = slots(store, [run for run in running if capacity.phase_holds_slot(run.phase)], running)
     try:
-        siblings = [root for root in store.root.parent.iterdir()
-                    if root != store.root and ((root / "runs").is_dir() or (root / "run-starts").is_dir())]
+        siblings = [root for root in store.root.parent.iterdir() if root != store.root and capacity._holds_anything(root)]
     except OSError:
         siblings = []
     for root in siblings:
         try:
             sibling = StateStore(root, now=lambda: now)
             runs = _still_running(sibling, sibling.active_runs())
-            running = {run.number for run in runs}
-            count += sum(_alive(run, now, alive) for run in runs) + sum(
-                1 for number, prepared in sibling.run_starts().items()
-                if number not in running and capacity._within_grace(prepared, now))
+            count += slots(sibling, [run for run in runs
+                                     if capacity.phase_holds_slot(run.phase) and _alive(run, now, alive)], runs)
         except (OSError, ValueError, TypeError, KeyError):
             continue
     return count
@@ -149,10 +151,10 @@ def _admission(
     """Replay the gate's start loop read-only: machine budget, project ceiling, lane holds, file rule.
 
     Each startable issue gets the first reason the loop would hold it for (cap,
-    quota, structure), or starts and claims its Files for the issues after it.
+    plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
     from foragent.overlap_files import Claim, admits, any_overlap, claims, recorded_union
-    from foragent.scheduler_start import _lane_held
+    from foragent.scheduler_start import _lane_hold
 
     ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
     if not probe:
@@ -197,8 +199,8 @@ def _admission(
             # No slot ends the loop: nothing after this point is checked.
             held.update({later: "cap" for _, later in ranked[index:]})
             break
-        if _lane_held(ctx, lane, now, number):  # The issue's own quota decision, as the tick makes it.
-            held[number] = "quota"
+        if (hold := _lane_hold(ctx, lane, now, number)) is not None:  # The tick's own lane hold, per issue.
+            held[number] = hold
         elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
             held[number] = "structure"
         elif hold_all == "machine":
@@ -212,10 +214,15 @@ def _admission(
                 known.append(Claim(run, item.parsed, item.parsed.files))
             else:
                 unknown.append(run)
+    paused = orch_plan.load(store, now)["paused"]
+    held_lanes = {items[number].lane for number, reason in held.items() if reason == "plan_pause"}
+    plan_paused = {lane: {"until": paused[lane]["until"], "why": paused[lane]["why"]}
+                   for lane in sorted(held_lanes) if lane in paused}
     return {"machine_cap": machine_cap, "machine_runs": machine_active, "project_runs": project_active,
             "project_cap": config.max_parallel, "free_run_slots": free,
             "waiting_issues": [item.number for item in waiting if item.startable],
-            "overlap_blocked": contended, "held": {str(number): reason for number, reason in sorted(held.items())}}
+            "overlap_blocked": contended, "held": {str(number): reason for number, reason in sorted(held.items())},
+            "plan_paused": plan_paused}
 
 
 def _resources(store: StateStore, config: Config, root, now: datetime, waiting, slots, running,
@@ -242,7 +249,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
     work["idle_while_waiting"] = work["free_run_slots"] > 0 and "structure" in held
     # Executors the waiting work needs: startable waiting issues and runs waiting in flight.
     lanes = {item.lane for item in waiting if item.startable}
-    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait")}
+    lanes |= {run.lane for run in running if run.phase in ("test-slot-wait", "overlap-wait", "run-slot-wait")}
     needed = set().union(*(lane_executors(config, lane) for lane in lanes)) if lanes else set()
     quota = _quota(store, now)
     for name, value in quota.items():
@@ -263,7 +270,7 @@ def _resources(store: StateStore, config: Config, root, now: datetime, waiting, 
 
 
 def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
-    """The one resource holding work now; machine and quota are real limits, the rest are fixable."""
+    """The one resource holding work now; machine, quota and lane holds are normal, the rest are fixable."""
     machine, slots, work = resources["machine"], resources["test_slots"], resources["parallelizable_work"]
     held: dict[str, list[str]] = {}
     for number, reason in work["held"].items():
@@ -278,7 +285,7 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
                 "detail": f"load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}"}
     if "github" in held:
         return {"kind": "github", "normal": True,
-                "detail": f"GitHub rate limit until {work['github_wait_until']}; the tick starts nothing: "
+                "detail": f"GitHub pause until {work['github_wait_until']}; the tick starts nothing: "
                           + ", ".join(held["github"])}
     if "run_hours" in held:
         return {"kind": "run_hours", "normal": True,
@@ -286,6 +293,14 @@ def _binding(resources: dict[str, Any]) -> dict[str, Any] | None:
     if "quota" in held:
         return {"kind": "quota", "normal": True,
                 "detail": "usage-limit pause holds " + ", ".join(held["quota"])}
+    if "plan_pause" in held:
+        paused = work.get("plan_paused", {})
+        lanes = "; ".join(f"lane {lane} until {item['until']}: {item['why']}" for lane, item in paused.items())
+        return {"kind": "plan_pause", "normal": True,
+                "detail": "plan pause holds " + ", ".join(held["plan_pause"]) + (f" ({lanes})" if lanes else "")}
+    if "dream" in held:
+        return {"kind": "dream", "normal": True,
+                "detail": "lane dream holds " + ", ".join(held["dream"])}
     if slots["queue_length"] > 0:
         return {"kind": "test_slots", "normal": False,
                 "detail": f"{slots['queue_length']} waiting for {slots['admitted']} admitted test slot(s) with machine headroom"}

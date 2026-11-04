@@ -91,7 +91,7 @@ def recorded_github(values, *, runs=None):
             return json.dumps({'full_name': 'owner/repo', 'default_branch': 'trunk'})
         if '/actions/runs?head_sha=head&' in endpoint:
             return json.dumps(runs if runs is not None else [values[0]['run'] if values else report()['run']])
-        if '/actions/runs/42/artifacts?' in endpoint:
+        if '/artifacts?' in endpoint:
             artifacts = [value['artifact'] for value in values]
             return '\n'.join(json.dumps([artifact]) for artifact in artifacts) or '[]'
         for value in values:
@@ -184,6 +184,46 @@ def compare(checks, count=2):
                       expected_scope=measurement_scope(Config(ci_shards=count), Path('.'), []),
                       expected_shards=range(count))
 
+
+
+@pytest.mark.parametrize("approve", [True, False], ids=["later-main", "unapproved"])
+def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkeypatch, approve):
+    """Main can move between fetch and push; CI then measures that later base (#1688)."""
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks="ci", checks_fallback=None, test_command="pytest", ci_shards=2)
+    values = [report(), report(1)]  # both shards measured "base"
+    for value in values:
+        value["report"]["scope"] = measurement_scope(config, tmp_path, [])
+    asked, sleeps = [], []
+    git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
+    tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
+                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
+                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "flag", lambda *args: None)
+
+    def later_base(sha):
+        asked.append(sha)
+        return approve
+
+    deadline = BASE_TIME.timestamp()
+    if approve:
+        evidence = ci_mode.require_comparison(attempt, 99, "head", base_sha="pushed", deadline=deadline,
+                                              later_base=later_base)
+        assert asked == ["base"] and sleeps == []
+        assert evidence.base_sha == "base" and evidence.reports is not None
+        assert evidence.current(1, ctx, git, 99, "head", "base", "pass")
+        assert not evidence.current(1, ctx, git, 99, "head", "pushed", "pass")
+    else:
+        with pytest.raises(ExecutorStopped):
+            ci_mode.require_comparison(attempt, 99, "head", base_sha="pushed", deadline=deadline,
+                                       later_base=later_base)
+        assert asked == ["base"]
 
 @pytest.mark.parametrize("damage", ["non-json-extra", "circular-extra", "overflow-duration",
                                    "transport-key", "transport-type", "transport-json", "transport-recursion", "transport-overflow"])
@@ -286,7 +326,9 @@ def test_rejects_unusable_shards(damage):
         checks[1] = deepcopy(checks[0])
         payload = checks[1]['report']
     elif damage == "cancelled":
+        # A red run alone is usable evidence; its incomplete report is not.
         checks[1]['run']["conclusion"] = "cancelled"
+        payload["head"]["complete"] = False
     elif damage == "exclusions":
         payload['excluded'] = ['tests/acceptance/test_unapproved.py']
     checks[1]['report'] = '{' if damage == 'malformed' else payload
@@ -864,7 +906,8 @@ def test_shard_publishes_real_base_and_head_measurements(git_history, tmp_path, 
     assert payload['base']['complete'] and payload['head']['complete']
     assert f'{keep}::test_keep' in payload['base']['passing_ids']
     assert f'{keep}::test_keep' not in payload['head']['passing_ids']
-    assert output.read_text() == 'comparison=true\n'
+    assert output.read_text() == 'comparison=true\nlost=1\n'
+    assert (tmp_path / 'shard-0.lost').read_text() == f'{keep}::test_keep\n'
 
 
 @pytest.mark.parametrize('legacy_value', ['["stale-tree"]', 'invalid JSON'])
@@ -1419,6 +1462,7 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     reads = []
     heads = set()
     locks = []
+    measured = {}  # CI measures each pushed head once; a later main move never rewrites it
     merge_lock = case.store.merge_lock
     sleep = case.ctx.sleep
 
@@ -1427,14 +1471,15 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
         heads.add(head)
         if changed[0] and change == 'missing':
             return []
-        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
+        base = measured.setdefault(head, case.history.tip)
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), base)
         values = [report(), report(1)]
         for value in values:
             value['run']['head_sha'] = value['artifact']['workflow_run']['head_sha'] = head
             if changed[0] and change == 'producer':
                 value['run']['id'] = value['artifact']['workflow_run']['id'] = 43
             payload = value['report']
-            payload.update(base_sha=case.history.tip, head_sha=head, excluded=excluded,
+            payload.update(base_sha=base, head_sha=head, excluded=excluded,
                            scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
             if changed[0] and change == 'regression':
                 payload['head']['passing_ids'] = []
@@ -1470,11 +1515,12 @@ def test_final_lock_rechecks_comparison_and_releases_before_reverification(run_c
     case.ctx.sleep = unlocked_sleep
     outcome = runner.review_only(1, case.ctx, repair_ci=False) if reviewed else runner.run_issue(1, case.ctx)
 
-    # Both paths refresh a moved base on their merge turn (#712).
+    # Both paths recheck a moved base on their merge turn (#712); only review-only
+    # merges a neutral docs move into the head, implementation reuses it (#1688).
     if change in {'producer', 'base'}:
         assert outcome == 'merged'
         assert len(locks) == 2
-        assert len(heads) == (2 if change == 'base' else 1)
+        assert len(heads) == (2 if change == 'base' and reviewed else 1)
     else:
         assert outcome != 'merged' and not case.tracker.merged_prs
     if change in {'producer', 'regression', 'missing'}:
@@ -1579,3 +1625,125 @@ def test_github_binary_download_preserves_bytes_and_text_errors(monkeypatch):
         tracker._call(['api', 'missing'])
     assert exc.value.stdout == 'body'
     assert all(not kwargs.get('text') for _, kwargs in calls)
+
+
+def _evidence_rows(store):
+    return [row["data"] for row in store.flow_records() if row["kind"] == "ci-evidence"]
+
+
+def _evidence_store(tmp_path):
+    from conftest import BASE_TIME
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / 'state', now=lambda: BASE_TIME)
+    store.start_run(1, branch='foragent/issue-1', worktree=store.worktree_path(1))
+    return store
+
+
+def test_acceptance_closes_only_an_open_evidence_refusal(tmp_path):
+    from foragent import ci_mode
+
+    store = _evidence_store(tmp_path)
+    ctx = SimpleNamespace(store=store)
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    assert _evidence_rows(store) == [], 'Nothing was refused, so there is nothing to close'
+    for _ in range(2):
+        ci_mode._note_evidence(ctx, 1, 'base', 'head', 'missing', 'no shards')
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    ci_mode._note_evidence(ctx, 1, 'base', 'head')
+    assert [(row['refused'], row['reason'], row['detail']) for row in _evidence_rows(store)] == [
+        (True, 'missing', 'no shards'), (False, None, None)]
+    assert _evidence_rows(store)[0]['base_sha'] == 'base' and _evidence_rows(store)[0]['head_sha'] == 'head'
+
+
+@pytest.mark.parametrize('error,reason', [
+    ('stale', 'stale'), ('missing', 'missing'), ('unusable', 'unusable'), ('transport', 'unavailable'),
+])
+def test_refusal_reason_comes_from_the_refused_branch(error, reason):
+    from foragent import ci_mode
+    from foragent.tracker import TrackerError
+
+    raised = {'stale': ci_mode.StaleComparison, 'missing': ci_mode.MissingComparison,
+              'unusable': ci_mode.UnusableComparison, 'transport': TrackerError}[error]
+    assert ci_mode._refusal(raised('same words')) == reason
+
+
+def test_failed_observation_never_replaces_the_comparison_result():
+    from foragent import ci_mode
+
+    def broken(n):
+        raise OSError('state unreadable')
+
+    ci_mode._note_evidence(SimpleNamespace(store=SimpleNamespace(get_run=broken)), 1, 'base', 'head', 'missing', 'x')
+
+
+def _read_case(tmp_path, monkeypatch):
+    """Evidence accepted unlocked, read again under the lock with real reports."""
+    from foragent import ci_mode
+
+    store = _evidence_store(tmp_path)
+    reads = []
+
+    def reports(head):
+        value = reads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    ctx = SimpleNamespace(store=store, config=Config(checks='ci', test_command='pytest'), repo_root=tmp_path,
+                          tracker=SimpleNamespace(pr_acceptance_reports=reports))
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+    monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': []})
+    accepted = ci_mode.ComparisonEvidence('base', 'head', {'excluded': []}, 'trusted', 'pass', '',
+                                          ci_mode.serialize_reports([{'shard': 0}]))
+    return ctx, accepted, reads
+
+
+def test_each_changed_refusal_at_a_read_keeps_its_own_cause_and_acceptance_closes(tmp_path, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    reads += [[{'shard': 0}], [], [], TrackerError('HTTP 500'), [{'shard': 9}], [{'shard': 0}]]
+    answers = [accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') for _ in range(6)]
+    assert answers == [True, False, False, False, False, True]
+    assert [(row['refused'], row['reason'], row['detail']) for row in _evidence_rows(ctx.store)] == [
+        (True, 'missing', 'no acceptance reports at this read'),
+        (True, 'unavailable', 'HTTP 500'),
+        (True, 'reports-changed', 'the reports differ from the accepted ones'),
+        (False, None, None),
+    ]
+    assert all(row['base_sha'] == 'base' and row['head_sha'] == 'head' for row in _evidence_rows(ctx.store))
+
+
+@pytest.mark.parametrize('change,reason', [
+    ({'base_sha': 'moved'}, 'revision-moved'), ({'head': 'moved'}, 'revision-moved'),
+    ({'status': 'fail'}, 'status-changed'),
+])
+def test_a_moved_read_names_what_moved_without_reading_reports(tmp_path, monkeypatch, change, reason):
+    ctx, accepted, _reads = _read_case(tmp_path, monkeypatch)
+    read = {'head': 'head', 'base_sha': 'base', 'status': 'pass', **change}
+    assert accepted.current(1, ctx, None, 2, **read) is False
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == [reason]
+
+
+def test_trusted_branch_and_scope_changes_are_named(tmp_path, monkeypatch):
+    from foragent import ci_mode
+
+    ctx, accepted, _reads = _read_case(tmp_path, monkeypatch)
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'other')
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+    monkeypatch.setattr(ci_mode, '_trusted_sha', lambda *args: 'trusted')
+    monkeypatch.setattr(ci_mode, 'measurement_scope', lambda *args: {'excluded': [], 'more': 1})
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is False
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ['trusted-moved', 'scope-changed']
+
+
+def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, monkeypatch):
+    from foragent.tracker import TrackerError
+
+    ctx, accepted, reads = _read_case(tmp_path, monkeypatch)
+    reads.append(TrackerError('API rate limit exceeded'))
+    with pytest.raises(TrackerError):
+        accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
+    assert _evidence_rows(ctx.store) == []

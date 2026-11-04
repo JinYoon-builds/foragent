@@ -10,7 +10,7 @@ from pathlib import Path
 import subprocess
 import uuid
 
-from foragent import notify, orch_spawn
+from foragent import notify, orch_spawn, session_skills
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.state import StateStore
@@ -33,15 +33,18 @@ def _environment(session_id: str) -> dict[str, str]:
     return {**os.environ, **orch_spawn._role_env(session_id)}
 
 
-def plan_launch(root: Path, store: StateStore, now: datetime,
+def plan_launch(root: Path, store: StateStore, config: Config, now: datetime,
                 prompt: str | None = None) -> tuple[str, list[str], dict, dict] | None:
     """Pick a new session id and the launch command: ``(screen, argv, env, descriptor)``, or None without Claude.
 
-    Every screen (Orca, tmux, ``claude --bg``) passes ``--session-id`` with the
-    new id, so every launch has a descriptor to record.
+    The launch is always ``claude --bg`` (#1490) with ``--session-id`` set to
+    the new id, so every launch has a descriptor to record. The orchestrator's
+    default skills travel in the first message, with any ``prompt``.
     """
     session_id = str(uuid.uuid4())
-    chosen = orch_spawn._command(root, store, f"orch: {root.name}", session_id, prompt)
+    defaults = session_skills.section(config, "orchestrator", root)
+    first = f"{prompt or ''}{defaults}".strip() if defaults else prompt
+    chosen = orch_spawn._command(root, store, f"orch: {root.name}", session_id, first)
     if chosen is None:
         return None
     screen, argv = chosen
@@ -108,17 +111,20 @@ def spawn_orchestrator(repo_root: Path, store: StateStore, config: Config, *, pr
     (a refresh replaces a live session on purpose). Claude gets a new
     ``--session-id`` and ``prompt`` after ``/fa-orchestrator``. Returns
     ``{session_id, transcript_path, started_at}``, or None when spawning is off,
-    Claude or a screen is missing, or the launch failed. The caller holds the
+    Claude is missing, or the launch failed. The caller holds the
     openers' lock (``watch_open._opening``) from its checks until it has made
     the descriptor active, so two refreshes or a refresh and a gate spawn never
     interleave; this function takes no lock and writes no heartbeat.
     """
     if os.environ.get("FORAGENT_ORCH_SPAWN") == "off":
+        orch_spawn.note_skip(store, "disabled")
         return None
     root = repo_root.resolve()
-    planned = plan_launch(root, store, now, prompt)
+    planned = plan_launch(root, store, config, now, prompt)
     if planned is None or not launch(root, store, now, planned):
+        orch_spawn.note_skip(store, "launch-unavailable" if planned is None else "launch-failed")
         return None
+    orch_spawn.note_opened(store, planned)
     take_seat(store, planned, now)  # The deliberate replacement: the old holder becomes previous.
     _opened(store, config, root, now, planned)
     return planned[3]

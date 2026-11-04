@@ -56,8 +56,10 @@ def test_order_progress_and_lane_totals_use_full_history_without_closed_orders(t
     assert result.recent == 14 and result.eta == NOW
     assert result.eta_basis == {"m": 14}
     output = watch.render_frame(result, config, tmp_path)
-    assert "13/14" in output and "✓ 13 done" in output and "Finished task 13" in output
-    assert "Finished task 14" not in output
+    # The r57 bar counts today's 14 merges (both orders) against them plus the one running
+    # issue; the old order totals stay in the snapshot for other consumers.
+    assert "93% · 14 of 15 issues done" in output and "13/14" not in output
+    assert "Finished task" not in output, "merged titles are not lane rows any more"
 
 
 def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
@@ -68,12 +70,16 @@ def test_a_lane_with_a_worker_shows_only_its_worker_row(tmp_path):
     tracker.add_issue(2, "Ready", labels=["approved", "ready", "lane:api"])
     tracker.add_issue(3, "Waiting", labels=["approved", "lane:api"])
     store.start_run(1, branch="active", worktree="unused", lane="api")
-    output = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
-    rows = [line for line in output.splitlines() if "Server" in line]
-    # Folded, the worker row is followed only by the next waiting issue (#170).
-    assert len(rows) == 2 and rows[0].startswith("🐿") and "#1 Working" in rows[0]
-    assert rows[1].startswith("⏳") and "#2 Ready" in rows[1]
-    assert "#3" not in output
+    result = snapshot(tracker, store, config)
+    output = watch.render_frame(result, config, tmp_path)
+    lines = output.splitlines()
+    # One lane block: its name row, the worker's acorn, then the queue on the next row.
+    name = next(index for index, line in enumerate(lines) if line[14:].startswith("Server"))
+    assert "◖█#1 prep▌" in lines[name + 1], "a worker with no recorded step yet is preparing"
+    queue = next(line for line in lines[name:] if "next  " in line)
+    assert "◖█#1" not in queue and [f"#{item['number']}" for item in result.status["lanes"]["api"]["queued"]] == [
+        part.strip("◖█▌") for part in queue[14:].removeprefix("next  ").split("  ")]
+    assert "#1 Working" not in output and "#2 Ready" not in output, "titles move into the click explanation"
 
 
 def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
@@ -81,12 +87,13 @@ def test_open_order_after_last_child_and_no_order_are_renderable(tmp_path):
     store = StateStore(tmp_path, now=lambda: NOW)
     config = Config()
     empty = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
-    # With no work and no handled events, both empty panels are hidden.
-    assert "no open order" in empty and "none yet" not in empty and "now doing" not in empty
+    # With no work, the bubble says so and no bar counts zero issues.
+    assert "Nothing to do now. Tell the planning session about new work." in empty
+    assert "issues done" not in empty and "none yet" not in empty and "now doing" not in empty
     tracker.add_issue(90, "Awaiting order closure")
     finish(tracker, store, 1, 90, lane="main")
     output = watch.render_frame(snapshot(tracker, store, config), config, tmp_path)
-    assert "1/1" in output and "This order is all done ✓" in output
+    assert "100% · 1 of 1 issue done" in output and "Just merged #1." in output
 
 
 @pytest.mark.parametrize("language,done_words", [("en", "1 done"), ("ko", "1개 끝냄")])
@@ -100,17 +107,19 @@ def test_idle_lanes_have_one_row_each_and_a_queued_lane_waits_for_a_turn(tmp_pat
     tracker.add_issue(90, "Order")
     finish(tracker, store, 1, 90, lane="docs")
     idle = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80).splitlines()
-    rows = {name: [line for line in idle if name in line and line.startswith("[z]")] for name in ("Server", "Docs")}
-    assert [len(found) for found in rows.values()] == [1, 1]
-    assert rows["Server"][0].startswith("[z]") and rows["Docs"][0].startswith("[z]")
-    assert f"✓ {done_words}" in rows["Docs"][0] and "✓" not in rows["Server"][0]
-    assert "▐" not in "\n".join(idle)
+    # Idle lanes share one block: each name once on the names row, today's count only where merged.
+    rows = {name: [line for line in idle if name in line] for name in ("Server", "Docs")}
+    assert [len(found) for found in rows.values()] == [1, 1] and rows["Server"] == rows["Docs"]
+    assert "🧩 Docs v1" in rows["Docs"][0] and "🔧 Server v" not in rows["Server"][0]
+    assert "▐" not in "\n".join(idle) and done_words not in "\n".join(idle)
 
     tracker.add_issue(2, "Next docs task", labels=["approved", "ready", "lane:docs"])
     active = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80).splitlines()
-    docs = [line for line in active if "Docs" in line and "#2" in line]
-    assert len(docs) == 1 and docs[0].startswith("[.]")
-    assert "waiting for a turn" in docs[0] or "차례 기다리는 중" in docs[0]
+    docs = [line for line in active if "[#2]" in line]
+    assert len(docs) == 1 and ("next  " in docs[0] or "다음  " in docs[0])
+    name = next(index for index, line in enumerate(active) if line.startswith("🧩 Docs"))
+    # The waiting reason row comes from the recorded facts; its sentence always leads.
+    assert active[name + 1].startswith("waiting its turn" if language == "en" else "순서를 기다려요")
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
@@ -121,7 +130,8 @@ def test_a_long_title_never_wraps_its_row(tmp_path, width):
     tracker.add_issue(1, "긴 작업 이름 " * 30, labels=["approved", "ready", "lane:api"])
     lines = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=width).splitlines()
     rows = [line for line in lines if "#1" in line]
-    assert len(rows) == 1 and ("…" in rows[0]) == (width >= 100 or watch._cells(rows[0]) == width)
+    # The acorn carries the number alone; the title waits for the click explanation.
+    assert len(rows) == 1 and "◖█#1▌" in rows[0] and "긴 작업" not in "\n".join(lines)
     assert all(watch._cells(line) <= width for line in lines)
 
 
@@ -203,9 +213,10 @@ def test_unicode_layout_fits_resized_terminal_and_preserves_event_summary(tmp_pa
     result.events = [{"summary": "긴 사건 기록도 잘리지 않고 마지막 내용까지 보여야 합니다 끝", "at": NOW.isoformat()}]
     output = watch.render_frame(result, config, tmp_path, width=width)
     assert all(watch._cells(line) <= width for line in output.splitlines())
-    # The frame is unbounded (shell): the event log stays at every width, and the usage
+    # The r56 bubble replaces the event log; the event itself stays in the snapshot. The usage
     # and hint rows are the last two rows, cut to the width instead of wrapped.
-    assert "합니다 끝 ✓" in output
+    assert "합니다 끝" not in output and result.events[0]["summary"].endswith("합니다 끝")
+    assert "지금은 할 일이 없어요." in output.replace("\n", " ") or width < 80
     lines = output.splitlines()
     assert lines[-2].startswith("Claude —") and "동시 " not in lines[-2]
     assert lines[-1].startswith("도토리를 누르면")

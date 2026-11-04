@@ -41,7 +41,7 @@ def test_settings_cmd_list_describes_all_scopes_and_fixed_choices_without_llm(tm
             assert {"key", "scope", "value", "description"} <= item.keys()
             assert item["scope"] == scope
             assert isinstance(item["description"], str) and item["description"].strip()
-    for key, choices in {"review": {"fast", "batch", "careful"},
+    for key, choices in {"review": {"fast", "careful"},
                          "claude_quota.mode": {"keep", "burn"}, "animation": {True, False}}.items():
         assert set(by_key[key]["choices"]) == choices
     assert case.gh_calls == []
@@ -79,9 +79,9 @@ def test_settings_cmd_set_persists_only_the_owning_scope_and_get_reads_it(tmp_pa
 def test_settings_cmd_invalid_value_is_atomic_and_does_not_invoke_executor(tmp_path, monkeypatch, capsys):
     case = offline_local_cli(tmp_path, monkeypatch)
     # Establish a valid command first: an absent parser is not evidence of validation.
-    assert settings_command(case, "set", "review", "batch") == 0
+    assert settings_command(case, "set", "review", "fast") == 0
     before = file_bytes(tmp_path)
     assert settings_command(case, "set", "review", "fastest") != 0
     assert file_bytes(tmp_path) == before
-    assert setting_value(case, "review", capsys) == "batch"
+    assert setting_value(case, "review", capsys) == "fast"
     assert case.gh_calls == []

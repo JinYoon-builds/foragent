@@ -13,11 +13,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox, watch_lane_facts, watch_role_facts
+from foragent import orch_events, orch_inbox, watch_lane_facts, watch_role_facts
 from foragent.config import Config
 from foragent.labels import issue_lane
 from foragent.status import issue_state
 from foragent.state import StateStore
+from foragent.state_issues import _copy
 from foragent.tracker import Issue, Tracker
 from foragent.watch_sections import orch_panel, progress
 
@@ -76,6 +77,29 @@ class Snapshot:
     role_facts: dict[str, dict] = field(default_factory=dict)
     waiting_facts: dict[int, dict] = field(default_factory=dict)
     park_facts: dict[int, dict] = field(default_factory=dict)
+    # Whose turn each issue's question awaits (watch_questions.collect) and the open inbox
+    # questions that list no issue; None when not collected (the header then reads status).
+    questions: dict[int, str] | None = None
+    unlinked_questions: int = 0
+    # Each open issue whose question awaits someone: its number, lane slug, title and row state.
+    question_issues: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+
+def _questions(store: StateStore, history: list[Any] | None) -> dict[str, Any]:
+    """Snapshot fields for whose turn each question awaits; unreadable facts leave them uncollected."""
+    from foragent import watch_questions
+
+    try:
+        found = watch_questions.collect(store, history)
+    except (OSError, ValueError):
+        return {}
+    asking = {number for number, who in found.issues.items()
+              if who in (watch_questions.PERSON, watch_questions.ORCHESTRATOR)}
+    issues = {number: {"number": number, "lane": row.get("lane"), "title": row.get("title"),
+                       "state": issue_state(row.get("labels") or (), False)}
+              for row in store.local_issues()
+              if (number := row["number"]) in asking and row.get("state") == "open"}
+    return {"questions": found.issues, "unlinked_questions": found.unlinked, "question_issues": issues}
 
 
 # The checkout a refresh reads root-dependent facts under. watch.run binds it around its
@@ -119,41 +143,27 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
 
     events: deque[dict[str, Any]] = watch.deque(maxlen=5)
     try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = watch.json.loads(line)
-                except watch.json.JSONDecodeError:
-                    continue
-                if isinstance(event, dict) and isinstance(event.get("summary"), str):
-                    events.append(event)
+        for event in orch_events.read_events(store):
+            if isinstance(event.get("summary"), str):
+                events.append(event)
     except OSError:
         pass  # Missing or unreadable: no recent events.
-    return list(reversed(events))
+    return [_copy(event) for event in reversed(events)]
 
 
 def journal_facts(store: StateStore) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any] | None]:
     """Every closed phase event by issue and the latest event with a say line, from the whole journal."""
-    from foragent import watch
-
     phases: dict[int, list[dict[str, Any]]] = {}
     say = None
     try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = watch.json.loads(line)
-                except watch.json.JSONDecodeError:
-                    continue  # An append still being written.
-                if not isinstance(event, dict):
-                    continue
-                if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
-                    phases.setdefault(event["issue"], []).append(event)
-                if isinstance(event.get("say"), str) and event["say"].strip():
-                    say = event
+        for event in orch_events.read_events(store):
+            if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
+                phases.setdefault(event["issue"], []).append(_copy(event))
+            if isinstance(event.get("say"), str) and event["say"].strip():
+                say = event
     except OSError:
         pass  # Missing or unreadable: no phase events and no say line.
-    return phases, say
+    return phases, _copy(say)
 
 
 def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict[str, float], dict[int, float]]:
@@ -228,8 +238,9 @@ def collect(
     except (OSError, ValueError):
         history = None  # Unreadable history: no completions or week counts, not zero ones.
     merged = {}
+    owner_facts = store.owner_merge_facts() if history is not None else {}
     for run in history or []:
-        if run.outcome == "merged":
+        if store.run_merged(run, owner_facts=owner_facts):
             merged.pop(run.number, None)
             merged[run.number] = run
     done: dict[str, list[Issue]] = {}
@@ -303,4 +314,5 @@ def collect(
                           role_facts=watch_role_facts.collect(store),
                           waiting_facts=watch_lane_facts.waiting_facts(status, store, config, now, repo_root,
                                                                        rows, found_meter, history),
-                          park_facts=watch_lane_facts.park_facts(events))
+                          park_facts=watch_lane_facts.park_facts(events),
+                          **_questions(store, history))

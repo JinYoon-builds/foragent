@@ -12,12 +12,33 @@ def add(commands) -> None:
                         help="Run each executor once on a throwaway task in a temporary clone")
     doctor.add_argument("--executor", choices=("codex", "claude"),
                         help="Executor to check (default: the configured executor)")
+    doctor.add_argument("--setup", action="store_true", help="Read the machine setup checklist (works before init)")
+    doctor.add_argument("--json", action="store_true", help="Print the setup checklist as one JSON object")
     doctor.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
     cli = facade()
+    if args.setup:
+        from foragent import setup
+
+        try:
+            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
+            status = result.stdout + "\n" + result.stderr if result.returncode == 0 else ""
+        except (OSError, cli.subprocess.TimeoutExpired):
+            status = ""
+        items = setup.checklist(status)
+        if args.json:
+            print(cli.json.dumps({"items": items}))
+        else:
+            for item in items:
+                print(f"{'PASS' if item['ok'] else 'FAIL'} {item['id']}" +
+                      (f": {item['fix']}" if not item['ok'] else ""))
+        return 0 if all(item["ok"] for item in items) else 1
     root = args.repo_root.resolve()
+    if not (root / ".foragent.yml").is_file():
+        print("foragent: not a Foragent repo: .foragent.yml missing; run `fa init` first", file=cli.sys.stderr)
+        return 1
     config = cli.load_config(root)
     from foragent.roles import role_drift
     from foragent.runner_doctor import lane_skill_drift

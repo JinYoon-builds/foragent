@@ -21,6 +21,26 @@ def write_settings(path, settings):
     path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
 
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./...", "pytest && npm test"])
+def test_merge_owner_refuses_unsupported_test_commands_at_config_load(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    with pytest.raises(ConfigError) as error:
+        load_config(repo)
+    assert str(error.value) == "merge_owner requires an explicit supported pytest command in test_command."
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "uv run pytest", "python -m pytest tests"])
+def test_merge_owner_accepts_supported_pytest_commands(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    assert load_config(repo).merge_owner is True
+
+
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./..."])
+def test_flag_off_keeps_other_test_commands_supported(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": False, "test_command": command})
+    assert load_config(repo).test_command == command
+
+
 @pytest.mark.parametrize("value", ["auto", 1, 3, 12])
 def test_merge_group_max_accepts_auto_or_positive_integer(repo, value):
     write_settings(repo / ".foragent.yml", {"merge_group_max": value})
@@ -37,16 +57,17 @@ def test_merge_group_max_error_names_both_forms(repo, value):
 
 def test_exact_defaults(repo):
     expected = {
-        "review": "batch", "review_paths": {}, "always_human": [], "executor": "codex",
+        "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
-        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always",
+        "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "merge_owner": False,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low",
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True, "review_scoring": True,
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
@@ -56,7 +77,7 @@ def test_exact_defaults(repo):
         "presence": {"statusline": True, "session_start": True, "report": True},
         "executor_list": None,  # No repository executors list (#786).
         "order_written": False,  # No executor order written: headroom chooses (#186).
-        "skill_roles": {},
+        "skill_roles": {}, "default_skills": {},
         "lanes": {}, "max_parallel": None, "test_slots": 2, "overlap_per_file": 2,
         "overlap_mode": "measured",
         "executor_fallback_model": None,
@@ -65,6 +86,9 @@ def test_exact_defaults(repo):
                   "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
                   "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None}},
         "tiers_headroom_ample": 0.5,
+        "size_limits": {"s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
+                        "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
+                        "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25}},
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -128,14 +152,14 @@ def test_merge_order_and_nested_mapping_replacement(repo, tmp_path):
         "review_paths": {"global/**": "careful"}, "approvers": ["global-user"],
     })
     write_settings(repo / ".foragent.yml", {
-        "review": "fast", "review_paths": {"local/**": "batch"},
+        "review": "fast", "review_paths": {"local/**": "fast"},
         "approvers": ["local-user"], "executor_model": None,
     })
     config = load_config(repo, global_path)
     assert config.review == "fast"
     assert config.executor == "claude"
     assert config.executor_model is None
-    assert config.review_paths == {"local/**": "batch"}
+    assert config.review_paths == {"local/**": "fast"}
     assert config.approvers == ["local-user"]
     assert config.max_retries == 2
 
@@ -202,6 +226,7 @@ def test_invalid_yaml_and_non_mapping_config(repo, text):
     ("approvers", "user"), ("approvers", [None]),
     ("executor_model", 42), ("reviewer_model", []),
     ("acceptance_dir", ""), ("acceptance_dir", None), ("base_branch", "  "),
+    ("scheduled_roles", "sometimes"), ("scheduled_roles", 1), ("scheduled_roles", None),
     ("run_hours", "24-08"), ("run_hours", "09-24"), ("run_hours", "9-18"),
     ("run_hours", "09:00-18:00"), ("run_hours", "Always"), ("run_hours", None),
     ("run_hours", 1), ("run_hours", "09-18\n"),
@@ -286,7 +311,7 @@ def test_retired_floor_keys_are_accepted_and_ignored(repo, tmp_path, source, val
 
 def test_all_valid_overrides(repo):
     settings = {
-        "review": "careful", "review_paths": {"app/**": "fast", "lib/**": "batch"},
+        "review": "careful", "review_paths": {"app/**": "fast", "lib/**": "careful"},
         "always_human": ["auth/**"], "executor": "claude", "reviewer": "codex",
         "executor_model": "implementation-model", "reviewer_model": "review-model",
         "approvers": ["human"], "acceptance_dir": "checks/", "notify": ["slack:#project"],
@@ -520,7 +545,62 @@ def test_legacy_owner_must_be_a_github_login(repo, tmp_path, login):
         load_config(repo, tmp_path / "global.yml")
 
 
+def test_review_pass_scope_defaults_on_and_loads_from_the_repository(repo):
+    assert load_config(repo).review_pass_scope is True
+    write_settings(repo / ".foragent.yml", {"review_pass_scope": False})
+    assert load_config(repo).review_pass_scope is False
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_review_pass_scope_must_be_a_boolean(repo, value):
+    write_settings(repo / ".foragent.yml", {"review_pass_scope": value})
+    with pytest.raises(ConfigError, match="review_pass_scope must be true or false"):
+        load_config(repo)
+
+
 def test_legacy_owner_is_optional_and_kept_as_written(repo, tmp_path):
     assert load_config(repo, tmp_path / "global.yml").legacy_owner is None
     write_settings(repo / ".foragent.yml", {"legacy_owner": "Jin-Yoon"})
     assert load_config(repo, tmp_path / "global.yml").legacy_owner == "Jin-Yoon"
+
+
+@pytest.mark.parametrize("table", [
+    ["one"], "one", {"workers": "one"}, {"workers": [3]}, {"testers": ["one"]},
+    {"workers": ["../outside"]}, {"workers": ["a/../b"]}, {"workers": ["one two"]},
+])
+def test_default_skills_refuses_anything_but_a_role_table(tmp_path, table):
+    (tmp_path / ".foragent.yml").write_text(yaml.safe_dump({"default_skills": table}))
+    with pytest.raises(ConfigError, match="default_skills"):
+        load_config(tmp_path, global_path=tmp_path / "missing.yml")
+
+
+def test_default_skills_local_table_replaces_the_global_one_and_blank_means_empty(tmp_path):
+    other = tmp_path / "global.yml"
+    other.write_text(yaml.safe_dump({"default_skills": {"docs": ["kwp:engineering/one"], "workers": ["two"]}}))
+    (tmp_path / ".foragent.yml").write_text("repo: o/r\n")
+    assert load_config(tmp_path, global_path=other).default_skills == {
+        "docs": ["kwp:engineering/one"], "workers": ["two"]}
+    (tmp_path / ".foragent.yml").write_text("default_skills:\n  architect: [three]\n  docs:\n")
+    assert load_config(tmp_path, global_path=other).default_skills == {"architect": ["three"], "docs": None}
+
+
+def test_review_scoring_defaults_on_loads_and_rejects_non_bool(repo):
+    assert load_config(repo).review_scoring is True
+    write_settings(repo / ".foragent.yml", {"review_scoring": False})
+    assert load_config(repo).review_scoring is False
+    write_settings(repo / ".foragent.yml", {"review_scoring": "no"})
+    with pytest.raises(ConfigError, match="review_scoring"):
+        load_config(repo)
+
+
+def test_size_limits_merge_per_label_and_reject_bad_values(repo):
+    (repo / ".foragent.yml").write_text("size_limits:\n  m:\n    source_lines: 7\n")
+    limits = load_config(repo).size_limits
+    assert limits["m"] == {"source_lines": 7, "test_lines": 437, "file_count": 17}
+    assert limits["s"]["source_lines"] == 199
+    for bad in ("size_limits:\n  m:\n    source_lines: -1\n", "size_limits:\n  m:\n    lines: 3\n",
+                "size_limits:\n  xl:\n    source_lines: 3\n", "size_limits: 5\n",
+                "size_limits:\n  s:\n    file_count: true\n"):
+        (repo / ".foragent.yml").write_text(bad)
+        with pytest.raises(ConfigError, match="size_limits"):
+            load_config(repo)

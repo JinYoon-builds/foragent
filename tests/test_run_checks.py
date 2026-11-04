@@ -14,7 +14,7 @@ from foragent.reasons import Reason
 from foragent.runner import CheckResult, run_issue
 
 from conftest import ACCEPTANCE, git_command
-from runner_support import COMMAND, batch_setup, run_case, seed_batch, set_done_when
+from runner_support import COMMAND, run_case, set_done_when
 
 
 def test_generated_source_is_rechecked_and_committed_instead_of_old_index(run_case):
@@ -433,25 +433,6 @@ def test_retry_gets_remaining_budget_after_checks_spend_time(run_case, monkeypat
     monkeypatch.setattr("foragent.runner._check", check)
     assert run_issue(1, c.ctx) == "merged"
     assert [call["timeout_s"] for call in c.executor.calls] == [90 * 60, 88 * 60]
-
-
-def test_batch_acceptance_binding_still_uses_approval_snapshot(run_case):
-    c = run_case
-    batch_setup(c)
-    seed_batch(c, {ACCEPTANCE: "weakened by sibling"})
-    assert run_issue(1, c.ctx) == "hash-mismatch"
-    assert c.store.load_flag(1).reason == Reason.HASH_MISMATCH
-    assert not c.executor.calls and not c.tracker.created_prs
-
-
-def test_batch_still_checks_base_acceptance_when_batch_has_old_approved_copy(run_case):
-    c = run_case
-    batch_setup(c)
-    seed_batch(c, {"sibling.txt": "previous child"})
-    c.history.update({ACCEPTANCE: "changed on base after approval"})
-    assert run_issue(1, c.ctx) == "hash-mismatch"
-    assert c.store.load_flag(1).reason == Reason.HASH_MISMATCH
-    assert not c.executor.calls
 
 
 @pytest.mark.parametrize("command,expected", [

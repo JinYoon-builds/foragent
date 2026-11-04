@@ -1,9 +1,12 @@
 """Run records, run-start journal, pauses and run history."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from foragent import size_signal
+from foragent.file_cache import read_jsonl
+from foragent.state_issues import _copy
 from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run, carried_contract
 
@@ -11,6 +14,22 @@ from foragent.state_records import Run, carried_contract
 # Updates passing any of these change or attest process ownership, so they
 # observe the process tree; every other update is metadata only.
 PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
+
+
+def _owner_fact_matches(value):
+    if (not isinstance(value, dict) or type(value.get("number")) is not int
+            or not isinstance(value.get("started_at"), str)):
+        return False
+    fact = value.get("owner_merge")
+    if not isinstance(fact, dict) or value.get("owner_merge_started_at") != value["started_at"]:
+        return False
+    try:
+        merged = datetime.fromisoformat(fact["merged_at"])
+        started = datetime.fromisoformat(value["started_at"])
+        return (merged.tzinfo is not None and started.tzinfo is not None
+                and merged.astimezone(UTC) >= started.astimezone(UTC))
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 class RunRecordsMixin:
@@ -59,7 +78,13 @@ class RunRecordsMixin:
                       last_activity_at=timestamp, process_identities=identities, implementer=implementer,
                       executor=executor, reviewer=reviewer, executor_model=executor_model, **session, **contract)
             self._merge_lock_seconds.pop((number, timestamp), None)
-            self._write_run(run)
+            value = self._run_value(run)
+            # Owner completion fields belong to an execution, not to the issue.
+            if "owner_merge" in value:
+                for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
+                    value.pop(key, None)
+            self._write_run(run, value)
+            size_signal.freeze(self, number, approval, run, previous, restarted)  # this run's own estimate (#1696)
             if journal is not None:  # The audit event of this record (#107), under the same lock.
                 journal()
             return run
@@ -170,10 +195,52 @@ class RunRecordsMixin:
             value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
             self._write_json(path, value)
 
+    def record_owner_merge(self, number: int, started_at: str, fact: dict) -> None:
+        """Attach a validated GitHub merge fact to the admitted worker generation."""
+        with self._state_lock():
+            path = self.root / "runs" / f"{number}.json"
+            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            if value["started_at"] != started_at:
+                raise ValueError("Merge belongs to a superseded worker generation")
+            value["owner_merge"] = fact
+            value["owner_merge_started_at"] = started_at
+            value["merged_at"] = fact["merged_at"]
+            passed = value.get("last_review_pass_at")
+            value["review_pass_to_merge_seconds"] = (
+                (_state.datetime.fromisoformat(fact["merged_at"]) - _state.datetime.fromisoformat(passed)).total_seconds()
+                if passed else None)
+            self._write_json(path, value)
+            if value["status"] == "finished":
+                history = self.root / "runs.jsonl"
+                rows = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+                if not any(row["number"] == number and row["started_at"] == started_at
+                           and row.get("owner_merge") == fact
+                           and row.get("owner_merge_started_at") == started_at for row in rows):
+                    with history.open("a", encoding="utf-8") as stream:
+                        stream.write(_state.json.dumps(value, ensure_ascii=False) + "\n")
+
+    def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
+        """One completion fact, independent of the finished worker outcome."""
+        values = list(read_jsonl(self.root / "runs.jsonl"))
+        for path in (self.root / "runs").glob("[0-9]*.json"):
+            try:
+                values.append(_state.json.loads(path.read_text()))
+            except (OSError, ValueError):
+                continue  # Optional owner facts must not break readers of completed history.
+        return {(value["number"], value["started_at"]): _copy(value["owner_merge"]) for value in values
+                if _owner_fact_matches(value)}
+
+    def run_merged(self, run: Run, *, owner_facts=None) -> bool:
+        if run.outcome == "merged":
+            return True
+        facts = self.owner_merge_facts() if owner_facts is None else owner_facts
+        return (run.number, run.started_at) in facts
+
     def active_runs(self) -> list[Run]:
-        paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> records.
+        paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
         runs = [*map(self.get_run, sorted(int(path.stem) for path in paths if path.stem.isdigit())),
-                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-"))]
+                *(self.get_dream(path.stem[6:]) for path in sorted(paths) if path.stem.startswith("dream-")),
+                *self.draft_runs()]
         return [run for run in runs if run is not None and run.status == "running"]
 
     def pause_lane(self, lane: str, until: datetime) -> None:
@@ -209,11 +276,11 @@ class RunRecordsMixin:
     def executor_paused(self, executor: str, now: datetime) -> bool:
         return self.executor_pause_until(executor, now) is not None
 
-    def pause_github(self, until: datetime) -> datetime:
-        """Share a reset deadline across runners and ticks without shortening it."""
+    def pause_github(self, until: datetime, cause: str | None = None) -> datetime:
+        """Share a reset deadline across runners and ticks without shortening it; ``cause`` names an outage."""
         with self._state_lock():
             until = (self.github_wait_until(until) or until).astimezone(_state.UTC)
-            self._write_json(self.root / "github-pause.json", {"until": until.isoformat()})
+            self._write_json(self.root / "github-pause.json", {"until": until.isoformat(), "cause": cause})
             return until
 
     def github_wait_until(self, now: datetime) -> datetime | None:
@@ -225,8 +292,8 @@ class RunRecordsMixin:
         return until if now < until else None
 
     def finish_run(self, number: int | str, outcome: str, detail: str = "") -> Run:
-        if isinstance(number, str):  # A dream record (dream-<lane>) never enters runs.jsonl.
-            return self.finish_dream(number[6:], outcome, detail)
+        if isinstance(number, str):  # A dream or draft record (dream-<lane>, draft-<n>) never enters runs.jsonl.
+            return self._finish_side(number, outcome, detail)
         with self._state_lock():
             run = self.get_run(number)
             if run is None:
@@ -253,13 +320,9 @@ class RunRecordsMixin:
 
     def read_history(self) -> list[Run]:
         """Return each execution once, retaining its latest completion entry."""
-        try:
-            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return []
         runs: dict[tuple[int, str], _state.Run] = {}
-        for line in history.splitlines():
-            run = _state.load_record(_state.Run, _state.json.loads(line))
+        for value in read_jsonl(self.root / "runs.jsonl"):
+            run = _state.load_record(_state.Run, _copy(value))
             runs[run.number, run.started_at] = run
         return list(runs.values())
 
@@ -277,15 +340,14 @@ class RunRecordsMixin:
         return self._history_times("merged_at")
 
     def _history_times(self, key: str) -> dict[tuple[int, str], str]:
-        try:
-            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {}
         times: dict[tuple[int, str], str] = {}
-        for line in history.splitlines():
-            value = _state.json.loads(line)
-            if isinstance(value.get(key), str):
-                times[value["number"], value["started_at"]] = value[key]
+        for value in read_jsonl(self.root / "runs.jsonl"):
+            stamp = value.get(key)
+            if (key == "merged_at" and not isinstance(stamp, str)
+                    and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):
+                stamp = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
+            if isinstance(stamp, str):
+                times[value["number"], value["started_at"]] = stamp
         return times
 
     def prune_process_identities(self, *, inactive_only: bool = False) -> None:
