@@ -256,3 +256,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - After #1914 (fa orch close) merges: fa orch close 1860 --superseded-by 1882 --why 'PM r531: #1882 replaced the exclusion-record classifier'.
 - 24 h after the CI-cancel fix merges (architect r547): measure gh run list conclusion=cancelled, busy job-min/h (cap 1,200), orch-events 'ci -> timeout' (9/day on 11-04; target 0-2). If 3+/day remain, re-check r547 items (2) owner refreshes while CI pending and (3) order commits count as non-neutral.
 - r53 dashboard plan ready (preread clean): drafts/2026-11-04-r53/plan.json. Publish with --approve right after #1793 (PR #1849) and #1894 (PR #1897) merge; it rewrites their locks. Replaces #1899 (parked).
+- 6 h after #1924 merges (architect r570): 'CI did not finish' per hour should drop from 5-8/h to <=1/h; orch executions per distinct issue from 1.9 to ~1.2.
