@@ -187,3 +187,55 @@ def test_optional_local_check_uses_run_budget_not_done_when_deadline(git_history
     assert case.tracker.get_issue(1).labels & {"ready", "running", "blocked"} == (
         {"ready"} if moved else {"blocked"}
     )
+
+
+@pytest.mark.parametrize("moved", [False, True])
+@pytest.mark.parametrize("step", ["capture", "collection"])
+@pytest.mark.parametrize("cut_by", ["run-budget", "already-spent", "own-limit"])
+def test_baseline_measurement_cut_by_the_run_budget_names_the_run(
+    git_history, tmp_path, monkeypatch, step, moved, cut_by,
+):
+    """A base measurement limited by the run's remaining time and cut there spent the run
+    budget: too-large (base-changed after PASS and base following), not an unavailable baseline.
+    A cut at the measurement's own limit, with run time left, stays an unavailable baseline."""
+    from foragent import runner
+    from foragent.run_attempt import AttemptFailure, ExecutorStopped
+    from foragent.run_baseline import AcceptanceBaseline, _capture_acceptance_baseline, collect_protected_ids
+    from foragent.run_baseline_limits import capture_limit
+
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    own = capture_limit(None)
+    budget = {"run-budget": 300, "already-spent": 0}.get(cut_by, own + 600)
+    case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - budget)
+    case.ctx._budget_base_changed = 1 if moved else None
+    limits = []
+
+    def check_process(argv, *, timeout_s, **kwargs):
+        limits.append(timeout_s)
+        case.clock[0] += timedelta(seconds=timeout_s)
+        return -9, True, "Stopped at the supplied deadline"
+
+    # Another lane's acceptance test, so the base has a protected set to measure.
+    git_history.update({"tests/acceptance/test_other.py": "def test_other():\n    pass\n"}, message="Other lane")
+    case.git.fetch("origin", "main")
+    monkeypatch.setattr(runner, "run_logged", check_process)
+    sha = git_history.tip
+    command = f"{sys.executable} -m pytest"
+    previous = AcceptanceBaseline(command, ("tests/acceptance/test_feature.py::test_feature",), base_sha=sha)
+    measure = ((lambda: _capture_acceptance_baseline(1, case.ctx, command, sha)) if step == "capture"
+               else (lambda: collect_protected_ids(1, case.ctx, previous, sha)))
+    if cut_by == "own-limit":
+        with pytest.raises(AttemptFailure):
+            measure()
+        assert limits == [own]
+        assert case.store.load_flag(1) is None
+        return
+    with pytest.raises(ExecutorStopped) as caught:
+        measure()
+    expected = "base-changed" if moved else "too-large"
+    assert limits == ([300] if budget else [])
+    assert caught.value.outcome == expected
+    flag = case.store.load_flag(1)
+    assert (flag.reason if flag else None) == (None if moved else "too-large")
+    assert case.tracker.get_issue(1).labels & {"ready", "running", "blocked"} == (
+        {"ready"} if moved else {"blocked"})

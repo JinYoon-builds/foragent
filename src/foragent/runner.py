@@ -54,6 +54,7 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
+    new_budget_turn,
     paused_seconds,
     poll_executor,
     _remaining,
@@ -251,6 +252,7 @@ def _implement_and_publish(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
 ) -> str:
     """Run named implementation, check, review and publication steps."""
+    new_budget_turn(ctx)
     attempt = _prepare_implementation(n, ctx, git, target_branch=target_branch, failure=failure)
     outcome = "error"
     try:

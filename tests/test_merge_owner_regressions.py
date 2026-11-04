@@ -348,6 +348,57 @@ def test_owner_budget_spent_following_a_moved_base_after_pass_is_base_changed(pr
     assert case.tracker.get_issue(5).labels & {"ready", "blocked", "needs-human"} == labels & {"ready", "blocked", "needs-human"}
 
 
+@pytest.mark.parametrize("cut", ["local-units", "local-collection", "local-baseline", "related-units"])
+def test_owner_refresh_check_cut_at_the_run_budget_is_too_large(proto, monkeypatch, cut):
+    """reviewer=none, the source base moved: the owner's re-checks of the refreshed head run on the
+    run's remaining time, so one cut there is too-large and blocked, never a repair to ready (#1514)."""
+    from foragent import ci_local, run_checks
+    from foragent.run_checks import CheckResult
+
+    case = proto
+    case.config = replace(case.config, reviewer="none")
+    case.ctx.config = case.config
+    support.queue_workers(case, [5])
+    case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"})
+    reverify, cuts = merge_owner._reverify, []
+
+    def most_budget_used(ctx, place, job, git, head):
+        case.clock[0] += timedelta(seconds=runner._remaining(place.n, ctx) - 300)
+        return reverify(ctx, place, job, git, head)
+
+    def timed_out(command, ctx):
+        cuts.append(command)
+        case.clock[0] += timedelta(seconds=runner._remaining(5, ctx))  # the owner turn's own clock
+        return CheckResult(command, None, True, "killed at the run's remaining time", 300)
+
+    monkeypatch.setattr(merge_owner, "_reverify", most_budget_used)
+    if cut == "local-units":
+        monkeypatch.setattr(ci_local, "verify_local_only_units", lambda attempt, command: timed_out("local units", attempt.ctx))
+    elif cut == "local-collection":
+        check = ci_local.check
+        monkeypatch.setattr(ci_local, "_uses_local_only", lambda worktree: True)
+        monkeypatch.setattr(ci_local, "check", lambda n, ctx, command, root:
+                            timed_out(command, ctx) if "--collect-only" in command else check(n, ctx, command, root))
+    elif cut == "local-baseline":
+        check = ci_local.check
+        monkeypatch.setattr(ci_local, "check", lambda n, ctx, command, root:
+                            timed_out(command, ctx) if not cuts else check(n, ctx, command, root))
+    else:
+        monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *args, **kwargs: ["tests/test_unit.py"])
+        monkeypatch.setattr(run_checks, "run_related_check", lambda n, ctx, root, command, *args: timed_out(command, ctx))
+    support.gate(case)
+    assert cuts
+    path = merge_owner._path(case.ctx, 5)
+    for _ in range(2):  # a later owner turn keeps the result
+        assert json.loads(path.read_text())["phase"] == "too-large"
+        assert not merge_owner.pending(case.store, 5) and not retry_marker(case.store.root, 5).exists()
+        assert case.tracker.get_issue(5).labels & {"ready", "blocked", "needs-human"} == {"blocked"}
+        assert case.tracker.get_pr(support.pr_for(case, 5).number).state == "open"
+        bodies = [comment.body for comment in case.tracker.list_comments(5)]
+        assert any("split it" in body for body in bodies) and any("reason=too-large" in body for body in bodies)
+        support.gate(case)
+
+
 @pytest.mark.parametrize('boundary', ['initial-inputs', 'final-inputs', 'exception', 'withdraw'])
 @pytest.mark.parametrize('outcome', ['too-large', 'base-changed', 'runtime-exceeded'])
 def test_owner_keeps_terminal_outcome_through_later_handlers(proto, monkeypatch, boundary, outcome):

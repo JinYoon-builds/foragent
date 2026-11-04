@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, runner
+from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, run_waits, runner
 from foragent.issue import body_hash, parse_body
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
@@ -361,7 +361,7 @@ def _reverify(ctx, place, job, git, head):
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
     if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link):
-        if stopped in {"timeout", "too-large", "base-changed", "runtime-exceeded"}:
+        if stopped in run_waits.TIME_OUTCOMES:
             return stopped
         raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
     attempt = ci_mode.review_checks(n, ctx, git, target)  # local_only stays on the machine in either mode.
@@ -586,8 +586,7 @@ def advance_members(ctx, members, comparison=None):
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
         # Each turn starts its own budget: only the handed-off PASS stands, no base was followed yet.
-        ctx._budget_review_pass = place.n if job.get("review_pass") else None
-        ctx._budget_base_changed = None
+        run_waits.new_budget_turn(ctx, place.n if job.get("review_pass") else None)
         with _track_checks(ctx, place, job):
             advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
     return advanced

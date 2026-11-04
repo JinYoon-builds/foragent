@@ -1509,3 +1509,50 @@ def test_combined_conflict_markers_are_rejected_by_the_normal_refresh_publicatio
     assert not case.store.owner_merge_facts()
     assert events(case)[-1]["used_members"] == 0
     assert all(not row["spent"] for row in batch.retirements(case.ctx))
+
+
+@pytest.mark.parametrize("moved", [None, "docs/guide.md", "src/neighbor.py"], ids=["same-base", "main-docs-moved", "main-source-moved"])
+def test_train_tip_done_when_cut_at_the_run_budget_leaves_that_member_too_large(batched, monkeypatch, moved):
+    """A train check cut at a member's remaining run time is that member's too-large, not a repair.
+    When main moved its source after the members' review PASS, the train followed that base on the
+    member's budget: base-changed, back to ready (#1514)."""
+    from foragent import run_checks, runner
+    from foragent.run_checks import CheckResult
+    from foragent.run_previous import retry_marker
+
+    case = batched
+    queue_workers(case, [5, 1])
+    assert all(json.loads(merge_owner._path(case.ctx, n).read_text())["review_pass"] for n in (5, 1))
+    if moved:
+        case.history.update({moved: "moved\n"})
+    moved = bool(moved) and moved.startswith("src/")  # a docs-only move is neutral: no base following
+    verify, done_when, cut = merge_owner._verify_review_head, run_checks.run_done_when, []
+
+    def most_budget_used(n, ctx, *args):
+        if not cut:
+            case.clock[0] += timedelta(seconds=runner._remaining(n, ctx) - 300)
+        return verify(n, ctx, *args)
+
+    def cut_at_remaining(n, ctx, command, worktree, log, timeout_s, **kwargs):
+        if cut:
+            return done_when(n, ctx, command, worktree, log, timeout_s, **kwargs)
+        cut.append((n, timeout_s))
+        case.clock[0] += timedelta(seconds=timeout_s)
+        return CheckResult(command, None, True, "killed at the run's remaining time", timeout_s)
+
+    monkeypatch.setattr(merge_owner, "_verify_review_head", most_budget_used)
+    monkeypatch.setattr(run_checks, "run_done_when", cut_at_remaining)
+    support.gate(case)
+    [(n, limit)] = cut
+    assert limit == 300 and not case.target_pushes
+    assert [m["n"] for row in batch.retirements(case.ctx) for m in row["spent"]] == [n]
+    expected = "base-changed" if moved else "too-large"
+    for _ in range(2):  # a later owner turn keeps the result
+        assert json.loads(merge_owner._path(case.ctx, n).read_text())["phase"] == expected
+        assert not merge_owner.pending(case.store, n)
+        assert retry_marker(case.store.root, n).exists() is moved
+        assert case.tracker.get_issue(n).labels & {"ready", "blocked", "needs-human"} == (
+            {"ready"} if moved else {"blocked"})
+        assert case.tracker.get_pr(support.pr_for(case, n).number).state == ("closed" if moved else "open")
+        assert any("split it" in c.body for c in case.tracker.list_comments(n)) is not moved
+        support.gate(case)

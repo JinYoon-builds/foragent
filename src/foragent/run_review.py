@@ -593,6 +593,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     from foragent import runner
     from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head, _refresh_reviewed_head
 
+    runner.new_budget_turn(ctx)
     approval = ctx.store.load_approval(n)
     if approval is None:
         invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")

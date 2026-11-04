@@ -26,7 +26,8 @@ from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline_limits import _duration, load_reusable, recorded_duration, record_timeout, repository_limit
 from foragent.run_checks import CheckResult, _append, _passing_acceptance_ids, _pytest_command, junit_node_id
-from foragent.run_waits import _credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase
+from foragent.run_waits import (_credited_wait, _phase, _progress, _test_slot, phase_identity, restore_phase,
+                                stop_if_budget_spent)
 from foragent.state import StateStore
 
 if TYPE_CHECKING:
@@ -261,9 +262,12 @@ def _capture_acceptance_baseline(
 ) -> AcceptanceBaseline | None:
     from foragent import runner
 
+    cut = []  # The capture ran on the run's remaining time and was cut or never started.
+
     def check(command: str, worktree: Path) -> CheckResult:
         remaining = runner._remaining(n, ctx)
         if remaining <= 0:
+            cut.append(True)
             raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before capture")
         # A capture (not a cache hit) is work on this base; a second capture of it repeats it.
         try:
@@ -275,6 +279,7 @@ def _capture_acceptance_baseline(
                                progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                                full_text_dir=cuts.issue_dir(ctx.store.root, n))
         _progress(n, ctx)
+        cut.extend([True] if result.timed_out else [])
         return result
 
     def wait(acquire) -> None:
@@ -291,6 +296,9 @@ def _capture_acceptance_baseline(
         )
         completed = True
         return result
+    except AttemptFailure as exc:
+        stop_if_budget_spent(n, ctx, bool(cut), str(exc))  # the cache already kept what the cut measured
+        raise
     finally:
         # The capture ends here: close it and give back the phase (and work) it interrupted.
         restore_phase(n, ctx, previous, resume=completed)
@@ -559,7 +567,9 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
                 return owned, selectable
             remaining = runner._remaining(n, ctx)
             if remaining <= 0:
-                raise AttemptFailure("acceptance baseline unavailable: run budget exhausted before collection")
+                detail = "acceptance baseline unavailable: run budget exhausted before collection"
+                stop_if_budget_spent(n, ctx, True, detail)
+                raise AttemptFailure(detail)
             plugins = Path(directory) / "plugins"
             plugins.mkdir()
             plugin = f"_foragent_nodeids_{secrets.token_hex(8)}"
@@ -578,10 +588,11 @@ def collect_protected_ids(n: int, ctx: RunContext, previous: AcceptanceBaseline,
             except (OSError, ValueError, KeyError, TypeError):
                 ids, errors, rootdir = None, None, None
             if result.timed_out or result.exit_code not in (0, 5) or ids is None or errors:
-                raise AttemptFailure(
-                    f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
-                    f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
-                    f"collection_errors={'unknown' if errors is None else errors})")
+                detail = (f"acceptance baseline unavailable: collecting {acceptance_dir} on {sha} failed "
+                          f"(exit_code={result.exit_code}, timed_out={result.timed_out}, "
+                          f"collection_errors={'unknown' if errors is None else errors})")
+                stop_if_budget_spent(n, ctx, result.timed_out, detail)
+                raise AttemptFailure(detail)
             # pytest's node ids are relative to its rootdir; baseline ids to the repository root.
             prefix = rootdir.resolve().relative_to(worktree.resolve()).as_posix()
             collected = {node if prefix == "." else f"{prefix}/{node}" for node in ids}

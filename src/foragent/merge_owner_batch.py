@@ -5,7 +5,7 @@ from hashlib import sha256
 from types import SimpleNamespace
 import json
 
-from foragent import ci_mode, harness_guard
+from foragent import ci_mode, harness_guard, run_waits
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import main_write_lock
@@ -386,6 +386,24 @@ def prepare(ctx, report, candidates):
         return None
 
 
+def _member_turn(ctx, place, job, git, base):
+    """A member's checks on the train tip spend that member's turn (#1514).
+
+    Its handed-off review PASS stands, and the train's base is followed on that budget:
+    a move from the member's measured base that is not neutral is base following after
+    the PASS, judged by the same rule as the single path's refresh.
+    """
+    from foragent.run_base_move import base_move_is_neutral, capture_move
+
+    passed = bool(job.get("review_pass"))
+    run_waits.new_budget_turn(ctx, place.n if passed else None)
+    if passed and base != job["base"]:
+        view = SimpleNamespace(n=place.n, ctx=ctx, git=git, approval=load_record(Approval, job["approval"]),
+                               baseline=None)
+        if not base_move_is_neutral(view, capture_move(git, base)):
+            ctx._budget_base_changed = place.n
+
+
 def land(ctx, report, candidates, proof):
     """Reuse every member's final check before the sole target ref update."""
     from foragent import merge_owner as owner
@@ -395,8 +413,7 @@ def land(ctx, report, candidates, proof):
     reason = "train merged"
     try:
         ctx.merge_owner_started_at = ctx.now()
-        # A train turn follows no base on a worker's budget; drop marks an earlier turn left (#1514).
-        ctx._budget_review_pass = ctx._budget_base_changed = None
+        run_waits.new_budget_turn(ctx)  # No member's turn has started; drop marks an earlier turn left.
         with ExitStack() as stack:
             prepared = []
             for member in proof.chain:
@@ -412,8 +429,9 @@ def land(ctx, report, candidates, proof):
             }))
             files = sorted({path for _, job, *_ in prepared
                             for path in parse_body(job["approval"]["body"]).files})
-            for member, (place, job, _, _, _) in zip(proof.chain, prepared):
+            for member, (place, job, _, git, _) in zip(proof.chain, prepared):
                 checking = member
+                _member_turn(ctx, place, job, git, proof.base)
                 link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
 
                 def verify(head):
@@ -423,12 +441,19 @@ def land(ctx, report, candidates, proof):
                                                      files, link, verify)
                 with owner._track_checks(ctx, place, job):
                     if stopped := guarded(proof.chain[-1][2]):
+                        if stopped in run_waits.TIME_OUTCOMES:
+                            raise ExecutorStopped(stopped, f"Train tip Done when: {stopped}")
                         raise AttemptFailure(f"Train tip Done when: {stopped}", ctx.config.base_branch)
             checking = None
-            place, job, *_ = prepared[0]
+            place, job, _, git, _ = prepared[0]
+            _member_turn(ctx, place, job, git, proof.base)  # The shared checks run on the first member's turn.
             with owner._track_checks(ctx, place, job):
-                ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch,
-                                      files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
+                try:
+                    ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch,
+                                          files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
+                except ExecutorStopped:
+                    checking = proof.chain[0]  # These checks spent the first member's run budget.
+                    raise
             untracked = tip._call([
                 "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
                 *(f":(exclude,literal){path}" for path in sorted(tip.artifact_paths())),
@@ -442,6 +467,7 @@ def land(ctx, report, candidates, proof):
                 owner.run_publish._check_publication(tip, ctx.config.base_branch, proof.base)
                 for member, (place, job, pr, git, evidence) in zip(proof.chain, prepared):
                     checking = member
+                    _member_turn(ctx, place, job, git, proof.base)
                     if not owner._ready(ctx, place, job, pr, git, proof.base, evidence):
                         failed = member
                         reason = evidence.reason or f"single path final check {job['phase']}"

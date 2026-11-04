@@ -301,6 +301,17 @@ def test_failed_rerun_preserves_pr_and_raw_review_with_visible_reason(review_cas
     assert (original.parent / "review-2.txt").read_text() == (message if isinstance(message, str) else message.last_message)
 
 
+def test_rerun_review_timeout_is_not_named_by_an_earlier_calls_marks(review_case):
+    """One context serves several review-only calls; a call that followed a base after PASS
+    must not turn a later call's reviewer timeout into base-changed (#1514)."""
+    c = review_case
+    enable_reviewer(c, [ExecResult(0, True, "review timed out", Path("unused"))])
+    c.ctx._budget_review_pass = c.ctx._budget_base_changed = 1  # what the earlier call left on c.ctx
+    assert "too-large" in orch.rerun_review(c.ctx, 1)
+    assert_blocked(c, Reason.TOO_LARGE)
+    assert "ready" not in c.tracker.get_issue(1).labels
+
+
 @pytest.mark.parametrize("entry", ["rerun-review", "resolve"])
 @pytest.mark.parametrize("failure,reason", [
     ("checks", Reason.RETRIES_EXCEEDED), ("ci", Reason.RETRIES_EXCEEDED),

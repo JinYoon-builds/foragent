@@ -97,6 +97,34 @@ def paused_seconds(n: int, ctx: RunContext) -> float:
     return run.waited_seconds + run.talk_pause_seconds(now)
 
 
+# The names ``_timeout`` gives a run that ran out of time, plus the gate's runtime backstop.
+# Consumers pass them on unchanged; they are never a repairable check failure (#1514).
+TIME_OUTCOMES = frozenset({"timeout", "too-large", "base-changed", "runtime-exceeded"})
+
+
+def new_budget_turn(ctx: RunContext, review_pass: int | None = None) -> None:
+    """Start the timeout-attribution marks of one invocation (#1514).
+
+    The marks live on the context, and one context can serve several runs, review-only
+    calls or owner turns in a row. Every entry that spends a run budget calls this first,
+    so only its own PASS and its own base following can name a timeout base-changed.
+    """
+    ctx._budget_review_pass = review_pass
+    ctx._budget_base_changed = None
+
+
+def stop_if_budget_spent(n: int, ctx: RunContext, cut: bool, detail: str) -> None:
+    """Name a run whose budget a check spent (#1514).
+
+    A check limited by the run's remaining time that was cut (or could not start) with no
+    run time left spent the run budget: that is the run's too-large or base-changed, never a
+    check failure for repair or an unavailable baseline. ``_verify_contents`` uses the same rule.
+    """
+    if cut and _remaining(n, ctx) <= 0:
+        from foragent.run_attempt import ExecutorStopped
+        raise ExecutorStopped(_timeout(n, ctx), detail)
+
+
 def _timeout(n: int, ctx: RunContext, *, check: bool = False) -> str:
     if check:
         flag(ctx, n, Reason.TIMEOUT, "Check reached its time limit")
