@@ -204,17 +204,19 @@ def _tick_steps(ctx: TickContext) -> TickReport:
             # A manually closed card leaves its column; known cards only.
             board.sync_status(ctx, issue, "closed", existing_only=True)
             return
-        if getattr(ctx.config, "merge_owner", False):
-            from foragent.merge_owner import pending
+        from foragent.merge_owner import pending
 
-            if pending(ctx.store, issue.number):
-                board.sync_status(ctx, issue, "PR open")
-                return
+        repaired = False
         if processes_available:  # Cleans a left-over worktree; board writes skip parents.
             repaired = RUNNING in issue.labels or ctx.store.run_start_pending(issue.number)
             issue = _recover_orphan(ctx, issue, report)
-            if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
-                return  # Its repair read GitHub; a second read before a start waits for the next tick.
+        # After the repair's run read: a worker that handed off meanwhile waits on the merge
+        # owner (a store fact, whatever the switch says now) and is never promoted again.
+        if pending(ctx.store, issue.number):
+            board.sync_status(ctx, issue, "PR open")
+            return
+        if repaired and ctx._refresh_failed and RUNNING not in issue.labels:
+            return  # Its repair read GitHub; a second read before a start waits for the next tick.
         if ctx._refresh_failed and issue.number in recovered:
             return
         if issue.number in parents:
