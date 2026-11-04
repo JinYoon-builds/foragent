@@ -623,12 +623,13 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
-    if getattr(ctx.config, "merge_owner", False):
+    # Dreams retain the direct path's input-staleness checks and main-write lock.
+    if getattr(ctx.config, "merge_owner", False) and not current.head.startswith("foragent/dream-"):
         from foragent.runner import review_only
 
         issue_n = pr_issue_number(current.head)
-        if issue_n is None:
-            raise OrchError("merge_owner prototype supports approved issue PRs only")
+        if issue_n is None or not current.head.startswith("foragent/issue-"):
+            raise OrchError("merge_owner supports approved issue PRs and lane dream PRs only")
         authorized = replace(ctx, merge_authorization={"approved_by": approved_by, "at": at,
                                                        "pr": n, "target": current.base, "head": head})
         outcome = review_only(issue_n, authorized, verdict_head=head, repair_ci=False)
