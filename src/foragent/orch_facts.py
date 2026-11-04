@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -146,6 +146,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
         if (into / "data").is_dir():
             alive.update(orch_facts_machine.probe_workloads(into / "data", _probe))
         machine = {"test_slots": capacity.read_test_slots(), "budget": machine_budget.values(), "sample": sample,
+                   "step_weights": step_weights.learned(store),
                    "stored": stored, "slot_stores": into / orch_facts_machine.SLOT_STORES,
                    "merge_stores": into / orch_facts_machine.MERGE_STORES, "now": store._now(), "alive": alive}
         # A lock file created meanwhile (a first write under it) means the read was not covered.
@@ -221,6 +222,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "failure_reasons": _failure_reasons(rows),
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
+        "step_weights": machine["step_weights"],
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
         **orch_facts_decided.collect(store, now, RECENT),
@@ -288,6 +290,7 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
         f"waited {_s(slots['total_wait_seconds'])}",
         f"  Machine: load {machine['load_per_cpu']:.2f} per CPU, memory {machine['memory_pressure']}",
         "  " + orch_facts_machine.human_line(resources, language),
+        step_weights.human(facts["step_weights"]),
         f"  Parallel: {work['free_run_slots']} free (machine {work['machine_runs']}/{work['machine_cap']}"
         + (f", project {work['project_runs']}/{work['project_cap']}" if work["project_cap"] is not None else "")
         + "); held: " + (", ".join(f"#{n} {reason}" for n, reason in work["held"].items()) or "none"),
