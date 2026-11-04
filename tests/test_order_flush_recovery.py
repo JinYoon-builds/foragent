@@ -1,11 +1,12 @@
 """Recovery cases around the plumbing rebuild, in addition to locked edge checks."""
 
 from dataclasses import replace
+import fcntl
 
 import pytest
 
 from conftest import git_command
-from foragent import order_flush, order_flush_journal as journal, order_notes
+from foragent import main_write, order_flush, order_flush_journal as journal, order_notes
 from foragent.git import GitError
 from foragent.order import PlanError
 from foragent.state import StateStore
@@ -40,9 +41,18 @@ def flush(case, boundary="chosen"):
     return order_flush.flush(root, config, tracker, git, store, repo="owner/repo", boundary=boundary)
 
 
+def assert_train_can_publish(git):
+    # A separate descriptor models the train's writer, bypassing the adapter's reentrant lock.
+    with (git.common_dir() / "foragent-publish.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 @pytest.mark.parametrize("with_order", [False, True], ids=["notes", "orders-and-notes"])
 @pytest.mark.parametrize("merge_owner", [False, True])
-def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history, monkeypatch, with_order, merge_owner):
+def test_flush_waits_before_committing_until_the_merge_train_finishes(
+    waiting, git_history, monkeypatch, with_order, merge_owner,
+):
     from foragent import order, order_submissions
 
     root, config, tracker, git, store = waiting
@@ -58,26 +68,110 @@ def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history
     base = git_command(git_history.origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(git_history.origin, "update-ref", train, base)
-    if merge_owner:
-        for attempt in range(2):
-            with pytest.raises(GitError, match="waiting for merge train"):
-                flush(case)
-            assert git_command(git_history.origin, "rev-parse", "main") == base
-            assert not tracker.issues
-            assert not any(row["kind"] in {"pushed", "issues", "done"} for row in journal.entries(store))
-            if attempt == 0:
-                committed = git.head_sha()
-                assert committed != base
-            assert git.head_sha() == committed
-        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
-        git_command(git_history.origin, "update-ref", "-d", train)
+    before_index = git_command(root, "ls-files", "--stage")
+    elapsed, sleeps = [0], []
+
+    def finish_train(seconds):
+        assert merge_owner, "merge_owner off must never wait"
+        assert seconds == 30
+        assert_train_can_publish(git)
+        assert git.head_sha() == base
+        assert git_command(root, "ls-files", "--stage") == before_index
+        assert not tracker.issues
+        assert not journal.entries(store)
+        assert (root / "docs/decisions.md").read_text() == "# Decisions\n"
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        if len(sleeps) == 2:
+            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+            git_command(git_history.origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(main_write.time, "sleep", finish_train)
     assert flush(case)["status"] == "published"
     assert git_command(git_history.origin, "rev-parse", "main") == git.head_sha()
+    assert sleeps == ([30, 30] if merge_owner else [])
     if merge_owner:
-        assert git.head_sha() != committed
         assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
         assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
     assert bool(tracker.issues) == with_order
+    intact(case)
+
+
+@pytest.mark.parametrize("resuming", [False, True], ids=["new", "uncommitted-resume"])
+def test_flush_train_timeout_preserves_files_index_head_and_journal(waiting, git_history, monkeypatch, resuming):
+    root, config, tracker, git, store = waiting
+    if resuming:
+        def stop(*_args):
+            raise Interrupted()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(git, "commit_paths", stop)
+            with pytest.raises(Interrupted):
+                flush(waiting)
+    case = root, replace(config, merge_owner=True), tracker, git, store
+    base, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file() and ".git" not in path.parts}
+    records = journal.entries(store)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(git_history.origin, "update-ref", train, base)
+    elapsed, sleeps = [0], []
+
+    def sleep(seconds):
+        assert seconds == 30
+        assert_train_can_publish(git)
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(GitError, match="timed out after 40 minutes waiting for merge train"):
+        flush(case)
+    assert sum(sleeps) == 40 * 60
+    assert git.head_sha() == base
+    assert git_command(git_history.origin, "rev-parse", "main") == base
+    assert git_command(root, "ls-files", "--stage") == index
+    assert {path: path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and ".git" not in path.parts} == files
+    assert journal.entries(store) == records
+    assert not tracker.issues
+    git_command(git_history.origin, "update-ref", "-d", train)
+    assert flush(case)["status"] == "published"
+    intact(case)
+
+
+def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, git_history, monkeypatch):
+    root, config, tracker, git, store = waiting
+
+    def stop(*_args):
+        raise Interrupted()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(git, "commit_paths", stop)
+        with pytest.raises(Interrupted):
+            flush(waiting)
+    case = root, replace(config, merge_owner=True), tracker, git, store
+    base, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    partial = (root / "docs/decisions.md").read_bytes()
+    records = journal.entries(store)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(git_history.origin, "update-ref", train, base)
+
+    def finish_train(seconds):
+        assert seconds == 30
+        assert_train_can_publish(git)
+        assert git.head_sha() == base
+        assert git_command(root, "ls-files", "--stage") == index
+        assert (root / "docs/decisions.md").read_bytes() == partial
+        assert journal.entries(store) == records
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+        git_command(git_history.origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", finish_train)
+    assert flush(case)["status"] == "published"
+    assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+    assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
+    assert len([row for row in journal.entries(store) if row["kind"] == "selected"]) == 1
     intact(case)
 
 
