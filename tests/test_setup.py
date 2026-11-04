@@ -1,6 +1,7 @@
 """Setup readers share scope decisions without changing machine state."""
 
 import json
+import shutil
 import subprocess
 
 import pytest
@@ -73,17 +74,19 @@ def test_doctor_and_init_read_both_auth_streams(tmp_path, monkeypatch, capsys, s
 
 
 @pytest.mark.parametrize("failure", [FileNotFoundError("gh"), subprocess.TimeoutExpired("gh", 10), None])
-def test_doctor_scope_unknown_when_auth_cannot_be_read(tmp_path, monkeypatch, capsys, failure):
+def test_doctor_scopes_wait_when_auth_cannot_be_read(tmp_path, monkeypatch, capsys, failure):
     def run(*args, **kwargs):
         if failure is not None:
             raise failure
         return subprocess.CompletedProcess(["gh", "auth", "status"], 1, account("'repo'"), "failed")
 
     monkeypatch.setattr(gh, "run", run)
-    # Unknown scopes pass, but this plain folder still needs a repository.
     assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(tmp_path)]) == 1
     items = json.loads(capsys.readouterr().out)["items"]
-    assert next(item for item in items if item["id"] == "gh-project-scope")["ok"] is True
+    scope = next(item for item in items if item["id"] == "gh-project-scope")
+    assert scope["ok"] is False
+    assert "gh auth" not in scope["fix"]
+    assert ("gh-installed" if isinstance(failure, FileNotFoundError) else "gh-logged-in") in scope["fix"]
 
 
 def test_plain_doctor_never_reads_gh(tmp_path, monkeypatch, capsys):
@@ -109,7 +112,7 @@ def test_init_stops_at_shared_checklist_before_setup(setup, monkeypatch, dry_run
 def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, capsys):
     monkeypatch.setattr(checklist_setup, "CHECKS", (
         lambda status: {"id": "earlier", "ok": False, "fix": "first fix"},
-        checklist_setup.gh_project_scope,
+        checklist_setup.project_scope,
         lambda status: {"id": "later", "ok": False, "fix": "last fix"},
     ))
     monkeypatch.setattr(gh, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, "", ""))
@@ -180,3 +183,87 @@ def test_repository_checklist_accepts_nested_and_linked_worktrees(tmp_path):
     git_command(root, "worktree", "add", "-b", "feature", str(linked))
     for folder in (nested, linked):
         assert checklist_setup.repository_linked(folder) == {"id": "repository-linked", "ok": True}
+
+
+@pytest.mark.parametrize("state,first_failure", [
+    ("missing", "gh-installed"),
+    ("logged-out", "gh-logged-in"),
+    ("needs-scope", "gh-project-scope"),
+    ("ready", None),
+])
+def test_doctor_reports_ordered_prerequisites_in_linked_repo(setup, monkeypatch, capsys, state, first_failure):
+    git_command(setup.root, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+    original_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda tool, *a, **kw:
+                        None if tool == "gh" and state == "missing" else
+                        f"/test/bin/{tool}" if tool in {"git", "gh", "uv"} else original_which(tool, *a, **kw))
+    calls = []
+
+    def read_auth(args, **kwargs):
+        calls.append(args)
+        assert args == ["auth", "status"]
+        if state == "missing":
+            raise FileNotFoundError("gh")
+        return subprocess.CompletedProcess(["gh", *args], 1 if state == "logged-out" else 0,
+                                           account("'project'" if state == "ready" else "'repo'"), "not logged in")
+
+    monkeypatch.setattr(gh, "run", read_auth)
+    before = {str(p.relative_to(setup.root)): p.read_bytes() for p in setup.root.rglob("*") if p.is_file()}
+    code = cli.main(["doctor", "--setup", "--json", "--repo-root", str(setup.root)])
+    items = json.loads(capsys.readouterr().out)["items"]
+    ids = [item["id"] for item in items]
+    required = ["git-installed", "gh-installed", "uv-installed", "gh-logged-in", "gh-project-scope", "repository-linked"]
+    assert [ids.index(name) for name in required] == sorted(ids.index(name) for name in required)
+    failed = [item for item in items if not item["ok"]]
+    assert code == (1 if first_failure else 0)
+    assert (failed[0]["id"] if failed else None) == first_failure
+    by_id = {item["id"]: item for item in items}
+    if state == "missing":
+        assert "gh" in failed[0]["fix"] and ("install" in failed[0]["fix"] or "https://" in failed[0]["fix"])
+        for name in ("gh-logged-in", "gh-project-scope"):
+            assert by_id[name]["ok"] is False
+            assert "gh-installed" in by_id[name]["fix"] and "gh auth" not in by_id[name]["fix"]
+        assert calls == []
+    else:
+        assert calls == [["auth", "status"]]
+        if state == "logged-out":
+            assert by_id["gh-logged-in"]["fix"] == "gh auth login"
+            assert by_id["gh-project-scope"]["ok"] is False
+            assert "gh-logged-in" in by_id["gh-project-scope"]["fix"]
+        elif state == "needs-scope":
+            assert failed[0]["fix"] == FIX
+    assert {str(p.relative_to(setup.root)): p.read_bytes() for p in setup.root.rglob("*") if p.is_file()} == before
+
+
+@pytest.mark.parametrize("state", ["missing", "logged-out", "needs-scope"])
+def test_init_reports_shared_prerequisite_fixes_before_setup(setup, monkeypatch, capsys, state):
+    git_command(setup.root, "remote", "set-url", "origin", "https://github.com/owner/repo.git")
+    original_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda tool, *a, **kw:
+                        None if tool == "gh" and state == "missing" else
+                        f"/test/bin/{tool}" if tool in {"git", "gh", "uv"} else original_which(tool, *a, **kw))
+
+    def read_auth(args, **kwargs):
+        if state == "missing":
+            raise FileNotFoundError("gh")
+        if state == "logged-out":
+            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="not logged in")
+        return account("'repo'")
+
+    monkeypatch.setattr(gh, "run", lambda args, **kw: subprocess.CompletedProcess(["gh", *args], 0, read_auth(args), ""))
+    monkeypatch.setattr(setup, "run_gh", read_auth)
+    assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(setup.root)]) == 1
+    failing = [item for item in json.loads(capsys.readouterr().out)["items"] if not item["ok"]]
+    expected = {
+        "missing": ["gh-installed", "gh-logged-in", "gh-project-scope"],
+        "logged-out": ["gh-logged-in", "gh-project-scope"],
+        "needs-scope": ["gh-project-scope"],
+    }
+    assert [item["id"] for item in failing] == expected[state]
+    with pytest.raises(TrackerError) as error:
+        setup.init()
+    for item in failing:
+        assert item["fix"] in str(error.value)
+    assert not (setup.root / ".foragent.yml").exists()
+    assert not setup.tracker.labels and not setup.installs
+    assert not any("commit" in args or "push" in args for args in setup.git_calls)

@@ -5,6 +5,7 @@
 
 MESSAGES = {
     "en": {
+        "setup_wait_for": "Complete {prerequisite} first.",
         "init_repository_choices": (
             "Choose one way forward (nothing is created or linked until you agree):\n"
             "  New private repository: gh repo create <owner>/<repo> --private --source .\n"
@@ -39,6 +40,7 @@ MESSAGES = {
         ),
     },
     "ko": {
+        "setup_wait_for": "{prerequisite}부터 완료해 주세요.",
         "init_repository_choices": (
             "다음 중 하나를 골라 주세요. 동의하기 전에는 만들거나 연결하지 않아요:\n"
             "  새 비공개(private) 저장소: gh repo create <owner>/<repo> --private --source .\n"

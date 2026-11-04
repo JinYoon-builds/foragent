@@ -4,13 +4,14 @@ description: Set up a project folder for Foragent.
 ---
 
 1. Run `fa doctor --setup --json` in the project folder, before `fa init`.
-   Read its `items` from top to bottom: tools installed, gh login, gh project
-   scope, then repository linked. The checklist is the source of setup steps;
+   Read its `items` from top to bottom: git installed, gh installed, uv installed,
+   gh logged in, gh project scope, then repository linked. The checklist is the source of setup steps;
    a nonzero exit with JSON means there are steps to finish. For each failing
    item, the `/fa` session shows its exact `fix` and handles it before moving on:
    - Installation: use AskUserQuestion (or the available question tool) to ask
      Yes (recommended) or No. Run the shown install command only after Yes.
-     After No, print the command and stop.
+     If the fix is an official installation page, show it and wait for the
+     person to finish that step. After No, print the command or page and stop.
    - Login: ask the person to run `! gh auth login` in Claude Code themselves,
      then wait. Never ask for, read or store a token, and never run their login
      for them. For project scope, show `! gh auth refresh -h github.com -s project`
@@ -27,6 +28,7 @@ description: Set up a project folder for Foragent.
      after the answer, initialize git if needed and run
      `git remote add origin <URL>`. If origin already exists, show the checklist's
      `git remote set-url origin <URL>` fix and ask before replacing it.
+   An item waiting on an earlier prerequisite is handled after that prerequisite.
    Re-run the checklist after each completed fix; continue only when all items
    pass. If there is no question tool, stop and print the next exact command
    and any repository choices. An unanswered question is not agreement.
