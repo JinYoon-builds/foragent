@@ -24,8 +24,8 @@ from typing import Any, BinaryIO
 
 WRAPPER_COMMAND = "fa statusline"
 HOOK_COMMAND = "fa statusline --session-start"
-# Sessions the person starts or resumes; not /clear or compaction inside a session.
-HOOK_MATCHER = "startup|resume"
+# Decision context must be restored whenever Claude starts a fresh context.
+HOOK_MATCHER = "startup|resume|clear|compact"
 PROMPT_COMMAND = "fa statusline --prompt-context"
 # Seconds Claude Code waits for the prompt hook before it goes on without its context.
 PROMPT_TIMEOUT = 5
@@ -136,6 +136,14 @@ def wrapper_active(settings: dict) -> bool:
 
 def with_hook(settings: dict) -> dict:
     """``settings`` with every missing Foragent hook added (unchanged when all are there)."""
+    hooks = settings.get("hooks")
+    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    if any(isinstance(group, dict) and isinstance(group.get("hooks"), list)
+           and group.get("matcher") != HOOK_MATCHER
+           and any(_is_ours("SessionStart", hook) for hook in group["hooks"])
+           for group in (groups if isinstance(groups, list) else [])):
+        # Reinstall only our commands; shared groups keep their original matcher.
+        settings = without_hook(settings)
     if has_hook(settings):
         return settings
     hooks = settings.get("hooks")
@@ -285,10 +293,10 @@ def _pm_moved_notice(payload: dict) -> str | None:
 
 
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for the SessionStart hook: one JSON object with the summary line, or nothing.
+    """SessionStart: decision context, plus the summary line on startup and resume.
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
-    Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
+    Claude. Clear and compaction restore decisions without restarting the summary or squirrel.
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -311,13 +319,32 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
         presence.bind_checkout(folder, datetime.now(UTC))
     except Exception:  # Setup upkeep must never disturb the session that is starting.
         pass
-    try:
-        message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
-                                                 datetime.now(UTC))
-    except Exception:  # A failed summary must never disturb the session that is starting.
-        message = None
+    message = None
+    if payload.get("source", "startup") in {"startup", "resume"}:
+        try:
+            message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
+                                                     datetime.now(UTC))
+        except Exception:  # A failed summary must never disturb the session that is starting.
+            pass
+    output = {}
     if message:
-        stdout.write((json.dumps({"systemMessage": message}, ensure_ascii=False) + "\n").encode("utf-8"))
+        output["systemMessage"] = message
+    try:
+        from foragent import decisions
+
+        root = presence.project_root(folder)
+        project = presence._project(folder)
+        if root is not None and project is not None and presence._planning_session(folder, project[1]):
+            config, store = project
+            ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
+            context = decisions.unordered_context(root, decisions.observed_rows(store._issue_view()),
+                                                  ledger, config.language)
+            if context:
+                output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
+    except Exception:  # Decision records must never stop the session from starting.
+        pass
+    if output:
+        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()
     return 0
 

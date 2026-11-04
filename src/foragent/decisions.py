@@ -72,6 +72,22 @@ def ledger_ids(text: str) -> list[str]:
     return list(dict.fromkeys(HEADING.findall(text)))
 
 
+def unordered_context(root: Path, rows: list[dict[str, Any]], ledger: str, language: str) -> str | None:
+    """Unlinked ledger entries in append order, using the same facts as `fa decisions`."""
+    from foragent.i18n import text
+
+    unlinked = {row["id"] for row in view(root, rows, ledger) if row["state"] == NOTHING_ORDERED}
+    headings = list(HEADING.finditer(ledger))
+    entries = []
+    for index, heading in enumerate(headings):
+        identity = heading.group(1)
+        if identity in unlinked:
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(ledger)
+            entries.append(ledger[heading.start():end].strip())
+            unlinked.remove(identity)
+    return text("decisions_unordered_context", language) + "\n\n" + "\n\n".join(entries) if entries else None
+
+
 def _citations(text: str) -> set[str]:
     return set(CITATION.findall(text))
 

@@ -8,6 +8,7 @@ MESSAGES = {
         "decisions_none": "The decision ledger has no decisions yet.",
         "decisions_row": "{id}: {state} ({issues})",
         "decisions_no_issues": "no linked issues",
+        "decisions_unordered_context": "Decisions with no linked issue (oldest first), from FA records:",
     },
     "ko": {
         "decisions_help": "결정마다 연결된 이슈와 로컬 사실로 계산한 상태를 보여 줘요",
@@ -16,5 +17,6 @@ MESSAGES = {
         "decisions_none": "결정 장부에 아직 결정이 없어요",
         "decisions_row": "{id}: {state} ({issues})",
         "decisions_no_issues": "연결된 이슈 없음",
+        "decisions_unordered_context": "FA 기록에서 아직 이슈가 없는 결정을 오래된 순서로 보여 줘요:",
     },
 }
