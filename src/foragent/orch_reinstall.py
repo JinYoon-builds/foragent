@@ -98,12 +98,12 @@ def follow_base(ctx) -> None:
     """Follow the fetched base under the tick lock; keep diagnostics off tick JSON stdout."""
     sha = None
     try:
+        installed = _installed_revision()
+        if installed is None:
+            return
         base = f"refs/remotes/origin/{ctx.config.base_branch}"
         project = ctx.git.file_at(base, "pyproject.toml")
         if project is None or tomllib.loads(project).get("project", {}).get("name") != "foragent":
-            return
-        installed = _installed_revision()
-        if installed is None:
             return
         sha = ctx.git.ref_sha(base)
         if sha == installed:

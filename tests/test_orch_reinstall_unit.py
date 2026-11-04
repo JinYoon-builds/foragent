@@ -159,18 +159,22 @@ def follow_context(case):
 def test_follow_unknown_revision_does_not_install(reinstall, monkeypatch):
     ctx = follow_context(reinstall)
     monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: None)
+    def unexpected(*args):
+        pytest.fail("an unknown installation must not read Git")
+    monkeypatch.setattr(ctx.git, "_call", unexpected)
     orch_reinstall.follow_base(ctx)
     assert reinstall.calls == []
     assert not failures(reinstall)
 
 
-def test_follow_other_project_never_reads_installed_revision(reinstall, monkeypatch):
+def test_follow_other_project_never_compares_or_installs(reinstall, monkeypatch):
     c = reinstall
     c.history.update({"pyproject.toml": '[project]\nname = "other"\n'})
     ctx = follow_context(c)
-    def unexpected():
-        pytest.fail("other projects must not inspect this machine's installation")
-    monkeypatch.setattr(orch_reinstall, "_installed_revision", unexpected)
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: "f" * 40)
+    def unexpected(*args):
+        pytest.fail("other projects must not compare installed and base revisions")
+    monkeypatch.setattr(ctx.git, "ref_sha", unexpected)
     orch_reinstall.follow_base(ctx)
     assert c.calls == []
 
