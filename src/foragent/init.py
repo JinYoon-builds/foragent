@@ -529,8 +529,15 @@ def _default_ignore_recovery(root: Path, config: Config, git: GitRepo) -> list[s
     path = root / ".gitignore"
     if not names or not path.is_file() or path.is_symlink():
         return []
-    tracked = git._call(["ls-tree", "--name-only", "HEAD", "--", ".gitignore"]).strip()
-    original = git._call(["show", "HEAD:.gitignore"]).encode("utf-8") if tracked else b""
+    try:
+        head = git._call(["rev-parse", "--verify", "--quiet", "HEAD"]).strip()
+    except GitError as exc:
+        cause = exc.__cause__
+        if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
+            raise
+        head = None  # An unborn branch has an empty committed baseline.
+    tracked = git._call(["ls-tree", "--name-only", head, "--", ".gitignore"]).strip() if head else ""
+    original = git._call(["show", f"{head}:.gitignore"]).encode("utf-8") if tracked else b""
     expected = SkillManager.default_ignore_content(original, [entry_directory(name) for name in names])
     if expected != original and path.read_bytes() == expected:
         return git.uncommitted_paths([".gitignore"])

@@ -97,11 +97,16 @@ class Setup:
                 raise subprocess.CalledProcessError(1, ["git", *args], stderr="pre-commit hook failed")
             # Import only the requested setup paths, retaining unrelated index entries.
             title = args[args.index("-m") + 1]
-            parent = git_command(root, "rev-parse", "HEAD")
+            try:
+                parent = git_command(root, "rev-parse", "--verify", "--quiet", "HEAD")
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                parent = None  # The first setup commit has no parent.
             branch = git_command(root, "symbolic-ref", "HEAD")
             stream = [
                 f"commit {branch}\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
-                f"data {len(title.encode())}\n{title}\n", f"from {parent}\n",
+                f"data {len(title.encode())}\n{title}\n", *([f"from {parent}\n"] if parent else []),
             ]
             for setup_path in args[args.index("--") + 1:]:
                 if setup_path == ":!CLAUDE.local.md":
@@ -1850,3 +1855,54 @@ def test_reinit_keeps_ignore_edits_outside_its_generated_output(setup, interrupt
     assert all('.gitignore' not in args[args.index('--') + 1:]
                for args in setup.git_calls if 'commit' in args)
     assert '.gitignore' in git_command(setup.root, 'status', '--porcelain')
+
+
+@pytest.mark.parametrize('initial', ['existing-ignore', 'interrupted-setup'])
+def test_init_installs_defaults_before_the_first_commit(setup, initial):
+    root = setup.root.parent / 'unborn'
+    root.mkdir()
+    git_command(root, 'init', '--initial-branch=main')
+    git_command(root, 'remote', 'add', 'origin', 'https://github.com/owner/repo.git')
+    fresh = Setup(root)
+    if initial == 'existing-ignore':
+        (root / '.gitignore').write_text('# Project ignores\nbuild/\n')
+    else:
+        fresh.commit_fails = True
+        with pytest.raises(GitError, match='pre-commit hook failed'):
+            fresh.init(no_push=True, no_launchd=True)
+        fresh.commit_fails = False
+        assert (root / '.claude/skills/review-procedure/SKILL.md').is_file()
+    probe = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', 'HEAD'], cwd=root, capture_output=True)
+    assert probe.returncode == 1, 'This scenario must still have no commit'
+    report = fresh.init(no_push=True, no_launchd=True)
+    assert report.committed
+    assert git_command(root, 'rev-list', '--count', 'HEAD') == '1'
+    assert yaml.safe_load((root / '.foragent.yml').read_text())['default_skills'] == ROLE_DEFAULT_SKILLS
+    shipped = Path(__file__).resolve().parents[1] / 'skills'
+    for name in {name for names in ROLE_DEFAULT_SKILLS.values() for name in names}:
+        assert (root / '.claude/skills' / name / 'SKILL.md').read_bytes() == (shipped / name / 'SKILL.md').read_bytes()
+    assert git_command(root, 'show', 'HEAD:.gitignore') == (root / '.gitignore').read_text().strip()
+    if initial == 'existing-ignore':
+        assert (root / '.gitignore').read_text().startswith('# Project ignores\nbuild/\n')
+    assert git_command(root, 'status', '--porcelain') == ''
+    assert not fresh.init(no_push=True, no_launchd=True).committed
+    assert git_command(root, 'rev-list', '--count', 'HEAD') == '1'
+
+
+@pytest.mark.parametrize('step', ['probe', 'tree', 'blob'])
+def test_init_ignore_recovery_propagates_git_errors_other_than_missing_head(setup, monkeypatch, step):
+    setup.init(no_push=True, no_launchd=True)
+    run = setup.run_git
+
+    def fail_read(args):
+        targeted = ((step == 'probe' and args == ['rev-parse', '--verify', '--quiet', 'HEAD'])
+                    or (step == 'tree' and args[:2] == ['ls-tree', '--name-only'])
+                    or (step == 'blob' and args[:1] == ['show'] and args[1].endswith(':.gitignore')))
+        if targeted:
+            raise subprocess.CalledProcessError(128 if step == 'probe' else 1, ['git', *args],
+                                                stderr='injected Git read failure')
+        return run(args)
+
+    monkeypatch.setattr(setup, 'run_git', fail_read)
+    with pytest.raises(GitError, match='injected Git read failure'):
+        setup.init(no_push=True, no_launchd=True)
