@@ -16,8 +16,8 @@ from foragent.runner import REVIEW_PROMPT, _review, parse_code_review, run_issue
 
 from conftest import ACCEPTANCE, git_command
 from runner_support import (
-    BODY, COMMAND, REPORTED_JSON_FINDINGS, enable_native_reviewer, enable_reviewer,
-    expected_review_rules, import_index, review_context, run_case,
+    BODY, COMMAND, GROUNDED_SCORE, REPORTED_JSON_FINDINGS, enable_native_reviewer, enable_reviewer,
+    expected_review_rules, import_index, review_context, run_case, scoring_request,
 )
 
 
@@ -360,6 +360,19 @@ def test_code_review_result_parsing(text, verdict):
         assert result.findings == next(line for line in text.splitlines() if line.startswith("- "))
 
 
+@pytest.mark.parametrize("note", ["Review completed.", "NOTE: checked the hunks"])
+def test_none_marker_reads_the_same_on_the_first_or_last_line(note):
+    from foragent.run_review import code_review_findings
+
+    first, last = f"(none)\n\n{note}", f"{note}\n\n(none)"
+    assert code_review_findings(first) == code_review_findings(last) == ("PASS", [], "")
+    # NOTE lines are removed first; a marker between two prose lines is not the marker.
+    assert code_review_findings(f"{note}\n(none)\n{note}")[0] == (
+        "PASS" if note.startswith("NOTE:") else "UNUSABLE")
+    for text in (first, last):
+        assert parse_code_review(json.dumps({"result": text})).no_findings
+
+
 def test_code_review_plain_finding_reports_failure():
     text = "src/foragent/adopt.py:180 — I couldn't confirm this one, because ..."
     result = parse_code_review(json.dumps({"result": "VERDICT: FAIL\n" + text}))
@@ -462,6 +475,8 @@ def test_pr_body_reviews_published_head_and_keeps_findings_in_comments(run_case,
     heads = []
 
     def review(**kwargs):
+        if scoring_request(kwargs.get("prompt")) is not None:
+            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
         pr = c.tracker.created_prs[0]
         if not heads:
             assert kwargs["review_pr"] == pr.number
@@ -548,9 +563,13 @@ def test_claude_review_scope_restores_original_or_removes_temporary_file(review_
         "# Review scope (written by Foragent for this review only)\n\n"
         + authored_body(BODY) + "\n\n" + expected_review_rules(ctx.config.acceptance_dir) + "\n\n"
     ).encode() + (original if original is not None else b"")
-    calls = []
+    calls, scorings = [], []
 
     def review(**kwargs):
+        if scoring_request(kwargs.get("prompt")) is not None:
+            # The finding's scoring session runs after the scope file is restored.
+            scorings.append(path.read_bytes() if path.exists() else None)
+            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
         calls.append(kwargs)
         assert kwargs["prompt"] == "" and kwargs["review_level"] == "low"
         assert path.read_bytes() == expected
@@ -574,6 +593,7 @@ def test_claude_review_scope_restores_original_or_removes_temporary_file(review_
         assert result.verdict == {"pass": "PASS", "fail": "FAIL", "force-stage": "PASS"}.get(outcome, "UNUSABLE")
         assert any("changes discarded" in note for note in result.notes) == (outcome == "force-stage")
     assert len(calls) == 1
+    assert scorings == ([original] if outcome == "fail" else [])
     if original is None:
         assert not path.exists()
     else:
@@ -1014,6 +1034,12 @@ def test_review_requires_exactly_one_verdict(text, native):
     ('[ {"summary":"selected locale is lost"} ]\n(none)', False),
     ("feature.txt:1 — selected locale is lost\n(none)", False),
     ('```json\n[{"summary":"selected locale is lost"}]\n```\n(none)', False),
+    ("(none)\n\nReview completed.", True), ("\n(none)\nNo defects found.\n", True),
+    ("(none)\nfeature.txt:1 — selected locale is lost", False),
+    ("(none)\nNo defects.\nfeature.txt:1 — selected locale is lost", False),
+    ('(none)\n[ {"summary":"selected locale is lost"} ]', False),
+    ('(none)\n```json\n[{"summary":"selected locale is lost"}]\n```', False),
+    ("Review completed.\n(none)\nMore prose.", False),
 ])
 @pytest.mark.parametrize("native", [False, True])
 def test_missing_verdict_keeps_protocol_separate_from_empty_findings(text, empty, native):

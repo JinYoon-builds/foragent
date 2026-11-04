@@ -110,6 +110,12 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     if type(values["merge_owner"]) is not bool:
         raise ConfigError("merge_owner must be a boolean")
+    if type(values["merge_batch"]) is not bool:
+        raise ConfigError("merge_batch must be a boolean")
+    if values["merge_batch"] and (not values["merge_owner"] or values["checks"] != "ci"):
+        raise ConfigError("merge_batch requires merge_owner: true and checks: ci")
+    if type(values["merge_batch_size"]) is not int or not 2 <= values["merge_batch_size"] <= 8:
+        raise ConfigError("merge_batch_size must be an integer from 2 to 8")
     if values["merge_owner"]:
         from foragent.run_checks import _pytest_command
 
@@ -132,6 +138,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("animation must be true or false")
     if type(values["review_pass_scope"]) is not bool:
         raise ConfigError("review_pass_scope must be true or false")
+    if type(values["review_scoring"]) is not bool:
+        raise ConfigError("review_scoring must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     presence = values["presence"]

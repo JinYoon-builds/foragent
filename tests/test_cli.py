@@ -52,6 +52,10 @@ class FakeGit:
         assert args[:2] == ["cat-file", "blob"], args
         return (self.root / args[2]).read_text(encoding="utf-8")
 
+    def file_at(self, ref, path):
+        source = self.root / path
+        return source.read_text(encoding="utf-8") if source.is_file() else None
+
     def remove_worktree(self, path):
         pass
 
@@ -119,6 +123,41 @@ def test_tick_no_start_json_builds_context_and_promotes(app, capsys):
     assert calls["roots"] == [root]
     assert calls["repos"] == calls["stores"] == ["owner/repo"]
     assert calls["launches"] == [] and store.active_runs() == []
+
+
+@pytest.mark.parametrize("failure", [False, True], ids=["installed", "install-failed"])
+def test_tick_json_remains_valid_during_base_reinstall(app, monkeypatch, capsys, failure):
+    from foragent import orch_reinstall
+
+    root, git, tracker, store, calls = app
+    (root / "pyproject.toml").write_text('[project]\nname = "foragent"\n')
+    old, new = "a" * 40, "b" * 40
+    monkeypatch.setattr(orch_reinstall, "_installed_revision", lambda: old)
+    monkeypatch.setattr(git, "ref_sha", lambda ref: new, raising=False)
+    original = git._call
+    def read(args):
+        if args == ["diff", "--name-only", f"{old}..{new}", "--", "src/", "pyproject.toml"]:
+            return "src/foragent/__init__.py\n"
+        return original(args)
+    monkeypatch.setattr(git, "_call", read)
+    installs = []
+    def install(ctx, sha):
+        assert ctx.git is git
+        installs.append(sha)
+        if failure:
+            raise RuntimeError("broken install")
+        return "reinstalled test build"
+    monkeypatch.setattr(orch_reinstall, "_install_sha", install)
+
+    assert cli.main(["gate", "tick", "--repo-root", str(root), "--no-start", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"skipped": None, "actions": []}
+    assert captured.err == ("reinstall failed: broken install\n" if failure else "reinstalled test build\n")
+    assert installs == [new] and git.fetches == [("origin", "main")]
+    events = [json.loads(line) for line in (store.root / "orch-events.jsonl").read_text().splitlines()] if failure else []
+    assert [e["summary"] for e in events if e["kind"] == "reinstall-failed"] == (
+        [f"base {new}: broken install"] if failure else []
+    )
 
 
 def test_tick_starts_by_default_and_prints_plain_report(app, capsys):
