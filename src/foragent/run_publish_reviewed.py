@@ -60,7 +60,10 @@ def _refresh_reviewed_head(
     run_publish._check_publication(git, pr.base, target_sha)
     if before_push is not None:
         before_push(new_head)
-    git.push_head(pr.head, lease=head)
+    from foragent import orch_github
+
+    orch_github.push(ctx, n, lambda: git.push_head(pr.head, lease=head),
+                     head=new_head, lease=head, branch=pr.head, kind="refresh")
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
     if ctx.tracker.pr_head_sha(pr.number) != new_head:

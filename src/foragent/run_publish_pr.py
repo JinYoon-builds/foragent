@@ -13,11 +13,19 @@ if TYPE_CHECKING:
 
 
 def _push_branch(attempt: Implementation) -> None:
+    from foragent import orch_github
+
+    lease = (attempt.rebuild_lease if attempt.rebuilt else
+             attempt.git.remote_branch_sha(attempt.branch) or "")
+    try:
+        orch_github.push(attempt.ctx, attempt.n,
+                         lambda: attempt.git.push(attempt.branch, lease=lease), head=attempt.git.head_sha(),
+                         lease=lease, branch=attempt.branch, kind="publish")
+    except run_publish.GitError:
+        attempt.tracker_available = False  # WIP cleanup must not repeat a refused/exhausted push.
+        raise
     if attempt.rebuilt:
-        attempt.git.push(attempt.branch, lease=attempt.rebuild_lease)
         attempt.rebuild_lease = attempt.git.head_sha()
-    else:
-        attempt.git.push(attempt.branch)
     attempt.pushed_head = attempt.git.head_sha()
 
 
