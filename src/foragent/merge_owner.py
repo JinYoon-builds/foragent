@@ -6,7 +6,7 @@ Merge prerequisites still come from run_publish's fresh locked read.
 """
 
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -21,6 +21,7 @@ from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
+from foragent.run_base_move import BaseMove, REUSED, move_is_neutral
 from foragent.run_checks import _verify_review_head
 from foragent.state import Approval
 from foragent.state_local import _approval_identity
@@ -243,11 +244,12 @@ def _complete(ctx, place, job, pr):
     fact = {"pr": pr.number, "target": pr.base, "head": actual_head, "merged_at": pr.merged_at}
     job["merge_fact"] = fact
     _save(ctx, place, job)
+    base = job.get("merge_base", job["base"])
     if not any(row.get("event") == "turn" and row.get("result") == "merged"
                and row.get("n") == place.n and row.get("started_at") == place.started_at
                for row in queue._rows(ctx.store)):
-        queue.record_turn(ctx, place, job["base"], "merged")
-    run_group_evidence.record_merge(place.n, ctx, fact["target"], job["base"], fact["head"])
+        queue.record_turn(ctx, place, base, "merged")
+    run_group_evidence.record_merge(place.n, ctx, fact["target"], base, fact["head"])
     ctx.store.record_owner_merge(place.n, place.started_at, fact)
     # The old PR's merge remains true even if this issue now authorizes follow-up
     # work. Only the admitted approval may receive completion side effects.
@@ -314,10 +316,32 @@ def _advance(ctx, place, job, pr):
                 _save(ctx, place, job)
                 return
             base = git.ref_sha(f"origin/{pr.base}")
-            if base != job["base"]:
+            comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job["comparison"] else None
+            measured_base = comparison.base_sha if comparison else job["base"]
+            needs_proof = base != job["base"] or measured_base != base
+            neutral = needs_proof and ci_mode.enabled(ctx, pr.base) and comparison is not None and move_is_neutral(
+                git, BaseMove(measured_base, base), ctx=ctx, n=n,
+                own_locked=approval.acceptance_blobs, strict=True,
+            )
+            if neutral:
+                if inputs.status == "pending":
+                    return False
+                followed = comparison.follow(base)
+                # The same proved range also covers a trusted default ref
+                # moving from the previously accepted base. Reports and
+                # their measured base remain immutable.
+                if comparison.trusted_sha == (comparison.accepted_sha or comparison.base_sha):
+                    followed = replace(followed, trusted_sha=base)
+                neutral = followed.current(n, ctx, git, pr.number, job["head"], base, inputs.status)
+                if neutral:
+                    comparison = followed
+            if neutral:
+                runner._append(ctx.store.log_path(n), f"{REUSED}: {base}")
+            if needs_proof and not neutral:
                 def before_push(head):
                     # A progress SHA alone is not a Git reachability root.
                     ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
+                    job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
                     job.update(phase="publishing", previous_head=job["head"], head=head,
                                base=base, comparison=None, ready_at=ctx.now().timestamp())
                     _save(ctx, place, job)
@@ -349,17 +373,17 @@ def _advance(ctx, place, job, pr):
                 logs = ctx.tracker.pr_failed_logs(pr.number)
                 run_publish._hold_if_not_started(n, ctx, pr.number, logs)
                 raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
-            comparison = None
             if ci_mode.enabled(ctx, pr.base):
-                comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job["comparison"] else None
-                if comparison is None or not comparison.current(n, ctx, git, pr.number, job["head"], base, status):
+                if not neutral and (comparison is None or not comparison.current(
+                        n, ctx, git, pr.number, job["head"], base, status)):
                     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
                                               target_branch=pr.base, baseline=None, approval=approval,
                                               log=ctx.store.log_path(n))
                     comparison = ci_mode.require_comparison(attempt, pr.number, job["head"],
                                                            base_sha=base, status=status, wait=False)
-                    job["comparison"] = asdict(comparison)
-                    _save(ctx, place, job)
+                job["comparison"] = asdict(comparison)
+            # Keep the CI measurement origin even after accepting neutral moves.
+            _save(ctx, place, job)
             with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
                 inputs = run_publish._final_merge_inputs(
                     n, ctx, git, pr.number, job["branch"], job["target"], job["head"],
@@ -379,7 +403,7 @@ def _advance(ctx, place, job, pr):
                         current_title=pr.title, base=pr.base, body=lambda: pr.body,
                         note=lambda line: runner._append(ctx.store.log_path(n), line),
                     )
-                    job["phase"] = "merging"
+                    job.update(phase="merging", merge_base=base)
                     _save(ctx, place, job)
                     ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
             if ready:
