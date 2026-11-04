@@ -237,6 +237,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
+        ctx._budget_review_pass = n
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
     facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)
@@ -471,7 +472,10 @@ def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
         return False
     branch = f"foragent/issue-{n}"
     pr = next((pr for pr in ctx.tracker.list_prs("open", branch) if pr.head == branch), None)
-    return pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
+    passed = pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
+    if passed:
+        ctx._budget_review_pass = n
+    return passed
 
 
 def unchanged_since_pass(git: GitRepo, head: str) -> bool:
@@ -587,6 +591,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is not None and head != verdict_head:
         return _hold_changed_head(n, ctx, link)
     if verdict_head is not None:
+        ctx._budget_review_pass = n
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
         _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")

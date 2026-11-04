@@ -355,6 +355,7 @@ def _implement(
     from foragent import runner
 
     n, ctx = attempt.n, attempt.ctx
+    ctx._budget_base_changed = ctx._budget_review_pass = None
     wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")

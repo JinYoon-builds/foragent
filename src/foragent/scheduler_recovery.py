@@ -235,8 +235,8 @@ def _recover_runs(ctx: TickContext, report: TickReport) -> None:
             if run.pid is not None and not waiting and runtime > (ctx.config.max_runtime_minutes + 10) * 60:
                 if scheduler._kill_run(ctx, run.key, report, outcome="killed" if issue else "error", unless_talking=True,
                                        detail="Runner exceeded its runtime limit.", decided=run) and issue:
-                    scheduler.flag(ctx, run.number, scheduler.Reason.TIMEOUT, "Too big for one session; split it in order")
-                    report.actions.append(f"#{run.number} flagged timeout")
+                    scheduler.flag(ctx, run.number, scheduler.Reason.RUNTIME_EXCEEDED, "Runner exceeded its runtime limit.")
+                    report.actions.append(f"#{run.number} flagged runtime-exceeded")
             elif run.pid is not None and not waiting and not sleep_credit.in_wake_grace(
                     ctx.store, run, ctx.now()) and ctx.now() - scheduler.lane_talk.stall_since(
                 ctx.store, run,  # The later of the last progress and the latest talk closing (D95).

@@ -294,10 +294,10 @@ def test_reviewer_timeout_at_runtime_limit_does_not_launch_more_sessions(run_cas
 
     timeout = ExecResult(0, True, "VERDICT: PASS", Path("unused"))
     calls = enable_reviewer(c, [timeout], consume_runtime)
-    assert run_issue(1, c.ctx) == "timeout"
+    assert run_issue(1, c.ctx) == "too-large"
     assert len(calls) == len(c.executor.calls) == 1
     assert not c.tracker.created_prs and not c.tracker.merged_prs
-    assert c.store.load_flag(1).reason == Reason.TIMEOUT
+    assert c.store.load_flag(1).reason == Reason.TOO_LARGE
 
 
 def test_reviewer_commit_is_detected_and_head_index_and_files_are_restored(run_case):

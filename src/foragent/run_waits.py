@@ -97,9 +97,17 @@ def paused_seconds(n: int, ctx: RunContext) -> float:
     return run.waited_seconds + run.talk_pause_seconds(now)
 
 
-def _timeout(n: int, ctx: RunContext) -> str:
-    flag(ctx, n, Reason.TIMEOUT, "Too big for one session; split it in order")
-    return "timeout"
+def _timeout(n: int, ctx: RunContext, *, check: bool = False) -> str:
+    if check:
+        flag(ctx, n, Reason.TIMEOUT, "Check reached its time limit")
+        return "timeout"
+    if getattr(ctx, "_budget_base_changed", None) == n:
+        ctx.store.update_run(n, detail="Run budget spent following a changed base; returning to ready.")
+        ctx.tracker.add_labels(n, ["ready"])
+        ctx.tracker.remove_labels(n, ["running"])
+        return "base-changed"
+    flag(ctx, n, Reason.TOO_LARGE, "Too big for one session; split it in order")
+    return "too-large"
 
 
 @contextmanager

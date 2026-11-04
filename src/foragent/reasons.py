@@ -15,6 +15,8 @@ class Reason(StrEnum):
     RETRIES_EXCEEDED = "retries-exceeded"
     STALLED = "stalled"
     TIMEOUT = "timeout"
+    TOO_LARGE = "too-large"
+    RUNTIME_EXCEEDED = "runtime-exceeded"
     STOP_REFUSED = "stop-refused"
     NO_MACHINE_CHECK = "no-machine-check"
     ORCHESTRATOR_TIMEOUT = "orchestrator-timeout"
@@ -33,6 +35,8 @@ GROUP: dict[Reason, str] = {
     Reason.RETRIES_EXCEEDED: "tech-failure",
     Reason.STALLED: "tech-failure",
     Reason.TIMEOUT: "tech-failure",
+    Reason.TOO_LARGE: "tech-failure",
+    Reason.RUNTIME_EXCEEDED: "tech-failure",
     Reason.STOP_REFUSED: "tech-failure",
     Reason.NO_MACHINE_CHECK: "decision",
     Reason.ORCHESTRATOR_TIMEOUT: "tech-failure",

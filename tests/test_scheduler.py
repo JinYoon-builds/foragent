@@ -837,7 +837,7 @@ def test_running_overtime_backstop_kills_alive_runner(ctx, monkeypatch, seconds,
     assert actions == ([5432] if killed else [])
     if killed:
         assert ctx.store.get_run(1).outcome == "killed"
-        assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+        assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
         assert ctx.tracker.get_issue(1).labels == {"approved", "blocked"}
     else:
         assert ctx.store.get_run(1).status == "running"
@@ -872,7 +872,7 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     tick(ctx)
     assert killed == [5432]
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
     assert [entry["action"] for entry in ctx.store.github_outbox()] == [
         "add_labels", "remove_labels", "comment",
     ]
@@ -885,9 +885,9 @@ def test_runtime_backstop_outbox_survives_uncollected_old_comment_after_reset(ct
     assert ctx.store.github_outbox() == []
     assert remote.get_issue(1).labels == {"approved", "blocked"}
     assert ctx.store.local_issues()[0]["labels"] == ["approved", "blocked"]
-    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.TIMEOUT
+    assert parse_reason(remote.list_comments(1)[-1].body) == Reason.RUNTIME_EXCEEDED
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
     assert [run.outcome for run in ctx.store.read_history()] == ["killed"]
     assert launches == []
     assert report.actions == []
@@ -2546,7 +2546,7 @@ def test_tick_runtime_backstop_excludes_waited_seconds(ctx):
     ctx.store.update_run(1, waited_seconds=0)
     tick(ctx)
     assert ctx.store.get_run(1).outcome == "killed"
-    assert ctx.store.load_flag(1).reason == Reason.TIMEOUT
+    assert ctx.store.load_flag(1).reason == Reason.RUNTIME_EXCEEDED
 
 
 def test_tick_does_not_stall_a_waiting_executor(ctx):
