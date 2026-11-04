@@ -299,7 +299,7 @@ def _join(ctx, report, base, before, place, job):
     """Skip composition failures; an already included head aborts the train."""
     try:
         head = job["head"]
-        if ci_mode.changed_workflows(ctx.git, base, head):
+        if ci_mode.pr_changes_workflows(ctx.git, base, head):
             raise ValueError("acceptance workflow differs from target")
         if not ctx.git.is_ancestor(head, before):
             tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
