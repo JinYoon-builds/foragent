@@ -1244,6 +1244,43 @@ def update_base(case, files):
     case.base = case.history.tip
 
 
+def test_train_related_units_use_published_tip_receipt_and_keep_locked_commands(batched, monkeypatch):
+    from foragent import runner
+
+    case = batched
+    paths = [f"tests/test_member_{n}.py" for n in (5, 1)]
+    update_base(case, {path: "def test_member():\n    pass\n" for path in paths})
+    queue_workers(case, [5, 1])
+    member_heads = {case.tracker.pr_head_sha(support.pr_for(case, n).number) for n in (5, 1)}
+    lookups, commands = [], []
+
+    def receipt(head):
+        lookups.append(head)
+        return 42, {f"{path}::test_member" for path in paths}
+
+    check = runner._check
+
+    def observed(command, *args, **kwargs):
+        commands.append(command)
+        return check(command, *args, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "pr_unit_passed_tests", receipt)
+    monkeypatch.setattr(runner, "_check", observed)
+    support.gate(case)
+
+    tip = case.tracker.pr_head_sha(groups(case)[0].number)
+    assert lookups and set(lookups) == {tip}
+    assert not member_heads.intersection(lookups)
+    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2
+    assert not any("--junitxml " in command for command in commands)
+    assert any("--collect-only" in command and all(path in command for path in paths)
+               for command in commands)
+    for n in (5, 1):
+        assert any(f"tests/acceptance/test_own_{n}.py" in command and "--collect-only" not in command
+                   for command in commands)
+    assert f"related units: all 2 passed in CI run 42 for {tip}" in case.store.log_path(5).read_text()
+
+
 def test_train_ci_includes_every_members_done_when_and_excludes_only_outsiders(batched):
     case = batched
     own = "tests/acceptance/test_own_5.py"
