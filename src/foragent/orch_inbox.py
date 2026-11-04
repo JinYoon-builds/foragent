@@ -13,7 +13,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from foragent.file_cache import read_lines
 from foragent.orch_events import append_event
+from foragent.state_issues import _copy
 from foragent.state import StateStore
 
 REQUEST_STATUSES = ("new", "processing", "done")
@@ -367,27 +369,17 @@ def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, A
     """
     path = store.root / "orch-events.jsonl"
     try:
-        with path.open("rb") as stream:
-            size = stream.seek(0, 2)
-            start = max(0, size - NOTICE_TAIL_BYTES)
-            # One byte more: whether the tail begins right after a newline.
-            stream.seek(max(0, start - 1))
-            data = stream.read()
+        start, lines = read_lines(path).tail(NOTICE_TAIL_BYTES)
     except FileNotFoundError:
         return [], []
     except OSError as exc:
         return [], [f"orch-events.jsonl: unreadable ({exc.strerror or exc})"]
-    lines = data.split(b"\n")
-    if start > 0:
-        # The first piece is the byte before the tail plus whatever of a record the
-        # tail cut into; when that byte is a newline the piece is empty.
-        lines = lines[1:]
     events, problems = [], []
-    for number, raw in enumerate(lines, 1):
-        if not raw.strip():
+    for number, line in enumerate(lines, 1):
+        if line.blank:
             continue
         try:
-            event = json.loads(raw.decode("utf-8", errors="replace"))
+            event = line.parsed()
         except Exception as exc:  # any failure (bad JSON, deep nesting's RecursionError) skips this line alone
             problems.append(f"orch-events.jsonl: tail line {number} unreadable ({type(exc).__name__})")
             continue
@@ -416,7 +408,7 @@ def recent_notices(store: StateStore, since: datetime) -> tuple[list[dict[str, A
         if event["kind"] == NOTICE_KIND and at > since:
             notices.append((at, event))
     notices.sort(key=lambda item: item[0])
-    return [event for _, event in notices], problems
+    return [_copy(event) for _, event in notices], problems
 
 
 def _event_at(event: dict[str, Any]) -> datetime | None:

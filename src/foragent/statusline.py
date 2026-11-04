@@ -298,6 +298,7 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
     Claude. The summary follows presence.session_start; PM and decision context are independent.
     Clear and compaction restore that context without restarting the summary or squirrel.
+    hookSpecificOutput.sessionTitle names the session's role and the project (presence.session_start too).
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -327,9 +328,8 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
                                                      datetime.now(UTC))
         except Exception:  # A failed summary must never disturb the session that is starting.
             pass
-    output = {}
-    if message:
-        output["systemMessage"] = message
+    output: dict[str, Any] = {"systemMessage": message} if message else {}
+    specific: dict[str, Any] = {}
     try:
         project = presence._project(folder)
         planning = project is not None and presence._planning_session(folder, project[1])
@@ -357,7 +357,15 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
         except Exception:  # Decision records must never stop the session from starting.
             pass
     if contexts:
-        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": "\n\n".join(contexts)}
+        specific["additionalContext"] = "\n\n".join(contexts)
+    try:
+        title = presence.session_title(folder, payload.get("agent_type"))
+    except Exception:  # A failed title only drops the title.
+        title = None
+    if title:
+        specific["sessionTitle"] = title
+    if specific:
+        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", **specific}
     if output:
         stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()

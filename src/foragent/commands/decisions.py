@@ -13,15 +13,35 @@ def add(commands) -> None:
     command = commands.add_parser("decisions", help=cli.text("decisions_help", language))
     command.add_argument("--json", action="store_true", help=cli.text("decisions_json_help", language))
     command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    actions = command.add_subparsers(dest="decisions_action")
+    stop = actions.add_parser("stop-check", help=cli.text("decisions_stop_help", language))
+    stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    drop = actions.add_parser("drop", help=cli.text("decisions_drop_help", language))
+    drop.add_argument("identity")
+    drop.add_argument("--why", required=True, help=cli.text("decisions_why_help", language))
+    drop.add_argument("--repo-root", type=cli.Path, default=cli.argparse.SUPPRESS)
 
 
 def run(args) -> int:
     from foragent import decisions
 
     cli = facade()
+    if args.decisions_action == "stop-check":
+        return _stop_check()
     root = args.repo_root.resolve()
     config, _repo, store = repo_store(root)
     ledger = root / decisions.LEDGER
+    if args.decisions_action == "drop":
+        try:
+            decisions.drop(root, args.identity, args.why)
+        except (OSError, UnicodeError) as exc:
+            print(cli.text("decisions_write_failed", config.language, error=exc), file=cli.sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(cli.text(str(exc), config.language, id=args.identity), file=cli.sys.stderr)
+            return 1
+        print(cli.text("decisions_dropped", config.language, id=args.identity, why=args.why.strip()))
+        return 0
     try:
         text = ledger.read_text(encoding="utf-8")
     except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError):
@@ -36,4 +56,57 @@ def run(args) -> int:
     for row in rows:
         issues = ", ".join(f"#{n}" for n in row["issues"]) or cli.text("decisions_no_issues", config.language)
         print(cli.text("decisions_row", config.language, id=row["id"], state=row["state"], issues=issues))
+        if row["state"] == "dropped":
+            print(cli.text("decisions_drop_reason", config.language, why=row["why"]))
     return 0
+
+
+def _stop_check() -> int:
+    from foragent import decisions, presence
+
+    cli = facade()
+    if "FORAGENT_ROLE" in cli.os.environ:
+        return 0
+    language = "en"
+    try:
+        payload = cli.json.load(cli.sys.stdin)
+        if not isinstance(payload, dict) or payload.get("stop_hook_active"):
+            return 0
+        root = presence.project_root(cli.Path(payload.get("cwd") or cli.Path.cwd()))
+        if root is None:
+            return 0
+        config, _repo, store = repo_store(root)
+        language = config.language
+        ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
+        rows = decisions.view(root, decisions.observed_rows(store._issue_view()), ledger)
+        count, oldest = decisions.backlog(root, rows, ledger)
+    except Exception as exc:
+        print(cli.text("decisions_check_failed", language, error=exc), file=cli.sys.stderr)
+        return 1
+    if count >= 4 or oldest > 50:
+        print(cli.json.dumps({"decision": "block", "reason": cli.text(
+            "decisions_stop_reason", language, count=count, days=oldest)}, ensure_ascii=False))
+    return 0
+
+
+def install_stop_hook(root) -> None:
+    """Explicit project opt-in; preserve other settings and keep a single copy."""
+    from foragent import statusline
+
+    cli = facade()
+    language = cli.load_config(root).language
+    path = root / ".claude/settings.local.json"
+    try:
+        with statusline._install_lock():
+            settings = cli.json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            hooks = settings.setdefault("hooks", {})
+            groups = hooks.setdefault("Stop", [])
+            command = "fa decisions stop-check"
+            if not any(statusline._fa_arguments(hook.get("command", "")) == ["decisions", "stop-check"]
+                       for group in groups for hook in group.get("hooks", []) if hook.get("type") == "command"):
+                groups.append({"hooks": [{"type": "command", "command": command, "timeout": 15}]})
+                statusline._write_json(path, settings)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        print(cli.text("decisions_hook_failed", language, error=exc), file=cli.sys.stderr)
+        return
+    print(cli.text("decisions_hook_installed", language))

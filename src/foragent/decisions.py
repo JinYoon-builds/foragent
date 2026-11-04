@@ -2,13 +2,14 @@
 
 An issue's explicit marker is the only intent record. Older issues without a
 marker fall back to exact D-number citations in their published order spec; that
-proves a link, never that code fulfils the decision. State is derived from the
-last recorded issue observations and is never stored.
+proves a link, never that code fulfils the decision. Completion is derived from
+the last recorded issue observations. Drops append a reason to the shared ledger.
 """
 
+from datetime import date
 import json
-import re
 from pathlib import Path
+import re
 from typing import Any
 
 ID = re.compile(r"D[1-9][0-9]*")
@@ -23,6 +24,7 @@ PARENT = re.compile(r"<!-- foragent:plan id=([A-Za-z0-9][A-Za-z0-9_-]*) map=(\{[
                     r"(?: acceptance=(\{[^\n]*\}))? -->")
 SPEC_LINK = re.compile(r"(?<![A-Za-z0-9_.-])docs/specs/([A-Za-z0-9][A-Za-z0-9_-]*)\.md(?![A-Za-z0-9_])")
 LEDGER = "docs/decisions.md"
+DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 
 NOTHING_ORDERED, IN_PROGRESS, DONE = "decided, nothing ordered", "in progress", "done"
 
@@ -86,6 +88,67 @@ def unordered_context(root: Path, rows: list[dict[str, Any]], ledger: str, langu
             entries.append(ledger[heading.start():end].strip())
             unlinked.remove(identity)
     return text("decisions_unordered_context", language) + "\n\n" + "\n\n".join(entries) if entries else None
+
+
+def dropped(ledger: str) -> dict[str, str]:
+    result = {}
+    for raw in DROP.findall(ledger):
+        try:
+            record = json.loads(raw)
+            if ID.fullmatch(record["id"]) and record["why"].strip():
+                result[record["id"]] = record["why"]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return result
+
+
+def drop(root: Path, identity: str, why: str) -> None:
+    """Append a reason to the shared ledger, preserving the original decision."""
+    import fcntl
+    import os
+
+    if not why.strip():
+        raise ValueError("decisions_drop_reason_required")
+    with (root / LEDGER).open("r+", encoding="utf-8") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        ledger = stream.read()
+        if identity not in ledger_ids(ledger):
+            raise ValueError("decisions_drop_unknown")
+        record = {"id": identity, "why": why.strip(), "date": date.today().isoformat()}
+        stream.write("\n<!-- foragent:decision-drop " + json.dumps(record, ensure_ascii=False) + " -->\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def backlog(root: Path, rows: list[dict[str, Any]], ledger: str, *, today: date | None = None) -> tuple[int, int]:
+    """Count unlinked, live headings; derive their age from the heading or its first git addition."""
+    import subprocess
+
+    today = today or date.today()
+    pending = {row["id"] for row in rows if not row["issues"] and row["state"] != "dropped"}
+    born: dict[str, date] = {}
+    for heading in re.finditer(r"^### (D[1-9][0-9]*)\.[^\r\n]*", ledger, re.MULTILINE):
+        identity = heading[1]
+        if identity not in pending:
+            continue
+        stamp = re.search(r"\b\d{4}-\d{2}-\d{2}\b", heading[0])
+        if stamp:
+            born[identity] = date.fromisoformat(stamp[0])
+    undated = pending - born.keys()
+    if undated:
+        history = subprocess.run(
+            ["git", "-C", str(root), "log", "--reverse", "--format=foragent-date:%cI", "-p", "--", LEDGER],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        added_on = None
+        for line in history.stdout.splitlines():
+            if line.startswith("foragent-date:"):
+                added_on = date.fromisoformat(line.removeprefix("foragent-date:")[:10])
+            elif added_on is not None and line.startswith("+### "):
+                found = HEADING.match(line[1:])
+                if found and found[1] in undated:
+                    born.setdefault(found[1], added_on)
+    return len(pending), max([0, *((today - stamp).days for stamp in born.values())])
 
 
 def _citations(text: str) -> set[str]:
@@ -164,15 +227,20 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
             if identity in links:
                 links[identity].add(row["number"])
     by_number = {row["number"]: row for row in rows}
+    drops = dropped(ledger)
     result = []
     for identity in ids:
         numbers = sorted(links[identity])
         linked_rows = [by_number.get(number) for number in numbers]
-        if not numbers:
+        if identity in drops:
+            state = "dropped"
+        elif not numbers:
             state = NOTHING_ORDERED
         else:
             state = DONE if all(_finished(row) for row in linked_rows) else IN_PROGRESS
         times = [row.get("observed_at") if row else None for row in linked_rows]
         oldest = min(times) if times and all(times) else None
         result.append({"id": identity, "issues": numbers, "state": state, "observed_at": oldest})
+        if identity in drops:
+            result[-1]["why"] = drops[identity]
     return result

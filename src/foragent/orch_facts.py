@@ -25,6 +25,7 @@ from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
     _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
+from foragent.file_cache import temporary_reads
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
 
@@ -169,7 +170,7 @@ def collect(store: StateStore, config: Config, root, *, checkout: bool = False) 
     from foragent.scheduler_config import tick_config
 
     for attempt in range(FREEZE_ATTEMPTS):
-        with tempfile.TemporaryDirectory(prefix="foragent-facts-") as directory:
+        with tempfile.TemporaryDirectory(prefix="foragent-facts-") as directory, temporary_reads(Path(directory)):
             frozen = _freeze(store, Path(directory), Path(root) if checkout else None)
             if frozen is None and attempt < FREEZE_ATTEMPTS - 1:
                 continue
