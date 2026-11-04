@@ -77,3 +77,4 @@
 - New plan fields that make publish write (e.g. `closes`, #1791) belong in docs/order.md §6 next to edits[]; impl/p8a gets updated by the order itself, order.md does not.
 - Files-scope orders ('#NNNN stays off #MMMM's reserved files', e.g. #1861) only move scope; check the named issue, which may close via a PM branch merge (#1860 → #1882). PM-branch merges can append many Dnn at once without touching rules.md; count cited IDs.
 - Setup checklist / gh `project` scope (#1799 setup.py, #1800 notice once) need no README requirement line: README names no board or `fa doctor`, and fa init/doctor print the fix. D117 skill-source tables (#1892) appear in no reader doc; rules.md D37/D117 drift is already r720.
+- Gate lane-label/board Lane sync (#1230, board_lanes.py, via #1845 redesign) and dream redo (#1231, skill reference only) need no reader-doc line; README Lanes already says issues go to the owning lane. #1232 fa-allow is in README :33/:111 both languages.
