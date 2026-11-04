@@ -1074,3 +1074,112 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
     log = c.store.log_path(1).read_text()
     assert "retitle failed" in log and "HTTP 500" in log
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["publication", "base-refresh"])
+def test_own_publication_waits_for_replaced_head(run_case, monkeypatch, refresh):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max=1)
+    if not refresh:
+        pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="Closes #1")
+        git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.history.tip)
+        c.tracker.set_pr_head_sha(pr, c.history.tip)
+    set_head, read = c.tracker.set_pr_head_sha, c.tracker.pr_head_sha
+    lag, waits, moved, publications = [], [], [], []
+
+    def pushed(pr, head):
+        previous = read(pr)
+        set_head(pr, head)
+        publications.append((previous, head))
+        if previous != head and (not refresh or len(publications) > 1):
+            lag[:] = [previous, previous]
+
+    def reported(pr):
+        return lag.pop(0) if lag else read(pr)
+
+    def sleep(seconds):
+        waits.append(seconds)
+        c.now[0] += timedelta(seconds=seconds)
+
+    def checks(pr):
+        if refresh and not moved:
+            c.history.update({"src/next_base.py": "VALUE = 9\n"})
+            moved.append(c.history.tip)
+        return "pass"
+
+    monkeypatch.setattr(c.tracker, "set_pr_head_sha", pushed)
+    monkeypatch.setattr(c.tracker, "pr_head_sha", reported)
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    c.ctx.sleep = sleep
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [2]
+    assert waits == [2, 4]
+    assert not lag
+    assert not c.store.load_flag(1)
+    pushes = [args for _, args in c.operations if args[:1] == ["push"]]
+    leases = [next(arg for arg in args if arg.startswith("--force-with-lease=")) for args in pushes]
+    expected = ["", publications[0][1]] if refresh else [publications[0][0]]
+    assert leases == [f"--force-with-lease=refs/heads/foragent/issue-1:{head}" for head in expected]
+    assert len(pushes) == (2 if refresh else 1)
+
+
+@pytest.mark.parametrize("heads,expected,delays", [
+    (["new"], True, []),
+    (["old", "old", "new"], True, [2, 4]),
+    (["foreign"], False, []),
+    (["old", "foreign"], False, [2]),
+    (["old"] * 6, False, [2, 4, 8, 16, 30]),
+])
+def test_post_push_head_check_is_bounded_and_fresh(heads, expected, delays):
+    from types import SimpleNamespace
+    from foragent import run_publish
+    from foragent.merge_owner_reads import Snapshot
+
+    answers, calls, sleeps = iter(heads), [], []
+
+    def read(pr):
+        calls.append(pr)
+        return next(answers)
+
+    reads = Snapshot(SimpleNamespace(pr_head_sha=read))
+    ctx = SimpleNamespace(tracker=reads, reads=reads, sleep=sleeps.append)
+    with reads.fresh():
+        assert run_publish._head_after_push(ctx, 7, "new", "old") is expected
+    assert sleeps == delays
+    assert calls == [7] * len(heads)
+
+
+def test_post_push_without_replaced_head_does_not_retry():
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    sleeps = []
+    ctx = SimpleNamespace(tracker=SimpleNamespace(pr_head_sha=lambda pr: "other"), sleep=sleeps.append)
+    assert not run_publish._head_after_push(ctx, 7, "new", None)
+    assert sleeps == []
+
+
+def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_history):
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    branch = "foragent/issue-1"
+    cached = git_history.tip
+    git_command(git_history.clone, "update-ref", f"refs/remotes/origin/{branch}", cached)
+    git_history.update({"src/remote_progress.py": "VALUE = 2\n"})
+    git_command(git_history.origin, "update-ref", f"refs/heads/{branch}", git_history.tip)
+    assert git_history.tip != cached
+    git = GitRepo(git_history.clone)
+    execute, pushes = git._run, []
+
+    def transport(args):
+        if args[:1] == ["push"]:
+            pushes.append(args)
+            return ""
+        return execute(args)
+
+    git._run = transport
+    attempt = SimpleNamespace(git=git, branch=branch, rebuilt=False)
+    assert run_publish._push_branch(attempt) == git_history.tip
+    assert pushes == [["push", f"--force-with-lease=refs/heads/{branch}:{git_history.tip}", "origin", branch]]
+    assert attempt.pushed_head == git.head_sha()

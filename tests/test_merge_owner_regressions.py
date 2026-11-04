@@ -296,3 +296,114 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     assert not store.run_merged(new), "A later timestamp cannot move a fact between generations"
     assert (1, new.started_at) not in store.merge_times()
     assert store.merge_times()[1, old.started_at] == fact["merged_at"]
+
+
+def test_owner_refresh_exhausted_head_visibility_still_holds(proto, monkeypatch):
+    case = proto
+    support.queue_workers(case, [5])
+    pr = support.pr_for(case, 5).number
+    previous = case.tracker.pr_head_sha(pr)
+    read, pushed = case.tracker.pr_head_sha, case.tracker.set_pr_head_sha
+    changed, waits = [], []
+
+    def push(number, head):
+        pushed(number, head)
+        if number == pr and head != previous:
+            changed.append(head)
+
+    def reported(number):
+        return previous if number == pr and changed else read(number)
+
+    check = run_publish._head_after_push
+
+    def checking(ctx, *args):
+        ctx.sleep = waits.append
+        return check(ctx, *args)
+
+    monkeypatch.setattr(case.tracker, "set_pr_head_sha", push)
+    monkeypatch.setattr(case.tracker, "pr_head_sha", reported)
+    monkeypatch.setattr(run_publish, "_head_after_push", checking)
+    case.history.update({"src/neighbor.py": "VALUE = 'moved'\n"})
+    support.gate(case)
+    assert changed
+    assert waits == [2, 4, 8, 16, 30]
+    assert not case.tracker.merged_prs
+    assert "blocked" in case.tracker.get_issue(5).labels
+    assert "PR head changed after verification" in case.tracker.list_comments(5)[-1].body
+    assert not merge_owner.admissions(case.store)
+
+
+def test_restarted_owner_refresh_waits_for_its_own_push(proto, monkeypatch):
+    from acceptance.test_own_refresh_head import lagging_reads
+
+    case = proto
+    support.queue_workers(case, [5])
+    pr = support.pr_for(case, 5).number
+    case.history.update({"src/neighbor.py": "VALUE = 'restart refresh'\n"})
+    push, check = GitRepo.push_head, run_publish._head_after_push
+    interrupted, waits = [], []
+
+    def once(git, *args, **kwargs):
+        if not interrupted:
+            interrupted.append(True)
+            raise TrackerError("Interrupted before refresh ref update")
+        return push(git, *args, **kwargs)
+
+    def checking(ctx, *args):
+        ctx.sleep = waits.append
+        return check(ctx, *args)
+
+    monkeypatch.setattr(GitRepo, "push_head", once)
+    monkeypatch.setattr(run_publish, "_head_after_push", checking)
+    support.gate(case)
+    assert json.loads(merge_owner._path(case.ctx, 5).read_text())["phase"] == "publishing"
+    lag = lagging_reads(case, monkeypatch, pr)
+    support.drain(case, count=1)
+    assert lag["served"] == 2
+    assert waits == [2, 4]
+    assert case.tracker.merged_prs == [pr]
+    assert "blocked" not in case.tracker.get_issue(5).labels
+
+
+@pytest.mark.parametrize("reported", ["stale", "foreign"])
+def test_restarted_push_hold_targets_issue_and_continues_next_candidate(proto, monkeypatch, reported):
+    from conftest import git_command
+    from foragent.reasons import Reason, parse_reason
+
+    case = proto
+    support.queue_workers(case, [5, 1])
+    pr, next_pr = support.pr_for(case, 5), support.pr_for(case, 1)
+    case.history.update({"src/neighbor.py": "VALUE = 'restart rejection'\n"})
+    push, check, read = GitRepo.push_head, run_publish._head_after_push, case.tracker.pr_head_sha
+    interrupted, waits, foreign = [], [], []
+
+    def once(git, branch, **kwargs):
+        if branch == pr.head and not interrupted:
+            interrupted.append(True)
+            raise TrackerError("Interrupted before refresh ref update")
+        return push(git, branch, **kwargs)
+
+    def checking(ctx, number, head, replaced):
+        ctx.sleep = waits.append
+        if number == pr.number:
+            if reported == "stale":
+                monkeypatch.setattr(case.tracker, "pr_head_sha",
+                                    lambda n: replaced if n == number else read(n))
+            else:
+                foreign.append(support.update_pr_branch(case, 5))
+        return check(ctx, number, head, replaced)
+
+    monkeypatch.setattr(GitRepo, "push_head", once)
+    monkeypatch.setattr(run_publish, "_head_after_push", checking)
+    support.gate(case)
+    assert json.loads(merge_owner._path(case.ctx, 5).read_text())["phase"] == "publishing"
+    assert not case.tracker.merged_prs  # The following candidate has only refreshed so far.
+    support.gate(case)
+    assert "blocked" in case.tracker.get_issue(5).labels
+    assert parse_reason(case.tracker.list_comments(5)[-1].body) == Reason.RISK_HIGH
+    assert "PR head changed after verification" in case.tracker.list_comments(5)[-1].body
+    assert not merge_owner.pending(case.store, 5)
+    assert case.tracker.merged_prs == [next_pr.number], "A held candidate must not end the owner's tick"
+    assert waits == ([2, 4, 8, 16, 30] if reported == "stale" else [])
+    if foreign:
+        assert git_command(case.history.origin, "rev-parse", pr.head) == foreign[0]
