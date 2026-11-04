@@ -24,6 +24,19 @@ from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
 CONFIG_COMMENT = "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
+# D117 layer A: only a new project without a person's global table gets these defaults.
+ROLE_DEFAULT_SKILLS = {
+    "workers": ["principle-prove-it-works", "principle-fix-root-causes", "principle-attack-the-premise",
+                "principle-sequence-verifiable-units"],
+    "reviewers": ["principle-prove-it-works", "review-procedure", "principle-attack-the-premise",
+                  "principle-test-behavior-not-implementation"],
+    "orchestrator": ["principle-prove-it-works", "principle-attack-the-premise", "principle-never-block-on-the-human",
+                     "principle-encode-lessons-in-structure"],
+    "architect": ["principle-attack-the-premise", "principle-redesign-from-first-principles",
+                  "principle-exhaust-the-design-space", "principle-separate-before-serializing-shared-state",
+                  "principle-subtract-before-you-add", "principle-foundational-thinking"],
+    "docs": ["principle-minimize-reader-load"],
+}
 ISSUE_TEMPLATE = """---
 name: Foragent task
 about: Define a task for Foragent with executable acceptance checks.
@@ -345,10 +358,15 @@ def init_repo(
         values["approvers"] = approvers
         values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
         values["roles"] = roles.with_defaults(root, {})
+        global_path = Path.home() / ".config/foragent/config.yml"
+        global_values = _read_yaml(global_path) if global_path.exists() else {}
+        values["default_skills"] = (load_global_config().default_skills if "default_skills" in global_values
+                                    else ROLE_DEFAULT_SKILLS)
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers", "checks", "roles"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks", "roles", "default_skills"}
+                   or options[key] is not None or value != DEFAULTS[key]}
         if claude_quota is not None:
             minimal["claude_quota"] = {"mode": claude_quota}
             _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
@@ -370,7 +388,8 @@ def init_repo(
               "memory: project and the skills of its roles entry.", file=sys.stderr)
 
     # Before anything is written: one default without license facts stops the whole setup.
-    skill_manager, default_skills = _checked_default_skills(root, config if config_path.exists() else None)
+    skill_scope = config if config_path.exists() else replace(load_global_config(), default_skills=config.default_skills)
+    skill_manager, default_skills = _checked_default_skills(root, skill_scope)
     default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
                          for skill in default_skills.values())
 
