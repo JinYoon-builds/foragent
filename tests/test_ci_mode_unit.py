@@ -418,6 +418,12 @@ def test_workflow_runner_visibility_warning_and_rewrite(tmp_path, capsys, privat
     assert len(calls) == 1
 
 
+def test_checked_in_acceptance_workflow_matches_generator():
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root, global_path=root / 'absent-global.yml')
+    assert (root / WORKFLOW).read_text(encoding='utf-8') == workflow_text(config)
+
+
 @pytest.mark.parametrize('generated', [True, False])
 def test_workflow_removes_only_generated_legacy_publisher(tmp_path, capsys, generated):
     legacy = tmp_path / '.github/workflows/foragent-acceptance-publish.yml'
@@ -1090,9 +1096,12 @@ def test_review_checks_unit_selection_honors_runner_unit_tests(git_history, tmp_
     ('foragent/group-5-abcdef', 'owner/repo', 'release', True),
     ('foragent/group-5-abcdef', 'fork/repo', 'release', False),
     ('foragent/group-5-abcdef', 'owner/repo', 'main', False),
+    ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'release', True),
+    ('foragent/batch-merge-deadbeef-2', 'fork/repo', 'release', False),
+    ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'main', False),
     ('foragent/batch-1', 'owner/repo', 'release', False),
 ])
-def test_workflow_only_measures_issue_and_group_prs_to_the_primary_base(branch, repo, base, allowed):
+def test_workflow_only_measures_issue_group_and_batch_merge_prs_to_the_primary_base(branch, repo, base, allowed):
     document = yaml.safe_load(workflow_text(Config(base_branch='release')))
     condition = document['jobs']['acceptance']['if']
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
@@ -1808,3 +1817,23 @@ def test_a_rate_limit_at_a_read_stays_the_callers_and_is_no_refusal(tmp_path, mo
     with pytest.raises(TrackerError):
         accepted.current(1, ctx, None, 2, 'head', 'base', 'pass')
     assert _evidence_rows(ctx.store) == []
+
+
+@pytest.mark.parametrize('changed', [None, 'prefix-1', 'prefix-2'])
+def test_locked_read_rechecks_each_measured_head(tmp_path, monkeypatch, changed):
+    from foragent import ci_mode
+
+    ctx, accepted, _ = _read_case(tmp_path, monkeypatch)
+    pinned = [{'shard': 0}]
+    accepted = replace(accepted, reports_by_head={
+        head: ci_mode.serialize_reports(pinned) for head in ('prefix-1', 'prefix-2')})
+    requested = []
+
+    def reports(head):
+        requested.append(head)
+        return [{'shard': 9}] if head == changed else pinned
+
+    monkeypatch.setattr(ctx.tracker, 'pr_acceptance_reports', reports)
+    assert accepted.current(1, ctx, None, 2, 'head', 'base', 'pass') is (changed is None)
+    assert requested == (['prefix-1'] if changed == 'prefix-1' else ['prefix-1', 'prefix-2'])
+    assert [row['reason'] for row in _evidence_rows(ctx.store)] == ([] if changed is None else ['reports-changed'])

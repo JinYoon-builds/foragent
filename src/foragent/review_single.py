@@ -123,4 +123,4 @@ def single_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     if edited:
         review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=result.timed_out, conflicts=spec_conflicts(raw)),
-                          round_number, (raw,), git=git)
+                          round_number, (raw,), git=git, parsed=parsed)

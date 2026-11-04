@@ -94,7 +94,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if neutral is None:
             neutral = conflicts is None and run_publish.base_move_is_neutral(attempt, move)
         run_publish._append(log, f"{run_publish.REUSED if neutral else run_publish.REVERIFY}: {move.target_sha}")
-        # Exclude the merged base's paths from policy and patch replay. The
+        # Exclude the merged base's paths from policy. The
         # separate verified_base_sha advances only after verification/push.
         attempt.start_ref = move.target_sha
         if not neutral:
