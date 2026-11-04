@@ -894,21 +894,22 @@ def test_locked_write_reads_the_current_file_not_the_read_cache(store):
 
 
 def test_replace_between_stat_and_read_is_parsed_once(store, monkeypatch):
-    from foragent import state_issues
+    from pathlib import Path
 
     store.update_local_issue(7, title="first")
     peer = StateStore(store.root, now=lambda: NOW)
     parses = _counted_parses(monkeypatch)
-    read_issue_file = state_issues._read_issue_file
+    open_file = Path.open
 
-    def replaced_first(path):
-        # A peer's atomic replace lands after the reader's stat and before its read.
-        monkeypatch.setattr(state_issues, "_read_issue_file", read_issue_file)
-        peer.update_local_issue(7, title="second")
-        parses.clear()
-        return read_issue_file(path)
+    def replaced_first(path, *args, **kwargs):
+        if path == store.root / "issues.json":
+            # A peer's atomic replace lands after the reader's stat and before its open.
+            monkeypatch.setattr(Path, "open", open_file)
+            peer.update_local_issue(7, title="second")
+            parses.clear()
+        return open_file(path, *args, **kwargs)
 
-    monkeypatch.setattr(state_issues, "_read_issue_file", replaced_first)
+    monkeypatch.setattr(Path, "open", replaced_first)
     assert store.local_issues()[0]["title"] == "second"
     assert store.github_outbox() == []
     assert store.local_board_value(7, "p", "f") is None
