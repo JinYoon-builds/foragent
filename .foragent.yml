@@ -3,7 +3,7 @@ review: fast
 merge_owner: true  # 2026-11-04 Jin: PM switches the merge owner on and measures (#1502, #1797)
 test_command: uv run pytest -q  # required by merge_owner (pytest-only owner refresh)
 merge_batch: true  # 2026-11-04 Jin: prefix CI evidence for queued owner admissions (#1920, D110)
-merge_batch_size: 6  # start at 6; dynamic sizing after 1-2 h of measurements (Jin 2026-11-04)
+merge_batch_size: 2  # 2026-11-04 orchestrator (architect r615): 6 -> 2 after 4 h; a 6-batch ran 66 jobs on a 20-job cap, 3 of 5 failed at construction, merges fell 2.4/h -> 0.75/h. Re-measure 3 h after
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
 approvers:
