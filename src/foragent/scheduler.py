@@ -34,6 +34,8 @@ from foragent.scheduler_start import (
 )
 from foragent.state import Approval, StateStore
 from foragent.tracker import Comment, Dependency, Issue, LabelEvent, PullRequest, RecordingTracker, Tracker, TrackerError, local_issue_models
+# Public contract: the parallel budget a tick admits work with, and whether one more run fits it.
+machine_budget, has_slot = _machine_budget, _has_slot
 
 TICK_JITTER = timedelta(milliseconds=500)
 OPTIONAL_GH_SECONDS = 10  # Batch reconciliation and parent following together, per tick.
