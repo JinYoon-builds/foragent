@@ -43,8 +43,8 @@ def rejected(message='remote: Internal Server Error'):
     raise GitError(message)
 
 
-def attempt(ctx, head='verified', do_push=rejected):
-    orch_github.push(ctx, 1, do_push, head=head, lease='old', branch='branch', kind='refresh')
+def attempt(ctx, head='verified', do_push=rejected, *, kind='refresh', lease='old'):
+    orch_github.push(ctx, 1, do_push, head=head, lease=lease, branch='branch', kind=kind)
 
 
 def test_budget_survives_retries_but_resets_after_success_or_a_different_head(pushing):
@@ -70,22 +70,24 @@ def test_budget_survives_retries_but_resets_after_success_or_a_different_head(pu
     assert orch_github.pending_push(ctx, 1)['started'] == clock[0].isoformat()
 
 
-def test_resume_uses_exact_lease_once_and_refusal_consumes_it_without_waiting(pushing):
+@pytest.mark.parametrize(('kind', 'lease'), [('refresh', 'old'), ('publish', 'old'), ('publish', '')])
+def test_resume_uses_exact_lease_once_and_refusal_consumes_it_without_waiting(pushing, kind, lease):
     ctx, clock = pushing
     with pytest.raises(TrackerError):
-        attempt(ctx)
+        attempt(ctx, kind=kind, lease=lease)
     calls = []
     git = SimpleNamespace(head_sha=lambda: 'verified', _call=lambda args: '',
-                          push_head=lambda branch, **kw: calls.append((branch, kw)))
-    assert orch_github.resume_push(ctx, 1, git)
-    assert calls == [('branch', {'lease': 'old'})]
-    assert not orch_github.resume_push(ctx, 1, git)
+                          push_head=lambda branch, **kw: calls.append(('head', branch, kw)),
+                          push=lambda branch, **kw: calls.append(('branch', branch, kw)))
+    assert orch_github.resume_push(ctx, 1, git) is (kind == 'refresh')
+    assert calls == [('head' if kind == 'refresh' else 'branch', 'branch', {'lease': lease})]
+    assert orch_github.resume_push(ctx, 1, git) is None
     assert len(calls) == 1
     with pytest.raises(TrackerError):
-        attempt(ctx)
+        attempt(ctx, kind=kind, lease=lease)
     began = clock[0]
     with pytest.raises(GitError, match='403'):
-        attempt(ctx, do_push=lambda: rejected('returned error: 403'))
+        attempt(ctx, do_push=lambda: rejected('returned error: 403'), kind=kind, lease=lease)
     assert clock[0] == began
     assert orch_github.pending_push(ctx, 1) is None
 
@@ -96,7 +98,8 @@ def test_wait_before_review_never_claims_a_pass(pushing):
         orch_github.push(ctx, 1, rejected, head='unreviewed', lease='', branch='branch', kind='publish')
     calls = []
     git = SimpleNamespace(head_sha=lambda: 'unreviewed', _call=lambda args: '',
-                          push_head=lambda branch, **kw: calls.append((branch, kw)))
+                          push=lambda branch, **kw: calls.append((branch, kw)),
+                          push_head=lambda *a, **kw: pytest.fail('Publish must resume its branch push'))
     assert orch_github.resume_push(ctx, 1, git) is False
     assert calls == [('branch', {'lease': ''})]
 

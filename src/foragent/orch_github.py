@@ -138,8 +138,8 @@ def resume_push(ctx, number: int, git) -> bool | None:
         return None
     branch, lease = pending["branch"], pending["lease"]
     try:
-        push(ctx, number, lambda: git.push_head(branch, lease=lease) if lease is not None
-             else git.push(branch), head=pending["head"], lease=lease, branch=branch,
+        push(ctx, number, lambda: git.push_head(branch, lease=lease) if pending["push_kind"] == "refresh"
+             else git.push(branch, lease=lease), head=pending["head"], lease=lease, branch=branch,
              kind=pending["push_kind"])
     except GitError as exc:
         if lease is None or "(stale info)" not in str(exc):
