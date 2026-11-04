@@ -166,11 +166,7 @@ default_skills:
   - principle-fix-root-causes
   - principle-attack-the-premise
   - principle-sequence-verifiable-units
-  reviewers:
-  - principle-prove-it-works
-  - principle-attack-the-premise
-  - principle-test-behavior-not-implementation
-  - review-procedure
+  reviewers: [principle-prove-it-works, principle-attack-the-premise, principle-test-behavior-not-implementation, review-procedure]
   orchestrator:
   - principle-prove-it-works
   - principle-attack-the-premise
