@@ -7,6 +7,7 @@ import fcntl
 import logging
 import os
 from pathlib import Path
+import runpy
 import shutil
 import sys
 import tempfile
@@ -117,6 +118,30 @@ def _collect_versions(root: Path, bin_dir: Path, previous: set[Path]) -> None:
                 logger.warning("could not remove tool version %s", version, exc_info=True)
     except Exception:
         logger.warning("could not collect tool versions", exc_info=True)
+
+
+def installed_tool() -> tuple[str, Path] | None:
+    """The build and fa launcher of the version the gate published as current.
+
+    `current` is resolved once, so the build and the launcher come from one version
+    folder even if `current` switches again. A missing, dangling or half-published
+    version reads as None: there is no gate build to follow yet.
+    """
+    try:
+        version = (capacity.machine_root() / "tool-versions" / "current").resolve(strict=True)
+        launcher = version / "bin" / "fa"
+        if not (launcher.is_file() and os.access(launcher, os.X_OK)):
+            return None
+        builds = list((version / "tools/foragent/lib").glob("python*/site-packages/foragent/_build.py"))
+        if len(builds) != 1:
+            return None
+        sha = runpy.run_path(str(builds[0])).get("GIT_SHA")
+    except Exception:
+        # A version still being written may hold any partial file; it is simply not ready.
+        return None
+    if not isinstance(sha, str) or not sha.strip() or sha.strip() == "unknown":
+        return None
+    return sha.strip(), launcher
 
 
 def _publish(version: Path, bin_dir: Path, root: Path) -> None:
