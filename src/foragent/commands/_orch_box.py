@@ -9,6 +9,7 @@ from foragent.commands import facade
 def _add_inbox(orch_actions) -> None:
     cli = facade()
     request = orch_actions.add_parser("request", help="Put a planning request in the durable box")
+    request.set_defaults(pm_task="ask the orchestrator")
     request.add_argument("--from", dest="source", required=True, help="Sending session, e.g. planning")
     request.add_argument("--text", required=True)
     inbox = orch_actions.add_parser("inbox", help="List requests in the box (read this first on start)")
@@ -28,6 +29,7 @@ def _add_inbox(orch_actions) -> None:
     ask.add_argument("--issue", dest="issues", type=int, action="append", default=[],
                      help="Issue that waits on this answer (repeatable); shown in the board's Your turn")
     questions = orch_actions.add_parser("questions", help="List open human questions")
+    questions.set_defaults(pm_task="read open questions")
     questions.add_argument("--all", action="store_true", help="Include answered questions")
     answer = orch_actions.add_parser("answer", help="Record the answer and close one question")
     answer.add_argument("id")

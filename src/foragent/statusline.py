@@ -285,10 +285,10 @@ def _pm_moved_notice(payload: dict) -> str | None:
 
 
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for the SessionStart hook: one JSON object with the summary line, or nothing.
+    """Entry point for SessionStart: one JSON object with the summary and PM context, or nothing.
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
-    Claude. Outside a Foragent project, or with presence.session_start off, it prints nothing.
+    Claude. The summary follows presence.session_start; PM context is independent.
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -316,8 +316,21 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
                                                  datetime.now(UTC))
     except Exception:  # A failed summary must never disturb the session that is starting.
         message = None
+    output = {}
     if message:
-        stdout.write((json.dumps({"systemMessage": message}, ensure_ascii=False) + "\n").encode("utf-8"))
+        output["systemMessage"] = message
+    try:
+        project = presence._project(folder)
+        if project is not None and presence._planning_session(folder, project[1]):
+            from foragent.commands import _pm_table
+
+            output["hookSpecificOutput"] = {
+                "hookEventName": "SessionStart", "additionalContext": _pm_table.render(),
+            }
+    except Exception:  # Optional context must never disturb the session that is starting.
+        pass
+    if output:
+        stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()
     return 0
 
