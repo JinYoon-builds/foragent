@@ -7,7 +7,8 @@ ORDER = 146
 
 def add(commands) -> None:
     cli = facade()
-    parser = commands.add_parser("review", help=cli.text("branch_review_help"))
+    parser = commands.add_parser("review", help=cli.text("branch_review_help"),
+                                 description=cli.text("branch_review_description"))
     parser.add_argument("target", help=cli.text("branch_review_target_help"))
     parser.add_argument("--base", default="main", help=cli.text("branch_review_base_help"))
     context = parser.add_mutually_exclusive_group()
