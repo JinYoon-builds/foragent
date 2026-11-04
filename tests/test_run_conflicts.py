@@ -529,12 +529,14 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
         return result
 
     monkeypatch.setattr(GitRepo, "push", observe_push)
+    rebuild_offsets = []
 
     def implement(**kwargs):
         index = len(c.executor.calls)
         root = kwargs["worktree"]
         if index == 4:
             rebuild_push_starts.append(len(pushed_heads))
+            rebuild_offsets.append(len(c.operations))
             leases.append(c.ctx.git.remote_branch_sha("foragent/issue-1") or "")
             assert (root / "cli.py").read_text() == "commands = ['help', 'base', 'newbase']\n"
             assert (root / "latest.txt").read_text() == "latest\n"
@@ -581,6 +583,10 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     assert [args[1] for args in pushes[first_rewrite:]] == [
         f"--force-with-lease=refs/heads/foragent/issue-1:{head}" for head in expected_leases
     ]
+    pushes = [args for _, args in c.operations[rebuild_offsets[0]:] if args[0] == "push"]
+    assert pushes
+    assert all(args[1].startswith("--force-with-lease=") for args in pushes)
+    assert pushes[0][1] == f"--force-with-lease=refs/heads/foragent/issue-1:{leases[0]}"
     assert len(c.tracker.created_prs) == 1
 
 

@@ -49,6 +49,13 @@ class GitError(RuntimeError):
     """A Git command or remote URL could not be used."""
 
 
+def push_server_error(stderr: str) -> bool:
+    """Only explicit server faults in a push diagnostic are retryable."""
+    return bool(re.search(
+        r"remote: Internal Server Error|\[remote rejected\].*\(Internal Server Error\)"
+        r"|\bHTTP 5\d\d\b|returned error: 5\d\d\b", stderr))
+
+
 class PublicationError(GitError):
     """The proposed Git contents contain unresolved conflict markers."""
 

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 
+from foragent.file_cache import read_jsonl
 from foragent.state_locks import _file_lock
 from foragent.state_runs import record_merged
 
@@ -276,17 +277,9 @@ class LogRetentionMixin:
 
     def _newest_finished_runs(self) -> dict[int, dict]:
         """Each issue's newest finished run from runs.jsonl (appended in finish order)."""
-        try:
-            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {}
         newest: dict[int, dict] = {}
-        for line in history.splitlines():
-            try:
-                value = _state.json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(value, dict) and isinstance(value.get("number"), int):
+        for value in read_jsonl(self.root / "runs.jsonl", tolerant=True):
+            if isinstance(value.get("number"), int):
                 newest[value["number"]] = value
         return newest
 

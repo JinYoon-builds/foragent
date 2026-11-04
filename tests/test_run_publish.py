@@ -1159,7 +1159,7 @@ def test_post_push_without_replaced_head_does_not_retry():
     assert sleeps == []
 
 
-def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_history):
+def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_history, tmp_path):
     from types import SimpleNamespace
     from foragent import run_publish
 
@@ -1179,7 +1179,8 @@ def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_hist
         return execute(args)
 
     git._run = transport
-    attempt = SimpleNamespace(git=git, branch=branch, rebuilt=False)
+    ctx = SimpleNamespace(store=StateStore(tmp_path / "state", now=lambda: BASE_TIME), now=lambda: BASE_TIME)
+    attempt = SimpleNamespace(ctx=ctx, n=1, git=git, branch=branch, rebuilt=False)
     assert run_publish._push_branch(attempt) == git_history.tip
     assert pushes == [["push", f"--force-with-lease=refs/heads/{branch}:{git_history.tip}", "origin", branch]]
     assert attempt.pushed_head == git.head_sha()
