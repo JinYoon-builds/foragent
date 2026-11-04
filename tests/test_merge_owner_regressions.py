@@ -27,15 +27,12 @@ from foragent.tracker import RejectedEvidence, TrackerError
 def test_owner_reads_future_admission_fields_across_restart(proto, moved):
     case = proto
     support.queue_workers(case, [5])
-    path = case.store.root / "merge-queue.jsonl"
-    rows = [json.loads(line) for line in path.read_text().splitlines()]
-    for row in rows:
-        if row.get("event") == "ready" and row.get("merge_owner"):
-            publication = row["publication"]
-            publication["approval"]["future_owner_field"] = {"revision": 2}
-            assert isinstance(publication["comparison"], dict)
-            publication["comparison"]["future_owner_field"] = {"revision": 2}
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    path = merge_owner._path(case.ctx, 5)
+    publication = json.loads(path.read_text())
+    publication["approval"]["future_owner_field"] = {"revision": 2}
+    assert isinstance(publication["comparison"], dict)
+    publication["comparison"]["future_owner_field"] = {"revision": 2}
+    path.write_text(json.dumps(publication))
     if moved:
         case.history.update({"src/neighbor.py": "VALUE = 'new base'\n"})
     support.drain(case, count=1)
