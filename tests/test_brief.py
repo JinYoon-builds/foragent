@@ -129,7 +129,6 @@ def test_planning_requests_are_pending_planning_only_and_render_once(tmp_path):
 def test_gate_records_open_planning_prs_and_brief_reads_locally(tmp_path, monkeypatch):
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
-    import pytest
     from foragent.config import Config
     from foragent.state import StateStore
     from foragent.tracker import FakeTracker, RecordingTracker, TrackerError
@@ -164,11 +163,24 @@ def test_gate_records_open_planning_prs_and_brief_reads_locally(tmp_path, monkey
         return original(state, head_prefix)
 
     monkeypatch.setattr(remote, "list_prs", failed)
-    with pytest.raises(TrackerError, match="offline"):
-        tracker.refresh_issues()
+    now += timedelta(minutes=1)
+    remote.add_issue(99, "Fresh issue despite optional PR read failure")
+    assert tracker.refresh_issues()
+    assert next(row for row in store.local_issues() if row["number"] == 99)["title"] == (
+        "Fresh issue despite optional PR read failure")
+    assert store.issues_observation()["error"] is None
     assert (store.root / "planning_prs.json").read_bytes() == previous
     assert reopened.planning_prs() == expected
     monkeypatch.setattr(remote, "list_prs", original)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "record_planning_prs", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+        now += timedelta(minutes=1)
+        remote.add_issue(100, "Fresh issue despite optional record write failure")
+        assert tracker.refresh_issues()
+        assert next(row for row in store.local_issues() if row["number"] == 100)["title"] == (
+            "Fresh issue despite optional record write failure")
+        assert store.issues_observation()["error"] is None
+        assert (store.root / "planning_prs.json").read_bytes() == previous
     now += timedelta(minutes=5)
     remote.close_pr(live, delete_branch=False)
     tracker.refresh_issues()
