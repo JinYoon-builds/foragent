@@ -290,23 +290,24 @@ class Evidence:
 
 
 def _join(ctx, report, base, before, place, job):
-    """A candidate failure leaves the composed prefix available to the next one."""
+    """Skip composition failures; an already included head aborts the train."""
     try:
         head = job["head"]
         if ci_mode.changed_workflows(ctx.git, base, head):
             raise ValueError("acceptance workflow differs from target")
-        if ctx.git.is_ancestor(head, before):
-            raise ValueError("member already reachable")
-        tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
-        message = f"Merge member #{place.n}\n\nForagent-Member: #{place.n} {head} {place.started_at}\n"
-        commit = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                                "commit-tree", tree, "-p", before, "-p", head, "-m", message]).strip()
-        return place.n, head, commit, place.started_at
+        if not ctx.git.is_ancestor(head, before):
+            tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
+            message = f"Merge member #{place.n}\n\nForagent-Member: #{place.n} {head} {place.started_at}\n"
+            commit = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                    "commit-tree", tree, "-p", before, "-p", head, "-m", message]).strip()
+            return place.n, head, commit, place.started_at
     except Exception as exc:
         if isinstance(exc, TrackerError) and exc.waits:
             raise
         report.actions.append(f"#{place.n} merge batch excluded: {str(exc) or type(exc).__name__}")
         return None
+    # Its code remains in the prefix, so excluding it would skip its checks.
+    raise ValueError("member already reachable")
 
 
 def prepare(ctx, report, candidates):

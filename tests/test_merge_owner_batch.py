@@ -229,6 +229,39 @@ def test_green_tip_lands_members_whose_own_ci_is_pending(batched):
     assert len(case.store.owner_merge_facts()) == 2
 
 
+def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(batched, monkeypatch):
+    case = batched
+    queue_workers(case, [1])
+    ancestor = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def with_dependency(**kwargs):
+        if case.worker.number == 5:
+            git_command(kwargs["worktree"], "merge", "--no-commit", "--no-ff", ancestor)
+        return implement(**kwargs)
+
+    monkeypatch.setattr(model, "run", with_dependency)
+    queue_workers(case, [5, 4])
+    orch_queue.set_global(case.store, [5, 1, 4])
+    dependent = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
+    assert case.git.is_ancestor(ancestor, dependent)
+    case.tracker.set_pr_checks(support.pr_for(case, 1).number, "fail")
+    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pending")
+
+    report = support.gate(case)
+
+    assert not case.target_attempts and not case.target_pushes and not case.merges, report.actions
+    assert case.history.tip == case.base and not case.store.owner_merge_facts()
+    assert not case.batch_pushes and not groups(case) and not refs(case)
+    assert not any("#1 merge batch excluded" in action for action in report.actions)
+    retired, = batch.retirements(case.ctx)
+    assert retired["reason"] == "member already reachable" and retired["spent"] == []
+    assert events(case)[-1]["reason"] == "member already reachable"
+    assert events(case)[-1]["result"] == "unused"
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
+
+
 @pytest.mark.parametrize("path", [".github/workflows/foragent-acceptance.yml",
                                  ".github/workflows/foragent-acceptance-extra.yaml"])
 def test_workflow_changing_member_uses_single_fallback_while_remaining_members_batch(batched, monkeypatch, path):
