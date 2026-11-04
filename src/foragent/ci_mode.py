@@ -87,6 +87,7 @@ class ComparisonEvidence:
     reports: str | None = None
     # A later base accepted by a proved result-neutral move; reports stay bound to base_sha.
     accepted_sha: str | None = None
+    reports_by_head: dict | None = None
 
     def follow(self, base_sha):
         """The same evidence, accepted on a base the caller proved result-neutral."""
@@ -119,11 +120,12 @@ class ComparisonEvidence:
                     return "infrastructure", "the not-started evidence changed"
             if self.reports is None:
                 return None  # Local evidence is pinned to the same base/head and scope.
-            reports = ctx.tracker.pr_acceptance_reports(head)
-            if self.reports == serialize_reports(reports):
-                return None
-            return ("reports-changed", "the reports differ from the accepted ones") if reports else (
-                "missing", "no acceptance reports at this read")
+            for measured, recorded in (self.reports_by_head or {head: self.reports}).items():
+                reports = ctx.tracker.pr_acceptance_reports(measured)
+                if recorded != serialize_reports(reports):
+                    return ("reports-changed", "the reports differ from the accepted ones") if reports else (
+                        "missing", "no acceptance reports at this read")
+            return None
         except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
             if isinstance(exc, RejectedEvidence) and getattr(ctx.config, "merge_owner", False):
                 return "unusable", str(exc)
@@ -221,13 +223,14 @@ def _positive(value):
     return type(value) is int and value > 0
 
 
-def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
+def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards, previous=None):
     """Validate every shard; the first failing field names its observed and expected value.
 
     Only a moved base or a superseded measurement producer is stale. Those wait
     until every other check passes, so an unrelated invalid field never retries.
     The exclusions CI recorded are the reference for a completed measurement;
     today's ``excluded`` may differ either way and neither waives nor adds a test.
+    ``previous`` supplies a validated prefix's head suites as the regression baseline.
     """
     reports = {}
     expected_shards = set(expected_shards)
@@ -329,6 +332,15 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                                 f"expected {_shown(sorted(expected_shards)) if expected_shards else 'at least one shard'}")
     if stale:
         raise StaleComparison(f"Stale acceptance shard: {stale}")
+    if previous is not None:
+        previous_sha, before = previous
+        prior_lost, _ = comparison(before, repo, base_sha, previous_sha, excluded,
+                                   expected_scope=expected_scope, expected_shards=expected_shards)
+        if prior_lost:
+            raise UnusableComparison("previous prefix has acceptance regressions")
+        passing = {node for item in before for node in item["report"]["head"]["passing_ids"]}
+        passing_now = {node for item in artifacts for node in item["report"]["head"]["passing_ids"]}
+        lost.update(passing - passing_now)
     return sorted(lost), duration
 
 
@@ -366,10 +378,11 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, wait=True):
+                       later_base=None, wait=True, source=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
-    later base it approves instead of waiting for a measurement that never comes."""
+    later base it approves instead of waiting for a measurement that never comes.
+    A source maps an identical tree to existing reports; validation stays here."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
@@ -392,6 +405,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         workflows_changed = False
         workflow_error = str(exc)
     if workflows_changed:
+        if source is not None:
+            raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
         _note_evidence(ctx, n, base_sha, head, "workflow-changed", workflows_changed.replace("\0", " ").strip())
         try:
             ci_local.fallback_comparison(attempt, base_sha)
@@ -411,11 +426,18 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             raise UnusableComparison(workflow_error)
         # Measurement and artifact registration share ordinary CI's deadline.
         while True:
-            reports = ctx.tracker.pr_acceptance_reports(head)
+            measured_base, measured_head, previous = base_sha, head, None
+            if source is None:
+                reports = ctx.tracker.pr_acceptance_reports(head)
+            else:
+                measured_base, measured_head, reports, previous = source.measurement(attempt, head, base_sha)
             try:
-                lost, duration = comparison(reports, ctx.repo, base_sha, head, excluded,
+                lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
                                            expected_scope=scope,
-                                           expected_shards=range(ctx.config.ci_shards))
+                                           expected_shards=range(ctx.config.ci_shards), previous=previous)
+                if source is not None and any(not scope_covers(item["report"]["scope"], scope)
+                        for item in [*reports, *(previous[1] if previous else [])]):
+                    raise StaleComparison("prefix measurement scope no longer covers the current one")
                 recorded_reports = serialize_reports(reports)
                 break
             except (MissingComparison, StaleComparison) as exc:
@@ -441,6 +463,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 _progress(n, ctx)
                 ctx.sleep(min(30, remaining))
     except (KeyError, TypeError, ValueError, RecursionError, OverflowError, AttributeError, TrackerError) as exc:
+        if source is not None:
+            raise  # A failed substitution leaves the ordinary comparison available.
         if not wait and isinstance(exc, (MissingComparison, StaleComparison)):
             raise
         if isinstance(exc, TrackerError) and (exc.waits or (
@@ -479,7 +503,10 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         flag(ctx, n, Reason.CI_NOT_STARTED, "CI jobs did not start", infrastructure)
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
-                              recorded_reports)
+                              recorded_reports, reports_by_head=(
+                                  {measured_head: recorded_reports,
+                                   **({previous[0]: serialize_reports(previous[1])} if previous else {})}
+                                  if source is not None else None))
 
 
 def review_checks(n, ctx, git, target_branch):

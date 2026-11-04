@@ -20,3 +20,10 @@ metadata:
 ## PR CI load attribution (r547, 11-04)
 
 To attribute PR CI load, list each PR head sha since a cutoff (gh run list) with its parent count and commit title. 'Refresh PR #N onto' and 'Merge commit' heads are base refreshes; check for 'superseded before its CI ended' (next head created before the run's updatedAt). On 11-04, 9 of 47 heads replaced a head whose CI was still running, all made by the merge owner on the PR next in line, and the workflows had no `concurrency:` block. Use `gh run view` sequentially only for about 85 runs within the 2-min limit. (r547)
+
+
+## plan_pause idle lanes (r554, 11-04)
+idle_lanes_with_backlog during a `plan_pause` (facts 'Binding: plan_pause') is the intended hold; read the orch-events `role-signal-answer` for the same r-id first, since the orchestrator often answers not-now before the architect reads it (r554, 11-04: 9 lanes paused for r547, the one startable orch issue #1925 was on the overlap cap 3 for run_publish_flow.py).
+
+## hot_overlap_files with wait 0 (r426, 11-03)
+For hot_overlap_files with in-run overlap wait 0, the cost is conflicts on long runs. List conflicted overlap_records for *all* outcomes in runs.jsonl, because the facts 'Overlap conflicts (merged)' line hides unmerged runs. One wide refactor that runs for hours (#1641: 3 conflicts, 88 min, a PASS lost) is the usual peer. The fix is that issue's `exclusive:` header, not a split or a cap change. (r426, 11-03)
