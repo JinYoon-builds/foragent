@@ -1572,11 +1572,11 @@ def test_tracker_rejects_damaged_or_ambiguous_artifacts(damage):
 
 
 @pytest.mark.parametrize('workflow', [WORKFLOW, '.github/workflows/foragent-acceptance-extra.yaml'])
-@pytest.mark.parametrize('main_changed,pr_changed', [(True, False), (False, True), (True, True)],
-                         ids=['main-only', 'pr-only', 'both'])
-def test_changed_workflows_only_counts_pr_changes(git_history, workflow, main_changed, pr_changed):
+@pytest.mark.parametrize('main_changed,pr_changed', [(False, False), (True, False), (False, True), (True, True)],
+                         ids=['neither', 'main-only', 'pr-only', 'both-identical'])
+def test_workflow_equality_and_pr_changes_are_distinct(git_history, workflow, main_changed, pr_changed):
     from conftest import git_command
-    from foragent.ci_mode import changed_workflows
+    from foragent.ci_mode import changed_workflows, pr_changes_workflows
     from foragent.git import GitRepo
 
     git_history.update({workflow: 'name: original\n'})
@@ -1595,8 +1595,57 @@ def test_changed_workflows_only_counts_pr_changes(git_history, workflow, main_ch
         main_files[workflow] = 'name: updated\n'
     git_history.update(main_files)
 
-    changed = changed_workflows(GitRepo(git_history.origin), git_history.tip, head)
-    assert changed == (workflow + '\0' if pr_changed else '')
+    git = GitRepo(git_history.origin)
+    assert changed_workflows(git, git_history.tip, head) == (workflow + '\0' if main_changed != pr_changed else '')
+    assert pr_changes_workflows(git, git_history.tip, head) == (workflow + '\0' if pr_changed else '')
+
+
+@pytest.mark.parametrize('substitute', [False, True], ids=['pr', 'batch-tip'])
+def test_lagging_target_cannot_trust_artifacts_from_an_old_workflow(git_history, tmp_path, monkeypatch, substitute):
+    from conftest import BASE_TIME, git_command
+    from foragent import ci_local, ci_mode
+    from foragent.git import GitRepo
+    from foragent.run_attempt import AttemptFailure
+
+    git_history.update({WORKFLOW: 'name: original\n'})
+    base = git_history.tip
+    git_history.update({'feature.txt': 'regression\n'})
+    head = git_history.tip
+    git_command(git_history.origin, 'update-ref', 'refs/heads/main', base)
+    git_history.tip = base
+    git_history.update({WORKFLOW: 'name: fixed producer\n'})
+    git_command(git_history.origin, 'update-ref', 'refs/remotes/origin/main', git_history.tip)
+    git_command(git_history.origin, 'update-ref', 'refs/remotes/origin/release', base)
+    config = Config(checks='ci', base_branch='release', merge_owner=True, test_command='pytest', ci_shards=2)
+    forged = [report(), report(1)]
+    for value in forged:
+        value['run']['head_sha'] = value['artifact']['workflow_run']['head_sha'] = head
+        payload = value['report']
+        payload.update(base_sha=base, head_sha=head, scope=measurement_scope(config, git_history.clone, []))
+        for side in ('base', 'head'):
+            payload[side] = {'complete': True, 'collected_ids': [], 'passing_ids': []}
+    reads, local = [], []
+    store = SimpleNamespace(get_run=lambda n: SimpleNamespace(harness_guard={}), load_approval=lambda n: None,
+                            update_run=lambda *args, **kwargs: None, log_path=lambda n: tmp_path / 'log')
+    ctx = SimpleNamespace(repo='owner/repo', repo_root=git_history.clone, config=config, store=store,
+                          now=lambda: BASE_TIME, tracker=SimpleNamespace(
+                              pr_default_branch=lambda: 'main',
+                              pr_acceptance_reports=lambda sha: reads.append(sha) or forged))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=GitRepo(git_history.origin), target_branch='release',
+                              log=tmp_path / 'log')
+    monkeypatch.setattr(ci_mode, '_baseline_exclusions', lambda *args: [])
+
+    def regression(attempt, base_sha):
+        local.append(base_sha)
+        raise AttemptFailure('Local acceptance regression', attempt.target_branch)
+
+    monkeypatch.setattr(ci_local, 'fallback_comparison', regression)
+    source = SimpleNamespace(measurement=lambda *args: (base, head, forged)) if substitute else None
+    error = ci_mode.WorkflowChanged if substitute else AttemptFailure
+    message = 'prefix acceptance workflow differs' if substitute else 'Local acceptance regression'
+    with pytest.raises(error, match=message):
+        ci_mode.require_comparison(attempt, 2, head, base_sha=base, wait=False, source=source)
+    assert local == ([] if substitute else [base]) and not reads
 
 
 def test_trusted_workflow_revision_uses_repository_default_branch():

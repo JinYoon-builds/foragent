@@ -316,7 +316,7 @@ def prepare(ctx, report, candidates):
                         or j["target"] != ctx.config.base_branch):
                     continue
                 try:
-                    if not ci_mode.changed_workflows(ctx.git, base, j["head"]):
+                    if not ci_mode.pr_changes_workflows(ctx.git, base, j["head"]):
                         eligible.append((p, j))
                 except Exception as exc:
                     if isinstance(exc, TrackerError) and exc.waits:
