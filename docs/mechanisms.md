@@ -31,7 +31,8 @@ Code: [handoff](../src/foragent/run_publish_flow.py) (`src/foragent/run_publish_
 [combined candidate](../src/foragent/merge_owner_batch.py) (`src/foragent/merge_owner_batch.py`),
 [final reads](../src/foragent/run_publish_merge.py) (`src/foragent/run_publish_merge.py`).
 Origins: #1797 (owner), #1502 (switch-on and measurement), #1970 (one tip CI),
-#1989 (workflow changes take the single path); D118 and D95 in [decisions](decisions.md).
+#1989 (workflow changes take the single path); D125 (switch-on), D118 (sole main writer),
+D120 (whole-batch merge) and D95 in [decisions](decisions.md).
 
 ## Verification: prove this change still works on its target
 

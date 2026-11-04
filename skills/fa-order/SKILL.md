@@ -128,6 +128,14 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
 - Existing open issues without the Foragent format: propose per issue — rewrite (contract +
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
+- Board cleanup when /fa adopts an existing project (after `fa adopt survey`): propose
+  the cleanup items one by one, each with its evidence, and let the person agree or decline
+  each one. A rewrite goes into `edits`. A duplicate folded into another existing issue goes
+  into the plan's `closes` as `{"number": N, "into": M}`. An issue that history already
+  resolved goes into `closes` as `{"number": N, "commit": "<sha>"}` with the fixing commit.
+  Put only the agreed items in the plan; a declined item stays out and stays untouched.
+  `fa order publish` writes each close only when it is approved (`--approve`, or its number
+  in `--approve-numbers`), and `--dry-run` previews each close with its evidence.
 - Never ask what the code, docs, specs or earlier decisions already answer.
 - A **starter order** (the person says `starter: ...` after `fa init`) is one tiny task
   a lane can finish in about 10 minutes, to show the flow to a merged PR. Their example is

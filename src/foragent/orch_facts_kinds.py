@@ -61,6 +61,11 @@ EVIDENCE_ONLY = frozenset({"waiting_on_person"})
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
+# Kinds measured over a sliding window: kind -> (window, threshold) (#1840). Until that window
+# has passed since the last answer, a member newly reaching the threshold is drift of the same
+# window, not new evidence; it is worse only at double the threshold, as an existing member's
+# count is. After the window a new member is worse as usual.
+WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_WINDOW, OVERLAP_RUNS)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
