@@ -5,7 +5,7 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 ## People and questions
 
-- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Do anything with a right answer, then report it. (D71)
+- Ask the person only about goal changes, trade-offs, taste, hard-to-undo actions, and scope or priority. Hard to undo means data, money, public exposure or sending to others; changes git can revert, including deleting superseded code, are not person questions. A question an existing decision answers goes to the PM, not the person. Do anything with a right answer, then report it. (D71)
 - A bug fix with no choice: the orchestrator publishes and approves it after a clean preread. Anything with a choice goes through planning to Jin. (D101)
 - The person talks to the planning session. The orchestrator works in the back and sends its questions through planning. (D76)
 - Only the orchestrator adds `needs-human`, with what it tried, why a person is needed, and options. The gate and lanes add `blocked` with a reason. (D45)
