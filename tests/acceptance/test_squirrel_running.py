@@ -182,10 +182,10 @@ def test_squirrel_running_factual_states_are_single_rows_without_lane_sprites(tm
     ("working", "implementing", "🐿", "코드 쓰는 중"),
     ("working", "resolving", "🐿", "코드 쓰는 중"),
     ("working", "baseline", "🔍", "기준 재는 중"),
-    ("working", "checking", "🔍", "로컬 시험 중"),
+    ("working", "checking", "🔍", "목표 시험 중"),
     ("working", "reviewing", "🔍", "리뷰 받는 중"),
-    ("working", "ci", "🔍", "CI 시험 중"),
-    ("working", "merging", "🔍", "머지 전 재확인 중"),
+    ("working", "ci", "🔍", "전체 시험 중"),
+    ("working", "merging", "🔍", "합쳐서 시험 중"),
     ("waiting-human", "needs-human", "✋", "기다리는 중"),
     ("waiting-human", "waiting-person", "✋", "기다리는 중"),
     ("queued", None, "⏳", "차례 기다리는 중"),
@@ -202,14 +202,24 @@ def test_squirrel_running_glyph_and_phase_follow_each_workers_facts(tmp_path, st
     snapshot,config=single_worker(state=state,phase=phase)
     frame=plain_frame(render_frame(snapshot,config,tmp_path,width=160))
     row=issue_row(frame,101)
-    steps={'baseline':'준비','implementing':'작성','resolving':'작성','checking':'로컬',
-           'reviewing':'리뷰','ci':'CI','merging':'머지'}
+    # D113 short names; r560 renamed the merge step to 합침.
+    steps={'baseline':'준비','implementing':'작성','resolving':'작성','checking':'목표',
+           'reviewing':'리뷰','ci':'전체','merging':'합침'}
     if state=='waiting-human':
         assert '#101 질문' in row
     elif state=='working' and phase in steps:
         assert f'#101 {steps[phase]}' in row
     else:
-        assert '기다려요' in frame or '보류' in frame
+        # D112: the acorn says only that it waits; why it waits is in the bubble after a click.
+        # Queued work sits in the 다음 row with a bare acorn.
+        assert ('#101 대기▌' in row or '#101 보류▌' in row) if state=='working' or state=='blocked' else (
+            '다음' in row and '#101▌' in row), row
+        assert not any(word in row for word in ('공유 파일','시험 자리','기준선','한도','기다려요')), row
+        from test_lane_m2_contract import pick, bubble
+        from foragent.state import StateStore
+        opened,_=pick(snapshot,config,tmp_path,StateStore(tmp_path/'state'),('acorn',101),width=160)
+        words_open=bubble(opened).splitlines()
+        assert words_open[0].startswith('#101') and len(words_open) >= 3, 'the bubble explains the waiting acorn'
 
 
 def test_squirrel_running_two_workers_in_one_lane_have_independent_rows(tmp_path):
@@ -239,7 +249,7 @@ def test_squirrel_running_columns_align_by_display_cells_with_korean_and_emoji(t
     frame=plain_frame(render_frame(snapshot,config,tmp_path,width=100))
     a,b=issue_row(frame,101),issue_row(frame,105)
     assert cell_count(a[:a.index('#101')])==cell_count(b[:b.index('#105')]), 'acorns align by cells across Latin/Korean lane captions'
-    assert '#101 작성' in a and '#105 로컬' in b
+    assert '#101 작성' in a and '#105 목표' in b
     assert all(cell_count(line)<=100 for line in frame.splitlines())
 
 
@@ -262,7 +272,7 @@ def test_squirrel_running_acorns_show_only_finished_phases(tmp_path, phase, fini
     from test_lane_m2_contract import draw
     snapshot,config=single_worker(phase=phase)
     config=glyph_config(tmp_path,config,mode)
-    words={'baseline':'준비','implementing':'작성','checking':'로컬','reviewing':'리뷰','ci':'CI','merging':'머지'}
+    words={'baseline':'준비','implementing':'작성','checking':'목표','reviewing':'리뷰','ci':'전체','merging':'합침'}
     row=issue_row(draw(snapshot,config,tmp_path,width=160),101)
     assert f'#101 {words[phase]}' in row, 'replacement: one issue acorn carries its current step, not five completion markers'
     assert row.count('#101')==1
@@ -274,13 +284,13 @@ def test_squirrel_running_baseline_uses_checking_glyph_without_completing_local_
     snapshot,config=single_worker(phase='baseline')
     config=glyph_config(tmp_path,config,mode)
     row=issue_row(draw(snapshot,config,tmp_path,width=160),101)
-    assert '#101 준비' in row and '#101 로컬' not in row, 'baseline has its own preparation step; it does not claim local tests finished'
+    assert '#101 준비' in row and '#101 목표' not in row, 'baseline has its own preparation step; it does not claim goal tests finished'
 
 
 @pytest.mark.parametrize("phase,words", [("implementing", "writing code"),
-                                         ("baseline", "measuring the baseline"), ("checking", "local tests"),
-                                         ("reviewing", "in review"), ("ci", "CI tests"),
-                                         ("merging", "rechecking before merge"),
+                                         ("baseline", "measuring the baseline"), ("checking", "goal tests"),
+                                         ("reviewing", "in review"), ("ci", "full tests"),
+                                         ("merging", "testing merged"),
                                          ("overlap-wait", "waiting for a turn"),
                                          ("test-slot-wait", "waiting for a turn"),
                                          ("baseline-wait", "waiting for a turn"),
@@ -292,14 +302,16 @@ def test_squirrel_running_english_uses_unified_phase_words(tmp_path, phase, word
     config=replace(config,language='en')
     frame=draw(snapshot,config,tmp_path,width=160)
     row=issue_row(frame,101)
-    steps={'baseline':'prep','implementing':'write','checking':'local','reviewing':'review','ci':'CI','merging':'merge'}
+    steps={'baseline':'prep','implementing':'write','checking':'goal','reviewing':'review','ci':'full','merging':'merge'}
+    opened,_=pick(snapshot,config,tmp_path,StateStore(tmp_path/'state'),('acorn',101),width=160)
     if phase in steps:
         assert f'#101 {steps[phase]}' in row
-        opened,_=pick(snapshot,config,tmp_path,StateStore(tmp_path/'state'),('acorn',101),width=160)
-        assert '12m' in bubble(opened)
+        assert '12m' in bubble(opened) and words in bubble(opened), bubble(opened)
     else:
-        assert 'waiting' in frame.lower()
-    assert not any(word in row for word in ('작성','로컬','리뷰','준비','머지','분'))
+        # D112: the acorn only says it waits; its bubble explains the wait.
+        assert '#101 wait▌' in row, row
+        assert 'wait' in bubble(opened).lower()
+    assert not any(word in row for word in ('작성','로컬','리뷰','준비','머지','분','local','CI'))
 
 
 @pytest.mark.parametrize("language,seconds,elapsed", [("ko", 720, "12분"), ("en", 720, "12m"),
@@ -347,7 +359,7 @@ def test_squirrel_running_auto_glyphs_follow_terminal_and_effective_locale(
         else: monkeypatch.delenv(key,raising=False)
     snapshot,config=single_worker(phase='checking')
     frame=draw(snapshot,config,tmp_path,width=160)
-    assert '#101 로컬' in issue_row(frame,101)
+    assert '#101 목표' in issue_row(frame,101)
     assert ('▀' in frame or '▄' in frame) == (not ascii_mode)
     assert draw(snapshot,glyph_config(tmp_path,config,'auto'),tmp_path,width=160)==frame
 

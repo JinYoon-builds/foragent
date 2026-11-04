@@ -15,6 +15,11 @@ def test_idle_lanes_fold_into_one_line_and_rows_stay_one_line(
     case,main=status_case(git_history,tmp_path,monkeypatch,language=language)
     title='A very long issue title that would never fit in the narrow column of the table'
     case.tracker.update_issue(4,title=title,body='')
+    # r53: the dashboard draws the snapshot the gate writes on its tick.
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+    tick(tick_context(case,start_runs=False))
+    capsys.readouterr()
     assert main(['gate','watch','--once','--repo-root',str(case.root)])==0
     frame=plain_frame(capsys.readouterr().out)
     lines=frame.splitlines()
