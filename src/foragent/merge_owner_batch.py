@@ -311,7 +311,8 @@ def prepare(ctx, report, candidates):
             ctx.git.fetch("origin", ctx.config.base_branch)
             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
             eligible = [(p, j) for p, j, _ in candidates if (p.n, p.started_at) not in spent
-                        and j["phase"] == "waiting" and j["target"] == ctx.config.base_branch]
+                        and j["phase"] == "waiting" and j["target"] == ctx.config.base_branch
+                        and not ci_mode.changed_workflows(ctx.git, base, j["head"])]
             selected = []
             for start in range(0, len(eligible), ctx.config.merge_batch_size):
                 group = eligible[start:start + ctx.config.merge_batch_size]
@@ -366,7 +367,7 @@ def land(ctx, report, candidates, proof):
     from foragent import merge_owner as owner
 
     members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates}
-    failed, checking = None, None
+    failed, checking = [], None
     reason = "train merged"
     try:
         ctx.merge_owner_started_at = ctx.now()
@@ -416,7 +417,7 @@ def land(ctx, report, candidates, proof):
                 for member, (place, job, pr, git, evidence) in zip(proof.chain, prepared):
                     checking = member
                     if not owner._ready(ctx, place, job, pr, git, proof.base, evidence):
-                        failed = member
+                        failed = [member]
                         reason = evidence.reason or f"single path final check {job['phase']}"
                         break
                     approval = load_record(Approval, job["approval"])
@@ -432,7 +433,7 @@ def land(ctx, report, candidates, proof):
                     target = f"refs/heads/{ctx.config.base_branch}"
                     ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
                                    "origin", f"{proof.chain[-1][2]}:{target}"])
-        if failed is None:
+        if not failed:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
                     owner._try_admission(ctx, place, job, lambda: owner._reconcile(ctx, place, job))
@@ -442,6 +443,14 @@ def land(ctx, report, candidates, proof):
         if isinstance(exc, TrackerError) and exc.waits:
             raise
         reason = str(exc) or type(exc).__name__
+        if isinstance(exc, ci_mode.WorkflowChanged):
+            try:
+                # The final check fetched the target; attribute every differing head.
+                target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+                failed = [member for member in proof.chain
+                          if ci_mode.changed_workflows(ctx.git, target, member[1])]
+            except Exception as unavailable:
+                report.actions.append(f"merge batch workflow attribution unavailable: {unavailable}")
         if checking:
             place, job, _ = members[(checking[0], checking[3])]
 
@@ -450,7 +459,7 @@ def land(ctx, report, candidates, proof):
 
             owner._try_admission(ctx, place, job, rejected)
             if isinstance(exc, (AttemptFailure, ExecutorStopped, LocalComparisonUnavailable)):
-                failed = checking
+                failed = [checking]
     if failed:
-        reason = f"member #{failed[0]}: {reason}"
-    _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr)
+        reason = f"{', '.join(f'member #{member[0]}' for member in failed)}: {reason}"
+    _close(ctx, report, proof.base, proof.chain, reason, spent=failed, tip_pr=proof.pr)
