@@ -46,3 +46,13 @@ Read flow-records `kind=merge-batch` (members, result, used_members, ci_minutes,
 
 ## Push 500s vs push rate (r618, 11-04)
 To count pushes that landed, list Actions runs in the window (`actions/runs?created=A..B`, distinct head_branch+head_sha; the repo events API returned 0 PushEvents in 300 events). Read rejected pushes from runs.jsonl `detail` ('remote: Time ...Z'). On 11-04, 7 pushes were rejected with 500 at <=5 tries/min, while 9 landed with 0 rejected at 08:50-08:55, so rate was not the cause. git push raises GitError and skips #1644's TrackerError.transport wait, so each 500 ended as 'error' and needed an orchestrator retry.
+
+
+## Stuck merge-owner (11-04)
+A stuck merge-owner state is often one long tick, not a missing path: check `ps` for the `foragent.merge_owner` pid's age and its pytest child, and the `merge-owner-*` temp dir mtime. On 11-04 one tick ran a 28-min acceptance baseline inline, so the batch deadline close (prepare, 3600 s from prefix commit time) waited for the next tick. Check github-pause.json for ticks that ended early. (r641)
+
+
+## Moved from index (11-04)
+- For a 'replace ledger X with the git/GitHub fact' census, measure two things per ledger: which field holds the bytes (merge-owner/N.json was 99% comparison.reports, not head/base) and whether the copy disagrees with the GitHub cache (merged_prs.json vs owner facts: 0 of 23 on 11-04). With 0 disagreements, the cost is readers using the wrong copy, so fold the fix into the order that deletes the writer (B2). (r501)
+- `runs/issue-N/review-R.txt` keeps only the reviewer's output, not the prompt, so you cannot see from the run dir whether a post-PASS review got the PASS boundary. Check what you can instead: `git diff <review-pass-head> HEAD -- src/` in the issue worktree and the risk-map exempt paths. #1230 (11-03) FAILed twice after PASS on unchanged src, right after a lost-CI-tests retry. (r446)
+- 'machine 4/4' with low load is not always AIMD: `fa settings` machine max_parallel outranks machine.yml (machine_budget source `settings`), and capacity.json changed_at moves without decreased_at. Read orch-note.json for a running experiment first. When an experiment cuts runs right after a merge, re-state that merge's absolute per-24h targets as ratios (r313, 11-02).
