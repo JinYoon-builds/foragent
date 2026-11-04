@@ -68,3 +68,4 @@
 - An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
 - When the scheduled check is for an order that wrote my own proposal (e.g. #1826), compare the diff with the request texts and check named commands exist (commands/order.py add_parser); then close the memory wait.
 - 'Current decisions' asks usually duplicate rules.md (D108); point to rules.md first. decisions.py parses `### Dnn.` headings in any order, so in-place marks are safe; moving entries breaks append-only.
+- Bug fixes with in-app text (#1793 Terminal.app font hint, #1825 '(none)' review marker, #1836 merge-owner merges in readers) need no reader-doc line; README/docs name no font, review marker or merge owner. Grep those words once.
