@@ -7,7 +7,7 @@ description: Set up a project folder for Foragent.
    Read its `items` from top to bottom: tools installed, gh login, gh project
    scope, then repository linked. The checklist is the source of setup steps;
    a nonzero exit with JSON means there are steps to finish. For each failing
-   item, show its exact `fix` and handle it before moving on:
+   item, the `/fa` session shows its exact `fix` and handles it before moving on:
    - Installation: use AskUserQuestion (or the available question tool) to ask
      Yes (recommended) or No. Run the shown install command only after Yes.
      After No, print the command and stop.
@@ -31,7 +31,7 @@ description: Set up a project folder for Foragent.
    pass. If there is no question tool, stop and print the next exact command
    and any repository choices. An unanswered question is not agreement.
 
-2. After setup prerequisites pass, ask these configuration questions at first use: merge (review) mode, then Claude quota
+2. After setup prerequisites pass, ask only these configuration questions at first use: merge (review) mode, then Claude quota
    mode. Use AskUserQuestion (or the available question tool), recommendation first:
    - fast (recommended): merge passing work automatically unless a human review rule applies.
    - careful: require human review of each task before merging.

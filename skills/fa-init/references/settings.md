@@ -1,9 +1,10 @@
 # First-use settings questions
 
-After the ordered setup checklist passes, `/fa-init` asks two configuration
+After the ordered setup checklist passes, `/fa-init` asks only two configuration
 questions: merge (review) mode, then Claude quota mode. Checklist fixes (including
 installing tools and creating or linking a repository) require the person's
-agreement first. Login and permission commands are shown for the person to run.
+agreement in the `/fa` checklist walkthrough first. Login and permission commands
+are shown for the person to run.
 Setup also asks about the optional project FA permission rule when
 it is undecided, as described in [the setup flow](../SKILL.md). It says nothing
 about credits or spending; those are asked just in time elsewhere.
