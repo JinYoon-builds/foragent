@@ -14,6 +14,9 @@ from foragent.lanes import LaneError, add_lane, set_lane_skills, validate_lane
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.skills import SkillError, SkillManager, copy_lane_skills
 
+from conftest import git_command
+from test_order import offline_publication  # noqa: F401
+
 
 @pytest.fixture
 def library(tmp_path):
@@ -60,6 +63,7 @@ def test_catalog_metadata_and_multiple_library_prefixes(library, tmp_path):
     root, config, manager, _ = library
     assert manager.catalog() == [{"id": "kwp:engineering/testing-strategy", "name": "testing-strategy",
                                   "description": "Pick useful checks.", "license": "Apache-2.0", "role": None,
+                                  "source": "knowledge-work-plugins (Apache-2.0)",
                                   "runs_scripts": False, "copies": ["engineering/skills/testing-strategy"]}]
     second = tmp_path / "second"
     (second / "other/skills/testing-strategy").mkdir(parents=True)
@@ -428,6 +432,21 @@ def test_add_lane_agent_settings_and_scoped_commit(library, tmp_path):
     assert (root / ".foragent.yml").read_text() == before and len(commits) == 1
 
 
+@pytest.mark.parametrize("merge_owner", [False, True])
+def test_lane_creation_pushes_directly_during_a_merge_train(offline_publication, merge_owner):
+    root, _config, _tracker, git, _calls, origin = offline_publication
+    (root / ".foragent.yml").write_text(yaml.safe_dump({
+        "merge_owner": merge_owner, "test_command": "uv run pytest",
+    }))
+    base = git_command(origin, "rev-parse", "main")
+    ref = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", ref, base)
+    add_lane(root, "api", ["api/**"], git=git)
+    assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
+    assert git_command(origin, "rev-parse", ref) == base
+    assert "api" in load_config(root).lanes
+
+
 def test_lane_checks_branch_and_agent_before_writing(tmp_path):
     (tmp_path / ".foragent.yml").write_text("{}\n")
 
@@ -669,7 +688,7 @@ def test_skills_cli_routes_offline(library, tmp_path, monkeypatch, capsys):
     assert row["id"] == "kwp:engineering/testing-strategy" and row["license"] == "Apache-2.0"
     assert cli.main(["skills", "catalog"]) == 0
     output = capsys.readouterr().out
-    assert "ID\tName\tLicense\tDescription" in output and "Apache-2.0" in output
+    assert "ID\tName\tLicense\tSource\tDescription" in output and "Apache-2.0" in output
     assert cli.main(["skills", "sync"]) == 0
     assert "Synced:" in capsys.readouterr().out
     assert cli.main(["skills", "install", "engineering/testing-strategy", "--repo-root", str(tmp_path)]) == 0

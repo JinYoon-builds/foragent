@@ -46,7 +46,9 @@ session publishes only after the person approves there. When the orchestrator dr
 plan, it sends the plan path to the planning session. Approval relayed from another session
 is not approval. This first-hand rule covers D71 choices: a choice about behaviour, scope,
 screen wording or the approval boundary, or a real preread QUESTION, comes through the planning
-session to the person. A choice-free fix (required behaviour settled, nothing left to choose)
+session to the person. Under D71, hard to undo means data, money, public exposure or sending to
+others; changes git can revert, including deleting superseded code, are not person questions, and
+a question an existing decision answers goes to the PM, not the person. A choice-free fix (required behaviour settled, nothing left to choose)
 the orchestrator itself publishes and approves with `fa order publish PLAN.json --approve --defer <boundary>`
 after a clean preread; a Foragent caller role alone does not block that.
 
@@ -126,6 +128,14 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
 - Existing open issues without the Foragent format: propose per issue — rewrite (contract +
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
+- Board cleanup when /fa adopts an existing project (after `fa adopt survey`): propose
+  the cleanup items one by one, each with its evidence, and let the person agree or decline
+  each one. A rewrite goes into `edits`. A duplicate folded into another existing issue goes
+  into the plan's `closes` as `{"number": N, "into": M}`. An issue that history already
+  resolved goes into `closes` as `{"number": N, "commit": "<sha>"}` with the fixing commit.
+  Put only the agreed items in the plan; a declined item stays out and stays untouched.
+  `fa order publish` writes each close only when it is approved (`--approve`, or its number
+  in `--approve-numbers`), and `--dry-run` previews each close with its evidence.
 - Never ask what the code, docs, specs or earlier decisions already answer.
 - A **starter order** (the person says `starter: ...` after `fa init`) is one tiny task
   a lane can finish in about 10 minutes, to show the flow to a merged PR. Their example is
@@ -372,7 +382,10 @@ fixed seats: skeptic, first-time user, attacker, operator, maintainer in six mon
 incidents (risk map and decisions), and other users. A failed seat is listed under
 `failures`; the others still count. Merge duplicate questions across seats into one. Answer what the code, the
 docs or a settled decision already answers, and fold it into the spec yourself. Ask the
-person only the questions D71 leaves to them: behaviour, scope or approval. Then record
+person only the questions D71 leaves to them: behaviour, scope or approval. Changes git can
+revert, including deleting superseded code, are not person questions; hard to undo means data,
+money, public exposure or sending to others. A question an existing decision answers goes to the
+PM, not the person. Then record
 each question once with `fa order perspectives mark ID --changed yes|no` (yes when it
 changed the spec; mark every id of a merged duplicate). `fa order perspectives stats --json`
 shows which seats changed specs.

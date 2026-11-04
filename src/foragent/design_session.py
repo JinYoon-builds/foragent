@@ -298,7 +298,7 @@ def run(args, store: StateStore) -> int:
         return 0
     if args.action == "done":
         done(store, root)
-        print("Design preview closed; the lane view remains available.")
+        print("Design preview closed; the dashboard remains available.")
         return 0
     commands, urls = args.preview_commands or [], args.url or []
     refs = None

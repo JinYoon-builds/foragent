@@ -48,8 +48,11 @@ def install(root):
     from foragent.config import load_config
     from foragent.order import PlanError
 
+    from foragent import statusline
+
     path = root / ".claude/settings.local.json"
-    with locked(path.with_name("decision-hooks.lock")):
+    # Same lock as the Stop hook installer: both write this file during `fa init`.
+    with statusline._install_lock():
         try:
             settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
             hooks = settings.setdefault("hooks", {})

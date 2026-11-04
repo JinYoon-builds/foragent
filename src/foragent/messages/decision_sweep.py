@@ -2,7 +2,6 @@
 
 MESSAGES = {
     "en": {
-        "decision_sweep_install_help": "Install decision capture hooks only with yes; no leaves settings unchanged",
         "decision_sweep_add_help": "Retain a decision candidate after the person confirms it, for batched publication",
         "decision_sweep_candidate_help": "Candidate id from fa order pending --json",
         "decision_sweep_text_help": "The decision confirmed with the person in one line",
@@ -13,7 +12,6 @@ MESSAGES = {
         "order_flush_status_confirmed": "confirmed",
     },
     "ko": {
-        "decision_sweep_install_help": "yes일 때만 결정 수집 훅을 설치해요. no는 기존 설정을 유지해요",
         "decision_sweep_add_help": "사람에게 확인받은 결정 후보를 묶음 발행할 기록으로 남겨요",
         "decision_sweep_candidate_help": "fa order pending --json에 나온 후보 id",
         "decision_sweep_text_help": "사람에게 한 줄로 확인받은 결정",

@@ -529,23 +529,41 @@ def test_orch_merge_withdraws_reservation_when_premerge_cannot_finish(merge_case
     assert expected.__name__ in withdrawals[0]["data"]["detail"]
 
 
-def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case):
+@pytest.mark.parametrize("owner", [False, True])
+def test_orch_merge_refuses_a_dream_pr_that_predates_a_redo(merge_case, monkeypatch, owner):
     """#1231: after `fa orch dream --redo`, a dream PR from an older prompt is never merged."""
     from datetime import timedelta
 
-    from foragent import orch_dream
+    from foragent import orch_dream, runner
+
+    monkeypatch.setattr(runner, "review_only", lambda *args, **kwargs: pytest.fail("dream handed to reviewer"))
 
     c = merge_case
     git_command(c.history.origin, "update-ref", "refs/heads/foragent/dream-alpha", c.head)
     pr = c.tracker.create_pr(head="foragent/dream-alpha", base="main", title="Dream", body="Old")
     c.tracker.set_pr_head_sha(pr, c.head)
     c.tracker.set_pr_checks(pr, "pass")
-    c.ctx.config = replace(c.ctx.config, lanes={"alpha": {"paths": ["a/**"]}})
+    c.ctx.config = replace(c.ctx.config, merge_owner=owner, lanes={"alpha": {"paths": ["a/**"]}})
     earlier = BASE_TIME - timedelta(hours=1)
     orch_dream.record_published(c.ctx.store, "alpha", 1, earlier, covered_until=earlier, pr=pr,
                                 inputs={}, outputs={})
     assert orch_dream.redo(c.ctx, "alpha") == 0
     with pytest.raises(orch.OrchError, match=f"dream PR #{pr} predates a redo of lane alpha"):
+        orch.merge(c.ctx, pr, approved_by="jin")
+    assert c.tracker.merged_prs == []
+
+
+@pytest.mark.parametrize("head", ["foragent/batch-1", "feature/person"])
+def test_owner_merge_refuses_batch_and_unlinked_prs(merge_case, monkeypatch, head):
+    from foragent import runner
+
+    c = merge_case
+    c.ctx.config = replace(c.ctx.config, merge_owner=True)
+    pr = c.tracker.create_pr(head=head, base="main", title="Other", body="")
+    c.tracker.set_pr_head_sha(pr, c.head)
+    monkeypatch.setattr(runner, "review_only", lambda *args, **kwargs: pytest.fail("unsupported handoff"))
+    monkeypatch.setattr(orch, "_premerge", lambda *args: pytest.fail("unsupported direct merge"))
+    with pytest.raises(orch.OrchError, match="supports approved issue PRs and lane dream PRs only"):
         orch.merge(c.ctx, pr, approved_by="jin")
     assert c.tracker.merged_prs == []
 
