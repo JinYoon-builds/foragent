@@ -2,7 +2,7 @@ repo: JinYoon-builds/foragent  # 2026-10-30: pushes failed 255x with 'claude-pus
 review: fast
 merge_owner: true  # 2026-11-04 Jin: PM switches the merge owner on and measures (#1502, #1797)
 test_command: uv run pytest -q  # required by merge_owner (pytest-only owner refresh)
-merge_batch: true  # 2026-11-04 Jin: prefix CI evidence for queued owner admissions (#1920, D110)
+merge_batch: false  # 2026-11-04 16:00 Jin: pause v3 trains after train 94b39e57; v4 (tip first, bisect) replaces it
 merge_batch_size: 6  # start at 6; dynamic sizing after 1-2 h of measurements (Jin 2026-11-04)
 executor: claude  # 2026-10-23 14:4x: #247 fixed the /goal prompt (live-checked); Claude quota idle. Reviewer becomes codex. D74 will choose per issue
 language: ko
