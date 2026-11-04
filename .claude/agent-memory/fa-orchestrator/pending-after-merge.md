@@ -253,5 +253,6 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1873 blocked 3x on reviewer "(none)" first line = #1825's defect; its fix PR #1833 is green and queued. After #1833 merges: `fa orch retry 1873` and `fa orch retry 1655` and `fa orch retry 1515` and `fa orch retry 1854` (all four blocked by the same "(none)" first-line parser defect; no hint needed).
 - #1040 (D58 skill lifecycle) next edit: add evidence from PM r510/r514 — 236-skill catalog buries relevant ones; PRs 1830 1814 1813 1864 1863 report "Skills used: none".
 - New machine: no orca codex-accounts dir; rerun-review uses default ~/.codex (the c7c83cab export is obsolete).
-- D112 plan ready (preread clean): drafts/2026-11-04-d112/plan.json; publish with --approve right after #1882 (PM's merge-owner branch) merges.
 - #1873 (PM r532, Jin): when retrying after #1833, first edit its Goal: purpose is reviewing human-written branches and external contributors' PRs with the full panel (open source), not PM out-of-lane work; lower priority.
+- After #1914 (fa orch close) merges: fa orch close 1860 --superseded-by 1882 --why 'PM r531: #1882 replaced the exclusion-record classifier'.
+- 24 h after the CI-cancel fix merges (architect r547): measure gh run list conclusion=cancelled, busy job-min/h (cap 1,200), orch-events 'ci -> timeout' (9/day on 11-04; target 0-2). If 3+/day remain, re-check r547 items (2) owner refreshes while CI pending and (3) order commits count as non-neutral.

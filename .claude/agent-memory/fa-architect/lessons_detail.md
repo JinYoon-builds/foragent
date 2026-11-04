@@ -16,3 +16,7 @@ metadata:
 - The 5A panel (one reviewer per perspective) runs only when `first_review_findings` is empty and risk notes exist (run_review._review), so it ran on 1 of the last 30 FAILs (#1641 r2). Later rounds are single reviewers with #1170's 'First-round defect classes' prompt, which makes 'Remaining X class' chains (#1652 9, #1679 5). Check which review path produced the FAILs (review-R-P.txt files) before blaming the panel. (11-03)
 
 - A post-PASS FAIL with the same body_sha is not proof the PASS boundary failed: `review_pass_scope.for_review` drops the boundary for the whole review when *any* changed path matches a `pass_scope_exempt` risk entry (#1004 r22: 17 label-guard lines in scheduler_recovery.py). Diff PASS head (`review-pass-head` event) vs PR head for the cited file, then check the exempt match, before blaming the reviewer. (r323)
+
+## PR CI load attribution (r547, 11-04)
+
+To attribute PR CI load, list each PR head sha since a cutoff (gh run list) with its parent count and commit title. 'Refresh PR #N onto' and 'Merge commit' heads are base refreshes; check for 'superseded before its CI ended' (next head created before the run's updatedAt). On 11-04, 9 of 47 heads replaced a head whose CI was still running, all made by the merge owner on the PR next in line, and the workflows had no `concurrency:` block. Use `gh run view` sequentially only for about 85 runs within the 2-min limit. (r547)
