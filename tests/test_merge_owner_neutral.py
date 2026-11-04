@@ -9,7 +9,7 @@ from acceptance.test_merge_path_real_settings import world  # noqa: F401
 from conftest import git_command
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
-from foragent import ci_local, merge_owner
+from foragent import ci_local, merge_owner, run_merge_turn as queue
 from foragent.git import GitRepo
 from foragent.issue import body_hash
 from foragent.run_base_move import REUSED
@@ -20,8 +20,10 @@ def waiting(case, monkeypatch):
     if case.config.checks == "local":
         monkeypatch.setattr(case.ci, "reports", lambda row: [])
     support.queue_workers(case, [5])
-    row = next(iter(merge_owner.admissions(case.store).values()))["publication"]
-    assert case.tracker.pr_checks(row["pr"]) == "pass"
+    row = next(iter(merge_owner.admissions(case.store).values()))
+    assert "comparison" not in row["publication"]
+    job = merge_owner._load(case.ctx, queue.seat(case.ctx, 5, row["target"]), row)
+    assert case.tracker.pr_checks(job["pr"]) == "pass"
     pushes = []
     push = GitRepo.push_head
 
@@ -30,8 +32,8 @@ def waiting(case, monkeypatch):
         return push(git, *args, **kwargs)
 
     monkeypatch.setattr(GitRepo, "push_head", published)
-    assert "baseline" not in row and "comparison_baselines" not in row
-    return row, pushes, len(case.ci.rounds)
+    assert "baseline" not in job and "comparison_baselines" not in job
+    return job, pushes, len(case.ci.rounds)
 
 
 def assert_reused(case, admitted, pushes, rounds):
@@ -74,6 +76,26 @@ def test_owner_keeps_green_head_across_memory_additions_and_modifications(proto,
         case.history.update({memory: "memory\n"})
         case.history.update({memory: "updated memory\n"})
     assert_reused(case, admitted, pushes, rounds)
+
+
+@pytest.mark.parametrize("comparison", ["missing", "null"])
+def test_owner_refreshes_memory_moves_without_job_comparison(proto, monkeypatch, comparison):
+    case = proto
+    admitted, pushes, rounds = waiting(case, monkeypatch)
+    # A legacy queue payload must not replace missing job-file evidence.
+    journal = case.store.root / queue.QUEUE
+    rows = queue._rows(case.store)
+    next(row for row in rows if row.get("merge_owner"))["publication"]["comparison"] = admitted["comparison"]
+    journal.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    job = dict(admitted)
+    if comparison == "missing":
+        del job["comparison"]
+    else:
+        job["comparison"] = None
+    case.store._write_json(merge_owner._path(case.ctx, 5), job)
+    case.history.update({".claude/agent-memory/role.md": "memory\n"})
+    assert_refreshed(case, admitted, pushes, rounds)
+    assert REUSED not in case.store.log_path(5).read_text()
 
 
 def test_owner_refreshes_for_docs_only_moves(proto, monkeypatch):
