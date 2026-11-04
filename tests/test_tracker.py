@@ -2150,3 +2150,26 @@ def test_gh_checks_start_does_not_leak_from_a_previous_listing():
     assert tracker.pr_checks_started(42) is None
     assert tracker.pr_checks(42) == "pending"
     assert tracker.pr_checks_started(42) is None
+
+
+def test_fake_pr_mergeable_defaults_to_unknown_and_keeps_githubs_literal():
+    tracker = FakeTracker()
+    assert tracker.pr_mergeable(7) == "UNKNOWN"
+    tracker.set_pr_mergeable(7, "CONFLICTING")
+    assert tracker.pr_mergeable(7) == "CONFLICTING"
+    assert tracker.pr_mergeable(8) == "UNKNOWN"
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ('{"mergeable": "CONFLICTING"}', "CONFLICTING"),
+    ('{"mergeable": "MERGEABLE"}', "MERGEABLE"),
+    ('{"mergeable": "UNKNOWN"}', "UNKNOWN"),
+    ('{"mergeable": "something-new"}', "UNKNOWN"),
+    ('{}', "UNKNOWN"),
+    ("not json", "UNKNOWN"),
+])
+def test_gh_pr_mergeable_reads_githubs_mergeable_field(reply, expected):
+    calls = []
+    tracker = GhTracker("owner/repo", run=lambda args, input=None: calls.append(args) or reply)
+    assert tracker.pr_mergeable(12) == expected
+    assert calls[-1][:2] == ["pr", "view"] and "12" in calls[-1] and calls[-1][-1] == "mergeable"
