@@ -27,8 +27,9 @@ def test_goal_is_verbatim_and_does_not_require_an_issue(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("cached", [True, False])
 def test_issue_grounding_reads_cache_before_github(tmp_path, monkeypatch, cached):
+    """--issue reads only the local issue cache; a cache miss stops plainly and never calls GitHub."""
     body = "## Goal\nBound retries.\n\n## Out of scope\nTransport changes.\n\n## Done when\n```sh\nfalse\n```\n"
-    rows = [{"number": 42, "body": body}] if cached else []
+    rows = [{"number": 42, "body": body}] if cached else [{"number": 7, "body": body}]
     monkeypatch.setattr(StateStore, "local_issues", lambda self: rows)
     calls = []
 
@@ -37,11 +38,15 @@ def test_issue_grounding_reads_cache_before_github(tmp_path, monkeypatch, cached
         return SimpleNamespace(body=body)
 
     monkeypatch.setattr(GhTracker, "get_issue", get_issue)
-    parsed = review_branch.goal_for(tmp_path, Config(repo="owner/repo"), None, 42)
-    assert parsed.goal == "Bound retries."
-    assert parsed.out_of_scope == "Transport changes."
-    assert parsed.done_when_commands == []
-    assert calls == ([] if cached else [("owner/repo", 42)])
+    if cached:
+        parsed = review_branch.goal_for(tmp_path, Config(repo="owner/repo"), None, 42)
+        assert parsed.goal == "Bound retries."
+        assert parsed.out_of_scope == "Transport changes."
+        assert parsed.done_when_commands == []
+    else:
+        with pytest.raises(review_branch.ReviewError, match="#42"):
+            review_branch.goal_for(tmp_path, Config(repo="owner/repo"), None, 42)
+    assert calls == []
     assert not any(tmp_path.iterdir())
 
 
@@ -156,3 +161,66 @@ def test_cli_prints_original_error_and_cleanup_diagnostic(monkeypatch, capsys):
     assert "panel original error" in captured.err
     assert "worktree cleanup failed" in captured.err
     assert len(captured.err.splitlines()) == 1
+
+
+@pytest.mark.parametrize("target_kind", ["branch", "worktree"])
+def test_review_runs_no_program_the_repository_configures(tmp_path, monkeypatch, target_kind):
+    """Hooks, fsmonitor and filters configured in the person's repository never run during `fa review`."""
+    import os
+    import subprocess
+
+    repo, log = tmp_path / "repo", tmp_path / "repo" / "side-effects.log"
+    git = lambda *args, cwd=repo: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+    repo.mkdir()
+    git("init", "-q", "-b", "main")
+    env = {"GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@b", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@b"}
+
+    def commit(ref, message, parent=None):
+        # Plumbing commits: the shared test guard forbids `git commit`.
+        git("add", "-A")
+        tree = git("write-tree").strip()
+        sha = subprocess.run(["git", "commit-tree", tree, "-m", message, *(["-p", parent] if parent else [])], cwd=repo,
+                             check=True, capture_output=True, text=True, env={**os.environ, **env}).stdout.strip()
+        git("update-ref", ref, sha)
+        return sha
+
+    (repo / ".gitattributes").write_text("*.txt filter=mark\n")
+    (repo / "a.txt").write_text("base\n")
+    (repo / ".gitignore").write_text("side-effects.log\n")
+    base = commit("refs/heads/main", "base")
+    (repo / "a.txt").write_text("feature\n")
+    commit("refs/heads/feature", "feature", base)
+    (repo / "a.txt").write_text("base\n")
+    git("read-tree", "main")
+    target = "feature"
+    if target_kind == "worktree":
+        target = str(tmp_path / "feature-tree")
+        git("worktree", "add", "-q", target, "feature")
+    for hook in ("post-checkout", "reference-transaction", "pre-commit", "post-index-change"):
+        path = repo / ".git" / "hooks" / hook
+        path.write_text(f"#!/bin/sh\necho {hook} >> '{log}'\n")
+        path.chmod(0o755)
+    record = lambda what: f"sh -c 'echo {what} >> \"{log}\"; cat'"
+    git("config", "filter.mark.smudge", record("smudge"))
+    git("config", "filter.mark.clean", record("clean"))
+    git("config", "core.fsmonitor", f"{repo}/.git/hooks/post-checkout")
+    before = dict(os.environ)
+    seen = {}
+
+    def panel(n, ctx, checkout, *args, **kwargs):
+        state = checkout.review_state()
+        checkout._call(["update-ref", "HEAD", checkout.head_sha()])
+        (checkout.root / "a.txt").write_text("edited by a reviewer\n")
+        checkout._call(["add", "-A"])
+        checkout.restore_review_state(state)
+        seen["file"] = (checkout.root / "a.txt").read_text()
+        return ReviewResult("PASS", "")
+
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(review_branch, "_panel_review", panel)
+    monkeypatch.setattr(review_branch, "load_config", lambda root: Config())
+    result, _language, _worktree = review_branch.review(target)
+    assert result.verdict == "PASS"
+    assert seen["file"] == "feature\n", "the checkout holds the branch's blob, unfiltered"
+    assert not log.exists() or log.read_text() == "", f"repository programs ran: {log.read_text()!r}"
+    assert dict(os.environ) == before

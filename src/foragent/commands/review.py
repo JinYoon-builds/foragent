@@ -23,7 +23,7 @@ def run(args) -> int:
     cli = facade()
     try:
         result, language, worktree = review(args.target, args.base, goal=args.goal, issue=args.issue)
-    except (ReviewError, cli.GitError, cli.ConfigError, cli.TrackerError, ValueError, OSError, cli.subprocess.SubprocessError,
+    except (ReviewError, cli.GitError, cli.ConfigError, ValueError, OSError, cli.subprocess.SubprocessError,
             ExecutorStopped) as exc:
         detail = " ".join(" ".join((str(exc), *getattr(exc, "__notes__", ()))).split())
         print(cli.text("branch_review_error", error=detail), file=cli.sys.stderr)
