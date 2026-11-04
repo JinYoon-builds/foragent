@@ -49,7 +49,8 @@ def test_waiting_with_fresh_runner_shows_localized_phase_and_age(
                    runner_minutes=1, language=language, phase_minutes=phase_minutes)
     stalled = MESSAGES[language]["watch_stalled"].partition("{minutes}")[0].strip()
     # Lane rows show the unified phase word and the worker's total elapsed age.
-    sentence = {("checking", "en"): "running related tests on this computer", ("ci", "en"): "running CI on GitHub", ("checking", "ko"): "내 컴퓨터에서 관련 테스트를 돌리고 있어요"}[(phase, language)]
+    # D113 full names: checking tests the issue's goal, ci runs the full suite.
+    sentence = {("checking", "en"): "goal tests", ("ci", "en"): "full tests", ("checking", "ko"): "목표 시험 중"}[(phase, language)]
     expected_age = f"{phase_minutes}분" if language == "ko" else f"{phase_minutes}m"
     missing = [label for label in (sentence, expected_age) if label not in row]
     assert not missing and stalled not in row, (
