@@ -115,6 +115,28 @@ def queue_workers(case, numbers):
             case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
 
 
+def batch_candidates(case):
+    candidates = []
+    for row in merge_owner.admissions(case.store).values():
+        place = merge_owner.queue.Seat(row["n"], row["started_at"], row["target"])
+        job = merge_owner._load(case.ctx, place, row)
+        candidates.append((place, job, case.tracker.get_pr(job["pr"])))
+    return candidates
+
+
+def edit_member_shared_file(case, monkeypatch, numbers):
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def edit(**kwargs):
+        result = implement(**kwargs)
+        if case.worker.number in numbers:
+            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
+        return result
+
+    monkeypatch.setattr(model, "run", edit)
+
+
 def edit_member_workflows(case, monkeypatch, paths):
     model = case.ctx.executor_factory("claude")
     implement = model.run
@@ -207,6 +229,42 @@ def test_green_tip_lands_members_whose_own_ci_is_pending(batched):
     assert len(case.store.owner_merge_facts()) == 2
 
 
+def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(batched, monkeypatch):
+    case = batched
+    # Worker worktrees share this repository's objects and local Git identity.
+    git_command(case.root, "config", "--local", "user.name", "Offline Tests")
+    git_command(case.root, "config", "--local", "user.email", "tests@example.com")
+    queue_workers(case, [1])
+    ancestor = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    model = case.ctx.executor_factory("claude")
+    implement = model.run
+
+    def with_dependency(**kwargs):
+        if case.worker.number == 5:
+            git_command(kwargs["worktree"], "merge", "--no-commit", "--no-ff", ancestor)
+        return implement(**kwargs)
+
+    monkeypatch.setattr(model, "run", with_dependency)
+    queue_workers(case, [5, 4])
+    orch_queue.set_global(case.store, [5, 1, 4])
+    dependent = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
+    assert case.git.is_ancestor(ancestor, dependent)
+    case.tracker.set_pr_checks(support.pr_for(case, 1).number, "fail")
+    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pending")
+
+    report = support.gate(case)
+
+    assert not case.target_attempts and not case.target_pushes and not case.merges, report.actions
+    assert case.history.tip == case.base and not case.store.owner_merge_facts()
+    assert not case.batch_pushes and not groups(case) and not refs(case)
+    assert not any("#1 merge batch excluded" in action for action in report.actions)
+    retired, = batch.retirements(case.ctx)
+    assert retired["reason"] == "member already reachable" and retired["spent"] == []
+    assert events(case)[-1]["reason"] == "member already reachable"
+    assert events(case)[-1]["result"] == "unused"
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
+
+
 @pytest.mark.parametrize("path", [".github/workflows/foragent-acceptance.yml",
                                  ".github/workflows/foragent-acceptance-extra.yaml"])
 def test_workflow_changing_member_uses_single_fallback_while_remaining_members_batch(batched, monkeypatch, path):
@@ -268,11 +326,8 @@ def test_remote_only_candidate_does_not_block_locally_available_batch(batched, m
     case.config = replace(case.config, merge_batch_size=2)
     case.ctx.config = case.config
     queue_workers(case, [5, 1, 4])
-    candidates = []
-    for row in merge_owner.admissions(case.store).values():
-        place = merge_owner.queue.Seat(row["n"], row["started_at"], row["target"])
-        job = merge_owner._load(case.ctx, place, row)
-        candidates.append((place, job, case.tracker.get_pr(job["pr"])))
+    candidates = batch_candidates(case)
+    for _, job, _ in candidates:
         case.tracker.set_pr_checks(job["pr"], "pending")
     fresh = tmp_path / "fresh-owner"
     fresh.mkdir()
@@ -285,6 +340,7 @@ def test_remote_only_candidate_does_not_block_locally_available_batch(batched, m
     missing_head = candidates[2][1]["head"]
     with pytest.raises(GitError):
         git._call(["cat-file", "-e", f"{missing_head}^{{commit}}"])
+    candidates = [candidates[2], *candidates[:2]]
     monkeypatch.setattr(case.ctx, "git", git)
     report = TickReport()
     for _ in range(3):
@@ -705,49 +761,107 @@ def test_restart_recreates_missing_prefix_prs_from_refs_without_republishing(bat
     assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2 and not refs(case)
 
 
-def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
+def test_main_conflict_skips_member_and_fills_batch_from_later_candidates(batched, monkeypatch):
     case = batched
-    model = case.ctx.executor_factory("claude")
-    implement = model.run
-
-    def incompatible(**kwargs):
-        result = implement(**kwargs)
-        if case.worker.number in {5, 4}:
-            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
-        return result
-
-    monkeypatch.setattr(model, "run", incompatible)
-    queue_workers(case, [5, 1, 4, 2])
-    support.gate(case)
-    assert not groups(case) and not refs(case)
-    assert events(case)[-1]["result"] == "unused"
-    assert [m["n"] for m in events(case)[-1]["members"]] == [5, 1, 4, 2]
-    support.drain(case)
-    assert not groups(case)  # Even the healthy suffix never forms a retry batch.
-
-def test_incomplete_train_retirements_have_distinct_member_identities(batched, monkeypatch):
-    case = batched
-    case.config = replace(case.config, merge_batch_size=2)
+    case.config = replace(case.config, merge_batch_size=3)
     case.ctx.config = case.config
-    model = case.ctx.executor_factory("claude")
-    implement = model.run
-
-    def incompatible(**kwargs):
-        result = implement(**kwargs)
-        (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
-        return result
-
-    monkeypatch.setattr(model, "run", incompatible)
+    edit_member_shared_file(case, monkeypatch, {1})
     queue_workers(case, [5, 1, 4, 2])
-    for n in [5, 1, 4, 2]:
-        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    candidates = batch_candidates(case)
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, candidates)
+    assert proof, report.actions
+    assert [n for n, *_ in proof.chain] == [5, 4, 2]
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert chain == proof.chain
+    skipped = [action for action in report.actions if "#1" in action]
+    assert len(skipped) == 1 and ("conflict" in skipped[0].lower() or "status 1" in skipped[0])
+    excluded = case.tracker.pr_acceptance_reports(proof.chain[-1][2])[0]["report"]["excluded"]
+    assert "tests/acceptance/test_own_1.py" in excluded
+    assert all(f"tests/acceptance/test_own_{n}.py" not in excluded for n in [5, 4, 2])
+    assert not batch.retirements(case.ctx)
+    assert set(merge_owner.admissions(case.store)) == {(p.n, p.started_at) for p, _, _ in candidates}
+
+
+def test_conflict_with_earlier_member_skips_only_that_member(batched, monkeypatch):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    edit_member_shared_file(case, monkeypatch, {5, 1})
+    queue_workers(case, [5, 1, 4, 2])
+    candidates = batch_candidates(case)
+    for _, job, _ in candidates:
+        case.git._call(["merge-tree", "--write-tree", case.base, job["head"]])
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, candidates)
+    assert proof, report.actions
+    assert [n for n, *_ in proof.chain] == [5, 4, 2]
+    assert len([action for action in report.actions if "#1" in action]) == 1
+    assert not batch.retirements(case.ctx)
+
+
+def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {5, 1, 4, 2})
+    queue_workers(case, [5, 1, 4, 2])
+    candidates = batch_candidates(case)
     for _ in range(3):
-        support.gate(case)
-    retired = batch.retirements(case.ctx)
-    assert len(retired) == 2
-    assert {tuple(m["n"] for m in row["members"]) for row in retired} == {(5, 1), (4, 2)}
-    assert all(row["candidate"] == case.base and not row["spent"] for row in retired)
-    assert not groups(case) and len(events(case)) == 2
+        report = TickReport()
+        assert batch.prepare(case.ctx, report, candidates) is None, report.actions
+        assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
+    assert not groups(case) and not refs(case) and not events(case)
+    assert not batch.retirements(case.ctx)
+    assert len(merge_owner.admissions(case.store)) == 4
+
+
+def test_member_composition_failure_leaves_single_path_available(batched, monkeypatch):
+    case = batched
+    case.config = replace(case.config, merge_batch_size=3)
+    case.ctx.config = case.config
+    queue_workers(case, [5, 1, 4, 2])
+    failed_head = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    call = case.git._call
+
+    def unavailable(args):
+        if args[:2] == ["merge-tree", "--write-tree"] and args[-1] == failed_head:
+            raise GitError("member tree unavailable")
+        return call(args)
+
+    monkeypatch.setattr(case.git, "_call", unavailable)
+    report = support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2]
+    assert len([a for a in report.actions if "#1" in a and "member tree unavailable" in a]) == 1
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+    assert [place[0] for place in merge_owner.admissions(case.store)] == [1]
+    monkeypatch.setattr(case.git, "_call", call)
+    support.drain(case, count=1)
+    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+
+
+def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {5, 1})
+    queue_workers(case, [5, 1, 4, 2])
+    case.pending_batch = True
+    first = support.gate(case)
+    tip, = groups(case)
+    _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
+    assert [n for n, *_ in chain] == [5, 4, 2], first.actions
+    case.tracker.set_pr_checks(tip.number, "fail")
+    support.gate(case)
+    retired, = batch.retirements(case.ctx)
+    assert retired["identity"] == batch._identity(case.base, chain)
+    assert [member["n"] for member in retired["members"]] == [5, 4, 2]
+    assert retired["candidate"] == chain[-1][2] and retired["spent"] == []
+    assert batch.prepare(case.ctx, TickReport(), batch_candidates(case)) is None
+    assert len(groups(case)) == 1 and not refs(case)
+    assert len(merge_owner.admissions(case.store)) == 4
+
 
 def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
     case = proto

@@ -32,6 +32,7 @@ def add(commands) -> None:
             command.add_argument("--approved-by", required=True)
             command.add_argument("--at")
         elif name == "retry":
+            command.set_defaults(pm_task="retry an issue")
             command.add_argument("--hint")
         elif name == "resolve":
             command.add_argument("--verdict", choices=("pass", "fail"), required=True)
@@ -42,6 +43,7 @@ def add(commands) -> None:
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
     stop = orch_actions.add_parser("stop", help="Stop a running issue (or --all), keep its work and return it to ready")
+    stop.set_defaults(pm_task="stop an issue")
     stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     stop.add_argument("number", type=int, nargs="?")
     stop.add_argument("--all", action="store_true",
