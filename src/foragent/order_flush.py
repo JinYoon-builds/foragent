@@ -144,14 +144,13 @@ def _require_base(git, config):
 def _finish(root, config, tracker, git, store, repo, batch, records, prepared=None, sha=None):
     resuming = sha is None
     if resuming:
-        sha = recovery.committed(root, config, git, store, batch, records)
+        sha = recovery.committed(root, config, git, batch)
         if sha is None:
             rows, notes = _members(store, batch)
             prepared, files, roots = _preflight(rows, notes, root, config, tracker, repo, git)
             if set(files) != set(batch["paths"]):
                 raise order.PlanError(text("order_flush_paths_changed", config.language))
             sha = _write(root, git, files, roots, recovery.title(batch))
-            journal.append(store, "committed", batch["batch"], sha=sha)
     completed = {row.get("entry", row.get("order")) for row in records
                  if row["batch"] == batch["batch"] and row["kind"] == "issues"}
     if prepared is None:
@@ -164,7 +163,7 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         # An owner approved since the commit may lock bytes this retried push would move.
         if not git.is_ancestor(sha, f"origin/{config.base_branch}"):
             _refuse_affected(prepared, {}, config, tracker, repo, git)
-    sha = recovery.push(config, git, store, batch, sha, recovering=resuming)
+    sha = recovery.push(config, git, batch, sha, recovering=resuming)
     for row, publication in prepared:
         if row["entry_id"] in completed or row["id"] in completed:
             continue
@@ -213,7 +212,6 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
                      "notes": [row["entry_id"] for row in notes], "paths": sorted(files)}
             journal.append(store, **batch)
             sha = _write(root, git, files, roots, recovery.title(batch))
-            journal.append(store, "committed", batch["batch"], sha=sha)
             return _finish(root, config, tracker, git, store, repo, batch, records, prepared, sha)
 
 

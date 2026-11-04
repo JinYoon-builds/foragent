@@ -1,6 +1,5 @@
 """Recover a single publication intent from Git facts, without undoing commits."""
 
-from foragent import order_flush_journal as journal
 from foragent.i18n import text
 from foragent.order import PlanError
 from foragent.order_files import check_write
@@ -49,53 +48,43 @@ def _land(root, config, git, batch, local, published):
         raise PlanError(text("order_flush_descendants", config.language))
 
 
-def _unfinished_rebuild(git, history, saved):
-    """The rebuild intent whose ref never moved: the tree may sit on either side of it."""
-    rebuilding = [row for row in history if row["kind"] == "rebuilding"]
-    if (rebuilding and history.index(rebuilding[-1]) > history.index(saved[-1])
-            and git.head_sha() == rebuilding[-1]["old"]):
-        return rebuilding[-1]
-    return None
+def _rebuild_ref(batch):
+    return f"refs/foragent/flush/{batch['batch']}"
 
 
-def committed(root, config, git, store, batch, records):
-    """Return the recognized SHA, or restore the uncommitted intent for retry."""
+def committed(root, config, git, batch):
+    """Recover from Git history and any unfinished tree/ref installation."""
     remote = f"origin/{config.base_branch}"
     git.fetch("origin", config.base_branch)
-    history = [row for row in records if row["batch"] == batch["batch"]]
-    saved = [row for row in history if row["kind"] in {"committed", "rebased"}]
-    sha = saved[-1]["sha"] if saved else None
-    # The recorded SHA may be stale: a rebuilt ref can have outlived its rebased record.
-    local = sha if sha and git.is_ancestor(sha, "HEAD") else _find(git, "HEAD", batch)
-    intent = _unfinished_rebuild(git, history, saved) if saved else None
-    # Publication is a remote fact, whatever this clone recorded or holds; it ends any rebuild.
     found = _find(git, remote, batch)
+    local = _find(git, "HEAD", batch)
+    ref = _rebuild_ref(batch)
+    intent = git._call(["for-each-ref", "--format=%(objectname)", ref]).strip() or None
     if found:
-        if intent:
-            # Two-tree read-tree lands on the unmoved ref from either side of the interruption.
-            git._call(["read-tree", "-m", "-u", intent["sha"], intent["old"]])
+        if intent and local and local != intent:
+            # The tree may have moved before the branch ref did. Restore it first.
+            git._call(["read-tree", "-m", "-u", intent, local])
         _land(root, config, git, batch, local, found)
-        if found != sha:
-            journal.append(store, "rebased" if sha else "committed", batch["batch"], sha=found, old=sha)
+        if intent:
+            git._call(["update-ref", "-d", ref, intent])
         return found
     if local is None:
         restore(root, git, batch["paths"])
         return None
-    if local != sha:
-        journal.append(store, "rebased" if sha else "committed", batch["batch"], sha=local, old=sha)
-        return local
     if intent:
-        _install(git, config, intent["old"], intent["sha"])
-        journal.append(store, "rebased", batch["batch"], old=intent["old"], sha=intent["sha"])
-        sha = intent["sha"]
-    return sha
+        if local != intent:
+            if git.head_sha() != local:
+                raise PlanError(text("order_flush_descendants", config.language))
+            _install(git, config, local, intent)
+        git._call(["update-ref", "-d", ref, intent])
+        return intent
+    return local
 
 
-def push(config, git, store, batch, sha, *, recovering):
+def push(config, git, batch, sha, *, recovering):
     remote = f"origin/{config.base_branch}"
     if recovering:
         if git.is_ancestor(sha, remote):
-            journal.append(store, "pushed", batch["batch"], sha=sha)
             return sha
         if not git.is_ancestor(remote, "HEAD"):
             if git.head_sha() != sha:
@@ -106,10 +95,10 @@ def push(config, git, store, batch, sha, *, recovering):
                 value = git._call(["config", "--default", fallback, "--get", key]).strip()
                 identity.extend(["-c", f"{key}={value or fallback}"])
             rebuilt = git._call([*identity, "commit-tree", tree, "-p", remote, "-m", title(batch)]).strip()
-            journal.append(store, "rebuilding", batch["batch"], old=sha, sha=rebuilt)
+            ref = _rebuild_ref(batch)
+            git._call(["update-ref", ref, rebuilt])
             _install(git, config, sha, rebuilt)
-            journal.append(store, "rebased", batch["batch"], old=sha, sha=rebuilt)
+            git._call(["update-ref", "-d", ref, rebuilt])
             sha = rebuilt
     git.push_base(config.base_branch)
-    journal.append(store, "pushed", batch["batch"], sha=sha)
     return sha

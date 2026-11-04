@@ -1,4 +1,7 @@
-"""Flush is the sole writer of this append-only publication checkpoint."""
+"""Flush records batch membership and issue progress; Git owns commit/push facts.
+
+Legacy Git checkpoint rows remain readable but play no part in recovery.
+"""
 
 from contextlib import contextmanager
 import fcntl
