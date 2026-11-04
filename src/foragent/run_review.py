@@ -571,6 +571,8 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
         attempt.previous_rebutted_findings = findings
         if attempt.review_failures > ctx.config.review_max:
+            if not attempt.review_hold:
+                attempt.review_hold_reason = Reason.REVIEW_DEFECTS
             attempt.review_hold = True
 
 
