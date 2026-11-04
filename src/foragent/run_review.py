@@ -83,16 +83,30 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
 
 
+def _beside_marker(text: str) -> str | None:
+    """The text beside the empty findings marker, or None when there is no marker.
+
+    The marker is "(none)" alone on the first or the last non-blank line; every parser that
+    reads it uses this one rule. Any other text is a note, which the caller still checks.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if lines and lines[0].strip() == "(none)":
+        return "\n".join(lines[1:])
+    if lines and lines[-1].strip() == "(none)":
+        return "\n".join(lines[:-1])
+    return None
+
+
 def _empty_findings(message: str) -> bool:
     """Convert the tool's empty findings marker, without judging any review prose."""
     text = review_notes.strip(message).strip()
     if not text:
         return True
-    lines = text.splitlines()
-    return (lines[-1].strip() == "(none)"
-            and not any(FINDING_LINE.match(line) for line in lines[:-1])
+    rest = _beside_marker(text)
+    return (rest is not None
+            and not any(FINDING_LINE.match(line) for line in rest.splitlines())
             and "```" not in text
-            and not code_review_findings("\n".join(lines[:-1]))[1])
+            and not code_review_findings(rest)[1])
 
 
 FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
@@ -129,7 +143,7 @@ def code_review_findings(text: str) -> tuple[str, list[str] | list[dict], str]:
         if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
             return "UNUSABLE", [], "/code-review gave invalid findings"
         return "FAIL", items, ""
-    if not blocks and lines and lines[0].strip() == "(none)":
+    if not blocks and _beside_marker(text) is not None:
         return "PASS", [], ""
     return "UNUSABLE", [], "/code-review gave no verdict"
 
