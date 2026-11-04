@@ -18,7 +18,6 @@ from foragent.config import DEFAULTS, Config, ConfigError, _read_yaml, _validate
 from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
-from foragent.main_write import push_base
 from foragent.order import detect_test_commands
 from foragent.skills import Skill, SkillManager, with_vendored_library
 from foragent.tracker import GhTracker, Tracker, TrackerError
@@ -485,7 +484,7 @@ def init_repo(
             if pending:
                 git.commit_paths(pending, "Set up Foragent")
             if push_planned:
-                push_base(git, config)
+                git.push_base(base_branch)
     label = None if no_launchd else (install_launchd or launchd.install)(root)
     _bind_checkout(root)
     if fa_allow is None and not _has_claude_settings(root) and not _fa_allow_decided(str(root.resolve())):

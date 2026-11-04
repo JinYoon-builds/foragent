@@ -92,7 +92,7 @@ def test_offline_fetch_still_commits_locally_and_a_later_tick_delivers(case):
 
 
 @pytest.mark.parametrize("merge_owner", [True, False])
-def test_merge_train_wait_preserves_commit_until_next_tick(case, merge_owner):
+def test_merge_train_wait_rebuilds_memory_after_main_advances(case, merge_owner):
     case.ctx.config = replace(case.ctx.config, merge_owner=merge_owner)
     before = run(case.origin, "rev-parse", "main").strip()
     train = f"refs/heads/foragent/batch-merge-{before[:8]}-1"
@@ -108,11 +108,16 @@ def test_merge_train_wait_preserves_commit_until_next_tick(case, merge_owner):
         assert origin_file(case, path) == b"Old lesson.\n"
         assert "waiting for merge train" in " ".join(publish(case))
         assert run(case.root, "rev-parse", "HEAD").strip() == local
+        case.history.update({"README.md": "Train advanced main.\n"}, message="Train merged")
         run(case.origin, "update-ref", "-d", train)
         assert publish(case) == ["role memory published to main"]
+        assert run(case.root, "rev-parse", "HEAD").strip() != local
+        assert run(case.root, "rev-parse", "HEAD^").strip() == case.history.tip
+        assert origin_file(case, "README.md") == b"Train advanced main.\n"
     else:
         assert actions == ["role memory published to main"]
-    assert run(case.origin, "rev-parse", "main").strip() == local
+        assert run(case.origin, "rev-parse", "main").strip() == local
+    assert run(case.origin, "rev-parse", "main") == run(case.root, "rev-parse", "HEAD")
     assert origin_file(case, path) == b"Old lesson.\nNew lesson.\n"
     assert publish(case) == []
 

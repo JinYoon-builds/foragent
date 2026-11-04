@@ -1,4 +1,4 @@
-"""One admission point; remote facts are read again at every push attempt."""
+"""Retryable writers inspect live train refs at every push destination."""
 
 import ast
 from collections import Counter
@@ -42,13 +42,55 @@ def test_gate_reads_live_refs_under_the_existing_lock(git_history, monkeypatch):
     with git.publish_lock():
         main_write.push_base(git, config)
     assert pushed == ["main"]
-    assert calls == [["ls-remote", "--heads", "origin", "refs/heads/foragent/batch-merge-*"]] * 2
+    assert calls == [["ls-remote", "--heads", str(git_history.origin),
+                      "refs/heads/foragent/batch-merge-*"]] * 2
 
 
-def test_unreadable_train_refs_use_the_failed_push_path():
+@pytest.mark.parametrize("train_at", ["fetch", "first-push", "second-push", None])
+def test_gate_inspects_every_push_destination(git_history, tmp_path, monkeypatch, train_at):
+    git = GitRepo(git_history.clone)
+    destinations = {"fetch": git_history.origin}
+    for name in ("first-push", "second-push"):
+        destination = tmp_path / f"{name}.git"
+        git_command(tmp_path, "clone", "--bare", str(git_history.origin), str(destination))
+        git_command(git_history.clone, "config", "--add", "remote.origin.pushurl", str(destination))
+        destinations[name] = destination
+    if train_at:
+        git_command(destinations[train_at], "update-ref",
+                    f"refs/heads/foragent/batch-merge-{git_history.tip[:8]}-1", git_history.tip)
+    pushed = []
+    monkeypatch.setattr(git, "push_base", pushed.append)
+    with git.publish_lock():
+        if train_at in {"first-push", "second-push"}:
+            with pytest.raises(GitError, match="waiting for merge train"):
+                main_write.push_base(git, Config(merge_owner=True))
+            assert not pushed
+        else:
+            main_write.push_base(git, Config(merge_owner=True))
+            assert pushed == ["main"]
+
+
+def test_gate_inspects_the_rewritten_push_url(git_history, tmp_path, monkeypatch):
+    destination = tmp_path / "push.git"
+    git_command(tmp_path, "clone", "--bare", str(git_history.origin), str(destination))
+    git_command(git_history.clone, "config", f"url.{destination}.pushInsteadOf", str(git_history.origin))
+    git_command(destination, "update-ref",
+                f"refs/heads/foragent/batch-merge-{git_history.tip[:8]}-1", git_history.tip)
+    git = GitRepo(git_history.clone)
+    pushed = []
+    monkeypatch.setattr(git, "push_base", pushed.append)
+    with git.publish_lock(), pytest.raises(GitError, match="waiting for merge train"):
+        main_write.push_base(git, Config(merge_owner=True))
+    assert not pushed
+
+
+@pytest.mark.parametrize("failure", ["resolve", "list"])
+def test_unreadable_train_refs_use_the_failed_push_path(failure):
     pushed = []
 
     def unreadable(args):
+        if args[0] == "remote" and failure == "list":
+            return "/unavailable/push.git\n"
         raise GitError("remote unavailable")
 
     git = SimpleNamespace(_call=unreadable, push_base=pushed.append)
@@ -64,13 +106,13 @@ def test_owner_off_does_not_read_train_refs():
     assert pushed == ["release/v1"]
 
 
-def test_all_base_push_callers_use_the_one_gate():
+def test_only_retryable_base_writers_use_the_train_gate():
     source = Path(main_write.__file__).parent
     direct = {path.name for path in source.rglob("*.py") if ".push_base(" in path.read_text()}
-    assert direct == {"main_write.py"}
+    assert direct == {"main_write.py", "order.py", "init.py", "lanes.py"}
     writers = {path.name for path in source.rglob("*.py")
                if "from foragent.main_write import push_base" in path.read_text()}
-    assert writers == {"orch_role_memory.py", "order.py", "order_flush_recovery.py", "lanes.py", "init.py"}
+    assert writers == {"orch_role_memory.py", "order_flush_recovery.py"}
     # Inventory the lower-level escape hatches too: a new raw push must be audited.
     raw, branches = Counter(), Counter()
     for path in source.rglob("*.py"):

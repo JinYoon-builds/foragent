@@ -42,7 +42,7 @@ def flush(case, boundary="chosen"):
 
 @pytest.mark.parametrize("with_order", [False, True], ids=["notes", "orders-and-notes"])
 @pytest.mark.parametrize("merge_owner", [False, True])
-def test_flush_waits_for_merge_train_and_retries(waiting, git_history, monkeypatch, with_order, merge_owner):
+def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history, monkeypatch, with_order, merge_owner):
     from foragent import order, order_submissions
 
     root, config, tracker, git, store = waiting
@@ -69,9 +69,14 @@ def test_flush_waits_for_merge_train_and_retries(waiting, git_history, monkeypat
                 committed = git.head_sha()
                 assert committed != base
             assert git.head_sha() == committed
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
         git_command(git_history.origin, "update-ref", "-d", train)
     assert flush(case)["status"] == "published"
     assert git_command(git_history.origin, "rev-parse", "main") == git.head_sha()
+    if merge_owner:
+        assert git.head_sha() != committed
+        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+        assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
     assert bool(tracker.issues) == with_order
     intact(case)
 

@@ -9,7 +9,6 @@ import yaml
 from foragent import lane_memory
 from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
-from foragent.main_write import push_base
 from foragent.paths import repo_path
 from foragent.skills import SkillManager, with_vendored_library
 
@@ -126,7 +125,7 @@ def add_lane(root: Path, name: str, paths: list[str], *, skills: list[str] | Non
             git.update_base(config.base_branch)
         git.commit_paths(published, f"Foragent lane {name}")
         if push:
-            push_base(git, config)
+            git.push_base(config.base_branch)
     return lane
 
 
