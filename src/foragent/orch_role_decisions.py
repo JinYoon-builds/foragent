@@ -17,8 +17,8 @@ from foragent.state import StateStore
 
 
 def add_request(store: StateStore, config: Config, source: str, text: str) -> dict[str, Any]:
-    """Role sessions deliver proposals with --from <role>; keep that identity on creation."""
-    extra = {"role": source} if source in load_roles(config) else None
+    """Role sessions deliver proposals; the orchestrator hands ordinary requests to planning."""
+    extra = {"role": source} if source != "orchestrator" and source in load_roles(config) else None
     return orch_inbox.add_request(store, source, text, extra)
 
 
@@ -27,7 +27,8 @@ def request_status(store: StateStore, config: Config, request_id: str, status: s
     roles = load_roles(config)
 
     def ordinary(record: dict[str, Any]) -> None:
-        if status == "done" and (record.get("role") or record.get("from") in roles):
+        role = record.get("role") or record.get("from")
+        if status == "done" and role != "orchestrator" and (record.get("role") or role in roles):
             raise orch_inbox.InboxError("close role proposals with fa orch role-decision")
 
     return orch_inbox.set_request_status(

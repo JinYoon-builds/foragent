@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from foragent import size_signal
+from foragent.file_cache import read_jsonl
+from foragent.state_issues import _copy
 from foragent.state_phases import close_phase, work_event  # noqa: F401
 from foragent.state_records import Run, carried_contract
 
@@ -28,6 +30,20 @@ def _owner_fact_matches(value):
                 and merged.astimezone(UTC) >= started.astimezone(UTC))
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def owner_facts_of(values) -> dict[tuple[int, str], dict]:
+    """Detached valid owner merge facts among raw run records, by (number, started_at)."""
+    return {(value["number"], value["started_at"]): _copy(value["owner_merge"]) for value in values
+            if _owner_fact_matches(value)}
+
+
+def record_merged(value, owner_facts) -> bool:
+    """The one merge rule on a raw run record: outcome merged, or a recorded owner merge of it."""
+    if not isinstance(value, dict) or type(value.get("number")) is not int:
+        return False  # No usable identity: nothing to count, whatever else the record says.
+    return value.get("outcome") == "merged" or (
+        isinstance(value.get("started_at"), str) and (value["number"], value["started_at"]) in owner_facts)
 
 
 class RunRecordsMixin:
@@ -219,21 +235,19 @@ class RunRecordsMixin:
 
     def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
         """One completion fact, independent of the finished worker outcome."""
-        history = self.root / "runs.jsonl"
-        values = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+        values = list(read_jsonl(self.root / "runs.jsonl"))
         for path in (self.root / "runs").glob("[0-9]*.json"):
             try:
                 values.append(_state.json.loads(path.read_text()))
             except (OSError, ValueError):
                 continue  # Optional owner facts must not break readers of completed history.
-        return {(value["number"], value["started_at"]): value["owner_merge"] for value in values
-                if _owner_fact_matches(value)}
+        return owner_facts_of(values)
 
     def run_merged(self, run: Run, *, owner_facts=None) -> bool:
         if run.outcome == "merged":
             return True
         facts = self.owner_merge_facts() if owner_facts is None else owner_facts
-        return (run.number, run.started_at) in facts
+        return record_merged({"number": run.number, "started_at": run.started_at}, facts)
 
     def active_runs(self) -> list[Run]:
         paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.
@@ -319,13 +333,9 @@ class RunRecordsMixin:
 
     def read_history(self) -> list[Run]:
         """Return each execution once, retaining its latest completion entry."""
-        try:
-            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return []
         runs: dict[tuple[int, str], _state.Run] = {}
-        for line in history.splitlines():
-            run = _state.load_record(_state.Run, _state.json.loads(line))
+        for value in read_jsonl(self.root / "runs.jsonl"):
+            run = _state.load_record(_state.Run, _copy(value))
             runs[run.number, run.started_at] = run
         return list(runs.values())
 
@@ -339,22 +349,22 @@ class RunRecordsMixin:
         """When the gate merged each execution's PR, by (number, started_at).
 
         A record keeps the key of an earlier execution of the same issue until its
-        own merge replaces it, so a time before the execution's start is not its own."""
-        return self._history_times("merged_at")
+        own merge replaces it, so a time before the execution's start is not its own.
+        A recorded owner merge dates its own generation, also when only runs/<n>.json holds it."""
+        times = self._history_times("merged_at")
+        for key, fact in self.owner_merge_facts().items():
+            times[key] = fact["merged_at"]
+        return times
 
     def _history_times(self, key: str) -> dict[tuple[int, str], str]:
-        try:
-            history = (self.root / "runs.jsonl").read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return {}
         times: dict[tuple[int, str], str] = {}
-        for line in history.splitlines():
-            value = _state.json.loads(line)
-            if (key == "merged_at" and not isinstance(value.get(key), str)
+        for value in read_jsonl(self.root / "runs.jsonl"):
+            stamp = value.get(key)
+            if (key == "merged_at" and not isinstance(stamp, str)
                     and isinstance(value.get("owner_merge"), dict) and _owner_fact_matches(value)):
-                value[key] = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
-            if isinstance(value.get(key), str):
-                times[value["number"], value["started_at"]] = value[key]
+                stamp = value["owner_merge"].get("merged_at")  # Owner-published runs record it here only.
+            if isinstance(stamp, str):
+                times[value["number"], value["started_at"]] = stamp
         return times
 
     def prune_process_identities(self, *, inactive_only: bool = False) -> None:

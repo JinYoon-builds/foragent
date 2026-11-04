@@ -29,8 +29,7 @@ its heartbeat is stale, the question waits in the FA inbox for the next planning
 ## Ask only D71 choices
 
 Under D71, ask the user only these five kinds: a goal change, a trade-off between valid options,
-taste or preference, something hard to undo (delete, deploy, public release, `always_human` paths,
-`risk:high` issues), and scope or priority. Everything else has a right answer: confirm the facts
+taste or preference, something hard to undo (data, such as a delete git cannot revert; money; public exposure, such as a deploy or public release; sending to others; `always_human` paths; `risk:high` issues), and scope or priority. Changes git can revert, including deleting superseded code, are not person questions; a question an existing decision answers goes to the PM, not the person. Everything else has a right answer: confirm the facts
 from evidence (code, docs, logs, decision log), fix it first, then report it in one line and record
 it with `fa orch log` or an issue comment. Answerable cases: you own or wrote a test that
 contradicts the documented behaviour; a safety guard misfired; plumbing broke (paths, tools,

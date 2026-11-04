@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 import fcntl
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -15,7 +16,10 @@ from typing import Any
 
 from foragent.git import GitRepo
 from foragent.inspect_data import InspectContext, Prepared, PreparedCommand, collect, load_prepared
-from foragent.processes import _child_environment, kill_process_group, observe_tree, recorded_tree, run_logged
+from foragent.processes import (
+    _child_environment, kill_process_group, observe_tree, recorded_tree, run_logged, try_environment, try_home,
+)
+from foragent import settings
 from foragent.records import write_back
 
 
@@ -31,11 +35,13 @@ def _git(ctx: InspectContext) -> GitRepo:
     return GitRepo(ctx.repo_root)
 
 
-def run_command(command: str, worktree: Path, log_path: Path) -> PreparedCommand:
+def run_command(command: str, worktree: Path, log_path: Path, home: Path) -> PreparedCommand:
+    """Run one try command against the throwaway Foragent state under home, never the real one."""
     with tempfile.NamedTemporaryFile(dir=log_path.parent, suffix=".stderr") as errors:
         code, timed_out, stdout = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree, timeout_s=60, log_path=log_path,
             terminate_children=True, capture_stdout=True, stderr_path=Path(errors.name),
+            env=try_environment(home, worktree), inherit_env=False,
         )
         errors.seek(max(0, Path(errors.name).stat().st_size - 6000))
         stderr = errors.read().decode("utf-8", errors="replace")[-1500:]
@@ -50,6 +56,8 @@ def prepare(ctx: InspectContext) -> list[int]:
     git = _git(ctx)
     git.fetch("origin", ctx.config.base_branch)
     base_sha = git.ref_sha(f"origin/{ctx.config.base_branch}")
+    # The person's own language still applies to try output; nothing else of theirs is read.
+    language = settings.language(Path(os.devnull))
     prepared = []
     for item in items:
         previous = load_prepared(ctx.store, item.number)
@@ -57,14 +65,17 @@ def prepare(ctx: InspectContext) -> list[int]:
             continue
         wt_root = ctx.store.root / "inspect/wt"
         wt_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=f"{item.number}-", dir=wt_root) as directory:
+        with tempfile.TemporaryDirectory(prefix=f"{item.number}-", dir=wt_root) as directory, \
+                tempfile.TemporaryDirectory(prefix=f"{item.number}-home-", dir=wt_root) as home_directory:
             worktree = Path(directory)
+            # One card's commands share one throwaway state; cards never share it.
+            home = try_home(Path(home_directory), language)
             try:
                 git.add_detached_worktree(worktree, base_sha)
                 results = []
                 for command in item.try_card.commands:
                     with tempfile.NamedTemporaryFile(dir=wt_root, suffix=".log") as log:
-                        results.append(run_command(command, worktree, Path(log.name)))
+                        results.append(run_command(command, worktree, Path(log.name), home))
                 saved = ctx.store.root / "inspect/prepared" / f"{item.number}.json"
                 saved.parent.mkdir(parents=True, exist_ok=True)
                 record = _prepared_write_back(saved, Prepared(base_sha, results))
