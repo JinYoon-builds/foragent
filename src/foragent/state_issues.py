@@ -1,9 +1,9 @@
 """Local issue snapshot, its pending GitHub writes and local label/comment facts."""
 
-import threading as _threading
 from datetime import datetime, timedelta
 from typing import Any
 
+from foragent.file_cache import read_json
 import foragent.state_observations as _observations
 
 
@@ -36,59 +36,16 @@ def _copy(value: Any) -> Any:
     return value
 
 
-# Parsed issues.json per state directory, keyed by the file version one stat shows. Shared by
-# every store instance in the process; an atomic replace gives a new inode, so it is seen next read.
-# The directory's identity, not its spelling, names the entry, so symlinked or relative roots share it.
-# Only readers use it: a locked write always parses the current file (_issue_snapshot).
-# Every value leaving the cache through a public method is copied (_copy), so no caller holds it.
-_RECORDS: dict[tuple[int, int], tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
-_RECORDS_LOCK = _threading.Lock()
 _EMPTY = {"refreshed_at": None, "issues": {}}
-
-
-def _version(stat: Any) -> tuple[int, int, int, int]:
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
-
-
-def _read_issue_file(path: Any) -> tuple[tuple[int, int, int, int], dict[str, Any]] | None:
-    """Parse the file and the version of exactly the bytes parsed (fstat of the open file)."""
-    try:
-        with path.open(encoding="utf-8") as stream:
-            version = _version(_state.os.fstat(stream.fileno()))
-            return version, _state.json.loads(stream.read())
-    except FileNotFoundError:
-        return None
 
 
 class IssueSnapshotMixin:
     def _issue_record(self) -> dict[str, Any]:
         """The parsed record of the current file version; shared, so callers must not mutate it."""
-        path = self.root / "issues.json"
         try:
-            directory = _state.os.stat(self.root)
+            return read_json(self.root / "issues.json")
         except FileNotFoundError:
             return _EMPTY
-        key = (directory.st_dev, directory.st_ino)
-
-        def current() -> dict[str, Any] | None:
-            try:
-                version = _version(_state.os.stat(path))
-            except FileNotFoundError:
-                return _EMPTY
-            cached = _RECORDS.get(key)
-            return cached[1] if cached is not None and cached[0] == version else None
-
-        if (record := current()) is not None:
-            return record
-        # One parse per version: concurrent misses wait and reuse the first parse.
-        with _RECORDS_LOCK:
-            if (record := current()) is not None:
-                return record
-            read = _read_issue_file(path)
-            if read is None:
-                return _EMPTY
-            _RECORDS[key] = read
-            return read[1]
 
     def _issue_view(self) -> dict[str, Any]:
         """A detached copy of the cached record for read-only lookups."""
@@ -96,8 +53,10 @@ class IssueSnapshotMixin:
 
     def _issue_snapshot(self) -> dict[str, Any]:
         """The current file, parsed now: the baseline of a read-modify-write under the state lock."""
-        read = _read_issue_file(self.root / "issues.json")
-        return _copy(_EMPTY) if read is None else read[1]
+        try:
+            return _state.json.loads((self.root / "issues.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return _copy(_EMPTY)
 
     def local_issues(self) -> list[dict[str, Any]]:
         """The visible issues: each latest observation plus its unretired intents, without the tracker."""
