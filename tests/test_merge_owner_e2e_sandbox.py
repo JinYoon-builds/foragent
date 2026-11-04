@@ -23,6 +23,8 @@ import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from conftest import ACCOUNT_HOME, BASE_TIME, REAL_HOME, git_command
 from foragent import capacity, merge_owner, orch_queue, runner, scheduler
 from foragent.ci_workflow import WORKFLOW, measurement_scope, read_exclusions
@@ -335,7 +337,12 @@ class Sandbox:
             branch = destination.removeprefix("refs/heads/")
             for arg in args:
                 if arg.startswith("--force-with-lease="):
-                    assert git_command(self.origin, "rev-parse", branch) == arg.rsplit(":", 1)[1]
+                    current = subprocess.run(
+                        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                        cwd=self.origin, text=True, capture_output=True,
+                    )
+                    assert current.returncode in (0, 1), current.stderr
+                    assert current.stdout.strip() == arg.rsplit(":", 1)[1]
             git_command(self.origin, "fetch", str(root), f"+{source}:refs/heads/{branch}")
             self.publish_measurement(root, git_command(root, "rev-parse", source))
             return ""
@@ -504,3 +511,36 @@ def test_four_approved_issues_merge_after_restart_and_lost_test_repair(tmp_path,
     assert (after["merges"], after["closures"], after["repairs"], len(after["prs"])) == before
     assert all(args[0] in {"api", "pr", "issue"} for args in after["calls"])
     sandbox.assert_isolated()
+
+
+@pytest.mark.parametrize("exists,lease,allowed", [
+    (False, "empty", True),
+    (True, "matching", True),
+    (False, "matching", False),
+    (True, "empty", False),
+    (True, "wrong", False),
+], ids=["create", "replace", "missing-with-sha", "existing-with-empty", "wrong-sha"])
+def test_sandbox_push_enforces_creation_and_replacement_leases(tmp_path, monkeypatch, exists, lease, allowed):
+    sandbox = Sandbox(tmp_path, monkeypatch)
+    old = git_command(sandbox.origin, "rev-parse", "main")
+    branch = "lease-check"
+    if exists:
+        git_command(sandbox.origin, "update-ref", f"refs/heads/{branch}", old)
+    sandbox.main_update({"src/new.py": "VALUE = 7\n"}, "Next head")
+    git_command(sandbox.repo, "fetch", "origin", "main:refs/heads/upload")
+    new = git_command(sandbox.repo, "rev-parse", "upload")
+    assert old != new
+    expected = {"empty": "", "matching": old, "wrong": new}[lease]
+    measurements = []
+    monkeypatch.setattr(sandbox, "publish_measurement", lambda root, sha: measurements.append((root, sha)))
+    argv = ["push", f"--force-with-lease=refs/heads/{branch}:{expected}",
+            "origin", f"upload:refs/heads/{branch}"]
+    if allowed:
+        sandbox.git_transport(argv)
+    else:
+        with pytest.raises(AssertionError):
+            sandbox.git_transport(argv)
+    current = git_command(sandbox.origin, "ls-remote", "--heads", ".", f"refs/heads/{branch}")
+    actual = current.split()[0] if current else None
+    assert actual == (new if allowed else old if exists else None)
+    assert measurements == ([(sandbox.repo, new)] if allowed else [])

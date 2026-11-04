@@ -1157,3 +1157,29 @@ def test_post_push_without_replaced_head_does_not_retry():
     ctx = SimpleNamespace(tracker=SimpleNamespace(pr_head_sha=lambda pr: "other"), sleep=sleeps.append)
     assert not run_publish._head_after_push(ctx, 7, "new", None)
     assert sleeps == []
+
+
+def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_history):
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    branch = "foragent/issue-1"
+    cached = git_history.tip
+    git_command(git_history.clone, "update-ref", f"refs/remotes/origin/{branch}", cached)
+    git_history.update({"src/remote_progress.py": "VALUE = 2\n"})
+    git_command(git_history.origin, "update-ref", f"refs/heads/{branch}", git_history.tip)
+    assert git_history.tip != cached
+    git = GitRepo(git_history.clone)
+    execute, pushes = git._run, []
+
+    def transport(args):
+        if args[:1] == ["push"]:
+            pushes.append(args)
+            return ""
+        return execute(args)
+
+    git._run = transport
+    attempt = SimpleNamespace(git=git, branch=branch, rebuilt=False)
+    assert run_publish._push_branch(attempt) == git_history.tip
+    assert pushes == [["push", f"--force-with-lease=refs/heads/{branch}:{git_history.tip}", "origin", branch]]
+    assert attempt.pushed_head == git.head_sha()
