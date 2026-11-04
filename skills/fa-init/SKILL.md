@@ -104,24 +104,54 @@ description: Set up a project folder for Foragent.
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
 
-5. Show a short "What I read" list from the survey:
+5. Show a short "What I read" list from the survey. The survey only reads; it
+   changes nothing locally or on GitHub.
+   - `docs`: the docs it read (README, CLAUDE.md, AGENTS.md) with their opening
+     `excerpt`.
    - `hot_paths`: frequently changed paths and their commit counts.
    - `existing_setup`: settings already present that will NOT be touched,
      including existing CLAUDE.md, AGENTS.md, .claude/ files and skills.
    - `ci`: workflow files, detected test commands, and `runs_acceptance` findings.
+   - `github`: open `issues` and `pulls`. For each issue with a nonempty
+     `fixed_by`, say a commit already fixes it and quote the short sha and
+     subject as evidence; only a closing keyword (`fixes #12`) counts, a plain
+     mention does not. If `available` is false, say GitHub was not read and give
+     `reason`; the local part still stands. If `truncated` is true, say the list
+     is partial.
    Preserve existing agent setup; the only CI edit is the approved step 8 change.
+   Never overwrite existing Claude settings (`.claude/settings*.json`), agent
+   files or skills.
 
-6. Propose lanes from `hot_paths`, showing each name and path globs. Reuse
-   existing lanes where they fit and keep overlapping paths in the same lane.
-   Use AskUserQuestion (or the available question tool): Approve all (recommended),
-   Approve some, or Change lanes. Create only the approved new lanes with
-   `fa lanes add <name> --paths '<path>/**'`, substituting the approved name and
-   globs. This creates new lane definitions; it must not overwrite existing
-   agent files or install or edit existing skills.
+6. From the docs, code and hot paths, say in one sentence what kind of project it
+   is (for example "a Python command-line tool that counts words"). Then ask who
+   uses it (for example: only me, my team, outside users or customers), using
+   AskUserQuestion (or the available question tool) with your best guess first.
+   With that answer, prepare one proposal and confirm it in a single
+   AskUserQuestion: Approve all (recommended), Approve some, or Change.
+   - Lanes from `hot_paths`, showing each name and path globs. Reuse existing
+     lanes where they fit and keep overlapping paths in the same lane.
+   - Roles only where work must judge across areas (for example security review
+     for software with outside users), each with its scope and the reason.
+   - Conditional skills: skills from `fa skills catalog --json` that fit only
+     because of what the survey found (for example a web screen or payment
+     code), each with the lane it attaches to and the finding that makes it fit.
+   Do not ask a separate question per lane, role or skill. Apply only the
+   approved items: create new lanes with `fa lanes add <name> --paths '<path>/**'`,
+   substituting the approved name and globs, and add that lane's approved skills
+   to the same command (`--skill <id> <id>`). `fa lanes skills` replaces a
+   lane's whole fixed skill list, so for a reused lane read its current
+   `lanes.<lane>.skills` from `fa order context --json` and run it once as
+   `fa lanes skills <lane> <current-ids> <new-ids>`, the current skills followed by
+   every approved new one. Create approved roles with
+   `fa role add <name> --scope "<paths>" --signal "paths:<paths>" --skill <skill-id> --why "<confirmed reason>"`;
+   it refuses a name that already exists, so an existing role is reused as is.
+   These create new definitions; they must not overwrite existing agent files,
+   Claude settings or skills, or install over or edit existing skills.
 
 7. Run `fa adopt baseline --json`. Report `command`, `passed`, `exit_code`,
-   and the already-broken tests in `failing`. Record these as the starting
-   state rather than fixing them during setup. If no test command was found,
+   and the already-broken tests in `failing`. Report and record these as base
+   failures (broken before Foragent started), not as new failures, and do not fix
+   them during setup. If no test command was found,
    report `skipped`; if the run timed out, report that explicitly. An empty
    failure list with a nonzero exit code is not a passing baseline.
 
@@ -147,8 +177,11 @@ description: Set up a project folder for Foragent.
    available question tool) with the recommended choice first. Offer skills with
    role `style` from the existing catalog; if none fits, report that and leave the
    style unset. Show the paths and style choice for approval, create approved new
-   lanes with `fa lanes add <name> --paths '<path>/**'`, then fix only the chosen
-   style with `fa lanes skills <name> <style-id>` on the relevant new or reused lane.
+   lanes with `fa lanes add <name> --paths '<path>/**' --skill <style-id>`, which
+   fixes only the chosen style on a new lane. On a reused lane, `fa lanes skills`
+   replaces the whole fixed list: read the lane's current `skills` from the
+   `fa order context --json` output above and run
+   `fa lanes skills <name> <current-ids> <style-id>`, keeping every current skill.
    Each lane agent chooses tool, review, and domain skills per issue as needed;
    examples include `design-system`, `design-critique`, `accessibility-review`,
    `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane
