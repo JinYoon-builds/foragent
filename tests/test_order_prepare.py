@@ -659,16 +659,6 @@ def test_holds_are_counted_in_the_current_cycle_only():
     assert holds(None) == []
 
 
-def _lane_case_module():
-    """The order's shared offline fixtures (local Git, faked executors, no GitHub)."""
-    import importlib
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-    return importlib.import_module("lane_tests_case")
-
-
 def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, git_history, capsys):
     cases = _cases
     case = request.getfixturevalue("lane_case")
@@ -690,7 +680,7 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
     assert [call["role"] for call in case.calls].count("writer") == 4
 
 
-_cases = _lane_case_module()
+from helpers import lane_tests as _cases
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
 
 

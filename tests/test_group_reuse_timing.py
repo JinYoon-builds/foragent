@@ -7,17 +7,13 @@ checked head and runs its checks again.
 """
 
 from collections import Counter
-from pathlib import Path
 import shlex
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from test_merge_group import (  # noqa: E402,F401
-    contend, group_case, isolated_home, offline_acceptance, prepare, publish_case,
-)
+from helpers.merge_group_case import contend, group_case, prepare
+from helpers.home import isolated_home, offline_acceptance
+from helpers.publication import publish_case
 
 
 @pytest.fixture(autouse=True)

@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
@@ -181,7 +181,7 @@ def test_pending_prefixes_run_in_parallel_without_merges(batched):
 
 @pytest.mark.parametrize("configured,expected", [(None, 4), (6, 6)], ids=["default", "configured-six"])
 def test_batch_size_limits_prefixes_and_survives_restart(request, monkeypatch, configured, expected):
-    from acceptance import test_merge_path_real_settings as contract
+    from helpers import merge_world as contract
 
     numbers = (5, 1, 4, 2, 6, 3, 7)
     monkeypatch.setattr(contract, "NUMBERS", numbers)

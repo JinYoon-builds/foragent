@@ -1,22 +1,19 @@
 """#1651: a scoring session runs in the worktree, so its repository edits are undone like a reviewer's."""
 
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
-from conftest import git_command  # noqa: E402
-from foragent.runner import run_issue  # noqa: E402
-from test_order_machine_budget import fake_workloads  # noqa: E402,F401
-from test_review_grounded_fail import (  # noqa: E402
+from conftest import git_command
+from foragent.runner import run_issue
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_scoring import (
     GROUNDS, REAL, TASTE, UNGROUNDED, Script, install, ordinary, records, scoring_request,
 )
-from test_review_perspectives import review_offline  # noqa: E402,F401
-from test_risk_map import entry, offline, risk_case  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from helpers.review_panel import review_offline  # noqa: F401
+from helpers.risk import entry, offline, risk_case  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 INVENTED = "tests/acceptance/test_scorer_invented.py"
 

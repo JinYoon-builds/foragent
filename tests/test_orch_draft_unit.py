@@ -2,16 +2,11 @@
 
 from pathlib import Path
 import subprocess
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from test_lane_test_drafts import (  # noqa: E402,F401
-    GOALS, PLACEHOLDER, assert_draft_outside_source, body, draft_sessions, drafts, isolated_home, placeholder,
-    refresh, run_session, ticks,
-)
+from helpers.draft_sessions import GOALS, PLACEHOLDER, assert_draft_outside_source, body, draft_sessions, drafts, placeholder, refresh, run_session, ticks
+from helpers.home import isolated_home
 
 
 def _die(case, number):
@@ -104,7 +99,7 @@ def _agent(case, monkeypatch, *, tests=True, plan=True, exit_code=0, error_kind=
 
 def _session(case):
     """Start the issue's next drafting session and run its worker; return the record."""
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
 
     before = len(draft_sessions(case))
     refresh(case)
@@ -141,7 +136,7 @@ def test_the_attempt_cap_survives_trimmed_journals(drafts, monkeypatch):
     placeholder(case, 11, "orch")
     _agent(case, monkeypatch, exit_code=1)
     ticks(case)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
     cli_exit(case.main, list(draft_sessions(case)[0]))
     for _ in range(orch_draft.MAX_SESSIONS - 1):
         assert _session(case).outcome == "error"
@@ -158,7 +153,7 @@ def test_an_incomplete_draft_is_not_kept_and_the_issue_is_drafted_again(drafts, 
     placeholder(case, 11, "orch")
     _agent(case, monkeypatch, tests=tests, plan=plan)
     ticks(case)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
     assert cli_exit(case.main, list(draft_sessions(case)[0])) == 1
     record = case.store.get_draft(11)
     assert (record.outcome, record.attempts) == ("error", 1)
@@ -185,7 +180,7 @@ def test_a_non_object_plan_is_incomplete(drafts, monkeypatch):
     for executor in (executors.ClaudeExecutor, executors.CodexExecutor):
         monkeypatch.setattr(executor, "run", agent)
     ticks(case)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
     assert cli_exit(case.main, list(draft_sessions(case)[0])) == 1
     assert case.store.get_draft(11).outcome == "error"
 
@@ -197,7 +192,7 @@ def test_transient_errors_use_no_attempt(drafts, monkeypatch):
     placeholder(case, 11, "orch")
     _agent(case, monkeypatch, tests=False, plan=False, exit_code=1, error_kind="transient")
     ticks(case)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
     cli_exit(case.main, list(draft_sessions(case)[0]))
     for _ in range(orch_draft.MAX_SESSIONS + 1):
         record = _session(case)
@@ -215,7 +210,7 @@ def test_a_usage_limit_pauses_the_executor_and_uses_no_attempt(drafts, monkeypat
     placeholder(case, 11, "orch")
     _agent(case, monkeypatch, tests=False, plan=False, exit_code=1, error_kind="limit")
     ticks(case)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
     cli_exit(case.main, list(draft_sessions(case)[0]))
     record = case.store.get_draft(11)
     assert (record.outcome, record.attempts) == ("limit-wait", 1)

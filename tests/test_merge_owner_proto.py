@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import pytest
 
-from acceptance import test_merge_path_real_settings as contract
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers import merge_world as contract
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from foragent import merge_owner, orch_queue, runner
 from foragent.config import Config, ConfigError, load_config
