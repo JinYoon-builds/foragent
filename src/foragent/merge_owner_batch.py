@@ -402,9 +402,13 @@ def land(ctx, report, candidates, proof):
             with owner._track_checks(ctx, place, job):
                 ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch,
                                       files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
+            untracked = tip._call([
+                "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
+                *(f":(exclude,literal){path}" for path in sorted(tip.artifact_paths())),
+            ])
             if (tip.head_sha() != proof.chain[-1][2]
-                    or tip._call(["status", "--porcelain=v1", "--untracked-files=no"])):
-                raise ValueError("Train tip machine checks modified tracked files or HEAD")
+                    or tip._call(["status", "--porcelain=v1", "--untracked-files=no"]) or untracked):
+                raise ValueError("Train tip machine checks modified tracked files, created untracked files, or changed HEAD")
             with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
                 if proof.outcome(ctx) != "pass":
                     raise ValueError("tip CI red")

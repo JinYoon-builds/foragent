@@ -582,7 +582,17 @@ def _reconcile(ctx, place, job):
         return None
     ctx.git.fetch("origin", job["target"])
     target = ctx.git.ref_sha(f"origin/{job['target']}")
-    if ctx.git.is_ancestor(job["head"], target):
+    # Fetching the target brings its ancestors, but an unlanded admission's
+    # head may still exist only on the remote. That is not a reconciliation error.
+    try:
+        ctx.git._call(["rev-parse", "--verify", "--quiet", f"{job['head']}^{{commit}}"])
+    except run_publish.GitError as exc:
+        if not (isinstance(exc.__cause__, subprocess.CalledProcessError) and exc.__cause__.returncode == 1):
+            raise
+        landed = False
+    else:
+        landed = ctx.git.is_ancestor(job["head"], target)
+    if landed:
         # Commit creation can precede the worker and CI. Record when we confirm
         # reachability, independently of the mutable PR head or issue state.
         _complete_fact(ctx, place, job, dict(pr=job["pr"], target=job["target"],

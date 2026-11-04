@@ -790,28 +790,53 @@ def test_train_validates_later_members_acceptance_locks_on_composed_tip(batched,
     assert events(case)[-1]["reason"] == retirement["reason"]
 
 
-def test_train_retires_when_machine_checks_modify_the_tip_worktree(batched):
+@pytest.mark.parametrize("path,original", [
+    ("machine.txt", "base\n"),
+    ("src/runtime_config.py", None),
+    ("src/runtime config\nquoted\".py", None),
+], ids=["tracked", "untracked-source", "untracked-unusual-path"])
+def test_train_retires_when_machine_checks_modify_the_tip_worktree(batched, path, original):
     case = batched
     update_base(case, {
-        "machine.txt": "base\n",
+        **({path: original} if original is not None else {}),
         "tests/test_machine_rewrite.py": (
             "from pathlib import Path\nimport pytest\n"
             "@pytest.mark.local_only\ndef test_machine_rewrite():\n"
             "    if all(Path(f'src/member_{n}.py').exists() for n in (5, 1)):\n"
-            "        Path('machine.txt').write_text('fixed\\n')\n"
+            f"        Path({path!r}).write_text('fixed\\n')\n"
             "@pytest.mark.local_only\ndef test_machine_requirement():\n"
             "    if all(Path(f'src/member_{n}.py').exists() for n in (5, 1)):\n"
-            "        assert Path('machine.txt').read_text() == 'fixed\\n'\n"),
+            f"        assert Path({path!r}).read_text() == 'fixed\\n'\n"),
     })
     queue_workers(case, [5, 1])
     support.gate(case)
     tip = case.tracker.pr_head_sha(groups(case)[0].number)
-    assert git_command(case.root, "show", f"{tip}:machine.txt") == "base"
+    if original is None:
+        assert case.git.blob_sha(tip, path) is None
+    else:
+        assert git_command(case.root, "show", f"{tip}:{path}") == original.strip()
     assert not case.target_attempts and not case.merges and case.history.tip == case.base
     assert not case.store.owner_merge_facts() and not refs(case)
     retirement, = batch.retirements(case.ctx)
     assert "modified tracked files" in retirement["reason"]
     assert events(case)[-1]["reason"] == retirement["reason"]
+
+
+def test_train_machine_checks_may_create_runner_artifacts(batched):
+    case = batched
+    update_base(case, {
+        "tests/test_machine_artifact.py": (
+            "from pathlib import Path\nimport pytest\n"
+            "@pytest.mark.local_only\ndef test_machine_artifact():\n"
+            "    artifact = Path('.foragent/machine-check.log')\n"
+            "    artifact.parent.mkdir(exist_ok=True)\n"
+            "    artifact.write_text('checked\\n')\n"),
+    })
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    assert len(case.target_pushes) == 1 and not case.merges and not refs(case)
+    assert len(case.store.owner_merge_facts()) == 2
+    assert case.git.file_at(case.history.tip, ".foragent/machine-check.log") is None
 
 
 def forged_tip(case, tip):
