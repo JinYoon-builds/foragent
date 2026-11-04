@@ -730,7 +730,7 @@ def test_immediate_order_waits_before_committing_during_a_merge_train(
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
     assert sleeps == ([30, 30] if merge_owner else [])
-    assert capsys.readouterr().out.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
+    assert capsys.readouterr().err.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
     if merge_owner:
         assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
         assert (root / "upstream.txt").read_text() == "Train advanced main.\n"
