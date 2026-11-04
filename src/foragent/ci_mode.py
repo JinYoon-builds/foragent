@@ -231,14 +231,13 @@ def _positive(value):
     return type(value) is int and value > 0
 
 
-def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards, previous=None):
+def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
     """Validate every shard; the first failing field names its observed and expected value.
 
     Only a moved base or a superseded measurement producer is stale. Those wait
     until every other check passes, so an unrelated invalid field never retries.
     The exclusions CI recorded are the reference for a completed measurement;
     today's ``excluded`` may differ either way and neither waives nor adds a test.
-    ``previous`` supplies a validated prefix's head suites as the regression baseline.
     """
     reports = {}
     expected_shards = set(expected_shards)
@@ -340,15 +339,6 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
                                 f"expected {_shown(sorted(expected_shards)) if expected_shards else 'at least one shard'}")
     if stale:
         raise StaleComparison(f"Stale acceptance shard: {stale}")
-    if previous is not None:
-        previous_sha, before = previous
-        prior_lost, _ = comparison(before, repo, base_sha, previous_sha, excluded,
-                                   expected_scope=expected_scope, expected_shards=expected_shards)
-        if prior_lost:
-            raise UnusableComparison("previous prefix has acceptance regressions")
-        passing = {node for item in before for node in item["report"]["head"]["passing_ids"]}
-        passing_now = {node for item in artifacts for node in item["report"]["head"]["passing_ids"]}
-        lost.update(passing - passing_now)
     return sorted(lost), duration
 
 
@@ -391,7 +381,7 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
-    A source maps an identical tree to existing reports; validation stays here."""
+    A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
     n, ctx = attempt.n, attempt.ctx
@@ -435,17 +425,17 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
             raise UnusableComparison(workflow_error)
         # Measurement and artifact registration share ordinary CI's deadline.
         while True:
-            measured_base, measured_head, previous = base_sha, head, None
+            measured_base, measured_head = base_sha, head
             if source is None:
                 reports = ctx.tracker.pr_acceptance_reports(head)
             else:
-                measured_base, measured_head, reports, previous = source.measurement(attempt, head, base_sha)
+                measured_base, measured_head, reports = source.measurement(attempt, head, base_sha)
             try:
                 lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
                                            expected_scope=scope,
-                                           expected_shards=range(ctx.config.ci_shards), previous=previous)
+                                           expected_shards=range(ctx.config.ci_shards))
                 if source is not None and any(not scope_covers(item["report"]["scope"], scope)
-                        for item in [*reports, *(previous[1] if previous else [])]):
+                        for item in reports):
                     raise StaleComparison("prefix measurement scope no longer covers the current one")
                 recorded_reports = serialize_reports(reports)
                 break
@@ -516,12 +506,11 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
         raise ExecutorStopped("held", infrastructure)
     return ComparisonEvidence(base_sha, head, scope, trusted_sha, status, infrastructure,
                               recorded_reports, reports_by_head=(
-                                  {measured_head: recorded_reports,
-                                   **({previous[0]: serialize_reports(previous[1])} if previous else {})}
+                                  {measured_head: recorded_reports}
                                   if source is not None else None))
 
 
-def review_checks(n, ctx, git, target_branch):
+def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
     """Rechecking an existing issue PR uses the same CI and machine evidence."""
     from types import SimpleNamespace
     from foragent import harness_guard, runner
@@ -532,9 +521,10 @@ def review_checks(n, ctx, git, target_branch):
 
     base = f"origin/{target_branch}"
     command = ctx.config.test_command or next(iter(runner.detect_test_commands(git.root)), None)
+    if excluded is None:
+        excluded = _baseline_exclusions(ctx, git.ref_sha(base), ctx.store.log_path(n))
     try:
-        baseline = capture_local_only(n, ctx, git, command, git.ref_sha(base),
-                                      _baseline_exclusions(ctx, git.ref_sha(base), ctx.store.log_path(n)))
+        baseline = capture_local_only(n, ctx, git, command, git.ref_sha(base), excluded)
     except AttemptFailure as exc:
         flag(ctx, n, Reason.ACCEPTANCE_BASELINE_UNAVAILABLE, "local_only acceptance baseline unavailable", str(exc))
         raise ExecutorStopped("held", str(exc)) from exc
@@ -548,7 +538,7 @@ def review_checks(n, ctx, git, target_branch):
                                   own_only=ctx.config.runner_unit_tests != "all"
                                   and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
-            harness_guard.guard_comparison(attempt, git.head_sha())  # as the head is after the local-only run
+            harness_guard.guard_comparison(attempt, git.head_sha(), files=files)
             checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.

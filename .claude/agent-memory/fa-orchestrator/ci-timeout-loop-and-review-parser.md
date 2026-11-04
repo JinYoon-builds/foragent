@@ -18,3 +18,5 @@ Three lessons from 2026-11-04 (scorecard: phase ci 2.4 -> 15.8 min, merge rate 3
 Related: [[read-result-before-reporting]], [[publish-moves-main-stale-heads]].
 
 4. **Resolve works once the GitHub queue drains, and must quote the current PR head.** 11-04 08:50Z: with 0 queued runs, resolving seven CI-timeout holds on their current heads moved all to the merge owner; earlier resolves quoted a superseded head (architect r585). Check `gh run list --status queued` first; while it is high, a pause of other lanes plus waiting beats repeated resolves.
+
+5. **A git push 500 is a GitHub-side fault, not a push burst.** 11-04 09:37-10:02Z: seven 'remote: Internal Server Error ... remote rejected' while githubstatus said operational. I guessed burst pushes; architect r618 measured: higher-rate minutes had 0 rejections and the same minute had both. The real gap: git push 5xx does not use the #1644 gh-outage wait, so each ends as error. Until that fix merges, retry them (spacing is harmless but not the cause).
