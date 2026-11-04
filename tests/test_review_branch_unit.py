@@ -1,5 +1,6 @@
 """Standalone options and error paths beyond the fixed branch review acceptance."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from foragent import review_branch, run_review
 from foragent.commands import review as command
 from foragent.config import Config
+from foragent.git import GitError
 from foragent.run_review import ReviewResult
 from foragent.state import StateStore
 from foragent.tracker import GhTracker
@@ -70,8 +72,87 @@ def test_standalone_finish_scores_once_without_run_journal(monkeypatch):
     (ReviewResult("FAIL", "finding", execution_failed=True), 2),
 ])
 def test_errors_are_not_pass_or_fail(monkeypatch, capsys, result, code):
-    monkeypatch.setattr(command, "review", lambda *args, **kwargs: (result, "en", False))
+    monkeypatch.setattr(review_branch, "review", lambda *args, **kwargs: (result, "en", False))
     args = SimpleNamespace(target="feature", base="main", goal=None, issue=None)
     assert command.run(args) == code
     out = capsys.readouterr().out
     assert f"VERDICT: {result.verdict}" in out
+
+
+@pytest.mark.parametrize("failed_cleanup", ["worktree", "directory", "both"])
+def test_cleanup_failures_preserve_the_original_review_error(tmp_path, monkeypatch, failed_cleanup):
+    original = ValueError("panel original error")
+    real_temporary = review_branch.TemporaryDirectory
+    paths, removed = [], []
+
+    class Directory:
+        def __init__(self, **kwargs):
+            self.inner = real_temporary(**kwargs)
+            self.name = self.inner.name
+            paths.append(self.inner.name)
+
+        def cleanup(self):
+            self.inner.cleanup()
+            if failed_cleanup in {"directory", "both"}:
+                raise OSError("directory cleanup failed")
+
+    class Git:
+        def __init__(self, root):
+            self.root = root
+
+        def _call(self, args):
+            if args == ["rev-parse", "--show-toplevel"]:
+                return str(tmp_path)
+            if args[:2] == ["worktree", "remove"]:
+                removed.append(args[-1])
+                if failed_cleanup in {"worktree", "both"}:
+                    raise GitError("worktree cleanup failed")
+            return "commit"
+
+    def fail(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(review_branch, "GitRepo", Git)
+    monkeypatch.setattr(review_branch, "TemporaryDirectory", Directory)
+    monkeypatch.setattr(review_branch, "resolve_target", lambda *args: ("head", False))
+    monkeypatch.setattr(review_branch, "load_config", lambda *args: Config())
+    monkeypatch.setattr(review_branch, "_panel_review", fail)
+    with pytest.raises(ValueError) as caught:
+        review_branch.review("feature")
+    assert caught.value is original
+    assert len(removed) == 1
+    assert len(paths) == 1
+    assert not Path(paths[0]).exists()
+    notes = " ".join(original.__notes__)
+    assert ("worktree cleanup failed" in notes) == (failed_cleanup in {"worktree", "both"})
+    assert ("directory cleanup failed" in notes) == (failed_cleanup in {"directory", "both"})
+
+
+def test_a_cleanup_failure_after_success_is_still_an_error():
+    calls = []
+
+    def fail():
+        calls.append("cleanup")
+        raise OSError("cleanup only")
+
+    with pytest.raises(OSError, match="cleanup only"):
+        with review_branch._cleanup(fail):
+            pass
+    assert calls == ["cleanup"]
+
+
+def test_cli_prints_original_error_and_cleanup_diagnostic(monkeypatch, capsys):
+    original = ValueError("panel original error")
+    original.add_note("Cleanup also failed: worktree cleanup failed")
+
+    def fail(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(review_branch, "review", fail)
+    args = SimpleNamespace(target="feature", base="main", goal=None, issue=None)
+    assert command.run(args) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "panel original error" in captured.err
+    assert "worktree cleanup failed" in captured.err
+    assert len(captured.err.splitlines()) == 1

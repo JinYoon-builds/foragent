@@ -1,7 +1,10 @@
 """A disposable first-round review of a local commit, independent of issue runs."""
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+import sys
 from tempfile import TemporaryDirectory
 
 from foragent.config import load_config, resolved_reviewer
@@ -30,6 +33,21 @@ class LocalReviewContext(RunContext):
     def __post_init__(self) -> None:
         # There is no issue tracker to wrap or global GitHub recorder to install.
         pass
+
+
+@contextmanager
+def _cleanup(action: Callable[[], None]) -> Iterator[None]:
+    """Clean up a disposable resource without replacing an active review exception."""
+    try:
+        yield
+    finally:
+        original = sys.exception()
+        try:
+            action()
+        except Exception as error:
+            if original is None:
+                raise
+            original.add_note(text("branch_review_cleanup_error", error=" ".join(str(error).split())))
 
 
 def goal_for(root: Path, config, goal: str | None, issue: int | None) -> ParsedIssue:
@@ -74,11 +92,12 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
     fork = source._call(["merge-base", head, base_sha]).strip()
     config = load_config(root)
     parsed = goal_for(root, config, goal, issue)
-    with TemporaryDirectory(prefix="fa-review-") as directory:
-        temporary = Path(directory)
+    directory = TemporaryDirectory(prefix="fa-review-")
+    with _cleanup(directory.cleanup):
+        temporary = Path(directory.name)
         checkout = temporary / "worktree"
         source._call(["worktree", "add", "--detach", str(checkout), head])
-        try:
+        with _cleanup(lambda: source._call(["worktree", "remove", "--force", str(checkout)])):
             git = GitRepo(checkout)
             store = StateStore(temporary / "state")
             store.start_run(0, branch=target, worktree=checkout)
@@ -89,6 +108,4 @@ def review(target: str, base: str = "main", *, goal: str | None = None,
                 text("branch_review_scope", config.language), review_perspectives.shares(config), 1,
                 workers=config.review_reviewers, journal=False,
             )
-        finally:
-            source._call(["worktree", "remove", "--force", str(checkout)])
     return result, config.language, worktree_target
