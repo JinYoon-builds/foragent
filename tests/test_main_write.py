@@ -125,7 +125,8 @@ def test_only_retryable_base_writers_use_the_train_gate():
                 raw[path.name] += 1
             if node.func.attr in {"push", "push_head", "ensure_batch_branch"}:
                 branches[path.name, node.func.attr] += 1
-    assert raw == {"git.py": 4, "merge_owner_batch.py": 2, "run_group_ci.py": 2}
+    # The owner creates/deletes train refs and lands their tip with a target lease.
+    assert raw == {"git.py": 4, "merge_owner_batch.py": 3, "run_group_ci.py": 2}
     assert branches == {
         ("orch_dream_publish.py", "push"): 1, ("run_publish_preserve.py", "push"): 1,
         ("run_publish_pr.py", "push"): 2, ("order_flush.py", "push"): 1,
