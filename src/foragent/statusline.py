@@ -342,6 +342,13 @@ def prompt_context(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None
     moved = _pm_moved_notice(payload)
     if moved:
         context = moved + ("\n\n" + context if context else "")
+    try:
+        fresh = presence.fresh_session(folder, payload.get("transcript_path"), channel="session_start")
+    except Exception:
+        fresh = None
+    if fresh:
+        note = fresh + "\nTell the person this suggestion; the statusline may not show on Orca mobile."
+        context = note + ("\n\n" + context if context else "")
     from foragent.orch_inbox import clean
 
     # The one place box text leaves the process: whatever slipped past the row
@@ -381,9 +388,12 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     presence.renew_planning(Path.cwd())
     now = datetime.now(UTC)
     output = presence.append(output, presence.statusline_segment(Path.cwd(), now))
-    session_id = _session_input(raw).get("session_id")
-    output = presence.append(output, _pm_segment(Path.cwd(), _hook_session(_session_input(raw))))
+    payload = _session_input(raw)
+    session_id = payload.get("session_id")
+    output = presence.append(output, _pm_segment(Path.cwd(), _hook_session(payload)))
     art = presence.squirrel(Path.cwd(), session_id if isinstance(session_id, str) else None, now)
+    if fresh := presence.fresh_session(Path.cwd(), payload.get("transcript_path")):
+        output += (b"\n" if output and not output.endswith(b"\n") else b"") + fresh.encode("utf-8")
     stdout.write(art.encode("utf-8") + b"\n" + output if art else output)
     stdout.flush()
     return code

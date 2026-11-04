@@ -122,6 +122,26 @@ def _planning_session(cwd: Path, store) -> bool:
     return not cwd.resolve().is_relative_to((store.root / "worktrees").resolve())
 
 
+FRESH_SESSION_BYTES = 50 * 1024 * 1024
+
+
+def fresh_session(cwd: Path, transcript_path, *, channel: str = "statusline") -> str | None:
+    """A read-only suggestion for a large planning transcript, independent of box binding."""
+    from foragent.i18n import text
+
+    try:
+        if not isinstance(transcript_path, str) or not transcript_path:
+            return None
+        project = _project(cwd)
+        if project is None or not project[0].presence[channel] or not _planning_session(cwd, project[1]):
+            return None
+        if Path(transcript_path).stat().st_size < FRESH_SESSION_BYTES:
+            return None
+        return text("pm_fresh_session", project[0].language)
+    except Exception:  # An unavailable transcript or project must never disturb a hook.
+        return None
+
+
 def _parse_at(value) -> datetime | None:
     """A timezone-aware time from an ISO string, else None."""
     try:

@@ -438,9 +438,11 @@ class RecordingTracker:
                           **({"repository": dep.repository} if dep.repository else {})}
                          for dep in self._tracker.blocked_by(issue.number)]
             blocked_by[issue.number] = known
+        planning_prs = self._tracker.list_prs("open", "pm/")
         dropped = store.refresh_local_issues(issues, prs, self._context.config.lanes, observed_at,
                                             comments=comments, since_revision=revision, parents=parents,
                                             blocked_by=blocked_by, children=children, complete_prs=True)
+        store.record_planning_prs(planning_prs, observed_at)
         for read, started in child_reads:
             dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
         if listing is not None:
