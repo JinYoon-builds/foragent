@@ -186,6 +186,11 @@ def run_dream(lane: str, ctx: RunContext) -> int:
     # The record is finished last, after the worktree cleanup: once it says finished, this worker
     # touches nothing a later dream of the lane could own (D95).
     final = ("error", "Dream worker ended before finishing.")
+    from foragent import orch_stop
+
+    if (stop := orch_stop.active(store)) is not None:  # The stop admission: this dream does not start (#1491).
+        store.finish_dream(lane, "stopped", stop)
+        return 1
     try:
         if worktree.exists():
             ctx.git.remove_worktree(worktree)
