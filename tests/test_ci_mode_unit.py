@@ -498,6 +498,12 @@ def test_workflow_runner_visibility_warning_and_rewrite(tmp_path, capsys, privat
     assert len(calls) == 1
 
 
+def test_checked_in_acceptance_workflow_matches_generator():
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root, global_path=root / 'absent-global.yml')
+    assert (root / WORKFLOW).read_text(encoding='utf-8') == workflow_text(config)
+
+
 @pytest.mark.parametrize('generated', [True, False])
 def test_workflow_removes_only_generated_legacy_publisher(tmp_path, capsys, generated):
     legacy = tmp_path / '.github/workflows/foragent-acceptance-publish.yml'
@@ -1169,9 +1175,12 @@ def test_review_checks_unit_selection_honors_runner_unit_tests(git_history, tmp_
     ('foragent/group-5-abcdef', 'owner/repo', 'release', True),
     ('foragent/group-5-abcdef', 'fork/repo', 'release', False),
     ('foragent/group-5-abcdef', 'owner/repo', 'main', False),
+    ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'release', True),
+    ('foragent/batch-merge-deadbeef-2', 'fork/repo', 'release', False),
+    ('foragent/batch-merge-deadbeef-2', 'owner/repo', 'main', False),
     ('foragent/batch-1', 'owner/repo', 'release', False),
 ])
-def test_workflow_only_measures_issue_and_group_prs_to_the_primary_base(branch, repo, base, allowed):
+def test_workflow_only_measures_issue_group_and_batch_merge_prs_to_the_primary_base(branch, repo, base, allowed):
     document = yaml.safe_load(workflow_text(Config(base_branch='release')))
     condition = document['jobs']['acceptance']['if']
     assert 'github.event.pull_request.head.repo.full_name == github.repository' in condition
