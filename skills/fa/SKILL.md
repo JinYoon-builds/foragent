@@ -28,7 +28,20 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
    - If it prints `"setup": false` (no config in this folder), follow the init flow after
-     the greeting: read `skills/fa-init/SKILL.md` (the `fa-init` skill) and do it.
+     the greeting: run `fa doctor --setup --json` and read its `items` top to bottom
+     (git installed, gh installed, uv installed, gh logged in, gh project scope,
+     repository linked). A nonzero exit
+     with JSON reports unfinished setup. Show each failing item's exact `fix`.
+     Ask with AskUserQuestion (or the available question tool) before installing,
+     creating or linking anything, and run the chosen command only after the answer.
+     For an official installation page, show it and wait. Resolve waiting items
+     by completing their earlier prerequisite, then refresh the checklist.
+     For login, the person runs `! gh auth login`; show it and wait, never ask for,
+     read or store a token. For permissions, show the exact command and wait too.
+     With no question tool, stop and print the next command and repository choices.
+     Read `skills/fa-init/SKILL.md` (the `fa-init` skill) for the choices and fixes,
+     finish the checklist, then run `fa init` in the background after agreement and
+     continue to the first order. Reuse completed answers when entering that flow.
      Stop this skill there.
    - Otherwise, when the person asks for more than the report, show the briefing in four
      short parts, each one line or a short list:
