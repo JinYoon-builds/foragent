@@ -1,0 +1,11 @@
+{
+  "name": "foragent",
+  "owner": {"name": "JinYoon-builds"},
+  "plugins": [
+    {
+      "name": "foragent",
+      "source": "./",
+      "description": "Foragent skills for Claude Code; type /fa to start."
+    }
+  ]
+}
