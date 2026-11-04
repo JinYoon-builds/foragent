@@ -289,11 +289,32 @@ class Evidence:
         return True
 
 
+def _join(ctx, report, base, before, place, job):
+    """A candidate failure leaves the composed prefix available to the next one."""
+    try:
+        head = job["head"]
+        if ci_mode.changed_workflows(ctx.git, base, head):
+            raise ValueError("acceptance workflow differs from target")
+        if ctx.git.is_ancestor(head, before):
+            raise ValueError("member already reachable")
+        tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
+        message = f"Merge member #{place.n}\n\nForagent-Member: #{place.n} {head} {place.started_at}\n"
+        commit = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                "commit-tree", tree, "-p", before, "-p", head, "-m", message]).strip()
+        return place.n, head, commit, place.started_at
+    except Exception as exc:
+        if isinstance(exc, TrackerError) and exc.waits:
+            raise
+        report.actions.append(f"#{place.n} merge batch excluded: {str(exc) or type(exc).__name__}")
+        return None
+
+
 def prepare(ctx, report, candidates):
     """None permits single admissions; False ends a reserved or retired train's tick."""
     base, chain, proof = None, [], None
     try:
         retired = retirements(ctx)
+        retired_ids = {row.get("identity") for row in retired}
         recovered, damaged = _discover(ctx, report)
         if damaged or len(recovered) > 1:
             for base, chain in recovered:
@@ -310,39 +331,32 @@ def prepare(ctx, report, candidates):
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-            eligible = []
+            before = base
             for p, j, _ in candidates:
                 if ((p.n, p.started_at) in spent or j["phase"] != "waiting"
                         or j["target"] != ctx.config.base_branch):
                     continue
-                try:
-                    if not ci_mode.changed_workflows(ctx.git, base, j["head"]):
-                        eligible.append((p, j))
-                except Exception as exc:
-                    if isinstance(exc, TrackerError) and exc.waits:
-                        raise
-                    report.actions.append(f"#{p.n} merge batch workflow comparison unavailable: {exc}")
-            selected = []
-            for start in range(0, len(eligible), ctx.config.merge_batch_size):
-                group = eligible[start:start + ctx.config.merge_batch_size]
-                identity = _identity(base, [(p.n, j["head"], base, p.started_at) for p, j in group])
-                if not any(row.get("identity") == identity for row in retired):
-                    selected = group
-                    break
-            if len(selected) < 2:
+                member = _join(ctx, report, base, before, p, j)
+                if member is None:
+                    continue
+                chain.append(member)
+                before = member[2]
+                if len(chain) == ctx.config.merge_batch_size:
+                    if _identity(base, chain) not in retired_ids:
+                        break
+                    chain, before = [], base
+            if len(chain) < 2 or _identity(base, chain) in retired_ids:
                 return None
-            chain = [(p.n, j["head"], base, p.started_at) for p, j in selected]
+            # Only the tip is published. Bind its CI scope to the members that
+            # actually composed, without repeating their merge-tree checks.
             excluded = _exclusions(ctx, base, chain)
-            before = base
-            for k, (p, j) in enumerate(selected):
-                if ctx.git.is_ancestor(j["head"], before):
-                    raise ValueError("member already reachable")
-                tree = ctx.git._call(["merge-tree", "--write-tree", before, j["head"]]).splitlines()[0]
-                message = (f"Merge member #{p.n}\n\nForagent-Member: #{p.n} {j['head']} {p.started_at}\n"
-                           f"{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}")
-                before = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                                        "commit-tree", tree, "-p", before, "-p", j["head"], "-m", message]).strip()
-                chain[k] = (p.n, j["head"], before, p.started_at)
+            n, head, tip, started = chain[-1]
+            before = chain[-2][2]
+            message = ctx.git._call(["show", "-s", "--format=%B", tip]).rstrip()
+            message += f"\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
+            tip = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                 "commit-tree", _tree(ctx.git, tip), "-p", before, "-p", head, "-m", message]).strip()
+            chain[-1] = (n, head, tip, started)
         used = _landed(ctx, base, chain)
         if used:
             _close(ctx, report, base, chain, "member heads already reachable from target", used=used)
