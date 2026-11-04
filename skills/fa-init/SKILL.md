@@ -3,23 +3,43 @@ name: fa-init
 description: Set up a project folder for Foragent.
 ---
 
-1. Check whether the current folder is a git work tree. If it is not, get the
-   personal login with `gh api user --jq .login` and organization logins with
-   `gh api user/orgs --jq '.[].login'`. Use AskUserQuestion (or the available
-   question tool) to choose an owner (personal login recommended first, then
-   organization logins) and visibility (private recommended first, then public).
-   Run `git init --initial-branch=main`, create an initial commit, then run
-   `gh repo create <owner>/<folder> --private|--public --source . --push` using
-   the selected owner, folder name, and visibility flag.
+1. Run `fa doctor --setup --json` in the project folder, before `fa init`.
+   Read its `items` from top to bottom: tools installed, gh login, gh project
+   scope, then repository linked. The checklist is the source of setup steps;
+   a nonzero exit with JSON means there are steps to finish. For each failing
+   item, show its exact `fix` and handle it before moving on:
+   - Installation: use AskUserQuestion (or the available question tool) to ask
+     Yes (recommended) or No. Run the shown install command only after Yes.
+     After No, print the command and stop.
+   - Login: ask the person to run `! gh auth login` in Claude Code themselves,
+     then wait. Never ask for, read or store a token, and never run their login
+     for them. For project scope, show `! gh auth refresh -h github.com -s project`
+     and wait for the person to finish the permission step.
+   - Repository: ask New private repository (recommended), New public repository,
+     or Existing repository URL. Show the commands and ask before creating or
+     linking anything; the choice must come from the person's answer. For a new
+     repository, read `gh api user --jq .login` and
+     `gh api user/orgs --jq '.[].login'` and confirm the owner and name (personal
+     login recommended). Only after agreement, run `git init --initial-branch=main`
+     if the folder has no git work tree, create an initial commit if needed,
+     then run `gh repo create <owner>/<repo> --private|--public --source . --push`
+     with the chosen visibility. For an existing repository, ask for the URL;
+     after the answer, initialize git if needed and run
+     `git remote add origin <URL>`. If origin already exists, show the checklist's
+     `git remote set-url origin <URL>` fix and ask before replacing it.
+   Re-run the checklist after each completed fix; continue only when all items
+   pass. If there is no question tool, stop and print the next exact command
+   and any repository choices. An unanswered question is not agreement.
 
-2. At first use, ask only these configuration questions: merge (review) mode, then Claude quota
+2. After setup prerequisites pass, ask these configuration questions at first use: merge (review) mode, then Claude quota
    mode. Use AskUserQuestion (or the available question tool), recommendation first:
    - fast (recommended): merge passing work automatically unless a human review rule applies.
    - careful: require human review of each task before merging.
    On a re-run, skip a question whose key is already set in its own scope file
    ([settings](references/settings.md)). Leave the executor to the config default.
 
-3. Run `fa init --review <mode>` in the project folder (no `--executor`, never
+3. After the person agrees to set up Foragent, run `fa init --review <mode>` in
+   the background in the project folder and wait for its result (no `--executor`, never
    `--claude-quota`), so the answer lands in init's own commit, and show its
    summary. Only if Claude is available (`claude auth status` logged in, or
    `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` set), then ask the quota mode:

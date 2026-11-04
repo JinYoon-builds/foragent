@@ -262,7 +262,10 @@ def init_repo(
     requested_map = _parse_board_map(board_map) if board_map is not None else None
     root = Path(repo_root).resolve()
     git = git or GitRepo(root)
-    git.check_worktree()
+    try:
+        git.check_worktree()
+    except GitError as exc:
+        raise GitError(setup.repository_fix("init_git_missing", exc, _preflight_language(root, language))) from exc
     top_level = git.worktree_root()
     normalized_root = top_level if top_level != root else None
     if normalized_root is not None:
@@ -272,10 +275,9 @@ def init_repo(
     try:
         repo = git.remote_slug()
     except GitError as exc:
-        # A failed `git remote get-url` (non-zero exit) means no origin; a readable url that
-        # the remote parser rejects means origin is not GitHub.
+        # A failed get-url means no origin; a rejected URL means it is not GitHub.
         key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
-        raise GitError(text(key, preflight_language, error=exc)) from exc
+        raise GitError(setup.repository_fix(key, exc, preflight_language)) from exc
     run = gh_run or _run_gh
     try:
         auth_status = run(["auth", "status"], input=None)
@@ -285,7 +287,8 @@ def init_repo(
         key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
         raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
 
-    fixes = [item["fix"] for item in setup.checklist(auth_status) if not item["ok"]]
+    fixes = [item["fix"] for item in setup.checklist(auth_status, root=root, git=git,
+                                                  language=preflight_language) if not item["ok"]]
     if fixes:
         raise TrackerError(text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes)))
 
