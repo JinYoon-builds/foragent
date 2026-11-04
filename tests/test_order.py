@@ -5000,3 +5000,107 @@ def test_a_same_input_reread_whose_estimate_cannot_be_kept_records_nothing(publi
     with pytest.raises(order.PlanError, match="disk full"):
         _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
     assert (root / order.PREREAD_FILE).read_bytes() == records
+
+
+_CLEANUP_SHA = "4f1c2a9e8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e"
+
+
+@pytest.mark.parametrize("value", [
+    None, {}, [41], [{"number": 41}], [{"number": 41, "commit": _CLEANUP_SHA, "into": 42}],
+    [{"number": 0, "into": 42}], [{"number": True, "into": 42}], [{"number": 41, "into": 41}],
+    [{"number": 41, "into": "42"}], [{"number": 41, "commit": "xyz1234"}], [{"number": 41, "commit": "abc12"}],
+    [{"number": 41, "into": 42}, {"number": 41, "commit": _CLEANUP_SHA}],
+])
+def test_cleanup_closes_reject_invalid_items_before_writes(publishing, plan, value):
+    plan["closes"] = value
+    with pytest.raises(order.PlanError, match=r"closes"):
+        publish(publishing, plan, approve=True)
+    assert publishing[-1] == []
+
+
+@pytest.mark.parametrize("target", ["missing", "pr", "running", "edited", "replaced", "into-missing", "into-pr"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_conflicts_refuse_the_whole_order_before_writes(publishing, plan, target, dry_run):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    if target not in ("missing", "into-missing"):
+        tracker.add_issue(42, "Other work", "body", ["running"] if target == "running" else [],
+                          is_pull_request=target in ("pr", "into-pr"))
+    if target == "edited":
+        plan["edits"] = [{"number": 42, "goal": "Edit it", "out_of_scope": "Other work", "done_when": ["true"]}]
+    if target == "replaced":
+        plan["issues"][0]["replaces"] = [42]
+    second = ({"number": 43, "into": 42} if target.startswith("into") else {"number": 42, "commit": _CLEANUP_SHA})
+    if target.startswith("into"):
+        tracker.add_issue(43, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, second]
+    with pytest.raises(order.PlanError, match="#4[23]"):
+        publish(publishing, plan, approve=True, dry_run=dry_run)
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+    assert publishing[-1] == []
+
+
+def test_cleanup_close_is_never_an_approval_and_respects_a_reopen(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.add_issue(42, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    report = publish(publishing, plan, approve_numbers=[41])
+    assert report.rows and all(not row["approved"] for row in report.rows)
+    resolved = tracker.get_issue(41)
+    assert resolved.state == "closed" and resolved.state_reason == "completed"
+    assert "approved" not in resolved.labels
+    assert [_CLEANUP_SHA in c.body for c in tracker.list_comments(41)] == [True]
+    assert tracker.get_issue(42).state == "open" and tracker.list_comments(42) == []
+    tracker.issues[41] = replace(resolved, state="open", state_reason=None)
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open", "A person's reopen wins over this plan's earlier close"
+    assert len(tracker.list_comments(41)) == 1
+    duplicate = tracker.get_issue(42)
+    assert duplicate.state_reason == "not_planned" and "approved" not in duplicate.labels
+    assert ["#41" in c.body for c in tracker.list_comments(42)] == [True]
+
+
+def test_cleanup_dry_run_previews_full_evidence(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.add_issue(42, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    summary = publish(publishing, plan, approve=True, dry_run=True).summary()
+    assert f"#41 (resolved by {_CLEANUP_SHA})" in summary and "#42 (duplicate of #41)" in summary
+    assert tracker.get_issue(41).state == "open" and publishing[-1] == []
+
+
+def test_cleanup_leaves_an_issue_closed_before_this_order_alone(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.close_issue(41, reason="not_planned")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}]
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state_reason == "not_planned" and tracker.list_comments(41) == []
+
+
+@pytest.mark.parametrize("late", [42, 43], ids=["cleanup-target", "replaced-target"])
+def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publishing, plan, monkeypatch, late):
+    """Work that starts after the publication checks but before the first close stops all closes."""
+    from foragent import size_signal
+
+    tracker = publishing[2]
+    for number in (41, 42, 43):
+        tracker.add_issue(number, f"Old work {number}", "body")
+    plan["issues"][0]["replaces"] = [43]
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    published = size_signal.published
+
+    def start_late(*args, **kwargs):
+        # The last write before the closes: a gate claims the target in this interval.
+        tracker.add_labels(late, ["running"])
+        return published(*args, **kwargs)
+
+    monkeypatch.setattr(size_signal, "published", start_late)
+    closes = []
+    monkeypatch.setattr(tracker, "close_issue", lambda n, *a, **k: closes.append(n))
+    with pytest.raises(order.PlanError, match=f"#{late}"):
+        publish(publishing, plan, approve=True)
+    assert closes == [], "No close may be written once a target is running"
+    assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
