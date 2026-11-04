@@ -1238,7 +1238,7 @@ def test_gh_pr_head_sha_reads_current_head():
 def test_gh_check_bucket_mapping(buckets, expected, link):
     run = ScriptedRun(json.dumps([{"bucket": bucket, "link": link} for bucket in buckets]))
     assert GhTracker(REPO, run).pr_checks(42) == expected
-    assert run.calls == [(["pr", "checks", "42", "-R", REPO, "--json", "bucket,name,workflow,link"], None)]
+    assert run.calls == [(["pr", "checks", "42", "-R", REPO, "--json", "bucket,name,workflow,link,state,startedAt"], None)]
 
 
 @pytest.mark.parametrize("response,expected", [
@@ -2118,3 +2118,35 @@ def test_evidence_does_not_hide_workflow_comment_errors(outbox_context, monkeypa
         ctx.tracker.comment(1 if same_issue else 2, "Workflow transition")
     assert ctx.store.github_outbox() == [evidence]
     assert ctx.store.github_blocking_outbox() == []
+
+
+@pytest.mark.parametrize("exit_code", [0, 8])
+@pytest.mark.parametrize("rows,expected", [
+    ([{"state": "QUEUED", "startedAt": NOW.isoformat()}], None),
+    ([{"state": "IN_PROGRESS", "startedAt": "0001-01-01T00:00:00Z"}], None),
+    ([{"state": "IN_PROGRESS", "startedAt": "invalid"}], None),
+    ([{"state": "IN_PROGRESS", "startedAt": "2026-10-20T09:00:00"}], None),
+    ([{"state": "QUEUED"}, {"state": "SUCCESS", "startedAt": NOW.isoformat()},
+      {"state": "IN_PROGRESS", "startedAt": (NOW + timedelta(minutes=1)).isoformat()}], NOW),
+])
+def test_gh_checks_start_comes_from_the_same_listing(exit_code, rows, expected):
+    output = json.dumps([{"bucket": "pending", **row} for row in rows])
+    script = ScriptedRun(gh_error("", output, exit_code) if exit_code else output)
+    tracker = GhTracker(REPO, script)
+    assert tracker.pr_checks_started(42) is None
+    assert tracker.pr_checks(42) == "pending"
+    assert tracker.pr_checks_started(42) == expected
+    assert tracker.pr_checks_started(99) is None
+    assert len(script.calls) == 1
+
+
+def test_gh_checks_start_does_not_leak_from_a_previous_listing():
+    responses = iter([json.dumps([{"bucket": "pass", "state": "SUCCESS", "startedAt": NOW.isoformat()}]),
+                      "[]", json.dumps([{"bucket": "pending", "state": "QUEUED"}])])
+    tracker = GhTracker(REPO, lambda *args, **kwargs: next(responses))
+    assert tracker.pr_checks(42) == "pass"
+    assert tracker.pr_checks_started(42) == NOW
+    assert tracker.pr_checks(42) == "none"
+    assert tracker.pr_checks_started(42) is None
+    assert tracker.pr_checks(42) == "pending"
+    assert tracker.pr_checks_started(42) is None

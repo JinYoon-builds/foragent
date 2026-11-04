@@ -11,7 +11,6 @@ import pytest
 
 from conftest import BASE_TIME
 from foragent import capacity, scheduler
-from foragent.reasons import Reason
 from foragent.state import StateStore
 from test_orch_review_handoff import make_case, tick_context
 
@@ -218,7 +217,8 @@ def test_sleep_and_wait_credit_preserve_the_runtime_limit(
             assert run.status == "finished" and run.outcome == "killed", (
                 "101 min of real work must still exceed the 90 min gate runtime backstop"
             )
-            assert case.killed == [PID] and case.store.load_flag(1).reason == Reason.TIMEOUT
+            # #1514: the backstop cannot tell a moving base from too-large work; it has its own neutral name.
+            assert case.killed == [PID] and case.store.load_flag(1).reason == "runtime-exceeded"
 
 
 def test_sleep_is_not_stall_time_and_no_sleep_still_stalls(git_history, tmp_path, monkeypatch):
