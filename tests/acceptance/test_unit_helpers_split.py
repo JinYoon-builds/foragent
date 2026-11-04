@@ -1,0 +1,656 @@
+"""Unit tests do not borrow helpers from locked acceptance modules.
+
+A locked acceptance file may change with any order commit. When a unit test
+imports helpers from one, that commit can turn main red with no code change
+(afd1b174, 2026-11-03). Unit tests outside tests/acceptance take the helpers
+they share from a tests/helpers package instead, keep every test they had,
+and still load when no acceptance module can be imported.
+"""
+
+import ast
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "src/foragent").is_dir())
+TESTS = ROOT / "tests"
+ACCEPTANCE = TESTS / "acceptance"
+HELPERS = TESTS / "helpers"
+
+
+def _unit_sources():
+    return sorted(p for p in TESTS.rglob("*.py") if not p.is_relative_to(ACCEPTANCE))
+
+
+def _parse(path):
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+def _imported_modules(tree):
+    """Every absolute module name a source imports, statically or by a literal import_module()."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield node.lineno, alias.name
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            yield node.lineno, node.module
+            for alias in node.names:
+                yield node.lineno, f"{node.module}.{alias.name}"
+        elif (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant)
+              and isinstance(node.args[0].value, str)
+              and getattr(node.func, "attr", getattr(node.func, "id", None)) in {"import_module", "__import__"}):
+            yield node.lineno, node.args[0].value
+
+
+def _locked_target(module):
+    """The acceptance file this module name loads, or None."""
+    parts = module.split(".")
+    if parts[:2] == ["tests", "acceptance"]:
+        parts = parts[1:]
+    if parts[0] == "acceptance":
+        return f"tests/acceptance/{parts[1]}.py" if len(parts) > 1 else "tests/acceptance"
+    if (ACCEPTANCE / f"{parts[0]}.py").is_file() or (ACCEPTANCE / parts[0]).is_dir():
+        return f"tests/acceptance/{parts[0]}.py"
+    return None
+
+
+def _test_names(tree):
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
+            names.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            names |= {f"{node.name}::{item.name}" for item in node.body
+                      if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")}
+    return names
+
+
+def _imports_helpers(tree):
+    return any(re.fullmatch(r"(tests\.)?helpers(\..+)?", name) for _, name in _imported_modules(tree))
+
+
+def test_unit_tests_import_no_locked_acceptance_module_and_keep_every_test():
+    found = []
+    for path in _unit_sources():
+        for line, module in _imported_modules(_parse(path)):
+            target = _locked_target(module)
+            if target:
+                found.append(f"{path.relative_to(ROOT)}:{line} imports {target}")
+    lost = []
+    for name, before in TESTS_BEFORE.items():
+        path = TESTS / name
+        now = _test_names(_parse(path)) if path.is_file() else set()
+        missing = sorted(set(before.split()) - now)
+        if missing:
+            lost.append(f"tests/{name} lost {len(missing)}: {', '.join(missing)}")
+    assert not found and not lost, (
+        "unit test sources still import locked acceptance modules:\n" + "\n".join(sorted(set(found)))
+        + "\nunit tests were dropped or renamed:\n" + "\n".join(lost))
+
+
+_BLOCKED_RUN = """
+import sys
+from pathlib import Path
+import pytest
+
+acceptance = Path(sys.argv[1])
+stems = {p.stem for p in acceptance.glob("*.py")} | {p.name for p in acceptance.iterdir() if p.is_dir()}
+
+class LockedModules:
+    def find_spec(self, name, path=None, target=None):
+        head = name.split(".")
+        if head[:2] == ["tests", "acceptance"] or head[0] == "acceptance" or head[0] in stems:
+            raise ImportError(f"locked acceptance module {name} is not importable here")
+        return None
+
+class Block:
+    def pytest_sessionstart(self, session):
+        sys.meta_path.insert(0, LockedModules())  # ahead of pytest's own import hooks
+
+raise SystemExit(pytest.main(["--collect-only", "-q", "-o", "addopts=", "-p", "no:cacheprovider", *sys.argv[2:]],
+                             plugins=[Block()]))
+"""
+
+
+def test_the_former_borrowers_collect_every_test_when_acceptance_modules_cannot_load():
+    files = [f"tests/{name}" for name in TESTS_BEFORE if (TESTS / name).is_file()]
+    done = subprocess.run([sys.executable, "-c", _BLOCKED_RUN, str(ACCEPTANCE), *files],
+                          cwd=ROOT, capture_output=True, text=True, timeout=600, check=False)
+    collected = {line.split("[")[0] for line in done.stdout.splitlines() if "::" in line}
+    missing = sorted(f"{name}::{test}" for name, tests in TESTS_BEFORE.items() for test in tests.split()
+                     if f"tests/{name}::{test}" not in collected)
+    assert done.returncode == 0 and not missing, (
+        f"collection without acceptance modules exited {done.returncode}; "
+        f"{len(missing)} tests not collected, first: {missing[:5]}\n" + done.stdout[-3000:] + done.stderr[-2000:])
+
+
+def test_tests_helpers_is_a_used_package_that_pytest_does_not_collect_and_carries_no_unused_code():
+    assert (HELPERS / "__init__.py").is_file(), "no tests/helpers package"
+    modules = sorted(HELPERS.rglob("*.py"))
+    collectable = [str(p.relative_to(ROOT)) for p in modules if re.fullmatch(r"test_.*\.py|.*_test\.py", p.name)]
+    tests_inside = [f"{p.relative_to(ROOT)}::{name}" for p in modules for name in _test_names(_parse(p))]
+
+    users = [p for p in sorted(TESTS.rglob("*.py")) if not p.is_relative_to(HELPERS) and _imports_helpers(_parse(p))]
+    borrowers = sorted(p.name for p in users if p.name in TESTS_BEFORE)
+    user_text = "\n".join(p.read_text(encoding="utf-8") for p in users)
+
+    unused = []
+    for path in modules:
+        source = path.read_text(encoding="utf-8")
+        elsewhere = user_text + "".join(p.read_text(encoding="utf-8") for p in modules if p != path)
+        for node in _parse(path).body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined = [node.name]
+            elif isinstance(node, ast.Assign):
+                defined = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                defined = [node.target.id]
+            else:
+                continue
+            rest = source.replace(ast.get_source_segment(source, node), "", 1)
+            for name in defined:
+                pattern = rf"\b{re.escape(name)}\b"
+                if not name.startswith("_") and not re.search(pattern, elsewhere) and not re.search(pattern, rest):
+                    unused.append(f"{path.relative_to(ROOT)}: {name}")
+    assert not collectable and not tests_inside and borrowers and not unused, (
+        f"helper files pytest would collect: {collectable}\n"
+        f"test functions inside tests/helpers: {tests_inside[:10]}\n"
+        f"former borrowers importing tests/helpers: {borrowers}\n"
+        f"helpers no test uses (copied, not trimmed): {unused[:20]}")
+
+
+TESTS_BEFORE = {
+    "test_base_move_publish.py": (
+        "test_more_neutral_moves_than_publication_rounds_still_merge "
+        "test_issue_approved_after_verification_does_not_make_its_test_neutral "
+        "test_merge_uses_the_classified_commit_when_the_shared_ref_moves_again "
+        "test_reverify_recaptures_with_the_baselines_command_when_detection_would_fail "
+        "test_neutral_move_during_first_push_reads_ci_on_the_base_it_measured "
+        "test_ci_failure_on_a_base_moved_during_push "
+    ),
+    "test_board_parents_refs.py": (
+        "test_unlisted_reference_read_closed_earlier_is_read_again_before_closing "
+        "test_record_with_many_unlisted_closed_references_closes_in_one_tick "
+        "test_interrupted_action_continues_after_its_last_completed_read "
+        "test_action_that_ran_to_its_end_reads_unlisted_references_fresh "
+        "test_changed_listing_ends_an_interrupted_actions_reads "
+        "test_card_added_then_moved_across_ticks_with_one_card "
+        "test_remembered_child_read_stops_repeating_and_never_hides_open_work "
+        "test_changed_child_row_ends_a_remembered_child_read "
+        "test_remembered_open_child_keeps_the_parent_open_while_the_card_catches_up "
+        "test_remembered_cancelled_child_keeps_its_group_in_the_closing_comment "
+        "test_a_record_read_on_every_tick_cannot_starve_a_later_one "
+        "test_recurring_batch_reads_cannot_starve_a_parent_action "
+        "test_batch_step_gets_the_budget_again_once_parents_are_done "
+        "test_a_record_waiting_on_an_unlisted_reference_leaves_the_batch_step_running "
+        "test_parent_step_runs_only_on_ticks_that_read_the_listing "
+        "test_child_found_by_a_read_follows_its_listed_row_while_the_action_is_interrupted "
+        "test_card_deleted_after_its_creation_is_created_again_once "
+        "test_card_deleted_after_its_read_is_found_missing_when_the_write_is_rejected "
+        "test_timed_out_write_keeps_the_board_reads_and_a_rejected_one_forgets_them "
+        "test_only_a_rejection_of_the_write_ends_the_board_reads "
+        "test_response_carrying_errors_is_not_remembered_as_a_completed_read "
+        "test_listed_row_beats_a_lagging_read_of_the_same_child "
+        "test_change_in_a_child_only_a_read_names_ends_the_board_reads "
+        "test_write_response_carrying_errors_ends_the_board_reads "
+        "test_a_write_is_sent_again_when_the_card_needs_it_again "
+        "test_parent_closes_once_with_slow_calls_and_a_missing_card "
+    ),
+    "test_ci_failure_facts.py": (
+        "test_ci_comparison_regression_in_the_flow_path_is_kept_once_per_head "
+        "test_ci_comparison_regression_in_the_review_path_is_kept "
+    ),
+    "test_github_outage_unit.py": (
+        "test_only_unreachable_or_server_errors_from_gh_wait "
+        "test_an_unrecognised_failure_waits_for_issue_and_pr_reads test_a_rate_limit_is_a_4xx_that_still_waits "
+        "test_a_stdout_only_server_error_is_part_of_the_error_message "
+        "test_failed_checks_listing_on_stdout_is_still_read_as_checks "
+        "test_a_checks_read_whose_stdout_is_a_server_error_waits_instead_of_parsing_it "
+        "test_a_long_message_cannot_push_the_outage_out_of_the_wait_record "
+        "test_an_outage_pause_keeps_its_failure_for_every_run_that_enters_it "
+        "test_a_rate_limit_pause_keeps_its_probe_and_its_wording "
+        "test_only_a_reviewer_pass_of_the_exact_open_pr_head_and_body_resumes "
+        "test_contents_a_check_changes_after_a_reused_pass_are_reviewed_before_merge "
+        "test_a_reused_pass_that_then_fails_ci_gets_a_new_implementation_and_review "
+        "test_a_server_error_from_the_merge_waits_once_and_merges_once_later "
+        "test_a_wait_keeps_its_own_failure_when_another_writer_pauses_first "
+        "test_a_merge_wait_read_that_meets_an_outage_takes_the_shared_pause "
+        "test_a_gh_timeout_or_launch_failure_leads_its_record_whatever_the_arguments "
+    ),
+    "test_group_reuse_timing.py": (
+        "test_neutral_commit_during_lock_acquisition_keeps_the_checked_head "
+        "test_source_commit_during_lock_acquisition_still_rechecks "
+        "test_neutral_commit_during_the_leaders_lock_acquisition_keeps_one_check "
+        "test_source_commit_during_the_leaders_lock_acquisition_still_rechecks "
+    ),
+    "test_merge_owner_batch.py": (
+        "test_every_prefix_published_before_single_path_merges_and_reused_across_restart "
+        "test_pending_prefixes_run_in_parallel_without_merges "
+        "test_batch_size_limits_prefixes_and_survives_restart "
+        "test_green_earlier_prefix_is_usable_when_later_prefix_is_red "
+        "test_ci_green_cannot_bypass_any_fresh_locked_single_path_check "
+        "test_changed_scope_keeps_the_ordinary_refresh_requirement "
+        "test_cleanup_restart_keeps_the_retired_tip_and_never_reuses_evidence "
+        "test_retirement_cancels_owned_prefix_ci_before_deleting_refs_and_retries "
+        "test_disabling_batching_retires_published_prefixes_idempotently "
+        "test_invalid_tip_does_not_prevent_retirement_of_intact_prefixes "
+        "test_retargeted_prefix_is_retained_by_the_owner_close_guard "
+        "test_target_changes_still_require_refresh_and_only_identical_trees_reuse_ci "
+        "test_conflict_discards_entire_candidate_without_splitting_or_retry "
+        "test_unusable_candidate_stops_evidence_and_members_resume_single_path "
+        "test_merge_batch_false_uses_the_unchanged_single_path test_merge_batch_requires_owner_ci_and_a_boolean "
+        "test_reused_prefix_runs_machine_only_checks_on_the_merged_tree "
+        "test_prefix_protects_tests_that_started_passing_after_the_previous_member "
+        "test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary "
+        "test_retired_generations_stay_spent_after_flow_log_rotation "
+        "test_prefix_creation_identity_survives_temporary_listing_lag "
+        "test_batch_github_wait_reaches_owner_pause_without_retirement "
+        "test_union_refresh_checks_and_publishes_its_own_tree_before_ci_reuse "
+        "test_combined_conflict_markers_are_rejected_by_the_normal_refresh_publication_gate "
+        "test_restart_recreates_missing_prefix_prs_from_refs_without_republishing "
+        "test_existing_four_member_batch_survives_size_reduction "
+        "test_last_reconciliation_throttle_stops_batch_preparation "
+        "test_retirement_uses_the_generation_recorded_before_two_refreshes "
+        "test_pending_prefix_does_not_hold_a_member_with_usable_own_ci "
+    ),
+    "test_merge_owner_neutral.py": (
+        "test_owner_keeps_green_head_across_memory_additions_and_modifications "
+        "test_owner_refreshes_memory_moves_without_job_comparison test_owner_refreshes_for_docs_only_moves "
+        "test_owner_rechecks_docs_used_by_acceptance test_owner_refreshes_when_memory_is_removed "
+        "test_owner_refreshes_when_the_measured_object_is_unavailable "
+        "test_owner_refreshes_when_one_intervening_commit_touches_src "
+        "test_owner_refreshes_for_an_added_acceptance_file test_owner_refreshes_for_docs_in_local_mode "
+        "test_owner_refreshes_for_memory_that_the_pr_changed "
+        "test_modified_acceptance_file_refreshes_even_when_excluded "
+        "test_rewound_or_diverged_base_refreshes_and_checks_lost_passing_test "
+        "test_repeated_neutral_reads_keep_the_original_measurement_base "
+        "test_refresh_clears_old_merge_intent_before_manual_merge "
+        "test_replacement_fallback_refreshes_before_measuring_a_neutral_base "
+        "test_changed_excluded_contract_with_fallback_cannot_inherit_neutrality "
+    ),
+    "test_merge_owner_proto.py": (
+        "test_four_prs_priority_without_live_workers test_main_moves_between_turns "
+        "test_lost_test_never_enters_queue test_new_base_lost_test_uses_existing_repair_path "
+        "test_conflict_goes_to_repair_without_queued_worker test_manually_closed_issue_drops_queue_without_ghost "
+        "test_restart_after_merge_response_lost test_ci_never_reports_releases_gate_without_wait_limit "
+        "test_two_gates_share_existing_tick_lock test_pr_merged_by_hand_is_reconciled "
+        "test_restart_during_refresh_publication test_local_mode_keeps_local_evidence_through_main_move "
+        "test_ci_mode_runs_local_only_after_refresh test_missing_ci_comparison_waits_across_ticks "
+        "test_orch_merge_uses_reviewed_handoff test_refused_merge_reconciles_before_requesting_repair "
+        "test_main_move_at_handoff_is_owner_work test_final_recheck_under_lock "
+        "test_merge_owner_is_validated_opt_in test_durable_handoff_survives_label_cleanup_failure "
+        "test_changed_head_never_enters_destructive_repair "
+        "test_explicit_human_authorization_survives_policy_and_restart "
+        "test_human_authorization_retains_live_integrity_checks "
+        "test_batch_child_merge_never_installs_unapproved_branch "
+        "test_nonwaiting_comparison_transport_retains_admission "
+        "test_reconciliation_reads_stored_pr_numbers_with_real_gh_adapter "
+        "test_restart_reaps_durable_owner_checks_before_launching_more "
+        "test_cleanup_does_not_kill_reused_pid_or_depend_on_github "
+        "test_refused_process_cleanup_defers_only_its_admission "
+        "test_missing_issue_retires_only_that_admission_and_transport_retries "
+        "test_one_admission_failure_does_not_block_other_merges_or_scheduler "
+        "test_terminal_failure_yields_to_another_admission_in_the_same_tick "
+        "test_slow_owner_check_leaves_scheduler_and_tick_lock_available "
+        "test_process_launcher_transfers_owner_lock_without_waiting "
+        "test_owner_process_bootstrap_releases_inherited_lock_during_github_backoff "
+        "test_repair_replays_labels_after_lost_successful_close test_repair_close_cannot_delete_a_concurrent_push "
+        "test_owner_gh_close_and_merge_preserve_branches test_manual_merge_must_match_admitted_publication "
+        "test_human_authorization_names_requested_pr_and_target "
+        "test_admitted_crash_label_failure_does_not_abort_other_work "
+        "test_owner_merge_fact_drives_scorecard_and_ownership "
+        "test_flag_off_ci_default_branch_failure_keeps_original_fallback "
+        "test_completed_failed_acceptance_producer_is_terminal "
+        "test_forty_pending_admissions_read_each_github_fact_once "
+    ),
+    "test_merge_owner_queue_slim.py": (
+        "test_enqueue_persists_large_evidence_before_small_queue_row test_failed_job_write_never_admits "
+        "test_owner_merges_with_job_file_evidence_without_remeasurement "
+        "test_absent_job_evidence_remeasures_and_never_merges_without_it "
+        "test_compaction_preserves_order_fields_backup_and_noop_version "
+        "test_compaction_preserves_queue_record_boundaries test_compaction_serializes_with_concurrent_append "
+        "test_failed_compaction_replace_preserves_original_and_backup "
+        "test_owner_process_compacts_at_start_even_during_backoff "
+    ),
+    "test_merge_owner_regressions.py": (
+        "test_owner_reads_future_admission_fields_across_restart "
+        "test_owner_excludes_main_writers_until_merge_finishes test_throttle_persists_shared_wait_without_repair "
+        "test_old_publication_preserves_new_approval test_repair_intent_survives_confirmation_or_label_failure "
+        "test_slow_failed_admission_does_not_spend_next_budget "
+        "test_owner_local_fallback_autodetects_without_worker_baseline "
+        "test_owner_merge_fact_is_bound_and_timestamp_is_parsed "
+    ),
+    "test_orch_draft_unit.py": (
+        "test_a_session_that_died_unfinished_is_drafted_again_up_to_the_cap "
+        "test_a_restarted_session_after_a_death_drafts_and_ends_eligibility "
+        "test_only_the_exact_placeholder_line_counts test_a_draft_does_not_count_toward_its_lanes_plan_width "
+        "test_a_finished_draft_stays_finished_after_the_journals_are_trimmed "
+        "test_the_attempt_cap_survives_trimmed_journals "
+        "test_an_incomplete_draft_is_not_kept_and_the_issue_is_drafted_again test_a_non_object_plan_is_incomplete "
+        "test_transient_errors_use_no_attempt test_a_usage_limit_pauses_the_executor_and_uses_no_attempt "
+        "test_an_issue_recorded_while_candidates_are_read_does_not_break_the_tick "
+    ),
+    "test_orch_premerge.py": (
+        "test_detects_and_runs_every_full_suite_from_pr_head test_test_artifacts_do_not_affect_trial_merge "
+        "test_publication_checks_actual_pr_contents_before_direct_merge "
+        "test_changes_during_premerge_refuse_merge_before_attribution "
+        "test_match_head_guard_catches_change_after_approval_comment "
+        "test_failure_cleanup_never_leaves_temporary_worktrees "
+        "test_worktree_creation_failure_preserves_original_error "
+        "test_merge_without_ci_uses_clock_and_records_pr_in_event "
+        "test_invalid_attribution_is_rejected_before_checks "
+        "test_orch_merge_records_linked_issue_state_returned_by_github "
+        "test_orch_merge_completes_when_linked_issue_refresh_fails "
+        "test_premerge_ci_accepts_and_caches_an_entirely_excluded_acceptance_suite "
+        "test_premerge_head_only_pending_lock_exclusion_keeps_unowned_failures "
+        "test_premerge_suite_releases_slot_and_propagates_it_to_nested_tests "
+        "test_orch_merge_takes_the_fifo_merge_turn test_orch_merge_failure_records_failed_turn_and_withdraws "
+        "test_orch_merge_claims_the_turn_atomically_against_a_joining_run "
+        "test_orch_merge_checks_the_current_base_after_waiting_for_the_merge_lock "
+        "test_orch_merge_withdraws_reservation_when_premerge_cannot_finish "
+        "test_orch_merge_refuses_a_dream_pr_that_predates_a_redo "
+        "test_protected_acceptance_test_must_still_pass_on_the_merge_result "
+        "test_green_head_that_drops_a_protected_test_is_refused "
+        "test_memory_only_change_with_a_failing_neighbour_merges "
+        "test_refused_approved_inputs_run_no_protected_baseline "
+        "test_protected_ids_come_from_base_configuration_not_the_head_command "
+        "test_unreadable_protected_report_breaks_every_protected_test test_no_protected_set_skips_the_check "
+        "test_same_base_cache_with_wider_exclusions_is_reused "
+        "test_current_exclusions_override_the_reused_baseline "
+        "test_concurrent_human_merges_serialize_premerge_through_merge "
+        "test_human_withdraw_is_atomic_against_another_claim "
+        "test_linked_pr_on_a_batch_branch_answers_to_the_configured_base "
+        "test_refused_approved_input_names_every_changed_path_and_skips_the_suite "
+        "test_done_when_runs_on_the_merged_tree_inside_a_test_slot "
+        "test_done_when_stops_at_the_first_failure_and_quotes_it_on_one_line "
+        "test_done_when_timeout_refuses_the_merge "
+        "test_conflicted_pr_keeps_the_conflict_refusal_without_running_done_when "
+        "test_batch_dream_and_unlinked_prs_keep_their_handling "
+        "test_issue_pr_without_a_snapshot_runs_no_approved_checks "
+        "test_merge_refuses_approved_inputs_that_moved_after_premerge "
+        "test_premerge_command_says_why_on_its_one_line "
+        "test_path_approved_as_absent_and_still_absent_is_refused_on_head_and_base "
+        "test_path_approved_as_absent_is_named_once_on_each_ref_when_one_ref_has_it "
+        "test_ordinary_path_keeps_its_answer_for_a_path_approved_as_absent "
+    ),
+    "test_orch_reviewers.py": (
+        "test_override_wins_rejects_below_one_and_clears test_shares_are_round_robin_and_capped "
+        "test_reviewer_count_limits_concurrency_but_never_drops_a_perspective "
+        "test_panel_usage_limit_is_limit_wait_and_discards_the_round "
+        "test_parallel_reviewers_get_distinct_log_paths "
+        "test_reviewer_without_verdict_makes_round_unusable_without_merge "
+        "test_usage_limit_wins_over_another_reviewers_exhausted_retries "
+        "test_reviewer_and_merge_errors_make_the_round_unusable "
+        "test_break_it_a_missing_member_verdict_cannot_be_covered_by_the_merger "
+        "test_merge_fail_blocks_once_with_merged_classes_and_no_raw_reviewer_text "
+    ),
+    "test_orch_role_schedule.py": (
+        "test_finished_orders_needs_every_known_child_closed_and_skips_ordinary_work "
+        "test_a_lane_dream_needs_a_finished_order_with_a_merge_of_that_lane_since_its_last_dream "
+        "test_an_order_finishing_after_a_dream_keeps_its_turn_for_merges_that_dream_already_saw "
+        "test_a_lane_with_only_failed_work_in_a_finished_order_does_not_dream "
+        "test_docs_starts_after_the_architect_each_in_its_own_tick "
+        "test_the_docs_role_needs_no_new_run_input_but_the_architect_does "
+        "test_a_later_run_of_other_work_does_not_wake_the_architect_for_an_order_that_had_no_input "
+        "test_a_later_edit_of_a_closed_child_does_not_finish_its_order_again "
+        "test_an_order_past_the_journal_lifetime_is_not_recorded_and_wakes_nothing "
+        "test_quota_executor_pause_and_run_hours_hold_session_and_request "
+        "test_a_failed_start_retries_after_an_hour_or_a_later_reset_without_stopping_the_tick "
+        "test_a_capacity_refusal_stays_due_with_no_failure_and_no_wait "
+        "test_a_session_that_died_before_writing_done_waits_the_hour_from_its_call "
+        "test_a_failed_session_does_not_advance_the_input_cutoff "
+        "test_a_retrospective_closed_with_no_marked_note_is_asked_again_after_the_hour "
+        "test_one_pending_retrospective_names_every_finished_order_and_a_marked_note_covers_them "
+        "test_an_order_finishing_while_a_request_waits_is_not_covered_by_the_note_that_answers_the_request "
+        "test_a_note_answers_an_open_request_so_a_new_order_does_not_wait_for_it_to_close "
+        "test_only_listed_roles_wake_and_the_rest_show_as_unavailable "
+        "test_human_lines_are_localized_and_name_the_hold "
+        "test_with_no_opener_the_request_stays_pending_and_a_launch_is_no_completion "
+        "test_the_last_retrospective_outlives_the_trim_and_later_status_notes "
+        "test_a_refused_retrospective_note_writes_nothing_even_with_person_found "
+    ),
+    "test_order_prepare.py": (
+        "test_only_new_files_under_the_acceptance_directory_are_candidates "
+        "test_an_unchanged_tree_has_no_candidates test_status_reads_the_record_without_starting_an_agent "
+        "test_writer_reply_is_read_from_a_fenced_block "
+        "test_writers_ignore_inherited_authority_and_may_edit_only_the_tree_tests "
+        "test_isolated_executor_commands_drop_user_configuration "
+        "test_risk_guidance_follows_the_proposed_lane_paths_without_listed_files "
+        "test_a_source_file_edited_and_restored_during_the_run_is_refused "
+        "test_shared_test_configuration_of_any_tool_is_refused_but_data_fixtures_are_not "
+        "test_a_failed_writer_still_reports_the_paths_it_changed "
+        "test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read "
+        "test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions "
+        "test_unreadable_entries_left_by_the_writer_are_questions "
+        "test_checkout_context_is_copied_whole_and_faithfully "
+        "test_a_proposed_lane_copies_library_skills_whole_and_its_agent "
+        "test_links_that_find_other_content_in_the_scratch_are_refused_by_path "
+        "test_a_linked_claude_folder_leading_outside_refuses_every_context_place "
+        "test_applying_context_never_reaches_through_a_tracked_symlink "
+        "test_refused_lane_context_asks_before_any_writer_starts "
+        "test_a_new_issue_and_an_edit_with_the_same_number_get_their_own_trees "
+        "test_the_copy_keeps_every_mode_whatever_the_umask test_a_writer_changing_a_fifo_mode_is_a_question "
+        "test_the_scratch_keeps_no_settings_that_run_commands_outside_the_sandbox "
+        "test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session "
+        "test_a_pass_without_the_agreed_evidence_promotes_nothing "
+        "test_reviewer_runs_checks_in_the_writer_sandbox_without_edit_tools "
+        "test_promotion_needs_the_reviewed_requirements_and_base test_holds_are_counted_in_the_current_cycle_only "
+        "test_results_made_on_an_older_main_are_written_and_reviewed_again "
+        "test_promotion_never_loses_a_planning_edit_made_meanwhile "
+        "test_compare_and_swap_keeps_writes_that_race_each_step "
+        "test_a_plan_changed_before_the_move_is_never_replaced_even_briefly "
+        "test_a_write_through_an_open_descriptor_during_removal_is_never_deleted "
+        "test_a_late_write_is_kept_beside_a_plan_that_planning_replaced_meanwhile "
+        "test_moved_bytes_that_differ_are_renamed_never_deleted_when_the_name_is_taken "
+        "test_identity_binds_every_other_issue_and_the_risk_guidance "
+        "test_invalid_review_outcomes_carry_no_verdict "
+        "test_a_reviewer_changing_main_never_reaches_a_pass_or_the_next_review "
+        "test_writer_and_reviewer_read_every_other_issues_contract "
+        "test_base_moving_under_the_publication_lock_writes_nothing "
+        "test_a_new_base_commit_with_the_same_content_needs_new_red_evidence "
+        "test_a_review_still_waiting_or_questioned_is_named_with_its_status "
+        "test_a_local_main_ahead_of_origin_is_not_the_reviewed_base "
+        "test_a_local_commit_made_while_waiting_for_the_lock_is_caught_under_it "
+        "test_dropping_statements_after_preparation_cannot_fall_back_to_legacy_preread "
+        "test_an_existing_issue_published_with_behaviour_keeps_its_route "
+        "test_a_named_test_weakened_in_the_checkout_after_review_is_not_published "
+        "test_a_changed_writer_setup_needs_a_new_review "
+        "test_lane_memory_notes_written_after_review_keep_the_review "
+        "test_the_reviewer_runs_against_the_legacy_helper_publication_writes "
+        "test_a_legacy_helper_changed_after_review_is_named_and_refused "
+        "test_a_question_stays_open_until_planning_clarifies_the_statements "
+        "test_a_legacy_checkout_test_changed_after_review_is_named_and_refused "
+        "test_a_stopped_review_shows_interrupted_and_resumes_from_the_written_bytes "
+        "test_a_stopped_writer_never_promotes_its_partial_files "
+        "test_a_running_recorded_owner_keeps_its_preparation "
+        "test_holds_and_a_question_survive_an_unrelated_issue_edit "
+        "test_an_owner_whose_liveness_is_unknown_is_never_taken_over "
+        "test_main_moving_during_review_is_seen_before_promotion "
+        "test_each_issue_is_prepared_on_main_as_it_is_when_its_turn_comes "
+        "test_writer_and_reviewer_wait_for_machine_admission "
+        "test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test "
+        "test_a_review_that_did_not_see_another_issues_reviewed_tests_is_refused "
+        "test_bytes_read_for_publication_are_the_bytes_checked_even_if_the_checkout_changes_back "
+        "test_preparation_uses_the_current_executor_factory_after_import "
+        "test_a_new_plan_id_does_not_free_an_edit_from_its_statement_route "
+        "test_a_published_behaviour_heading_keeps_the_route_however_the_line_ends "
+        "test_text_quoting_a_behaviour_heading_is_not_the_statement_route "
+        "test_an_edit_of_a_child_its_own_order_prepared_keeps_the_route "
+        "test_another_orders_child_with_the_same_key_stays_legacy "
+        "test_a_mapped_child_edited_as_prepared_by_another_order_keeps_the_route "
+        "test_a_flush_refuses_a_retained_edit_whose_issue_took_the_route_since "
+        "test_preparation_that_arrives_during_publication_stops_a_legacy_edit "
+        "test_preparation_that_arrives_during_publication_stops_a_legacy_child "
+        "test_preparation_that_arrives_during_a_flush_stops_a_legacy_edit "
+        "test_evidence_that_went_stale_during_publication_stops_the_statement_issue "
+        "test_preparation_claims_its_issues_under_the_lock_before_any_agent_starts "
+        "test_another_clones_preparation_cannot_start_inside_a_publication "
+        "test_a_publication_during_another_clones_preparation_is_refused "
+        "test_an_edit_of_a_child_whose_parent_map_failed_keeps_the_route "
+        "test_a_retained_edit_is_refused_when_the_child_is_prepared_before_the_flush "
+        "test_the_childs_own_marker_links_it_to_the_preparation "
+    ),
+    "test_order_red.py": (
+        "test_a_path_outside_the_copy_is_not_checked_and_writes_nothing "
+        "test_local_commits_the_remote_lacks_do_not_decide test_a_test_left_unrun_after_an_early_stop_is_not_red "
+        "test_a_strict_xfail_that_passes_is_not_red test_a_name_that_looks_like_an_option_stays_a_path "
+        "test_a_name_that_selects_a_node_is_not_checked test_a_base_link_outside_the_copy_is_not_run "
+        "test_a_unittest_failure_outside_the_test_body_is_not_red "
+        "test_a_failure_raised_through_the_test_body_is_red "
+    ),
+    "test_reconcile_unit.py": (
+        "test_failed_event_write_is_retried_by_the_next_tick "
+        "test_failed_record_after_event_does_not_repeat_the_event "
+    ),
+    "test_review_conflict_paths.py": (
+        "test_spec_conflicts_keeps_every_distinct_prefixed_line_in_order "
+        "test_code_review_conflict_outside_json_stops_whatever_the_verdict "
+        "test_conflict_round_keeps_the_reviewers_own_verdict_and_classes_beside_it "
+        "test_panel_member_conflict_stops_without_a_merge_call_that_could_drop_it "
+        "test_older_pr_scope_gains_the_spec_conflict_rule_once "
+        "test_panel_member_conflict_wins_over_another_members_usage_limit "
+        "test_panel_conflict_with_reversed_member_orders_and_queued_perspectives "
+        "test_panel_without_conflict_records_quota_and_requeues_once "
+        "test_break_it_conflict_receipt_must_keep_the_reviewers_verdict "
+        "test_break_it_conflict_priority_requires_delivery_of_the_question "
+    ),
+    "test_review_notes_unit.py": (
+        "test_parse_review_keeps_notes_out_of_findings_and_an_all_note_fail_passes "
+        "test_code_review_notes_are_plain_lines_beside_findings "
+        "test_note_normalisation_dedups_whitespace_and_case "
+        "test_fail_with_note_retries_on_findings_only_and_records_note_once "
+        "test_unusable_review_still_records_its_notes_and_hands_off_without_them "
+        "test_native_code_review_notes_are_recorded test_panel_records_every_members_notes_once "
+        "test_saved_review_pasted_into_the_next_prompt_drops_notes "
+        "test_every_implementer_prompt_carries_the_break_it_rule "
+        "test_panel_usage_limit_keeps_completed_members_notes test_every_feedback_channel_drops_note_lines "
+        "test_single_reviewer_limit_response_keeps_its_notes test_panel_limited_response_keeps_its_own_notes "
+        "test_architect_gets_notes_since_its_last_clean_session_and_a_failed_session_uses_none "
+        "test_architect_section_caps_inline_notes_and_counts_the_rest "
+        "test_other_roles_keep_their_prompt_and_the_architect_appends_notes "
+    ),
+    "test_review_pass_scope_unit.py": (
+        "test_off_switch_removes_the_extra_conflict_review "
+        "test_conflict_finding_within_budget_returns_to_the_lane_then_merges "
+        "test_conflict_at_a_later_base_move_can_still_hold "
+        "test_clean_base_update_adds_no_review_and_never_moves_the_boundary "
+        "test_new_pass_after_a_body_edit_sets_a_new_boundary test_only_a_real_reviewer_pass_makes_a_boundary "
+        "test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence "
+        "test_off_switch_keeps_todays_confirmation_after_a_pass "
+        "test_later_fail_on_the_same_body_leaves_the_boundary "
+        "test_missing_pass_commit_or_record_falls_back_to_full_review "
+        "test_unbound_pass_never_names_a_head_and_binding_needs_the_same_tree "
+        "test_only_a_yaml_true_mark_is_an_exemption test_mark_added_only_on_the_branch_grants_nothing "
+        "test_exemption_also_matches_a_path_brought_in_from_main test_scoped_note_reaches_the_issue_once "
+        "test_off_keeps_notes_where_they_were_and_full_review_prompt "
+        "test_body_edit_before_any_pass_keeps_todays_confirmation "
+        "test_review_events_record_the_body_and_only_a_pass_records_a_tree "
+        "test_risk_entry_and_cli_write_and_show_the_mark test_incident_entries_of_this_repository_carry_the_mark "
+    ),
+    "test_review_scoring_unit.py": (
+        "test_a_scorer_edit_is_undone_before_publication test_a_locked_test_the_scorer_wrote_is_not_a_ground "
+        "test_panel_and_single_scoring_both_restore "
+    ),
+    "test_run_check_slot.py": (
+        "test_commands_together_fit_inside_the_hook_timeout "
+        "test_no_time_left_blocks_the_stop_without_starting_the_next_command "
+        "test_hook_settings_and_budget_share_one_timeout test_slot_wait_past_the_hook_deadline_blocks_the_stop "
+        "test_interrupted_check_blocks_the_stop "
+    ),
+    "test_short_merge_lock_unit.py": (
+        "test_base_already_moved_after_ci_is_refreshed_before_queuing "
+        "test_ci_limits_and_registration_grace_restart_for_each_pushed_head "
+        "test_final_conflict_is_resolved_outside_the_lock test_unmerged_run_keeps_both_durations_null "
+        "test_reviewed_head_waits_unlocked_and_rechecks_inside_final_lock "
+        "test_ci_repair_latency_uses_the_last_reviewer_pass test_lock_hold_includes_bookkeeping_after_acquisition "
+        "test_merge_finalization_stays_inside_the_final_lock "
+    ),
+    "test_sleep_credit.py": (
+        "test_without_a_baseline_the_tick_credits_nothing_and_stores_one "
+        "test_a_tick_credits_sleep_since_the_previous_tick test_a_waiting_run_gets_no_sleep_credit "
+        "test_a_run_started_after_the_previous_tick_gets_nothing_from_the_next "
+        "test_progress_after_the_previous_tick_resets_the_stall_credit_first "
+        "test_the_increment_is_clamped_to_the_wall_time_since_the_previous_tick "
+        "test_a_clock_moved_back_credits_nothing test_remaining_runtime_reads_the_run_record_not_the_sensor "
+        "test_a_run_record_without_the_fields_reads_as_zero test_sensor_clock_baselines_are_pruned_by_age_only "
+        "test_only_sleep_above_a_minute_starts_wake_grace "
+        "test_activity_ends_grace_only_for_its_run_and_a_short_sleep_does_not_restart_it "
+        "test_the_tick_report_shows_one_wake_line_only_after_a_long_sleep "
+    ),
+    "test_watch_acorns.py": (
+        "test_folded_lane_keeps_last_finished_running_and_next_waiting "
+        "test_last_finished_follows_merge_time_not_list_order test_unfolded_lane_lists_everything_then_fold_line "
+        "test_idle_lane_folds_to_its_summary_and_unfolds_finished_rows test_no_toggle_line_when_nothing_is_hidden "
+        "test_blocked_issue_counts_as_running_when_folded "
+        "test_a_short_plain_frame_drops_folded_extras_before_other_sections "
+        "test_scroll_stays_within_the_last_full_screen test_scroll_before_any_screen_is_bounded_by_the_last_frame "
+        "test_window_shows_position_line_only_when_taller_than_the_screen test_key_map "
+        "test_enter_and_f_do_nothing_without_an_issue_row_on_screen "
+        "test_wheel_scrolls_and_a_click_on_another_issue_switches_the_box "
+        "test_issue_box_phase_words_and_missing_sections test_osc8_and_screen_sequences "
+        "test_held_issues_beside_a_worker_each_get_a_row test_status_lists_every_held_issue_of_a_lane "
+        "test_queued_rows_do_not_take_the_lanes_phase test_a_frame_draws_the_same_rows_with_or_without_view_state "
+        "test_a_finished_orders_idle_lane_still_offers_its_finished_rows "
+        "test_issue_box_shares_the_rows_state_and_lane "
+        "test_completed_order_merges_stay_reachable_by_click_and_keys "
+        "test_missing_times_show_a_dash_on_every_row_kind test_a_stopped_run_keeps_its_phase_in_row_and_box "
+        "test_links_restore_the_cursor_curses_expects test_footers_list_the_new_keys_from_their_own_feature_file "
+        "test_hits_use_screen_rows_after_a_height_render test_live_view_paints_exactly_render_frames_slice "
+        "test_only_the_first_visible_issue_row_is_highlighted test_closing_the_box_keeps_the_rows_scroll "
+        "test_issue_box_keeps_whitespace_of_goal_title_and_commands "
+        "test_a_wrapped_box_line_joins_back_to_the_exact_text "
+        "test_issue_box_drops_terminal_controls_but_not_spaces "
+        "test_links_are_written_after_every_refresh_even_when_text_is_unchanged "
+        "test_interaction_data_comes_from_the_final_rows_after_trimming "
+        "test_completion_rows_open_a_box_but_do_not_fold test_a_screen_under_three_rows_counts_as_no_height "
+        "test_live_view_under_three_rows_paints_the_start_of_f test_done_summary_and_more_line_are_plain_text "
+        "test_a_refresh_error_takes_the_bottom_row "
+        "test_row_identity_decides_fold_and_box_lane_when_an_issue_shows_twice "
+        "test_a_stateless_height_render_keeps_its_pins_and_counts_only_body_rows "
+        "test_a_refresh_error_over_the_only_body_row_leaves_nothing_to_open "
+        "test_the_top_line_counts_only_running_work_and_only_real_questions "
+    ),
+    "test_watch_dream.py": (
+        "test_status_json_lane_rows_follow_the_running_dream_record "
+        "test_dreaming_row_keeps_the_done_count_in_order_and_drops_it_at_zero "
+        "test_ascii_glyphs_draw_the_bubble_as_brackets "
+        "test_lane_with_waiting_work_shows_its_normal_rows_without_a_bubble "
+        "test_unfolding_a_dreaming_lane_lists_its_finished_issues_below_the_bubble "
+    ),
+    "test_watch_settings.py": (
+        "test_get_without_key_prints_every_setting_nested_or_dotted "
+        "test_live_team_change_asks_in_the_window_and_n_reverts "
+        "test_unchanged_enter_saves_nothing_and_personal_rows_skip_confirmation "
+        "test_read_only_row_and_setter_error_show_one_line_and_save_nothing "
+        "test_window_takes_keys_until_closed_and_tabs_follow_glyphs "
+        "test_m_flips_the_local_override_and_does_nothing_without_a_store "
+        "test_open_window_replaces_the_rows_between_header_and_help "
+        "test_personal_glyph_choice_wins_over_a_repository_auto "
+        "test_get_json_reads_each_scope_from_its_own_file_with_the_quota_override "
+        "test_reviewer_cycles_claude_codex_unset_none_with_their_labels "
+        "test_note_names_the_repository_even_when_it_matches_the_user_value "
+        "test_prompt_counts_unmapped_keys_as_n_but_not_timeouts_or_resizes "
+        "test_short_screen_scrolls_to_the_selected_row_and_the_prompt "
+        "test_short_screen_keeps_header_tabs_prompt_and_help_around_the_window "
+        "test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot "
+        "test_runner_unit_tests_automatic_names_the_choice_that_applies "
+        "test_settings_window_draws_the_runner_row_through_its_own_module "
+    ),
+    "test_watch_workers.py": (
+        "test_workers_are_numbered_in_start_order_not_issue_order test_start_time_ties_break_by_issue_number "
+        "test_numbers_are_positions_among_current_workers test_a_lane_with_workers_shows_only_their_rows "
+        "test_orchestrator_claim_needs_a_fresh_heartbeat test_idle_project_without_heartbeat_claims_nothing "
+        "test_stale_gate_heartbeat_warns_on_the_first_line test_log_age_decides_working_or_quiet "
+        "test_rows_list_several_workers_in_start_order test_each_worker_row_shows_its_own_state "
+        "test_elapsed_counts_from_each_runs_start "
+    ),
+    "test_worker_budget_unit.py": (
+        "test_recorded_runner_birth_is_available_before_execution "
+        "test_direct_rerun_panel_uses_n_slots_and_merges_once test_admission_waits_as_long_as_the_run_may_take "
+        "test_a_running_record_is_no_reservation_unless_its_pid_is_this_live_process "
+        "test_direct_admission_judges_a_reservation_by_the_clock_that_wrote_it "
+        "test_other_workloads_judge_a_reservation_by_their_own_clock "
+        "test_runner_entries_admit_their_reservation_by_the_context_clock "
+    ),
+}
