@@ -1,5 +1,9 @@
 """Scene regressions: decorative glyphs, authored selection and shared elision."""
 from datetime import timedelta
+import os
+from pathlib import Path
+import re
+import unicodedata
 
 import pytest
 
@@ -9,6 +13,14 @@ from foragent.state import StateStore
 from foragent.watch_sections import lane_blocks, lane_bubble
 from test_watch import NOW
 from test_watch_scene_review import _snapshot
+
+
+def cells(value):
+    """Terminal cells of rendered text, as terminals draw it: marks and format characters take
+    none, wide and full-width characters and the squirrel emoji (narrow by Unicode) take two."""
+    return sum(0 if unicodedata.combining(char) or unicodedata.category(char) in {'Mn', 'Me', 'Cf'}
+               else 2 if char == '\N{CHIPMUNK}' or unicodedata.east_asian_width(char) in 'WF' else 1
+               for char in value)
 
 
 def row(slug='work'):
@@ -23,7 +35,7 @@ def test_scene_decorations_follow_ascii_mode_without_pixels(language, mode, tmp_
 
     monkeypatch.setenv('TERM', 'xterm-256color')
     monkeypatch.setenv('LC_ALL', 'C' if mode == 'non-utf8' else 'C.UTF-8')
-    config = Config(language=language, view_glyphs='auto' if mode == 'non-utf8' else 'ascii',
+    config = Config(language=language, view_glyphs='auto' if mode == 'non-utf8' else 'ascii', stall_minutes=10,
                     lanes={'work': {'paths': ['src/']}, 'rest-a': {}, 'rest-b': {}})
     work = row()
     snapshot = _snapshot(work, today=1, today_done={'rest-a': 1},
@@ -45,13 +57,14 @@ def test_scene_decorations_follow_ascii_mode_without_pixels(language, mode, tmp_
         if language == 'en':
             assert value.isascii(), value
     snapshot.status['issues'] = {}
-    one = ''.join(value for line in lane_bubble._bar(snapshot, language, 120, '...', ascii=True)
-                  for value, _ in line)
+    one = '\n'.join(''.join(value for value, _ in line)
+                    for line in lane_bubble.render(snapshot, config, tmp_path, width=120, now=NOW, state={}))
     assert '100% |' in one and '·' not in one
-    monkeypatch.setattr(watch, '_activity', lambda *args: '○ looks stalled 10 min')
+    # A live worker that has been silent for 15 minutes, past the configured stall limit.
     item = {'number': 2, 'state': 'working', 'phase': 'implementing',
-            'run': {'started_at': NOW.isoformat()}}
-    assert watch_scene.activity_warning(snapshot, config, work, item, NOW) == 'o looks stalled 10 min'
+            'run': {'pid': os.getpid(), 'started_at': (NOW - timedelta(minutes=15)).isoformat()}}
+    assert watch_scene.activity_warning(snapshot, config, work, item, NOW) == (
+        'o looks stalled 15 min' if language == 'en' else 'o 멈춘 듯 15분')
 
 
 def test_ascii_templates_preserve_literal_middle_dots_in_names_paths_and_reasons():
@@ -209,32 +222,56 @@ def test_selected_authored_wait_uses_the_ascii_mark_when_its_reason_is_clipped(l
     top = next(i for i, line in enumerate(lines) if line.startswith('+'))
     body = '\n'.join(lines[top:top + 8])
     assert '...' in body and '…' not in body
-    assert 'Long reason' in body and all(watch._cells(line) <= 50 for line in lines)
+    assert 'Long reason' in body and all(cells(line) <= 50 for line in lines)
 
 
 @pytest.mark.parametrize('mark', ['…', '...'])
 @pytest.mark.parametrize('width', [0, 1, 2, 3, 8])
-def test_shared_elision_bounds_cells_and_marks_forced_omissions(mark, width):
+def test_shared_elision_bounds_cells_and_marks_forced_omissions(mark, width, tmp_path, monkeypatch):
     from foragent.watch_scene import fit_marked
 
     cut = fit_marked([('한글 suffix', 'bold')], width, mark)
     value = ''.join(part for part, _ in cut)
-    assert watch._cells(value) <= width
-    if width >= watch._cells(mark):
+    assert cells(value) <= width
+    if width >= cells(mark):
         assert value.endswith(mark)
     else:
         assert value == mark[:width]
     literal = [('literal  data', 'dim')]
     assert fit_marked(literal, 30, mark) == literal
-    forced = lane_bubble._clip([[('x', 'bold')], [('hidden', 'dim')]], 8, mark, limit=1)
-    assert ''.join(part for part, _ in forced[0]) == 'x' + mark
+    forced = fit_marked([('x', 'bold')], 8, mark, omitted=True)
+    assert ''.join(part for part, _ in forced) == 'x' + mark
+    # The bubble's own cut: a lane name that wraps past the rows its later rows leave it ends its
+    # last kept row in the mark, even when that row would fit, and the later rows stay.
+    work = {**row(), 'lane_display': ' '.join(f'word{index}' for index in range(30)), 'state': 'working',
+            'phase': 'implementing', 'running': [{'number': 2, 'title': 'Choice'}], 'queued': []}
+    monkeypatch.setenv('TERM', 'xterm-256color')
+    monkeypatch.setenv('LC_ALL', 'C.UTF-8')
+    snapshot = _snapshot(work)
+    snapshot.status['active_runs'] = [{
+        'number': 2, 'lane': 'work', 'phase': 'implementing',
+        'started_at': (NOW - timedelta(minutes=30)).isoformat(),
+        'phase_started_at': (NOW - timedelta(minutes=12)).isoformat()}]
+    config = Config(language='en', view_glyphs='ascii' if mark == '...' else 'emoji', lanes={'work': {}})
+    rows = [''.join(value for value, _ in line)[2:-2].rstrip() for line in lane_bubble.render(
+        snapshot, config, tmp_path, width=40, now=NOW, state={'explanation_target': ('acorn', 2)})[1:-1]]
+    assert rows[0] == '#2 Choice' and rows[1].startswith('lane word0'), rows
+    assert rows[2].endswith(mark), rows
+    assert rows[3:5] == ['writing code', '12m in this step'], rows
+    assert 'word29' not in '\n'.join(rows)
 
 
-def test_fitting_explanation_rows_remove_controls_but_keep_authored_spaces():
-    rows = lane_bubble._explanation_rows([
-        [('lane a\nb\tc\x1b[31m', '')], [('Waiting: Choice  pending', 'dim')]], 80, '...')
-    assert [''.join(value for value, _ in line) for line in rows] == [
-        'lane a b c[31m', 'Waiting: Choice  pending']
+def test_fitting_explanation_rows_remove_controls_but_keep_authored_spaces(tmp_path):
+    work = {**row(), 'lane_display': 'a\nb\tc\x1b[31m'}
+    snapshot = _snapshot(work, waiting_facts={2: {'lane': 'work', 'title': 'Choice', 'authored': {
+        'text': 'Original wait', 'reason': 'Choice  pending', 'next_condition': 'Record locale',
+        'responsible_role': 'planner'}}})
+    config = Config(language='en', view_glyphs='ascii', lanes={'work': {}})
+    rows = [''.join(value for value, _ in line) for line in lane_bubble.render(
+        snapshot, config, tmp_path, width=80, now=NOW, state={'explanation_target': ('acorn', 2)})]
+    body = [line.strip('| ').rstrip() for line in rows]
+    assert body[body.index('#2 Choice') + 1:][:2] == ['lane a b c[31m', 'Waiting: Choice  pending'], rows
+    assert not any(char in line for line in rows for char in '\n\t\x1b')
 
 
 @pytest.mark.parametrize('language', ['en', 'ko'])
@@ -320,13 +357,27 @@ def test_resolved_authored_lane_still_routes_one_acorn_to_its_recorded_lane(lang
 
 
 def _phases_the_runner_sets():
-    """Every literal phase passed to the runner's phase setters, read from the source."""
+    """Every literal phase passed to the runner's phase setters, read from the source.
+
+    A setter is any function or class of the module that defines ``run_waits.in_phase`` which
+    takes a ``phase`` parameter, so a new setter there is scanned without being named here."""
     import ast
+    import inspect
     from pathlib import Path
 
     import foragent
+    from foragent import run_waits
 
-    setters = {"_phase", "in_phase", "_credited_wait", "WaitPhase"}
+    def takes_phase(node):
+        if isinstance(node, ast.ClassDef):
+            node = next((item for item in node.body if isinstance(item, ast.FunctionDef)
+                         and item.name == "__init__"), None)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        return any(arg.arg == "phase" for arg in node.args.args + node.args.kwonlyargs)
+
+    module = ast.parse(Path(inspect.getsourcefile(inspect.unwrap(run_waits.in_phase))).read_text(encoding="utf-8"))
+    setters = {node.name for node in module.body if takes_phase(node)}
     found = set()
     for path in Path(foragent.__file__).parent.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -336,13 +387,23 @@ def _phases_the_runner_sets():
     return found
 
 
-def _worker(phase, state="working"):
-    return {"number": 7, "class": "wait" if phase in WAIT_PHASES or state == "blocked" else "working",
-            "phase": phase, "state": state}
-
-
 WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait",
                         "run-slot-wait"})
+
+
+def _acorn_word(work, language, **extra):
+    """The word beside #7 on the lane's drawn acorn: '' when the acorn shows its number alone."""
+    config = Config(language=language, view_glyphs="ascii", lanes={"work": {}})
+    lines = lane_blocks.render(_snapshot(work, **extra), config, Path("."), width=120, now=NOW)
+    found = re.findall(r"\[#7(?: ([^\]]*))?\]", "\n".join("".join(value for value, _ in line) for line in lines))
+    assert len(found) == 1, found
+    return found[0]
+
+
+def _working(phase, state="working"):
+    """One lane whose issue #7 is in ``phase``: running, or held when blocked."""
+    listing = "held" if state == "blocked" else "running"
+    return {"slug": "work", "state": state, "issue": 7, "phase": phase, listing: [{"number": 7, "state": state}]}
 
 
 def test_the_source_scan_finds_the_phases_of_each_setter():
@@ -358,13 +419,9 @@ def test_every_phase_the_runner_can_set_has_a_word_on_the_acorn(phase, language)
     from foragent import watch_scene
 
     assert watch_scene.WAIT_PHASES == WAIT_PHASES
-    snapshot = _snapshot(row())
-    current, _ = watch_scene.lane_items(snapshot, {
-        "slug": "work", "state": "working", "issue": 7, "phase": phase, "running": [{"number": 7}]})
-    word = lane_blocks._word(current[0], language)
+    word = _acorn_word(_working(phase), language)
     assert word and word.strip(), f"{phase} leaves the acorn with only its number"
     assert word != watch.text("lane_blocks_word_wait", language), f"{phase} has no word of its own"
-    assert f"#7 {word}" in "".join(value for value, _ in lane_blocks._acorn(current[0], language, 0, True))
 
 
 @pytest.mark.parametrize("language, phase, word", [
@@ -376,19 +433,25 @@ def test_every_phase_the_runner_can_set_has_a_word_on_the_acorn(phase, language)
     ("en", None, "prep"), ("ko", None, "준비"),
 ])
 def test_a_worker_says_what_it_waits_for_or_that_it_is_preparing(language, phase, word):
-    assert lane_blocks._word(_worker(phase), language) == word
+    assert _acorn_word(_working(phase), language) == word
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
 def test_an_unknown_phase_or_a_block_shows_the_generic_wait_word_never_blank(language):
     generic = watch.text("lane_blocks_word_wait", language)
-    assert generic and lane_blocks._word(_worker("a-phase-from-tomorrow"), language) == generic
-    assert lane_blocks._word(_worker("implementing", "blocked"), language) == generic
+    assert generic and _acorn_word(_working("a-phase-from-tomorrow"), language) == generic
+    assert _acorn_word(_working("implementing", "blocked"), language) == generic
 
 
 def test_queued_work_still_says_nothing_beside_its_number():
-    for kind in ("next", "authored"):
-        assert lane_blocks._word({"class": kind, "phase": None}, "en") == ""
+    from foragent import watch_scene
+
+    work = {"slug": "work", "state": "queued", "issue": 7, "queued": [{"number": 7}]}
+    authored = {7: {"lane": "work", "authored": {"text": "Recorded wait"}}}
+    for kind, extra in (("next", {}), ("authored", {"waiting_facts": authored})):
+        _, upcoming = watch_scene.lane_items(_snapshot(work, **extra), work)
+        assert [item["class"] for item in upcoming] == [kind]
+        assert _acorn_word(work, "en", **extra) == ""
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
