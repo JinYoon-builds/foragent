@@ -22,7 +22,9 @@ def add(commands) -> None:
     watch_command = actions.add_parser("watch", help="Watch the lane conveyor")
     watch_command.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     watch_command.add_argument("--once", action="store_true")
-    watch_command.add_argument("--open", action="store_true", help="Open the view in a split or new window and return")
+    open_view = watch_command.add_argument(
+        "--open", action="store_true", help="Open the view in a split or new window and return")
+    open_view.pm_task = "open the dashboard"
     run_issue = actions.add_parser("run-issue", help="Run one approved issue")
     run_issue.add_argument("number", type=int)
     run_issue.add_argument("--repo-root", type=cli.Path, required=True)
