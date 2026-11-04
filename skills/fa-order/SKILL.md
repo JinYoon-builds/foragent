@@ -64,7 +64,7 @@ fa command, as an `issues[]` entry in the order, and let it go through the same 
 
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
-then `fa gate watch --open` so the lane view is available while the order is prepared.
+then `fa gate watch --open` so the dashboard is open while the order is prepared.
 Report facts after every preparation step with `fa order progress`; its JSON output is
 the persisted state shared with the view. Bubble text is built deterministically from
 these facts, with no LLM calls or separate model generation for bubbles.
@@ -475,7 +475,8 @@ takes over its work; it only makes sure one runs and talks to it:
 - Run `fa orch alive --json`. If it prints `"alive": false`, run `fa orch ensure`. It
   opens one orchestrator in the background and prints one line; when it opened nothing,
   tell the user that line. If the orchestrator is already alive, do not start a second one.
-- Open the lane view beside this planning session with `fa gate watch --open`.
+- Open the dashboard beside this planning session yourself with `fa gate watch --open`;
+  it leaves an open dashboard as it is. Never ask the person to type a dashboard command.
 - Send every request to the orchestrator twice: as a cross-session message to the
   `orch: <project>` session (SendMessage) and with
   `fa orch request --from planning --text "<request>"`, so it survives a restart.
