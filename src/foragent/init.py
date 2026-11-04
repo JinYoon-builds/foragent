@@ -285,9 +285,11 @@ def init_repo(
         key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
         raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
 
-    fixes = [item["fix"] for item in setup.checklist(auth_status) if not item["ok"]]
+    items = setup.checklist(auth_status, language=preflight_language)
+    failed = [item for item in items if not item["ok"]]
+    fixes = [item["fix"] for item in failed if not item.get("advice", False)]
     if fixes:
-        raise TrackerError(text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes)))
+        raise TrackerError(text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {item['fix']}" for item in failed)))
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
@@ -295,7 +297,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
-    notes: list[str] = []
+    notes: list[str] = [item["fix"] for item in failed if item.get("advice", False)]
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch

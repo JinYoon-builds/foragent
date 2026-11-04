@@ -167,6 +167,8 @@ def setup(tmp_path, monkeypatch):
     run = subprocess.run
 
     def offline_tools(argv, *args, **kwargs):
+        if argv[:2] == ["pmset", "-g"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=" sleep 0\n", stderr="")
         if argv == ["codex", "login", "status"]:
             return subprocess.CompletedProcess(argv, 0, stdout="Logged in using ChatGPT\n", stderr="")
         if argv == ["claude", "auth", "status"]:
@@ -1768,3 +1770,62 @@ def test_fa_allow_preserves_invalid_nested_settings(tmp_path, monkeypatch, setti
     assert offer_fa_allow(root, answer) == "unreadable"
     assert local.read_text() == original
     assert not fa_allow_record_path().exists()
+
+
+@pytest.mark.parametrize("language_source", ["default", "flag", "config"])
+@pytest.mark.parametrize("blocked", [False, True])
+def test_sleep_advice_does_not_block_init(setup, monkeypatch, language_source, blocked):
+    from foragent import setup as checklist
+
+    monkeypatch.setattr(checklist.sys, "platform", "darwin")
+    run = subprocess.run
+
+    def power_probe(argv, *args, **kwargs):
+        if argv[:2] == ["pmset", "-g"]:
+            output = " sleep 1\n" if argv == ["pmset", "-g"] else "Listed by owning process:\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", power_probe)
+    language = "en" if language_source == "default" else "ko"
+    if language_source == "config":
+        (setup.root / ".foragent.yml").write_text("language: ko\n")
+    if blocked:
+        gh_run = setup.run_gh
+        monkeypatch.setattr(setup, "run_gh", lambda args, input=None:
+                            "github.com\n  ✓ Logged in to github.com account human\n  - Token scopes: 'repo'\n"
+                            if args == ["auth", "status"] else gh_run(args, input))
+    item = checklist.checklist("", language=language)[-1]
+    assert item == {"id": "no-idle-sleep", "ok": False, "advice": True,
+                    "fix": text("setup_no_idle_sleep_fix", language)}
+    kwargs = {"language": language} if language_source == "flag" else {}
+    if blocked:
+        with pytest.raises(TrackerError) as error:
+            setup.init(no_launchd=True, **kwargs)
+        output = str(error.value)
+        assert "gh auth refresh -h github.com -s project" in output
+    else:
+        output = setup.init(no_launchd=True, **kwargs).summary()
+    assert item["fix"] in output
+    other_language = "ko" if language == "en" else "en"
+    assert text("setup_no_idle_sleep_fix", other_language) not in output
+    if not blocked:
+        assert (setup.root / ".foragent.yml").is_file(), "advice must let real init finish"
+    assert setup.installs == []
+
+
+@pytest.mark.parametrize("kind, details, expected", [
+    ("PreventUserIdleSystemSleep", "Details: caffeinate asserting forever", True),
+    ("PreventSystemSleep", "Details: caffeinate asserting forever", True),
+    ("PreventUserIdleDisplaySleep", "Details: caffeinate asserting forever", False),
+    ("PreventSystemSleep", "Details: caffeinate asserting on behalf of Process ID 42", False),
+    ("PreventSystemSleep", "Details: caffeinate asserting for 300 secs", False),
+    ("PreventSystemSleep", "Details: caffeinate asserting forever\n\tCreated for PID: 42", False),
+    ("PreventSystemSleep", "Details: caffeinate asserting forever\n\tTimeout will fire in 3 secs", False),
+    ("PreventSystemSleep", "named: temporary activity", False),
+])
+def test_standing_sleep_assertion_lifetime(kind, details, expected):
+    from foragent.setup import _standing_blocker
+
+    assertion = f'   pid 123(caffeinate): [0x123] 01:00:00 {kind} named: "blocker"\n\t{details}\n'
+    assert _standing_blocker(assertion) is expected

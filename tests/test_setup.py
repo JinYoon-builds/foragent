@@ -14,6 +14,20 @@ from test_init import setup
 FIX = "gh auth refresh -h github.com -s project"
 
 
+@pytest.fixture(autouse=True)
+def awake_machine(monkeypatch):
+    """Scope tests must not depend on the host's power settings or blockers."""
+    monkeypatch.setattr(checklist_setup.sys, "platform", "darwin")
+    run = subprocess.run
+
+    def probe(argv, *args, **kwargs):
+        if argv == ["pmset", "-g"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=" sleep 0\n", stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", probe)
+
+
 def account(scopes=None, *, active=True, host="github.com", name="human"):
     return (f"{host}\n  ✓ Logged in to {host} account {name} (keyring)\n"
             f"  - Active account: {str(active).lower()}\n" +
@@ -63,7 +77,10 @@ def test_doctor_and_init_read_both_auth_streams(tmp_path, monkeypatch, capsys, s
 
     monkeypatch.setattr(gh, "run", run)
     assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(tmp_path)]) == 1
-    assert json.loads(capsys.readouterr().out) == {"items": [{"id": "gh-project-scope", "ok": False, "fix": FIX}]}
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert [item for item in items if item["id"] == "gh-project-scope"] == [
+        {"id": "gh-project-scope", "ok": False, "fix": FIX},
+    ]
     assert checklist_setup.checklist(_run_gh(["auth", "status"]))[0]["fix"] == FIX
     assert calls == [["auth", "status"], ["auth", "status"]]
 
@@ -102,9 +119,9 @@ def test_init_stops_at_shared_checklist_before_setup(setup, monkeypatch, dry_run
 
 def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, capsys):
     monkeypatch.setattr(checklist_setup, "CHECKS", (
-        lambda status: {"id": "earlier", "ok": False, "fix": "first fix"},
+        lambda status, *, language="en": {"id": "earlier", "ok": False, "fix": "first fix"},
         checklist_setup.gh_project_scope,
-        lambda status: {"id": "later", "ok": False, "fix": "last fix"},
+        lambda status, *, language="en": {"id": "later", "ok": False, "fix": "last fix"},
     ))
     monkeypatch.setattr(gh, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, "", ""))
     assert cli.main(["doctor", "--setup", "--repo-root", str(setup.root)]) == 1
@@ -113,3 +130,31 @@ def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, c
     with pytest.raises(TrackerError) as error:
         setup.init()
     assert str(error.value).index("first fix") < str(error.value).index("last fix")
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_doctor_sleep_advice_uses_repo_language(tmp_path, monkeypatch, capsys, language, json_output):
+    from foragent.i18n import text
+
+    run = subprocess.run
+
+    def power_probe(argv, *args, **kwargs):
+        if argv[:2] == ["pmset", "-g"]:
+            output = " sleep 1\n" if argv == ["pmset", "-g"] else "Listed by owning process:\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", power_probe)
+    monkeypatch.setattr(gh, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, account("'project'"), ""))
+    (tmp_path / ".foragent.yml").write_text(f"language: {language}\n")
+    args = ["doctor", "--setup", "--repo-root", str(tmp_path)]
+    assert cli.main([*args, *(["--json"] if json_output else [])]) == 1
+    output = capsys.readouterr().out
+    expected = text("setup_no_idle_sleep_fix", language)
+    if json_output:
+        items = json.loads(output)["items"]
+        item = next(item for item in items if item["id"] == "no-idle-sleep")
+        assert item == {"id": "no-idle-sleep", "ok": False, "advice": True, "fix": expected}
+    else:
+        assert expected in output
