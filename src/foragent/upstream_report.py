@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 import foragent
+from foragent.file_cache import read_lines
 from foragent.orch_tick_outcome import LOG_FILE as TICK_FAILURE_LOG
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
@@ -88,8 +89,9 @@ def _source(store: StateStore, source: str) -> tuple[list[tuple[str, str]], int 
             raise ReportError("report_source_missing")
         return _issue_records(store, flag.number), flag.number, "flag"
     try:
-        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
-        event = json.loads(lines[int(number) - 1])
+        lines = read_lines(store.root / "orch-events.jsonl").require_utf8().lines
+        line = lines[int(number) - 1]
+        event = line.parsed()
     except (FileNotFoundError, IndexError, ValueError):
         raise ReportError("report_source_missing") from None
     issue = event.get("issue")

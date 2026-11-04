@@ -205,3 +205,95 @@ def test_tolerant_append_recovers_incomplete_line_and_strict_history_still_raise
     assert file_cache.read_jsonl(path, tolerant=True) == [{"n": 1}, {"n": 2}]
     path.unlink()
     assert file_cache.read_jsonl(path, tolerant=True) == []
+
+
+def test_reader_policies_share_one_parse_even_after_a_strict_error(tmp_path, monkeypatch):
+    path = tmp_path / 'orch-events.jsonl'
+    path.write_bytes(b'{"cache_probe": true, "text": "\xff"}\n[]\nmalformed\n')
+    parsed = count_parses(monkeypatch)
+    assert file_cache.read_jsonl(path, tolerant=True, errors='replace') == [
+        {'cache_probe': True, 'text': '\ufffd'}]
+    with pytest.raises(UnicodeDecodeError):
+        file_cache.read_jsonl(path, tolerant=True)
+    with pytest.raises(ValueError):
+        file_cache.read_jsonl(path, errors='replace')
+    assert file_cache.read_jsonl(path, tolerant=True, errors='replace')[0]['text'] == '\ufffd'
+    assert len(parsed) == 1
+
+
+def test_json_readers_share_one_value_and_see_restored_mtime_changes(tmp_path, monkeypatch):
+    from foragent import gates
+
+    store = StateStore(tmp_path)
+    path = tmp_path / 'issues.json'
+    path.write_text('{"issues": {}, "cache_probe": true, "revision": 1}')
+    parsed = count_parses(monkeypatch)
+    assert store.issues_revision() == 1
+    assert gates._read_json(path)['revision'] == 1
+    assert len(parsed) == 1
+    before = path.stat()
+    path.write_text(path.read_text().replace('"revision": 1', '"revision": 2'))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert gates._read_json(path)['revision'] == 2
+    assert StateStore(tmp_path).issues_revision() == 2
+    assert len(parsed) == 2
+
+
+def test_notice_tail_reuses_lines_and_preserves_byte_cut_and_error_numbers(tmp_path, monkeypatch):
+    from foragent import orch_inbox
+
+    store = StateStore(tmp_path, now=lambda: NOW)
+    path = tmp_path / 'orch-events.jsonl'
+    event = {'at': NOW.isoformat(), 'kind': 'notification', 'summary': '한글\u2028tail',
+             'status': 'sent', 'cache_probe': True}
+    # Use the actual notice kind; a literal Unicode separator remains inside one LF record.
+    event['kind'] = orch_inbox.NOTICE_KIND
+    last = json.dumps(event, ensure_ascii=False).encode() + b'\n'
+    first = b'{"kind":"note","padding":"xxxxxxxxxxxxxxxx"}\n'
+    path.write_bytes(first + b'broken\n' + last)
+    parsed = count_parses(monkeypatch)
+    monkeypatch.setattr(orch_inbox, 'NOTICE_TAIL_BYTES', len(last) + len(b'broken\n') + 2)
+    file_cache.read_jsonl(path, tolerant=True, errors='replace')
+    notices, problems = orch_inbox.recent_notices(store, NOW.replace(hour=1))
+    assert notices == []  # The record is before the requested window.
+    assert problems == ['orch-events.jsonl: tail line 1 unreadable (JSONDecodeError)']
+    notices, problems = orch_inbox.recent_notices(store, NOW.replace(year=2025))
+    assert notices == [event]
+    assert problems[0].startswith('orch-events.jsonl: only the last ')
+    notices[0]['summary'] = 'caller mutation'
+    assert orch_inbox.recent_notices(store, NOW.replace(year=2025))[0] == [event]
+    assert len(parsed) == 1
+    # A cut exactly after LF retains the next complete line, too.
+    monkeypatch.setattr(orch_inbox, 'NOTICE_TAIL_BYTES', len(last))
+    assert orch_inbox.recent_notices(store, NOW.replace(year=2025))[0] == [event]
+
+
+def test_temporary_facts_reads_release_values_when_their_files_disappear(tmp_path):
+    import weakref
+
+    path = tmp_path / 'orch-events.jsonl'
+    path.write_text('{"summary":"snapshot"}\n')
+    # A weak reference observes retained parsed objects without depending on the cache's shape.
+    class Value(dict):
+        pass
+    with file_cache.temporary_reads(tmp_path):
+        value = file_cache.read(path, lambda data: Value(json.loads(data)))
+        reference = weakref.ref(value)
+        assert file_cache.read(path, lambda data: pytest.fail('parsed twice')) is value
+    del value
+    assert reference() is None
+
+
+def test_transcript_raw_selection_keeps_escaped_and_unrelated_bad_rows_out(tmp_path, monkeypatch):
+    from foragent import orch_refresh
+
+    path = tmp_path / 'transcript.jsonl'
+    event = {'type': 'system', 'subtype': 'compact_boundary', 'sessionId': 's', 'cache_probe': True}
+    row = json.dumps(event)
+    # The old transcript reader selects the literal word before parsing JSON.
+    path.write_text('[' * 2000 + '\n' + row.replace('compact_boundary', 'compact_\\u0062oundary') + '\n'
+                    + row + '\n')
+    parsed = count_parses(monkeypatch)
+    assert orch_refresh.compactions(path, 's') == 1
+    assert orch_refresh.compactions(path, 's') == 1
+    assert len(parsed) == 2

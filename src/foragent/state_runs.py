@@ -212,7 +212,7 @@ class RunRecordsMixin:
             self._write_json(path, value)
             if value["status"] == "finished":
                 history = self.root / "runs.jsonl"
-                rows = [_state.json.loads(line) for line in history.read_text().splitlines()] if history.exists() else []
+                rows = read_jsonl(history)
                 if not any(row["number"] == number and row["started_at"] == started_at
                            and row.get("owner_merge") == fact
                            and row.get("owner_merge_started_at") == started_at for row in rows):
