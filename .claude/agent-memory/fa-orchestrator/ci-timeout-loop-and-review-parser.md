@@ -16,3 +16,5 @@ Three lessons from 2026-11-04 (scorecard: phase ci 2.4 -> 15.8 min, merge rate 3
 3. **An issue number is not its PR.** I reported #1825 as merged; it was the issue, its PR #1833 was still open. Check `gh pr view <PR> --json state` before saying a fix landed.
 
 Related: [[read-result-before-reporting]], [[publish-moves-main-stale-heads]].
+
+4. **Resolve works once the GitHub queue drains, and must quote the current PR head.** 11-04 08:50Z: with 0 queued runs, resolving seven CI-timeout holds on their current heads moved all to the merge owner; earlier resolves quoted a superseded head (architect r585). Check `gh run list --status queued` first; while it is high, a pause of other lanes plus waiting beats repeated resolves.
