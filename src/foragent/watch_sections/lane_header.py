@@ -31,7 +31,7 @@ def _questions(status: dict[str, Any], snapshot: Snapshot | None = None) -> int:
     in the needs-human group. Parked work waiting for a person and open PRs also count
     as waiting_human in the summary, but they ask nothing, so the summary is not a fallback.
     """
-    if snapshot is not None and snapshot.questions is not None:
+    if snapshot is not None and (snapshot.questions is not None or snapshot.now_view is not None):
         from foragent import watch_scene
 
         return watch_scene.person_questions(snapshot)

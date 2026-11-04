@@ -20,7 +20,15 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     """The first non-None answer from the sections' optional ``explain``, in ORDER."""
     from foragent import watch_layout
 
-    for section in watch_layout._sections():
+    if snapshot.now_view is not None:
+        from foragent import watch_now
+
+        sections = watch_now.sections()
+        snapshot = watch_now.details(target, snapshot, config, repo_root, now=now,
+                                     state=state if state is not None else {})
+    else:
+        sections = watch_layout._sections()
+    for section in sections:
         provider = getattr(section, "explain", None)
         if provider is None:
             continue

@@ -70,6 +70,8 @@ def _segment(snapshot: Snapshot, role: str, language: str, now: datetime) -> tup
     alive, short, called = _facts(snapshot, role)
     name = watch.text(f"lane_explainers_name_{role}", language)
     if alive:
+        if snapshot.now_view is not None:
+            return name + " · " + watch.text("lane_explainers_click_alive", language), "working"
         reason = _one_row(short) if short else watch.text("lane_explainers_no_short", language)
         return watch.text(f"lane_explainers_alive_{role}", language, short=reason), "working"
     parts = _age_parts(called, now)
@@ -89,6 +91,13 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     if together:
         rows = [[segments[0], (ROLE_GAP, ""), segments[1]]]
         places = [(0, top), (watch._cells(segments[0][0]) + len(ROLE_GAP), top)]
+    elif snapshot.now_view is not None:
+        # The main scene keeps its single roles line even on a phone.
+        left = max(1, (width - len(ROLE_GAP)) // 2)
+        mark = _ellipsis(config)
+        rows = [[*watch._fit(watch_scene.fit_marked([segments[0]], left, mark), left), (ROLE_GAP, ""),
+                 *watch_scene.fit_marked([segments[1]], max(1, width - left - len(ROLE_GAP)), mark)]]
+        places = [(0, top), (left + len(ROLE_GAP), top)]
     else:
         mark = _ellipsis(config)
         rows = [watch_scene.fit_marked([segment], width, mark) for segment in segments]

@@ -209,10 +209,6 @@ def run(args) -> int:
         if args.open:
             cli.watch_open.open_view(root, store, config.language)
         else:
-            observation = store.issues_observation()
-            if observation["as_of"] is None and observation["error"] is None:
-                # Never observed: seed the snapshot once; refreshes stay local.
-                cli._refresh_status(tracker, store, config)
             cli.watch.run(
                 lambda: cli._status(tracker, store, config), tracker, store, config, root,
                 once=args.once, now=lambda: cli.datetime.now(cli.UTC),

@@ -90,7 +90,9 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
-        with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
+        from foragent import watch_now
+
+        with watch_now.publishing(ctx), scheduler_housekeeping.after_tick(ctx) as done:
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
             memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
             timed("role_memory_publish", orch_role_memory.publish, ctx, memory)

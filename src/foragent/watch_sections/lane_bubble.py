@@ -3,8 +3,9 @@
 The bubble says what the lanes are doing (work, waiting, the finish estimate, questions,
 the planning request being handled, today's newest merges and a hint), or explains the
 selected target through watch_explanations; acorns are explained here. From 80 columns
-the sprite stands left of the bubble with its mouth on row 3; narrower, or without
-pixels (ASCII, a non-UTF-8 terminal or animation off), the bubble takes the whole width.
+the sprite stands left of the bubble with its mouth on row 3; narrower, it stands
+above the full-width bubble. Without pixels (ASCII, a non-UTF-8 terminal or animation
+off), the bubble takes the whole width.
 The bar under the bubble counts today's merges against them plus the approved work left.
 """
 
@@ -54,6 +55,8 @@ def latest_merges(snapshot: Snapshot) -> list[int]:
 
     Ties keep the map's order; a hand-built map obeys the same window as a collected one.
     """
+    if snapshot.now_view is not None:
+        return snapshot.now_view.get("summary", {}).get("merges", [])
     captured = _aware(snapshot.captured_at)
     midnight = captured.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     timed = [(number, _aware(moment)) for number, moment in (snapshot.merged_at or {}).items()
@@ -64,6 +67,9 @@ def latest_merges(snapshot: Snapshot) -> list[int]:
 
 def bar_counts(snapshot: Snapshot) -> tuple[int, int]:
     """(done, total): today's merges, and those plus the distinct approved issues left."""
+    if snapshot.now_view is not None:
+        summary = snapshot.now_view.get("summary", {})
+        return summary.get("today", 0), summary.get("total", 0)
     issues = snapshot.status.get("issues")
     left = {item.get("number") for name in REMAINING
             for item in ((issues or {}).get(name) or () if isinstance(issues, dict) else ())
@@ -97,6 +103,15 @@ def _clock(at: datetime, now: datetime, language: str) -> str:
     return progress._when(at, now, language, f"{local.hour:02}:{local.minute:02}")
 
 
+def work_summary(issues: int, lanes: int, language: str) -> str:
+    from foragent import watch
+
+    key = ("lane_bubble_idle" if not issues else "lane_bubble_working_one_each" if issues == 1 and lanes == 1
+           else "lane_bubble_working_one_issue" if issues == 1
+           else "lane_bubble_working_one_lane" if lanes == 1 else "lane_bubble_working")
+    return watch.text(key, language, issues=issues, lanes=lanes)
+
+
 def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str, str, str]]:
     """The default sentences in order, as (role, text, style)."""
     from foragent import watch, watch_scene
@@ -105,16 +120,13 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
     t = lambda key, **values: watch.text(key, language, **values)
     rows = watch_scene.lane_rows(status)
     sentences: list[tuple[str, str, str]] = []
-    issues = sum(len(row.get("running") or ()) for row in rows)
-    lanes = sum(bool(row.get("running")) for row in rows)
-    if issues:
-        key = ("lane_bubble_working_one_each" if issues == 1 and lanes == 1
-               else "lane_bubble_working_one_issue" if issues == 1
-               else "lane_bubble_working_one_lane" if lanes == 1 else "lane_bubble_working")
-        sentences.append(("work", t(key, issues=issues, lanes=lanes), ""))
-    else:
-        sentences.append(("idle", t("lane_bubble_idle"), ""))
-    queued = sum(len(row.get("queued") or ()) for row in rows)
+    facts = snapshot.now_view.get("summary", {}) if snapshot.now_view is not None else {}
+    issues = facts.get("working", sum(len(row.get("running") or ()) for row in rows))
+    lanes = facts.get("working_lanes", sum(bool(row.get("running")) for row in rows))
+    pending = snapshot.now_view is not None and snapshot.now_view.get("pending")
+    sentences.append(("work" if issues else "idle", t("lane_bubble_snapshot_pending") if pending
+                      else work_summary(issues, lanes, language), ""))
+    queued = facts.get("queued", sum(len(row.get("queued") or ()) for row in rows))
     if queued:
         sentences.append(("queued", t("lane_bubble_queued_one") if queued == 1
                           else t("lane_bubble_queued", count=queued), ""))
@@ -123,10 +135,10 @@ def summary(snapshot: Snapshot, config: Config, now: datetime) -> list[tuple[str
         low, high = _clock(low, now, language), _clock(high, now, language)
         sentences.append(("eta", t("lane_bubble_eta", low=low) if low == high
                           else t("lane_bubble_eta_range", low=low, high=high), ""))
-        recent = snapshot.recent or 0
-        if recent > 0:
-            sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
-                              else t("lane_bubble_pace", count=recent), ""))
+    recent = snapshot.recent or 0
+    if recent > 0:
+        sentences.append(("pace", t("lane_bubble_pace_one") if recent == 1
+                          else t("lane_bubble_pace", count=recent), ""))
     # The person's questions from the projection: answered ones are gone, issue-less ones count.
     asked, who = watch_scene.person_questions(snapshot), t("question_person")
     if asked:
@@ -233,8 +245,9 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     from foragent.watch_sections.lanes import glyph_mode
 
     ascii = glyph_mode(config) == "ascii"
-    sprite = _pixels(config) and width >= SPRITE_FROM
-    box_width = width - SPRITE_CELLS - SPRITE_GAP if sprite else width
+    sprite = _pixels(config)
+    beside = sprite and width >= SPRITE_FROM
+    box_width = width - SPRITE_CELLS - SPRITE_GAP if beside else width
     inside = max(1, box_width - 4)
     target = state.get("explanation_target") if state is not None else None
     found = (watch_explanations.explain(target, snapshot, config, repo_root, now=now, width=inside, state=state)
@@ -245,23 +258,25 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
         # Too narrow for borders: the sentences alone, cut to the width.
         from foragent import watch_scene
 
-        return ([watch_scene.fit_marked(line, width, mark) for line in body if line]
-                + _bar(snapshot, config.language, width, mark, ascii=ascii))
-
-    box = _box(body, box_width, sprite, glyph_mode(config))
+        box = [watch_scene.fit_marked(line, width, mark) for line in body if line]
+    else:
+        box = _box(body, box_width, beside, glyph_mode(config))
     if sprite:
         art = pixel_rows(ORCHESTRATOR)
-        box = [[*art[index], (" " * (SPRITE_CELLS - len(art[index]) + SPRITE_GAP), ""), *row]
-               for index, row in enumerate(box)]
-        hits.append((0, top, SPRITE_CELLS, top + len(box), ("orchestrator", None)))
+        if beside:
+            box = [[*art[index], (" " * (SPRITE_CELLS - len(art[index]) + SPRITE_GAP), ""), *row]
+                   for index, row in enumerate(box)]
+        else:
+            box = [*[watch._fit(row, width) for row in art], *box]
+        hits.append((0, top, min(width, SPRITE_CELLS), top + len(art), ("orchestrator", None)))
     return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
 
 
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
             now: datetime, width: int, state: dict | None) -> list[Line] | None:
     """An acorn's rows: #N and title (one row), its lane, what it is doing and for how long,
-    and a worker warning when there is one. Queued authored waits show their recorded
-    context; other classes keep their state explanation, with that context in the block.
+    and a worker warning when there is one. Authored waits show their recorded
+    context here; it never appears under an acorn in the lane block.
     Other targets are not this section's."""
     from foragent import watch, watch_scene
     from foragent.status import _age
@@ -282,21 +297,33 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
             break
     else:
         return None  # Not an acorn on screen: the summary stays.
-    slug, name = row.get("slug"), row.get("lane_display") or row.get("slug") or ""
+    slug, name = row.get("slug"), watch_scene.lane_name(row, config)
     paths = watch_scene.owned_paths(snapshot, config, slug)
     rows = [watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
                                    width, _ellipsis(config))]
     rows.append([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
                   else t("lane_bubble_lane", lane=name), "")])
     kind, run, phase = item["class"], item["run"], item["phase"]
-    if kind == "authored":
-        from foragent.watch_waiting import explanation
 
-        return rows + explanation(item["authored"], language, width, mark=_ellipsis(config))
+    def with_context(rows):
+        if item.get("authored"):
+            from foragent.watch_waiting import explanation
+
+            # Title, lane and full phase plus the three recorded wait fields fit the bubble.
+            return rows[:3] + explanation(item["authored"], language, width, mark=_ellipsis(config))
+        blocker = watch_scene.row_of(snapshot.waiting_facts, number).get("blocker")
+        if blocker:
+            rows.append([(str(blocker), "")])
+        if run and run.get("detail"):
+            rows.append([(run["detail"], "")])
+        return rows
+
+    if kind == "authored":
+        return with_context(rows)
     if kind == "question":
-        return rows + [[(t("lane_bubble_question_click", who=t("question_person")), "question")]]
+        return with_context(rows + [[(t("lane_bubble_question_click", who=t("question_person")), "question")]])
     if kind == "parked":
-        return rows + [[(t("lane_bubble_parked_click", lane=name), "")]]
+        return with_context(rows + [[(t("lane_bubble_parked_click", lane=name), "")]])
     if kind == "next":
         rows.append([(t("lane_bubble_queued_click", lane=name), "")])
         reason = watch_scene.waiting_reason(snapshot, row, number, language, ascii=ascii)
@@ -308,12 +335,17 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         from foragent.watch_sections.lanes import row_words
 
         rows.append([(row_words(item["state"], phase, item["asked"], language)[1], "")])
+    elif phase == "merge-owner-wait":
+        from foragent.messages.squirrel import phase_word
+
+        rows.append([(phase_word(phase, language), "")])
     elif kind == "wait":
         key = "blocked" if item["state"] == "blocked" and phase not in watch_scene.WAIT_PHASES else phase
         rows.append([(t(key), "")])
     else:
-        step = watch_scene.STEPS.get(phase)
-        rows.append([(t(f"lane_bubble_phase_{step}" if step else "lane_bubble_phase_working"), "")])
+        from foragent.messages.squirrel import phase_word
+
+        rows.append([(phase_word(phase or "baseline", language), "")])
     age = max(0.0, (now - snapshot.captured_at).total_seconds())
     # The step's own start; a run that recorded no step yet is in its first step since it began.
     started = (run.get("phase_started_at") or (run.get("started_at") if phase is None else None)) if run else None
@@ -326,4 +358,4 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
         warning = watch_scene.activity_warning(snapshot, config, row, item, now)
         if warning:
             rows.append([(warning, "yellow")])
-    return rows
+    return with_context(rows)

@@ -117,7 +117,7 @@ def _memory(root: Path | None, agent: str | None) -> str | None:
 def lane_facts(
     status: dict[str, Any], store: StateStore, config: Config, now: datetime, root: Path | None,
     work: list[tuple] | None, events: list[dict[str, Any]] | None, rows: dict[int, dict[str, Any]],
-    history: list | None,
+    history: list | None, *, slugs: list[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Owned paths, this week's merges and first-pass reviews, and the newest memory per lane.
 
@@ -125,7 +125,7 @@ def lane_facts(
     Monday 00:00 through ``now``. A merge counts for the lane of the recorded run that
     started it; reviews count only inside that run (start <= review <= merge).
     """
-    slugs = list(dict.fromkeys([*config.lanes, *status.get("lanes", {})]))
+    slugs = list(dict.fromkeys([*config.lanes, *status.get("lanes", {})])) if slugs is None else slugs
     week: dict[str, list[int]] | None = None
     if work is not None and history is not None:
         local = now.astimezone()
@@ -278,9 +278,21 @@ def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, set[str]]:
     return held, paths
 
 
+def authored_waits(status: dict[str, Any], rows: dict[int, dict[str, Any]], config: Config) -> dict[int, dict]:
+    """Only the recorded waiting text and placement, without collecting scheduling details."""
+    runs = {run["number"]: run for run in status.get("active_runs", [])}
+    found = {}
+    for number, row in rows.items():
+        if row["state"] == "open" and (authored := order_waiting.read_waiting(row.get("body") or "")) is not None:
+            lane = (runs.get(number) or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
+            found[number] = {"authored": authored, "lane": lane, "title": row.get("title") or ""}
+    return found
+
+
 def waiting_facts(
     status: dict[str, Any], store: StateStore, config: Config, now: datetime, root: Path | None,
     rows: dict[int, dict[str, Any]], meter: dict[str, Any], history: list | None,
+    *, numbers: set[int] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Why each waiting open issue waits, from recorded evidence only.
 
@@ -304,16 +316,13 @@ def waiting_facts(
     starts = None if history is None else [
         at for run in [*history, *status.get("active_runs", [])]
         if (at := _time(run.get("started_at") if isinstance(run, dict) else run.started_at)) is not None]
-    found: dict[int, dict[str, Any]] = {}
-    for number, row in sorted(rows.items()):
+    selected = rows if numbers is None else {number: row for number, row in rows.items() if number in numbers}
+    found = authored_waits(status, selected, config)
+    for number, row in sorted(selected.items()):
         if row["state"] != "open":
             continue
         run = runs.get(number)
         lane = (run or {}).get("lane") or issue_lane(row.get("labels") or (), config.lanes)
-        authored = order_waiting.read_waiting(row.get("body") or "")
-        if authored is not None:
-            found[number] = {"authored": authored, "lane": lane,
-                             "title": row.get("title") or ""}
         labels = set(row.get("labels") or ())
         state = issue_state(labels - {RUNNING}, run is not None, local_group(row))
         if state in HELD or (run is None and {NEEDS_HUMAN, WAITING_PERSON, BLOCKED} & labels):

@@ -135,7 +135,12 @@ def _frame(
 
     from foragent.watch_sections import settings as settings_window
 
-    discovered = _sections()
+    if getattr(snapshot, "now_view", None) is not None:
+        from foragent import watch_now
+
+        discovered = watch_now.sections()
+    else:
+        discovered = _sections()
     # Declarations are unconditional: a section replaces its targets even when it draws
     # nothing or the settings window hides it. Absent names are ignored.
     replaced = {name for section in discovered for name in getattr(section, "REPLACES", ())}

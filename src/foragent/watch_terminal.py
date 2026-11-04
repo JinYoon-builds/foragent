@@ -302,7 +302,6 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             # Under 3 rows this is F itself, painted from the top and cut to the screen below.
             visible = watch._window(frame, view_state, height, max(1, width), config.language,
                                     layout if store is not None else None)
-            top = view_state.get("scroll", 0)
             alert = [watch._fit(watch._line(error, "yellow"), max(1, width))] if error else []
             row_map = view_state.get("row_map")
             footer = len((view_state.get("pinned_rows") or {}).get("footer", ())) if row_map is not None else 0
@@ -321,14 +320,6 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 # A refresh error takes the bottom row (in place of the position line).
                 bottom = max(0, height - 1)
                 visible = visible[:bottom] + [[]] * (bottom - len(visible[:bottom])) + alert
-            # One highlighted row, by its position: the first issue row on screen.
-            mark = watch.highlighted_row(view_state)
-            if mark is None:
-                marked = set()
-            elif row_map is not None:
-                marked = {y for y, row in row_map.items() if row == mark}
-            else:
-                marked = {mark - top}
             if not painted:
                 screen.erase()
                 painted = True
@@ -338,7 +329,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 x = 0
                 # _frame already cut every line to the width; it is painted as it is.
                 for value, style in line:
-                    attribute = palette.attribute(style) | (curses.A_REVERSE if y in marked else 0)
+                    attribute = palette.attribute(style)
                     try:
                         screen.addstr(y, x, value, attribute)
                     except curses.error:

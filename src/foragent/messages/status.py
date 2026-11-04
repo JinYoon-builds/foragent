@@ -1,5 +1,8 @@
 """Status vocabulary: summary counts, run states and phases."""
 
+from foragent.messages.squirrel import MESSAGES as SQUIRREL_WORDS
+from foragent.messages.squirrel import PHASE_WORDS
+
 MESSAGES = {
     "en": {
         "summary": "working {working} · waiting for you {waiting_human} · queued {queued}",
@@ -12,9 +15,7 @@ MESSAGES = {
         "queued": "queued",
         "idle": "idle",
         "implementing": "implementing",
-        "checking": "checking",
         "reviewing": "reviewing",
-        "ci": "waiting for CI",
         "merging": "merging",
         "overlap-wait": "waiting for shared files",
         "test-slot-wait": "waiting for a test slot",
@@ -41,9 +42,7 @@ MESSAGES = {
         "queued": "기다리는 중",
         "idle": "쉬는 중",
         "implementing": "만드는 중",
-        "checking": "확인하는 중",
         "reviewing": "리뷰하는 중",
-        "ci": "CI 기다려요",
         "merging": "합치는 중",
         "overlap-wait": "공유 파일 기다려요",
         "test-slot-wait": "시험 자리 기다리는 중",
@@ -60,3 +59,8 @@ MESSAGES = {
         "waiting_for": "{issues} 기다려요",
     },
 }
+
+for _language, _words in MESSAGES.items():
+    for _key in ("checking", "ci", "merge-owner-wait"):
+        _words[_key] = SQUIRREL_WORDS[_language][PHASE_WORDS[_key]]
+    _words["waiting-merge"] = _words["merge-owner-wait"]

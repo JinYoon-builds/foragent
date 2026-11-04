@@ -124,10 +124,10 @@ def test_no_toggle_line_when_nothing_is_hidden(tmp_path):
 def test_blocked_issue_counts_as_running_when_folded(tmp_path):
     snapshot, config = lane_case(running=False, blocked=True)
     lines = plain_frame(whole(snapshot, config, tmp_path, {})).splitlines()
-    # The blocked issue stays a current acorn (grey 대기) and the lane says it waits.
+    # The blocked issue stays a grey 대기 acorn; its reason is in the bubble (r53).
     assert numbers("\n".join(lines)) == [3, 4, 5, 6]
     current = next(y for y, line in enumerate(lines) if "◖█#3 대기▌" in line)
-    assert lines[current + 1][14:] == "순서를 기다려요"
+    assert lines[current + 1][14:].strip() == ""
 
 
 def test_a_short_plain_frame_drops_folded_extras_before_other_sections(tmp_path):
@@ -366,7 +366,7 @@ def test_a_stopped_run_keeps_its_phase_in_row_and_box(tmp_path):
     snapshot = replace(snapshot, run_phases={9: "reviewing"})
     assert "◖█#9 리뷰▌" in plain_frame(whole(snapshot, config, tmp_path, {}))
     opened = whole(snapshot, config, tmp_path, {"explanation_target": ("acorn", 9)})
-    assert "다른 AI가 리뷰하고 있어요" in bubble_of(opened)
+    assert "리뷰 받는 중" in bubble_of(opened)
 
     store = StateStore(tmp_path / "state")
     config = replace(config, language="ko", repo=None)
@@ -497,16 +497,16 @@ def test_only_the_first_visible_issue_row_is_highlighted(tmp_path, monkeypatch):
     """Class: selection by row position, not issue identity (several acorn rows)."""
     snapshot, config = lane_case()
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
-    # The current row and the queue row are both issue rows; only the first one is highlighted.
+    # The row position still controls Enter; no row-wide reverse background is painted (r53).
     assert sum("◖█#" in text for text in rows.values()) == 2
-    assert len(reverse) == 1 and "#3 작성" in rows[min(reverse)]
+    assert not reverse
     # Held issues add acorns to the current row, not more highlighted rows.
     snapshot.status["lanes"]["work"]["held"] = [{"number": 7, "title": "Blocked one", "state": "blocked"}]
     state = {}
     watch._frame(snapshot, config, tmp_path, tick=0, width=100, selected=None, now=snapshot.captured_at, state=state)
     assert [number for _, number in state["rows"]] == [3, 4]
     rows, reverse = live_paint(tmp_path, monkeypatch, snapshot, config, height=60)
-    assert len(reverse) == 1 and "#7 대기" in rows[min(reverse)]
+    assert not reverse and any("#7 대기" in row for row in rows.values())
 
 
 def test_closing_the_box_keeps_the_rows_scroll(tmp_path):
@@ -697,11 +697,9 @@ def test_done_summary_and_more_line_are_plain_text(tmp_path):
     layout = {}
     frame = watch.render_frame(many, config, tmp_path, width=100, layout=layout)
     lines = plain_frame(frame).splitlines()
-    y = next(y for y, line in enumerate(lines) if re.search(r"…\d+$", line.rstrip()))
-    x = watch._cells(lines[y][:lines[y].rindex("…")])
-    assert watch.hit_test(layout, x, y) is None, "the …N count is plain text"
-    # Exact overflow: the visible acorns and the count cover the running one and all 56 queued.
-    assert len(numbers(frame)) + int(lines[y].rstrip().rsplit("…", 1)[1]) == 57
+    assert not any(re.search(r"…\d+$", line.rstrip()) for line in lines)
+    # r53 has no row cap: the running acorn and all 56 queued acorns stay scrollable.
+    assert len(numbers(frame)) == 57
     assert {target[1] for *_, target in layout["hits"] if target[0] == "acorn"} == set(numbers(frame))
 
 

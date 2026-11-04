@@ -94,11 +94,11 @@ def summary_values(summary: dict[str, Any]) -> dict[str, Any]:
     return {key: "?" if value is None else value for key, value in summary.items()}
 
 
-def issue_state(labels: Any, active: bool, group: str | None = None) -> str | None:
+def issue_state(labels: Any, active: bool, group: str | None = None, *, merge_owner: bool = False) -> str | None:
     """One issue's row state from its local facts, the same for status and the lane view.
 
     A person (needs-human or waiting-person) comes first, then blocked, then a running
-    worker; an open PR waits for a person; approved or ready work is queued. None means
+    worker; an open PR waits for its merge owner, or a person in manual mode; approved or ready work is queued. None means
     the issue is not shown.
     """
     labels = set(labels or ())
@@ -109,7 +109,7 @@ def issue_state(labels: Any, active: bool, group: str | None = None) -> str | No
     if active or RUNNING in labels:
         return "working"
     if group == "pr-open":
-        return "waiting-human"
+        return "waiting-merge" if merge_owner else "waiting-human"
     if APPROVED in labels or READY in labels:
         return "queued"
     return None
@@ -124,7 +124,7 @@ def collect_lanes(
 
     lanes: dict[str, dict[str, Any]] = {}
     summary = dict(working=0, blocked=0, waiting_human=0, queued=0)
-    priority = {"working": 0, "waiting-human": 1, "blocked": 2, "queued": 3, "idle": 4}
+    priority = {"working": 0, "waiting-human": 1, "blocked": 2, "waiting-merge": 3, "queued": 4, "idle": 5}
     grouped = {item["number"]: (group, item) for group, items in groups.items() for item in items}
     # A lane dreams while its dream record runs; the tick owns that record's liveness.
     dreaming = {run.lane for run in store.dream_runs() if run.status == "running"}
@@ -160,15 +160,16 @@ def collect_lanes(
         if group in {RUNNING, READY}:
             row[group].append(item)
         # A running label without a live run is stale, not working.
-        state = issue_state(set(issue.labels) - {RUNNING}, active, group)
+        state = issue_state(set(issue.labels) - {RUNNING}, active, group, merge_owner=config.merge_owner)
         if state is None:
             continue
-        summary[state.replace("-", "_")] += 1
+        summary["queued" if state == "waiting-merge" else state.replace("-", "_")] += 1
         if state == "queued":
             row["queued"].append(item)
-        elif state in {"blocked", "waiting-human"} and not active:
+        elif state in {"blocked", "waiting-human", "waiting-merge"} and not active:
             # Every held issue, not only the lane's most urgent one, has a lane row.
-            row["held"].append({**item, "state": state})
+            row["held"].append({**item, "state": state,
+                                **({"phase": "merge-owner-wait"} if state == "waiting-merge" else {})})
         show(row, state, issue.number, issue.title, run if active else None,
              waiting.get(issue.number, []) if state == "queued" else [])
     # Runs recorded locally are working even when the snapshot predates them or is missing.
