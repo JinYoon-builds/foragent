@@ -253,7 +253,7 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1040 (D58 skill lifecycle) next edit: add evidence from PM r510/r514 — 236-skill catalog buries relevant ones; PRs 1830 1814 1813 1864 1863 report "Skills used: none".
 - New machine: no orca codex-accounts dir; rerun-review uses default ~/.codex (the c7c83cab export is obsolete).
 - #1873 (PM r532, Jin): when retrying after #1833, first edit its Goal: purpose is reviewing human-written branches and external contributors' PRs with the full panel (open source), not PM out-of-lane work; lower priority.
-- After #1914 (fa orch close) merges: fa orch close 1860 --superseded-by 1882 --why 'PM r531: #1882 replaced the exclusion-record classifier'.
+- #1860 closed 11-05 via plan closes (resolved by #1882). Its PR #1875 is still open: close it with fa orch close after #1914 merges.
 - 24 h after the CI-cancel fix merges (architect r547): measure gh run list conclusion=cancelled, busy job-min/h (cap 1,200), orch-events 'ci -> timeout' (9/day on 11-04; target 0-2). If 3+/day remain, re-check r547 items (2) owner refreshes while CI pending and (3) order commits count as non-neutral.
 - r53 dashboard plan ready (preread clean): drafts/2026-11-04-r53/plan.json. Publish with --approve right after #1793 (PR #1849) and #1894 (PR #1897) merge; it rewrites their locks. Replaces #1899 (parked).
 - 6 h after #1924 merges (architect r570): 'CI did not finish' per hour should drop from 5-8/h to <=1/h; orch executions per distinct issue from 1.9 to ~1.2.
@@ -263,3 +263,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - #1914 got 3 push 500s (10:00, 10:15, 10:42Z). If a 4th: fa orch park 1914 until the push-wait fix (architect r618, plan drafts/2026-11-04-batch-push) merges, then unpark + re-approve by edit.
 - Candidate order (11-04 #1952): a PR that is CONFLICTING with main gets no GitHub merge ref, so no CI runs; the gate waited and held 'missing acceptance shards: observed []' instead of noticing mergeable=CONFLICTING and rebasing. Ask the architect for the reading point (ci_mode missing shards vs tracker pr mergeable) before ordering.
 - #435 split (drafts/435split/plan.json, preread clean 2026-11-04 13Z): publish --approve right after #1641 merges (both use tests/acceptance/test_silence_watchdog.py). PM r655 item b.
+- #1491 (emergency stop): if its retry runs >3 h again with merge_owner.py peers, add an exclusive: header for merge_owner.py (architect r708, r426 pattern).
