@@ -207,7 +207,7 @@ def _admissible(ctx: TickContext, lanes: list[str] | None = None) -> list[str]:
 
     now = ctx.now()
     if orch_stop.active(ctx.store) is not None or _quota_exhausted(ctx.store, now):
-        return []  # A project stop holds every lane's dream until `fa orch resume --all` (#1491).
+        return []  # A project stop holds every lane's dream until `fa orch release` (#1491).
     due = dream_due(ctx.store, ctx.config, LocalIssues(ctx.store), now)
     return [lane for lane in (due if lanes is None else [lane for lane in lanes if lane in due])
             if not ctx.store.executor_paused(dream_config(ctx.config, lane).executor, now)]

@@ -18,7 +18,7 @@ One writer (D95): only the ``fa orch`` commands (pause, resume, plan, queue)
 write ``plan.json``. Readers derive the plan in force: an expired plan reads as
 empty, and a pause whose ``until`` has passed is ignored. A pause until
 ``UNTIL_RESUMED`` (a project stop's hold) outlives the plan's expiry: only
-``fa orch resume`` or a new pause of that lane ends it. The tick appends one
+``fa orch release``, ``fa orch resume`` or a new pause of that lane ends it. The tick appends one
 ``plan-expired`` event per ``expires_at`` value, deciding from the events
 journal. Until a command first writes ``plan.json``, readers take the lane
 queues from a pre-plan ``lane-queues.json``; that first write moves them in and
