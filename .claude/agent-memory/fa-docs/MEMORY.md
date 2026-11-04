@@ -21,6 +21,7 @@
 - r371 (2026-11-03): #1735/#1736 (merge a7af72be): README Bash(fa:*) paragraph (en 33 / ko 111) add one sentence that FA-launched sessions refuse person-only commands. Wait: orchestrator judges.
 - r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
 - r449 (2026-11-04): #1746/#1751/#1767 (=#1651, merge 826313b): ask D109 for undated-ID decisions.md:944 + rules.md:82-88 uncited section; gate.md:130 stale 4 defaults, :172 stray yaml; skills/review-procedure vs D37 → r347. Wait: orchestrator relays.
+- r482 (2026-11-04): answers r480 (decisions by topic): A = regroup rules.md into Jin's 6 topics + Dnn links + in-place 대체됨 marks; B = top section in decisions.md (needs D108 보강). Wait: orchestrator judges; PM then appends phase words/r53/one-screen Dnn.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -66,3 +67,4 @@
 - '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
 - An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
 - When the scheduled check is for an order that wrote my own proposal (e.g. #1826), compare the diff with the request texts and check named commands exist (commands/order.py add_parser); then close the memory wait.
+- 'Current decisions' asks usually duplicate rules.md (D108); point to rules.md first. decisions.py parses `### Dnn.` headings in any order, so in-place marks are safe; moving entries breaks append-only.
