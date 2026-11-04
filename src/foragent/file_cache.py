@@ -24,6 +24,11 @@ class _Failure:
 
 
 @dataclass(slots=True)
+class _Pending:
+    data: bytes
+
+
+@dataclass(slots=True)
 class Line:
     offset: int
     value: Any
@@ -31,6 +36,10 @@ class Line:
     unicode_error: UnicodeDecodeError | None = None
 
     def parsed(self) -> Any:
+        if isinstance(self.value, _Pending):
+            with _LOCK:
+                if isinstance(self.value, _Pending):
+                    self.value = _parse_line(self.offset, self.value.data).value
         if isinstance(self.value, _Failure):
             raise self.value.error.with_traceback(None)
         return self.value
@@ -39,7 +48,8 @@ class Line:
 @dataclass(slots=True)
 class Journal:
     data: bytes
-    lines: list[Line]
+    lines: list[Line]  # LF records: notices keep their binary tail framing.
+    text_lines: list[Line]  # Universal newlines: CR, CRLF and LF; values are shared.
     # Views contain references to the one parsed tree, never another parsed copy.
     views: dict[tuple[bool, str], Any] = field(default_factory=dict)
 
@@ -48,7 +58,7 @@ class Journal:
         if key not in self.views:
             rows = []
             try:
-                for line in self.lines:
+                for line in self.text_lines:
                     if errors == 'strict' and line.unicode_error is not None:
                         raise line.unicode_error
                     try:
@@ -79,8 +89,8 @@ class Journal:
 
     def matching(self, needle: bytes):
         """Preserve readers' raw-text selection without parsing selected lines again."""
-        for index, line in enumerate(self.lines):
-            end = self.lines[index + 1].offset if index + 1 < len(self.lines) else self.size
+        for index, line in enumerate(self.text_lines):
+            end = self.text_lines[index + 1].offset if index + 1 < len(self.text_lines) else self.size
             if needle in self.data[line.offset:end]:
                 yield line
 
@@ -148,25 +158,42 @@ def read_json(path: Path) -> Any:
     return read(path, lambda data: json.loads(data.decode('utf-8')))
 
 
+def _parse_line(offset: int, raw: bytes) -> Line:
+    unicode_error = None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        unicode_error = exc.with_traceback(None)
+        text = raw.decode("utf-8", errors="replace")
+    try:
+        value = json.loads(text)
+    except Exception as exc:
+        value = _Failure(exc.with_traceback(None))
+    return Line(offset, value, not raw.strip(), unicode_error)
+
+
 def _parse_lines(data: bytes) -> Journal:
-    lines, offset = [], 0
-    for raw in data.split(b'\n'):
-        # There is no extra line after a terminal newline (nor in an empty file).
+    lines, text_lines, offset = [], [], 0
+    for raw in data.split(b"\n"):
         if offset == len(data):
-            break
-        unicode_error = None
-        try:
-            text = raw.decode('utf-8')
-        except UnicodeDecodeError as exc:
-            unicode_error = exc.with_traceback(None)
-            text = raw.decode('utf-8', errors='replace')
-        try:
-            value = json.loads(text)
-        except Exception as exc:
-            value = _Failure(exc.with_traceback(None))
-        lines.append(Line(offset, value, not raw.strip(), unicode_error))
+            break  # No extra record after a terminal newline or in an empty file.
+        parts, start = [], offset
+        # bytes.splitlines recognizes CR/CRLF/LF, never Unicode characters in a JSON field.
+        for part in raw.splitlines(keepends=True) or [raw]:
+            parts.append(_parse_line(start, part))
+            start += len(part)
+        text_lines.extend(parts)
+        if len(parts) == 1:
+            lines.append(parts[0])
+        else:
+            # CR can be an LF record's whitespace or separate text records. Share its
+            # single value when possible; parse a distinct LF record only if requested.
+            content = [part for part in parts if not part.blank]
+            value = content[0].value if len(content) == 1 else _Pending(raw)
+            error = next((part.unicode_error for part in parts if part.unicode_error is not None), None)
+            lines.append(Line(offset, value, not raw.strip(), error))
         offset += len(raw) + 1
-    return Journal(data, lines)
+    return Journal(data, lines, text_lines)
 
 
 def read_lines(path: Path) -> Journal:

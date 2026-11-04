@@ -297,3 +297,61 @@ def test_transcript_raw_selection_keeps_escaped_and_unrelated_bad_rows_out(tmp_p
     assert orch_refresh.compactions(path, 's') == 1
     assert orch_refresh.compactions(path, 's') == 1
     assert len(parsed) == 2
+
+
+@pytest.mark.parametrize("separator", [b"\n", b"\r\n", b"\r"])
+@pytest.mark.parametrize("notice_first", [False, True])
+def test_universal_jsonl_and_lf_notice_views_share_values(tmp_path, monkeypatch, separator, notice_first):
+    from foragent import orch_inbox, upstream_report
+
+    store = StateStore(tmp_path)
+    events = [{"at": NOW.isoformat(), "kind": orch_inbox.NOTICE_KIND, "status": "sent",
+               "summary": f"event {index}", "channel": "보존\u0085할\u2028내\u2029용", "cache_probe": True}
+              for index in range(3)]
+    encoded = [json.dumps(event, ensure_ascii=False).encode() for event in events]
+    path = tmp_path / "orch-events.jsonl"
+    path.write_bytes(encoded[0] + separator + encoded[1] + b"\n" + encoded[2] + b"\n")
+    parsed = count_parses(monkeypatch)
+    opens, open_file = [], Path.open
+
+    def opened(file, *args, **kwargs):
+        if file == path:
+            opens.append(file)
+        return open_file(file, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    since = NOW.replace(year=2025)
+    expected = events[2:] if separator == b"\r" else events
+    expected_problems = (["orch-events.jsonl: tail line 1 unreadable (JSONDecodeError)"]
+                         if separator == b"\r" else [])
+    if notice_first:
+        assert orch_inbox.recent_notices(store, since) == (expected, expected_problems)
+    assert file_cache.read_jsonl(path) == events
+    assert file_cache.read_jsonl(path, tolerant=True, errors="replace") == events
+    assert orch_inbox.recent_notices(store, since) == (expected, expected_problems)
+    assert upstream_report._source(store, "event:3") == ([("joined", "event 2")], None, "event")
+    monkeypatch.setattr(orch_inbox, "NOTICE_TAIL_BYTES", len(encoded[2]) + 1)
+    notices, problems = orch_inbox.recent_notices(store, since)
+    assert notices == events[2:]
+    assert len(problems) == 1 and "only the last" in problems[0]
+    assert len(parsed) == 3, "The views parsed the same JSON value again"
+    assert len(opens) == 1, "The views reopened an unchanged log"
+
+
+@pytest.mark.parametrize("pretty", [False, True])
+def test_lf_notices_keep_cr_whitespace_without_changing_universal_rows(tmp_path, monkeypatch, pretty):
+    from foragent import orch_inbox
+
+    event = {"at": NOW.isoformat(), "kind": orch_inbox.NOTICE_KIND, "status": "sent",
+             "summary": "one notice", "cache_probe": True}
+    encoded = json.dumps(event).encode()
+    raw = encoded.replace(b", ", b",\r") if pretty else b"\r \r" + encoded + b"\r\r"
+    path = tmp_path / "orch-events.jsonl"
+    path.write_bytes(raw + b"\n")
+    parsed = count_parses(monkeypatch)
+    with pytest.raises(ValueError):
+        file_cache.read_jsonl(path)
+    assert file_cache.read_jsonl(path, tolerant=True) == ([] if pretty else [event])
+    for _ in range(2):
+        assert orch_inbox.recent_notices(StateStore(tmp_path), NOW.replace(year=2025)) == ([event], [])
+    assert len(parsed) == 1, "The LF view should reuse an existing value or parse its distinct record once"

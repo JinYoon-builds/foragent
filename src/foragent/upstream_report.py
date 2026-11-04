@@ -89,7 +89,7 @@ def _source(store: StateStore, source: str) -> tuple[list[tuple[str, str]], int 
             raise ReportError("report_source_missing")
         return _issue_records(store, flag.number), flag.number, "flag"
     try:
-        lines = read_lines(store.root / "orch-events.jsonl").require_utf8().lines
+        lines = read_lines(store.root / "orch-events.jsonl").require_utf8().text_lines
         line = lines[int(number) - 1]
         event = line.parsed()
     except (FileNotFoundError, IndexError, ValueError):
