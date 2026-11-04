@@ -12,15 +12,19 @@ if TYPE_CHECKING:
     from foragent.state import Run
 
 
-def _push_branch(attempt: Implementation) -> None:
+def push_publication(ctx: RunContext, n: int, git: GitRepo, branch: str, lease: str) -> None:
+    """The one branch push of publication; GitHub server errors wait with this head and lease."""
     from foragent import orch_github
 
+    orch_github.wait_out_push(ctx, n, lambda: git.push(branch, lease=lease), head=git.head_sha(),
+                              lease=lease, branch=branch, kind="publish")
+
+
+def _push_branch(attempt: Implementation) -> None:
     lease = (attempt.rebuild_lease if attempt.rebuilt else
              attempt.git.remote_branch_sha(attempt.branch) or "")
     try:
-        orch_github.push(attempt.ctx, attempt.n,
-                         lambda: attempt.git.push(attempt.branch, lease=lease), head=attempt.git.head_sha(),
-                         lease=lease, branch=attempt.branch, kind="publish")
+        push_publication(attempt.ctx, attempt.n, attempt.git, attempt.branch, lease)
     except run_publish.GitError:
         attempt.tracker_available = False  # WIP cleanup must not repeat a refused/exhausted push.
         raise

@@ -44,7 +44,7 @@ def rejected(message='remote: Internal Server Error'):
 
 
 def attempt(ctx, head='verified', do_push=rejected, *, kind='refresh', lease='old'):
-    orch_github.push(ctx, 1, do_push, head=head, lease=lease, branch='branch', kind=kind)
+    orch_github.wait_out_push(ctx, 1, do_push, head=head, lease=lease, branch='branch', kind=kind)
 
 
 def test_budget_survives_retries_but_resets_after_success_or_a_different_head(pushing):
@@ -95,7 +95,7 @@ def test_resume_uses_exact_lease_once_and_refusal_consumes_it_without_waiting(pu
 def test_wait_before_review_never_claims_a_pass(pushing):
     ctx, _ = pushing
     with pytest.raises(TrackerError):
-        orch_github.push(ctx, 1, rejected, head='unreviewed', lease='', branch='branch', kind='publish')
+        orch_github.wait_out_push(ctx, 1, rejected, head='unreviewed', lease='', branch='branch', kind='publish')
     calls = []
     git = SimpleNamespace(head_sha=lambda: 'unreviewed', _call=lambda args: '',
                           push=lambda branch, **kw: calls.append((branch, kw)),

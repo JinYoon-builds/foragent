@@ -85,8 +85,8 @@ def _push_event(ctx, number: int, kind: str, **fields) -> None:
     append_event(ctx.store, ctx.now(), number, kind, "Git push " + kind, **fields)
 
 
-def push(ctx, number: int, do_push, *, head: str, lease: str | None, branch: str,
-         kind: str) -> None:
+def wait_out_push(ctx, number: int, do_push, *, head: str, lease: str | None, branch: str,
+                  kind: str) -> None:
     """One push attempt, retaining the exact verified head and lease across outage waits."""
     from foragent.git import GitError, push_server_error
 
@@ -138,9 +138,15 @@ def resume_push(ctx, number: int, git) -> bool | None:
         return None
     branch, lease = pending["branch"], pending["lease"]
     try:
-        push(ctx, number, lambda: git.push_head(branch, lease=lease) if pending["push_kind"] == "refresh"
-             else git.push(branch, lease=lease), head=pending["head"], lease=lease, branch=branch,
-             kind=pending["push_kind"])
+        # Resume through the original push sites, so no new push path exists.
+        if pending["push_kind"] == "refresh":
+            from foragent.run_publish_reviewed import push_refresh
+
+            push_refresh(ctx, number, git, branch, lease, pending["head"])
+        else:
+            from foragent.run_publish_pr import push_publication
+
+            push_publication(ctx, number, git, branch, lease)
     except GitError as exc:
         if lease is None or "(stale info)" not in str(exc):
             raise
