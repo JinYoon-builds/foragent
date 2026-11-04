@@ -122,10 +122,12 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
-         role: str = ARCHITECT, short: str | None = None, alarm: str | None = None) -> str:
+         role: str = ARCHITECT, short: str | None = None, alarm: str | None = None,
+         tier: str | None = None) -> str:
     """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused.
 
     ``alarm`` is the gate's request id when the gate calls the role for an alarm.
+    ``tier`` names the work's weight; scheduled light checks use m, design checks use l.
     """
     language = config.language
     if _entry(config, role) is None:
@@ -159,6 +161,7 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
         # this command resumes still finds its alarm and its workload record and delivers both.
         workload = capacity_sessions.new_path(store, os.getpid())
         session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
+                   "tier": tier or ("m" if role == "docs" else "l"),
                    "workload": str(workload), **({"short": short} if short else {}),
                    **({"alarm": alarm} if alarm else {})}
         store._write_json(record_path(store, role), session)
@@ -192,21 +195,25 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
 
 
 def session_options(config: Config, store: StateStore, root: Path | None = None,
-                    role: str = ARCHITECT, entry: dict | None = None) -> dict:
-    """The size-l tier's model and effort; Claude loads the role's agent when the project has it.
+                    role: str = ARCHITECT, entry: dict | None = None,
+                    tier: str | None = None) -> dict:
+    """The work's tier model, with a role override; Claude loads the project's role agent.
 
     Codex gets the state directory, and the role's memory directory when present, as writable roots.
     """
-    tier = config.tiers["l"]
+    tier = config.tiers[tier or ("m" if role == "docs" else "l")]
     entry = entry if entry is not None else _entry(config, role)
+    model = entry.get("model") if entry else None
     if config.executor == "claude":
-        options = {"model": tier.get("claude_model") or config.executor_model}
+        options = {"model": model or tier.get("claude_model") or config.executor_model}
         if _has_agent(root, entry):
             options["agent"] = entry["agent"]
         return options
     memory = root / entry["memory"] if root is not None else None
     extra = (memory,) if memory is not None and memory.is_dir() else ()
-    return {"model": config.executor_model, "effort": tier.get("codex_effort"),
+    effort = tier if tier.get("codex_model") else config.tiers["l"]
+    return {"model": model or tier.get("codex_model") or config.executor_model,
+            "effort": effort.get("codex_effort"),
             "add_dirs": (store.root, *extra)}
 
 
@@ -236,7 +243,9 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if entry is None:
             raise ArchitectRefused(text("role_unknown", config.language, role=role,
                                         roles=", ".join(load_roles(config)) or "-"))
-        options = session_options(config, store, root, role, entry)
+        record = read_record(store, role)
+        tier = record.get("tier") if record and record.get("started_at") == started_at else None
+        options = session_options(config, store, root, role, entry, tier=tier)
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
         notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""

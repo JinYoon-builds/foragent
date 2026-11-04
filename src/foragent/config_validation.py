@@ -302,10 +302,10 @@ def _validate_roles(roles: Any) -> None:
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9-]+", name):
             raise ConfigError(f"invalid roles name: {name}")
         if not isinstance(role, dict) or role.keys() - {
-            "agent", "skills", "memory", "signals", "scope", "created_at", "idle_days",
+            "agent", "skills", "memory", "signals", "scope", "created_at", "idle_days", "model",
         }:
             raise ConfigError(f"invalid roles entry: {name}")
-        for key in ("agent", "memory"):
+        for key in ("agent", "memory", "model"):
             if role.get(key) is not None and not isinstance(role[key], str):
                 raise ConfigError(f"roles.{name}.{key} must be a string")
         if not _strings(role.get("skills", [])):

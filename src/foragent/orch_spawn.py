@@ -19,10 +19,11 @@ from types import SimpleNamespace
 
 from foragent import orch_binding, orch_push, orch_seat, orch_silent, orch_stale_files, processes, watch_open
 from foragent.commands.orch import ALIVE_SECONDS  # `fa orch alive` uses the same limit.
-from foragent.config import Config
+from foragent.config import Config, load_config
 from foragent.i18n import text
 from foragent.orch_events import append_event
 from foragent.orch_tick_outcome import step
+from foragent.roles import load_roles
 from foragent.state import StateStore
 
 SPAWN_SPACING = timedelta(minutes=2)
@@ -176,7 +177,11 @@ def _command(root: Path, store: StateStore, title: str, session_id: str | None =
     agent = ["--agent", "fa-orchestrator"] if (root / AGENT).is_file() else []
     named = ["--session-id", session_id] if session_id else []
     first = [prompt] if prompt else []
-    return "background", [claude, "--bg", "-n", title, *agent, *named, SKILL, *first]
+    config = load_config(root)
+    model = (load_roles(config).get("orchestrator", {}).get("model")
+             or config.tiers["l"].get("claude_model") or config.executor_model)
+    selected = ["--model", model] if model else []
+    return "background", [claude, "--bg", "-n", title, *agent, *named, *selected, SKILL, *first]
 
 
 def _role_env(session_id: str) -> dict[str, str]:
