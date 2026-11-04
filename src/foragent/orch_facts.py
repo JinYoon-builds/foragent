@@ -23,7 +23,7 @@ from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
     RECENT, _comparisons, _executions, _failure_reasons, _file_conflicts, _history, _hot_files, _merges_since_tidy, _row,
-    _slowest_files, _test_slots, _waiting_issues,
+    _slowest_files, merged_keys, _test_slots, _waiting_issues,
 )
 from foragent.state import Run, StateStore
 from foragent.state_logs import FLOW_LOCK
@@ -198,7 +198,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
     executions = [execution for execution in _executions(store, now, current)
                   if execution.run.status == "running" or execution.started >= now - RECENT]
     rows = [_row(execution, now) for execution in executions]
-    reviews = orch_facts_reviews.attach(store, executions, rows)
+    merged = merged_keys(store, rows)
+    reviews = orch_facts_reviews.attach(store, executions, rows, merged)
     areas = orch_facts_reviews.attach_project_review(store, root, executions, rows, machine)
     history = _history(rows)
     for row in rows:
@@ -218,8 +219,8 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "slowest_test_files": _slowest_files(rows),
         "waste": {"seconds": wasted, "runtime_seconds": runtime, "share": wasted / runtime if runtime else None},
         "hot_files": _hot_files(waiting),
-        "file_conflicts": _file_conflicts(rows),
-        "failure_reasons": _failure_reasons(rows),
+        "file_conflicts": _file_conflicts(rows, merged),
+        "failure_reasons": _failure_reasons(rows, merged),
         "merges_since_tidy": _merges_since_tidy(store),
         "resources": resources,
         "step_weights": machine["step_weights"],

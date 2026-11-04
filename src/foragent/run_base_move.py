@@ -189,9 +189,8 @@ def _open_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     carrying an approval label whose Files or acceptance links name the path.
     """
     directory = _repo_path(ctx.config.acceptance_dir) + "/"
-    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
-    if getattr(ctx.config, "merge_owner", False):
-        merged.update(number for number, _ in ctx.store.owner_merge_facts())
+    owner_facts = ctx.store.owner_merge_facts()
+    merged = {run.number for run in ctx.store.read_history() if ctx.store.run_merged(run, owner_facts=owner_facts)}
     issues = {issue.number: issue for issue in ctx.tracker.list_issues("open")}
     owners: dict[str, set[int]] = {}
 
