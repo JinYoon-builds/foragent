@@ -10,7 +10,7 @@ writes this file.
 ## Lessons
 
 - A feature that repeats the reviewer hold "found defects after 3 rounds" with a new race each time usually has a Goal that sets a higher bar than the path it reuses. Name the inherited races as non-goals. Do not add more ordering rules. (#370, 9 holds)
-- Production state: `~/.local/share/foragent/JinYoon-builds__foragent/` (runs.jsonl, orch-events.jsonl). `fa orch facts --json` does not list each issue's runs, so read runs.jsonl for those.
+- Production state: `~/.local/share/foragent/JinYoon-builds__foragent/`. `fa orch facts --json` has no per-issue runs; read runs.jsonl.
 - Before stacking a feature on a merged one, run the new locked test's expectations against the merged feature's locked tests. Conflicts show up as concrete cases (#186 vs #786: claude 79% under keep 80 must win), and the reconciling rule (here: a written order beats headroom) follows from them.
 - Locked acceptance tests (`tests/acceptance/*`, "do not edit") constrain every later proposal. Check `grep -ln` there before you propose a behaviour change; unit tests may change.
 - Lanes do not limit parallelism here: no per-lane cap without a live plan width, and starts are ranked across lanes. A "redraw lanes to spread work" question is answered by checking binding (`fa orch facts`) and the per-lane open backlog first.
@@ -18,7 +18,7 @@ writes this file.
 - Goals grow 'Fixed answers'/'More:' clauses after each hold; when those clauses need to know which turn/attempt/snapshot is which, replace them with a value derived from an append-only record (#238 turn ordinal) instead of another rule.
 - A spec conflict between a locked test and 'needs a sample first' is often a missing definition (what is the reference with no sample?), not a real conflict; answer it with the definition (#435: run start).
 - Before splitting a file for parallelism, read `overlap_per_file` in .foragent.yml (3 here) and the 'held:' reason in `fa orch facts`. 'cap' means the machine is full; a split cannot help. Also list the shared non-code files (docs/decisions.md, SKILL.md, config.py), which still overlap after any split.
-- Lane `paths` drive nothing at run time (only agent text); a lane split moves notebook size, dream scope and the person's view, never overlap conflicts or parallelism. Say so in the proposal.
+- Lane `paths` drive nothing at run time (only agent text); a lane split moves notebook size, dream scope and the view, never overlap or parallelism.
 - A busy lane rarely dreams: dream_due needs the lane idle. Check `runs/dream-<lane>.json` and orch-events dream-done before blaming notebook size on lane width. Dreams take ~2.5 min, so the start hold while dreaming costs little.
 - Repeated ordering holds over one cache row usually mean the row has two writers (ingest and local writes, as in issues.json + outbox_base). Propose: the latest observation has one writer, local writes go to an append-only intent log, and the visible row is derived. Check each locked test against that one rule. (#1125)
 - A merge gate that re-runs the user's test command on base to get evidence grows one command-rewriting rule per review round (#1105: shlex, -x, -c, conftest, PYTHONPATH). Reuse the run baseline's fixed invocation and its cached passing set (`node_ids`) instead, and keep the user's command verbatim and on head only.
@@ -52,7 +52,7 @@ writes this file.
 - Before blaming a phase total, group it by hour. The 10,406 min merge wait of 11-01 was 775/h until 13Z and 33/h after; the median merge gap never moved, so the queue drained because arrivals fell.
 - Compare review rounds with the last PASS, not only with round 1. 60 of 119 FAIL rounds came after a PASS, and 74% of findings on same-body rounds were on code unchanged since the PASS. To check, map heads by commit time from refs/pull/N in a bare clone, and read runs/issue-N*/review-R.txt.
 - Long gaps contain more order commits by chance. 'Merge gap with an order commit 29.5 vs without 14.7' is length bias, not a cost. Compare whole windows instead.
-- A scorecard zero can mean nothing writes the event. `reverts_after_merge` read kind=revert events that no code wrote until #1560, so 'reverts 0' in r244/r247/r261 had no basis then (git check 11-01: 0 canonical reverts in 561 first-parent commits, so it held). Grep the writer before citing a zero.
+- A scorecard zero can mean nothing writes the event (`reverts_after_merge` had no writer until #1560). Grep the writer before citing a zero.
 - Role wakes follow each finished order (D99); Jin rejected count or time thresholds for them. A wake soon after the last review is a light check of that order's diff, so 'Nothing to change' is the normal result; do not propose a threshold.
 - List a held issue's closed PRs with sizes vs PASS rounds; #1158 grew +242 (PASS) -> +980 on one Goal, so recover from the PASS head + Goal edit. Compare Goal text via GraphQL `userContentEdits`.
 - A Goal non-goal naming one class works (reviewer wrote 'r85 rebuttal accepted') but findings move to the next class (#1004 rounds 13-15). State one bar: what the reviewer holds on, everything else is a NOTE.
@@ -88,7 +88,7 @@ writes this file.
 - hot_overlap_files with overlap wait 0: list conflicted overlap_records for *all* outcomes; a long wide refactor is the usual peer, fix is its `exclusive:` header (r426). Detail: [lessons_detail](lessons_detail.md)
 - After a feature switch flips (merge_owner, 11-04), check which path the locked tests pin (config defaults stay False) and grep readers of the old outcome. (r430, r431) Detail: [lessons_detail](lessons_detail.md)
 - For "tests check internals" counts, use ast: private-name access is 15% of unit tests but 2% of locked tests; the locked cost is cross-imports (43 unit files `from test_X import`), not private access. (r432)
-- `cxdo scan` in parallel fails ("ln: last.md: File exists"), and a `pgrep -f "<pattern>"` wait loop matches its own command line forever. Run scans one by one. The scan output is capped near 2,000 chars, so ask for a ranked short table.
+- Run `cxdo scan` one at a time (parallel fails on last.md; a `pgrep -f` wait loop matches itself). Output is capped near 2,000 chars, so ask for a short ranked table.
 - `runs/issue-N/review-R.txt` keeps only the reviewer's output, not the prompt, so you cannot see from the run dir whether a post-PASS review got the PASS boundary. Check what you can instead: `git diff <review-pass-head> HEAD -- src/` in the issue worktree and the risk-map exempt paths. #1230 (11-03) FAILed twice after PASS on unchanged src, right after a lost-CI-tests retry. (r446)
 - `fa orch facts` 'Binding: structure (fixable)' can be an intended `exclusive:` header hold. Read the `kind=overlap` row in flow-records.jsonl: `cause: exclusive` with one long peer is the chosen trade (r426), so measure it (held issues, minutes, new conflicts) and set a park trigger instead of a fix. (r450, 11-03)
 - When several rounds' review NOTEs name one sentinel value (None/unchanged) that means several states, grep main for the field first. If the run itself added it (#1641 fallback_reports, r2-r4), the cause is the run's own method. Hint 'do not store the decision; re-read it in each comparison; unknown means read again' instead of one more fix per state. (r455)
@@ -102,4 +102,8 @@ writes this file.
 - idle_lanes_with_backlog under 'Binding: plan_pause' is intended; read the `role-signal-answer` for that r-id first (r554). Detail: [lessons_detail](lessons_detail.md)
 - lane_concentration counts each retry as its own execution, so a CI-timeout storm inflates one lane's share. Count executions per distinct issue and the 'CI did not finish' outcomes per hour in runs.jsonl before reading it as scope (r570, 11-04: orch 25 runs on 13 issues, 15 were CI timeouts).
 - idle_lanes_with_backlog in a plan pause released by 'fix X merged': check X is green but `blocked`; compare resolve sha with PR head (r584). Detail: [lessons_detail](lessons_detail.md)
-- 'CI did not finish' storms: 20-job account cap vs 9 jobs/PR head, and the 1200 s CI wait counts queue time (r599). Detail: [lessons_detail](lessons_detail.md)
+- 'CI did not finish': 20-job cap vs 11 jobs/PR head; the 1200 s wait counts queue time (r599). [detail](lessons_detail.md)
+- For a 'CI did not finish' storm, read `kind=merge-batch` flow-records first: size-6 batches used 1 member and cost 66 jobs vs a 20 cap (r615). [detail](lessons_detail.md)
+- Push 500s: count landed pushes from Actions runs, not repo events. Rate was not the cause; a git push 5xx skips #1644's wait (r618). [detail](lessons_detail.md)
+- lane_concentration re-fire: diff runs.jsonl since the last answer by outcome first; +1 is often a success or a known push-500 restart (r622, r628).
+- A stuck merge-owner state is often one long tick, not a missing path: check `ps` for the `foragent.merge_owner` pid's age and its pytest child, and the `merge-owner-*` temp dir mtime. On 11-04 one tick ran a 28-min acceptance baseline inline, so the batch deadline close (prepare, 3600 s from prefix commit time) waited for the next tick. Check github-pause.json for ticks that ended early. (r641)

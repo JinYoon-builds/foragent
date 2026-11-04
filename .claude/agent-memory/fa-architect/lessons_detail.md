@@ -40,3 +40,9 @@ idle_lanes_with_backlog during a plan pause whose release is 'fix X merged': che
 
 ## Outbox-wait after approval batch (r544, 11-04)
 idle_lanes_with_backlog right after an approval batch is usually `outbox-wait`: the approvals' own `ready` label writes sit in issues.json `outbox`, so `_start_ready` holds every start for one tick. 11-04 04:53 (r544): 5 orch issues waited, all started at 04:56 with the outbox at 0. Check `kind=ready` reasons and the outbox's `queued_at` before digging.
+
+## Merge batches vs the CI job cap (r615, 11-04)
+Read flow-records `kind=merge-batch` (members, result, used_members, ci_minutes, reason) before blaming lanes for a CI-timeout storm. On 11-04, size 6 batches: 2 CI'd batches used 1 member each (180/199 CI min), 3 of 5 died at construction because one `git merge-tree` conflict drops the whole chain in merge_owner_batch.prepare. A PR head here runs 3 workflows = 11 jobs, so a 6-batch is 66 jobs vs the 20-job cap; merges fell 2.4/h -> 0.75/h. Also compare main merge rate before/after a switch with `gh pr list --state merged`.
+
+## Push 500s vs push rate (r618, 11-04)
+To count pushes that landed, list Actions runs in the window (`actions/runs?created=A..B`, distinct head_branch+head_sha; the repo events API returned 0 PushEvents in 300 events). Read rejected pushes from runs.jsonl `detail` ('remote: Time ...Z'). On 11-04, 7 pushes were rejected with 500 at <=5 tries/min, while 9 landed with 0 rejected at 08:50-08:55, so rate was not the cause. git push raises GitError and skips #1644's TrackerError.transport wait, so each 500 ended as 'error' and needed an orchestrator retry.

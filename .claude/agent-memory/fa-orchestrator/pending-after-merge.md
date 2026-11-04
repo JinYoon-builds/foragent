@@ -258,3 +258,6 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - r53 dashboard plan ready (preread clean): drafts/2026-11-04-r53/plan.json. Publish with --approve right after #1793 (PR #1849) and #1894 (PR #1897) merge; it rewrites their locks. Replaces #1899 (parked).
 - 6 h after #1924 merges (architect r570): 'CI did not finish' per hour should drop from 5-8/h to <=1/h; orch executions per distinct issue from 1.9 to ~1.2.
 - L1 (union paths from base) plan drafts/2026-11-04-cleanup1/plan-l1.json: publish after #1635 and #1915 merge (it rewrites their lock test_orch_facts.py).
+- 11-04 09:37-09:48Z: four GitHub push 500s (remote rejected, Internal Server Error) on #1954 #1892 #1894 while githubstatus said operational; if it repeats, call the architect with push counts per minute (trains + refreshes + retries).
+- 3 h after merge_batch_size 2 lands (architect r615): construction failures <=1/5, used members per CI'd batch 2, merges to main >=2/h. If used_members stays 1, merge_batch off is the next step (Jin decision, D110).
+- #1914 got 3 push 500s (10:00, 10:15, 10:42Z). If a 4th: fa orch park 1914 until the push-wait fix (architect r618, plan drafts/2026-11-04-batch-push) merges, then unpark + re-approve by edit.
