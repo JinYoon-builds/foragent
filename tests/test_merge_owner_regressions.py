@@ -296,3 +296,46 @@ def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     assert not store.run_merged(new), "A later timestamp cannot move a fact between generations"
     assert (1, new.started_at) not in store.merge_times()
     assert store.merge_times()[1, old.started_at] == fact["merged_at"]
+
+
+def test_late_owner_merge_fact_updates_its_history_without_changing_new_run(tmp_path):
+    clock = [datetime(2026, 10, 20, 9, 0, 0, tzinfo=UTC)]
+    store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    old = store.start_run(1, branch="old", worktree=tmp_path / "old")
+    store.update_run(1, last_review_pass_at=clock[0].isoformat())
+    clock[0] += timedelta(seconds=1)
+    store.finish_run(1, "merge-queued")
+    finished = store.finish_times()[1, old.started_at]
+    clock[0] += timedelta(seconds=1)
+    new = store.start_run(1, branch="new", worktree=tmp_path / "new")
+    path, history = store.root / "runs/1.json", store.root / "runs.jsonl"
+    newer = path.read_bytes()
+    fact = {"pr": 9, "target": "main", "head": "abc", "merged_at": clock[0].isoformat()}
+
+    before = history.read_bytes()
+    with pytest.raises(ValueError, match="generation is unavailable"):
+        store.record_owner_merge(1, (clock[0] - timedelta(days=1)).isoformat(), fact)
+    assert path.read_bytes() == newer and history.read_bytes() == before
+
+    store.record_owner_merge(1, old.started_at, fact)
+    assert path.read_bytes() == newer
+    assert store.owner_merge_facts() == {(1, old.started_at): fact}
+    assert store.run_merged(old) and not store.run_merged(new)
+    recorded = history.read_bytes()
+    assert len(recorded.splitlines()) == 2
+    saved = json.loads(recorded.splitlines()[-1])
+    assert saved["outcome"] == "merge-queued" and saved["finished_at"] == finished
+    assert saved["review_pass_to_merge_seconds"] == 2
+    assert store.finish_times()[1, old.started_at] == finished
+    assert store.merge_times() == {(1, old.started_at): fact["merged_at"]}
+
+    # Reconciliation after another restart repeats no append and preserves the new run.
+    store = StateStore(store.root, now=lambda: clock[0])
+    store.record_owner_merge(1, old.started_at, fact)
+    assert history.read_bytes() == recorded and path.read_bytes() == newer
+    assert len(store.read_history()) == 1
+    clock[0] += timedelta(seconds=1)
+    store.finish_run(1, "merge-queued")
+    new_fact = {**fact, "pr": 10, "head": "def", "merged_at": clock[0].isoformat()}
+    store.record_owner_merge(1, new.started_at, new_fact)
+    assert store.owner_merge_facts() == {(1, old.started_at): fact, (1, new.started_at): new_fact}
