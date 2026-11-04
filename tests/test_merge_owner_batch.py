@@ -303,10 +303,33 @@ def test_nonacceptance_workflow_change_remains_a_batch_member(batched, monkeypat
     assert len(case.target_pushes) == 1 and not case.merges
 
 
+@pytest.mark.parametrize('path', ['.github/workflows/foragent-acceptance.yml',
+                                 '.github/workflows/foragent-acceptance-extra.yaml'])
+def test_main_only_workflow_change_keeps_old_members_in_batch(batched, monkeypatch, path):
+    case = batched
+    queue_workers(case, [5, 1])
+    workflow = 'name: updated-main-workflow\non: [pull_request]\njobs: {}\n'
+    case.history.update({path: workflow})
+    base = case.history.tip
+
+    def unexpected(*args):
+        pytest.fail('The batch tip uses the current main workflow and must use its CI evidence')
+
+    monkeypatch.setattr(ci_local, 'fallback_comparison', unexpected)
+    report = support.gate(case)
+    pr, = groups(case)
+    tip = case.tracker.pr_head_sha(pr.number)
+    decoded_base, chain = batch._decode(case.git, pr.head, tip)
+    assert decoded_base == base and [n for n, *_ in chain] == [5, 1]
+    assert git_command(case.history.origin, 'show', f'{tip}:{path}') == workflow.strip()
+    assert len(case.target_pushes) == 1 and not case.merges, report.actions
+    assert len(case.store.owner_merge_facts()) == 2
+
+
 def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypatch):
     case = batched
     queue_workers(case, [5, 1])
-    compare, failed = ci_mode.changed_workflows, []
+    compare, failed = ci_mode.pr_changes_workflows, []
 
     def unavailable_once(*args):
         if not failed:
@@ -314,7 +337,7 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
             raise GitError("workflow diff unavailable")
         return compare(*args)
 
-    monkeypatch.setattr(ci_mode, "changed_workflows", unavailable_once)
+    monkeypatch.setattr(ci_mode, "pr_changes_workflows", unavailable_once)
     report = support.gate(case)
     assert failed and not groups(case) and not case.target_pushes
     assert len(case.merges) == 1
@@ -682,7 +705,7 @@ def test_target_workflow_change_retires_train_without_spending_members(batched, 
     base, _ = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert base != case.history.tip
     retirement, = batch.retirements(case.ctx)
-    assert "prefix acceptance workflow differs" in retirement["reason"]
+    assert retirement["reason"] == "member head or target changed"
     assert retirement["spent"] == []
     assert not case.target_pushes and not case.merges and not refs(case)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
