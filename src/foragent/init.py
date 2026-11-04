@@ -19,7 +19,7 @@ from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
-from foragent.skills import Skill, SkillManager, with_vendored_library
+from foragent.skills import Skill, SkillManager, entry_directory, with_vendored_library
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
@@ -417,6 +417,7 @@ def init_repo(
         *([".gitignore"] if default_ignore else []),
         # Files an interrupted earlier run migrated but never committed are found by their state.
         *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
+        *_default_ignore_recovery(root, config, git),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
@@ -513,17 +514,27 @@ def init_repo(
                       notes=notes, tracker=tracker)
 
 
-def _checked_default_skills(root: Path, config: Config | None) -> tuple[SkillManager | None, dict[str, Skill | None]]:
-    """Every role's default skills, each with license facts that allow redistribution.
-
-    A new project has no settings file yet, so its table and libraries come from the person's global config.
-    """
-    scope = config if config is not None else load_global_config()
-    names = session_skills.assigned_entries(scope)
+def _checked_default_skills(root: Path, config: Config) -> tuple[SkillManager | None, dict[str, Skill | None]]:
+    """Check the chosen role table against local, redistributable files before setup writes."""
+    names = session_skills.assigned_entries(config)
     if not names:
         return None, {}
-    manager = SkillManager(with_vendored_library(scope, root))
+    manager = SkillManager(with_vendored_library(config, root))
     return manager, {name: manager.check_default(name, root) for name in names}
+
+
+def _default_ignore_recovery(root: Path, config: Config, git: GitRepo) -> list[str]:
+    """Recover only the installer's exact append to HEAD; other ignore edits stay the person's."""
+    names = session_skills.assigned_entries(config)
+    path = root / ".gitignore"
+    if not names or not path.is_file() or path.is_symlink():
+        return []
+    tracked = git._call(["ls-tree", "--name-only", "HEAD", "--", ".gitignore"]).strip()
+    original = git._call(["show", "HEAD:.gitignore"]).encode("utf-8") if tracked else b""
+    expected = SkillManager.default_ignore_content(original, [entry_directory(name) for name in names])
+    if expected != original and path.read_bytes() == expected:
+        return git.uncommitted_paths([".gitignore"])
+    return []
 
 
 FA_ALLOW_RULE = "Bash(fa:*)"

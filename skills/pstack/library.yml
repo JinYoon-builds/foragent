@@ -1,4 +1,4 @@
-# The pstack principle skills vendored with Foragent. Code reads this list; nothing else decides membership.
+# Skills vendored with Foragent. This manifest defines membership and per-skill source overrides.
 name: pstack
 repo: https://github.com/cursor/plugins
 revision: 9b93e81fb2921b9263d9463c15bafeabfe3903aa

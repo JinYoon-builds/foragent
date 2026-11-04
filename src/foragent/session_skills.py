@@ -54,9 +54,10 @@ class _Finder:
             for folder in (f".claude/skills/{directory}", f"skills/{directory}"):
                 path = base / folder / "SKILL.md"
                 try:  # A copy that cannot be looked at is not offered.
+                    if not path.is_file() or reached_through_symlink(base / folder):
+                        continue
                     license_id = copy_license(base / folder, base, origin)
-                    usable = (path.is_file() and not reached_through_symlink(base / folder)
-                              and license_id in OPEN_SOURCE_LICENSES)
+                    usable = license_id in OPEN_SOURCE_LICENSES
                 except OSError:
                     usable = False
                 if usable:
@@ -79,11 +80,13 @@ class _Finder:
         directory = skill.path.name if skill is not None else entry_directory(entry)
         if (found := self._local(directory, skill)) is not None:
             return found
-        if (skill is None or redistributable_license(skill.path, skill.library.path)[0] not in OPEN_SOURCE_LICENSES
-                or reached_through_symlink(skill.path)):
+        if skill is None:
+            return None
+        license_id, _ = redistributable_license(skill.path, skill.library.path)
+        if license_id not in OPEN_SOURCE_LICENSES or reached_through_symlink(skill.path):
             return None
         path = (skill.path / "SKILL.md").resolve()
-        return path, str(path), skill_source(directory, skill.library, license=skill.license)
+        return path, str(path), skill_source(directory, skill.library, license=license_id)
 
     def source(self, entry: str) -> str:
         skill = self._select(entry)
