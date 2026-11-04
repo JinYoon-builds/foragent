@@ -6,26 +6,44 @@ scheduler._kill_run(outcome="stopped"): the existing path terminates the tree an
 saves the WIP (named `[stopped: <why>]`). _restore_stopped then returns the issue
 to ready with one stop event. Every unfinished record `fa gate status` lists is
 stoppable; when its workers are already gone the same path saves the work (#1207).
+
+`fa orch stop --all --keep-work --why` (#1491) is the project-wide stop, and
+`fa orch release` is its pair. Both append to `<state>/stop-requests.jsonl` (their
+only writers); `active()` derives the stop in force from it and is the admission every
+start asks (tick starts, dreams, drafts, role sessions, review reruns, run entry). The
+stop also holds each lane not held yet through the plan's own pause (orch_plan stays the
+writer of lane holds); the release lifts only those holds. It signals nothing: a running
+run's owner stops after its current agent turn (`raise_if_requested`) and saves its
+work, and `GitRepo.remove_worktree` never discards a dirty worktree while a stop is in
+force.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+import fcntl
+import json
 from typing import TYPE_CHECKING
 
 from foragent import processes
 from foragent.i18n import text
+from foragent.labels import lane_order
+from foragent.run_attempt import ExecutorStopped
 from foragent.state import Run
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from foragent.runner import RunContext
+    from foragent.state import StateStore
 
 TICK_LOCK_WAIT_S = 60
+STOP_PREFIX = "project stop: "
 
 
 @contextmanager
-def _tick_lock(ctx: RunContext, n: int) -> Iterator[None]:
+def _tick_lock(ctx: RunContext, n: int | None) -> Iterator[None]:
     """Hold the gate's tick lock, polling for up to TICK_LOCK_WAIT_S while a tick holds it."""
     from foragent.orch import OrchError
 
@@ -36,6 +54,8 @@ def _tick_lock(ctx: RunContext, n: int) -> Iterator[None]:
                 yield
                 return
         if ctx.monotonic() >= deadline:
+            if n is None:
+                raise OrchError(text("orch_stop_all_busy", ctx.config.language))
             _note(ctx, n, None, "skipped", "busy")
             raise OrchError(text("orch_stop_busy", ctx.config.language, n=n))
         ctx.sleep(1)
@@ -134,3 +154,162 @@ def stop(ctx: RunContext, n: int, why: str) -> str:
         _note(ctx, n, run, "stopped", "requested", why)  # The kill stands even if a later restore step fails.
         _restore_stopped(tick_ctx, n, why, report)
     return text("orch_stop_done", language, n=n, why=why)  # _restore_stopped posted it as the audit comment.
+
+
+def _requests(store: StateStore) -> Path:
+    return store.root / "stop-requests.jsonl"
+
+
+def _records(store: StateStore) -> list[dict]:
+    """The stop and release records in order; a torn line is no record."""
+    try:
+        lines = _requests(store).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("why"), str):
+            records.append(item)
+    return records
+
+
+def _since_release(records: list[dict]) -> list[dict]:
+    """The stop records after the latest release; empty when no project stop is active."""
+    tail = []
+    for item in records:
+        tail = [] if item.get("kind") == "release" else [*tail, item]
+    return tail
+
+
+def active(store: StateStore) -> str | None:
+    """The why of the project-wide stop in force, or None; the one admission check every start asks.
+
+    A stop stays in force until `fa orch release` records its pair; it never expires.
+    """
+    stops = _since_release(_records(store))
+    return stops[-1]["why"] if stops else None
+
+
+def raise_if_requested(ctx: RunContext, n: int) -> None:
+    """The run owner's check before and after each external step: stop with outcome "stopped".
+
+    The owner's existing preservation path then saves the worktree on the issue branch and
+    finishes the run; the next tick's orphan recovery returns it to ready (_restore_stopped).
+    """
+    if (why := active(ctx.store)) is None:
+        return
+    run = ctx.store.get_run(n)
+    if run is None or run.status != "running":
+        return
+    _note(ctx, n, run, "stopped", "project-stop", why)
+    raise ExecutorStopped("stopped", why)
+
+
+def halt(ctx: RunContext, n: int, why: str) -> None:
+    """The deferred stop of the shared final merge read: no merge starts during a project stop.
+
+    A live run finishes "stopped" through its owner's save; the merge owner keeps its job queued.
+    """
+    if (run := ctx.store.get_run(n)) is not None and run.status == "running":
+        _note(ctx, n, run, "stopped", "project-stop", why)
+    raise ExecutorStopped("stopped", why)
+
+
+@contextmanager
+def merging(ctx: RunContext, n: int, refused: Callable[[str], BaseException] | None = None) -> Iterator[None]:
+    """Hold the stop record lock around every merge call, after its last check.
+
+    `stop_all` records a stop under the same lock, so a stop recorded before this read merges
+    nothing, and a stop that arrives during the merge call waits for that call to return.
+    """
+    with record_lock(ctx.store):
+        if (why := active(ctx.store)) is not None:
+            if refused is not None:
+                raise refused(why)
+            halt(ctx, n, why)
+        yield
+
+
+@contextmanager
+def record_lock(store) -> Iterator[None]:
+    """The lock a stop is recorded under; held briefly by each irreversible step that reads it.
+
+    Merge calls, worktree removal and branch moves read the stop and act inside it, so a stop
+    lands either before the read or after the step. Never take it twice in one thread.
+    """
+    store.root.mkdir(parents=True, exist_ok=True)
+    with (store.root / "stop.lock").open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def stop_all(ctx: RunContext, why: str) -> str:
+    """Record one project-wide stop and hold every lane not held yet; each run's owner stops its run.
+
+    Nothing here signals a process or writes a run: the runner that owns each run reads the
+    stop at its next step (`raise_if_requested`) and saves and finishes the run itself.
+    The record names the lanes this stop held, so its release lifts only those.
+    """
+    from foragent import orch_plan
+    from foragent.orch import OrchError
+    from foragent.scheduler_stop import unfinished_runs
+
+    language = ctx.config.language
+    why = " ".join(why.split())
+    if not why:
+        raise OrchError(text("orch_stop_why_required", language))
+    with _tick_lock(ctx, None):
+        now = ctx.now()
+        lanes = sorted({"main", *ctx.config.lanes}, key=lane_order)
+        paused = orch_plan.load(ctx.store, now)["paused"]
+        held = [lane for lane in lanes if lane not in paused]  # A lane held before keeps its own hold.
+        for lane in held:
+            orch_plan.pause(ctx.store, lane, orch_plan.UNTIL_RESUMED, f"{STOP_PREFIX}{why}")
+        with record_lock(ctx.store):  # A merge call or removal in flight finishes first; no later one starts.
+            _append(ctx.store, {"at": now.isoformat(), "kind": "stop", "why": why, "held": held})
+        running = sorted(run.number for run in unfinished_runs(ctx.store))
+    lines = [text("orch_stop_all_held", language, lanes=", ".join(lanes), why=why)]
+    lines += [text("orch_stop_all_owner", language, n=n) for n in running]
+    return "\n".join(lines)
+
+
+def release(ctx: RunContext, why: str = "") -> str:
+    """Lift the project-wide stop and resume the lanes it held; a lane held before stays held.
+
+    Works with no argument, so one command restarts FA; a given why is also kept in the journal.
+    """
+    from foragent import orch_plan
+    from foragent.orch_events import append_event
+
+    language = ctx.config.language
+    why = " ".join(why.split())
+    with _tick_lock(ctx, None):
+        stops = _since_release(_records(ctx.store))
+        if not stops:
+            return text("orch_release_none", language)
+        now = ctx.now()
+        paused = orch_plan.load(ctx.store, now)["paused"]
+        resumed = []
+        for lane in dict.fromkeys(lane for item in stops for lane in item.get("held") or []):
+            item = paused.get(lane)
+            # Only the stop's own hold is lifted; a pause a person set since then stays.
+            if (item is not None and item["until"] == orch_plan.UNTIL_RESUMED.isoformat()
+                    and orch_plan.resume(ctx.store, lane)):
+                resumed.append(lane)
+        _append(ctx.store, {"at": now.isoformat(), "kind": "release", "why": why, "resumed": resumed})
+        if why:
+            append_event(ctx.store, now, None, "release", f"Project stop released: {why}", why=why, resumed=resumed)
+    return text("orch_release_done", language, lanes=", ".join(resumed) or "-")
+
+
+def _append(store: StateStore, record: dict) -> None:
+    """Append one stop or release record; these commands are the file's only writers."""
+    with store._state_lock(), _requests(store).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")

@@ -125,12 +125,83 @@ class GitRepo:
                 store = StateStore(path.parent.parent)
                 stack.enter_context(store.worktree_lock(int(path.name[6:])))
             if path.exists():
+                if path.parent.name == "worktrees":
+                    from foragent import orch_stop
+
+                    store = StateStore(path.parent.parent)
+                    stack.enter_context(orch_stop.record_lock(store))  # A stop lands before this read or after the removal.
+                    if not self._discardable(path, store):
+                        return  # Kept during the project stop: removing it would lose unsaved files.
                 self._call(["worktree", "remove", "--force", str(path)])
             self._call(["worktree", "prune"])
 
+    def _discardable(self, path: Path, store: StateStore) -> bool:
+        """The one discard point: under a project stop, nothing unsaved is removed (#1491).
+
+        Every exit of a stopped run (dreams, review reruns, verification, publication) ends in
+        this removal. A dirty worktree is first committed as WIP on its branch (a detached issue
+        worktree takes its issue branch). Removal goes ahead only when nothing is left that it
+        would delete, ignored and excluded files included (a dream's ignored memory, `.foragent/`
+        notes, injected skills, caches); otherwise the worktree stays on disk until the release.
+        """
+        from foragent import orch_stop
+
+        if (why := orch_stop.active(store)) is None or not (path / ".git").is_file():
+            return True
+        tree = self.at(path)
+        if not tree._unsaved():
+            return True
+        if tree.merge_in_progress():
+            tree.quit_merge()  # Keep the partial resolution as files; the WIP is not a merge.
+        detached = tree._call(["rev-parse", "--abbrev-ref", "HEAD"]).strip() == "HEAD"
+        branch = f"foragent/issue-{path.name[6:]}"
+        if detached and path.name.startswith("issue-") and path.name[6:].isdigit() and not tree._moves_back(branch, "HEAD"):
+            tree._call(["switch", "-C", branch, "HEAD"])  # Only forward: the branch keeps every commit it has.
+            detached = False
+        if not detached:
+            tree.stage_changes()
+            if tree.has_staged_changes():
+                tree.commit(f"WIP: unfinished work kept by the project stop [stopped: {why}]")
+        if not (left := tree._unsaved()):
+            return True
+        from datetime import UTC, datetime
+
+        from foragent.orch_events import append_event
+
+        number = int(path.name[6:]) if path.name.startswith("issue-") and path.name[6:].isdigit() else None
+        append_event(store, datetime.now(UTC), number, "worktree-kept",
+                     f"{path} kept during the project stop: {len(left)} unsaved path(s)",
+                     path=str(path), unsaved=left[:20])
+        return False
+
+    def _unsaved(self) -> list[str]:
+        """Every path a forced worktree removal would lose: changes, untracked and ignored files."""
+        output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
+        return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
+
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._call(["worktree", "add", "-B", branch, str(path), base_ref])
+        with self._branch_move(path, branch, base_ref):
+            self._call(["worktree", "add", "-B", branch, str(path), base_ref])
+
+    @contextmanager
+    def _branch_move(self, path: Path, branch: str, tip: str) -> Iterator[None]:
+        """Under a project stop a run branch never moves back: commits only it holds would be lost (#1491)."""
+        if path.parent.name != "worktrees":
+            yield
+            return
+        from foragent import orch_stop
+
+        store = StateStore(path.parent.parent)
+        with orch_stop.record_lock(store):
+            if (why := orch_stop.active(store)) is not None and self._moves_back(branch, tip):
+                from foragent.run_attempt import ExecutorStopped
+
+                raise ExecutorStopped("stopped", why)
+            yield
+
+    def _moves_back(self, branch: str, tip: str) -> bool:
+        return (old := self.local_branch_sha(branch)) is not None and not self.is_ancestor(old, tip)
 
     def ref_sha(self, ref: str) -> str:
         return self._call(["rev-parse", "--verify", f"{ref}^{{commit}}"]).strip()
@@ -174,7 +245,8 @@ class GitRepo:
 
     def attach_branch(self, branch: str) -> None:
         """Continue work on a detached PR head without replacing its worktree."""
-        self._call(["switch", "-C", branch, "HEAD"])
+        with self._branch_move(self.root, branch, "HEAD"):
+            self._call(["switch", "-C", branch, "HEAD"])
 
     def stage_changes(self) -> None:
         output = self._call([

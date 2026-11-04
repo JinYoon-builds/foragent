@@ -396,9 +396,10 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                 )
                 if not subject:
                     attempt.pr_title = title
-                run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
-                    ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
+                    with orch_stop.merging(ctx, n):  # A stop during the retitle merges nothing (#1491).
+                        run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
+                        ctx.tracker.merge_pr(pr, method="squash", expected_head_sha=verified_head_sha, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
                     if exc.waits:
@@ -460,4 +461,4 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish, size_signal  # noqa: E402
+from foragent import orch_stop, run_publish, size_signal  # noqa: E402
