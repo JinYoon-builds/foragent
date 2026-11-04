@@ -1,0 +1,7 @@
+{
+  "name": "foragent",
+  "description": "Foragent: type /fa to set up a project, order work and let lanes finish it between tasks.",
+  "homepage": "https://github.com/JinYoon-builds/foragent",
+  "repository": "https://github.com/JinYoon-builds/foragent",
+  "license": "MIT OR Apache-2.0"
+}
