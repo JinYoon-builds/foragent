@@ -71,3 +71,4 @@
 - 'Current decisions' asks usually duplicate rules.md (D108); point to rules.md first. decisions.py parses `### Dnn.` headings in any order, so in-place marks are safe; moving entries breaks append-only.
 - Bug fixes with in-app text (#1793 Terminal.app font hint, #1825 '(none)' review marker, #1836 merge-owner merges in readers) need no reader-doc line; README/docs name no font, review marker or merge owner. Grep those words once.
 - Terminal support changes in watch_open.py (e.g. #1959 Ghostty) must reach README's terminal list, in English (:81) and 한국어 (:159); grep `TERM_PROGRAM` in the diff.
+- Existing-project adoption (`fa adopt survey`, #1789: docs/GitHub issues/fixed_by evidence, one-confirmation proposal) lives only in skills/fa-init; README names just `fa init`. Role-signal re-fire tuning (#1840) is in docs/specs only. Neither needs a reader-doc line.
