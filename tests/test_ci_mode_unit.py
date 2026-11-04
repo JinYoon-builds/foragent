@@ -225,6 +225,108 @@ def test_report_on_a_later_base_is_read_on_the_base_ci_measured(tmp_path, monkey
                                        later_base=later_base)
         assert asked == ["base"]
 
+@pytest.mark.parametrize("case", ["older", "declined", "later", "missing", "same-base", "invalid"])
+def test_older_base_callback_only_refreshes_valid_stale_base(tmp_path, monkeypatch, case):
+    from conftest import BASE_TIME
+    from foragent import ci_mode
+    from foragent.run_attempt import ExecutorStopped
+
+    config = Config(checks="ci", checks_fallback=None, test_command="pytest", ci_shards=2)
+    values = [report(), report(1)]
+    for value in values:
+        value["report"]["scope"] = measurement_scope(config, tmp_path, [])
+    if case == "missing":
+        values.pop()
+    if case == "same-base":
+        values[1]["run"]["id"] += 1  # A stale producer alone cannot request a base refresh.
+        values[1]["artifact"]["workflow_run"]["id"] += 1
+    if case == "invalid":
+        values[0]["report"]["head"]["complete"] = False
+    asked, flags, sleeps = [], [], []
+    git = SimpleNamespace(ref_sha=lambda ref: "trusted", _call=lambda args: "")
+    tracker = SimpleNamespace(pr_acceptance_reports=lambda head: deepcopy(values), pr_default_branch=lambda: "main")
+    ctx = SimpleNamespace(repo="owner/repo", repo_root=tmp_path, config=config, now=lambda: BASE_TIME,
+                          sleep=sleeps.append, tracker=tracker, store=SimpleNamespace(
+                              log_path=lambda n: tmp_path / "log", update_run=lambda *args, **kwargs: None))
+    attempt = SimpleNamespace(n=1, ctx=ctx, git=git, target_branch="main", log=tmp_path / "log")
+    monkeypatch.setattr(ci_mode, "_baseline_exclusions", lambda *args: [])
+    monkeypatch.setattr(ci_mode, "flag", lambda *args: flags.append(args))
+
+    def older(sha):
+        asked.append(sha)
+        return case != "declined"
+
+    def require():
+        return ci_mode.require_comparison(
+            attempt, 99, "head", base_sha="base" if case == "same-base" else "expected",
+            deadline=BASE_TIME.timestamp(), later_base=lambda sha: case == "later", older_base=older)
+
+    if case == "older":
+        with pytest.raises(ci_mode.OlderMeasuredBase) as caught:
+            require()
+        assert caught.value.reported == "base"
+        assert flags == []
+    elif case == "later":
+        assert require().base_sha == "base"
+        assert flags == []
+    else:
+        with pytest.raises(ExecutorStopped):
+            require()
+        assert len(flags) == 1
+    assert asked == (["base"] if case in {"older", "declined"} else [])
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("reviewed", [False, True], ids=["implementation", "review-only"])
+@pytest.mark.parametrize("owner", [False, True], ids=["turn", "enqueue"])
+def test_unknown_reported_base_waits_for_evidence_without_refresh(run_case, monkeypatch, reviewed, owner):
+    from foragent import runner
+    from foragent.git import GitRepo
+
+    case = run_case
+    case.ctx.config = replace(case.ctx.config, checks="ci", ci_shards=2, merge_owner=owner,
+                              test_command=f"{sys.executable} -m pytest", max_retries=0,
+                              review="careful" if reviewed else "fast")
+    case.tracker.set_pr_checks(2, "pass")
+    pushes, reads, sleeps = [], [], []
+    for method in ("push", "push_head"):
+        original = getattr(GitRepo, method)
+        def push(git, *args, _original=original, **kwargs):
+            pushes.append(git.head_sha())
+            return _original(git, *args, **kwargs)
+        monkeypatch.setattr(GitRepo, method, push)
+    if reviewed:
+        assert runner.run_issue(1, case.ctx) == "pr-open"
+        case.now[0] += timedelta(seconds=1)
+        case.ctx.config = replace(case.ctx.config, review="fast")
+
+    def reports(head):
+        reads.append(head)
+        excluded = read_exclusions(GitRepo(case.store.worktree_path(1)), case.history.tip)
+        values = [report(), report(1)]
+        for value in values:
+            value["run"]["head_sha"] = value["artifact"]["workflow_run"]["head_sha"] = head
+            value["report"].update(
+                base_sha="unavailable-commit" if len(reads) == 1 else case.history.tip,
+                head_sha=head, excluded=excluded,
+                scope=measurement_scope(case.ctx.config, case.ctx.repo_root, excluded))
+        return values
+
+    sleep = case.ctx.sleep
+    def wait(seconds):
+        sleeps.append(seconds)
+        sleep(seconds)
+    monkeypatch.setattr(case.tracker, "pr_acceptance_reports", reports)
+    case.ctx.sleep = wait
+    outcome = runner.review_only(1, case.ctx, repair_ci=False) if reviewed else runner.run_issue(1, case.ctx)
+    assert outcome == ("merge-queued" if owner else "merged"), case.store.log_path(1).read_text()
+    assert len(reads) >= 2 and len(set(reads)) == 1
+    assert sleeps == [30], "Unknown ancestry must use the existing freshness wait"
+    assert len(pushes) == 1, "Unknown ancestry must not refresh or push the head again"
+    assert len(case.executor.calls) == 1, "Waiting for evidence must not spend a worker turn"
+    assert case.store.load_flag(1) is None
+
+
 @pytest.mark.parametrize("damage", ["non-json-extra", "circular-extra", "overflow-duration",
                                    "transport-key", "transport-type", "transport-json", "transport-recursion", "transport-overflow"])
 def test_individual_ci_report_errors_are_unusable_during_import_and_locked_read(tmp_path, monkeypatch, damage):
