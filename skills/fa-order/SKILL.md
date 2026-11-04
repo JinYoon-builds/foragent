@@ -383,6 +383,11 @@ decisions, one at a time with context, and fold their answers into the plan.
 DECIDE lines are the lane's own choices: show them once in the restatement you present for
 approval, under "the lane will decide these" (in the person's language). They need no
 planning approval and no loop to remove every guess; the lane records them in its PR.
+Each row also shows the lane's expected size (`expected_size`: source lines, test lines,
+files), or `size: unknown` when it gave none. A `size_note` means an estimate is above the
+issue's size label limit (`size_limits`); show it beside the design and let the person judge
+a split. It never blocks publishing or approval. `fa order sizes --json` shows merged issues'
+expected and real size and the share of wrong estimates.
 `--approve` refuses issues whose latest preread of the current content is missing or still
 has open questions; any plan edit needs a new preread. The dry-run is never blocked.
 Issues with behaviour `statements` take `fa order prepare PLAN.json --json` instead of preread:

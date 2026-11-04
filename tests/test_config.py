@@ -21,6 +21,26 @@ def write_settings(path, settings):
     path.write_text(yaml.safe_dump(settings), encoding="utf-8")
 
 
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./...", "pytest && npm test"])
+def test_merge_owner_refuses_unsupported_test_commands_at_config_load(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    with pytest.raises(ConfigError) as error:
+        load_config(repo)
+    assert str(error.value) == "merge_owner requires an explicit supported pytest command in test_command."
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "uv run pytest", "python -m pytest tests"])
+def test_merge_owner_accepts_supported_pytest_commands(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": True, "test_command": command})
+    assert load_config(repo).merge_owner is True
+
+
+@pytest.mark.parametrize("command", [None, "npm test", "go test ./..."])
+def test_flag_off_keeps_other_test_commands_supported(repo, command):
+    write_settings(repo / ".foragent.yml", {"merge_owner": False, "test_command": command})
+    assert load_config(repo).test_command == command
+
+
 @pytest.mark.parametrize("value", ["auto", 1, 3, 12])
 def test_merge_group_max_accepts_auto_or_positive_integer(repo, value):
     write_settings(repo / ".foragent.yml", {"merge_group_max": value})
@@ -42,11 +62,12 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
+        "merge_owner": False,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True,
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True, "review_scoring": True,
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
@@ -65,6 +86,9 @@ def test_exact_defaults(repo):
                   "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
                   "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None}},
         "tiers_headroom_ample": 0.5,
+        "size_limits": {"s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
+                        "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
+                        "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25}},
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -558,3 +582,25 @@ def test_default_skills_local_table_replaces_the_global_one_and_blank_means_empt
         "docs": ["kwp:engineering/one"], "workers": ["two"]}
     (tmp_path / ".foragent.yml").write_text("default_skills:\n  architect: [three]\n  docs:\n")
     assert load_config(tmp_path, global_path=other).default_skills == {"architect": ["three"], "docs": None}
+
+
+def test_review_scoring_defaults_on_loads_and_rejects_non_bool(repo):
+    assert load_config(repo).review_scoring is True
+    write_settings(repo / ".foragent.yml", {"review_scoring": False})
+    assert load_config(repo).review_scoring is False
+    write_settings(repo / ".foragent.yml", {"review_scoring": "no"})
+    with pytest.raises(ConfigError, match="review_scoring"):
+        load_config(repo)
+
+
+def test_size_limits_merge_per_label_and_reject_bad_values(repo):
+    (repo / ".foragent.yml").write_text("size_limits:\n  m:\n    source_lines: 7\n")
+    limits = load_config(repo).size_limits
+    assert limits["m"] == {"source_lines": 7, "test_lines": 437, "file_count": 17}
+    assert limits["s"]["source_lines"] == 199
+    for bad in ("size_limits:\n  m:\n    source_lines: -1\n", "size_limits:\n  m:\n    lines: 3\n",
+                "size_limits:\n  xl:\n    source_lines: 3\n", "size_limits: 5\n",
+                "size_limits:\n  s:\n    file_count: true\n"):
+        (repo / ".foragent.yml").write_text(bad)
+        with pytest.raises(ConfigError, match="size_limits"):
+            load_config(repo)

@@ -5,6 +5,7 @@
 
 MESSAGES = {
     "en": {
+        "init_setup_fixes": "Setup checks failed. Run these fixes, then rerun fa init:\n{fixes}",
         "init_gh_missing": (
             "gh auth status failed: {error}\n"
             "The GitHub CLI (gh) is not installed. Install it, then rerun fa init:\n"
@@ -27,6 +28,7 @@ MESSAGES = {
         ),
     },
     "ko": {
+        "init_setup_fixes": "설정 점검을 통과하지 못했어요. 다음 명령을 실행한 뒤 fa init을 다시 실행하세요:\n{fixes}",
         "init_gh_missing": (
             "gh auth status failed: {error}\n"
             "GitHub CLI(gh)가 설치되어 있지 않아요. 설치한 뒤 fa init을 다시 실행하세요:\n"

@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership
+from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
 from foragent import order_replaces
 from foragent.config import Config
@@ -920,6 +920,14 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                                published_blobs=published_blobs, approve=approve)
 
 
+def _recorded(write, *args) -> None:
+    """Run an estimate-input write; its failure stops the caller as an ordinary plan error."""
+    try:
+        write(*args)
+    except size_signal.RecordError as exc:
+        raise PlanError(str(exc)) from exc
+
+
 def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
                     publication: _Publication, published_blobs: dict[str, str],
                     approve: bool = False) -> PublishReport:
@@ -930,6 +938,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     by_number, edit_numbers = publication.by_number, publication.edit_numbers
     unconfirmed, rows, owner = publication.unconfirmed, publication.rows, publication.owner
     assert owner is not None
+    # Before any issue write: until the outcome is recorded below, a run start reads these as unknown.
+    _recorded(size_signal.publishing, plan, config, _workload_store(root, repo), by_number, mapping, config.language)
     for issue in unconfirmed:
         _retire(tracker, config, issue, owner_label(owner))
     lane_names = {item["lane"] for item in plan["issues"]} - {"main"}
@@ -1054,6 +1064,8 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
         raise PlanError("approve numbers must refer to this plan's children or edits")
     approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
+    # Every body is written: record which preread each was read with, before any run can start.
+    size_signal.published(plan, root, config, _workload_store(root, repo), by_number, mapping, tracker)
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
@@ -1145,7 +1157,7 @@ def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: P
     run_config = lane_config(config, item["lane"])
     setup = implementer_setup(run_config, item["lane"], item["size"], root)
     prompt = preread_prompt(plan, item, root)
-    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + setup.memory_notice
+    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + size_signal.PROMPT + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan, _lane_instructions(run_config, item["lane"], root)],
@@ -1472,18 +1484,22 @@ def preread(plan: dict, root: Path, config: Config,
             order_references.remove(root, snapshot)
         if result.timed_out or result.exit_code != 0 or not result.last_message.strip():
             raise PlanError(f"preread of issue {item['key']} did not finish with an answer; see {log}")
-        unknowns = _unknowns(result.last_message)
-        decisions = _decisions(result.last_message)
-        approach = _approach(result.last_message)
-        _record_preread(root, directory, digest, {
-            "key": item["key"], "plan": plan["id"], **_binding(plan, item, config, repo or config.repo, published),
-            "unknowns": unknowns, "decisions": decisions, "approach": approach,
-            "at": datetime.now(UTC).isoformat(timespec="seconds")})
+        size, answer = size_signal.parse(result.last_message), size_signal.without(result.last_message)
+        unknowns = _unknowns(answer)
+        decisions = _decisions(answer)
+        approach = _approach(answer)
+        record = {"id": secrets.token_hex(16), "key": item["key"], "plan": plan["id"],
+                  **_binding(plan, item, config, repo or config.repo, published),
+                  "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
+                  "at": datetime.now(UTC).isoformat(timespec="seconds")}
+        # The estimate is born here, before the record; each run start fixes it from these notes (#1696).
+        _recorded(size_signal.note, store, record, digest, config.language)
+        _record_preread(root, directory, digest, record)
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}
                        | ({"decisions": decisions} if decisions else {})
-                       | ({"approach": approach} if approach else {}))
+                       | ({"approach": approach} if approach else {}) | size_signal.row(size, item["size"], config))
     # A statement issue has no reader turn, yet a refused publication must have this way back:
     # the agent that ran this re-read sees the current fields it now stands on.
     read = {item["key"] for item in items}

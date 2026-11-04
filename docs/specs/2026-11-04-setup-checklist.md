@@ -1,0 +1,3 @@
+# One setup checklist (Jin 2026-11-04)
+
+One list, three readers: `fa doctor --setup --json`, `fa init`, /fa. Contract: `{"items": [{"id", "ok", "fix"}]}` in check order; ids stable; `gh-project-scope` is the first item built. The list's order follows the list draft below (tools installed, gh login, gh project scope, repository linked, ...), so later items may sit before it. Full list draft (later issues): git, gh, uv installed; gh login; gh project scope; repository linked to GitHub (#1655); Claude Code login; Codex login (optional); Bash(fa:*) allowed; launchd gate; terminal for the dashboard; for remote use Full Disk Access and Remote Login.

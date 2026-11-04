@@ -26,6 +26,7 @@ from foragent.orch_facts_runs import (
     _slowest_files, _test_slots, _waiting_issues,
 )
 from foragent.state import Run, StateStore
+from foragent.state_logs import FLOW_LOCK
 
 HUMAN_RUNS = 6
 HUMAN_ITEMS = 4
@@ -114,7 +115,8 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             if source != store.root and source.parent != parent:
                 continue
             target = into / "data" / source.name
-            names = [*source.glob("*.json"), *source.glob("*.jsonl")] if source == store.root else [
+            # flow.lock too: a store without it reads as one that never recorded a flow record.
+            names = [*source.glob("*.json"), *source.glob("*.jsonl"), source / FLOW_LOCK] if source == store.root else [
                 source / "runs.jsonl"]
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
@@ -238,6 +240,15 @@ def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value * 100:.1f}%"
 
 
+def _waiting_text(facts: dict[str, Any]) -> str:
+    """The waiting-on-a-person numbers, appended to the kinds line so the block keeps its lines."""
+    waiting = facts.get("kind_numbers", {}).get("waiting_on_person")
+    if not waiting:
+        return ""
+    hours = waiting["oldest_waiting_seconds"] / 3600
+    return f"; waiting on a person: {waiting['waiting']}, oldest {waiting['oldest_issue']} ({hours:.1f} h)"
+
+
 def _decided_lines(facts: dict[str, Any], language: str) -> list[str]:
     """Decided issues waiting for tests, and decision-to-approval time, as two lines."""
     from foragent.i18n import text
@@ -300,7 +311,8 @@ def human(facts: dict[str, Any], language: str = "en") -> str:
     reason_lines = [f"Failure reasons (last {facts['window_days']} days): {'none' if not reasons else len(reasons)}"]
     reason_lines += [f"  {count}x {text[:100]}" for text, count in reasons[:HUMAN_ITEMS]]
     blocks = [runs + ["  " + line for line in [*orch_facts_reviews.human_lines(facts, language, HUMAN_ITEMS),
-                                               *orch_facts_reviews.project_review_lines(facts, language, HUMAN_ITEMS)]], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}",
+                                               *orch_facts_reviews.project_review_lines(facts, language, HUMAN_ITEMS)]], capacity_lines, hot_lines, reason_lines, [f"Merges since tidy: {facts['merges_since_tidy']}; kinds: {', '.join(facts['kinds']) or 'none'}"
+                                    + _waiting_text(facts),
                                     orch_facts_baselines.human_line(facts, language),
                                     *orch_role_schedule.human_lines(facts["role_schedule"], language),
                                     *_decided_lines(facts, language)]]

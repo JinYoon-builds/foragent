@@ -3,7 +3,7 @@
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import math
@@ -184,7 +184,8 @@ def list_blocked(ctx: RunContext) -> list[dict]:
     return items
 
 
-def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
+def _retry(ctx: RunContext, n: int, hint: str | None, *, expected_pr=None, expected_head_sha=None,
+           expected_target=None) -> str | None:
     tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
     # Undelivered advice (an earlier hint or a talk message) is kept; only delivery removes it.
     error = None
@@ -193,9 +194,19 @@ def _retry(ctx: RunContext, n: int, hint: str | None) -> str | None:
         error = orch_advice.publish(ctx.tracker, ctx, n,
                                     "<!-- foragent:orch -->\nRetry advice:\n\n" + hint)
         add_hint(ctx.store, n, hint)
-    # The next implementer receives the keep-work/defect-class default before any hint.
+    if getattr(ctx.config, "merge_owner", False):
+        pr = expected_pr if expected_pr is not None else ctx.tracker.find_pr(f"foragent/issue-{n}")
+        if pr is not None:
+            from foragent.merge_owner import close_for_repair
+
+            current = ctx.tracker.get_pr(pr)
+            close_for_repair(ctx, n, pr, expected_head_sha or current.head_sha or ctx.tracker.pr_head_sha(pr),
+                             expected_target or current.base, branch=f"foragent/issue-{n}",
+                             comment="Closed by Foragent orchestrator retry")
+    # The next implementer receives the keep-work default, including after a
+    # lost close response. Changed-head holds never publish a retry marker.
     ctx.store._atomic_write(retry_marker(ctx.store.root, n), "retry\n")
-    if (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
+    if not getattr(ctx.config, "merge_owner", False) and (pr := ctx.tracker.find_pr(f"foragent/issue-{n}")) is not None:
         ctx.tracker.close_pr(pr, "Closed by Foragent orchestrator retry")
     # Establish the destination before clearing the old state, including on errors.
     tracker.add_labels(n, [READY])
@@ -612,6 +623,18 @@ def merge(ctx: RunContext, n: int, *, approved_by: str, at: str | None = None) -
     # This command writes its own queue entry; the lock retains its reservation.
     current = _open_pr(ctx, n)
     head = ctx.tracker.pr_head_sha(n)
+    if getattr(ctx.config, "merge_owner", False):
+        from foragent.runner import review_only
+
+        issue_n = pr_issue_number(current.head)
+        if issue_n is None:
+            raise OrchError("merge_owner prototype supports approved issue PRs only")
+        authorized = replace(ctx, merge_authorization={"approved_by": approved_by, "at": at,
+                                                       "pr": n, "target": current.base, "head": head})
+        outcome = review_only(issue_n, authorized, verdict_head=head, repair_ci=False)
+        summary = f"PR #{n}: {outcome}; approved by {approved_by} at {at}"
+        _event(ctx, issue_n, "merge-owner-handoff", summary)
+        return summary
     place = merge_turn.Seat(pr_issue_number(current.head) or n, f"orch-merge {at}", current.base)
     if (holder := merge_turn.claim(ctx, place, head)) is not None:
         raise OrchError(f"PR #{n} waits for the merge turn: #{holder} holds it on {current.base}; "

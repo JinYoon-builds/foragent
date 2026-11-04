@@ -108,6 +108,13 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
     if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
         raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
+    if type(values["merge_owner"]) is not bool:
+        raise ConfigError("merge_owner must be a boolean")
+    if values["merge_owner"]:
+        from foragent.run_checks import _pytest_command
+
+        if not values["test_command"] or _pytest_command(values["test_command"]) is None:
+            raise ConfigError("merge_owner requires an explicit supported pytest command in test_command.")
     maximum = values["merge_group_max"]
     if maximum != "auto" and (type(maximum) is not int or maximum < 1):
         raise ConfigError("merge_group_max must be auto or a positive integer (1 turns merge groups off)")
@@ -125,6 +132,8 @@ def _validate(values: dict[str, Any]) -> None:
         raise ConfigError("animation must be true or false")
     if type(values["review_pass_scope"]) is not bool:
         raise ConfigError("review_pass_scope must be true or false")
+    if type(values["review_scoring"]) is not bool:
+        raise ConfigError("review_scoring must be true or false")
     if type(values["update_check"]) is not bool:
         raise ConfigError("update_check must be true or false")
     presence = values["presence"]
@@ -194,6 +203,13 @@ def _validate(values: dict[str, Any]) -> None:
                 raise ConfigError(f"tiers.{name}.{key} must be one of {', '.join(_EFFORTS)} or null")
             if key.endswith("_model") and value is not None and not isinstance(value, str):
                 raise ConfigError(f"tiers.{name}.{key} must be a string or null")
+    limits = values["size_limits"]
+    if not isinstance(limits, dict) or set(limits) != {"s", "m", "l"} or any(
+            not isinstance(limit, dict) or set(limit) != {"source_lines", "test_lines", "file_count"}
+            or any(type(value) is not int or value < 0 for value in limit.values()) for limit in limits.values()):
+        from foragent.i18n import text
+        raise ConfigError(text("config_size_limits_invalid",
+                               values["language"] if isinstance(values["language"], str) else "en"))
     ample = values["tiers_headroom_ample"]
     if not isinstance(ample, (int, float)) or isinstance(ample, bool) or not ample >= 0:
         raise ConfigError("tiers_headroom_ample must be a number of at least 0")

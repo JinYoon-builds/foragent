@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, risks
+from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, review_scoring, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -224,7 +224,8 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
-                   texts: tuple[str, ...], *, git: GitRepo | None = None) -> ReviewResult:
+                   texts: tuple[str, ...], *, git: GitRepo | None = None,
+                   parsed: ParsedIssue | None = None) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
@@ -232,6 +233,8 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
     _record_notes(n, ctx, round_number, *texts)
+    # Every FAIL finding, in any round, gets one scoring session; only a grounded one blocks (#1651).
+    review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
@@ -419,7 +422,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
-                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git)
+                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git,
+                          parsed=parsed)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
@@ -563,13 +567,18 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if approval is None:
         invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")
         return "no-approval"
-    pr = next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
-               if pr.head == f"foragent/issue-{n}"), None)
+    authorization = ctx.merge_authorization if getattr(ctx.config, "merge_owner", False) else None
+    pr = (ctx.tracker.get_pr(authorization["pr"]) if authorization else
+          next((pr for pr in ctx.tracker.list_prs("open", f"foragent/issue-{n}")
+                if pr.head == f"foragent/issue-{n}"), None))
     if pr is None:
         flag(ctx, n, Reason.RISK_HIGH, "No open Foragent PR to review; retry implementation.")
         return "no-pr"
     head = ctx.tracker.pr_head_sha(pr.number)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
+    if authorization and (pr.state != "open" or pr.merged_at or pr.head != f"foragent/issue-{n}"
+                          or pr.base != authorization["target"] or head != authorization["head"]):
+        return _hold_changed_head(n, ctx, link)
     parent = ctx.tracker.parent_of(n) if "batch" in {ctx.config.review, *ctx.config.review_paths.values()} else None
     batch_branch = f"foragent/batch-{parent}" if parent is not None else None
     if pr.base not in {ctx.config.base_branch, batch_branch}:

@@ -40,6 +40,13 @@ class Config:
         "m": {"codex_model": None, "codex_effort": "high", "claude_model": None, "claude_effort": None},
         "l": {"codex_model": None, "codex_effort": "xhigh", "claude_model": None, "claude_effort": None},
     })
+    # Expected-size limits per size label (#1696): an estimate strictly above one suggests a split.
+    # Nearest-rank p90 of merged PRs (docs/specs/2026-11-02-size-signal.md); never a refusal.
+    size_limits: dict[str, dict[str, int]] = field(default_factory=lambda: {
+        "s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
+        "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
+        "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25},
+    })
     # Usable quota share of the run's executor at which s and m issues start at tier l (#238).
     tiers_headroom_ample: float = 0.5
     skill_libraries: list[Any] = field(default_factory=lambda: [{
@@ -69,6 +76,7 @@ class Config:
     review_max: int = 2
     review_level: str = "low"
     review_pass_scope: bool = True  # False restores full/confirmation review after a saved PASS.
+    review_scoring: bool = True  # False lets every reviewer FAIL finding block without a scoring session (#1651).
     review_scope: str = "claude-local"
     review_perspectives: list[dict[str, str]] = field(default_factory=list)  # Added after the defaults (#532).
     review_reviewers: int = 1
@@ -101,6 +109,7 @@ class Config:
     conflict_retries: int = 2
     # Merge-queue entries the FIFO turn holder takes at once (#712); only 1 until merge groups (#459).
     merge_turn_size: int = 1
+    merge_owner: bool = False  # Prototype: gate ticks own queued PRs after workers exit.
     # Consecutive ready FIFO runs, holder included, checked together on current main; 1 turns grouping off.
     merge_group_max: int | Literal["auto"] = "auto"
     base_branch: str = "main"
@@ -592,6 +601,11 @@ def _overlay(values: dict[str, Any], overrides: dict[str, Any]) -> None:
             **previous, **{name: {**(previous[name] if isinstance(previous.get(name), dict) else {}), **tier}
                            if isinstance(tier, dict) else tier for name, tier in tiers.items()},
         }}
+    limits = overrides.get("size_limits")
+    if isinstance(limits, dict) and isinstance(values["size_limits"], dict):
+        overrides = {**overrides, "size_limits": {**values["size_limits"], **{
+            label: {**values["size_limits"].get(label, {}), **limit} if isinstance(limit, dict) else limit
+            for label, limit in limits.items()}}}
     quota = overrides.get("claude_quota")
     if isinstance(quota, dict) and isinstance(values["claude_quota"], dict):
         overrides = {**overrides, "claude_quota": {**values["claude_quota"], **quota}}

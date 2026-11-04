@@ -23,14 +23,22 @@ def _reviewed_base_changed(n: int, ctx: RunContext, pr) -> str:
 def _refresh_reviewed_head(
     n: int, ctx: RunContext, git: GitRepo, pr, head: str, target_sha: str,
     reverify: Callable[[str], str | None] | None,
+    *, before_push: Callable[[str], None] | None = None,
+    prepare: Callable[[], None] | None = None,
+    before_base_changed: Callable[[], None] | None = None,
 ) -> tuple[str, str | None]:
     """Carry review through a clean base merge, verifying its exact head before pushing."""
     from foragent import runner
 
+    def base_changed():
+        if before_base_changed is not None:
+            before_base_changed()
+        return run_publish._reviewed_base_changed(n, ctx, pr)
+
     if runner._remaining(n, ctx) <= 0:
         return head, run_publish._timeout(n, ctx)
     if reverify is None:
-        return head, run_publish._reviewed_base_changed(n, ctx, pr)
+        return head, base_changed()
     run_publish._phase(n, ctx, "checking")
     if git.head_sha() != head or ctx.tracker.pr_head_sha(pr.number) != head:
         link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -43,11 +51,15 @@ def _refresh_reviewed_head(
         if not git.conflict_paths():
             raise
         git.quit_merge()
-        return head, run_publish._reviewed_base_changed(n, ctx, pr)
+        return head, base_changed()
+    if prepare is not None:
+        prepare()
     new_head = git.head_sha()
     if stopped := reverify(new_head):
         return head, stopped
     run_publish._check_publication(git, pr.base, target_sha)
+    if before_push is not None:
+        before_push(new_head)
     git.push_head(pr.head, lease=head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
@@ -75,7 +87,7 @@ def _publish_reviewed_head(
         error = exc
         raise
     finally:
-        if outcome != "merged":
+        if not getattr(ctx.config, "merge_owner", False) and outcome != "merged":
             run_publish.merge_turn.withdraw(ctx, place, reason="publish-stopped",
                                             detail=run_publish.merge_turn.stopped_detail(outcome, error))
 
@@ -103,10 +115,11 @@ def _publish_reviewed_in_turn(
             return "hash-mismatch"
         if ctx.tracker.pr_head_sha(pr.number) != head:
             return run_publish._hold_changed_head(n, ctx, link)
-        current = next((item for item in ctx.tracker.list_prs("open", pr.head)
-                        if item.number == pr.number), None)
+        current = (ctx.tracker.get_pr(pr.number) if getattr(ctx.config, "merge_owner", False) else
+                   next((item for item in ctx.tracker.list_prs("open", pr.head) if item.number == pr.number), None))
         # A moved target SHA is no stop here: the turn holder refreshes it (#712).
-        if current is None or current.base != pr.base:
+        if (current is None or current.base != pr.base
+                or getattr(ctx.config, "merge_owner", False) and (current.state != "open" or current.merged_at)):
             return run_publish._reviewed_base_changed(n, ctx, pr)
         if not run_publish._acceptance_matches(n, ctx, git, approval):
             return "hash-mismatch"
@@ -131,6 +144,8 @@ def _publish_reviewed_in_turn(
         return None
 
     def policy_hold(decision: Decision, current_batch: str | None = batch_branch) -> str | None:
+        if getattr(ctx.config, "merge_owner", False) and ctx.merge_authorization is not None:
+            return None  # This reviewed head was explicitly authorized by orch.merge.
         if decision.kind == "hold":
             run_publish.flag(ctx, n, decision.reason, decision.summary, link)
             return "held"
@@ -174,6 +189,22 @@ def _publish_reviewed_in_turn(
             )
         if stopped:
             return stopped
+        if getattr(ctx.config, "merge_owner", False):
+            from foragent.merge_owner import enqueue
+
+            comparison = None
+            if comparison_attempt is not None:
+                comparison = run_publish.require_comparison(
+                    comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                    base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                )
+            else:
+                from foragent import ci_local, ci_mode
+
+                local = ci_mode.review_checks(n, ctx, git, pr.base)
+                ci_local.fallback_comparison(local, base_sha)
+            return enqueue(ctx, n, git, pr.number, pr.head, pr.base, head, base_sha,
+                           approval, started, comparison)
         waited, stopped = run_publish.merge_turn.await_turn(n, ctx, place, head, pr.number)
         if stopped:
             return stopped
@@ -236,6 +267,8 @@ def _publish_reviewed_in_turn(
                 else:
                     run_group_evidence.record_merge(n, ctx, pr.base, inputs.base_sha, head)  # own merge provenance
                     ctx.store.record_merge(n, ctx.now())
+                    size_signal.record(n, ctx, git, approval, inputs.base_sha, head, pr.number,
+                                       lambda line: run_publish._append(log, line))
                     if run_publish.review_mode_for(inputs.paths, ctx.config) == "fast":
                         runner.after_merge(ctx, pr.number, pr.base)
                     try:
@@ -276,4 +309,4 @@ def _publish_reviewed_in_turn(
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish  # noqa: E402
+from foragent import run_publish, size_signal  # noqa: E402

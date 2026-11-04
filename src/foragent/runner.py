@@ -148,9 +148,19 @@ class RunContext:
     poll_hook: Callable[[Callable[[], ExecResult], Callable[[], None]], ExecResult] = poll_executor
     monotonic: Callable[[], float] = time.monotonic
     lane_executor: str | None = None  # The lane's configured executor, before the run's pair (#186).
+    merge_owner_started_at: datetime | None = None  # A gate turn has its own work budget, excluding queue time.
+    merge_authorization: dict | None = None  # Explicit orch.merge decision, scoped to this reviewed handoff.
 
     def __post_init__(self) -> None:
         self.tracker = RecordingTracker(self.tracker, self)
+
+
+def _handed_off(n: int, ctx: RunContext) -> bool:
+    if not getattr(ctx.config, "merge_owner", False):
+        return False
+    from foragent.merge_owner import pending
+
+    return pending(ctx.store, n)
 
 
 def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
@@ -330,7 +340,7 @@ def _implement_and_publish(
         outcome = "killed"
         raise
     finally:
-        if outcome != "merged":
+        if outcome not in {"merged", "merge-queued"} and not _handed_off(n, ctx):
             run = ctx.store.get_run(n)
             _cleanup_after(n, ctx, outcome, "WIP preservation", lambda: _preserve_failed_implementation(
                 n, ctx, git, run.outcome or outcome, approval=attempt.approval, approved_ref=attempt.approved_ref,
@@ -418,7 +428,7 @@ def review_only(
         _append(ctx.store.log_path(n), traceback.format_exc())
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome, detail = "limit-wait", orch_github.cause(exc)
-        else:
+        elif not _handed_off(n, ctx):
             flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Review runner failed: {' '.join(str(exc).split())}")
     except SystemExit as exc:
         outcome = "killed"
@@ -435,7 +445,7 @@ def review_only(
                     # A stopped review keeps `running` for the tick's stop restore (_restore_stopped).
                     if outcome not in {"limit-wait", "stopped"}:
                         current = ctx.tracker.current_issue(n)
-                        if (outcome != "remote-ended" and current.state == "open"
+                        if (not _handed_off(n, ctx) and outcome != "remote-ended" and current.state == "open"
                                 and not current.labels & {BLOCKED, READY}):
                             flag(ctx, n, Reason.RETRIES_EXCEEDED, "Review did not finish; retry or rerun review.")
                         ctx.tracker.remove_labels(n, [RUNNING])
@@ -522,13 +532,14 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
         if isinstance(exc, TrackerError) and wait_for_rate_limit(n, ctx, exc):
             outcome, detail = "limit-wait", orch_github.cause(exc)
         else:
-            flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
+            if not _handed_off(n, ctx):
+                flag(ctx, n, Reason.RETRIES_EXCEEDED, f"Runner failed: {' '.join(str(exc).split())}")
             outcome = "error"
     except SystemExit as exc:
         outcome = "killed"
         detail = f"Runner exited: {exc}"
         stopped = ctx.store.get_run(n)
-        if stopped is None or stopped.outcome != "stalled-restart":
+        if not _handed_off(n, ctx) and (stopped is None or stopped.outcome != "stalled-restart"):
             # A handled stop must not look like an orphan to the next tick.
             ctx.tracker.add_labels(n, [BLOCKED])
             ctx.tracker.remove_labels(n, [READY, RUNNING])

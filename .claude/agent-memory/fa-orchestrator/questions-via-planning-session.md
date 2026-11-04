@@ -16,3 +16,5 @@ For a new order: when its plan passes dry-run and preread, send the planning ses
 Also refused on a relayed request (2026-10-30): closing an issue (#924). Closing or deleting on another session's word goes back to that session to do.
 
 Update (2026-10-31, D101 a in docs/decisions.md): choice-free bug fixes I find are published and approved by this session after a clean preread (done for #1237 without refusal). Orders carrying Jin's decisions or a choice still go to planning as a plan path.
+
+Update (2026-11-04, PM r406): plans inside a scope Jin already decided (including PM-requested bug and first-impression work within that scope) are approved by the orchestrator directly after a clean preread; do not wait for PM approval. Only Jin's share (taste, out-of-scope, hard to undo) goes to the box. Done that day for #1793.
