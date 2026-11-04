@@ -1563,12 +1563,17 @@ class GhTracker:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
     def pr_mergeable(self, pr: int) -> str:
-        """GitHub's own mergeable answer; anything but its three literal values reads UNKNOWN."""
+        """GitHub's mergeable answer as MERGEABLE, CONFLICTING or UNKNOWN.
+
+        Read from the same pull request endpoint as ``pr_head_sha``: GitHub's REST
+        ``mergeable`` is true, false (conflicts with the base) or null (still computing)."""
         try:
-            state = json.loads(self._call(["pr", "view", str(pr), "-R", self.repo, "--json", "mergeable"]))["mergeable"]
-        except (KeyError, TypeError, ValueError):
+            state = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"])).get("mergeable")
+        except (AttributeError, TypeError, ValueError):
             return "UNKNOWN"
-        return state if state in {"MERGEABLE", "CONFLICTING", "UNKNOWN"} else "UNKNOWN"
+        if state is True:
+            return "MERGEABLE"
+        return "CONFLICTING" if state is False else "UNKNOWN"
 
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""

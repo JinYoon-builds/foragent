@@ -2161,15 +2161,16 @@ def test_fake_pr_mergeable_defaults_to_unknown_and_keeps_githubs_literal():
 
 
 @pytest.mark.parametrize("reply, expected", [
-    ('{"mergeable": "CONFLICTING"}', "CONFLICTING"),
-    ('{"mergeable": "MERGEABLE"}', "MERGEABLE"),
-    ('{"mergeable": "UNKNOWN"}', "UNKNOWN"),
-    ('{"mergeable": "something-new"}', "UNKNOWN"),
-    ('{}', "UNKNOWN"),
+    ('{"mergeable": false, "mergeable_state": "dirty"}', "CONFLICTING"),
+    ('{"mergeable": true, "mergeable_state": "clean"}', "MERGEABLE"),
+    ('{"mergeable": null, "mergeable_state": "unknown"}', "UNKNOWN"),
+    ('{"mergeable": "CONFLICTING"}', "UNKNOWN"),
+    ('{"head": {"sha": "abc"}}', "UNKNOWN"),
+    ("[]", "UNKNOWN"),
     ("not json", "UNKNOWN"),
 ])
-def test_gh_pr_mergeable_reads_githubs_mergeable_field(reply, expected):
+def test_gh_pr_mergeable_reads_the_pull_request_endpoint(reply, expected):
     calls = []
     tracker = GhTracker("owner/repo", run=lambda args, input=None: calls.append(args) or reply)
     assert tracker.pr_mergeable(12) == expected
-    assert calls[-1][:2] == ["pr", "view"] and "12" in calls[-1] and calls[-1][-1] == "mergeable"
+    assert calls == [["api", "repos/owner/repo/pulls/12"]], "Same endpoint as pr_head_sha; no new gh call shape"
