@@ -973,3 +973,67 @@ def test_decisions_cli_waits_for_observation_after_an_accepted_close(tmp_path, m
     completed = NOW + timedelta(hours=1)
     state.record_issue(issue("closed", "completed"), {}, observed_at=completed)
     assert read() == {"id": "D79", "issues": [9], "state": "done", "observed_at": completed.isoformat()}
+
+
+@pytest.mark.parametrize("ages,blocked", [
+    ([], False), ([0], False), ([50], False), ([51], True),
+    ([0, 0, 0], False), ([0, 0, 0, 0], True),
+])
+def test_stop_check_fixed_count_and_age_boundaries(tmp_path, monkeypatch, capsys, ages, blocked):
+    from datetime import date
+    from io import StringIO
+    import json
+
+    from foragent import cli
+
+    (tmp_path / ".foragent.yml").write_text("repo: offline/stop\nlanguage: en\n")
+    (tmp_path / "docs").mkdir()
+    ledger = "".join(f"### D{n}. Choice ({date.today() - timedelta(days=age)}, Jin)\n"
+                     for n, age in enumerate(ages, 1))
+    (tmp_path / decisions.LEDGER).write_text(ledger)
+    monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli.sys, "stdin", StringIO(json.dumps({"cwd": str(tmp_path), "stop_hook_active": False})))
+    assert cli.main(["decisions", "stop-check"]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    answer = json.loads(output.out) if output.out.strip() else {}
+    assert (answer.get("decision") == "block") is blocked
+
+
+def test_undated_decision_age_uses_first_heading_addition_not_recent_edit(git_history):
+    history = git_history
+    ledger = "### D7. Undated choice\nOriginal words.\n"
+    history.update({decisions.LEDGER: ledger}, at=NOW - timedelta(days=61))
+    history.update({decisions.LEDGER: ledger + "New explanation.\n"}, at=NOW)
+    rows = decisions.view(history.origin, [], ledger)
+    assert decisions.backlog(history.origin, rows, ledger, today=NOW.date()) == (1, 61)
+    # A heading's explicit date takes precedence over the older git addition.
+    dated = ledger.replace("choice", f"choice ({NOW.date()}, Jin)")
+    assert decisions.backlog(history.origin, decisions.view(history.origin, [], dated), dated,
+                             today=NOW.date()) == (1, 0)
+
+
+def test_drop_is_visible_from_shared_ledger_on_another_machine(tmp_path, monkeypatch, capsys):
+    import json
+    import shutil
+
+    from foragent import cli
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    (first / "docs").mkdir(parents=True)
+    (first / ".foragent.yml").write_text("repo: offline/drop\nlanguage: en\n")
+    original = "### D7. Keep the original decision (2026-10-31, Jin)\nBecause it matters.\n"
+    (first / decisions.LEDGER).write_text(original)
+    assert cli.main(["decisions", "--repo-root", str(first), "drop", "D7", "--why", "Superseded by D9."]) == 0
+    assert (first / decisions.LEDGER).read_text().startswith(original)
+    before = (first / decisions.LEDGER).read_bytes()
+    assert cli.main(["decisions", "drop", "D7", "--why", "  ", "--repo-root", str(first)]) == 1
+    assert (first / decisions.LEDGER).read_bytes() == before
+    shutil.copytree(first, second)
+    monkeypatch.setattr(StateStore, "for_repo", classmethod(lambda cls, repo: StateStore(tmp_path / "other-state")))
+    capsys.readouterr()
+    assert cli.main(["decisions", "--repo-root", str(second), "--json"]) == 0
+    row, = json.loads(capsys.readouterr().out)
+    assert row["state"] == "dropped" and row["why"] == "Superseded by D9."
+    assert row["id"] == "D7"

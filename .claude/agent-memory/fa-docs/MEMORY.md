@@ -22,6 +22,9 @@
 - r383 (2026-11-03): #1724/#1725 (merge a0ef6cf8): add `fa order red` paragraph to docs/order.md near preread (~171), folded with r324. Wait: orchestrator judges.
 - r449 (2026-11-04): #1746/#1751/#1767 (=#1651, merge 826313b): ask D109 for undated-ID decisions.md:944 + rules.md:82-88 uncited section; gate.md:130 stale 4 defaults, :172 stray yaml; skills/review-procedure vs D37 → r347. Wait: orchestrator relays.
 - r482 (2026-11-04): answers r480 (decisions by topic): A = regroup rules.md into Jin's 6 topics + Dnn links + in-place 대체됨 marks; B = top section in decisions.md (needs D108 보강). Wait: orchestrator judges; PM then appends phase words/r53/one-screen Dnn.
+- r672 (2026-11-04): orders #1634/#1837/#1958 — README:81/:159 terminal list add Ghostty (#1959). Wait: orchestrator judges, then docs edits.
+- r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
+- r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -62,9 +65,16 @@
 - Orchestrator launch surface (#1490: always hidden `claude --bg`, no Orca tab/tmux window) appears in no reader doc; README's Orca/tmux lines (81/159) are about the lane view (watch_open), not the orchestrator.
 - New read-only `fa order` checks (collect #1523, red #1725) land with no reader-doc line; docs/order.md near the preread paragraph is the one place for them. Bundle such proposals.
 - Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
-- Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line. Alarm-rule Dnn ask stays r369.
+- Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line; facts held/Binding replay fixes (#2011 via #2010) neither. Alarm-rule Dnn ask stays r369.
 - 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.
 - '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
 - An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
 - When the scheduled check is for an order that wrote my own proposal (e.g. #1826), compare the diff with the request texts and check named commands exist (commands/order.py add_parser); then close the memory wait.
 - 'Current decisions' asks usually duplicate rules.md (D108); point to rules.md first. decisions.py parses `### Dnn.` headings in any order, so in-place marks are safe; moving entries breaks append-only.
+- Bug fixes with in-app text (#1793 Terminal.app font hint, #1825 '(none)' review marker, #1836 merge-owner merges in readers) need no reader-doc line; README/docs name no font, review marker or merge owner. Grep those words once.
+- Terminal support changes in watch_open.py (e.g. #1959 Ghostty) must reach README's terminal list, in English (:81) and 한국어 (:159); grep `TERM_PROGRAM` in the diff.
+- Existing-project adoption (`fa adopt survey`, #1789: docs/GitHub issues/fixed_by evidence, one-confirmation proposal) lives only in skills/fa-init; README names just `fa init`. Role-signal re-fire tuning (#1840) is in docs/specs only. Neither needs a reader-doc line.
+- New plan fields that make publish write (e.g. `closes`, #1791) belong in docs/order.md §6 next to edits[]; impl/p8a gets updated by the order itself, order.md does not.
+- Files-scope orders ('#NNNN stays off #MMMM's reserved files', e.g. #1861) only move scope; check the named issue, which may close via a PM branch merge (#1860 → #1882). PM-branch merges can append many Dnn at once without touching rules.md; count cited IDs.
+- Setup checklist / gh `project` scope (#1799 setup.py, #1800 notice once) need no README requirement line: README names no board or `fa doctor`, and fa init/doctor print the fix. D117 skill-source tables (#1892) appear in no reader doc; rules.md D37/D117 drift is already r720.
+- Gate lane-label/board Lane sync (#1230, board_lanes.py, via #1845 redesign) and dream redo (#1231, skill reference only) need no reader-doc line; README Lanes already says issues go to the owning lane. #1232 fa-allow is in README :33/:111 both languages.
