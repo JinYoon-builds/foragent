@@ -27,9 +27,25 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
 2. **Brief.** Run `FORAGENT_UPDATE_CHECK=off fa brief --json` in the project folder for the
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
-   - If it prints `"setup": false` (no config in this folder), follow the init flow after
-     the greeting: read `skills/fa-init/SKILL.md` (the `fa-init` skill) and do it.
-     Stop this skill there.
+   - If it prints `"setup": false` (no config in this folder), run
+     `fa doctor --setup --json` before the init interview. Read the `items` array
+     top to bottom in the returned order; the JSON is the shared setup checklist.
+     A nonzero exit with checklist JSON means setup needs attention.
+     - For each failing install item, show its exact `fix` for this OS. Ask whether
+       to install it (recommend installing, offer waiting). Run an install command
+       only after the person agrees to that item. On Linux, the fix links the
+       official install page: read it, show the applicable command, and ask before
+       running it. If they decline, pause setup.
+     - An item that waits on another item must wait. Fix the earlier prerequisite
+       first; never try an auth command while gh is missing.
+     - For login and permission items, show the exact command or settings pane
+       from `fix` and wait for the person to complete it. Show gh login as
+       `! gh auth login`, for the person to run in their own session. FA never
+       runs login or permission changes and never asks for, reads or stores a token.
+     - After a fix or the person's confirmation, rerun `fa doctor --setup --json`
+       and continue from the first failing item. Proceed only when all items pass.
+     Then read `skills/fa-init/SKILL.md` (the `fa-init` skill) and follow the init
+     flow after the greeting. Stop this skill there.
    - Otherwise, when the person asks for more than the report, show the briefing in four
      short parts, each one line or a short list:
      - **Working (하는 일):** `working` — lane, issue, title, phase and minutes.

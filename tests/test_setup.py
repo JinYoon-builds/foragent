@@ -14,6 +14,11 @@ from test_init import setup
 FIX = "gh auth refresh -h github.com -s project"
 
 
+@pytest.fixture(autouse=True)
+def full_tools(monkeypatch):
+    monkeypatch.setattr(checklist_setup, "installed_tools", lambda: dict.fromkeys(("git", "gh", "uv"), True))
+
+
 def account(scopes=None, *, active=True, host="github.com", name="human"):
     return (f"{host}\n  ✓ Logged in to {host} account {name} (keyring)\n"
             f"  - Active account: {str(active).lower()}\n" +
@@ -30,7 +35,7 @@ def account(scopes=None, *, active=True, host="github.com", name="human"):
     (None, True),  # GH_TOKEN: no disclosed scope list.
 ])
 def test_scope_is_an_exact_token(scopes, ok):
-    item = checklist_setup.checklist(account(scopes))[0]
+    item = checklist_setup.gh_project_scope(account(scopes))
     assert item == ({"id": "gh-project-scope", "ok": True} if ok else
                     {"id": "gh-project-scope", "ok": False, "fix": FIX})
 
@@ -42,12 +47,12 @@ def test_only_active_github_com_account_counts(active_first, active_scopes, ok):
     inactive = account("'project'" if not ok else "'repo'", active=False, name="other").split("\n", 1)[1]
     status = (active + inactive if active_first else account("'project'", active=False) + active.split("\n", 1)[1])
     status += account("'project'", host="work.example.com")
-    assert checklist_setup.checklist(status)[0]["ok"] is ok
+    assert checklist_setup.gh_project_scope(status)["ok"] is ok
 
 
 @pytest.mark.parametrize("status", ["", "not logged in", account("'repo'", host="work.example.com")])
 def test_unknown_github_scopes_pass(status):
-    assert checklist_setup.checklist(status)[0]["ok"] is True
+    assert checklist_setup.gh_project_scope(status)["ok"] is True
 
 
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
@@ -63,21 +68,28 @@ def test_doctor_and_init_read_both_auth_streams(tmp_path, monkeypatch, capsys, s
 
     monkeypatch.setattr(gh, "run", run)
     assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(tmp_path)]) == 1
-    assert json.loads(capsys.readouterr().out) == {"items": [{"id": "gh-project-scope", "ok": False, "fix": FIX}]}
-    assert checklist_setup.checklist(_run_gh(["auth", "status"]))[0]["fix"] == FIX
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert items[-1] == {"id": "gh-project-scope", "ok": False, "fix": FIX}
+    assert all(item["ok"] for item in items[:-1])
+    assert checklist_setup.gh_project_scope(_run_gh(["auth", "status"]))["fix"] == FIX
     assert calls == [["auth", "status"], ["auth", "status"]]
 
 
 @pytest.mark.parametrize("failure", [FileNotFoundError("gh"), subprocess.TimeoutExpired("gh", 10), None])
-def test_doctor_scope_unknown_when_auth_cannot_be_read(tmp_path, monkeypatch, capsys, failure):
+def test_doctor_waits_when_auth_cannot_be_read(tmp_path, monkeypatch, capsys, failure):
     def run(*args, **kwargs):
         if failure is not None:
             raise failure
-        return subprocess.CompletedProcess(["gh", "auth", "status"], 1, account("'repo'"), "failed")
+        raise subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="failed")
 
     monkeypatch.setattr(gh, "run", run)
-    assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(tmp_path)]) == 0
-    assert json.loads(capsys.readouterr().out)["items"][0]["ok"] is True
+    assert cli.main(["doctor", "--setup", "--json", "--repo-root", str(tmp_path)]) == 1
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert items[-1]["ok"] is False
+    assert "gh auth" not in items[-1]["fix"]
+    assert items[-2]["ok"] is False
+    assert items[-2]["fix"] == ("gh auth login" if not isinstance(failure, FileNotFoundError) else
+                                 "Wait for gh-installed, then rerun fa doctor --setup")
 
 
 def test_plain_doctor_never_reads_gh(tmp_path, monkeypatch, capsys):
@@ -103,7 +115,7 @@ def test_init_stops_at_shared_checklist_before_setup(setup, monkeypatch, dry_run
 def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, capsys):
     monkeypatch.setattr(checklist_setup, "CHECKS", (
         lambda status: {"id": "earlier", "ok": False, "fix": "first fix"},
-        checklist_setup.gh_project_scope,
+        checklist_setup.project_scope,
         lambda status: {"id": "later", "ok": False, "fix": "last fix"},
     ))
     monkeypatch.setattr(gh, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, "", ""))
@@ -113,3 +125,97 @@ def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, c
     with pytest.raises(TrackerError) as error:
         setup.init()
     assert str(error.value).index("first fix") < str(error.value).index("last fix")
+
+
+@pytest.mark.parametrize('platform,fixes', [
+    ('darwin', ['brew install git', 'brew install gh', 'brew install uv']),
+    ('linux', ['https://git-scm.com/downloads/linux',
+               'https://github.com/cli/cli/blob/trunk/docs/install_linux.md#installing-gh-on-linux-and-bsd',
+               'https://docs.astral.sh/uv/getting-started/installation/']),
+])
+def test_doctor_missing_tools_uses_os_fixes_without_auth(tmp_path, monkeypatch, capsys, platform, fixes):
+    monkeypatch.setattr(checklist_setup.sys, 'platform', platform)
+    monkeypatch.setattr(checklist_setup, 'installed_tools', lambda: dict.fromkeys(('git', 'gh', 'uv'), False))
+    monkeypatch.setattr(gh, 'run', lambda *a, **kw: pytest.fail('gh is missing; no auth call can run'))
+    assert cli.main(['doctor', '--setup', '--json', '--repo-root', str(tmp_path)]) == 1
+    items = json.loads(capsys.readouterr().out)['items']
+    assert [item['id'] for item in items] == [
+        'git-installed', 'gh-installed', 'uv-installed', 'gh-logged-in', 'gh-project-scope']
+    assert not any(item['ok'] for item in items)
+    assert [item['fix'] for item in items[:3]] == fixes
+    assert all('gh-installed' in item['fix'] and 'gh auth' not in item['fix'] for item in items[3:])
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize('missing,logged_in', [
+    (('git', 'gh', 'uv'), False),
+    (('uv',), False),
+    (('uv',), True),
+])
+def test_init_shows_every_failing_fix_before_any_setup(setup, monkeypatch, missing, logged_in):
+    monkeypatch.setattr(checklist_setup, 'installed_tools', lambda: {
+        tool: tool not in missing for tool in ('git', 'gh', 'uv')})
+    calls = []
+
+    def auth(args, input=None):
+        calls.append(args)
+        assert args == ['auth', 'status']
+        if not logged_in:
+            raise subprocess.CalledProcessError(1, ['gh', *args])
+        return account("'repo', 'project'")
+
+    monkeypatch.setattr(setup, 'run_gh', auth)
+    expected = checklist_setup.checklist(checklist_setup.collect(lambda: auth(['auth', 'status'])))
+    calls.clear()
+    before = {p.relative_to(setup.root): p.read_bytes() for p in setup.root.rglob('*') if p.is_file()}
+    with pytest.raises(TrackerError) as raised:
+        setup.init()
+    message = str(raised.value)
+    for item in expected:
+        if not item['ok']:
+            assert item['fix'] in message
+    assert not setup.installs and not setup.tracker.labels
+    assert not any('commit' in args or 'push' in args for args in setup.git_calls)
+    assert {p.relative_to(setup.root): p.read_bytes() for p in setup.root.rglob('*') if p.is_file()} == before
+    if 'git' in missing:
+        assert not setup.git_calls
+    assert calls == ([] if 'gh' in missing else [['auth', 'status']])
+
+
+@pytest.mark.parametrize("failure,details", [
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"], stderr="human's token has expired"),
+     ["human's token has expired"]),
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"], output="Failed to log in as human"),
+     ["Failed to log in as human"]),
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"],
+                                  output="github.com account human", stderr="The token is invalid"),
+     ["github.com account human", "The token is invalid"]),
+    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10, stderr=b"Timed out checking human"),
+     ["timed out", "Timed out checking human"]),
+    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10, output=b"Checking github.com account human"),
+     ["timed out", "Checking github.com account human"]),
+    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10,
+                              output=b"github.com account human", stderr=b"Connection failed: \xff"),
+     ["timed out", "github.com account human", "Connection failed: \ufffd"]),
+    (subprocess.CalledProcessError(1, ["gh", "auth", "status"]), ["non-zero exit status 1"]),
+    (subprocess.TimeoutExpired(["gh", "auth", "status"], 10), ["timed out after 10 seconds"]),
+])
+def test_init_preserves_gh_auth_failure_details(setup, monkeypatch, failure, details):
+    calls = []
+
+    def fail(args, **kwargs):
+        calls.append(args)
+        raise failure
+
+    monkeypatch.setattr(gh, "run", fail)
+    monkeypatch.setattr(setup, "run_gh", _run_gh)
+    with pytest.raises(TrackerError) as raised:
+        setup.init()
+    message = str(raised.value)
+    for detail in details:
+        assert detail in message
+    assert "gh auth login" in message
+    assert calls == [["auth", "status"]]
+    assert not (setup.root / ".foragent.yml").exists()
+    assert not setup.installs and not setup.tracker.labels
+    assert not any("commit" in args or "push" in args for args in setup.git_calls)

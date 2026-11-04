@@ -4,8 +4,15 @@ Checks evaluate collected facts; they never repair credentials or persist result
 Add later checks here in setup order (tools, login, scopes, repository, ...).
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import re
+import shutil
+import subprocess
+import sys
 from typing import NotRequired, TypedDict
+
+from foragent.i18n import text
 
 
 class SetupItem(TypedDict):
@@ -17,8 +24,8 @@ class SetupItem(TypedDict):
 def gh_project_scope(auth_status: str) -> SetupItem:
     """Check the active github.com account; an undisclosed scope list is unknown.
 
-    Environment tokens don't expose scopes. Missing gh and login failures belong
-    to future checklist items, so neither is treated as a missing project scope.
+    Environment tokens don't expose scopes. Tool and login prerequisites are
+    checked separately before this parser is called.
     """
     accounts = []
     host = ""
@@ -44,9 +51,87 @@ def gh_project_scope(auth_status: str) -> SetupItem:
     return item
 
 
-CHECKS = (gh_project_scope,)
+@dataclass(frozen=True)
+class Facts:
+    installed: dict[str, bool]
+    auth_status: str = ""
+    logged_in: bool = False
+    auth_error: str = ""
 
 
-def checklist(auth_status: str) -> list[SetupItem]:
+def installed_tools() -> dict[str, bool]:
+    return {tool: shutil.which(tool) is not None for tool in ("git", "gh", "uv")}
+
+
+def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
+    """Keep the process failure and gh's explanation, including partial timeout output."""
+    parts = [str(exc)]
+    if isinstance(exc, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        for output in (exc.stdout, exc.stderr):
+            if output:
+                parts.append(output.decode(errors="replace") if isinstance(output, bytes) else output)
+    return "\n".join(parts)
+
+
+def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None) -> Facts:
+    """Read prerequisites once; never invoke an auth command without gh on PATH."""
+    tools = installed if installed is not None else installed_tools()
+    if not tools["gh"]:
+        return Facts(tools, auth_error="gh not found on PATH")
+    try:
+        return Facts(tools, auth_status=read_auth(), logged_in=True)
+    except FileNotFoundError as exc:
+        return Facts({**tools, "gh": False}, auth_error=_auth_error(exc))
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return Facts(tools, auth_error=_auth_error(exc))
+
+
+INSTALL_PAGES = {
+    "git": "https://git-scm.com/downloads/linux",
+    "gh": "https://github.com/cli/cli/blob/trunk/docs/install_linux.md#installing-gh-on-linux-and-bsd",
+    "uv": "https://docs.astral.sh/uv/getting-started/installation/",
+}
+
+
+def installed_item(facts: Facts, tool: str) -> SetupItem:
+    item: SetupItem = {"id": f"{tool}-installed", "ok": facts.installed[tool]}
+    if not item["ok"]:
+        item["fix"] = f"brew install {tool}" if sys.platform == "darwin" else INSTALL_PAGES[tool]
+    return item
+
+
+def git_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "git")
+
+
+def gh_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "gh")
+
+
+def uv_installed(facts: Facts) -> SetupItem:
+    return installed_item(facts, "uv")
+
+
+def gh_logged_in(facts: Facts) -> SetupItem:
+    if not facts.installed["gh"]:
+        return {"id": "gh-logged-in", "ok": False, "fix": text("setup_wait_for", prerequisite="gh-installed")}
+    item: SetupItem = {"id": "gh-logged-in", "ok": facts.logged_in}
+    if not item["ok"]:
+        item["fix"] = "gh auth login"
+    return item
+
+
+def project_scope(facts: Facts) -> SetupItem:
+    for prerequisite in (gh_installed(facts), gh_logged_in(facts)):
+        if not prerequisite["ok"]:
+            return {"id": "gh-project-scope", "ok": False,
+                    "fix": text("setup_wait_for", prerequisite=prerequisite["id"])}
+    return gh_project_scope(facts.auth_status)
+
+
+CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
+
+
+def checklist(facts: Facts) -> list[SetupItem]:
     """Return fresh items in check order from the same facts for every reader."""
-    return [check(auth_status) for check in CHECKS]
+    return [check(facts) for check in CHECKS]

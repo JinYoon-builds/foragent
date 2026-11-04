@@ -22,12 +22,11 @@ def run(args) -> int:
     if args.setup:
         from foragent import setup
 
-        try:
-            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
-            status = result.stdout + "\n" + result.stderr if result.returncode == 0 else ""
-        except (OSError, cli.subprocess.TimeoutExpired):
-            status = ""
-        items = setup.checklist(status)
+        def read_auth():
+            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=True, timeout=10)
+            return result.stdout + "\n" + result.stderr
+
+        items = setup.checklist(setup.collect(read_auth))
         if args.json:
             print(cli.json.dumps({"items": items}))
         else:
