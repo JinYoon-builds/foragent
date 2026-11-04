@@ -264,3 +264,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - Candidate order (11-04 #1952): a PR that is CONFLICTING with main gets no GitHub merge ref, so no CI runs; the gate waited and held 'missing acceptance shards: observed []' instead of noticing mergeable=CONFLICTING and rebasing. Ask the architect for the reading point (ci_mode missing shards vs tracker pr mergeable) before ordering.
 - #435 split (drafts/435split/plan.json, preread clean 2026-11-04 13Z): publish --approve right after #1641 merges (both use tests/acceptance/test_silence_watchdog.py). PM r655 item b.
 - #1491 (emergency stop): if its retry runs >3 h again with merge_owner.py peers, add an exclusive: header for merge_owner.py (architect r708, r426 pattern).
+- Accepted docs-role proposals are not applied by themselves: r672/r716/r720 sat accepted until I ordered #2041. After accepting a docs proposal, order it (main lane, small lock) in the next batch.
