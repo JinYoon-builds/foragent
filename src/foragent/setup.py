@@ -50,18 +50,24 @@ def gh_project_scope(auth_status: str, *, language: str = "en") -> SetupItem:
 
 
 def _standing_blocker(assertions: str) -> bool:
-    """Only an indefinite sleep assertion counts, not aggregate assertion counts.
+    """Keep each assertion's type and lifetime together, even for a shared pid.
 
-    pmset groups each assertion's Details/Timeout lines beneath its owning pid.
-    Require explicit indefinite lifetime: display activity and other temporary
-    system assertions do not establish that the gate stays reachable between runs.
+    An assertion starts with its hex id, elapsed time and type. Its owner prefix
+    can be repeated or omitted on subsequent assertions of the same process.
+    Details belong only to that assertion, up to the next assertion header.
     """
-    for block in re.split(r"(?m)(?=^[ \t]*pid \d+\()", assertions)[1:]:
-        header = block.splitlines()[0]
-        if not re.search(r"\bPrevent(?:UserIdleSystem|System)Sleep\b", header):
+    headers = list(re.finditer(
+        r"(?m)^[ \t]*(?:pid[ \t]+\d+\([^\n]*\):[ \t]*)?"
+        r"\[0x[0-9a-fA-F]+\][ \t]+\S+[ \t]+(?P<kind>\w+)[ \t]+named:",
+        assertions,
+    ))
+    for index, header in enumerate(headers):
+        if header["kind"] not in {"PreventUserIdleSystemSleep", "PreventSystemSleep"}:
             continue
-        if ("asserting forever" in block
-                and not re.search(r"Process ID|Created for PID|asserting for \d|Timeout", block, re.IGNORECASE)):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(assertions)
+        details = assertions[header.end():end]
+        if ("asserting forever" in details
+                and not re.search(r"Process ID|Created for PID|asserting for \d|Timeout", details, re.IGNORECASE)):
             return True
     return False
 

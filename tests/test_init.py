@@ -1829,3 +1829,32 @@ def test_standing_sleep_assertion_lifetime(kind, details, expected):
 
     assertion = f'   pid 123(caffeinate): [0x123] 01:00:00 {kind} named: "blocker"\n\t{details}\n'
     assert _standing_blocker(assertion) is expected
+
+
+@pytest.mark.parametrize("repeated_pid", [False, True], ids=["shared-pid", "repeated-pid"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+@pytest.mark.parametrize("kinds, details, expected", [
+    (("PreventUserIdleDisplaySleep", "PreventUserIdleSystemSleep"),
+     ("Details: caffeinate asserting for 300 secs\n\tTimeout will fire in 3 secs",
+      "Details: caffeinate asserting forever"), True),
+    (("PreventSystemSleep", "PreventUserIdleDisplaySleep"),
+     ("Details: temporary sleep activity", "Details: caffeinate asserting forever"), False),
+    (("PreventUserIdleSystemSleep", "PreventSystemSleep"),
+     ("Details: caffeinate asserting on behalf of Process ID 42\n\tCreated for PID: 42",
+      "Details: caffeinate asserting forever"), True),
+    (("PreventSystemSleep", "PreventSystemSleep"),
+     ("Details: caffeinate asserting forever\n\tTimeout will fire in 3 secs",
+      "Details: temporary sleep activity"), False),
+], ids=["timed-display-and-standing-sleep", "temporary-sleep-and-standing-display",
+        "per-run-and-standing-sleep", "no-standing-sleep"])
+def test_sleep_assertions_of_one_pid_are_independent(repeated_pid, reverse, kinds, details, expected):
+    from foragent.setup import _standing_blocker
+
+    entries = list(zip(kinds, details))
+    if reverse:
+        entries.reverse()
+    assertions = "Listed by owning process:\n"
+    for index, (kind, detail) in enumerate(entries):
+        owner = "   pid 123(caffeinate): " if repeated_pid or index == 0 else "      "
+        assertions += f'{owner}[0x{index + 1:016x}] 01:00:00 {kind} named: "blocker"\n\t{detail}\n'
+    assert _standing_blocker(assertions) is expected
