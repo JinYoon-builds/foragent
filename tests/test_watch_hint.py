@@ -3,17 +3,13 @@
 from dataclasses import replace
 import json
 import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-
-from foragent import capacity, watch, watch_hint  # noqa: E402
-# The locked view test's offline terminal (no network, no executors, a fixed 120x30
-# environment) for the real pseudo-terminal case; it isolates HOME for every test here.
-from test_terminal_app_hangul_hint import offline_terminal  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from foragent import capacity, watch, watch_hint
+# Shared offline terminal for the real pseudo-terminal case; it isolates HOME here.
+from helpers.terminal_view import offline_terminal  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 TERMINAL = {"TERM_PROGRAM": "Apple_Terminal"}
 
@@ -98,7 +94,7 @@ def live(tmp_path, monkeypatch, keys, language="ko", term="Apple_Terminal", widt
     from types import SimpleNamespace
     from unittest.mock import Mock
 
-    from test_squirrel_running import running_snapshot
+    from helpers.lane_view import running_snapshot
     from foragent import watch_terminal
     from foragent.state import StateStore
 
@@ -262,7 +258,7 @@ def test_a_real_terminal_shrunk_right_after_the_hint_records_nothing(git_history
     import termios
     import time
 
-    from test_terminal_app_hangul_hint import FONT, korean_view, live_session
+    from helpers.terminal_view import FONT, korean_view, live_session
 
     case, main = korean_view(git_history, tmp_path, monkeypatch)
     pid, fd = pty.fork()

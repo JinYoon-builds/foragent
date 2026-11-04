@@ -1,9 +1,7 @@
 """Unit tests for the lane view's settings window and `fa settings get` without a key (#173)."""
 
 import json
-import sys
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 import yaml
@@ -13,8 +11,7 @@ from foragent.config import ConfigError, load_config
 from foragent.state import StateStore
 from foragent.watch import handle_key, render_frame, settings_view
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_view_done_state import done_snapshot  # noqa: E402
+from helpers.lane_view import done_snapshot
 
 
 @pytest.fixture

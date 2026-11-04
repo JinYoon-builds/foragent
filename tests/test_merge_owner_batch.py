@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
@@ -169,7 +169,7 @@ def published_train(case, monkeypatch):
 @pytest.mark.parametrize("numbers", [[5, 1], [2, 4, 1, 5], [5, 1, 4, 2, 6, 3]])
 def test_only_tip_published_and_reused_by_single_path_across_restart(request, monkeypatch, numbers):
     if len(numbers) > 4:
-        from acceptance import test_merge_path_real_settings as contract
+        from helpers import merge_world as contract
         monkeypatch.setattr(contract, "NUMBERS", tuple(numbers))
     case = request.getfixturevalue("batched")
     case.config = replace(case.config, merge_batch_size=6)
@@ -314,7 +314,8 @@ def test_pending_tip_does_not_publish_other_prefixes(batched):
 
 @pytest.mark.parametrize("configured,expected", [(None, 4), (6, 6)], ids=["default", "configured-six"])
 def test_batch_size_limits_prefixes_and_survives_restart(request, monkeypatch, configured, expected):
-    from acceptance import test_merge_path_real_settings as contract
+    from helpers import merge_world as contract
+
     numbers = (5, 1, 4, 2, 6, 3, 7)
     monkeypatch.setattr(contract, "NUMBERS", numbers)
     case = request.getfixturevalue("batched")

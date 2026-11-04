@@ -5,11 +5,9 @@ import sys
 
 import pytest
 
-sys.path.append(str(Path(__file__).resolve().parent / "acceptance"))
+from helpers.draft_red import DIRTY_GREETING, DRAFT, RED, check, draft_case  # noqa: F401
 
-from test_draft_red_check import DIRTY_GREETING, DRAFT, RED, check, draft_case  # noqa: E402, F401
-
-from conftest import git_command  # noqa: E402
+from conftest import git_command
 
 
 @pytest.mark.parametrize("name", ["../outside_test.py", "tests/../../outside_test.py", "/tmp/outside_test.py"])
@@ -84,7 +82,7 @@ def run_plan(case, capsys, plan):
 
 @pytest.mark.parametrize("link", ["file", "folder"])
 def test_a_base_link_outside_the_copy_is_not_run(draft_case, capsys, tmp_path, link):
-    from test_draft_red_check import draft
+    from helpers.draft_red import draft
 
     root, history = draft_case[0], draft_case[1]
     caller = tmp_path / "caller-only"

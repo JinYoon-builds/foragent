@@ -4,15 +4,11 @@ import fcntl
 import json
 import time
 from types import SimpleNamespace
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
 
 from foragent import capacity, run_check_slot, run_checks, runner
-from test_orch_review_handoff import make_case
-from test_board_status_groups import offline_github  # noqa: F401
-from test_skills_autosync import isolated_home  # noqa: F401
+from helpers.review_case import make_case
+from helpers.board_parents import offline_github  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 
 def _case(git_history, tmp_path, monkeypatch):

@@ -3,7 +3,6 @@
 from dataclasses import replace
 import json
 import os
-from pathlib import Path
 import shlex
 import sys
 from types import SimpleNamespace
@@ -983,9 +982,8 @@ def test_premerge_command_says_why_on_its_one_line(merge_case, monkeypatch, caps
 
 def bound_main(c, monkeypatch):
     """The public CLI on this case; remove the config it writes before merge_case's status check."""
-    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
     from foragent.cli import main
-    from test_orch_review_handoff import bind_cli
+    from helpers.review_case import bind_cli
 
     bind_cli(SimpleNamespace(root=c.history.clone, ctx=c.ctx, tracker=c.tracker, git=c.ctx.git, store=c.ctx.store,
                              clock=[BASE_TIME]), monkeypatch)
@@ -998,7 +996,7 @@ def test_path_approved_as_absent_and_still_absent_is_refused_on_head_and_base(me
 
     c = merge_case
     main = bound_main(c, monkeypatch)
-    from test_skills_autosync import cli_exit
+    from helpers.home import cli_exit
 
     pr = linked_pr(c, locks={"never-written.txt": ABSENT_BLOB})
     capsys.readouterr()

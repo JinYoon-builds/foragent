@@ -1,23 +1,19 @@
 """Boundary tests for review spec conflicts (#673) beyond the locked acceptance file."""
 
 import json
-from pathlib import Path
-import sys
 from threading import Barrier, Event
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
-from conftest import ACCEPTANCE  # noqa: E402
-from foragent.executors import ExecResult  # noqa: E402
-from foragent.run_review import spec_conflicts  # noqa: E402
-from foragent.runner import run_issue  # noqa: E402
-from runner_support import enable_native_reviewer, run_case  # noqa: E402,F401
-from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
-from test_risk_map import copy_history, offline  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from conftest import ACCEPTANCE
+from foragent.executors import ExecResult
+from foragent.run_review import spec_conflicts
+from foragent.runner import run_issue
+from runner_support import enable_native_reviewer, run_case  # noqa: F401
+from helpers.review_panel import PanelExecutor, install_panel
+from helpers.review_panel import perspective_case, review_offline  # noqa: F401
+from helpers.risk import copy_history, offline  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 CONFLICT = f"SPEC-CONFLICT: {ACCEPTANCE}:1 requires a closed talk; the finding wants it open"
 QUESTION = "<!-- foragent:blocked reason=spec-question -->"
