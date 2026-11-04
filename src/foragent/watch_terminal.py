@@ -139,10 +139,28 @@ class _Palette:
         return "\x1b[0m" + (f"\x1b[{';'.join(codes)}m" if codes else "")
 
 
-def _restart(cleanup: ExitStack) -> bool:
-    """Ask for a re-exec without joining the worker: a stuck refresh must not block it."""
+def _restart(cleanup: ExitStack, target: Path | bool = True) -> Path | bool:
+    """Ask for a re-exec without joining the worker: a stuck refresh must not block it.
+
+    ``True`` re-execs this view's own command; a Path is the fa launcher the gate installed.
+    """
     cleanup.pop_all()  # execv replaces the process, so the worker thread needs no shutdown.
-    return True
+    return target
+
+
+def _stale(started: str) -> Path | bool:
+    """What to re-exec when this view no longer runs the newest build, else False.
+
+    The build the gate installed wins: a view started from another install (the first
+    `uv tool install`) never sees its own package change. Without a published gate build
+    the view's own package is the fallback, as before.
+    """
+    from foragent import tool_install, watch
+
+    installed = tool_install.installed_tool()
+    if installed is not None and watch.should_reload(started, installed[0]):
+        return installed[1]
+    return watch.should_reload(started, watch._installed_build())
 
 
 def window_key(key: int, names: dict[int, str], prompting: bool, not_keys: tuple[int, ...]) -> str | None:
@@ -268,8 +286,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 except Exception as exc:
                     error = watch.text("watch_refresh_failed", config.language, error=watch._clean(exc))
                 pending = None
-                if watch.should_reload(started_build, watch._installed_build()):
-                    return _restart(cleanup)
+                if target := _stale(started_build):
+                    return _restart(cleanup, target)
             moment = watch.time.monotonic()
             due = moment >= next_refresh
             while next_refresh <= moment:
@@ -280,8 +298,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     refresh_now = False
                 elif due:
                     # A slow snapshot must not hide a reinstall: check once per due refresh.
-                    if watch.should_reload(started_build, watch._installed_build()):
-                        return _restart(cleanup)
+                    if target := _stale(started_build):
+                        return _restart(cleanup, target)
             tick = int((watch.time.monotonic() - animation_started) / 0.5)
             height, width = screen.getmaxyx()
             view_state["height"] = height  # The settings window fits itself to this screen.
