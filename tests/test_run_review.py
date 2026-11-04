@@ -1153,6 +1153,23 @@ def test_break_it_rejects_a_native_scope_without_the_verdict_contract(review_con
         test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
 
 
+def test_break_it_rejects_a_native_scope_without_the_mechanism_map(review_context, monkeypatch):
+    """The byte comparison must reject a scope that skips the map's first-read instruction."""
+    from foragent import run_review
+
+    rules = run_review.review_scope_rules
+
+    def without_map(*args, **kwargs):
+        return rules(*args, **kwargs).replace(
+            "Read docs/mechanisms.md first for the current mechanisms, their code, issues and decisions.\n",
+            "", 1,
+        )
+
+    monkeypatch.setattr(run_review, "review_scope_rules", without_map)
+    with pytest.raises(AssertionError):
+        test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
+
+
 def test_break_it_rejects_native_none_becoming_a_pass(run_case, monkeypatch):
     """The receipt check must catch the old bare-(none)-means-PASS shortcut."""
     from foragent import run_review
