@@ -34,6 +34,9 @@ def main() -> int:
         print(f"shard {shard}/{shards}: no unit test files")
         return 0
     command = [sys.executable, "-m", "pytest", "-q", "-m", "not local_only", *files]
+    report_file = os.environ.get("FA_REPORT_FILE")
+    if report_file:
+        command.append(f"--junitxml={report_file}")
     return subprocess.run(command, check=False).returncode
 
 

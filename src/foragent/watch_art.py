@@ -56,9 +56,9 @@ def _pixels(rows: Sequence[str], width: int) -> tuple[tuple[str | None, ...], ..
 
 # Big orchestrator hugging an acorn: 18 pixels wide, 15 high (8 cell rows).
 ORCHESTRATOR = _pixels([
-    '......KK...KK.....',
-    '.....KOOK.KOWK....',
-    '.....KOOOKKOOOK...',
+    '.......KK....KK...',
+    '......KOWK..KWOK..',
+    '......KOOOKKOOOK..',
     '..KKKKOOOOOOOOOK..',
     '.KWWWKOOOOOOOOOOK.',
     'KWWWWKOOEOOOOEOOK.',
@@ -72,6 +72,79 @@ ORCHESTRATOR = _pixels([
     '....KKKKKOK.KOK...',
     '........KK...KK...',
 ], 18)
+
+# Original block letters: the upper five rows are inset; the lower strokes
+# widen to seven pixels. F and T have feet to keep the same trapezoid silhouette.
+# Each string is a separate pixel row, independent of terminal character fonts.
+_LETTER_ROWS = {
+    "F": (
+        ".#####.", ".#####.", ".##....", ".##....", ".##....",
+        "######.", "######.", "###....", "###....", "###....",
+        "###....", "###....", "#######", "#######",
+    ),
+    "O": (
+        ".#####.", ".#####.", ".##.##.", ".##.##.", ".##.##.",
+        "##...##", "##...##", "##...##", "##...##", "##...##",
+        "##...##", "##...##", "#######", "#######",
+    ),
+    "R": (
+        ".#####.", ".#####.", ".##.##.", ".##.##.", ".##.##.",
+        "######.", "######.", "####...", "##.##..", "##..##.",
+        "##..##.", "##...##", "##...##", "##...##",
+    ),
+    "A": (
+        "..###..", ".#####.", ".##.##.", ".##.##.", ".##.##.",
+        "##...##", "##...##", "#######", "#######", "##...##",
+        "##...##", "##...##", "##...##", "##...##",
+    ),
+    "G": (
+        ".#####.", ".#####.", ".##....", ".##....", ".##....",
+        "##.....", "##.....", "##.####", "##.####", "##...##",
+        "##...##", "##...##", "#######", "#######",
+    ),
+    "E": (
+        ".#####.", ".#####.", ".##....", ".##....", ".##....",
+        "######.", "######.", "##.....", "##.....", "##.....",
+        "##.....", "##.....", "#######", "#######",
+    ),
+    "N": (
+        ".##.##.", ".##.##.", ".#####.", ".#####.", ".#####.",
+        "####.##", "####.##", "##.####", "##.####", "##.####",
+        "##..###", "##..###", "##...##", "##...##",
+    ),
+    "T": (
+        ".#####.", ".#####.", "..##...", "..##...", "..##...",
+        "..##...", "..##...", "..##...", "..##...", "..##...",
+        "..##...", "..##...", "#######", "#######",
+    ),
+}
+
+
+def _wordmark() -> tuple[tuple[str | None, ...], ...]:
+    """Cream/orange/brown faces over a one-pixel right/down dark shadow."""
+    letters = [_LETTER_ROWS[letter] for letter in "FORAGENT"]
+    width = sum(len(rows[0]) + 1 for rows in letters)
+    grid = [[None] * width for _ in range(15)]
+    faces = [(y, index * 8 + x) for index, rows in enumerate(letters)
+             for y, row in enumerate(rows) for x, pixel in enumerate(row) if pixel == "#"]
+    for y, x in faces:
+        grid[y + 1][x + 1] = "K"
+    for y, x in faces:
+        grid[y][x] = "W" if y < 5 else "O" if y < 10 else "R"
+    return tuple(tuple(row) for row in grid)
+
+
+WORDMARK = _wordmark()
+
+
+def greeting_rows(columns: int | None) -> list[str]:
+    """The whole squirrel, with FORAGENT beside it only at a known fitting width."""
+    width = len(ORCHESTRATOR[0]) + 2 + len(WORDMARK[0])
+    if columns is None or columns < width:
+        return ansi_rows(ORCHESTRATOR, PALETTE)
+    grid = [(*squirrel, None, None, *word) for squirrel, word in zip(ORCHESTRATOR, WORDMARK)]
+    return ansi_rows(grid, PALETTE)
+
 
 # Lane squirrels: 9 x 8 pixels (4 cell rows), in the four decided poses.
 LANE_POSES = {

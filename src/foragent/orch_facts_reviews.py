@@ -127,8 +127,15 @@ def _artifacts(store: StateStore) -> dict[int, list[tuple[datetime, int, set[str
     return found
 
 
-def attach(store: StateStore, executions: list, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Add review_rounds and finding_classes to each row; return the two summaries."""
+def attach(store: StateStore, executions: list, rows: list[dict[str, Any]],
+           merged: set[tuple[int, str]] | None = None) -> dict[str, Any]:
+    """Add review_rounds and finding_classes to each row; return the two summaries.
+
+    `merged` holds the (issue, started_at) that merged by store.run_merged; derived when absent."""
+    if merged is None:
+        from foragent.orch_facts_runs import merged_keys
+
+        merged = merged_keys(store, rows)
     by_issue: dict[int, list[int]] = {}
     for index, execution in enumerate(executions):
         by_issue.setdefault(execution.run.number, []).append(index)
@@ -154,9 +161,9 @@ def attach(store: StateStore, executions: list, rows: list[dict[str, Any]]) -> d
                               "repeated_rounds": entry["rounds"] - entry["runs"],
                               "repeated_runs": entry["runs"] - 1, "issues": sorted(entry["issues"])}
                        for slug, entry in sorted(classes.items())}
-    merged = [row for row in rows if row["status"] == "finished" and row["outcome"] == "merged"]
-    counts = [row["review_rounds"] for row in merged]
-    top = sorted(merged, key=lambda row: -row["review_rounds"])[:TOP_RUNS]
+    merged_rows = [row for row in rows if row["status"] == "finished" and (row["issue"], row["started_at"]) in merged]
+    counts = [row["review_rounds"] for row in merged_rows]
+    top = sorted(merged_rows, key=lambda row: -row["review_rounds"])[:TOP_RUNS]
     return {
         "review_rounds": {"median": median(counts) if counts else None,
                           "top_runs": [{"issue": row["issue"], "started_at": row["started_at"],

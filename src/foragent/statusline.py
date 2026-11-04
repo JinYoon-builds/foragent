@@ -293,10 +293,11 @@ def _pm_moved_notice(payload: dict) -> str | None:
 
 
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """SessionStart: decision context, plus the summary line on startup and resume.
+    """SessionStart: PM and decision context, plus the summary line on startup and resume.
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
-    Claude. Clear and compaction restore decisions without restarting the summary or squirrel.
+    Claude. The summary follows presence.session_start; PM and decision context are independent.
+    Clear and compaction restore that context without restarting the summary or squirrel.
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
     """
@@ -330,19 +331,33 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
     if message:
         output["systemMessage"] = message
     try:
-        from foragent import decisions
-
-        root = presence.project_root(folder)
         project = presence._project(folder)
-        if root is not None and project is not None and presence._planning_session(folder, project[1]):
-            config, store = project
-            ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
-            context = decisions.unordered_context(root, decisions.observed_rows(store._issue_view()),
-                                                  ledger, config.language)
-            if context:
-                output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": context}
-    except Exception:  # Decision records must never stop the session from starting.
-        pass
+        planning = project is not None and presence._planning_session(folder, project[1])
+    except Exception:  # Optional context must never disturb the session that is starting.
+        planning = False
+    contexts = []
+    if planning:
+        try:
+            from foragent.commands import _pm_table
+
+            contexts.append(_pm_table.render())
+        except Exception:  # Optional context must never disturb the session that is starting.
+            pass
+        try:
+            from foragent import decisions
+
+            root = presence.project_root(folder)
+            if root is not None:
+                config, store = project
+                ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
+                context = decisions.unordered_context(root, decisions.observed_rows(store._issue_view()),
+                                                      ledger, config.language)
+                if context:
+                    contexts.append(context)
+        except Exception:  # Decision records must never stop the session from starting.
+            pass
+    if contexts:
+        output["hookSpecificOutput"] = {"hookEventName": "SessionStart", "additionalContext": "\n\n".join(contexts)}
     if output:
         stdout.write((json.dumps(output, ensure_ascii=False) + "\n").encode("utf-8"))
         stdout.flush()
