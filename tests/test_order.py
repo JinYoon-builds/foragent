@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
+import fcntl
 import hashlib
 from itertools import count
 import json
@@ -13,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, order, size_signal
+from foragent import cli, main_write, order, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
@@ -80,9 +81,12 @@ class PublishingGit:
         self.pushed = False
 
     def _call(self, args):
-        # Recovery's history search: this fake keeps no history, so it finds no batch commit.
-        assert args[0] == "log"
-        return ""
+        assert args[0] in {"log", "for-each-ref"}
+        if args[0] == "for-each-ref" or args[-1].startswith("origin/") and not self.pushed:
+            return ""
+        title = next(arg.removeprefix("--grep=") for arg in args if arg.startswith("--grep="))
+        return "\n".join(f"published\0{event[1]}" for event in self.events
+                         if event[0] == "commit" and event[1] == title)
 
     def is_ancestor(self, ancestor, head):
         # The remote never moves here: HEAD always contains it, and it has HEAD once pushed.
@@ -698,17 +702,130 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
 
 
 @pytest.mark.parametrize("merge_owner", [False, True])
-def test_immediate_order_pushes_directly_during_a_merge_train(offline_publication, plan, merge_owner):
-    root, config, tracker, git, _calls, origin = offline_publication
+def test_immediate_order_waits_before_committing_during_a_merge_train(
+    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner,
+):
+    root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=merge_owner)
     base = git_command(origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
+    before = git_command(root, "status", "--porcelain")
+    elapsed, sleeps = [0], []
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+
+    def sleep(seconds):
+        assert seconds == 30
+        with open(git.common_dir() / "foragent-publish.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert git.head_sha() == base
+        assert git_command(root, "status", "--porcelain") == before
+        assert not any("commit" in args or args[0] == "push" for args in calls)
+        assert not tracker.issues
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        if len(sleeps) == 2:
+            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+            git_command(origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
 
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
-    assert git_command(origin, "rev-parse", train) == base
+    assert sleeps == ([30, 30] if merge_owner else [])
+    assert capsys.readouterr().err.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
+    if merge_owner:
+        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+        assert (root / "upstream.txt").read_text() == "Train advanced main.\n"
+    else:
+        assert not any(args[0] == "ls-remote" for args in calls)
+        assert git_command(origin, "rev-parse", train) == base
     assert tracker.issues
+
+
+def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
+    offline_publication, plan, monkeypatch, capsys,
+):
+    root, config, tracker, git, calls, origin = offline_publication
+    config = replace(config, merge_owner=True)
+    base = git.head_sha()
+    git_command(origin, "update-ref", f"refs/heads/foragent/batch-merge-{base[:8]}-1", base)
+    unrelated = root / "unrelated.txt"
+    unrelated.write_text("Staged\n")
+    git_command(root, "add", "--", "unrelated.txt")
+    unrelated.write_text("Unstaged\n")
+    before = git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")
+    elapsed, sleeps = [0], []
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+
+    def sleep(seconds):
+        assert seconds == 30
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(GitError, match="timed out after 40 minutes.*retry publication"):
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert elapsed[0] == 40 * 60 and len(sleeps) == 80
+    assert capsys.readouterr().err.splitlines()[-1] == "waiting for merge train (39 min)"
+    assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
+    assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
+    assert unrelated.read_text() == "Unstaged\n"
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert not tracker.issues
+
+
+def test_immediate_order_train_lookup_failure_stops_before_writes(offline_publication, plan, monkeypatch):
+    root, config, tracker, git, calls, _origin = offline_publication
+    base = git.head_sha()
+    before = git_command(root, "status", "--porcelain")
+    call = git._call
+
+    def unreadable(args):
+        if args[0] == "ls-remote":
+            raise GitError("remote unavailable")
+        return call(args)
+
+    monkeypatch.setattr(git, "_call", unreadable)
+    with pytest.raises(GitError, match="remote unavailable"):
+        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert git.head_sha() == base
+    assert git_command(root, "status", "--porcelain") == before
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert not tracker.issues
+
+
+@pytest.mark.parametrize("change", ["human-edit", "replacement-started"])
+def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_publication, plan, monkeypatch, change):
+    root, config, tracker, git, calls, origin = offline_publication
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    target = report.rows[0]["number"]
+    if change == "replacement-started":
+        target = 41
+        tracker.add_issue(target, "Earlier work", "Earlier body")
+        plan["issues"][0]["replaces"] = [target]
+    base = git.head_sha()
+    calls.clear()
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
+
+    def sleep(seconds):
+        assert seconds == 30
+        if change == "human-edit":
+            issue = tracker.get_issue(target)
+            tracker.update_issue(target, title="Edited while waiting", body=issue.body)
+        else:
+            tracker.add_labels(target, ["running"])
+        git_command(origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(order.PlanError, match=f"#{target}"):
+        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert git.head_sha() == base
+    assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert tracker.get_issue(target).state == "open"
+    if change == "human-edit":
+        assert tracker.get_issue(target).title == "Edited while waiting"
 
 
 @pytest.mark.parametrize("options,approved", [
@@ -3720,6 +3837,9 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     assert [event[0] for event in events] == ["commit", "push", "issue", "issue", "issue"]
     saved = list(events)
     checkpoint = (store.root / "flush-journal.jsonl").read_bytes()
+    records = [json.loads(line) for line in checkpoint.splitlines() if line.strip()]
+    assert {row["kind"] for row in records} == {"selected", "issues", "done"}
+    assert all("sha" not in row and "old" not in row for row in records)
     assert flush_waiting(publishing)["status"] == "empty"
     assert events == saved and (store.root / "flush-journal.jsonl").read_bytes() == checkpoint
     for item in plan["issues"]:
@@ -4886,3 +5006,107 @@ def test_a_same_input_reread_whose_estimate_cannot_be_kept_records_nothing(publi
     with pytest.raises(order.PlanError, match="disk full"):
         _proposals(root, config, plan, [("s", "APPROACH: Update the handoff.\nSIZE: source=9 tests=9 files=9")])
     assert (root / order.PREREAD_FILE).read_bytes() == records
+
+
+_CLEANUP_SHA = "4f1c2a9e8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e"
+
+
+@pytest.mark.parametrize("value", [
+    None, {}, [41], [{"number": 41}], [{"number": 41, "commit": _CLEANUP_SHA, "into": 42}],
+    [{"number": 0, "into": 42}], [{"number": True, "into": 42}], [{"number": 41, "into": 41}],
+    [{"number": 41, "into": "42"}], [{"number": 41, "commit": "xyz1234"}], [{"number": 41, "commit": "abc12"}],
+    [{"number": 41, "into": 42}, {"number": 41, "commit": _CLEANUP_SHA}],
+])
+def test_cleanup_closes_reject_invalid_items_before_writes(publishing, plan, value):
+    plan["closes"] = value
+    with pytest.raises(order.PlanError, match=r"closes"):
+        publish(publishing, plan, approve=True)
+    assert publishing[-1] == []
+
+
+@pytest.mark.parametrize("target", ["missing", "pr", "running", "edited", "replaced", "into-missing", "into-pr"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_cleanup_conflicts_refuse_the_whole_order_before_writes(publishing, plan, target, dry_run):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    if target not in ("missing", "into-missing"):
+        tracker.add_issue(42, "Other work", "body", ["running"] if target == "running" else [],
+                          is_pull_request=target in ("pr", "into-pr"))
+    if target == "edited":
+        plan["edits"] = [{"number": 42, "goal": "Edit it", "out_of_scope": "Other work", "done_when": ["true"]}]
+    if target == "replaced":
+        plan["issues"][0]["replaces"] = [42]
+    second = ({"number": 43, "into": 42} if target.startswith("into") else {"number": 42, "commit": _CLEANUP_SHA})
+    if target.startswith("into"):
+        tracker.add_issue(43, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, second]
+    with pytest.raises(order.PlanError, match="#4[23]"):
+        publish(publishing, plan, approve=True, dry_run=dry_run)
+    assert tracker.get_issue(41).state == "open" and tracker.list_comments(41) == []
+    assert publishing[-1] == []
+
+
+def test_cleanup_close_is_never_an_approval_and_respects_a_reopen(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.add_issue(42, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    report = publish(publishing, plan, approve_numbers=[41])
+    assert report.rows and all(not row["approved"] for row in report.rows)
+    resolved = tracker.get_issue(41)
+    assert resolved.state == "closed" and resolved.state_reason == "completed"
+    assert "approved" not in resolved.labels
+    assert [_CLEANUP_SHA in c.body for c in tracker.list_comments(41)] == [True]
+    assert tracker.get_issue(42).state == "open" and tracker.list_comments(42) == []
+    tracker.issues[41] = replace(resolved, state="open", state_reason=None)
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state == "open", "A person's reopen wins over this plan's earlier close"
+    assert len(tracker.list_comments(41)) == 1
+    duplicate = tracker.get_issue(42)
+    assert duplicate.state_reason == "not_planned" and "approved" not in duplicate.labels
+    assert ["#41" in c.body for c in tracker.list_comments(42)] == [True]
+
+
+def test_cleanup_dry_run_previews_full_evidence(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.add_issue(42, "Duplicate", "body")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    summary = publish(publishing, plan, approve=True, dry_run=True).summary()
+    assert f"#41 (resolved by {_CLEANUP_SHA})" in summary and "#42 (duplicate of #41)" in summary
+    assert tracker.get_issue(41).state == "open" and publishing[-1] == []
+
+
+def test_cleanup_leaves_an_issue_closed_before_this_order_alone(publishing, plan):
+    tracker = publishing[2]
+    tracker.add_issue(41, "Resolved work", "body")
+    tracker.close_issue(41, reason="not_planned")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}]
+    publish(publishing, plan, approve=True)
+    assert tracker.get_issue(41).state_reason == "not_planned" and tracker.list_comments(41) == []
+
+
+@pytest.mark.parametrize("late", [42, 43], ids=["cleanup-target", "replaced-target"])
+def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publishing, plan, monkeypatch, late):
+    """Work that starts after the publication checks but before the first close stops all closes."""
+    from foragent import size_signal
+
+    tracker = publishing[2]
+    for number in (41, 42, 43):
+        tracker.add_issue(number, f"Old work {number}", "body")
+    plan["issues"][0]["replaces"] = [43]
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "into": 41}]
+    published = size_signal.published
+
+    def start_late(*args, **kwargs):
+        # The last write before the closes: a gate claims the target in this interval.
+        tracker.add_labels(late, ["running"])
+        return published(*args, **kwargs)
+
+    monkeypatch.setattr(size_signal, "published", start_late)
+    closes = []
+    monkeypatch.setattr(tracker, "close_issue", lambda n, *a, **k: closes.append(n))
+    with pytest.raises(order.PlanError, match=f"#{late}"):
+        publish(publishing, plan, approve=True)
+    assert closes == [], "No close may be written once a target is running"
+    assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))

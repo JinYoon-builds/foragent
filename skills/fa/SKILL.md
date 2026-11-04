@@ -28,7 +28,20 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
    - If it prints `"setup": false` (no config in this folder), follow the init flow after
-     the greeting: read `skills/fa-init/SKILL.md` (the `fa-init` skill) and do it.
+     the greeting: run `fa doctor --setup --json` and read its `items` top to bottom
+     (git installed, gh installed, uv installed, gh logged in, gh project scope,
+     repository linked). A nonzero exit
+     with JSON reports unfinished setup. Show each failing item's exact `fix`.
+     Ask with AskUserQuestion (or the available question tool) before installing,
+     creating or linking anything, and run the chosen command only after the answer.
+     For an official installation page, show it and wait. Resolve waiting items
+     by completing their earlier prerequisite, then refresh the checklist.
+     For login, the person runs `! gh auth login`; show it and wait, never ask for,
+     read or store a token. For permissions, show the exact command and wait too.
+     With no question tool, stop and print the next command and repository choices.
+     Read `skills/fa-init/SKILL.md` (the `fa-init` skill) for the choices and fixes,
+     finish the checklist, then run `fa init` in the background after agreement and
+     continue to the first order. Reuse completed answers when entering that flow.
      Stop this skill there.
    - Otherwise, when the person asks for more than the report, show the briefing in four
      short parts, each one line or a short list:
@@ -56,7 +69,10 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    `fa profile set --kind "<kind>" --stage "<stage>" --priority "<priority>"`.
    If `profile` is empty, skip this step; the planning interview fills it.
 
-4. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
+4. **Open the lane view at session start.** Run `fa gate watch --open` in the project
+   folder beside this planning session, once at the start of every session.
+
+5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as
    given; the words come from the messages registry (`src/foragent/messages/brief.py`).
    In Korean they read: "무엇을 할까요?" [기획 인터뷰] [디자인 인터뷰] [볼 것 처리].
@@ -66,7 +82,7 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    - `design` (디자인 인터뷰, design interview) — decide how it should look and feel (D73).
    - `inspect` (볼 것 처리) — go through decisions and reviews.
 
-5. **Route.**
+6. **Route.**
    - Inbox: if the user chooses `inspect` (볼 것 처리, the to_see items), follow the inspect flow:
      read `skills/fa-inspect/SKILL.md` (the `fa-inspect` skill) and do it.
    - Design: if the user chooses `design` (디자인 인터뷰), follow the design session flow in
@@ -75,13 +91,12 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
      order flow: read `skills/fa-order/SKILL.md` (the `fa-order` skill) and do it.
      Pass on the profile you just confirmed so the order does not ask again.
 
-6. **Running work.** When work is running (`working` or `queued` is not empty), check the
+7. **Running work.** When work is running (`working` or `queued` is not empty), check the
    orchestrator before you route. This session is the planning session (D76). It never becomes the orchestrator and never
    takes over its work; it only makes sure one runs and talks to it:
    - Run `fa orch alive --json`. If it prints `"alive": false`, run `fa orch ensure`. It
      opens one orchestrator in the background and prints one line; when it opened nothing,
      tell the user that line. If the orchestrator is already alive, do not start a second one.
-   - Open the lane view beside this planning session with `fa gate watch --open`.
    - Send every request to the orchestrator twice: as a cross-session message to the
      `orch: <project>` session (SendMessage) and with
      `fa orch request --from planning --text "<request>"`, so it survives a restart.
@@ -90,7 +105,7 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    - Show the open questions from `fa orch questions` and record answers with
      `fa orch answer <id> --text "<answer>"`.
 
-7. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
+8. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
    1. A line in the lane memory: append one `- [id:<unique id>] <lesson>` line to the end of
       `.claude/agent-memory/fa-<lane>/MEMORY.new.md` of the lane that owns the area. The lane

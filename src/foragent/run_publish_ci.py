@@ -70,16 +70,24 @@ def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str
     return status
 
 
+QUEUE_CEILING = 3 * 60 * 60
+
+
 @dataclass
 class _CIWait:
     started: float
     polls: int = 0
     status: str = "pending"
     infrastructure: str = ""
+    running_since: float | None = None
+    queue_aware: bool = False
 
     @property
     def deadline(self) -> float:
-        return self.started + 1200
+        if not self.queue_aware:
+            return self.started + 1200
+        ceiling = self.started + QUEUE_CEILING
+        return min(self.running_since + 1200, ceiling) if self.running_since is not None else ceiling
 
 
 def _wait_for_ci(
@@ -97,6 +105,16 @@ def _wait_for_ci(
             return run_publish._timeout(n, ctx)
         if status is None:
             status = run_publish._ci_status(ctx, pr, git.root, ready_at)
+        started_reader = getattr(ctx.tracker, "pr_checks_started", None)
+        wait.queue_aware = callable(started_reader)
+        if wait.queue_aware:
+            started_at = started_reader(pr)
+            if started_at is not None:
+                since = max(wait.started, started_at.timestamp())
+                wait.running_since = min(wait.running_since, since) if wait.running_since is not None else since
+        if wait.queue_aware and wait.running_since is None and status in {"pass", "none"}:
+            # No queued checks remain. Missing start metadata keeps the ordinary comparison window.
+            wait.running_since = wait.started
         wait.status = status
         run_publish._progress(n, ctx)
         if ctx.tracker.pr_head_sha(pr) != head:
@@ -115,10 +133,14 @@ def _wait_for_ci(
             if comparison_mode and ctx.config.checks_fallback == "local":
                 wait.infrastructure = "CI did not finish before the poll deadline."
                 return None
-            run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", link)
+            detail = ("CI never left the queue before the 3-hour ceiling."
+                      if wait.queue_aware and wait.running_since is None
+                      else "CI ran past the wait limit.")
+            run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
             return "timeout"
         ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
-        wait.polls += 1
+        if not wait.queue_aware or wait.running_since is not None:
+            wait.polls += 1
         status = None
 
 

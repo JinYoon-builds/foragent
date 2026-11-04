@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_replaces
+from foragent import order_cleanup, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -26,6 +26,7 @@ from foragent.issue import MARKER, acceptance_paths, body_hash, parse_body
 from foragent.kick import kick_tick
 from foragent.labels import LABELS, issue_lane, issue_size, lane_order, state_group
 from foragent.lanes import add_lane, lane_files, validate_lane
+from foragent.main_write import wait_for_merge_train
 from foragent.order_files import check_destinations, check_write, issue_body, validate_paths
 from foragent.paths import repo_path
 from foragent.skills import SkillManager
@@ -318,7 +319,11 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
                   retained_files: dict[str, str] | None = None) -> dict[str, str | bytes]:
     """Every file the order publishes: text as str, reference images as decoded bytes."""
     _object(plan, {"id", "title", "summary", "spec_markdown", "issues"},
-            {"new_lanes", "edits", "reference_files"}, "plan")
+            {"new_lanes", "edits", "reference_files", "closes"}, "plan")
+    try:
+        order_cleanup.validate(plan, config.language)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
     for key in ("id", "title", "summary", "spec_markdown"):
         _text(plan[key], f"plan.{key}")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", plan["id"]):
@@ -691,6 +696,7 @@ class _Publication:
     reviewed_bases: dict[str, dict]
     closures: dict[int, list[str]] = field(default_factory=dict)
     collected: order_collect.Collected | None = None
+    cleanups: list[dict] = field(default_factory=list)
 
     @property
     def own(self) -> set[int]:
@@ -787,9 +793,10 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers = _publication_targets(plan, all_issues)
     if not landed:
         order_done_when.check(plan, by_number, config.language)
-    unknown_numbers = selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
+    unknown_numbers = (selected_numbers - edit_numbers - {mapping[key] for key in keys if key in mapping}
+                       - order_cleanup.numbers(plan))
     if unknown_numbers & by_number.keys() or (unknown_numbers and keys <= mapping.keys()):
-        raise PlanError("approve numbers must refer to this plan's existing children or edits")
+        raise PlanError("approve numbers must refer to this plan's existing children, edits or closes")
     for lane in plan.get("new_lanes", []):
         if lane["name"] in config.lanes:
             existing = config.lanes[lane["name"]]
@@ -814,6 +821,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                      "approved": approve or issue.number in selected_numbers})
     try:
         closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+        cleanups = order_cleanup.plan_cleanup(plan, tracker, parent, mapping, config.language)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc
     # A commit that already landed has no write left to protect. Everything else, dry runs and
@@ -822,14 +830,15 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
         collected = order_collect.check(plan, files, root, config, git)
     if dry_run:
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected)
+                            by_number, edit_numbers, unconfirmed, rows, None, {}, closures, collected,
+                            cleanups=cleanups)
     if landed:
         # A resumed batch commit passed the gates below before its intent was recorded, and later
         # commits (its own too) must not reopen them: only its issue effects remain.
         return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
                             by_number, edit_numbers, unconfirmed, rows,
                             _order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
-                                         [by_number[n] for n in mapping.values()]), {}, closures)
+                                         [by_number[n] for n in mapping.values()]), {}, closures, cleanups=cleanups)
     # Statement issues need the reviewed evidence preparation recorded, approved or not; the
     # tested base is checked again under the publication lock, before anything is written.
     _require_route(plan, config, repo, mapping, by_number)
@@ -839,7 +848,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     # A selected number not mapped yet is a child created now; its number is unknown
     # until creation, so every child still to be created needs a clean preread.
     # Statement issues take the reviewed-tests route instead of preread.
-    new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()))
+    new_numbers = bool(selected_numbers - edit_numbers - set(mapping.values()) - order_cleanup.numbers(plan))
     require_clean_preread(plan, root, config, [
         *(item for item in plan["issues"]
           if "statements" not in item
@@ -859,7 +868,8 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
     owner = (_order_owner(tracker, config, by_number.get(parent) if parent is not None else None,
                           [by_number[n] for n in mapping.values()]) if check_owner else None)
     return _Publication(files, keys, selected_keys, selected_numbers, parent, mapping, saved_blobs,
-                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures, collected)
+                        by_number, edit_numbers, unconfirmed, rows, owner, reviewed_bases, closures, collected,
+                        cleanups=cleanups)
 
 
 def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
@@ -868,6 +878,10 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
             approve_numbers: list[int] | None = None, dry_run: bool = False,
             defer: str | None = None, urgent: bool = False) -> PublishReport:
     waiting = defer is not None and not urgent and not plan.get("new_lanes")
+    if config.merge_owner and not dry_run and not waiting:
+        git = git or GitRepo(root)
+        # Let the train take the shared write lock, then read publication's mutable facts.
+        wait_for_merge_train(git, config)
     publication = _publication_checks(plan, root, config, tracker, repo=repo, manager=manager,
                                       approve=approve, approve_keys=approve_keys,
                                       approve_numbers=approve_numbers, dry_run=dry_run,
@@ -877,7 +891,8 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     if dry_run:
         return PublishReport(plan["title"], publication.parent, publication.rows,
                              sorted(publication.files), True, affected=affected, language=config.language,
-                             closures=order_replaces.preview(publication.closures, config.language))
+                             closures=[*order_replaces.preview(publication.closures, config.language),
+                                       *order_cleanup.preview(publication.cleanups, config.language)])
     if affected:
         raise PlanError(text("order_locks_refused", config.language, owners="\n".join(_owner_lines(affected))))
     if waiting:
@@ -1061,15 +1076,24 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
             tracker.comment(number, comment)
         recorded_blobs[str(number)] = blobs
     tracker.update_issue(parent, title=plan["title"], body=parent_body())
-    if selected_numbers - edit_numbers - {mapping[key] for key in keys}:
-        raise PlanError("approve numbers must refer to this plan's children or edits")
-    approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else selected_numbers | {mapping[key] for key in selected_keys}
+    closing = order_cleanup.numbers(plan)
+    if selected_numbers - edit_numbers - {mapping[key] for key in keys} - closing:
+        raise PlanError("approve numbers must refer to this plan's children, edits or closes")
+    # A cleanup close is approved for closing, not for running: it never gets the approved label.
+    approved_numbers = (set(mapping[key] for key in keys) | edit_numbers) if approve else (selected_numbers - closing) | {mapping[key] for key in selected_keys}
     # Every body is written: record which preread each was read with, before any run can start.
     size_signal.published(plan, root, config, _workload_store(root, repo), by_number, mapping, tracker)
     for number in sorted(approved_numbers):
         tracker.add_labels(number, ["approved"])
         board.sync_status(board.ProjectContext(tracker, repo, config), number, "Approved")
-    order_replaces.close_replaced(plan, publication.closures, tracker, mapping, approved_numbers, config.language)
+    try:
+        # The checks above read the targets before every issue write; work may have started since.
+        # Judge every close of this order again on fresh reads, before the first one is written.
+        closures, cleanups = order_cleanup.rejudge(plan, tracker, parent, mapping, config.language)
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    order_replaces.close_replaced(plan, closures, tracker, mapping, approved_numbers, config.language)
+    order_cleanup.close(plan, cleanups, tracker, approve, selected_numbers, config.language)
     if approved_numbers:
         kick_tick(root)
     if childless and (parent not in by_number or by_number[parent].state == "open"):

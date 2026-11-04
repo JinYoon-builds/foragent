@@ -130,6 +130,7 @@ class Tracker(Protocol):
     def pr_checks(self, pr: int) -> CheckStatus: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
@@ -1010,6 +1011,9 @@ class FakeTracker:
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
 
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None:
+        return None
+
     def pr_default_branch(self) -> str:
         return "main"
 
@@ -1110,6 +1114,7 @@ class GhTracker:
         self._sleep = sleep
         self._path = f"repos/{repo}"
         self._seen_states: set[str] = set()
+        self._checks_started: dict[int, datetime | None] = {}
 
     def _call(self, args: list[str], input: str | None = None, *, binary: bool = False) -> str | bytes:
         try:
@@ -1488,9 +1493,14 @@ class GhTracker:
         ]))
         return next((item["number"] for item in data), None)
 
+    def pr_checks_started(self, pr: int) -> datetime | None:
+        """Earliest actual start in the last checks listing; never makes a GitHub call."""
+        return self._checks_started.get(pr)
+
     def pr_checks(self, pr: int) -> CheckStatus:
+        self._checks_started[pr] = None
         try:
-            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link"])
+            output = self._call(["pr", "checks", str(pr), "-R", self.repo, "--json", "bucket,name,workflow,link,state,startedAt"])
         except TrackerError as exc:
             if "no checks reported" in (str(exc) + "\n" + exc.stdout).lower():
                 return "none"
@@ -1499,11 +1509,18 @@ class GhTracker:
             try:
                 if exc.returncode not in {1, 8} or not exc.stdout.strip():
                     raise ValueError("not a checks exit")
-                buckets = {item["bucket"] for item in _items(exc.stdout)}
+                items = _items(exc.stdout)
+                buckets = {item["bucket"] for item in items}
             except (TrackerError, ValueError, TypeError, KeyError):
                 raise exc from exc.__cause__
         else:
-            buckets = {item["bucket"] for item in _items(output)}
+            items = _items(output)
+            buckets = {item["bucket"] for item in items}
+        starts = [when for item in items
+                  if item.get("state") != "QUEUED"
+                  and (when := _parse_time(item.get("startedAt"))) is not None
+                  and when.year > 1]
+        self._checks_started[pr] = min(starts, default=None)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
@@ -1608,6 +1625,82 @@ class GhTracker:
             if isinstance(exc, TrackerError):
                 raise
             raise self._artifact_error(f"Unusable acceptance artifacts: {exc}") from exc
+
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None:
+        """Exact-head JUnit passes; incomplete or unreadable evidence uses local checks."""
+        import xml.etree.ElementTree as ET
+        import yaml
+        from foragent.run_checks import junit_node_id
+
+        workflow = ".github/workflows/ci.yml"
+        try:
+            runs = _items(self._call([
+                "api", "--paginate", "--jq", ".workflow_runs",
+                f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+            ]))
+            candidates = [run for run in runs if run.get("head_sha") == head
+                          and run.get("path", "").split("@", 1)[0] == workflow]
+            if not candidates or any(type(run.get("id")) is not int or run["id"] <= 0
+                                     for run in candidates):
+                return None
+            run = max(candidates, key=lambda value: value["id"])
+            if (run.get("status") != "completed" or run.get("conclusion") != "success"
+                    or run["repository"]["full_name"] != self.repo
+                    or run["head_repository"]["full_name"] != self.repo):
+                return None
+            # The immutable workflow gives the shard roster, never a guessed test selection.
+            document = yaml.safe_load(self._call([
+                "api", "-H", "Accept: application/vnd.github.raw+json",
+                f"{self._path}/contents/{workflow}?ref={quote(head, safe='')}",
+            ]))
+            matrix = document["jobs"]["test"]["strategy"]["matrix"]
+            shards = matrix["shard"]
+            if (set(matrix) != {"shard"} or not isinstance(shards, list) or not shards
+                    or any(type(shard) is not int or shard < 0 for shard in shards)
+                    or len(set(shards)) != len(shards)):
+                return None
+            expected = {f"unit-{shard}" for shard in shards}
+            artifacts = _items(self._call([
+                "api", "--paginate", "--jq", ".artifacts",
+                f"{self._path}/actions/runs/{run['id']}/artifacts?per_page=100",
+            ]))
+            units = [artifact for artifact in artifacts if artifact["name"].startswith("unit-")]
+            if len(units) != len(expected) or {artifact["name"] for artifact in units} != expected:
+                return None
+            passed, failed, ids = set(), set(), set()
+            for artifact in units:
+                artifact_id = artifact["id"]
+                if (type(artifact_id) is not int or artifact_id <= 0 or artifact_id in ids
+                        or artifact.get("expired") is not False
+                        or type(artifact["workflow_run"]["id"]) is not int
+                        or artifact["workflow_run"]["id"] != run["id"]
+                        or artifact["workflow_run"]["head_sha"] != head):
+                    return None
+                ids.add(artifact_id)
+                data = self._call(["api", f"{self._path}/actions/artifacts/{artifact_id}/zip"], binary=True)
+                with ZipFile(BytesIO(data)) as archive:
+                    filename = f"{artifact['name']}.xml"
+                    if archive.namelist() != [filename]:
+                        return None
+                    report = ET.fromstring(archive.read(filename))
+                if report.tag not in {"testsuites", "testsuite"}:
+                    return None
+                suites = list(report.iter("testsuite"))
+                if not suites or any([
+                    prop.get("value") for prop in suite.findall("properties/property")
+                    if prop.get("name") == "foragent_tested_commit"
+                ] != [head] for suite in suites):
+                    return None
+                for case in report.iter("testcase"):
+                    node_id = junit_node_id(case)
+                    if node_id is None:
+                        return None
+                    (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+                     else passed).add(node_id)
+            return run["id"], passed - failed
+        except (LookupError, TypeError, ValueError, AttributeError, BadZipFile, OSError,
+                EOFError, RuntimeError, zlib.error, ET.ParseError, yaml.YAMLError):
+            return None
 
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.

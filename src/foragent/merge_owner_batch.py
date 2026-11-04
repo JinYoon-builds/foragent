@@ -50,9 +50,10 @@ def _exclusions(ctx, base, chain):
 
 
 def retirements(ctx):
-    return [json.loads(line) for line in ctx.git._call([
-        "for-each-ref", "--format=%(contents:trailers:key=Foragent-Batch,valueonly)", SPENT]).splitlines()
-            if line.strip()]
+    rows = [json.loads(line) for line in ctx.git._call([
+        "for-each-ref", "--sort=creatordate", "--format=%(contents:trailers:key=Foragent-Batch,valueonly)",
+        SPENT]).splitlines() if line.strip()]
+    return sorted(rows, key=lambda row: row.get("sequence", -1))
 
 
 def _landed(ctx, base, chain):
@@ -75,7 +76,7 @@ def _record_retirement(ctx, identity, candidate, *, reason, **data):
         candidate = row["candidate"]
         reason = row.get("reason", "unknown (legacy retirement did not record a reason)")
     else:
-        row = dict(identity=identity, candidate=candidate, **data)
+        row = dict(identity=identity, candidate=candidate, sequence=len(retirements(ctx)), **data)
     if "reason" not in row:
         row["reason"] = reason
         ledger = json.dumps(row, separators=(",", ":"))
@@ -124,7 +125,7 @@ def _publish(ctx, base, chain, k):
     return _prefix_pr(ctx, base, k)
 
 
-def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None):
+def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None, passed=False):
     from foragent.merge_owner import close_for_repair
 
     minutes = 0
@@ -136,10 +137,12 @@ def _close(ctx, report, base, chain, reason, used=None, spent=(), tip_pr=None):
             raise
         pass  # Missing measurements are unknown; cleanup must still proceed.
     members = [dict(n=n, head=head, started_at=started) for n, head, _, started in chain]
+    if reason == "tip CI red" and len(chain) == 1:
+        spent = chain
     # Persist retirement before deleting the tip, so cleanup can resume after a crash.
     refs = {_name(base, len(chain)): chain[-1][2]} if chain[-1][2] != base else {}
     reason = _record_retirement(ctx, _identity(base, chain), chain[-1][2], reason=reason,
-                               members=members, refs=refs,
+                               base=base, passed=passed, members=members, refs=refs,
                                spent=[dict(n=n, head=h, started_at=s) for n, h, _, s in spent])
     if used is None:
         used = _landed(ctx, base, chain)
@@ -219,6 +222,7 @@ class Evidence:
         self.reason = None
         self.pending = False
         self.accepted = None
+        self.passed = False
 
     def reports(self, ctx):
         prefix, branch, pr = self.chain[-1][2], _name(self.base, len(self.chain)), self.pr
@@ -262,6 +266,7 @@ class Evidence:
         return measured_base, measured, reports
 
     def outcome(self, ctx):
+        self.passed = False
         status, origin, sha, reports = self.reports(ctx)
         if status == "fail":
             return "fail"
@@ -271,7 +276,8 @@ class Evidence:
                                     expected_shards=range(ctx.config.ci_shards))
         if any(not ci_mode.scope_covers(item["report"]["scope"], scope) for item in reports):
             raise ci_mode.StaleComparison("tip measurement scope no longer covers the current one")
-        return "fail" if lost else "pass"
+        self.passed = not lost
+        return "pass" if self.passed else "fail"
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         if status == "fail":
@@ -289,12 +295,81 @@ class Evidence:
         return True
 
 
+def _join(ctx, report, base, before, place, job):
+    """Skip composition failures; an already included head aborts the train."""
+    try:
+        head = job["head"]
+        if ci_mode.pr_changes_workflows(ctx.git, base, head):
+            raise ValueError("acceptance workflow differs from target")
+        if not ctx.git.is_ancestor(head, before):
+            tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
+            message = f"Merge member #{place.n}\n\nForagent-Member: #{place.n} {head} {place.started_at}\n"
+            commit = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                    "commit-tree", tree, "-p", before, "-p", head, "-m", message]).strip()
+            return place.n, head, commit, place.started_at
+    except Exception as exc:
+        if isinstance(exc, TrackerError) and exc.waits:
+            raise
+        report.actions.append(f"#{place.n} merge batch excluded: {str(exc) or type(exc).__name__}")
+        return None
+    # Its code remains in the prefix, so excluding it would skip its checks.
+    raise ValueError("member already reachable")
+
+
+def _failed_candidates(ctx, retired, candidates, base):
+    """Replay failed sets from facts; a landed half leaves one whole remainder."""
+    def key(member):
+        return member["n"], member["head"], member["started_at"]
+
+    def recorded_base(row):
+        return row.get("base") or ctx.git._call([
+            "rev-parse", f"{row['candidate']}~{len(row['members'])}"]).strip()
+
+    waiting = {(p.n, j["head"], p.started_at): (p, j, pr) for p, j, pr in candidates
+               if pr.head_sha == j["head"]}
+    passed, stopped = [], []
+    for row in reversed(retired):
+        if row.get("passed") or row.get("reason") == "train merged":
+            passed.append(row)
+        elif row.get("reason") != "tip CI red":
+            stopped.append({key(m) for m in row["members"]})
+        if row.get("reason") != "tip CI red":
+            continue
+        members = row["members"]
+        if not any(key(m) in waiting for m in members):
+            continue
+        landed = {key(m) for m in members if ctx.git.is_ancestor(m["head"], base)}
+        remaining = [waiting[key(m)] for m in members if key(m) in waiting and key(m) not in landed]
+        if not remaining:
+            continue
+        identities = {key(m) for m in members}
+        # A later non-green retirement of a retry resolves its containing failed sets.
+        if any(attempt and attempt <= identities for attempt in stopped):
+            continue
+        if any(identities <= {key(m) for m in success["members"]}
+               and recorded_base(row) != recorded_base(success)
+               and ctx.git.is_ancestor(recorded_base(row), recorded_base(success))
+               and ctx.git.is_ancestor(recorded_base(success), base) for success in passed):
+            continue
+        return remaining if landed else remaining[:(len(remaining) + 1) // 2]
+    return None
+
+
 def prepare(ctx, report, candidates):
     """None permits single admissions; False ends a reserved or retired train's tick."""
     base, chain, proof = None, [], None
     try:
         retired = retirements(ctx)
+        retired_ids = {row.get("identity") for row in retired}
         recovered, damaged = _discover(ctx, report)
+        active = []
+        for recovered_base, recovered_chain in recovered:
+            if any(row.get("identity") == _identity(recovered_base, recovered_chain)
+                   or "identity" not in row and row["candidate"] == recovered_chain[-1][2] for row in retired):
+                _close(ctx, report, recovered_base, recovered_chain, "candidate already retired")
+            else:
+                active.append((recovered_base, recovered_chain))
+        recovered = active
         if damaged or len(recovered) > 1:
             for base, chain in recovered:
                 _close(ctx, report, base, chain, "published prefix ledgers changed")
@@ -302,37 +377,44 @@ def prepare(ctx, report, candidates):
             return False
         if recovered:
             base, chain = recovered[0]
-            if any(row.get("identity") == _identity(base, chain)
-                   or "identity" not in row and row["candidate"] == chain[-1][2] for row in retired):
-                _close(ctx, report, base, chain, "candidate already retired")
-                return None
         else:
             spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
             ctx.git.fetch("origin", ctx.config.base_branch)
             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
-            eligible = [(p, j) for p, j, _ in candidates if (p.n, p.started_at) not in spent
-                        and j["phase"] == "waiting" and j["target"] == ctx.config.base_branch]
-            selected = []
-            for start in range(0, len(eligible), ctx.config.merge_batch_size):
-                group = eligible[start:start + ctx.config.merge_batch_size]
-                identity = _identity(base, [(p.n, j["head"], base, p.started_at) for p, j in group])
-                if not any(row.get("identity") == identity for row in retired):
-                    selected = group
+            eligible = [(p, j, pr) for p, j, pr in candidates
+                        if (p.n, p.started_at) not in spent and j["phase"] == "waiting"
+                        and j["target"] == ctx.config.base_branch]
+            retry = _failed_candidates(ctx, retired, eligible, base)
+            # A failed set reserves only a new, composable retry. Otherwise
+            # normal batching gets the same pass, with all members still eligible.
+            for selection, minimum in ((retry, 1), (eligible, 2)):
+                if selection is None:
+                    continue
+                chain, before = [], base
+                for p, j, _ in selection:
+                    member = _join(ctx, report, base, before, p, j)
+                    if member is None:
+                        continue
+                    chain.append(member)
+                    before = member[2]
+                    if len(chain) == ctx.config.merge_batch_size:
+                        if _identity(base, chain) not in retired_ids:
+                            break
+                        chain, before = [], base
+                if len(chain) >= minimum and _identity(base, chain) not in retired_ids:
                     break
-            if len(selected) < 2:
+            else:
                 return None
-            chain = [(p.n, j["head"], base, p.started_at) for p, j in selected]
+            # Only the tip is published. Bind its CI scope to the members that
+            # actually composed, without repeating their merge-tree checks.
             excluded = _exclusions(ctx, base, chain)
-            before = base
-            for k, (p, j) in enumerate(selected):
-                if ctx.git.is_ancestor(j["head"], before):
-                    raise ValueError("member already reachable")
-                tree = ctx.git._call(["merge-tree", "--write-tree", before, j["head"]]).splitlines()[0]
-                message = (f"Merge member #{p.n}\n\nForagent-Member: #{p.n} {j['head']} {p.started_at}\n"
-                           f"{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}")
-                before = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
-                                        "commit-tree", tree, "-p", before, "-p", j["head"], "-m", message]).strip()
-                chain[k] = (p.n, j["head"], before, p.started_at)
+            n, head, tip, started = chain[-1]
+            before = chain[-2][2] if len(chain) > 1 else base
+            message = ctx.git._call(["show", "-s", "--format=%B", tip]).rstrip()
+            message += f"\n{EXCLUSIONS_TRAILER}: {json.dumps(excluded, separators=(',', ':'))}"
+            tip = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+                                 "commit-tree", _tree(ctx.git, tip), "-p", before, "-p", head, "-m", message]).strip()
+            chain[-1] = (n, head, tip, started)
         used = _landed(ctx, base, chain)
         if used:
             _close(ctx, report, base, chain, "member heads already reachable from target", used=used)
@@ -355,7 +437,8 @@ def prepare(ctx, report, candidates):
         if isinstance(exc, TrackerError) and exc.waits:
             raise
         if chain:
-            _close(ctx, report, base, chain, str(exc) or type(exc).__name__, tip_pr=proof.pr if proof else None)
+            _close(ctx, report, base, chain, str(exc) or type(exc).__name__, tip_pr=proof.pr if proof else None,
+                   passed=proof.passed if proof else False)
             return False
         report.actions.append(f"merge batch unavailable: {exc}")
         return None
@@ -453,4 +536,5 @@ def land(ctx, report, candidates, proof):
                 failed = checking
     if failed:
         reason = f"member #{failed[0]}: {reason}"
-    _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr)
+    _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [], tip_pr=proof.pr,
+           passed=proof.passed)

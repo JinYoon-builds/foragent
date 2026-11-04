@@ -840,3 +840,26 @@ def test_planning_question_lines_drop_an_earlier_runs_or_a_closed_issues_questio
     segment = presence.statusline_segment(root, later(6))
     assert segment.endswith(" · 1 question needs your answer in the planning session"), segment
     assert asked["question"] not in (presence.prompt_context(root, later(6))[0] or "")
+
+
+@pytest.mark.parametrize("columns", [None, "", "unknown", "0", "-10", "60", "83", "84", "120"])
+def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(project, monkeypatch, columns):
+    from datetime import UTC, datetime
+
+    from foragent import presence, watch_art
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(presence, "_started_at", lambda path: now)
+    if columns is None:
+        monkeypatch.delenv("COLUMNS", raising=False)
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    output = presence.squirrel(project, "greeting", now)
+    rows = output.splitlines()
+    assert len(rows) == 8
+    widths = [len(re.sub(r"\x1b\[[0-9;]*m", "", row)) for row in rows]
+    if columns in ("84", "120"):
+        assert max(widths) == 84
+    else:
+        assert rows == watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE)
+        assert max(widths) == 18

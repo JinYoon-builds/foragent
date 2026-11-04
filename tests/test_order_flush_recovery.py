@@ -1,11 +1,12 @@
 """Recovery cases around the plumbing rebuild, in addition to locked edge checks."""
 
 from dataclasses import replace
+import fcntl
 
 import pytest
 
 from conftest import git_command
-from foragent import order_flush, order_flush_journal as journal, order_notes
+from foragent import main_write, order_flush, order_flush_journal as journal, order_notes
 from foragent.git import GitError
 from foragent.order import PlanError
 from foragent.state import StateStore
@@ -40,9 +41,18 @@ def flush(case, boundary="chosen"):
     return order_flush.flush(root, config, tracker, git, store, repo="owner/repo", boundary=boundary)
 
 
+def assert_train_can_publish(git):
+    # A separate descriptor models the train's writer, bypassing the adapter's reentrant lock.
+    with (git.common_dir() / "foragent-publish.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 @pytest.mark.parametrize("with_order", [False, True], ids=["notes", "orders-and-notes"])
 @pytest.mark.parametrize("merge_owner", [False, True])
-def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history, monkeypatch, with_order, merge_owner):
+def test_flush_waits_before_committing_until_the_merge_train_finishes(
+    waiting, git_history, monkeypatch, with_order, merge_owner,
+):
     from foragent import order, order_submissions
 
     root, config, tracker, git, store = waiting
@@ -58,26 +68,122 @@ def test_flush_rebuilds_after_the_merge_train_advances_main(waiting, git_history
     base = git_command(git_history.origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(git_history.origin, "update-ref", train, base)
-    if merge_owner:
-        for attempt in range(2):
-            with pytest.raises(GitError, match="waiting for merge train"):
-                flush(case)
-            assert git_command(git_history.origin, "rev-parse", "main") == base
-            assert not tracker.issues
-            assert not any(row["kind"] in {"pushed", "issues", "done"} for row in journal.entries(store))
-            if attempt == 0:
-                committed = git.head_sha()
-                assert committed != base
-            assert git.head_sha() == committed
-        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
-        git_command(git_history.origin, "update-ref", "-d", train)
+    before_index = git_command(root, "ls-files", "--stage")
+    elapsed, sleeps = [0], []
+
+    def finish_train(seconds):
+        assert merge_owner, "merge_owner off must never wait"
+        assert seconds == 30
+        assert_train_can_publish(git)
+        assert git.head_sha() == base
+        assert git_command(root, "ls-files", "--stage") == before_index
+        assert not tracker.issues
+        assert not journal.entries(store)
+        assert (root / "docs/decisions.md").read_text() == "# Decisions\n"
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        if len(sleeps) == 2:
+            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+            git_command(git_history.origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(main_write.time, "sleep", finish_train)
     assert flush(case)["status"] == "published"
     assert git_command(git_history.origin, "rev-parse", "main") == git.head_sha()
+    assert sleeps == ([30, 30] if merge_owner else [])
     if merge_owner:
-        assert git.head_sha() != committed
         assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
         assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
     assert bool(tracker.issues) == with_order
+    intact(case)
+
+
+@pytest.mark.parametrize("resuming", [False, True], ids=["new", "uncommitted-resume"])
+def test_flush_train_timeout_preserves_files_index_head_and_journal(waiting, git_history, monkeypatch, resuming):
+    root, config, tracker, git, store = waiting
+    if resuming:
+        def stop(*_args):
+            raise Interrupted()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(git, "commit_paths", stop)
+            with pytest.raises(Interrupted):
+                flush(waiting)
+    case = root, replace(config, merge_owner=True), tracker, git, store
+    base, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file() and ".git" not in path.parts}
+    records = journal.entries(store)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(git_history.origin, "update-ref", train, base)
+    elapsed, sleeps = [0], []
+
+    def sleep(seconds):
+        assert seconds == 30
+        assert_train_can_publish(git)
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(main_write.time, "sleep", sleep)
+    with pytest.raises(GitError, match="timed out after 40 minutes waiting for merge train"):
+        flush(case)
+    assert sum(sleeps) == 40 * 60
+    assert git.head_sha() == base
+    assert git_command(git_history.origin, "rev-parse", "main") == base
+    assert git_command(root, "ls-files", "--stage") == index
+    assert {path: path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and ".git" not in path.parts} == files
+    assert journal.entries(store) == records
+    assert not tracker.issues
+    git_command(git_history.origin, "update-ref", "-d", train)
+    assert flush(case)["status"] == "published"
+    intact(case)
+
+
+@pytest.mark.parametrize("unpushed", [False, True], ids=["published-head", "unpushed-commit"])
+def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, git_history, monkeypatch, unpushed):
+    root, config, tracker, git, store = waiting
+
+    def stop(*_args):
+        raise Interrupted()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(git, "commit_paths", stop)
+        with pytest.raises(Interrupted):
+            flush(waiting)
+    case = root, replace(config, merge_owner=True), tracker, git, store
+    base = git.head_sha()
+    memory = ".claude/agent-memory/fa-docs/MEMORY.md"
+    if unpushed:
+        path = root / memory
+        path.parent.mkdir(parents=True)
+        path.write_text("Retained local lesson.\n")
+        git.ensure_tracked([memory])
+        git.commit_paths([memory], "Retained role memory")
+    local, index = git.head_sha(), git_command(root, "ls-files", "--stage")
+    partial = (root / "docs/decisions.md").read_bytes()
+    records = journal.entries(store)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(git_history.origin, "update-ref", train, base)
+
+    def finish_train(seconds):
+        assert seconds == 30
+        assert_train_can_publish(git)
+        assert git.head_sha() == local
+        assert git_command(root, "ls-files", "--stage") == index
+        assert (root / "docs/decisions.md").read_bytes() == partial
+        assert journal.entries(store) == records
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+        git_command(git_history.origin, "update-ref", "-d", train)
+
+    monkeypatch.setattr(main_write.time, "sleep", finish_train)
+    assert flush(case)["status"] == "published"
+    assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+    assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
+    if unpushed:
+        assert (root / memory).read_text() == "Retained local lesson.\n"
+        assert git_command(git_history.origin, "show", f"main:{memory}") == "Retained local lesson."
+    assert len([row for row in journal.entries(store) if row["kind"] == "selected"]) == 1
     intact(case)
 
 
@@ -106,40 +212,39 @@ def interrupt_rebuild(case, git_history, monkeypatch, edge):
     fail_push(case, monkeypatch)
     old = git.head_sha()
     git_history.update({"upstream.txt": "Moved base\n"})
-    run, append = git._call, journal.append
+    run = git._call
 
     def command(args):
-        if args[0] == "read-tree" and edge == "before-tree":
+        deleting = args[:2] == ["update-ref", "-d"]
+        moving = args[0] == "update-ref" and args[1] == "refs/heads/main"
+        if (args[0] == "read-tree" and edge == "before-tree"
+                or deleting and edge == "before-cleanup"):
             raise Interrupted()
         result = run(args)
         if (args[0] == "read-tree" and edge == "after-tree"
-                or args[0] == "update-ref" and edge == "after-ref"):
+                or moving and edge == "after-ref"
+                or deleting and edge == "after-cleanup"):
             raise Interrupted()
         return result
 
-    def record(store, kind, batch, **values):
-        if kind == "rebased" and edge == "before-record":
-            raise Interrupted()
-        append(store, kind, batch, **values)
-        if kind == "rebased" and edge == "after-record":
-            raise Interrupted()
-
     with monkeypatch.context() as patch:
         patch.setattr(git, "_call", command)
-        patch.setattr(journal, "append", record)
         with pytest.raises(Interrupted):
             flush(case)
     return old
 
 
-@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-record"])
+@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-cleanup"])
 def test_rebuild_interruption_finishes_tree_ref_and_journal_once(waiting, git_history, monkeypatch, edge):
     case = waiting
     root, _config, _tracker, git, store = case
     old = interrupt_rebuild(case, git_history, monkeypatch, edge)
-    intent = next(row for row in journal.entries(store) if row["kind"] == "rebuilding")
+    intent = git_command(root, "for-each-ref", "--format=%(objectname)", "refs/foragent/flush/")
+    assert intent
     flush(case)
-    assert git.head_sha() == intent["sha"] != old
+    assert git.head_sha() == intent != old
+    assert not git_command(root, "for-each-ref", "refs/foragent/flush/")
+    assert {row["kind"] for row in journal.entries(store)} == {"selected", "done"}
     assert git.is_ancestor(git_history.tip, "HEAD")
     # The offline push transfers the bare ref; it doesn't update tracking refs.
     assert git_command(git_history.origin, "rev-parse", "refs/heads/main") == git.head_sha()
@@ -165,7 +270,7 @@ def test_moved_base_with_local_descendants_refuses_and_retains_pending(waiting, 
     assert git_command(root, "ls-files", "--stage") == index
     assert all(path.read_bytes() == data for path, data in before.items())
     assert order_notes.pending(store)["notes"][0]["status"] == "waiting"
-    assert not any(row["kind"] == "rebuilding" for row in journal.entries(store))
+    assert not git_command(root, "for-each-ref", "refs/foragent/flush/")
 
 
 def test_pending_other_boundary_finishes_before_selecting_new_work(waiting, monkeypatch):
@@ -300,15 +405,15 @@ def test_resume_holds_the_shared_publication_gate(waiting, monkeypatch):
 
 
 def interrupt_before_recording(case, monkeypatch):
-    git, append = case[3], journal.append
+    git = case[3]
+    commit = git.commit_paths
 
-    def record(store, kind, batch, **values):
-        if kind == "committed":
-            raise Interrupted()
-        append(store, kind, batch, **values)
+    def committed(*args):
+        commit(*args)
+        raise Interrupted()
 
     with monkeypatch.context() as patch:
-        patch.setattr(journal, "append", record)
+        patch.setattr(git, "commit_paths", committed)
         with pytest.raises(Interrupted):
             flush(case)
     return git.head_sha()
@@ -440,11 +545,12 @@ def assert_only_recorded_commit_published(case, git_history, sha, merged):
     assert not git_command(root, "diff", "--name-only", "HEAD", "--", "upstream.txt", "docs/decisions.md")
     assert not (root / "upstream.txt").exists()
     assert not git.uncommitted_paths(["docs/decisions.md"])
-    assert [row["sha"] for row in journal.entries(store) if row["kind"] == "pushed"] == [sha]
+    git.fetch("origin", "main")
+    assert git.is_ancestor(sha, "origin/main")
     published_once(case, git_history.origin)
 
 
-@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-record", "after-record"])
+@pytest.mark.parametrize("edge", ["before-tree", "after-tree", "after-ref", "before-cleanup", "after-cleanup"])
 def test_interrupted_rebuild_stops_when_the_batch_was_merged_externally(waiting, git_history, monkeypatch, edge):
     sha = interrupt_rebuild(waiting, git_history, monkeypatch, edge)
     merged = merge_externally(waiting, git_history, sha)
@@ -460,3 +566,19 @@ def test_retried_push_does_not_rebuild_a_batch_merged_externally(waiting, git_hi
     forbid_rebuild(waiting, monkeypatch)
     assert flush(waiting)["status"] == "published"
     assert_only_recorded_commit_published(waiting, git_history, sha, merged)
+
+
+@pytest.mark.parametrize("kind", ["committed", "pushed", "rebased", "rebuilding"])
+def test_legacy_git_checkpoints_are_ignored_without_rewriting(waiting, monkeypatch, kind):
+    root, _config, _tracker, git, store = waiting
+    fail_push(waiting, monkeypatch)
+    sha = git.head_sha()
+    batch = next(row for row in journal.entries(store) if row["kind"] == "selected")
+    # A legacy SHA pointing at a real ancestor must not replace the batch found in Git.
+    parent = git_command(root, "rev-parse", f"{sha}~1")
+    journal.append(store, kind, batch["batch"], sha=parent, old=parent)
+    before = (store.root / journal.JOURNAL).read_bytes()
+    forbid_commit(waiting, monkeypatch)
+    assert flush(waiting)["sha"] == sha
+    assert (store.root / journal.JOURNAL).read_bytes().startswith(before)
+    intact(waiting)
