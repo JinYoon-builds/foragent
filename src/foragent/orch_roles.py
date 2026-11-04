@@ -255,6 +255,11 @@ def command(args, store: StateStore, config: Config) -> None:
     if args.action == "role-decision":
         event = decide(store, args.id, args.decision, args.role, args.answer)
         print(f"Role {event['role']}: proposal {args.id} {args.decision}.")
+        if event["role"] == "architect":
+            from foragent import orch_architect_topics
+
+            if line := orch_architect_topics.respond(args.repo_root.resolve(), store, config, args.id):
+                print(line)
         return
     payload = collect(store, config, args.repo_root.resolve())
     print(json.dumps(payload, ensure_ascii=False) if args.json else human(payload))

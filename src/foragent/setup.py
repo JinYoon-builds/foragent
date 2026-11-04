@@ -6,12 +6,14 @@ Add later checks here in setup order (tools, login, scopes, repository, ...).
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 from typing import NotRequired, TypedDict
 
+from foragent.git import GitError, GitRepo
 from foragent.i18n import text
 
 
@@ -53,7 +55,7 @@ def gh_project_scope(auth_status: str) -> SetupItem:
 
 @dataclass(frozen=True)
 class Facts:
-    """Machine facts and the reader's display language; never persisted."""
+    """Read-only machine observations shared by every checklist reader."""
 
     installed: dict[str, bool]
     auth_status: str = ""
@@ -78,7 +80,7 @@ def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
 
 def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None,
             language: str = "en") -> Facts:
-    """Read prerequisites once; never invoke an auth command without gh on PATH."""
+    """Observe prerequisites once, without invoking gh until it is installed."""
     tools = installed if installed is not None else installed_tools()
     if not tools["gh"]:
         return Facts(tools, auth_error="gh not found on PATH", language=language)
@@ -116,9 +118,13 @@ def uv_installed(facts: Facts) -> SetupItem:
     return installed_item(facts, "uv")
 
 
+def waiting_item(item_id: str, prerequisite: str, language: str) -> SetupItem:
+    return {"id": item_id, "ok": False, "fix": text("setup_wait_for", language, prerequisite=prerequisite)}
+
+
 def gh_logged_in(facts: Facts) -> SetupItem:
     if not facts.installed["gh"]:
-        return {"id": "gh-logged-in", "ok": False, "fix": text("setup_wait_for", facts.language, prerequisite="gh-installed")}
+        return waiting_item("gh-logged-in", "gh-installed", facts.language)
     item: SetupItem = {"id": "gh-logged-in", "ok": facts.logged_in}
     if not item["ok"]:
         item["fix"] = "gh auth login"
@@ -128,14 +134,41 @@ def gh_logged_in(facts: Facts) -> SetupItem:
 def project_scope(facts: Facts) -> SetupItem:
     for prerequisite in (gh_installed(facts), gh_logged_in(facts)):
         if not prerequisite["ok"]:
-            return {"id": "gh-project-scope", "ok": False,
-                    "fix": text("setup_wait_for", facts.language, prerequisite=prerequisite["id"])}
+            return waiting_item("gh-project-scope", prerequisite["id"], facts.language)
     return gh_project_scope(facts.auth_status)
 
 
 CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
 
 
-def checklist(facts: Facts) -> list[SetupItem]:
+def repository_fix(key: str, error: GitError, language: str = "en") -> str:
+    """Share recovery text with init's early, before-auth repository preflight."""
+    return text(key, language, error=error, choices=text("init_repository_choices", language))
+
+
+def repository_linked(root: Path, *, git: GitRepo | None = None, language: str = "en") -> SetupItem:
+    """Describe the repository's next step without creating or linking anything."""
+    git = git or GitRepo(root)
+    try:
+        git.check_worktree()
+    except GitError as exc:
+        return {"id": "repository-linked", "ok": False,
+                "fix": repository_fix("init_git_missing", exc, language)}
+    try:
+        git.remote_slug()
+    except GitError as exc:
+        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+        return {"id": "repository-linked", "ok": False,
+                "fix": repository_fix(key, exc, language)}
+    return {"id": "repository-linked", "ok": True}
+
+
+def checklist(facts: Facts, *, root: Path | None = None,
+              git: GitRepo | None = None) -> list[SetupItem]:
     """Return fresh items in check order from the same facts for every reader."""
-    return [check(facts) for check in CHECKS]
+    items = [check(facts) for check in CHECKS]
+    if facts.installed["git"]:
+        items.append(repository_linked(root if root is not None else Path.cwd(), git=git, language=facts.language))
+    else:
+        items.append(waiting_item("repository-linked", "git-installed", facts.language))
+    return items

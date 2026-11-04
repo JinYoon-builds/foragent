@@ -23,14 +23,16 @@ def run(args) -> int:
         from foragent import setup
 
         def read_auth():
-            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=True, timeout=10)
+            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
+            result.check_returncode()
             return result.stdout + "\n" + result.stderr
 
         try:
             language = cli.load_config(args.repo_root).language
         except (cli.ConfigError, OSError):
             language = "en"
-        items = setup.checklist(setup.collect(read_auth, language=language))
+        facts = setup.collect(read_auth, language=language)
+        items = setup.checklist(facts, root=args.repo_root.resolve())
         if args.json:
             print(cli.json.dumps({"items": items}))
         else:
