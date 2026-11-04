@@ -162,9 +162,12 @@ def _publish_reviewed_in_turn(
     refreshed_pairs = set()
 
     def older_base(reported: str) -> bool:
-        return ((reported, base_sha) not in refreshed_pairs
-                and git.is_ancestor(reported, base_sha)
-                and not git.is_ancestor(base_sha, head))
+        try:
+            return ((reported, base_sha) not in refreshed_pairs
+                    and git.is_ancestor(reported, base_sha)
+                    and not git.is_ancestor(base_sha, head))
+        except run_publish.GitError:
+            return False  # Unproved ancestry keeps the existing CI wait.
 
     def refresh_older(reported: str) -> str | None:
         refreshed_pairs.add((reported, base_sha))
