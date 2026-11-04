@@ -206,3 +206,5 @@
 - [id:1491-2026-11-05-orch-pm-task-conflict] commands/orch.py의 stop parser 충돌은 등록 하나에 양쪽 의도를 합친다: --all 도움말·선택 number·release를 보존하고 main의 stop.set_defaults(pm_task="stop an issue")도 둔다. PM 명령표는 parser._defaults를 읽으므로 기능 실행이 통과해도 이 메타데이터를 버리면 세션 안내에서 중지가 사라진다. test_pm_command_table과 test_statusline_pm_table을 bulk/release CLI 회귀와 함께 검증한다.
 
 - [id:1491-2026-11-05-pm-table-profile-env] test_pm_command_table의 session_case는 격리된 HOME보다 CLAUDE_CONFIG_DIR을 먼저 읽어 settings.json을 준비한다. Orca 프로필 변수가 상속되면 실제 프로필 쓰기 EPERM으로 5개 모두 setup error가 난다. 시험 파일·제품을 바꾸지 않고 env -u CLAUDE_CONFIG_DIR ... fa test로 실행하면 fixture의 임시 HOME을 사용해 5개 모두 통과한다.
+
+- [id:1491-2026-11-05-owner-fetch-test-race] test_slow_owner_check_leaves_scheduler_and_tick_lock_available는 gate와 owner를 처음부터 겹쳐 같은 checkout의 origin/main fetch가 경합하면 owner가 정상 defer하고 entered.wait(10)이 거짓 실패한다. 초기 owner를 느린 검사까지 준비한 뒤 두 공개 gate tick을 겹쳐 검사한다(launch 시도 3회·실제 owner 1회도 확인). 준비 Future는 조기 종료/오류를 log와 함께 전달한다. 시간 제한 10/30/60초는 유지하며 실제 ref.lock 탐침은 옛 시험의 같은 실패와 수정 시험의 통과를 확인한다.
