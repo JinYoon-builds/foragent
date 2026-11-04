@@ -52,6 +52,8 @@ A lane is an agent that owns one area of your code, for example `src/foragent/or
 
 ## Runs on stock Claude Code
 
+`fa init` includes a **UX researcher** role that tests user flows by playing one to three target personas, starting from the README. Findings go through the orchestrator after a second session confirms them. Persona testing does not replace research with real users.
+
 Foragent does not replace Claude Code. It uses what stock Claude Code already has:
 
 - **Lanes are `.claude/agents`.** Each lane is a plain agent file, `.claude/agents/fa-<lane>.md`.
@@ -129,6 +131,8 @@ executors: [{name: claude, quota: api, spend_cap: <하루 USD>}]
 - **동시에 일해요.** 레인은 각자 자기 git worktree에서 동시에 돌아요. gate가 결과를 하나씩 합쳐요.
 
 ### 순정 Claude Code 위에서 돌아요
+
+`fa init`은 **UX 리서처** 역할도 준비해요. README에서 시작해 대상 페르소나 1~3명을 연기하며 사용 흐름을 시험해요. 발견한 문제는 두 번째 세션에서 확인한 뒤 오케스트레이터를 통해 전달해요. 페르소나 시험이 실제 사용자를 대상으로 한 리서치를 대신하지는 않아요.
 
 Foragent는 Claude Code를 대신하지 않아요. 순정 Claude Code에 이미 있는 것을 써요.
 
