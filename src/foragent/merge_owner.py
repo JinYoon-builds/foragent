@@ -714,7 +714,8 @@ def _tick(owner, report):
         live = (run is not None and run.started_at == key[1]
                 if waiting[key].get("merge_owner") else queue._live(ctx.store, key))
         if live:
-            if key in candidates:
+            # Batch preparation can have repaired or held a candidate in this pass.
+            if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
                 advanced = advance_members(owner, [candidates[key]])
                 if ctx.store.github_wait_until(ctx.now()):
                     return
