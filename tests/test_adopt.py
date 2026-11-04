@@ -437,3 +437,211 @@ def test_confirmed_own_skill_reaches_the_lane_catalogue_with_added_libraries(tmp
     assert cli.main(["skills", "catalog", "--json"]) == 0
     listed = [entry["id"] for entry in json.loads(capsys.readouterr().out) if not entry["id"].startswith("pstack:")]
     assert listed == ["foragent:fa-state-design", "addon:extra"]
+    assert cli.main(["skills", "install", "foragent:fa-state-design", "--repo-root", str(root)]) == 0
+    assert (root / ".claude/skills/fa-state-design/SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("libraries", ["empty", "own", "added"])
+def test_project_catalogue_is_shared_by_survey_prefer_and_lane(tmp_path, capsys, monkeypatch, libraries):
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    # A cached global catalogue must not override the project's library choices.
+    _skill_library(tmp_path, "https://github.com/anthropics/knowledge-work-plugins",
+                   ["ux-copy", "testing-strategy"])
+    local = tmp_path / "project-library"
+    for name in ("ux-copy", "testing-strategy"):
+        folder = local / "skills" / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Local {name}\n---\nBody.\n")
+    (local / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+    entry = {"name": "project", "repo": "https://github.com/anthropics/skills", "path": str(local)}
+    entries = [] if libraries == "empty" else [entry]
+    if libraries == "added":
+        entries.insert(0, {"name": "lib", "repo": "https://github.com/anthropics/knowledge-work-plugins",
+                           "path": str(tmp_path / "library")})
+    root = _signal_project(tmp_path, "screen", {
+        "src/App.jsx": "export const App = () => <button>Hi</button>;\n",
+        ".github/workflows/ci.yml": "jobs:\n  test:\n    timeout-minutes: 120\n    steps:\n    - run: pytest -q\n",
+        ".foragent.yml": yaml.safe_dump({"skill_libraries": entries,
+                                         "lanes": {"app": {"paths": ["src/**"], "skills": []}}}),
+    })
+    # A prefer target is independent of the caller's current project.
+    monkeypatch.chdir(tmp_path)
+    found = adopt.survey(root)["proposed_skills"]
+    assert len(found) == (0 if libraries == "empty" else 2)
+    for proposal in found:
+        assert cli.main(["skills", "prefer", proposal["id"], "--repo-root", str(root)]) == 0
+        offered = available_skills(load_config(root), [])
+        assert any(name == proposal["name"] for name, _, _ in offered)
+        if libraries == "own":
+            assert (proposal["name"], str((local / "skills" / proposal["name"] / "SKILL.md").resolve())) in [
+                (name, path) for name, _, path in offered
+            ]
+    before = (root / ".foragent.yml").read_bytes()
+    # An available global skill that this project excludes cannot be preferred.
+    if libraries != "added":
+        assert cli.main(["skills", "prefer", "lib:ux-copy", "--repo-root", str(root)]) != 0
+        assert (root / ".foragent.yml").read_bytes() == before
+    capsys.readouterr()
+    monkeypatch.chdir(root)
+    assert cli.main(["skills", "catalog", "--json"]) == 0
+    catalog = {item["id"]: item for item in json.loads(capsys.readouterr().out)}
+    assert all(item["id"] in catalog and item["license"] == catalog[item["id"]]["license"] for item in found)
+    if libraries != "empty":
+        assert {"project:ux-copy", "project:testing-strategy"} <= catalog.keys()
+    if libraries != "added":
+        assert not any(identity.startswith("lib:") for identity in catalog)
+    offered = available_skills(load_config(root), [])
+    assert [name for name, _, _ in offered[:len(found)]] == [item["name"] for item in found]
+    if libraries == "empty":
+        assert offered == []
+    assert load_config(root).lanes["app"]["skills"] == []
+
+
+@pytest.mark.parametrize("first", ["survey", "catalog", "prefer", "lane"])
+@pytest.mark.parametrize("source", ["trusted", "approved"])
+def test_every_catalogue_entry_point_fetches_the_same_missing_sources(
+    tmp_path, capsys, monkeypatch, first, source,
+):
+    from foragent import skills
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    calls = []
+
+    def clone(args):
+        assert args[:2] == ["git", "clone"]
+        calls.append(args[3])
+        path = Path(args[4])
+        folder = path / "skills/ux-copy"
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text("---\nname: ux-copy\ndescription: Screen copy\n---\nBody.\n")
+        (path / "LICENSE").write_text("SPDX-License-Identifier: MIT\n")
+        return ""
+
+    monkeypatch.setattr(skills, "_run", clone)
+    repo = "https://github.com/anthropics/skills" if source == "trusted" else "https://example.test/approved"
+    settings = {"skill_libraries": [{"name": "fresh", "repo": repo}]}
+    if source == "approved":
+        settings["skill_roles"] = {"fresh:ux-copy": "tool"}
+    root = _signal_project(tmp_path, "screen", {
+        "src/App.jsx": "export const App = () => <b>Hi</b>;\n",
+        ".foragent.yml": yaml.safe_dump(settings),
+    })
+    monkeypatch.chdir(root)
+    if first == "survey":
+        proposals = adopt.survey(root)["proposed_skills"]
+        assert [item["id"] for item in proposals] == (["fresh:ux-copy"] if source == "trusted" else [])
+    elif first == "lane":
+        assert any(name == "ux-copy" for name, _, _ in available_skills(load_config(root), []))
+    else:
+        args = ["skills", "catalog", "--json"] if first == "catalog" else [
+            "skills", "prefer", "fresh:ux-copy", "--repo-root", str(root)]
+        assert cli.main(args) == 0
+    assert calls == [repo]
+    capsys.readouterr()
+    proposals = adopt.survey(root)["proposed_skills"]
+    assert [item["id"] for item in proposals] == (["fresh:ux-copy"] if source == "trusted" else [])
+    assert cli.main(["skills", "prefer", "fresh:ux-copy", "--repo-root", str(root)]) == 0
+    assert available_skills(load_config(root), [])[0][0] == "ux-copy"
+    assert calls == [repo]
+
+
+@pytest.mark.parametrize("assignment", ["style", "default"])
+def test_survey_never_proposes_a_skill_that_confirmation_cannot_offer_to_lanes(tmp_path, monkeypatch, assignment):
+    _skill_library(tmp_path, "https://github.com/anthropics/knowledge-work-plugins", ["ux-copy", "testing-strategy"])
+    settings = {"skill_roles": {"lib:ux-copy": "style"}} if assignment == "style" else {
+        "default_skills": {"docs": ["lib:ux-copy"]}}
+    root = _signal_project(tmp_path, "screen", {
+        "src/App.jsx": "export const App = () => <b>Hi</b>;\n",
+        ".foragent.yml": yaml.safe_dump(settings),
+    })
+    found = adopt.survey(root)["proposed_skills"]
+    assert all(item["id"] != "lib:ux-copy" for item in found)
+
+
+@pytest.mark.parametrize("action", ["catalog", "prefer"])
+@pytest.mark.parametrize("source", ["missing", "unavailable", "not-directory"])
+def test_explicit_catalogue_commands_require_configured_sources(
+    git_history, tmp_path, capsys, monkeypatch, action, source,
+):
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    git_history.update({
+        "skills/ux-copy/SKILL.md": "---\nname: ux-copy\ndescription: Local screen copy\n---\nBody.\n",
+        "LICENSE": "SPDX-License-Identifier: MIT\n",
+    })
+    destination = tmp_path / "library"
+    if source == "not-directory":
+        destination.write_text("A file occupies the configured library path.\n")
+    repo = str(tmp_path / "absent.git") if source == "unavailable" else str(git_history.origin)
+    root = _signal_project(tmp_path, "project", {
+        ".foragent.yml": yaml.safe_dump({"skill_libraries": [
+            {"name": "requested-pack", "repo": repo, "path": str(destination)},
+        ]}),
+    })
+    monkeypatch.chdir(root)
+    settings = root / ".foragent.yml"
+    before = settings.read_bytes()
+    argv = ["skills", "catalog", "--json"] if action == "catalog" else [
+        "skills", "prefer", "requested-pack:ux-copy", "--repo-root", str(root)]
+    result = cli.main(argv)
+    output = capsys.readouterr()
+    if source != "missing":
+        assert result != 0
+        assert "requested-pack" in output.err
+        assert ("could not clone library" if source == "unavailable" else "not a directory") in output.err
+        assert output.out == ""
+        assert settings.read_bytes() == before
+        return
+
+    assert result == 0, output.err
+    assert (destination / "skills/ux-copy/SKILL.md").is_file()
+    if action == "catalog":
+        entries = [item for item in json.loads(output.out) if item["id"].startswith("requested-pack:")]
+        assert [(item["id"], item["license"]) for item in entries] == [("requested-pack:ux-copy", "MIT")]
+        assert settings.read_bytes() == before
+    else:
+        assert load_config(root).preferred_skills == ["requested-pack:ux-copy"]
+        assert available_skills(load_config(root), [])[0][2] == str(destination / "skills/ux-copy/SKILL.md")
+
+
+@pytest.mark.parametrize("action", ["survey", "lane"])
+@pytest.mark.parametrize("source", ["trusted", "untrusted"])
+def test_optional_catalogue_discovery_keeps_available_skills_when_a_source_is_missing(
+    tmp_path, monkeypatch, action, source,
+):
+    import subprocess
+    from foragent import skills
+    from foragent.config import load_config
+    from foragent.run_skill_catalog import available_skills
+
+    _skill_library(tmp_path, "https://github.com/anthropics/skills", ["ux-copy"])
+    repo = ("https://github.com/anthropics/knowledge-work-plugins" if source == "trusted"
+            else "https://example.test/untrusted")
+    root = _signal_project(tmp_path, "project", {
+        "src/App.jsx": "export const App = () => <b>Hi</b>;\n",
+        ".foragent.yml": yaml.safe_dump({"skill_libraries": [
+            {"name": "missing-pack", "repo": repo, "path": str(tmp_path / "missing")},
+            {"name": "cached", "repo": "https://github.com/anthropics/skills", "path": str(tmp_path / "library")},
+        ]}),
+    })
+    calls = []
+
+    def failed_clone(args):
+        assert args[:2] == ["git", "clone"]
+        calls.append(args[3])
+        raise subprocess.CalledProcessError(128, args, stderr="offline source")
+
+    monkeypatch.setattr(skills, "_run", failed_clone)
+    before = (root / ".foragent.yml").read_bytes()
+    if action == "survey":
+        assert [item["id"] for item in adopt.survey(root)["proposed_skills"]] == ["cached:ux-copy"]
+    else:
+        offered = available_skills(load_config(root), [])
+        assert ("ux-copy", str(tmp_path / "library/skills/ux-copy/SKILL.md")) in [
+            (name, path) for name, _, path in offered]
+    assert calls == ([repo] if source == "trusted" else [])
+    assert (root / ".foragent.yml").read_bytes() == before

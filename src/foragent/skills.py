@@ -15,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_global_config, register_skill_library
+from foragent.config import Config, DEFAULTS, SKILL_ROLES, load_config, load_global_config, register_skill_library
 from foragent.license_texts import STANDARD_LICENSES
 from foragent.paths import repo_path
 
@@ -748,6 +748,63 @@ def with_vendored_library(config: Config, *roots: Path | None) -> Config:
     if own is not None and own["skills"]:
         built_in.append(own)
     return replace(config, skill_libraries=[*built_in, *configured]) if built_in else config
+
+
+def project_skill_config(root: Path, *, global_config: Config | None = None) -> Config:
+    """Use a project's overrides, including an explicitly empty library list, before global defaults."""
+    base = global_config or load_global_config()
+    # Keep the CLI's configuration adapter while using the normal project merge and validation.
+    keys = ("skill_libraries", "skill_roles", "preferred_skills", "default_skills")
+    return (load_config(root, global_overrides={key: getattr(base, key) for key in keys})
+            if (root / ".foragent.yml").is_file() else base)
+
+
+def catalog_skills(
+    config: Config, *, required: bool, manager_factory: Callable[[Config], SkillManager] | None = None,
+) -> list[Skill]:
+    """The available catalogue shared by survey, preference confirmation and issue runs.
+
+    Include the shipped libraries using the same membership rules everywhere. Explicit commands
+    require the complete catalogue: fetch every missing source and propagate acquisition errors.
+    Optional discovery fetches trusted or person-approved sources and keeps available entries
+    when another source fails. Existing copies are never updated here. Approval and lane
+    style/default assignments are separate from source availability.
+    """
+    manager = (manager_factory or SkillManager)(with_vendored_library(config))
+    if required:
+        skills = manager.skills()
+    else:
+        approved = {identity.partition(":")[0] for identity in (*config.skill_roles, *config.preferred_skills)
+                    if ":" in identity}
+        manager.fetch_missing(lambda library: trusted_source(library.repo) or library.prefix in approved)
+        skills = manager.skills(available_only=True)
+    rank = {identity: index for index, identity in enumerate(config.preferred_skills)}
+    return sorted(skills, key=lambda skill: rank.get(skill.id, len(rank)))
+
+
+def issue_skills(config: Config, catalog: list[Skill], fixed: tuple[str, ...] | list[str] = ()) -> list[Skill]:
+    """Select per-issue skills from the catalogue; style and role defaults have their own sections.
+
+    Confirmation grants eligibility to a project preference, including a shipped skill. Without
+    confirmation, only unpinned trusted open-source skills or explicitly classified skills qualify.
+    Survey uses this same selection with proposed preferences to check the result of confirmation.
+    """
+    from foragent import session_skills
+
+    held_back = {*fixed, *session_skills.assigned_names(config)}
+    result, seen = [], set()
+    for skill in catalog:
+        if skill.role == "style" or skill.name in held_back or skill.path.name in held_back:
+            continue
+        if skill.library.revision is not None and skill.id not in config.preferred_skills:
+            continue
+        confirmed = skill.role is not None or skill.id in config.preferred_skills
+        if not confirmed and not (trusted_source(skill.library.repo) and skill.license in OPEN_SOURCE_LICENSES):
+            continue
+        if skill.id not in seen:
+            seen.add(skill.id)
+            result.append(skill)
+    return result
 
 
 def copy_lane_skills(root: Path, worktree: Path, names: list[str], manager: SkillManager) -> list[str]:

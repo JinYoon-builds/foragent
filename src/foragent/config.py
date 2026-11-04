@@ -491,7 +491,8 @@ def _hours(run_hours: str) -> tuple[int, int] | None:
     return int(start), int(end)
 
 
-def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
+def load_config(repo_root: Path, global_path: Path | None = None, *,
+                global_overrides: dict[str, Any] | None = None) -> Config:
     local_path = repo_root / ".foragent.yml"
     if not local_path.is_file():
         raise ConfigError("not a Foragent repo: .foragent.yml missing")
@@ -499,6 +500,8 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
         global_path = Path.home() / ".config/foragent/config.yml"
     values = deepcopy(DEFAULTS)
     global_values = _read_yaml(global_path) if global_path.exists() else {}
+    # Adapters may supply resolved global settings; the project's own keys still win.
+    global_values = {**global_values, **(global_overrides or {})}
     _overlay(values, global_values)
     local = _read_yaml(local_path)
     _overlay(values, local)

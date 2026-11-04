@@ -346,21 +346,22 @@ def _tests_evidence(root: Path, tracked: list[str], ci_files: list[str]) -> str 
 
 def _proposed_skills(root: Path, tracked: list[str], ci_files: list[str]) -> list[dict]:
     """Trusted catalogue skills for the concerns this project's code shows, each with its evidence."""
-    from foragent.config import load_global_config
-    from foragent.skills import SkillError, SkillManager, trusted_source, with_vendored_library
+    from dataclasses import replace
+    from foragent.skills import SkillError, catalog_skills, issue_skills, project_skill_config, trusted_source
 
     reasons = {"screen": _screen_evidence(root, tracked), "shared_state": _state_evidence(root, tracked),
                "heavy_tests": _tests_evidence(root, tracked, ci_files)}
     if not any(reasons.values()):
         return []
     try:
-        manager = SkillManager(with_vendored_library(load_global_config(), root))
-        # A first run has no library caches yet; fetch the trusted ones, as `fa skills catalog` would.
-        manager.fetch_missing(lambda library: trusted_source(library.repo))
-        skills = manager.skills(available_only=True)
+        config = project_skill_config(root)
+        skills = catalog_skills(config, required=False)
     except (ConfigError, SkillError, OSError):
         return []
     trusted = [skill for skill in skills if trusted_source(skill.library.repo)]
+    # Check exactly what a lane can select after confirmation, without recording a preference.
+    confirmed = replace(config, preferred_skills=[*config.preferred_skills, *(skill.id for skill in trusted)])
+    trusted = issue_skills(confirmed, trusted)
     proposals, seen = [], set()
     for concern, names in _CONCERN_SKILLS.items():
         if not reasons[concern]:

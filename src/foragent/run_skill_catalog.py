@@ -11,9 +11,9 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from foragent import cuts, session_skills
+from foragent import cuts
 from foragent.i18n import text
-from foragent.skills import OPEN_SOURCE_LICENSES, SkillError, SkillManager, trusted_source, with_vendored_library
+from foragent.skills import SkillError, catalog_skills, issue_skills
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -29,31 +29,14 @@ def available_skills(config: Config, fixed: list[str]) -> list[tuple[str, str, s
     through their own section, never through this catalog.
     """
     try:
-        # The same catalogue `fa skills catalog` and the survey read, built-in libraries included (#1653);
-        # a built-in skill is offered only once a person preferred it.
-        skills = SkillManager(with_vendored_library(config)).skills(available_only=True)
+        skills = catalog_skills(config, required=False)
     except (SkillError, OSError):
         return []
-    held_back = {*fixed, *session_skills.assigned_names(config)}
-    offered, seen = [], set()
-    for skill in skills:
-        if skill.role == "style" or skill.name in held_back or skill.path.name in held_back:
-            continue
-        # Built-in (pinned) libraries reach a lane only through a confirmed preference.
-        if skill.library.revision is not None and skill.id not in config.preferred_skills:
-            continue
-        confirmed = skill.role is not None or skill.id in config.preferred_skills
-        if not confirmed and not (trusted_source(skill.library.repo) and skill.license in OPEN_SOURCE_LICENSES):
-            continue
-        if skill.id in seen:
-            continue
-        seen.add(skill.id)
+    offered = []
+    for skill in issue_skills(config, skills, fixed):
         description = " ".join(skill.description.split())
-        offered.append((skill.id, skill.name, description, str((skill.path / "SKILL.md").resolve())))
-    # Project-preferred skills (#1653) come first, in the order a person confirmed them.
-    rank = {identity: index for index, identity in enumerate(config.preferred_skills)}
-    offered.sort(key=lambda item: rank.get(item[0], len(rank)))
-    return [item[1:] for item in offered]
+        offered.append((skill.name, description, str((skill.path / "SKILL.md").resolve())))
+    return offered
 
 
 # A longer catalog moves to a file, so about 270 installed skills leave a small issue's prompt small.
