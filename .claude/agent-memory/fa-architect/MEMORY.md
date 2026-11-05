@@ -120,3 +120,4 @@ writes this file.
 - Goal 'X = what admission decides' fails on live-read paths; bar = facts replay `_admission`, live reads NOTE (#2125 r810). [detail](lessons_detail.md)
 - 'Keep full text in a body that also holds records' (#2161) yields quoted-marker FAILs; count real inputs in docs/specs (0 of 566), hint publish refusal (r817).
 - A 'process holds state.lock on two fds' claim from lsof is not evidence of self-nesting: lsof 'w' is the open mode, each thread opens its own fd, and macOS cannot show flock owners. Read the `sample` per thread and find which process breaks the cycle when killed (11-05: tick facts _freeze state SH -> capacity vs admit_run capacity -> state, r821).
+- Before reading a 6 h lane_concentration count, list tick gaps in flow-records (`kind=tick`): after a gate stop (11-05 16:58-22:04Z deadlock) the window holds ~1 h of live gate, so few starts and one lane's share look large. (r827)
