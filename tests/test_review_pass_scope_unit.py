@@ -185,8 +185,11 @@ def test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence(git_hist
     head = case.tracker.pr_head_sha(2)
     exempt = capture_review(case, ["VERDICT: PASS"])
     review_only(1, case.ctx)
-    assert CONFIRMING in exempt[0] and FIRST_FINDING in exempt[0]
+    # q14 option A: the exempt path is reviewed in full, so the separate confirmation of round 1 goes away.
+    assert CONFIRMING not in exempt[0] and FIRST_FINDING not in exempt[0]
     assert head in exempt[0] and "pass_scope_exempt" in exempt[0]
+    # The exempt file's whole change since its base reaches the reviewer, though nothing changed after the PASS.
+    assert "+accepted = 'reviewed'" in exempt[0] and "feature.txt" in exempt[0]
 
 
 def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path, monkeypatch):
@@ -238,7 +241,10 @@ def test_only_a_yaml_true_mark_is_an_exemption(git_history, tmp_path, monkeypatc
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"], pass_scope_exempt=value)])})
     case = passed_case(git_history, tmp_path, monkeypatch)
     boundary = review_pass_scope.for_review(1, case.ctx, _at_head(case, tmp_path), "origin/main")
-    assert (boundary.diff is None) is exempt
+    # Only a real YAML true shows the file's whole change; otherwise the PASS head is the boundary (no change since).
+    assert ("+accepted = 'reviewed'" in boundary.diff) is exempt
+    assert ("Exempt paths: feature.txt" in boundary.section) is exempt
+    assert (boundary.diff == "") is not exempt
 
 
 def test_mark_added_only_on_the_branch_grants_nothing(git_history, tmp_path, monkeypatch):
