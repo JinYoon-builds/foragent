@@ -30,6 +30,8 @@ class PassSkips:
     ci: frozenset[str] | None
     ran: set[str] = field(default_factory=set)
     run_id: object = None  # The exact-head CI run that passed ``ci``.
+    # Per test file at ``head``: its collected ids and its local_only ids (None: not collectable).
+    layout: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def read(cls, ctx, head, *, published=True):
@@ -88,208 +90,113 @@ def _ci_evidence(ctx, head, *, published=True):
     return unit[0], frozenset(found)
 
 
-# pytest options that take the next word as their value (others are flags or carry `=value`).
-_VALUE_OPTIONS = {
-    "-k", "-m", "-p", "-o", "-c", "-W", "-r", "-n", "--deselect", "--ignore", "--ignore-glob", "--maxfail",
-    "--junitxml", "--junit-xml", "--verbosity", "--color", "--config-file", "--override-ini", "--rootdir",
-    "--confcutdir", "--basetemp", "--import-mode", "--tb", "--capture", "--code-highlight", "--junit-prefix",
-    "--durations", "--durations-min", "--pythonwarnings", "--dist", "--numprocesses", "--log-level",
-    "--log-cli-level", "--log-file", "--log-file-level", "--log-format", "--log-date-format", "--timeout",
-    "--cov", "--cov-report", "--cov-config", "--cov-fail-under", "--pyargs", "--deselect",
-}
-_VERBOSITY = {"-q", "-v", "--quiet", "--verbose"}
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.S)
-_NODE_LINE = re.compile(r"^([\w./-]+\.py)::\S")
+_NODE_LINE = re.compile(r"^(.+?\.py)::\S")
+_PASSED_LINE = re.compile(r"^PASSED (\S.*?\.py::.+)$")
 
 
-@dataclass
-class _PlainPytest:
-    """One Done when line that is a single plain pytest command, split into what pytest reads."""
-
-    assignments: list[str]
-    launcher: list[str]  # Everything up to and including the pytest word.
-    options: list[str]
-    selection: list[str]
-
-    def shell(self, options, selection):
-        prefix = [f"{name}={shlex.quote(value)}" for name, value in
-                  (word.split("=", 1) for word in self.assignments)]
-        return " ".join([*prefix, shlex.join([*self.launcher, *options, *selection])])
-
-
-def _certain_text(line):
-    """The line without a trailing comment when the shell reads its words literally; otherwise None.
-
-    Outside quotes: expansions, escapes, globs, braces, tildes and operators are not
-    certain, and a ``#`` must start a word (a comment to the end of the line).
-    Inside double quotes only ``$``, backquote and backslash expand. Single quotes are literal.
-    """
-    quote = None
-    for i, char in enumerate(line):
-        if quote == "'":
-            quote = None if char == "'" else quote
-        elif quote == '"':
-            if char in "$`\\":
-                return None
-            quote = None if char == '"' else quote
-        elif char in "'\"":
-            quote = char
-        elif char == "#":
-            if i and not line[i - 1].isspace():
-                return None
-            return line[:i] if line[:i].strip() else None
-        elif char in "$`\\*?[]{}~;&|<>()!":
-            return None
-    return None if quote else line
-
-
-def _plain_pytest(line):
-    """The line's pytest parts, or None for any form whose shell meaning is not certain.
-
-    Certain means: no expansions, globs, quoting-sensitive comments, escapes,
-    operators, redirections or unknown options that may take a value. Anything
-    else runs exactly as written, without skipping.
-    """
-    line = _certain_text(line)
-    if line is None:
-        return None
-    words = shlex.split(line)
-    if not words or any(any(char in "();<>|&!" for char in word) for word in words):
-        return None
-    index = next((i for i, word in enumerate(words) if Path(word).name in {"pytest", "py.test"}), None)
-    if index is None:
-        return None
-    assignments = []
-    while assignments.__len__() < index and _ASSIGNMENT.fullmatch(words[len(assignments)]):
-        assignments.append(words[len(assignments)])
-    options, selection, rest = [], [], iter(words[index + 1:])
-    for word in rest:
-        if word == "--":
-            selection.extend(rest)
-            break
-        if not word.startswith("-"):
-            selection.append(word)
-            continue
-        options.append(word)
-        if word in _VALUE_OPTIONS:
-            value = next(rest, None)
-            if value is None:
-                return None
-            options.append(value)
-        elif word.startswith("--") and "=" not in word:
-            known_flag = word in {"--quiet", "--verbose", "--exitfirst", "--strict-markers", "--strict-config",
-                                  "--lf", "--last-failed", "--ff", "--failed-first", "--sw", "--stepwise",
-                                  "--disable-warnings", "--showlocals", "--runxfail", "--no-header",
-                                  "--no-summary", "--strict", "--collect-only", "--co", "--setup-show"}
-            if not known_flag:
-                return None  # An unknown long option may take the next word as its value.
-        elif not word.startswith("--") and len(word) == 2 and word not in {"-q", "-v", "-x", "-s", "-l", "-h"}:
-            return None
-    if any(word in {"--collect-only", "--co", "--junitxml", "--junit-xml"} or word.startswith("--junit")
-           for word in options):
-        return None
-    if any(word.startswith("-") for word in selection):
-        return None  # After `--` a test path may look like an option; rebuilt commands would misread it.
-    return _PlainPytest(assignments, words[assignments.__len__():index + 1], options, selection)
-
-
-def _collect(n, ctx, root, plain, options, log):
-    """Node ids pytest itself collects for these options; None when collection is not clean."""
+def _collect_ids(n, ctx, root, invocation, files, extra, log):
+    """Node ids foragent's own pytest invocation collects in ``files``; [] when none; None when not clean."""
     from foragent import runner
 
-    quiet = [word for word in options if word not in _VERBOSITY and not re.fullmatch(r"-[qv]+", word)]
-    command = plain.shell([*quiet, "--collect-only", "-q", "-p", "no:cacheprovider"], plain.selection)
+    command = f"{invocation} --collect-only -q {extra}{shlex.join(sorted(files))}"
     log.unlink(missing_ok=True)
     result = runner._check(command, root, log, max(1, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
                            slot=_test_slot(n, ctx), clock=ctx.monotonic)
     if result.exit_code == 5 and not result.timed_out:
-        return []  # pytest collected no tests for these options.
+        return []
     if result.exit_code != 0 or result.timed_out:
         return None
-    text = log.read_text(encoding="utf-8").split("\nCheck exit_code=", 1)[0]
-    ids = [line for line in text.splitlines()[1:] if _NODE_LINE.match(line) and line != command]
-    if not ids or not all((root / _NODE_LINE.match(node).group(1)).is_file() for node in ids):
-        return None  # Output that is not one repository-relative node id per test proves nothing.
-    return ids
+    text = log.read_text(encoding="utf-8").split("\nCheck exit_code=", 1)[0].split("\n", 2)[-1]
+    ids = [row for row in text.splitlines() if _NODE_LINE.match(row) and _NODE_LINE.match(row).group(1) in files]
+    return ids or None
 
 
-def _with_local_only(options):
-    """These options with a marker expression that also requires local_only."""
-    result, words = [], iter(options)
-    expression = None
-    for word in words:
-        if word == "-m":
-            expression = next(words)
-        else:
-            result.append(word)
-    return [*result, "-m", f"({expression}) and local_only" if expression else "local_only"]
+def _deselections(n, ctx, root, skips, locked, directory):
+    """The exact ids to leave out (D124): CI-passed or already passed in this pass, never locked or local_only.
+
+    foragent's own pytest invocation collects the candidate files once per commit,
+    so local_only markers and every sibling id are known: ``--deselect`` matches
+    by prefix, and an id that prefixes another id that must run is not deselected.
+    """
+    from foragent import runner
+
+    def is_locked(path):
+        return any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
+
+    # CI evidence never covers locked paths; a test this pass already passed on this commit is never repeated.
+    ci = {node for node in skips.ci or () if "::" in node and not is_locked(node.split("::", 1)[0])}
+    ran = {node for node in skips.ran if "::" in node}
+    files = {node.split("::", 1)[0] for node in ci | ran}
+    missing = {path for path in files - skips.layout.keys() if (root / path).is_file()}
+    if missing:
+        test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(root)), None)
+        invocation = _pytest_command(test_command) if test_command else None
+        log = Path(directory) / "collect.log"
+        ids = _collect_ids(n, ctx, root, invocation, missing, "", log) if invocation else None
+        local = _collect_ids(n, ctx, root, invocation, missing, "-m local_only ", log) if ids else None
+        for path in missing:
+            skips.layout[path] = None if ids is None or local is None else (
+                [node for node in ids if node.split("::", 1)[0] == path],
+                {node for node in local if node.split("::", 1)[0] == path})
+    out = []
+    for path in sorted(files):
+        if (layout := skips.layout.get(path)) is None:
+            continue  # Not collectable here: nothing in this file is left out.
+        ids, local = layout
+        leave = {node for node in ids if node in ran or (node in ci and node not in local)}
+        out += [node for node in ids if node in leave
+                and not any(other != node and other.startswith(node) and other not in leave for other in ids)]
+    return out
 
 
 @contextmanager
-def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root):
-    """Yield the command to run so that it leaves out what ``skips`` covers (D124).
+def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owned=False):
+    """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
 
-    pytest itself collects each plain pytest line; the tests CI passed on
-    exactly this commit, or that passed earlier in this pass, are subtracted,
-    and the rest runs by node id with the line's own invocation and options.
-    Locked paths and ``local_only`` tests always stay. A block with any line
-    that is not a plain pytest command, or whose collection is not clean, runs
-    exactly as written.
+    The command text is never parsed or rewritten. pytest reads the extra
+    arguments (``-rp`` and one ``--deselect`` per test) from a file named in
+    ``PYTEST_ADDOPTS``, set by one line in front of the command, so every shell
+    form and launcher keeps its meaning and nothing is imported into the
+    interpreter. ``owned`` commands are foragent's own normalized pytest
+    invocations, which clear ``PYTEST_ADDOPTS``: they get the file as their last
+    argument instead. The ``PASSED`` summary lines record what this pass ran.
     """
-    from foragent.run_checks import _append, _passing_acceptance_ids
+    from foragent.run_checks import _append
 
-    lines = command.splitlines()
-    plains = [None if not line.strip() else _plain_pytest(line) for line in lines]
-    if skips is None or not any(plains) or any(line.strip() and plain is None
-                                               for line, plain in zip(lines, plains)):
-        if skips is not None:
-            _append(ctx.store.log_path(n), f"{label}: no CI skip for this command form; running it as written")
+    if skips is None:
         yield command
         return
     runs = ctx.store.root / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    passed = skips.passed()
+    log = ctx.store.log_path(n)
     with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
-        rewritten, reports, collected, skipped = [], [], 0, 0
-        for i, (line, plain) in enumerate(zip(lines, plains)):
-            if plain is None:
-                rewritten.append(line)
-                continue
-            log = Path(directory) / f"collect-{i}.log"
-            ids = _collect(n, ctx, root, plain, plain.options, log)
-            machine = _collect(n, ctx, root, plain, _with_local_only(plain.options), log) if ids else None
-            if not ids or machine is None:
-                _append(ctx.store.log_path(n), f"{label}: collection unavailable; running the command as written")
-                yield command
-                return
-            local = set(machine)
-
-            def keep(node):
-                path = node.split("::", 1)[0]
-                if node in skips.ran:
-                    return False
-                if node not in passed:
-                    return True
-                return (any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
-                        or node in local)
-
-            remaining = [node for node in ids if keep(node)]
-            collected += len(ids)
-            skipped += len(ids) - len(remaining)
-            if not remaining:
-                rewritten.append("true")
-                continue
-            report = Path(directory) / f"line-{i}.xml"
-            reports.append(report)
-            rewritten.append(plain.shell([*plain.options, f"--junitxml={report}", "-o", "junit_family=legacy"],
-                                         remaining))
-        _append(ctx.store.log_path(n), f"{label}: skipped {skipped} of {collected} using CI evidence for {skips.head}")
-        yield "\n".join(rewritten)
-        for report in reports:
-            try:
-                skips.ran.update(_passing_acceptance_ids(report))
-            except (OSError, ET.ParseError):
-                continue
+        out = _deselections(n, ctx, root, skips, locked, directory)
+        arguments = Path(directory) / "arguments.txt"
+        arguments.write_text("".join(f"{word}\n" for word in ["-rp", *(
+            word for node in out for word in ("--deselect", node))]), encoding="utf-8")
+        _append(log, f"{label}: leaving out {len(out)} tests CI passed on {skips.head}")
+        offset = log.stat().st_size if log.exists() else 0
+        # pytest splits PYTEST_ADDOPTS like a shell: the value carries its own quoting of the path.
+        option = shlex.quote(f"@{arguments}")
+        if owned:
+            # Every listed test already passed on this commit when pytest reports none collected (5).
+            yield (f"{command} {option}\nstatus=$?\n[ \"$status\" -eq 5 ] && exit 0\nexit \"$status\""
+                   if out else f"{command} {option}")
+        elif out:
+            # A pytest session whose tests were all left out reports 5 and would stop `&&` or fail the
+            # check; then the command runs once more exactly as written (every test, the accepted fallback).
+            yield (f"(\nPYTEST_ADDOPTS=\"${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}\"{shlex.quote(option)}\n"
+                   f"export PYTEST_ADDOPTS\n{command}\n)\nstatus=$?\n"
+                   f"if [ \"$status\" -eq 5 ]; then\n{command}\nelse\nexit \"$status\"\nfi")
+        else:
+            yield (f'PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}"{shlex.quote(option)}\n'
+                   f"export PYTEST_ADDOPTS\n{command}")
+        try:
+            with log.open(encoding="utf-8", errors="replace") as stream:
+                stream.seek(offset)
+                skips.ran.update(match.group(1) for row in stream if (match := _PASSED_LINE.match(row.rstrip("\n"))))
+        except OSError:
+            pass
 
 
 def report_ids(report, result, measurement):
@@ -421,7 +328,7 @@ def verify_local_only_units(attempt, command, *, skips=None):
         return None
 
     with skipping(attempt.n, attempt.ctx, selection, skips, label="Local-only units",
-                  root=attempt.worktree) as selected:
+                  root=attempt.worktree, owned=True) as selected:
         result = check(attempt.n, attempt.ctx, selected, attempt.worktree)
     result = replace(result, command=selection)
     # pytest's no-tests-selected status is valid for this optional marker set.
@@ -461,7 +368,7 @@ def fallback_comparison(attempt, base_sha, *, skips=None):
         with in_phase(n, ctx, "checking"):
             command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
             with skipping(n, ctx, command, skips if skips is not None and skips.head == head else None,
-                          label="Acceptance comparison", root=attempt.worktree) as selected:
+                          label="Acceptance comparison", root=attempt.worktree, owned=True) as selected:
                 result = check(n, ctx, selected, attempt.worktree)
     if (attempt.git.head_sha() != head
             or attempt.git._call(["status", "--porcelain=v1", "--untracked-files=no"])):

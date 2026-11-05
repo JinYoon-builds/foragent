@@ -579,7 +579,8 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skip
         if baseline.node_ids:
             harness_guard.guard_comparison(attempt, git.head_sha(), files=files)
             command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
-            with skipping(n, ctx, command, skips, label="Local-only acceptance", root=git.root) as selected:
+            with skipping(n, ctx, command, skips, label="Local-only acceptance", root=git.root,
+                          owned=True) as selected:
                 checks.append(check(n, ctx, selected, git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.

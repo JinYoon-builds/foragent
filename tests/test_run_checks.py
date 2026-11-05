@@ -623,12 +623,12 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
 
 
 def _skip_ctx(tmp_path):
-    from contextlib import nullcontext
     from types import SimpleNamespace
     from foragent.state import StateStore
 
     store = StateStore(tmp_path / "state")
-    return SimpleNamespace(store=store, monotonic=lambda: 0.0, config=SimpleNamespace(), _slot=nullcontext)
+    return SimpleNamespace(store=store, monotonic=lambda: 0.0,
+                           config=SimpleNamespace(test_command=f"{shlex.quote(sys.executable)} -m pytest"))
 
 
 @pytest.fixture
@@ -647,23 +647,37 @@ def _skip_repo(tmp_path):
     (root / "tests" / "acceptance").mkdir(parents=True)
     (root / "pytest.ini").write_text("[pytest]\nmarkers =\n    local_only: machine\n")
     marks = tmp_path / "marks.txt"
-    for path, name, marker in (("tests/test_ci.py", "test_ci", ""), ("tests/test_other.py", "test_other", ""),
-                               ("tests/test_machine.py", "test_machine", "@pytest.mark.local_only\n"),
-                               ("tests/acceptance/test_locked.py", "test_locked", "")):
-        (root / path).write_text(f"import pytest\n\n{marker}def {name}():\n"
-                                 f"    open({str(marks)!r}, 'a').write({name!r} + '\\n')\n")
+    for path, name, marker, body in (
+            ("tests/test_ci.py", "test_ci", "", ""), ("tests/test_other.py", "test_other", "", ""),
+            ("tests/test_machine.py", "test_machine", "@pytest.mark.local_only\n", ""),
+            ("tests/acceptance/test_locked.py", "test_locked", "", ""),
+            ("tests/test space.py", "test_space", "", ""),
+            ("tests/test_env.py", "test_env", "",
+             "    assert os.environ['OWNER_HOME'] == os.path.expanduser('~')\n")):
+        (root / path).write_text(f"import os\nimport pytest\n\n{marker}def {name}():\n"
+                                 f"    open({str(marks)!r}, 'a').write({name!r} + '\\n')\n{body}")
+    (root / "tests" / "test_prefix.py").write_text(
+        "def test_p():\n"
+        f"    open({str(marks)!r}, 'a').write('test_p\\n')\n\n"
+        "def test_p2():\n"
+        f"    open({str(marks)!r}, 'a').write('test_p2\\n')\n")
     return root, marks
 
 
 def _run_skipping(ctx, root, command, skips, locked=()):
-    import subprocess
+    from foragent import runner
     from foragent.ci_local import skipping
 
+    # As every owner check does: the command's output goes to the issue log.
     with skipping(1, ctx, command, skips, locked, root=root) as selected:
-        return subprocess.run(["/bin/sh", "-c", selected], cwd=root, capture_output=True, text=True).returncode
+        return runner._check(selected, root, ctx.store.log_path(1), 120).exit_code
 
 
 PYTEST = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
+
+
+def _ran(marks):
+    return sorted(marks.read_text().split()) if marks.exists() else []
 
 
 def test_owner_skip_leaves_out_only_ci_passed_tests_and_keeps_locked_and_machine_only(skip_world):
@@ -675,14 +689,14 @@ def test_owner_skip_leaves_out_only_ci_passed_tests_and_keeps_locked_and_machine
     skips = PassSkips("abc", ci)
     command = f"{PYTEST} tests/test_ci.py tests/test_machine.py\n{PYTEST} tests/acceptance tests/test_other.py"
     assert _run_skipping(ctx, root, command, skips, ["tests/acceptance/test_locked.py"]) == 0
-    assert sorted(marks.read_text().split()) == ["test_locked", "test_machine", "test_other"]
-    assert "skipped 1 of 4 using CI evidence for abc" in ctx.store.log_path(1).read_text()
+    assert _ran(marks) == ["test_locked", "test_machine", "test_other"]
+    assert "leaving out 1 tests CI passed on abc" in ctx.store.log_path(1).read_text()
     assert skips.ran == {"tests/test_machine.py::test_machine", "tests/acceptance/test_locked.py::test_locked",
                          "tests/test_other.py::test_other"}
 
-    # A later step of the same pass repeats nothing; a fully left-out command still passes.
+    # A later step of the same pass repeats nothing; a fully left-out command still passes or reports no tests.
     marks.unlink()
-    assert _run_skipping(ctx, root, f"{PYTEST} tests", skips) == 0
+    assert _run_skipping(ctx, root, f"{PYTEST} tests/test_ci.py tests/test_other.py || true", skips) == 0
     assert not marks.exists()
 
 
@@ -695,6 +709,16 @@ def test_owner_skip_without_evidence_runs_every_test(skip_world):
     assert marks.read_text().split() == ["test_ci"] * 2
 
 
+def test_owner_skip_deselects_exact_ids_even_when_one_prefixes_another(skip_world):
+    from foragent.ci_local import PassSkips
+
+    ctx, (root, marks) = skip_world
+    skips = PassSkips("abc", frozenset({"tests/test_prefix.py::test_p"}))
+    assert _run_skipping(ctx, root, f"{PYTEST} tests/test_prefix.py", skips) == 0
+    # test_p2 did not pass in CI; deselecting test_p by prefix would have dropped it too.
+    assert _ran(marks) == ["test_p", "test_p2"]
+
+
 @pytest.mark.parametrize("form", [
     "PYTHONPATH=src {python} -m pytest -q {tests}",
     "{python} -I -m pytest -q {tests}",
@@ -702,7 +726,22 @@ def test_owner_skip_without_evidence_runs_every_test(skip_world):
     "{python} -m pytest -q {tests}  # PYTHONPATH comment",
     "{python} -m pytest -q -- {tests}",
     "{python} -m pytest -q -k 'ci or other' {tests}",
-], ids=["env-prefix", "isolated", "ignore-env", "comment", "double-dash", "quoted-k"])
+    "{python} -m pytest -q tests/test_[co]*.py",
+    '{python} -m pytest -q "$PWD/tests/test_ci.py" tests/test_other.py',
+    "{python} -m pytest -q tests/test_ci.py \\\n    tests/test_other.py",
+    "# first a comment-only line\n\n{python} -m pytest -q {tests}",
+    "{python} -m pytest -q --junitxml=own.xml {tests}",
+    "{python} -m pytest -q --pyargs {tests}",
+    "{python} -m pytest -q -r fEp --tb short {tests}",
+    "{python} -m pytest -q {tests} && true",
+    "{python} -m pytest -q {tests} | cat",
+    "{python} -m pytest -q {tests} > out.txt; cat out.txt",
+    "{python} -m pytest -q $(echo tests/test_ci.py) tests/test_other.py",
+    "env -- {python} -m pytest -q {tests}",
+    "cd tests && {python} -m pytest -q test_ci.py test_other.py",
+], ids=["env-prefix", "isolated", "ignore-env", "comment", "double-dash", "quoted-k", "glob", "expansion",
+        "continuation", "comment-only-line", "own-junitxml", "pyargs", "value-options", "and-list", "pipe",
+        "redirection", "command-substitution", "env-launcher", "cd"])
 def test_owner_skip_applies_to_every_plain_pytest_form(skip_world, form):
     from foragent.ci_local import PassSkips
 
@@ -710,31 +749,31 @@ def test_owner_skip_applies_to_every_plain_pytest_form(skip_world, form):
     skips = PassSkips("abc", frozenset({"tests/test_ci.py::test_ci"}))
     command = form.format(python=shlex.quote(sys.executable), tests="tests/test_ci.py tests/test_other.py")
     assert _run_skipping(ctx, root, command, skips) == 0
-    assert marks.read_text().split() == ["test_other"]
-    assert "tests/test_other.py::test_other" in skips.ran
+    assert _ran(marks) == ["test_other"]
+
+
+def test_owner_skip_keeps_quoted_paths_and_assignment_expansion(skip_world):
+    from foragent.ci_local import PassSkips
+
+    ctx, (root, marks) = skip_world
+    skips = PassSkips("abc", frozenset({"tests/test space.py::test_space"}))
+    command = f"OWNER_HOME=~ {PYTEST} 'tests/test space.py' tests/test_env.py"
+    assert _run_skipping(ctx, root, command, skips) == 0
+    assert _ran(marks) == ["test_env"]
 
 
 @pytest.mark.parametrize("selection", [
-    "tests/test_*.py",
-    '"$PWD/tests/test_ci.py" tests/test_other.py',
-    "tests/test_ci.py \\\n    tests/test_other.py",
-    "tests/test_ci.py tests/test_other.py | cat",
-    "tests/test_ci.py tests/test_other.py --unknown-plugin-option",
-], ids=["glob", "expansion", "continuation", "pipe", "unknown-option"])
+    "PYTEST_ADDOPTS= {python} -m pytest -q {tests}",
+], ids=["clears-pytest-addopts"])
 def test_owner_skip_runs_uncertain_forms_exactly_as_written(skip_world, selection):
     from foragent.ci_local import PassSkips
 
     ctx, (root, marks) = skip_world
     skips = PassSkips("abc", frozenset({"tests/test_ci.py::test_ci"}))
-    command = f"{PYTEST} {selection}"
-    import subprocess
-    expected = subprocess.run(["/bin/sh", "-c", command], cwd=root, capture_output=True).returncode
-    ran = sorted(marks.read_text().split()) if marks.exists() else []
-    marks.unlink(missing_ok=True)
-    assert _run_skipping(ctx, root, command, skips) == expected
-    assert (sorted(marks.read_text().split()) if marks.exists() else []) == ran
-    assert expected != 0 or "test_ci" in ran  # Nothing CI passed was left out.
-    assert "running it as written" in ctx.store.log_path(1).read_text()
+    command = selection.format(python=shlex.quote(sys.executable), tests="tests/test_ci.py tests/test_other.py")
+    # A command that clears pytest's environment options on purpose runs every test it names.
+    assert _run_skipping(ctx, root, command, skips) == 0
+    assert _ran(marks) == ["test_ci", "test_other"]
 
 
 def test_ci_passing_set_joins_exact_head_receipt_and_acceptance_reports():
