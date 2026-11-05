@@ -17,6 +17,20 @@ FIX = "gh auth refresh -h github.com -s project"
 
 
 @pytest.fixture(autouse=True)
+def awake_machine(monkeypatch):
+    """Scope tests must not depend on the host's power settings or blockers."""
+    monkeypatch.setattr(checklist_setup.sys, "platform", "darwin")
+    run = subprocess.run
+
+    def probe(argv, *args, **kwargs):
+        if argv == ["pmset", "-g"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=" sleep 0\n", stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", probe)
+
+
+@pytest.fixture(autouse=True)
 def full_tools(monkeypatch):
     """Offline PATH at the same boundary tests override with their own `shutil.which`."""
     which = shutil.which
@@ -136,6 +150,34 @@ def test_readers_use_the_same_ordered_list_for_later_items(setup, monkeypatch, c
     assert str(error.value).index("first fix") < str(error.value).index("last fix")
 
 
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_doctor_sleep_advice_uses_repo_language(tmp_path, monkeypatch, capsys, language, json_output):
+    from foragent.i18n import text
+
+    run = subprocess.run
+
+    def power_probe(argv, *args, **kwargs):
+        if argv[:2] == ["pmset", "-g"]:
+            output = " sleep 1\n" if argv == ["pmset", "-g"] else "Listed by owning process:\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+        return run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", power_probe)
+    monkeypatch.setattr(gh, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, account("'project'"), ""))
+    (tmp_path / ".foragent.yml").write_text(f"language: {language}\n")
+    args = ["doctor", "--setup", "--repo-root", str(tmp_path)]
+    assert cli.main([*args, *(["--json"] if json_output else [])]) == 1
+    output = capsys.readouterr().out
+    expected = text("setup_no_idle_sleep_fix", language)
+    if json_output:
+        items = json.loads(output)["items"]
+        item = next(item for item in items if item["id"] == "no-idle-sleep")
+        assert item == {"id": "no-idle-sleep", "ok": False, "advice": True, "fix": expected}
+    else:
+        assert expected in output
+
+
 @pytest.mark.parametrize('platform,fixes', [
     ('darwin', ['brew install git', 'brew install gh', 'brew install uv']),
     ('linux', ['https://git-scm.com/downloads/linux',
@@ -147,8 +189,10 @@ def test_doctor_missing_tools_uses_os_fixes_without_auth(tmp_path, monkeypatch, 
     monkeypatch.setattr(checklist_setup, 'installed_tools', lambda: dict.fromkeys(('git', 'gh', 'uv'), False))
     monkeypatch.setattr(gh, 'run', lambda *a, **kw: pytest.fail('gh is missing; no auth call can run'))
     assert cli.main(['doctor', '--setup', '--json', '--repo-root', str(tmp_path)]) == 1
-    items = json.loads(capsys.readouterr().out)['items']
-    assert [item['id'] for item in items] == [
+    report = json.loads(capsys.readouterr().out)['items']
+    # Advice items (no-idle-sleep on macOS) follow the blocking prerequisites and do not change them.
+    items = [item for item in report if not item.get('advice')]
+    assert [item['id'] for item in report[:len(items)]] == [
         'git-installed', 'gh-installed', 'uv-installed', 'gh-logged-in', 'gh-project-scope', 'repository-linked']
     assert not any(item['ok'] for item in items)
     assert [item['fix'] for item in items[:3]] == fixes

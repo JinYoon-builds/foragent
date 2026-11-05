@@ -1727,6 +1727,12 @@ def test_combined_harness_checks_use_all_members_approved_files(batched, monkeyp
 
 
 def test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary(batched, monkeypatch):
+    """The locked recheck uses the scope fixed at build time (#2100).
+
+    #80 owned the interaction test when the batch was built, so CI measured
+    without it. #80 losing its approval under the lock does not make that
+    test count as lost: the batch lands once instead of retiring.
+    """
     case = batched
     path = "tests/acceptance/test_interaction.py"
     update_base(case, {path: "from pathlib import Path\ndef test_interaction():\n"
@@ -1749,8 +1755,11 @@ def test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary(batched, m
 
     monkeypatch.setattr(StateStore, "merge_lock", required_again)
     support.gate(case)
-    assert not case.target_pushes and not case.merges and not refs(case)
-    assert events(case)[-1]["used_members"] == 0
+    tip = case.history.tip
+    assert path in batch._recorded_exclusions(case.git, tip)
+    assert case.target_pushes == [(tip, "refs/heads/main", case.base)] and not refs(case)
+    assert not any("scope" in row.get("reason", "") for row in batch.retirements(case.ctx))
+    assert events(case)[-1]["used_members"] == 2
 
 
 def test_retired_attempt_is_not_rebuilt_after_flow_log_rotation(batched):
@@ -2031,3 +2040,44 @@ def test_combined_conflict_markers_are_rejected_by_the_normal_refresh_publicatio
     assert not case.store.owner_merge_facts()
     assert events(case)[-1]["used_members"] == 0
     assert all(not row["spent"] for row in batch.retirements(case.ctx))
+
+
+def test_recorded_exclusions_come_from_the_tip_commit_only(tmp_path):
+    """The judged scope is the list written into the tip, never a parent's list."""
+    from foragent.git import GitRepo
+
+    git_command(tmp_path, "init", "-q")
+    for key, value in (("user.name", "t"), ("user.email", "t@t")):
+        git_command(tmp_path, "config", key, value)
+
+    tree = git_command(tmp_path, "mktree", input="")
+
+    def commit(message):
+        return git_command(tmp_path, "commit-tree", tree, "-m", message)
+
+    base = commit('Base\n\nForagent-Acceptance-Excluded: ["tests/acceptance/test_base.py"]')
+    plain = commit("Member\n\nForagent-Member: #1 abc")
+    tip = commit('Member\n\nForagent-Member: #2 def\nForagent-Acceptance-Excluded: ["a.py","b.py"]')
+    broken = commit('Member\n\nForagent-Acceptance-Excluded: ["b.py","a.py"]')
+    git = GitRepo(tmp_path)
+    assert batch._recorded_exclusions(git, tip) == ["a.py", "b.py"]
+    assert batch._recorded_exclusions(git, base) == ["tests/acceptance/test_base.py"]
+    assert batch._recorded_exclusions(git, plain) is None  # published before the list was recorded
+    with pytest.raises(ValueError, match="tip exclusions trailer invalid"):
+        batch._recorded_exclusions(git, broken)
+
+
+def test_tip_outcome_ignores_the_moving_open_issue_set(batched, monkeypatch):
+    case = batched
+    case.pending_batch = True
+    queue_workers(case, [5, 1])
+    support.gate(case)
+    pr = groups(case)[0]
+    tip = case.tracker.pr_head_sha(pr.number)
+    base, chain = batch._decode(case.git, pr.head, tip)
+    green(case)
+    born = int(case.clock[0].timestamp())
+    proof = batch.Evidence(base, chain, pr.number, born, batch._recorded_exclusions(case.git, tip))
+    assert proof.excluded and proof.outcome(case.ctx) == "pass"
+    monkeypatch.setattr(batch, "_exclusions", lambda *a: pytest.fail("recomputed from open issues"))
+    assert proof.outcome(case.ctx) == "pass"
