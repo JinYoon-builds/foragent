@@ -480,7 +480,13 @@ def _child_marker(identity: str, key: str) -> str:
 
 def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
     """The issue body publish writes for a plan child or edit, before any plan-child marker."""
-    return issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    if "statements" in item:
+        key = item.get("key", f"#{item.get('number')}")
+        notes = order_reviewed._record(plan, repo).get(key, {}).get("notes", [])
+        if notes:
+            body += "\n## Preparation notes\n" + "".join(f"- {note}\n" for note in notes)
+    return body
 
 
 @dataclass
@@ -499,20 +505,24 @@ class PublishReport:
     def summary(self) -> str:
         if self.waiting_for is not None:
             return text("order_submission_waiting", self.language, id=self.title, boundary=self.waiting_for)
-        lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
+        # Only the dry-run preview speaks the configured language; "Published:" stays as it was.
+        language = self.language if self.dry_run else "en"
+        lines = [text("publish_preview_heading", language, title=self.title) if self.dry_run
+                 else f"Published: {self.title}"]
         if self.parent is not None:
-            lines.append(f"Parent: #{self.parent}")
+            lines.append(text("publish_parent", language, number=self.parent))
         lines.extend(self.closures)
-        lines.append("Files: " + ", ".join(self.paths))
+        lines.append(text("publish_files", language, paths=", ".join(self.paths)))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
+        yes, no = text("publish_yes", language), text("publish_no", language)
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
-            lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
+            lines += [f"\nlane:{lane}", text("publish_table_header", language), "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
                 if row["lane"] == lane:
                     title = row["title"].replace("|", "\\|").replace("\n", " ")
                     blockers = ", ".join(map(str, row["blocked_by"])) or "—"
-                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {'yes' if row['approved'] else 'no'} | {'yes' if row['interactive'] else 'no'} |")
+                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {yes if row['approved'] else no} | {yes if row['interactive'] else no} |")
         return "\n".join(lines)
 
 
