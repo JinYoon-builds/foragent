@@ -5,3 +5,4 @@
 - [Publish help omits closes](broken_publish_help_closes.md) — `fa order publish --help` schema has no `closes` field
 - [Closes preview already closed](broken_closes_preview_already_closed.md) — dry run promises to close an already-closed issue
 - [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
+- [Stop has no person restart](broken_stop_no_person_release.md) — fa stop's undo is only internal fa orch release, unnamed in help
