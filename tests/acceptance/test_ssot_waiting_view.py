@@ -1,4 +1,4 @@
-"""Locked: waiting context stays visible in the lane view."""
+"""Locked: waiting context stays visible in the lane view (r53/D112: in the acorn's bubble)."""
 import json
 
 from foragent import watch
@@ -23,6 +23,12 @@ def test_lane_frame_shows_unapproved_wait_from_issue_snapshot(git_history, tmp_p
     status = json.loads(capsys.readouterr().out)
     snapshot = watch.collect(status, case.tracker, case.store, case.config, case.clock[0])
     frame = watch.render_frame(snapshot, case.config, case.root, width=240)
+    for value in (REASON, CONDITION):  # The role name also appears in the roles line.
+        assert value not in frame, f'D112: the main screen carries no per-issue wait text: {value}'
+    # D112: a click on the acorn opens the bubble with the recorded wait.
+    from test_lane_m2_contract import bubble, pick
+    opened, _ = pick(snapshot, case.config, case.root, case.store, ('acorn', 1), width=240)
+    words = bubble(opened)
     for value in (REASON, CONDITION, ROLE):
-        assert value in frame, f'Lane frame omitted the unapproved wait: {value}'
+        assert value in words, f'Acorn bubble omitted the unapproved wait: {value}'
     assert calls == [], 'Rendering must reuse the gate snapshot'

@@ -81,6 +81,9 @@ def _final_merge_inputs(
     CI (including workflow registration grace), and the remaining run budget. Verification/review
     evidence stays pinned to the supplied head and approval snapshot.
     """
+    from foragent import orch_stop
+    if (why := orch_stop.active(ctx.store)) is not None:  # Every merge path reads this first (#1491).
+        return run_publish._MergeInputs(stop=lambda: orch_stop.halt(ctx, n, why))
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
 
     def invalid_approval() -> str:
