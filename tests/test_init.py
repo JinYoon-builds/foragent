@@ -616,6 +616,11 @@ def test_auth_precondition_error_changes_nothing(setup, error, fix, other):
     def fail(*args, **kwargs):
         raise error
 
+    from foragent import setup as checklist
+
+    # The checklist's install fix is per platform: brew on macOS, the install page elsewhere.
+    install = checklist.installed_item(checklist.Facts({"gh": False}), "gh")["fix"]
+    fix, other = (install if value == "brew install gh" else value for value in (fix, other))
     setup.run_gh = fail
     with pytest.raises(TrackerError, match="Setup is not complete") as raised:
         setup.init()
