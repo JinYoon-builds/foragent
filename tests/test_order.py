@@ -266,8 +266,9 @@ def test_publish_order_contract_labels_native_links_and_summary(publishing, plan
     root, _, tracker, git, events = publishing
     report = publish(publishing, plan, approve=True)
     assert [event[0] for event in events] == ["commit", "push", "issue", "issue", "issue"]
-    assert events[0][1] == "Foragent order 2026-10-20-login: acceptance tests and spec"
-    assert set(events[0][2]) == {FILE, "docs/specs/2026-10-20-login.md"}
+    assert events[0][1] == "Foragent order 2026-10-20-login: acceptance tests"
+    assert set(events[0][2]) == {FILE}, "The parent issue carries the spec; no spec file is committed"
+    assert tracker.get_issue(1).body.count(f"## Spec\n{plan['spec_markdown']}\n") == 1
     assert (root / FILE).read_text() == "assert True\n"
     assert report.parent == 1
     expected = (
@@ -475,7 +476,7 @@ def test_ignored_acceptance_is_in_remote_commit_before_issues(offline_publicatio
 
     tracker.create_issue = create_after_publication
     order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert ["add", "-f", "--", f"docs/specs/{plan['id']}.md", FILE] in calls
+    assert ["add", "-f", "--", FILE] in calls
     assert len(tracker.issues) == 3
 
 
@@ -1064,7 +1065,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "repo"}
     assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
@@ -1076,7 +1077,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
     assert [item["state_group"] for item in result["open_issues"]] == ["unapproved", "needs-human", "needs-human", "needs-human", "running", "approved-waiting"]
     assert result["open_issues"][1]["lane"] == "api" and result["open_issues"][1]["size"] == "l"
     assert {item["waiting"] for item in result["open_issues"]} == {None}
-    assert result["specs"] == [{"path": "docs/specs/one.md", "heading": "First heading"}]
+    assert "First heading" not in json.dumps(result), "Leftover spec files are not indexed"
     assert result["repo"]["test_commands"] == ["uv run pytest", "pnpm test", "go test ./..."]
     assert result["repo"]["languages"] == ["Go", "JavaScript", "Python"]
     assert result["repo"]["has_workflows"] is True
@@ -2246,6 +2247,11 @@ def test_publication_checks_destinations_after_the_base_refresh_before_any_write
     root, config, tracker, _git, events = publishing
     plan["reference_files"] = {"docs/design/a/HANDOFF.md": "approved"}
     git = RefreshingGit(root, events, link)
+    if link == "docs/specs":  # An order writes no spec file, so that link is never a destination.
+        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+        assert sorted(p.name for p in (root / "elsewhere").iterdir()) == ["keep.txt"]
+        assert [event[0] for event in events][:2] == ["commit", "push"]
+        return
     with pytest.raises(order.PlanError, match="symlink"):
         order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     assert sorted(p.name for p in (root / "elsewhere").iterdir()) == ["keep.txt"]
@@ -3852,7 +3858,10 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     flush_waiting(publishing)
     assert identities == {issue.title: issue.number for issue in tracker.list_issues()}
     assert all("approved" not in issue.labels for issue in tracker.list_issues())
-    assert len([event for event in events if event[0] == "commit"]) == 2
+    # The revision changed only issue text (the spec lives in the parent), so Git gets no new commit.
+    assert len([event for event in events if event[0] == "commit"]) == 1
+    parent = next(issue for issue in tracker.list_issues() if "<!-- foragent:plan " in issue.body)
+    assert parent.body.count(plan["spec_markdown"]) == 1
 
 
 @pytest.mark.parametrize("via_cli", [False, True])
@@ -4068,7 +4077,7 @@ def test_flush_pushes_before_reading_only_required_issue_blob_metadata(publishin
     monkeypatch.setattr(git, "blob_shas", blob_metadata)
     assert flush_waiting(publishing)["status"] == "published"
     if with_order:
-        assert reads == [(git.head_sha(), {FILE, f"docs/specs/{plan['id']}.md"})]
+        assert reads == [(git.head_sha(), {FILE})]
         parent = next(issue for issue in tracker.list_issues() if "<!-- foragent:plan " in issue.body)
         assert f'"{FILE}": "git-opaque-object-id"' in parent.body
     else:

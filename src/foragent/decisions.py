@@ -1,8 +1,10 @@
 """Decision links on issues and the derived linkage/completion view (`fa decisions`).
 
 An issue's explicit marker is the only intent record. Older issues without a
-marker fall back to exact D-number citations in their published order spec; that
-proves a link, never that code fulfils the decision. Completion is derived from
+marker fall back to exact D-number citations in their order's spec: the spec text
+in the order's parent issue, or for orders published before the parent carried it,
+the citations kept in docs/decision-links.json (or a project's leftover spec file).
+That proves a link, never that code fulfils the decision. Completion is derived from
 the last recorded issue observations. Drops append a reason to the shared ledger.
 """
 
@@ -24,6 +26,8 @@ PARENT = re.compile(r"<!-- foragent:plan id=([A-Za-z0-9][A-Za-z0-9_-]*) map=(\{[
                     r"(?: acceptance=(\{[^\n]*\}))? -->")
 SPEC_LINK = re.compile(r"(?<![A-Za-z0-9_.-])docs/specs/([A-Za-z0-9][A-Za-z0-9_-]*)\.md(?![A-Za-z0-9_])")
 LEDGER = "docs/decisions.md"
+# Citations extracted once from the retired docs/specs files: order id -> decision IDs.
+LEGACY_LINKS = "docs/decision-links.json"
 DROP = re.compile(r"^<!-- foragent:decision-drop (\{[^\r\n]*\}) -->\r?$", re.MULTILINE)
 
 NOTHING_ORDERED, IN_PROGRESS, DONE = "decided, nothing ordered", "in progress", "done"
@@ -162,6 +166,29 @@ def _spec_names(row: dict[str, Any], parents: dict[int, set[str]]) -> set[str]:
     return set(CHILD.findall(body)[-1:]) | references | parents.get(row["number"], set())
 
 
+def _legacy_links(root: Path) -> dict[str, set[str]]:
+    try:
+        data = json.loads((root / LEGACY_LINKS).read_text(encoding="utf-8"))
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {name: {item for item in ids if isinstance(item, str) and CITATION.fullmatch(item)}
+            for name, ids in data.items() if isinstance(ids, list)}
+
+
+def _parent_specs(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Citations in each order parent's own text (summary and spec), by order id."""
+    from foragent.run_parent import parent_summary
+
+    found: dict[str, set[str]] = {}
+    for row in rows:
+        body = row.get("body") or ""
+        for identity, _mapping, _acceptance in PARENT.findall(body)[-1:]:
+            found.setdefault(identity, set()).update(_citations(parent_summary(body)))
+    return found
+
+
 def _parent_map(rows: list[dict[str, Any]]) -> dict[int, set[str]]:
     """Children named in each published order record's issue map, by spec name."""
     found: dict[int, set[str]] = {}
@@ -208,6 +235,8 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
     links: dict[str, set[int]] = {identity: set() for identity in ids}
     parents = _parent_map(rows)
     specs: dict[str, set[str]] = {}
+    legacy = _legacy_links(root)
+    carried = _parent_specs(rows)
     observed = {row["number"] for row in rows}
     # A published map names its children even when the snapshot has no row for one:
     # the link stays, and the missing observation keeps the decision short of done.
@@ -222,6 +251,7 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
                         specs[name] = _citations((root / "docs/specs" / f"{name}.md").read_text(encoding="utf-8"))
                     except (FileNotFoundError, UnicodeDecodeError, IsADirectoryError):
                         specs[name] = set()
+                    specs[name] |= legacy.get(name, set()) | carried.get(name, set())
                 linked |= specs[name]
         for identity in linked:
             if identity in links:

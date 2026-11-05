@@ -106,8 +106,6 @@ def _validate(values: dict[str, Any]) -> None:
     alert = values["orch_silent_alert_minutes"]
     if type(alert) is not int or not 0 <= alert <= 1440:
         raise ConfigError("orch_silent_alert_minutes must be an integer from 0 to 1440")
-    if type(values["merge_turn_size"]) is not int or values["merge_turn_size"] != 1:
-        raise ConfigError("merge_turn_size must be 1 until merge groups (#459)")
     if type(values["merge_owner"]) is not bool:
         raise ConfigError("merge_owner must be a boolean")
     if type(values["merge_batch"]) is not bool:

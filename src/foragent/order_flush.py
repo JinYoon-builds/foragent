@@ -80,8 +80,7 @@ def _preflight(rows, notes, root, config, tracker, repo, git, collected=None):
         except (ValueError, OSError, TrackerError) as exc:
             raise order.PlanError(text("order_flush_refused", config.language, id=row["id"], error=exc)) from exc
         references = set(plan.get("reference_files", {}))
-        roots.update({name: "docs/specs" if name == f"docs/specs/{plan['id']}.md"
-                      else "docs/design" if name in references else config.acceptance_dir
+        roots.update({name: "docs/design" if name in references else config.acceptance_dir
                       for name in publication.files})
         prepared.append((row, publication))
     note_files = _note_files(root, notes, config.language)

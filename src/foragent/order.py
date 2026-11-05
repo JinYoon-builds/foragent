@@ -243,11 +243,6 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                     "reason": flag[1], "question": details.strip() or summary.strip().strip("*"),
                     "answer": answer.body.split("\n", 1)[-1].strip() if answer else None,
                 })
-    specs = []
-    for path in sorted((root / "docs/specs").glob("*.md")):
-        heading = next((re.sub(r"\s+#+\s*$", "", match[1]).strip() for line in path.read_text(encoding="utf-8").splitlines()
-                        if (match := re.match(r"^#{1,6}\s+(.+)", line))), None)
-        specs.append({"path": path.relative_to(root).as_posix(), "heading": heading})
     ignored = {".git", ".venv", "node_modules", ".pytest_cache", "__pycache__"}
     tree, languages = [], set()
     extensions = {".py": "Python", ".js": "JavaScript", ".jsx": "JavaScript", ".ts": "TypeScript",
@@ -285,8 +280,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
                          "waiting": order_waiting.section(issue.body),
                          **owner_errors.get(issue.number, {})} for issue in issues],
         "pull_requests": _pull_requests(tracker),
-        "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
-                                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
+        "repo": {"tree": sorted(tree), "languages": sorted(languages),
+                 "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
 
 
@@ -345,8 +340,8 @@ def validate_plan(plan: dict, root: Path, config: Config, *,
     names = [lane["name"] for lane in plan.get("new_lanes", [])]
     if len(set(names)) != len(names):
         raise PlanError("duplicate new_lanes names")
-    files = {f"docs/specs/{plan['id']}.md": plan["spec_markdown"]}
-    repo_path(root, next(iter(files)))
+    # The parent issue body carries the spec; an order writes no spec file.
+    files: dict[str, str | bytes] = {}
     references = order_references.validate(plan, root)
     acceptance = repo_path(root, config.acceptance_dir)
     keys, edits = set(), set()
@@ -520,10 +515,8 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
                    manager: SkillManager | None) -> dict[str, str]:
     """Commit only this order's own paths on the latest base and push them."""
     # Destinations are checked here, after the base refresh, so upstream changes count.
-    spec = f"docs/specs/{plan['id']}.md"
     references = set(plan.get("reference_files", {}))
-    roots = {name: "docs/specs" if name == spec else "docs/design" if name in references
-             else config.acceptance_dir for name in files}
+    roots = {name: "docs/design" if name in references else config.acceptance_dir for name in files}
     check_destinations(root, files)
     for name in files:
         check_write(root, name, roots[name])
@@ -551,7 +544,7 @@ def _publish_files(plan: dict, root: Path, config: Config, git: GitRepo, files: 
     git.ensure_tracked(list(files))
     changed = git.uncommitted_paths(list(files))
     if changed:
-        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests and spec")
+        git.commit_paths(changed, f"Foragent order {plan['id']}: acceptance tests")
     published_blobs = git.blob_shas(git.head_sha(), files)
     missing = [name for name in files if published_blobs.get(name, "missing") == "missing"]
     if missing:
@@ -981,7 +974,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+        return f"{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.

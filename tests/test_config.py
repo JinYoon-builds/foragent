@@ -60,7 +60,7 @@ def test_exact_defaults(repo):
         "review": "fast", "review_paths": {}, "always_human": [], "executor": "codex",
         "executor_model": None, "reviewer": None, "reviewer_model": None, "review_max": 2, "approvers": [],
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
-        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
+        "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
         "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,
@@ -457,12 +457,13 @@ def test_committed_config_missing_or_invalid_falls_back(tmp_path, content):
 
 @pytest.mark.parametrize("value", [2, 0, "1", True])
 def test_merge_turn_size_is_one_until_merge_groups(repo, value):
-    assert load_config(repo).merge_turn_size == 1
-    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": 1}), encoding="utf-8")
-    assert load_config(repo).merge_turn_size == 1
-    (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": value}), encoding="utf-8")
-    with pytest.raises(ConfigError, match=r"merge_turn_size must be 1 until merge groups \(#459\)"):
-        load_config(repo)
+    """Retired (#2161): an existing project file with any value still loads; the key is dropped."""
+    assert not hasattr(load_config(repo), "merge_turn_size")
+    for setting in (1, value):
+        (repo / ".foragent.yml").write_text(yaml.safe_dump({"merge_turn_size": setting, "max_retries": 3}),
+                                            encoding="utf-8")
+        config = load_config(repo)
+        assert not hasattr(config, "merge_turn_size") and config.max_retries == 3
 
 
 @pytest.mark.parametrize("roles", [[], {"Bad": {}}, {"x": {"color": "red"}}, {"x": {"skills": "a"}},
