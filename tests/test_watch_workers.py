@@ -104,7 +104,7 @@ def test_orchestrator_claim_needs_a_fresh_heartbeat(tmp_path):
     path = store.root / "orch-heartbeat.json"
     path.write_text(json.dumps({"at": (clock[0] - timedelta(seconds=5)).isoformat()}))
     text = frame(tracker, store, config, clock)
-    # A fresh watch is no news: the evidence row only warns.
+    # A fresh watch is no news: the bubble only warns.
     assert "orchestrator is off" not in text and "⚠" not in text
     path.write_text(json.dumps({"at": (clock[0] - timedelta(seconds=31)).isoformat()}))
     text = frame(tracker, store, config, clock)
@@ -135,9 +135,9 @@ def test_log_age_decides_working_or_quiet(tmp_path):
     for minutes, expected in ((9, None), (10, "quiet for 10 min")):
         modified = (clock[0] - timedelta(minutes=minutes)).timestamp()
         os.utime(log, (modified, modified))
-        # The warning stands beside the acorn, and its explanation repeats it.
+        # Per-issue warnings live only in the acorn explanation (r53).
         row = rows_with(frame(tracker, store, config, clock), "◖█#1")[0]
-        assert ("quiet" not in row) if expected is None else (expected in row), row
+        assert "quiet" not in row
         words = explained(tracker, store, config, clock, 1)
         assert ("quiet" not in words) if expected is None else (expected in words), words
 

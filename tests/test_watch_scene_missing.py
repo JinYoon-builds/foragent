@@ -206,7 +206,7 @@ def test_missing_lanes_or_runs_draw_the_empty_scene(tmp_path):
     del facts["status"]["active_runs"]
     snapshot = Snapshot(**facts)
     assert watch_scene.lane_rows(snapshot.status) == []
-    assert lane_blocks.render(snapshot, _config("emoji"), tmp_path, width=120, now=NOW)  # The evidence row.
+    assert lane_blocks.render(snapshot, _config("emoji"), tmp_path, width=120, now=NOW) == []  # No evidence clutter.
     assert "Nothing to do now" in "\n".join("".join(v for v, _ in line) for line in lane_bubble.render(
         snapshot, _config("emoji"), tmp_path, width=120, now=NOW, state={}))
 

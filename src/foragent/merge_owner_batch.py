@@ -85,7 +85,7 @@ def _record_retirement(ctx, identity, candidate, *, reason, **data):
                                 "commit-tree", _tree(ctx.git, candidate), "-p", previous or candidate,
                                 "-m", f"Retire merge batch\n\nForagent-Batch: {ledger}"]).strip()
         ctx.git._call(["update-ref", marker, retired, previous or "0" * len(retired)])
-    print(f"merge batch {identity[:12]} candidate {candidate[:12]} retired: {reason}", flush=True)
+    print(f"merge train {identity[:12]} candidate {candidate[:12]} retired: {reason}", flush=True)
     return reason
 
 
@@ -195,7 +195,7 @@ def retire(ctx, report):
     """Retirement remains available when new batching and CI reuse are disabled."""
     recovered, damaged = _discover(ctx, report)
     for base, chain in recovered:
-        _close(ctx, report, base, chain, "merge batching disabled")
+        _close(ctx, report, base, chain, "merge trains disabled")
     _retire_damaged(ctx, damaged)
 
 
@@ -333,7 +333,7 @@ def _join(ctx, report, base, before, place, job):
     except Exception as exc:
         if isinstance(exc, TrackerError) and exc.waits:
             raise
-        report.actions.append(f"#{place.n} merge batch excluded: {str(exc) or type(exc).__name__}")
+        report.actions.append(f"#{place.n} merge train excluded: {str(exc) or type(exc).__name__}")
         return None
     # Its code remains in the prefix, so excluding it would skip its checks.
     raise ValueError("member already reachable")
@@ -467,7 +467,7 @@ def prepare(ctx, report, candidates):
             _close(ctx, report, base, chain, str(exc) or type(exc).__name__, tip_pr=proof.pr if proof else None,
                    passed=proof.passed if proof else False)
             return False
-        report.actions.append(f"merge batch unavailable: {exc}")
+        report.actions.append(f"merge train unavailable: {exc}")
         return None
 
 

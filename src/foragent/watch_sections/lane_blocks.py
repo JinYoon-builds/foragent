@@ -1,11 +1,10 @@
 """The lane blocks (lane-view m2): one squirrel per lane, its acorns and its queue.
 
-First a compact evidence row (the orchestrator is off, planning requests, the inbox
-count), then one block per lane under a heavy rule: working lanes, lanes with a
+One block per lane under a heavy rule: working lanes, lanes with a
 question, waiting lanes, and one shared block for every idle lane. A block shows the
 lane's pixel squirrel (gnawing, waving, looking out or, shared, lying asleep), its name,
-owned paths and today's merges, its current acorns, a waiting reason, then '다음' with
-the queue. Acorns flow over two rows at most and end in an exact …N for the rest.
+owned paths and today's merges, its current acorns, then '다음' with the queue.
+Issue explanations belong in the big squirrel's bubble. All acorns remain scrollable.
 Without pixels (ASCII, a non-UTF-8 terminal, animation off) or below 40 columns the
 blocks are text only; every text fallback gives each acorn its own selectable row.
 """
@@ -31,7 +30,6 @@ ART_CELLS = 11
 CONTENT_FROM = 14  # Art, then three spaces.
 ART_ROWS = 4
 PIXELS_FROM = 40
-ACORN_ROWS = 2  # Current acorns and queued ones each take at most this many rows.
 WORDS = {"question": "lane_blocks_word_question", "parked": "lane_blocks_word_parked"}
 # (class, recipient) -> (plain word, recipient words): a question names its recipient.
 TURNS = {("question", "person"): ("lane_blocks_word_question", "question_person"),
@@ -53,20 +51,20 @@ def _modes(config: Config, width: int) -> tuple[bool, bool, bool]:
 def _word(item: dict[str, Any], language: str) -> str:
     """What the acorn says beside its number. Queued work says nothing; a worker always says
     something: its step, what it waits for, or, for a phase no one named, that it waits."""
-    from foragent import watch, watch_scene
+    from foragent import watch
+    from foragent.messages.squirrel import PHASE_WORDS, phase_word
 
     kind, phase, asked = item["class"], item["phase"], item.get("asked")
+    if phase in PHASE_WORDS and (kind == "working" or kind == "wait" and phase == "merge-owner-wait"):
+        return phase_word(phase, language, short=True)
     if (kind, asked) in TURNS:
         # A question's word names whose turn it is (#1160), after the plain word it extends.
         base, name = TURNS[kind, asked]
         return f"{watch.text(base, language)}: {watch.text(name, language)}"
     if kind == "working" and phase is None:
-        key = "lane_blocks_step_baseline"  # A run that recorded no step yet is still preparing.
-    elif kind == "working" and phase in watch_scene.STEPS:
-        key = f"lane_blocks_step_{watch_scene.STEPS[phase]}"
-    elif kind == "wait" and phase in watch_scene.WAIT_PHASES:
-        key = f"lane_blocks_word_{phase}"
+        return phase_word("baseline", language, short=True)
     elif kind in {"working", "wait"}:
+        # D112: a waiting acorn only says it waits; why is in its bubble.
         key = "lane_blocks_word_wait"
     elif kind in WORDS:
         key = WORDS[kind]
@@ -171,7 +169,7 @@ def _name_row(snapshot: Snapshot, config: Config, row: dict[str, Any], width: in
     from foragent import watch, watch_scene
 
     slug, language = row.get("slug"), config.language
-    name = watch._clean(row.get("lane_display") or slug or "")
+    name = watch._clean(watch_scene.lane_name(row, config))
     joined = ", ".join(watch_scene.owned_paths(snapshot, config, slug))
     count = watch_scene.today_count(snapshot, slug)
     right = ("" if not count else watch.text("lane_blocks_today_one", language) if count == 1
@@ -199,21 +197,17 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
     language = config.language
     mark = "..." if ascii_glyphs else "…"
     acorn_tick = tick if config.animation else 0
-    # Every text fallback (narrow, ASCII or non-UTF-8 glyphs, animation off) lists one acorn
-    # per row, all of them, so each issue keeps its own selectable row (blocks.11); only the
-    # pixel scene flows acorns side by side within its two rows and counts the rest as …N.
+    # Text fallback keeps every issue selectable; pixel acorns fill the available width.
     per_row = None if pixels else 1
     name, name_cells = _name_row(snapshot, config, row, width, mark)
     lines: list[Line] = [name]
     hits: list[Hit] = []
     marks: list[tuple[int, int]] = []
 
-    def units(items: list[dict[str, Any]], warnings: bool) -> list[tuple[Line, Line, str, int]]:
-        # A worker warning stands right beside its acorn (blocks.08).
+    def units(items: list[dict[str, Any]]) -> list[tuple[Line, Line, str, int]]:
         return [(_acorn(item, language, acorn_tick, ascii_glyphs),
                  _acorn(item, language, acorn_tick, ascii_glyphs, word=False),
-                 watch_scene.activity_warning(snapshot, config, row, item, now) if warnings else "",
-                 item["number"]) for item in items]
+                 "", item["number"]) for item in items]
 
     def place(flowed: tuple[list[Line], list[tuple[int, int, int, int]]]) -> None:
         rows, placed = flowed
@@ -226,31 +220,15 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
                 firsts.add(offset)
                 marks.append((start + offset, number))
 
-    def group(items: list[dict[str, Any]], warnings: bool, prefix: Line) -> None:
-        from foragent.watch_waiting import explanation
-
-        ordinary = [item for item in items if not item["authored"]]
-        if ordinary:
-            place(_flow(units(ordinary, warnings), width, ACORN_ROWS if pixels else len(ordinary),
-                        prefix, mark, per_row))
-        # Each recorded wait keeps its acorn and canonical explanation together, outside
-        # the ordinary flow's overflow budget. Never hide a reason, condition or owner.
-        for item in items:
-            if not (context := item["authored"]):
-                continue
-            place(_flow(units([item], warnings), width, 1, prefix, mark, 1))
-            lines.extend(explanation(context, language, width, mark=mark))
+    def group(items: list[dict[str, Any]], prefix: Line) -> None:
+        place(_flow(units(items), width, max(1, len(items)), prefix, mark, per_row))
 
     if current:
-        group(current, True, [])
-    waiting = watch_scene.representative_wait(row, current, upcoming)
-    if waiting is not None:
-        lines.append(watch_scene.fit_marked([(watch_scene.waiting_reason(snapshot, row, waiting, language,
-                                                                        ascii=ascii_glyphs), "dim")], width, mark))
+        group(current, [])
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
-        group(upcoming, False, prefix)
+        group(upcoming, prefix)
     return lines, hits, marks, name_cells
 
 
@@ -267,7 +245,7 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
     entries: list[tuple[Line, int, str]] = []
     for row in rows:
         slug = row.get("slug")
-        spans: Line = [(watch._clean(row.get("lane_display") or slug or ""), "")]
+        spans: Line = [(watch._clean(watch_scene.lane_name(row, config)), "")]
         count = watch_scene.today_count(snapshot, slug)
         if count:
             spans.append((f" {'v' if ascii_glyphs else '✓'}{count}", "green"))
@@ -293,36 +271,6 @@ def _idle_block(snapshot: Snapshot, config: Config, rows: list[dict[str, Any]], 
     return lines, hits
 
 
-def _evidence(snapshot: Snapshot, config: Config, now: datetime) -> Line:
-    """The orchestrator's missing watch, the planning requests (D76) and the inbox count, on one row."""
-    from foragent import watch, watch_scene
-    from foragent.watch_sections import orch_panel
-    from foragent.watch_sections.lanes import glyph_mode
-
-    status, language = snapshot.status, config.language
-    t = lambda key, **values: watch.text(key, language, **values)
-    age = max(0.0, (now - snapshot.captured_at).total_seconds())
-    parts: list[tuple[str, str]] = []
-    heartbeat = (snapshot.heartbeats or {}).get("orch")
-    requests = [row for row in snapshot.requests or () if isinstance(row, dict)]
-    fresh = heartbeat is not None and heartbeat + age <= orch_panel.ORCH_FRESH_SECONDS
-    if not fresh and (heartbeat is not None or status.get("active_runs")
-                      or any(watch._has_work(row) for row in watch_scene.lane_rows(status))):
-        parts.append((t("watch_orch_off"), "yellow"))
-    if requests:
-        count = lambda name: sum(row.get("status") == name for row in requests)
-        parts.append((t("watch_requests", processing=count("processing"), done=count("done")), ""))
-    inbox = (snapshot.panel or {}).get("inbox")
-    if inbox is not None:
-        parts.append((t("orch_panel_for_you", count=inbox), ""))
-    line: Line = []
-    ascii = glyph_mode(config) == "ascii"
-    for index, (value, style) in enumerate(parts):
-        line += ([(" | " if ascii else " · ", "dim")] if index else []) + [(
-            watch_scene.generated_ascii(value) if ascii else value, style)]
-    return line
-
-
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch, watch_scene
     from foragent.watch_art import LANE_POSES, lookout, lying_asleep, pixel_rows
@@ -335,9 +283,6 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     inside = max(1, width - left)
     rule = (("-" if ascii_glyphs else "━") * width, "separator")
     out: list[Line] = []
-    evidence = _evidence(snapshot, config, now)
-    if evidence:
-        out.append(watch_scene.fit_marked(evidence, width, "..." if ascii_glyphs else "…"))
     needs = watch_scene.question_numbers(snapshot)
     lanes = []
     for row in watch_scene.lane_rows(snapshot.status):

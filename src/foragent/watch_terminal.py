@@ -7,7 +7,6 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 import os
-import re
 
 from foragent.config import Config
 from foragent.watch_cells import Style
@@ -15,9 +14,8 @@ from foragent import watch_hint
 from foragent.watch_data import Snapshot
 
 
-# A visible issue number, linked to its GitHub page after each refresh.
+# Save curses' cursor while writing the selected acorn bubble's explicit link.
 SAVE_CURSOR, RESTORE_CURSOR = "\x1b7", "\x1b8"
-ISSUE_NUMBER = re.compile(r"(?<![\w#])#(\d+)(?!\w)")
 
 
 def color_pairs(colors: int) -> list[tuple[int, int]]:
@@ -255,11 +253,12 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                       hit=curses.color_pair(4) | curses.A_BOLD, claude=curses.color_pair(5),
                       codex=curses.color_pair(6), blue=curses.color_pair(7))
         screen.bkgd(" ", styles["road"])
+    styles["issue-link"] = styles.get("blue", 0)
     palette = _Palette(curses, styles)
     if palette.enabled:
         base = watch.color_pairs(curses.COLORS)
         pairs = {"road": 1, "edge": 1, "divider": 2, "yellow": 2, "working": 2, "green": 3, "queue": 4, "hit": 4,
-                 "claude": 5, "codex": 6, "blue": 7}
+                 "claude": 5, "codex": 6, "blue": 7, "issue-link": 7}
         palette.inks.update({name: base[index - 1] for name, index in pairs.items()})
     try:
         curses.curs_set(0)
@@ -352,7 +351,6 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             # Under 3 rows this is F itself, painted from the top and cut to the screen below.
             visible = watch._window(frame, view_state, height, max(1, width), config.language,
                                     layout if store is not None else None)
-            top = view_state.get("scroll", 0)
             fitted = None if error else watch_hint.fitting(hint, max(1, width))
             if fitted and holding is None:
                 taken = watch_hint.hold()
@@ -386,14 +384,6 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
             hint_row = next((y for y, row in enumerate(visible[:max(1, height)])
                              if fitted and row is alert[0]), None)
             hint_whole = hint_row is not None
-            # One highlighted row, by its position: the first issue row on screen.
-            mark = watch.highlighted_row(view_state)
-            if mark is None:
-                marked = set()
-            elif row_map is not None:
-                marked = {y for y, row in row_map.items() if row == mark}
-            else:
-                marked = {mark - top}
             if not painted:
                 screen.erase()
                 painted = True
@@ -403,7 +393,7 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                 x = 0
                 # _frame already cut every line to the width; it is painted as it is.
                 for value, style in line:
-                    attribute = palette.attribute(style) | (curses.A_REVERSE if y in marked else 0)
+                    attribute = palette.attribute(style)
                     try:
                         screen.addstr(y, x, value, attribute)
                     except curses.error:
@@ -411,12 +401,12 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                         # a resize between measuring and painting does too.
                         if y == hint_row:
                             hint_whole = False  # Not known to be drawn whole: not seen.
-                    for found in ISSUE_NUMBER.finditer(value):
-                        url = watch.issue_url(config, int(found[1]))
+                    if style == "issue-link" and value:
+                        url = watch.issue_url(config, view_state["explanation_target"][1])
                         if url is not None:
                             # The link keeps the span's colours, bold, dim and reverse, then resets.
-                            links.append(f"\x1b[{y + 1};{x + watch._cells(value[:found.start()]) + 1}H"
-                                         + palette.link(style, attribute) + watch.osc8(url, found[0]) + "\x1b[0m")
+                            links.append(f"\x1b[{y + 1};{x + 1}H"
+                                         + palette.link(style, attribute) + watch.osc8(url, value) + "\x1b[0m")
                     x += watch._cells(value)
                 if x < width:
                     # A screen that only paints (the minimal screen the locked live-view tests
@@ -434,9 +424,8 @@ def _terminal(screen, refresh: Callable[[], Snapshot], snapshot: Snapshot, confi
                     pass
             screen.refresh()
             seen_at = (height, width) if hint_whole and holding is not None else None
-            # Curses cannot write OSC 8, so every visible #n is written again as a link after
-            # each refresh. No "unchanged" shortcut: curses also repaints unchanged text (after
-            # a resize, or when it clears the screen itself), and that drops the links.
+            # Curses cannot write OSC 8. Restore only the bubble's explicit link after each
+            # refresh, including repaints after a resize or with unchanged text.
             if links:
                 # Save and restore the cursor and attributes (DECSC/DECRC) around the links,
                 # so curses' next refresh starts from the position it believes it left.

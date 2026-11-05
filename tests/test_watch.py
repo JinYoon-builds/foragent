@@ -118,8 +118,11 @@ def test_idle_lanes_have_one_row_each_and_a_queued_lane_waits_for_a_turn(tmp_pat
     docs = [line for line in active if "[#2]" in line]
     assert len(docs) == 1 and ("next  " in docs[0] or "다음  " in docs[0])
     name = next(index for index, line in enumerate(active) if line.startswith("🧩 Docs"))
-    # The waiting reason row comes from the recorded facts; its sentence always leads.
-    assert active[name + 1].startswith("waiting its turn" if language == "en" else "순서를 기다려요")
+    # r53 keeps one blank before the next acorns; the reason belongs to the bubble.
+    assert active[name + 1] == ""
+    selected = watch.render_frame(snapshot(tracker, store, config), config, tmp_path, width=80,
+                                  state={"explanation_target": ("acorn", 2)})
+    assert ("Waiting its turn" if language == "en" else "순서를 기다려요") in selected
 
 
 @pytest.mark.parametrize("width", [40, 80, 120])
@@ -146,8 +149,9 @@ def test_live_liveness_crosses_ten_minutes_between_refreshes(tmp_path):
     status = local_status(tracker, store, config)
     status["lanes"]["main"]["last_activity_seconds"] = 599
     result = watch.collect(status, tracker, store, config, NOW)
-    before = watch.render_frame(result, config, tmp_path, now=NOW)
-    after = watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2))
+    state = {"explanation_target": ("acorn", 1)}
+    before = watch.render_frame(result, config, tmp_path, now=NOW, state=state)
+    after = watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2), state=state)
     assert "멈춘 듯" not in before
     assert "○ 멈춘 듯 10분" in after
 
@@ -168,16 +172,17 @@ def test_live_runner_death_is_visible_without_refresh_and_permission_is_alive(tm
         raise PermissionError
 
     monkeypatch.setattr(watch.os, "kill", inaccessible)
-    assert gone not in watch.render_frame(result, config, tmp_path)
+    state = {"explanation_target": ("acorn", 1)}
+    assert gone not in watch.render_frame(result, config, tmp_path, state=state)
 
     def dead(pid, signal):
         raise ProcessLookupError
 
     monkeypatch.setattr(watch.os, "kill", dead)
-    assert gone in watch.render_frame(result, config, tmp_path)
+    assert gone in watch.render_frame(result, config, tmp_path, state=state)
     result.status["lanes"]["main"]["state"] = "blocked"
     result.worker_states[1] = "blocked"  # A worker row follows its own issue's labels.
-    assert gone not in watch.render_frame(result, config, tmp_path)
+    assert gone not in watch.render_frame(result, config, tmp_path, state=state)
 
 
 @pytest.mark.parametrize("stall_minutes,threshold", [(3, 180), (20, 600)])
@@ -189,8 +194,9 @@ def test_live_liveness_uses_configured_threshold_between_refreshes(tmp_path, sta
     store.start_run(1, branch="active", worktree="unused")
     result = snapshot(tracker, store, config)
     result.status["lanes"]["main"]["last_activity_seconds"] = threshold - 1
-    assert "○ looks stalled" not in watch.render_frame(result, config, tmp_path, now=NOW)
-    assert "○ looks stalled" in watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2))
+    state = {"explanation_target": ("acorn", 1)}
+    assert "○ looks stalled" not in watch.render_frame(result, config, tmp_path, now=NOW, state=state)
+    assert "○ looks stalled" in watch.render_frame(result, config, tmp_path, now=NOW + timedelta(seconds=2), state=state)
 
 
 def test_partial_event_append_and_missing_memory_have_usable_output(tmp_path):

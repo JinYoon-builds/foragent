@@ -359,7 +359,7 @@ def test_the_live_terminal_uses_its_own_width_for_the_column_rules(tmp_path, mon
     screen.getch.return_value = ord("q")
     monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(watch.sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: snapshot)
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
     monkeypatch.setattr(curses, "has_colors", lambda: False)
     monkeypatch.setattr(curses, "curs_set", lambda *args: None)

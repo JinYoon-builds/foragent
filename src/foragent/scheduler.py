@@ -90,36 +90,39 @@ def tick(ctx: TickContext) -> TickReport:
     with ctx.store.tick_lock() as acquired, orch_spawn.deciding(ctx, acquired) as keep, scheduler_flow.recording(ctx, acquired):
         if not acquired:  # The tick that holds the lock renews the gate heartbeat and decides D76.
             return TickReport(skipped=BUSY_TICK)
-        with scheduler_housekeeping.after_tick(ctx) as done:  # Log pruning on every return path.
+        from foragent import watch_now
+
+        # Retain the tick's process evidence until the dashboard has been published.
+        with ExitStack() as process_scope, watch_now.publishing(ctx), scheduler_housekeeping.after_tick(ctx) as done:
             timed("gate_heartbeat", ctx.store.write_heartbeat, "gate", ctx.now())
             memory = TickReport()  # Role memory is committed before any step that reads a remote or returns early.
             timed("role_memory_publish", orch_role_memory.publish, ctx, memory)
             timed("launchd_refresh", launchd.refresh_from_tick, ctx.repo, ctx.repo_root, ctx.store.root)
-            with tick_processes(ctx.store) as snapshot:
-                cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
-                if snapshot.available:
-                    with step("reap_inactive_runs"):
-                        _reap_inactive_runs(ctx, cleanup)
-                if getattr(ctx.config, "merge_owner", False):
-                    from foragent import merge_owner
+            snapshot = process_scope.enter_context(tick_processes(ctx.store))
+            cleanup, ctx._budget_sample = TickReport(actions=memory.actions), None  # machine.yml applies once in every tick.
+            if snapshot.available:
+                with step("reap_inactive_runs"):
+                    _reap_inactive_runs(ctx, cleanup)
+            if getattr(ctx.config, "merge_owner", False):
+                from foragent import merge_owner
 
-                    merge_owner.start(ctx, cleanup)
-                timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
-                timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
-                if skipped := _github_wait(ctx, {}, "github_wait_check"):
-                    return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
-                if not isinstance(ctx.tracker, RecordingTracker):
-                    ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
-                try:
-                    report = _tick_locked(ctx)
-                    report.actions[:0] = cleanup.actions
-                except TrackerError as exc:
-                    if not exc.is_rate_limit:
-                        raise
-                    return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
-                orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
-                                     start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
-                return keep(done(report, finished=True))  # Only a finished tick checks tidy.
+                merge_owner.start(ctx, cleanup)
+            timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
+            timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.
+            if skipped := _github_wait(ctx, {}, "github_wait_check"):
+                return keep(done(TickReport(skipped=skipped, actions=cleanup.actions)))
+            if not isinstance(ctx.tracker, RecordingTracker):
+                ctx.tracker = RecordingTracker(ctx.tracker, ctx, queue_writes=True)
+            try:
+                report = _tick_locked(ctx)
+                report.actions[:0] = cleanup.actions
+            except TrackerError as exc:
+                if not exc.is_rate_limit:
+                    raise
+                return keep(done(TickReport(skipped=_github_pause(ctx, exc), actions=cleanup.actions)))
+            orch_role_raise.tick(ctx.store, ctx.repo_root, ctx.now(), ctx.config.language,
+                                 start=ctx.start_runs)  # Met role signals (#794); alarms call (#1469).
+            return keep(done(report, finished=True))  # Only a finished tick checks tidy.
 
 
 def _tick_locked(ctx: TickContext) -> TickReport:

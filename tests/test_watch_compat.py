@@ -40,7 +40,7 @@ def test_layout_uses_replaced_facade_detail_and_activity(tmp_path, monkeypatch):
     # A lane row shows the activity cell when it warns (○ stalled or gone, ? quiet).
     monkeypatch.setattr(watch, "_activity", lambda *args: "○ facade activity")
 
-    frame = watch.render_frame(snapshot, config, tmp_path, selected="main")
+    frame = watch.render_frame(snapshot, config, tmp_path, selected="main", state={"explanation_target": ("acorn", 1)})
 
     assert "facade detail" in frame
     assert "facade activity" in frame
@@ -58,7 +58,7 @@ def test_live_run_uses_replaced_facade_frame_and_clock(tmp_path, monkeypatch):
     screen.getch.return_value = ord("q")
     monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(watch.sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr(watch, "collect", lambda *args: snapshot)
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: snapshot)
     monkeypatch.setattr(watch, "_frame", frame)
     monkeypatch.setattr(watch, "time", SimpleNamespace(monotonic=lambda: 0))
     monkeypatch.setattr(curses, "has_colors", lambda: False)
