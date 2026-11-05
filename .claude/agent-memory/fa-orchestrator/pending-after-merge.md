@@ -274,3 +274,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - 7 days after #2136 merged (11-05 12:53Z): re-measure run minutes after outside issue close (architect r787 query), expected 294 min/7d -> 0.
 - If #2125 review round 6 (started 14:39Z 11-05) FAILs in the startable/admission class: apply architect r810's Goal bar (startable = fa orch facts admission replay; live GitHub-read start checks are NOTE) by order edit + retry. If it PASSes, drop.
 - After the shared-start+split issue merges: unpark #1653 and re-approve by order edit (park removes approved), then retry.
+- GitHub push refusal variants seen: '(failed)' (#2061 fix) and 'remote: fatal error in commit_refs_rules' (#1577, 11-05 16:2xZ). If the second repeats on another issue, extend the push wait to it.

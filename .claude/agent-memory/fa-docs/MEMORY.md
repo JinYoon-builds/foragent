@@ -30,6 +30,7 @@
 - r800 (2026-11-05): orders #2130/#2135 (#1874 merge b0fedd49, #2136 merge b0985e42) — mechanisms.md 'Order completion' add UX researcher order/daily calls + Origins #1654/#1874. Wait: orchestrator judges.
 - r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
+- r819 (2026-11-06): orders #1785/#1795/#1846/#2177/#2181 — npx foragent E404 (npm unpublished, Jin A publish/B curl-only); then launch posts hn/geeknews en+ko install lines → one-line install + /fa. Wait: orchestrator relays.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -96,3 +97,5 @@
 - New role callers in orch_role_schedule.py (e.g. #1874 UX researcher per order/daily) belong in docs/mechanisms.md 'Order completion' entry, which names the woken roles. Run-lifecycle fixes in scheduler_stop.py (#2136 stop on outside close) appear in no reader doc.
 - Urgent fix orders that apply an existing dated Dnn (e.g. #2103 applying D124) may be the first code for a decision that never got a rules.md line; grep rules.md for the Dnn on each check.
 - Local-check trimming orders in CI mode (#2146/#2147: post-PASS base refresh leaves related unit tests to PR CI) touch no reader doc; how-foragent-differs.md:44/76 're-verify on latest main' and mechanisms.md:40 stay true at concept level.
+- Install-path changes (#1475 one-line installer) update README in the same merge but not docs/launch/*; grep launch posts for `uv tool install`/`fa init`. Check `npm view <pkg>` before trusting a README `npx` line.
+- 'Re-approve #NNNN' / '#NNNN test correction' orders (#1795/#1846/#2177) carry empty bodies; check the named issue's merge only.
