@@ -932,25 +932,52 @@ def _group(rows: list[dict[str, Any]]) -> dict[str, Any]:
                                               if sum(run["reviewer_hold"] for run in runs) > 1)}
 
 
-def _attribution(skills: list[Skill]) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Which recorded `skills_used` entry names which skill, and the entries that name several.
+class SkillNames:
+    """The one mapping from a recorded `skills_used` entry to the listed skills it names.
 
-    A full ID names its skill. A bare name (the skill's name or folder) names a skill only when no
-    other listed skill answers to it; otherwise it is ambiguous and credited to none."""
-    claims: dict[str, set[str]] = {}
-    for skill in skills:
-        for key in {skill.name, skill.path.name}:
-            claims.setdefault(key, set()).add(skill.id)
-    names = {key: next(iter(ids)) for key, ids in claims.items() if len(ids) == 1}
-    names.update({skill.id: skill.id for skill in skills})
-    ambiguous = {key: sorted(ids) for key, ids in claims.items() if len(ids) > 1 and key not in names}
-    return names, ambiguous
+    A full ID names its skill. A bare name (a skill's name or folder) names a skill only when no
+    other listed skill answers to it. A name several listed skills answer to is ambiguous: it is
+    attributed to none of them, neither as use nor as non-use."""
+
+    def __init__(self, skills: list[Skill]) -> None:
+        claims: dict[str, set[str]] = {}
+        for skill in skills:
+            for key in {skill.name, skill.path.name}:
+                claims.setdefault(key, set()).add(skill.id)
+        self.ids = {skill.id for skill in skills}
+        self.claims = {key: frozenset(ids) for key, ids in claims.items()}
+
+    def resolve(self, entry: str) -> tuple[str | None, frozenset[str]]:
+        """(the skill the entry names, or None; the skills it could name)."""
+        if entry in self.ids:
+            return entry, frozenset({entry})
+        candidates = self.claims.get(entry, frozenset())
+        return (next(iter(candidates)) if len(candidates) == 1 else None), candidates
+
+    def ambiguous(self, entry: str) -> bool:
+        named, candidates = self.resolve(entry)
+        return named is None and len(candidates) > 1
 
 
-def _mentions(entries: set[str], names: dict[str, str], ambiguous: dict[str, list[str]]) -> set[str]:
-    """Every skill an execution's recorded entries could mean, credited or ambiguous."""
-    return {names[entry] for entry in entries if entry in names} | {
-        skill for entry in entries for skill in ambiguous.get(entry, ())}
+def _issue_status(runs: list[dict[str, Any]], skill_id: str, names: SkillNames, window: set[int]) -> str:
+    """Whether one issue used a skill, by every execution of the issue in any lane and at any time.
+
+    ``used``: an execution in the window (indexes in ``window``) names it. ``unconfirmed``: no such
+    execution, but one names it outside the window, an entry could name it ambiguously, or an
+    execution never reported its skills. ``unused``: every execution reported and none could name it."""
+    unconfirmed = False
+    used = False
+    for index, run in enumerate(runs):
+        if not run["reported"]:
+            unconfirmed = True
+        for entry in run["skills"]:
+            named, candidates = names.resolve(entry)
+            if named == skill_id:
+                used = used or index in window
+                unconfirmed = unconfirmed or index not in window
+            elif named is None and skill_id in candidates:
+                unconfirmed = True
+    return "used" if used else "unconfirmed" if unconfirmed else "unused"
 
 
 def lifecycle_facts(skills: list[Skill], store: Any, *, state_root: Path | None = None,
@@ -961,37 +988,43 @@ def lifecycle_facts(skills: list[Skill], store: Any, *, state_root: Path | None 
     the issues whose runs reported using it, and how comparable work went: issues in the lanes
     that used it, with the skill and without it, since it was admitted (or ever, if it never
     was). ``evidence`` is ``insufficient`` until both sides have MIN_COMPARABLE_RUNS issues.
-    Recorded uses that name several listed skills are credited to none and listed under
-    ``ambiguous_uses``. The without side holds only confirmed non-use: every execution of the
-    issue reported its skills and none of its entries could mean this skill; the other issues
-    in those lanes are counted as ``unconfirmed``. Unfamiliar skills also carry the facts a person reviews before admitting.
+    Every recorded name goes through SkillNames: one that several listed skills answer to counts
+    for none of them, neither as use nor as non-use, and the summary counts such records
+    (``ambiguous_records``). An issue's status comes from all its executions (``_issue_status``):
+    the without side holds only confirmed non-use; the other comparable issues are
+    ``unconfirmed_issues``. Unfamiliar skills also carry the facts a person reviews before admitting.
     """
     states = lifecycle_states(state_root if state_root is not None else store.root)
     unique = list({skill.id: skill for skill in reversed(skills)}.values())[::-1]
-    names, ambiguous = _attribution(unique)
+    names = SkillNames(unique)
     rows = _executions(store)
+    issues: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
-        row["ids"] = {names[entry] for entry in row["skills"] if entry in names}
-        row["mentions"] = _mentions(row["skills"], names, ambiguous)
+        issues.setdefault(row["number"], []).append(row)
     moment = now or datetime.now(timezone.utc)
     facts = []
     for skill in unique:
         state = states.get(skill.id)
         since = _stamp(state.get("since")) if state else None
-        window = [row for row in rows if since is None or row["started"] >= since]
-        used_issues = {row["number"] for row in window if skill.id in row["ids"]}
-        used = [row for row in window if row["number"] in used_issues]
-        lanes = {row["lane"] for row in used}
-        candidates: dict[int, list[dict[str, Any]]] = {}
-        for row in window:
-            if row["lane"] in lanes and row["number"] not in used_issues:
-                candidates.setdefault(row["number"], []).append(row)
-        confirmed = {number for number, runs in candidates.items()
-                     if all(run["reported"] and skill.id not in run["mentions"] for run in runs)}
-        without = [row for number in sorted(confirmed) for row in candidates[number]]
-        last = max((row["started"] for row in rows if skill.id in row["ids"]), default=None)
+        status: dict[int, str] = {}
+        in_window: dict[int, list[dict[str, Any]]] = {}
+        for number, runs in issues.items():
+            window = {index for index, run in enumerate(runs) if since is None or run["started"] >= since}
+            if window:
+                status[number] = _issue_status(runs, skill.id, names, window)
+                in_window[number] = [runs[index] for index in sorted(window)]
+        used_issues = sorted(number for number, value in status.items() if value == "used")
+        lanes = {run["lane"] for number in used_issues for run in in_window[number]}
+        comparable = [number for number in status if number not in used_issues
+                      and any(run["lane"] in lanes for run in in_window[number])]
+        unused = [number for number in comparable if status[number] == "unused"]
+        used = [run for number in used_issues for run in in_window[number]]
+        without = [run for number in unused for run in in_window[number]]
+        last = max((row["started"] for row in rows
+                    if any(names.resolve(entry)[0] == skill.id for entry in row["skills"])), default=None)
         # An ambiguous entry may be this skill: unused is unconfirmed while one is newer than last_used.
-        maybe = max((row["started"] for row in rows if skill.id in row["mentions"] - row["ids"]), default=None)
+        maybe = max((row["started"] for row in rows if any(
+            names.ambiguous(entry) and skill.id in names.resolve(entry)[1] for entry in row["skills"])), default=None)
         origin = _origin(skill)
         with_group, without_group = _group(used), _group(without)
         entry = {"id": skill.id, "name": skill.name, "description": " ".join(skill.description.split()),
@@ -1002,17 +1035,21 @@ def lifecycle_facts(skills: list[Skill], store: Any, *, state_root: Path | None 
                  "status_reason": state["reason"] if state else None,
                  "since": state.get("since") if state else None,
                  "offered": state is None or state["status"] != "retired",
-                 "used_in": sorted(used_issues),
+                 "used_in": used_issues,
                  "last_used": last.isoformat() if last else None,
                  "days_since_used": None if last is None else round((moment - last).total_seconds() / 86400, 1),
                  "last_ambiguous_mention": maybe.isoformat() if maybe else None,
                  "comparison": {"lanes": sorted(lanes), "with": with_group, "without": without_group,
-                                "unconfirmed_issues": sorted(set(candidates) - confirmed)},
+                                "unconfirmed_issues": sorted(number for number in comparable
+                                                             if status[number] == "unconfirmed")},
                  "evidence": ("sufficient" if with_group["issues"] >= MIN_COMPARABLE_RUNS
                               and without_group["issues"] >= MIN_COMPARABLE_RUNS else "insufficient")}
         if origin == "unfamiliar":
             entry["review"] = _review(skill)
         facts.append(entry)
-    used_ambiguous = {key: ids for key, ids in ambiguous.items() if any(key in row["skills"] for row in rows)}
-    return {"minimum_comparable_runs": MIN_COMPARABLE_RUNS, "failure_holds": sorted(str(reason) for reason in REVIEWER_HOLDS),
-            "ambiguous_uses": used_ambiguous, "skills": facts}
+    ambiguous = [entry for row in rows for entry in sorted(row["skills"]) if names.ambiguous(entry)]
+    return {"minimum_comparable_runs": MIN_COMPARABLE_RUNS,
+            "failure_holds": sorted(str(reason) for reason in REVIEWER_HOLDS),
+            "ambiguous_records": len(ambiguous),
+            "ambiguous_uses": {entry: sorted(names.resolve(entry)[1]) for entry in sorted(set(ambiguous))},
+            "skills": facts}
