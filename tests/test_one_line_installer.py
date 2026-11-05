@@ -155,3 +155,25 @@ def test_first_cli_install_only_registers_the_exact_missing_plugin(machine, exis
         after = snapshot(home)
         assert after['marketplace'] == before['marketplace']
         assert after['plugins'] == before['plugins']
+
+
+def test_clean_install_workflow_runs_on_install_changes_nightly_and_on_demand():
+    """Jin 2026-11-05: not on every PR; on install-path changes, nightly and by hand."""
+    import fnmatch
+
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/clean-install.yml").read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["schedule"] and all(entry.get("cron") for entry in triggers["schedule"])
+    assert "workflow_dispatch" in triggers
+    for event in ("pull_request", "push"):
+        paths = triggers[event]["paths"]
+        for path in ("install.sh", "npm/bin/foragent.js", "npm/package.json", ".claude-plugin/plugin.json",
+                     "pyproject.toml", "uv.lock", "setup.py", "src/foragent/cli.py",
+                     "src/foragent/commands/doctor.py", ".github/workflows/clean-install.yml"):
+            assert any(fnmatch.fnmatch(path, pattern) for pattern in paths), f"{event}: {path} triggers the run"
+        for path in ("README.md", "src/foragent/order.py", "tests/test_order.py"):
+            assert not any(fnmatch.fnmatch(path, pattern) for pattern in paths), f"{event}: {path} does not"
+        for pattern in paths:
+            assert any(ROOT.glob(pattern)), f"{event}: {pattern} names a file in this repository"
