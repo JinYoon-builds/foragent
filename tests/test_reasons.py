@@ -25,6 +25,7 @@ def test_groups_cover_exact_contract_codes():
         Reason.ACCEPTANCE_BASELINE_UNAVAILABLE: "tech-failure",
         Reason.CI_NOT_STARTED: "tech-failure",
         Reason.TEST_HARNESS_CHANGED: "review",
+        Reason.REVIEW_DEFECTS: "review",
     }
     assert set(GROUP) == set(Reason)
     assert str(Reason.TIMEOUT) == "timeout"

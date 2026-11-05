@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, orch_stop
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -387,6 +387,11 @@ def review_only(
     previous = ctx.store.get_run(n)
     started = False
     admission = ExitStack()
+    if (stop := orch_stop.active(ctx.store)) is not None:  # The stop admission, before any write (#1491).
+        from foragent.i18n import text
+
+        _append(ctx.store.log_path(n), text("orch_stop_start_refused", ctx.config.language, n=n, why=stop))
+        return "stopped"
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -451,7 +456,8 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    # A stopped review keeps `running` for the tick's stop restore (_restore_stopped).
+                    if outcome not in {"limit-wait", "stopped"}:
                         current = ctx.tracker.current_issue(n)
                         if (not _handed_off(n, ctx) and outcome != "remote-ended" and current.state == "open"
                                 and not current.labels & {BLOCKED, READY}):
@@ -509,6 +515,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
                                        process_identities=observe_tree(roots=(os.getpid(),)))
         if run.status == "running":
             admission.close()  # The record now names this live process: it holds the slot.
+        orch_stop.raise_if_requested(ctx, n)  # A run that starts under a project stop takes no step (#1491).
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome

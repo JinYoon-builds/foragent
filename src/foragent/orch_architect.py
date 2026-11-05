@@ -124,13 +124,18 @@ def _say(key: str, role: str, language: str, **values) -> str:
 
 def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
          role: str = ARCHITECT, short: str | None = None, alarm: str | None = None, *,
-         topic: bool | str = True, rebuttal: str | None = None) -> str:
+         topic: bool | str = True, rebuttal: str | None = None, tier: str | None = None) -> str:
     """Start one session of ``role`` and return the line for the caller; refuse with ArchitectRefused.
 
     ``alarm`` is the gate's request id when the gate calls the role for an alarm.
     Architect calls start a topic; other roles and explicit ``topic=False`` calls are one-shot.
+    ``tier`` names the work's weight; scheduled light checks use m, design checks use l.
     """
     language = config.language
+    from foragent import orch_stop
+
+    if (stop := orch_stop.active(store)) is not None:  # No session starts during a project stop (#1491).
+        raise ArchitectRefused(text("orch_stop_role_refused", language, role=role, why=stop))
     if _entry(config, role) is None:
         raise ArchitectRefused(text("role_unknown", language, role=role,
                                     roles=", ".join(load_roles(config)) or "-"))
@@ -160,17 +165,18 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
 
         with orch_architect_topics.launch(store, topic if role == ARCHITECT else False,
                                           started_at, why, config.executor, rebuttal) as context:
-            process = _launch(root, store, role, started_at, why, short, alarm, log, context)
+            process = _launch(root, store, role, started_at, why, short, alarm, log, context,
+                              tier or ("m" if role == "docs" else "l"))
     append_event(store, now, None, f"{role}-call", why, why=why, pid=process.pid, log=str(log),
                  **({"short": short} if short else {}))
     return _say("started", role, language, pid=process.pid, log=log)
 
 
-def _launch(root, store, role, started_at, why, short, alarm, log, context):
+def _launch(root, store, role, started_at, why, short, alarm, log, context, tier):
     # The record exists before Popen, including the topic and alarm for a fast child.
     workload = capacity_sessions.new_path(store, os.getpid())
     session = {"pid": None, "start_time": None, "started_at": started_at, "why": why,
-               "workload": str(workload), **({"short": short} if short else {}),
+               "tier": tier, "workload": str(workload), **({"short": short} if short else {}),
                **({"alarm": alarm} if alarm else {}), **context}
     store._write_json(record_path(store, role), session)
     try:
@@ -201,21 +207,25 @@ def _launch(root, store, role, started_at, why, short, alarm, log, context):
 
 
 def session_options(config: Config, store: StateStore, root: Path | None = None,
-                    role: str = ARCHITECT, entry: dict | None = None) -> dict:
-    """The size-l tier's model and effort; Claude loads the role's agent when the project has it.
+                    role: str = ARCHITECT, entry: dict | None = None,
+                    tier: str | None = None) -> dict:
+    """The work's tier model, with a role override; Claude loads the project's role agent.
 
     Codex gets the state directory, and the role's memory directory when present, as writable roots.
     """
-    tier = config.tiers["l"]
+    tier = config.tiers[tier or ("m" if role == "docs" else "l")]
     entry = entry if entry is not None else _entry(config, role)
+    model = entry.get("model") if entry else None
     if config.executor == "claude":
-        options = {"model": tier.get("claude_model") or config.executor_model}
+        options = {"model": model or tier.get("claude_model") or config.executor_model}
         if _has_agent(root, entry):
             options["agent"] = entry["agent"]
         return options
     memory = root / entry["memory"] if root is not None else None
     extra = (memory,) if memory is not None and memory.is_dir() else ()
-    return {"model": config.executor_model, "effort": tier.get("codex_effort"),
+    effort = tier if tier.get("codex_model") else config.tiers["l"]
+    return {"model": model or tier.get("codex_model") or config.executor_model,
+            "effort": effort.get("codex_effort"),
             "add_dirs": (store.root, *extra)}
 
 
@@ -248,11 +258,17 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if entry is None:
             raise ArchitectRefused(text("role_unknown", config.language, role=role,
                                         roles=", ".join(load_roles(config)) or "-"))
-        options = session_options(config, store, root, role, entry)
+        # The tier was chosen at launch; turn_record is this session's own record or None.
+        tier = turn_record.get("tier") if turn_record is not None else None
+        options = session_options(config, store, root, role, entry, tier=tier)
         options.update(orch_architect_topics.options(store, turn_record))
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
         notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""
+        from foragent import orch_stop
+
+        if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
+            raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
         result = executors.executor_for(config.executor).run(
             worktree=root, prompt=build_prompt(why, root, config.executor, role, entry, review_notes=notes)
             + session_skills.section(config, role, root),

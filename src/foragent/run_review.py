@@ -252,13 +252,15 @@ def _review_session(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
                    texts: tuple[str, ...], *, git: GitRepo | None = None,
-                   parsed: ParsedIssue | None = None) -> ReviewResult:
+                   parsed: ParsedIssue | None = None, journal: bool = True) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
     once per issue as a review-note event.
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
+    if not journal:
+        return review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed, record=False)
     _record_notes(n, ctx, round_number, *texts)
     # Every FAIL finding, in any round, gets one scoring session; only a grounded one blocks (#1651).
     review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
@@ -304,7 +306,7 @@ def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
 def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
                   rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
                   round_number: int, *, lane_decisions: str = "", workers: int = 1,
-                  pass_scope: str = "", diff: str | None = None) -> ReviewResult:
+                  pass_scope: str = "", diff: str | None = None, journal: bool = True) -> ReviewResult:
     """One independent whole-change reviewer per perspective share; one merge call decides.
 
     At most `workers` reviewers (the issue's reviewer count) and the shared machine budget run at
@@ -319,7 +321,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
     executor = ctx.executor_factory(reviewer)
-    record = notes_of(n, ctx, reviewer, round_number)
+    record = notes_of(n, ctx, reviewer, round_number) if journal else None
     diff = git.staged_diff(base_ref) if diff is None else diff
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
@@ -450,7 +452,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
                                           conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git,
-                          parsed=parsed)
+                          parsed=parsed, journal=journal)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
@@ -585,6 +587,8 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
         attempt.previous_rebutted_findings = findings
         if attempt.review_failures > ctx.config.review_max:
+            if not attempt.review_hold:
+                attempt.review_hold_reason = Reason.REVIEW_DEFECTS
             attempt.review_hold = True
 
 

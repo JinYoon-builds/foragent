@@ -33,6 +33,16 @@ class OlderMeasuredBase(StaleComparison):
         super().__init__(reported)
 
 
+class ConflictingPR(Exception):
+    """GitHub reports the PR head conflicting with its base: no CI will measure it.
+
+    Not an UnusableComparison, so no comparison handler turns it into a hold."""
+
+    def __init__(self, head):
+        self.head = head
+        super().__init__(head)
+
+
 class WorkflowChanged(UnusableComparison):
     """The measuring workflow differs from the default branch, so its artifacts are not trusted."""
 
@@ -385,11 +395,13 @@ def reported_base(reports):
 
 
 def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, status="pass", deadline=None,
-                       later_base=None, older_base=None, wait=True, source=None):
+                       later_base=None, older_base=None, wait=True, source=None, conflicting=None):
     """Compare against ``base_sha``. CI measures whatever base the target had at
     the push, so a caller may pass ``later_base(sha)`` to accept a report on a
     later base it approves. ``older_base(sha)`` requests an existing base refresh
     by raising OlderMeasuredBase instead of waiting for an impossible report.
+    ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
+    starts no CI for a head that conflicts with its base.
     A source supplies a tested merge train tip; validation stays here."""
     from foragent import ci_local, harness_guard
 
@@ -466,6 +478,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 from foragent import runner
 
                 _note_evidence(ctx, n, base_sha, head, _refusal(exc), f"{exc}\n{infrastructure}".strip())
+                if conflicting is not None and conflicting():
+                    raise ConflictingPR(head) from exc
                 remaining = min(deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
                 if infrastructure or remaining <= 0:
                     raise

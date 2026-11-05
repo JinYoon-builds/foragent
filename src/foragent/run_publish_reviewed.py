@@ -294,9 +294,10 @@ def _publish_reviewed_in_turn(
                     body=lambda: merge_retitle_body(pr.head, ctx), note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
-                run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
+                    with orch_stop.merging(ctx, n):  # A stop during the retitle merges nothing (#1491).
+                        run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
+                        ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
                     if exc.waits:
@@ -350,4 +351,4 @@ def _publish_reviewed_in_turn(
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish, size_signal  # noqa: E402
+from foragent import orch_stop, run_publish, size_signal  # noqa: E402

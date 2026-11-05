@@ -24,6 +24,8 @@ class Reason(StrEnum):
     ACCEPTANCE_BASELINE_UNAVAILABLE = "acceptance-baseline-unavailable"
     CI_NOT_STARTED = "ci-not-started"
     TEST_HARNESS_CHANGED = "test-harness-changed"
+    # The reviewer still found defects after the review budget (#2036): a design hold.
+    REVIEW_DEFECTS = "review-defects"
 
 
 GROUP: dict[Reason, str] = {
@@ -44,7 +46,11 @@ GROUP: dict[Reason, str] = {
     Reason.ACCEPTANCE_BASELINE_UNAVAILABLE: "tech-failure",
     Reason.CI_NOT_STARTED: "tech-failure",
     Reason.TEST_HARNESS_CHANGED: "review",
+    Reason.REVIEW_DEFECTS: "review",
 }
+
+# Holds a reviewer ended a run on (#2036): the only holds repeated_design_holds counts.
+REVIEWER_HOLDS = frozenset({Reason.REVIEW_DEFECTS, Reason.REVIEW_DISPUTE})
 
 APPROVAL_MARKER = "<!-- foragent:approved"
 REASON_CODE = r"[a-z-]+"

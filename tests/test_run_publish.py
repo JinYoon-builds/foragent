@@ -1146,3 +1146,35 @@ def test_finished_checks_without_start_metadata_keep_the_comparison_window(monke
     wait = run_publish._CIWait(start)
     assert run_publish._wait_for_ci(1, ctx, None, 2, "head", start, wait, pytest.fail, status=status) is None
     assert wait.deadline == start + 1200
+
+
+@pytest.mark.parametrize("answers, raises, sleeps", [
+    (["UNKNOWN", "UNKNOWN", "CONFLICTING"], True, 2),
+    (["MERGEABLE"] * 3, False, 3),
+    (None, False, 3),
+])
+def test_ci_wait_leaves_at_once_only_when_github_says_conflicting(monkeypatch, answers, raises, sleeps):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+    from foragent.ci_mode import ConflictingPR
+
+    clock, slept = [BASE_TIME], []
+    start = BASE_TIME.timestamp()
+
+    def sleep(value):
+        slept.append(value)
+        clock[0] += timedelta(seconds=value)
+        if len(slept) == 3:
+            raise StopIteration  # the wait would have continued
+    replies = list(answers or [])
+    conflicting = None if answers is None else (lambda: replies.pop(0) == "CONFLICTING")
+    ctx = SimpleNamespace(repo="owner/repo", now=lambda: clock[0], sleep=sleep,
+                          config=SimpleNamespace(checks_fallback="none"),
+                          tracker=SimpleNamespace(pr_checks=lambda pr: "pending", pr_head_sha=lambda pr: "head"))
+    monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    wait = run_publish._CIWait(start)
+    with pytest.raises(ConflictingPR if raises else StopIteration):
+        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=Path("/nonexistent")), 2, "head", start, wait,
+                                 pytest.fail, conflicting=conflicting)
+    assert len(slept) == sleeps
