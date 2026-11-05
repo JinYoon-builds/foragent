@@ -3,8 +3,46 @@
 import pytest
 
 from foragent import watch
+from foragent.config import Config
 from foragent.watch_data import Snapshot
+from foragent.watch_sections import lane_blocks, lane_bubble
+from helpers.cells import cells
 from test_watch import NOW
+
+
+@pytest.fixture
+def utf8(monkeypatch):
+    """A UTF-8 colour terminal, so the scene may draw pixels (glyph_mode reads these)."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.delenv("LC_CTYPE", raising=False)
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+
+
+def _text(line):
+    return "".join(value for value, _ in line)
+
+
+def _blocks(snapshot, config, width):
+    """The lane blocks as drawn (rows of text), their hits and their keyboard marks."""
+    hits, marks = [], []
+    out = lane_blocks.render(snapshot, config, ".", width=width, now=NOW, hits=hits, marks=marks)
+    return [_text(line) for line in out], hits, marks
+
+
+def _acorn_hits(hits):
+    """(row, x0, x1, number) of every acorn the frame can click, in drawing order."""
+    return [(y0, x0, x1, target[1]) for x0, y0, x1, _, target in hits if target[0] == "acorn"]
+
+
+def _running(numbers, **extra):
+    """One working lane whose running acorns are ``numbers``, each with a live run."""
+    row = {"slug": "work", "lane_display": "work", "state": "working", "issue": numbers[0], "phase": "implementing",
+           "running": [{"number": n, "title": "T"} for n in numbers], "queued": [], "held": []}
+    snapshot = _snapshot(row, worker_states={n: "working" for n in numbers}, **extra)
+    snapshot.status["active_runs"] = [{"number": n, "lane": "work", "status": "running", "phase": "implementing",
+                                       "started_at": NOW.isoformat()} for n in numbers]
+    return snapshot
 
 
 def _snapshot(row, **extra):
@@ -38,30 +76,46 @@ def test_a_held_question_for_a_running_issue_is_not_lost_to_deduplication():
     assert _classes(snapshot, row) == {1: "working", 2: "question"}
 
 
-def test_long_lane_metadata_keeps_the_step_time_and_warning_rows():
-    from foragent.watch_sections.lane_bubble import BODY_ROWS, _explanation_rows
+def test_long_lane_metadata_keeps_the_step_time_and_warning_rows(utf8):
+    from datetime import timedelta
 
-    found = [[("#5 Title", "bold")], [("lane " + ", ".join(f"area{n}/**" for n in range(40)), "")],
-             [("writing code", "")], [("12m", "")], [("quiet for 9m", "yellow")]]
-    rows = ["".join(value for value, _ in row) for row in _explanation_rows(found, 30, "…")]
+    from foragent.watch_sections.lane_bubble import BODY_ROWS
+
+    snapshot = _running([5], log_ages={5: 1800})
+    snapshot.status["lanes"]["work"]["running"] = [{"number": 5, "title": "Title"}]
+    snapshot.status["active_runs"][0]["phase_started_at"] = (NOW - timedelta(minutes=12)).isoformat()
+    config = Config(language="en", lanes={"work": {"paths": [f"area{n}/**" for n in range(40)]}})
+    # A 34-cell box without the sprite holds 30 cells of explanation.
+    out = lane_bubble.render(snapshot, config, ".", width=34, now=NOW, state={"explanation_target": ("acorn", 5)})
+    box = [_text(line) for line in out[:BODY_ROWS + 2]]
+    assert box[0].startswith("╭") and box[-1].startswith("╰")
+    rows = [text[2:-2].rstrip() for text in box[1:-1]]
+    rows = rows[:max(index for index, text in enumerate(rows) if text) + 1]
     assert len(rows) <= BODY_ROWS
-    assert rows[0] == "#5 Title" and rows[-3:] == ["writing code", "12m", "quiet for 9m"]
+    assert rows[0] == "#5 Title" and rows[-3:] == [
+        "writing code", "12m in this step", "? quiet for 30 min"], rows
     assert rows[1].startswith("lane") and rows[2].endswith("…") and len(rows) == BODY_ROWS
 
 
 @pytest.mark.parametrize("ascii_glyphs", [False, True])
-def test_oversized_first_acorns_still_leave_room_for_the_exact_omitted_count(ascii_glyphs):
-    from foragent.watch_sections.lane_blocks import _flow
-    from foragent.watch_art import sideways_acorn
-
-    mark = "..." if ascii_glyphs else "…"
-    units = [(sideways_acorn(100 + n, "write", "working", ascii=ascii_glyphs),
-              sideways_acorn(100 + n, "", "working", ascii=ascii_glyphs),
-              "quiet for 30 minutes, nothing written to the log", 100 + n) for n in range(10)]
-    lines, placed = _flow(units, 40, 2, [], mark)
-    texts = ["".join(value for value, _ in line) for line in lines]
-    assert all(watch._cells(text) <= 40 for text in texts), texts
-    assert texts[-1].endswith(f"{mark}{10 - len(placed)}") and len(placed) >= 2
+def test_oversized_first_acorns_still_leave_room_for_the_exact_omitted_count(utf8, ascii_glyphs):
+    # Ten working acorns, each with a long quiet warning, in a 40-cell pixel frame (26 cells
+    # of content beside the squirrel): two rows, then the exact count of the rest.
+    snapshot = _running(list(range(100, 110)), log_ages={n: 1800 for n in range(100, 110)})
+    texts, hits, _ = _blocks(snapshot, Config(language="en", lanes={"work": {}}), 40)
+    placed = _acorn_hits(hits)
+    assert all(cells(text) <= 40 for text in texts), texts
+    last = texts[max(y for y, *_ in placed)].rstrip()
+    assert last.endswith(f"…{10 - len(placed)}") and len(placed) >= 2, texts
+    if ascii_glyphs:
+        # ASCII glyphs are a text fallback: every acorn on its own row, none left to count.
+        config = Config(language="en", lanes={"work": {}}, view_glyphs="ascii")
+        texts, hits, _ = _blocks(snapshot, config, 40)
+        placed = _acorn_hits(hits)
+        assert all(cells(text) <= 40 for text in texts), texts
+        assert sorted(number for *_, number in placed) == list(range(100, 110))
+        assert len({y for y, *_ in placed}) == 10 and not any("..." + str(n) in "".join(texts)
+                                                               for n in range(1, 10)), texts
 
 
 @pytest.mark.parametrize("asked", ["listing", "needs-human"])
@@ -98,44 +152,43 @@ def test_marked_fit_shows_every_cut_and_leaves_fitting_lines_alone(ascii_glyphs)
     mark = "..." if ascii_glyphs else "…"
     line = [("LongLaneName" * 5, "bold"), (" ✓3", "green")]
     cut = "".join(value for value, _ in fit_marked(line, 40, mark))
-    assert watch._cells(cut) <= 40 and cut.endswith(mark) and cut.startswith("LongLaneName")
+    assert cells(cut) <= 40 and cut.endswith(mark) and cut.startswith("LongLaneName")
     assert fit_marked([("short", "")], 40, mark) == [("short", "")]
 
 
-def test_overlong_lane_and_idle_names_and_evidence_are_cut_with_the_mark():
-    from types import SimpleNamespace
-
-    from foragent.watch_sections.lane_blocks import _idle_block, _name_row
-
+def test_overlong_lane_and_idle_names_and_evidence_are_cut_with_the_mark(utf8):
+    # A working lane (its name row) and a resting one (the shared idle block), both named
+    # far wider than a 40-cell text frame, with merges today.
     long = "LongLaneName" * 5
-    config = SimpleNamespace(language="en", lanes={long: {}})
-    row = {"slug": long, "lane_display": long}
-    snapshot = _snapshot(row, today_done={long: 2})
-    line, _ = _name_row(snapshot, config, row, 40, "…")
-    text = "".join(value for value, _ in line)
-    assert text.endswith("…") and watch._cells(text) <= 40 and text.startswith("LongLaneName")
-    lines, hits = _idle_block(snapshot, config, [row], 40, (False, False, False))
-    names = "".join(value for value, _ in lines[-1])
-    assert names.endswith("…") and watch._cells(names) <= 40
-    assert hits and hits[0][4] == ("squirrel", long)
+    busy, idle = long + "A", long + "B"
+    working = {"slug": busy, "lane_display": busy, "state": "working", "issue": 1, "phase": "implementing",
+               "running": [{"number": 1, "title": "T"}], "queued": [], "held": []}
+    resting = {"slug": idle, "lane_display": idle, "state": "idle", "running": [], "queued": [], "held": []}
+    snapshot = _snapshot(working, today_done={busy: 2, idle: 2}, worker_states={1: "working"})
+    snapshot.status["lanes"] = {busy: working, idle: resting}
+    config = Config(language="en", lanes={busy: {}, idle: {}}, animation=False)
+    texts, hits, _ = _blocks(snapshot, config, 40)
+    text = next(text for text in texts if text.startswith("LongLaneName"))
+    assert text.rstrip().endswith("…") and cells(text) <= 40 and long[:20] in text
+    names = texts[-1].rstrip()
+    assert names.endswith("…") and cells(names) <= 40 and names.startswith("LongLaneName")
+    idle_hits = [hit for hit in hits if hit[1] == len(texts) - 1]
+    assert idle_hits and idle_hits[0][4] == ("squirrel", idle)
 
 
-def test_a_bar_label_wider_than_the_row_is_cut_with_the_mark():
-    from foragent.watch_sections.lane_bubble import _bar
-
+def test_a_bar_label_wider_than_the_row_is_cut_with_the_mark(utf8):
     row = {"slug": "work", "running": [], "queued": [], "held": []}
     snapshot = _snapshot(row, today=8)
     snapshot.status["issues"] = {"running": [{"number": 1}, {"number": 2}]}
-    text = "".join(value for value, _ in _bar(snapshot, "en", 12, "…")[0])
-    assert text.endswith("…") and watch._cells(text) <= 12 and text.startswith("80%")
+    # The bar follows the bubble, as its last row.
+    out = lane_bubble.render(snapshot, Config(language="en", lanes={"work": {}}), ".", width=12, now=NOW)
+    text = _text(out[-1])
+    assert text.endswith("…") and cells(text) <= 12 and text.startswith("80%")
 
 
 @pytest.mark.parametrize("fallback", ["animation-off", "ascii", "non-utf8", "narrow"])
 def test_every_text_fallback_gives_each_acorn_its_own_selectable_row(monkeypatch, fallback):
     from types import SimpleNamespace
-
-    from foragent.watch_scene import lane_items
-    from foragent.watch_sections.lane_blocks import _block, _modes
 
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.delenv("LC_ALL", raising=False)
@@ -147,68 +200,57 @@ def test_every_text_fallback_gives_each_acorn_its_own_selectable_row(monkeypatch
            "running": [{"number": n, "title": "T"} for n in (101, 102, 103)],
            "queued": [{"number": n, "title": "N"} for n in (201, 202, 203)], "held": []}
     snapshot = _snapshot(row, worker_states={101: "working", 102: "working", 103: "working"})
-    current, upcoming = lane_items(snapshot, row)
     width = 30 if fallback == "narrow" else 160
-    modes = _modes(config, width)
-    assert not modes[0], "every case is a text fallback"
-    lines, hits, marks, _ = _block(snapshot, config, row, current, upcoming, width, 0, NOW, modes)
+    texts, hits, marks = _blocks(snapshot, config, width)
+    # A text fallback draws no squirrel art: the lane name's one row is the squirrel's hit.
+    squirrels = [(y1 - y0, target) for _, y0, _, y1, target in hits if target[0] == "squirrel"]
+    assert squirrels == [(1, ("squirrel", "work"))], "every case is a text fallback"
     numbers = (101, 102, 103, 201, 202, 203)
-    assert sorted(number for _, number in marks) == sorted(numbers), "each acorn is reachable by keyboard"
+    assert sorted(number for _, number, _ in marks) == sorted(numbers), "each acorn is reachable by keyboard"
     for number in numbers:
-        rows = [text for text in ("".join(value for value, _ in line) for line in lines) if f"#{number}" in text]
+        rows = [text for text in texts if f"#{number}" in text]
         assert len(rows) == 1 and sum(f"#{n}" in rows[0] for n in numbers) == 1, (number, rows)
-    assert {target for *_, target in hits} == {("acorn", n) for n in numbers}
+    assert {target for *_, target in hits if target[0] == "acorn"} == {("acorn", n) for n in numbers}
 
 
 @pytest.mark.parametrize("ascii_glyphs", [True, False])
 @pytest.mark.parametrize("width", [8, 10, 12])
-def test_narrow_acorns_keep_their_complete_id_before_the_step_word_or_the_prefix(ascii_glyphs, width):
-    from foragent.watch_art import sideways_acorn
-    from foragent.watch_sections.lane_blocks import _flow
-
-    mark = "..." if ascii_glyphs else "…"
-    units = [(sideways_acorn(n, word, style, ascii=ascii_glyphs), sideways_acorn(n, "", style, ascii=ascii_glyphs),
-              "", n) for n, word, style in ((1062, "write", "working"), (1063, "", "next"))]
-    for prefix in ([], [("next  ", "dim")]):
-        lines, placed = _flow(units, width, 2, prefix, mark, 1)
-        texts = ["".join(value for value, _ in line) for line in lines]
-        assert all(watch._cells(text) <= width for text in texts), texts
-        for number in (1062, 1063):
-            rows = [index for index, text in enumerate(texts) if f"#{number}" in text]
-            assert len(rows) == 1, (number, texts)
-            assert [entry[3] for entry in placed if entry[0] == rows[0]] == [number]
-        assert not any(text.rstrip().endswith(("#10", "#106")) for text in texts), texts
+def test_narrow_acorns_keep_their_complete_id_before_the_step_word_or_the_prefix(utf8, ascii_glyphs, width):
+    # A working acorn with a step word (no prefix) and a queued one under the "next" prefix.
+    snapshot = _running([1062])
+    snapshot.status["lanes"]["work"]["queued"] = [{"number": 1063, "title": "N"}]
+    config = Config(language="en", lanes={"work": {}}, view_glyphs="ascii" if ascii_glyphs else "auto")
+    texts, hits, _ = _blocks(snapshot, config, width)
+    placed = _acorn_hits(hits)
+    assert all(cells(text) <= width for text in texts), texts
+    for number in (1062, 1063):
+        rows = [index for index, text in enumerate(texts) if f"#{number}" in text]
+        assert len(rows) == 1, (number, texts)
+        assert [entry[3] for entry in placed if entry[0] == rows[0]] == [number]
+    assert not any(text.rstrip().endswith(("#10", "#106")) for text in texts), texts
 
 
-def test_an_id_wider_than_the_row_is_cut_with_the_mark_not_silently():
-    from foragent.watch_art import sideways_acorn
-    from foragent.watch_sections.lane_blocks import _flow
-
-    units = [(sideways_acorn(1062, "write", "working", ascii=True), sideways_acorn(1062, "", "working", ascii=True),
-              "", 1062)]
-    lines, placed = _flow(units, 5, 1, [], "...", 1)
-    text = "".join(value for value, _ in lines[0])
-    assert text.endswith("...") and watch._cells(text) <= 5 and placed[0][3] == 1062
+def test_an_id_wider_than_the_row_is_cut_with_the_mark_not_silently(utf8):
+    texts, hits, _ = _blocks(_running([1062]), Config(language="en", lanes={"work": {}}, view_glyphs="ascii"), 5)
+    placed = _acorn_hits(hits)
+    text = texts[placed[0][0]]
+    assert text.endswith("...") and cells(text) <= 5 and [entry[3] for entry in placed] == [1062]
 
 
-def test_an_id_that_fits_beside_the_count_is_drawn_not_counted():
-    from foragent.watch_art import sideways_acorn
-    from foragent.watch_sections.lane_blocks import _flow
-
-    units = [(sideways_acorn(n, "write", "working", ascii=True), sideways_acorn(n, "", "working", ascii=True),
-              "", n) for n in (1062, 1063, 1064)]
-    lines, placed = _flow(units, 14, 2, [], "...", 1)
-    texts = ["".join(value for value, _ in line) for line in lines]
+def test_an_id_that_fits_beside_the_count_is_drawn_not_counted(utf8):
+    # A 40-cell pixel frame leaves 26 cells beside the squirrel: one acorn a row, and the
+    # second (last) row still draws its acorn beside the count of the one left out.
+    texts, hits, _ = _blocks(_running([1062, 1063, 1064]), Config(language="en", lanes={"work": {}}), 40)
+    placed = _acorn_hits(hits)
     assert [entry[3] for entry in placed] == [1062, 1063]
-    assert "[#1063]" in texts[1] and texts[1].endswith("...1") and watch._cells(texts[1]) <= 14
+    second = texts[placed[1][0]]
+    assert placed[1][0] == placed[0][0] + 1 and "#1063" in second
+    assert second.rstrip().endswith("…1") and cells(second) <= 40
 
 
 @pytest.mark.parametrize("listing", ["running", "held", "queued", "facts-only"])
 @pytest.mark.parametrize("pixels", [False, True])
-def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_overflow(listing, pixels):
-    from foragent.config import Config
-    from foragent.watch_scene import lane_items
-    from foragent.watch_sections.lane_blocks import _block
+def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_overflow(utf8, listing, pixels):
 
     row = {"slug": "work", "lane_display": "work", "state": "idle", "issue": None,
            "running": [], "held": [], "queued": [{"number": n, "title": "Next"} for n in range(40)]}
@@ -217,20 +259,22 @@ def test_authored_waits_keep_their_acorn_and_all_explanation_rows_outside_flow_o
     snapshot = _snapshot(row, waiting_facts={999: {"lane": "work", "title": "Authored wait", "authored": {
         "text": "Canonical wait", "reason": "Choice  pending", "next_condition": "Record choice",
         "responsible_role": "orchestrator"}}})
-    config = Config(language="en", lanes={"work": {}})
-    current, upcoming = lane_items(snapshot, row)
-    lines, hits, marks, _ = _block(snapshot, config, row, current, upcoming, 60, 0, NOW,
-                                  (pixels, not pixels, False))
-    text = "\n".join("".join(value for value, _ in line) for line in lines)
+    # Pixels draw 60 cells of content beside the squirrel; the text case uses ASCII glyphs.
+    config = Config(language="en", lanes={"work": {}}, view_glyphs="auto" if pixels else "ascii")
+    left = lane_blocks.CONTENT_FROM if pixels else 0
+    texts, hits, marks = _blocks(snapshot, config, 60 + left)
+    lines = [text[left:] for text in texts]
+    # The block starts under its rule; the orchestrator line above it is not the block's.
+    text = "\n".join(lines[next(index for index, line in enumerate(texts) if line.startswith(("-", "━"))):])
     own = [hit for hit in hits if hit[-1] == ("acorn", 999)]
-    assert len(own) == 1 and [number for _, number in marks].count(999) == 1
+    assert len(own) == 1 and [number for _, number, _ in marks].count(999) == 1
     y = own[0][1]
-    assert "#999" in "".join(value for value, _ in lines[y])
-    assert ["".join(value for value, _ in line).strip() for line in lines[y + 1:y + 4]] == [
+    assert "#999" in lines[y]
+    assert [line.strip() for line in lines[y + 1:y + 4]] == [
         "Waiting: Choice  pending", "Next: Record choice", "Owner: orchestrator"]
     for phrase in ("Choice  pending", "Record choice", "orchestrator"):
         assert text.count(phrase) == 1
-    assert all(sum(watch._cells(value) for value, _ in line) <= 60 for line in lines)
+    assert all(cells(line) <= 60 for line in lines)
 
 
 def test_authored_wait_uses_its_recorded_lane_when_a_listing_still_names_another_lane():
@@ -255,16 +299,18 @@ def _run(number):
 
 
 def _acorn_and_click(snapshot, tmp_path, number):
-    from foragent.config import Config
-    from foragent.watch_sections.lane_blocks import _word
-    from foragent.watch_scene import lane_items
+    """The word the drawn acorn says beside its number, and the click's explanation."""
+    import re
+
     from foragent.watch_sections.lane_bubble import explain
 
-    row = snapshot.status["lanes"]["work"]
-    current, upcoming = lane_items(snapshot, row)
-    item = next(item for item in current + upcoming if item["number"] == number)
+    # ASCII acorns print as [#N word] in a wide text frame, one acorn per row.
+    config = Config(language="en", lanes={"work": {}}, view_glyphs="ascii")
+    texts, _, _ = _blocks(snapshot, config, 160)
+    words = [found.group(1) for text in texts for found in re.finditer(rf"\[#{number}(?: ([^\]]*))?\]", text)]
+    assert len(words) == 1, texts
     rows = explain(("acorn", number), snapshot, Config(language="en"), tmp_path, now=NOW, width=70, state={})
-    return _word(item, "en"), "\n".join("".join(value for value, _ in line) for line in rows)
+    return words[0] or "", "\n".join("".join(value for value, _ in line) for line in rows)
 
 
 @pytest.mark.parametrize("with_run", [True, False], ids=["active-run", "listed-only"])

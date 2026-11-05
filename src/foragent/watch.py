@@ -31,7 +31,7 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, collection_root, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, activity, render_frame
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
