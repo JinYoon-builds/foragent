@@ -11,7 +11,7 @@ Record (``<state>/prepare/<order id>.json``)::
     {"plan": "<order id>", "issues": {"<key>": {
         "key", "status", "phase", "questions", "notes", "reason", "updated_at",
         "base_revision", "scratch", "cycle", "written": {path: text}, "done_when": [command],
-        "ignored": [tool output directory], "coverage", "red",
+        "ignored": [tool output path], "coverage", "red",
         "attempts": [{"attempt", "role": "writer", "cycle", "started_at", "finished_at", "status",
                       "base_revision", "scratch", "executor", "model", "options", "log",
                       "exit_code", "timed_out", "session_id", "written", "done_when",
@@ -138,7 +138,9 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
     offending path is a QUESTION either way, and partial candidates are kept as facts only.
     """
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
-    candidates, refused, ignored = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
+    discarded = []
+    candidates, refused, ignored = order_scratch.changes(
+        git, tree, manifest, config.acceptance_dir, protected, before, discarded=discarded)
     written, questions = {}, [say("prepare_refused_path", path=name, directory=config.acceptance_dir)
                               for name in refused]
     for name, data in candidates.items():
@@ -146,14 +148,15 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
             written[name] = data.decode("utf-8")
         except UnicodeDecodeError:
             questions.append(say("prepare_not_text", path=name))
-    facts = {"written": written, "refused": refused, "ignored": ignored, "done_when": [], "notes": []}
+    facts = {"written": written, "refused": refused, "ignored": ignored, "done_when": [],
+             "notes": [f"discarded stray file {name}" for name in discarded]}
     if questions:
         return facts | {"status": "question", "questions": questions, "reason": say("prepare_question")}
     if failure is not None:
         return facts | failure
     reply = _envelope(result.last_message or "")
     facts["done_when"] = reply["done_when"] if reply else []
-    facts["notes"] = reply["notes"] if reply else []
+    facts["notes"].extend(reply["notes"] if reply else [])
     if reply and reply["questions"]:
         return facts | {"status": "question", "questions": reply["questions"], "reason": say("prepare_question")}
     if reply is None:
