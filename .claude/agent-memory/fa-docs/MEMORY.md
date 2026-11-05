@@ -25,9 +25,7 @@
 - r672 (2026-11-04): orders #1634/#1837/#1958 — README:81/:159 terminal list add Ghostty (#1959). Wait: orchestrator judges, then docs edits.
 - r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
-- r749 (2026-11-05): orders #1704/#1740/#1775/#1984/#2012/#2049/#2051 — README en/ko one sentence for `fa review <branch>` (#1873, contributor PRs). Wait: orchestrator judges; also when #1492 (fa stop) merges, check README team section 'stop the affected factories'.
-- r759 (2026-11-05): orders #1205/#1211/#1706/#1719/#1759/#1858 — add #1206 Done-when executable refusal to docs/order.md after collection paragraph (~:192). Wait: orchestrator judges.
-- r767 (2026-11-05): orders #1705/#1853/#1855/#1881/#1953/#2079 — duplicate '### D125' (#1856 review rule :946 vs #1472 merge-owner switch-on :1028); renumber later to D126 + mechanisms.md:34; README :77/:166 add `fa stop`. Wait: orchestrator judges.
+- r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
@@ -88,3 +86,5 @@
 - Children 'Remove superseded #NNNN locked tests (superseded by #MMMM)' (e.g. #1208/#1760/#1859 → #1970 merge trains) mean the child's code never landed as specced; check only the superseding PR.
 - Orders landing in one merge batch can each take the 'next free' Dnn from the same base; after batch merges run `grep '^### D' docs/decisions.md | sort | uniq -d` style check (#1856 vs #1472 both D125).
 - docs/mechanisms.md (#1472) is the docs owner's map, rewritten in place per merge group; check merge-path/role entries against each order's diff and its D-citations.
+- Before any docs write, run `gh pr list` for foragent/batch-merge-* branches; an open one blocks writing even when it touches no docs. Record exact texts in the wait request so the next call only applies them.
+- When applying a wait's 'exact texts', re-read each accepted answer first: the orchestrator's answer can change wording (r749 → /fa phrasing, Jin q7) and override the text the wait recorded. When renumbering a Dnn, grep every doc for the old ID, not only the citations the wait lists (gate.md:149 was missed).

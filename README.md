@@ -2,7 +2,7 @@
 
 > Your agent forages for the next task.
 
-Stock Claude Code is already good at finishing one task. Foragent automates the part **between tasks**: when one task ends, it runs the done-when commands, sends the change to an adversarial review, merges it when it passes, and picks up the next issue by itself. You decide what to build and approve it once.
+Stock Claude Code is already good at finishing one task. Foragent automates the part **between tasks**: when one task ends, it runs the done-when commands, sends the change to an adversarial review, merges it when it passes, and picks up the next issue by itself. You decide what to build and approve it once. git and GitHub are the source of truth; Foragent keeps only what they cannot know.
 
 ```
 task ends → done-when commands → adversarial review → merge → next issue
@@ -57,6 +57,8 @@ A lane is an agent that owns one area of your code, for example `src/foragent/or
 
 ## Runs on stock Claude Code
 
+`fa init` includes a **UX researcher** role that tests user flows by playing one to three target personas, starting from the README. Findings go through the orchestrator after a second session confirms them. Persona testing does not replace research with real users.
+
 Foragent does not replace Claude Code. It uses what stock Claude Code already has:
 
 - **Lanes are `.claude/agents`.** Each lane is a plain agent file, `.claude/agents/fa-<lane>.md`.
@@ -91,13 +93,15 @@ These limits are known. Each item names the file where a change would start.
 - **Codex-only setups are not supported yet.** Foragent runs on Claude Code; Codex CLI is optional. Running with Codex CLI and without Claude Code is not supported at launch. Start at `config.resolved_reviewer` (the default reviewer) and `orch_spawn` (`src/foragent/orch_spawn.py`, which starts the orchestrator with `claude`).
 - **The background gate is macOS only.** It runs as a launchd service. A Linux service (for example systemd) is not written yet. Start at `src/foragent/launchd.py`.
 - **Native Windows is not supported yet.** WSL will follow the Linux gate when it exists. Start at `src/foragent/launchd.py`.
-- **Terminal switching works only in Orca.** Foragent opens the dashboard beside your session in tmux, WezTerm, kitty, iTerm2 or Terminal, but only Orca lets it switch back to the terminal it opened before. Other terminals open a new split instead. Start at `src/foragent/watch_open.py`.
+- **Terminal switching works only in Orca.** Foragent opens the dashboard beside your session in tmux, WezTerm, kitty, Ghostty, iTerm2 or Terminal, but only Orca lets it switch back to the terminal it opened before. Other terminals open a new split instead. Start at `src/foragent/watch_open.py`.
 - **One factory per person per repository.** Two machines signed in as the same person would both work that person's issues. Run one gate per person. Start at `src/foragent/ownership.py`.
 - **Update checks always use the main repository.** A fork still checks `JinYoon-builds/foragent` for updates and installs from it. Start at `src/foragent/update_check.py`.
 
+To review a contributor's PR or a branch you wrote with the full review panel, check it out locally and ask /fa to review it; it shows the verdict and findings and changes nothing (the command underneath is `fa review <branch>`).
+
 ## 한국어
 
-순정 Claude Code는 이미 작업 하나를 잘 끝내요. Foragent는 **작업과 작업 사이**를 자동화해요. 작업이 끝나면 완료 확인 명령을 돌리고, 변경을 적대적 리뷰에 보내고, 통과하면 합치고, 다음 이슈를 스스로 가져와요. 사람은 무엇을 만들지 정하고 한 번 승인해요.
+순정 Claude Code는 이미 작업 하나를 잘 끝내요. Foragent는 **작업과 작업 사이**를 자동화해요. 작업이 끝나면 완료 확인 명령을 돌리고, 변경을 적대적 리뷰에 보내고, 통과하면 합치고, 다음 이슈를 스스로 가져와요. 사람은 무엇을 만들지 정하고 한 번 승인해요. git과 GitHub가 원본이에요. Foragent는 그 둘이 모르는 것만 따로 가져요.
 
 ```
 작업이 끝남 → 완료 확인 명령 → 적대적 리뷰 → 머지 → 다음 이슈
@@ -146,6 +150,8 @@ executors: [{name: claude, quota: api, spend_cap: <하루 USD>}]
 
 ### 순정 Claude Code 위에서 돌아요
 
+`fa init`은 **UX 리서처** 역할도 준비해요. README에서 시작해 대상 페르소나 1~3명을 연기하며 사용 흐름을 시험해요. 발견한 문제는 두 번째 세션에서 확인한 뒤 오케스트레이터를 통해 전달해요. 페르소나 시험이 실제 사용자를 대상으로 한 리서치를 대신하지는 않아요.
+
 Foragent는 Claude Code를 대신하지 않아요. 순정 Claude Code에 이미 있는 것을 써요.
 
 - **레인은 `.claude/agents`예요.** 레인마다 평범한 에이전트 파일 `.claude/agents/fa-<lane>.md`가 있어요.
@@ -180,9 +186,11 @@ Foragent를 쓰는 데 이 명령들은 필요 없어요. `/fa`가 대신 실행
 - **Codex만으로는 아직 못 써요.** Foragent는 Claude Code 위에서 돌고 Codex CLI는 선택이에요. Claude Code 없이 Codex CLI만으로 돌리는 것은 출시 때 지원하지 않아요. `config.resolved_reviewer`(기본 리뷰어)와 `orch_spawn`(`src/foragent/orch_spawn.py`, `claude`로 오케스트레이터를 시작해요)에서 시작해요.
 - **백그라운드 gate는 macOS에서만 돌아요.** launchd 서비스로 돌아요. Linux 서비스(예: systemd)는 아직 없어요. `src/foragent/launchd.py`에서 시작해요.
 - **Windows는 아직 지원하지 않아요.** WSL은 Linux gate가 생기면 따라가요. `src/foragent/launchd.py`에서 시작해요.
-- **터미널 전환은 Orca에서만 돼요.** Foragent는 tmux, WezTerm, kitty, iTerm2, Terminal에서 세션 옆에 대시보드를 열어요. 하지만 전에 열었던 터미널로 돌아가는 것은 Orca에서만 돼요. 다른 터미널은 새 분할 창을 열어요. `src/foragent/watch_open.py`에서 시작해요.
+- **터미널 전환은 Orca에서만 돼요.** Foragent는 tmux, WezTerm, kitty, Ghostty, iTerm2, Terminal에서 세션 옆에 대시보드를 열어요. 하지만 전에 열었던 터미널로 돌아가는 것은 Orca에서만 돼요. 다른 터미널은 새 분할 창을 열어요. `src/foragent/watch_open.py`에서 시작해요.
 - **한 사람은 저장소마다 공장 하나예요.** 같은 사람으로 로그인한 두 컴퓨터는 둘 다 그 사람의 이슈를 일해요. 사람마다 gate 하나만 돌리세요. `src/foragent/ownership.py`에서 시작해요.
 - **업데이트 확인은 늘 원래 저장소를 봐요.** 포크도 `JinYoon-builds/foragent`에서 업데이트를 확인하고 설치해요. `src/foragent/update_check.py`에서 시작해요.
+
+외부 기여자의 PR이나 직접 쓴 브랜치는 로컬에 받아 /fa에 검토를 맡겨요. 판정과 지적만 보여 주고 아무것도 바꾸지 않아요(안에서 쓰는 명령은 `fa review <브랜치>`).
 
 ### 문서
 
