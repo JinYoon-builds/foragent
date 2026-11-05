@@ -67,18 +67,13 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 - Review judges by tests, goal, principles and real defects. Other approaches, names and structure are taste: a NOTE, never a failure. ([D98](decisions.md#d98-무엇what은-계획이-어떻게how는-레인이-정한다-2026-10-30-jin))
 - The first review round is multi-perspective. Later rounds only confirm. ([D105](decisions.md#d105-첫-리뷰는-여러-관점으로-다음-회차는-확인만-2026-10-31-jin))
+- A review FAIL blocks only when it is grounded (Goal or Out of scope line, locked test, breaking input) and scores 80+; a grounded fatal path always blocks; the rest is a NOTE. ([D125](decisions.md#d125-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
+- When the Goal does not decide a point, review asks a spec-question instead of sending rework. ([D125](decisions.md#d125-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
 - An unclear review goes verbatim to the implementer, who fixes or answers each point. A new reviewer judges. ([D44](decisions.md#d44-문제는-가장-가까운-층이-먼저-푼다-2026-10-21-jin))
 - When the same issue comes back twice for the same defect class, redesign it. ([D106](decisions.md#d106-같은-종류의-결함으로-두-번-돌아오면-다시-설계한다-2026-10-31-jin))
 - A PR that touches a risk-map path gets that note and a stricter review. ([D84](decisions.md#d84-리뷰어를-강화한다--프로젝트마다-자라는-위험-지도-2026-10-24-jin))
 - The nearest layer solves first: issue problems go to the lane, system problems to the orchestrator, person-only decisions to Jin. ([D43](decisions.md#d43-오케스트레이터가-기술-문제를-먼저-처리한다-2026-10-21-jin), [D44](decisions.md#d44-문제는-가장-가까운-층이-먼저-푼다-2026-10-21-jin))
 - Review strength follows reversibility. `always_human` paths, `risk:high`, deploys and public releases go to a person. ([D10](decisions.md#d10-검수-강도는-되돌릴-수-있는-정도로-정한다))
-### Review findings are scored (#1651)
-
-- Every reviewer FAIL finding, in any round (single reviewer, panel merge or confirmation), gets one fresh scoring session with the reviewer, run one at a time. The scorer follows skills/review-procedure (the code-review plugin's 0-100 table and false-positive list, Apache-2.0).
-- Grounding rule: a finding blocks only when it is grounded (a line quoted from the Goal or Out of scope, a locked acceptance test file that exists under the acceptance directory, or a concrete breaking input) and scores 80 or more. A grounded fatal-path finding (data loss, breaking main, merge without approval, a person-only permission handed to an agent) blocks whenever the path exists, whatever its score. Everything else is a NOTE with its score, kept as a `review-score` event and `runs/issue-N/score-R-K.txt`. A reply without a valid score keeps the FAIL.
-- When the scorer says the Goal does not decide the point (`spec_question`), the run stops with a spec-question to the planning side, like a locked-test conflict; it is not rework.
-- Panel fact: the perspective panel still runs only on a first round with a risk note; its defaults are rule-documents, obvious-bugs, git-history, earlier-pr-comments, code-comments and fatal-path.
-- `review_scoring: false` in .foragent.yml turns scoring off.
 
 ## Roles
 
