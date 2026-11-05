@@ -256,6 +256,11 @@ def test_unreadable_machine_state_is_not_reported_as_a_slot_exit(case, monkeypat
 
 def test_slot_wait_is_an_idle_phase_with_visible_words():
     assert not capacity.phase_holds_slot(capacity.RUN_SLOT_WAIT_PHASE)
+    from foragent.watch_sections import lane_blocks
+
+    worker = {"number": 7, "class": "wait", "phase": capacity.RUN_SLOT_WAIT_PHASE, "state": "working"}
     for language in ("en", "ko"):
-        assert text("lane_blocks_word_run-slot-wait", language)
+        # D112: the acorn only says it waits; the click bubble names the machine slot.
+        assert lane_blocks._word(worker, language) == text("lane_blocks_word_wait", language)
+        assert text(capacity.RUN_SLOT_WAIT_PHASE, language)
         assert text("scorecard_label_phase_run-slot-wait", language)
