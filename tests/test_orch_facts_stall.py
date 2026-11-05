@@ -70,8 +70,10 @@ def test_free_lanes_exclude_busy_ones_and_count_main(env):
     assert held == {}
     approve(store, 4, "osprey", ["src/osprey-two.py"])
     current, held = supply(store, root)
-    assert held == {} and current["startable"] == 3, "A start in busy osprey feeds no free lane"
+    assert held == {} and current["startable"] == 4, (
+        "Startable is every waiting issue the replay does not hold, whatever its lane: one replay, no second count")
     store.update_local_issue(3, labels=["approved"])
+    store.update_local_issue(4, labels=["approved", "lane:osprey"])
     assert supply(store, root)[0] == {"free_lanes": ["heron", "kestrel", "main"], "startable": 2, "short": True}
 
 
@@ -316,3 +318,55 @@ def test_orchestrator_receives_one_signal_per_stall_kind():
     signals = orch_role_raise._signals("orchestrator", {"signals": []}, config)
     assert [signal["kinds"] for signal in signals] == [[kind] for kind in orch_facts_stall.KINDS]
     assert orch_role_raise._signals("docs", {"signals": []}, config) == []
+
+
+def park_marker(store, number, why):
+    store.update_local_issue(number, title=f"Parked {number}", labels=["lane:heron"], state="open")
+    store.queue_github_write(number, "comment", body=f"<!-- foragent:orch kind=parked -->\n#{number}: parked; why: {why}")
+
+
+def test_park_reason_naming_a_gate_merged_pr_is_resolved_by_every_gate_record(tmp_path):
+    """Goal (3): a park reason names an issue or PR that has since merged or closed. A PR merged by
+    the gate counts through any record the gate keeps of it; a PR merged outside the gate does not."""
+    clock = [BASE_TIME]
+    store = store_at(tmp_path, clock)
+    # The merge owner merged PR #700 for issue #600 (an owner merge fact on its run).
+    store.update_local_issue(600, title="Merge owner", labels=["lane:heron"], state="open")
+    store.start_run(600, branch="foragent/issue-600", worktree=store.worktree_path(600), lane="heron")
+    store.record_owner_merge(600, store.get_run(600).started_at, {
+        "pr": 700, "target": "main", "head": "abc", "merged_at": (BASE_TIME + timedelta(minutes=1)).isoformat()})
+    park_marker(store, 501, "Replaced by the merge owner; revisit when PR #700 merges")
+    # Issue #610's own gate PR #710 shows merged on its row.
+    store.update_local_issue(610, title="Row merge", labels=[], state="open", pr_number=710, merged=True)
+    park_marker(store, 502, "Waits for #710")
+    # The merged-PR listing: #720 from a gate branch, #730 from an outside branch.
+    store.record_merged_pr_listing({"watermark": BASE_TIME.isoformat(), "prs": [
+        {"number": 720, "head": "foragent/issue-620", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"},
+        {"number": 730, "head": "someone/feature", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"}]})
+    park_marker(store, 503, "Waits for #720")
+    park_marker(store, 504, "Waits for #730, merged outside the gate")
+    # A closed PR row and another repository's closed issue are not this repository's closed issues.
+    store.update_local_issue(740, title="PR row", labels=[], state="closed", is_pull_request=True)
+    store.update_local_issue(750, title="Closed here", labels=[], state="closed")
+    park_marker(store, 505, "Waits for #740")
+    park_marker(store, 506, "Waits for other/repo#750")
+    park_marker(store, 507, "Waits for #750")
+    # This repository named in full: a qualified reference or a GitHub URL, to an issue or a gate PR.
+    park_marker(store, 508, "Wait for owner/repo#750")
+    park_marker(store, 509, "Wait for Owner/Repo#700")
+    park_marker(store, 510, "Wait for https://github.com/owner/repo/pull/720")
+    park_marker(store, 511, "Wait for https://github.com/owner/repo/issues/750")
+    park_marker(store, 512, "Wait for https://github.com/other/repo/issues/750")
+    expected = {"#501": ["#700"], "#502": ["#710"], "#503": ["#720"], "#507": ["#750"],
+                "#508": ["#750"], "#509": ["#700"], "#510": ["#720"], "#511": ["#750"]}
+    assert orch_facts_stall.park_resolved_numbers(store, "owner/repo") == {"parked": expected}
+    # Without a known repository only bare references can be this repository's.
+    assert set(orch_facts_stall.park_resolved_numbers(store)["parked"]) == {"#501", "#502", "#503", "#507"}
+
+
+def test_facts_pass_the_configured_repository_to_the_park_lookup(env):
+    store, root = env
+    store.update_local_issue(750, title="Closed here", labels=[], state="closed")
+    park_marker(store, 508, "Wait for owner/repo#750")
+    facts = orch_facts.collect(store, Config(repo="owner/repo"), root)
+    assert facts["kind_numbers"]["park_resolved"] == {"parked": {"#508": ["#750"]}}

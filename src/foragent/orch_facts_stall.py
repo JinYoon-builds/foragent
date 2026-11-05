@@ -31,22 +31,18 @@ KINDS = ("supply_low", "request_stuck", "park_resolved")
 HELD = {BLOCKED, NEEDS_HUMAN, WAITING_PERSON}
 
 
-def supply(config: Config, running: list[Run], waiting, work: dict[str, Any]) -> dict[str, Any]:
-    """Free lanes and the approved issues the gate's admission would start in them now.
+def supply(config: Config, running: list[Run], work: dict[str, Any]) -> dict[str, Any]:
+    """Free lanes and the waiting issues the admission replay does not hold.
 
-    ``work`` is the read-only replay of the tick's start loop (``orch_facts_resources._admission``,
-    which decides through ``scheduler_start.local_hold``, the loop's own rule): every issue it holds
-    (a cap, a lane pause, dream or quota hold, plan width, labels, a recorded blocker, the file rule
-    or an exclusive reservation, a GitHub wait, run hours or critical memory) is not startable. A
-    free lane has no live run; only admitted issues of free lanes count, since a start in a busy lane
-    feeds no free one. ``short``: fewer startable issues than free lanes.
+    ``work`` is `fa orch facts`' one admission replay (``resources.parallelizable_work``, from
+    ``orch_facts_resources._admission``): startable is its ``waiting_issues`` minus its ``held``,
+    the same answer facts prints under held, with no second count. A free lane has no live run.
+    ``short``: fewer startable issues than free lanes.
     """
     free = sorted((set(config.lanes) | {"main"}) - {run.lane or "main" for run in running})
-    lanes = {item.number: item.lane for item in waiting}
     held = set(work.get("held") or {})
-    admitted = [number for number in work.get("waiting_issues") or []
-                if str(number) not in held and lanes.get(number) in free]
-    return {"free_lanes": free, "startable": len(admitted), "short": len(admitted) < len(free)}
+    startable = [number for number in work.get("waiting_issues") or [] if str(number) not in held]
+    return {"free_lanes": free, "startable": len(startable), "short": len(startable) < len(free)}
 
 
 def _unapproved_ready(store: StateStore) -> int:
@@ -151,24 +147,61 @@ def _park_reason(store: StateStore, row: dict[str, Any]) -> str | None:
     return max(markers)[2] if markers else None
 
 
-def park_resolved_numbers(store: StateStore) -> dict[str, Any]:
-    """Parked issues whose park reason names another issue that is now closed: parked -> that issue."""
+# GitHub's ways to name an issue or PR in text: `#N`, `owner/name#N` and an issue or PR URL.
+_REFERENCE = re.compile(
+    r"(?:https?://github\.com/(?P<url>[\w.-]+/[\w.-]+)/(?:issues|pull)/(?P<url_n>\d+)"
+    r"|(?<![\w/.-])(?P<slug>[\w.-]+/[\w.-]+)#(?P<slug_n>\d+)"
+    r"|(?<![\w/.-])#(?P<bare_n>\d+))\b")
+
+
+def references(text: str, repo: str | None) -> list[int]:
+    """This repository's issue and PR numbers a text names, in order: a bare `#N`, and `owner/name#N`
+    or a GitHub URL whose owner/name is ``repo`` (any case). Another repository's references are left out."""
+    own = (repo or "").casefold()
+    found = []
+    for match in _REFERENCE.finditer(text):
+        if match["bare_n"]:
+            found.append(int(match["bare_n"]))
+        elif (slug := match["slug"] or match["url"]) and own and slug.casefold() == own:
+            found.append(int(match["slug_n"] or match["url_n"]))
+    return found
+
+
+def _resolved(store: StateStore, rows: list[dict[str, Any]]) -> set[int]:
+    """Numbers whose work is over, from what the gate records: issues now closed, and PRs the gate
+    merged (an issue row's own branch PR marked merged, a merge owner fact, or a gate-branch PR in
+    the merged-PR listing). A PR merged outside the gate is not here; neither is a PR row itself."""
+    from foragent.tracker import pr_issue_number
+
+    resolved = {row["number"] for row in rows if row.get("state") == "closed" and not row.get("is_pull_request")}
+    resolved |= {row["pr_number"] for row in rows if row.get("merged") and type(row.get("pr_number")) is int}
+    resolved |= {fact["pr"] for fact in store.owner_merge_facts().values() if type(fact.get("pr")) is int}
+    for pr in (store.merged_pr_listing() or {}).get("prs", []):
+        if pr.get("merged_at") and pr_issue_number(str(pr.get("head") or "")) is not None:
+            resolved.add(pr["number"])
+    return resolved
+
+
+def park_resolved_numbers(store: StateStore, repo: str | None = None) -> dict[str, Any]:
+    """Parked issues whose park reason names an issue or gate PR whose work is over: parked -> those.
+
+    ``repo`` (owner/name) lets a qualified reference or URL to this repository count too."""
     rows = store.local_issues()
-    closed = {row["number"] for row in rows if row.get("state") == "closed"}
-    resolved = {}
+    resolved = _resolved(store, rows)
+    found = {}
     for row in rows:
         if row.get("state") != "open" or row.get("is_pull_request"):
             continue
         reason = _park_reason(store, row)
         if reason is None:
             continue
-        named = [int(n) for n in re.findall(r"#(\d+)", reason.partition("\n")[2]) if int(n) != row["number"]]
-        if done := [n for n in dict.fromkeys(named) if n in closed]:
-            resolved[f"#{row['number']}"] = [f"#{n}" for n in done]
-    return {"parked": resolved} if resolved else {}
+        named = [n for n in references(reason.partition("\n")[2], repo) if n != row["number"]]
+        if done := [n for n in dict.fromkeys(named) if n in resolved]:
+            found[f"#{row['number']}"] = [f"#{n}" for n in done]
+    return {"parked": found} if found else {}
 
 
-def collect(store: StateStore, now: datetime, current: dict[str, Any]) -> dict[str, Any]:
+def collect(store: StateStore, now: datetime, current: dict[str, Any], repo: str | None = None) -> dict[str, Any]:
     return {"supply_low": supply_low_numbers(store, now, current),
             "request_stuck": request_stuck_numbers(store, now),
-            "park_resolved": park_resolved_numbers(store)}
+            "park_resolved": park_resolved_numbers(store, repo)}

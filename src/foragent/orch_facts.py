@@ -210,7 +210,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
     resources = _resources(store, config, root, now, waiting, slots, running, machine)
-    supply = orch_facts_stall.supply(config, running, waiting, resources["parallelizable_work"])
+    supply = orch_facts_stall.supply(config, running, resources["parallelizable_work"])
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,
