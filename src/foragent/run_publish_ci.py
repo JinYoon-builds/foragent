@@ -93,9 +93,12 @@ class _CIWait:
 def _wait_for_ci(
     n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
     wait: _CIWait, failed: Callable[[], None], status: str | None = None,
-    *, comparison_mode: bool = False,
+    *, comparison_mode: bool = False, conflicting: Callable[[], bool] | None = None,
 ) -> str | None:
-    """Consume even a status observed under the lock, but only wait unlocked."""
+    """Consume even a status observed under the lock, but only wait unlocked.
+
+    ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
+    starts no CI for a head that conflicts with its base."""
     from foragent import runner
 
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
@@ -138,6 +141,10 @@ def _wait_for_ci(
                       else "CI ran past the wait limit.")
             run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
             return "timeout"
+        if conflicting is not None and conflicting():
+            from foragent.ci_mode import ConflictingPR
+
+            raise ConflictingPR(head)
         ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
         if not wait.queue_aware or wait.running_since is not None:
             wait.polls += 1

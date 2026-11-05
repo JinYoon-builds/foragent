@@ -192,9 +192,11 @@ def _admissible(ctx: TickContext, lanes: list[str] | None = None) -> list[str]:
     the dream after them, so a window exhausted or a lane started meanwhile counts.
     """
 
+    from foragent import orch_stop
+
     now = ctx.now()
-    if _quota_exhausted(ctx.store, now):
-        return []
+    if orch_stop.active(ctx.store) is not None or _quota_exhausted(ctx.store, now):
+        return []  # A project stop holds every lane's dream until `fa orch release` (#1491).
     due = dream_due(ctx.store, ctx.config, LocalIssues(ctx.store), now)
     return [lane for lane in (due if lanes is None else [lane for lane in lanes if lane in due])
             if not ctx.store.executor_paused(dream_config(ctx.config, lane).executor, now)]

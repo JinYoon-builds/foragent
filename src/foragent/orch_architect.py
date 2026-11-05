@@ -131,6 +131,10 @@ def call(root: Path, store: StateStore, config: Config, why: str, now: datetime,
     Architect calls start a topic; other roles and explicit ``topic=False`` calls are one-shot.
     """
     language = config.language
+    from foragent import orch_stop
+
+    if (stop := orch_stop.active(store)) is not None:  # No session starts during a project stop (#1491).
+        raise ArchitectRefused(text("orch_stop_role_refused", language, role=role, why=stop))
     if _entry(config, role) is None:
         raise ArchitectRefused(text("role_unknown", language, role=role,
                                     roles=", ".join(load_roles(config)) or "-"))
@@ -253,6 +257,10 @@ def run_session(root: Path, store: StateStore, config: Config, why: str, started
         if config.executor != "claude":
             options["events_path"] = events_path(store, started_at, role)
         notes = review_notes.architect_section(store, role) if role == ARCHITECT else ""
+        from foragent import orch_stop
+
+        if (stop := orch_stop.active(store)) is not None:  # A stop between the start and this turn (#1491).
+            raise ArchitectRefused(text("orch_stop_role_refused", config.language, role=role, why=stop))
         result = executors.executor_for(config.executor).run(
             worktree=root, prompt=build_prompt(why, root, config.executor, role, entry, review_notes=notes)
             + session_skills.section(config, role, root),
