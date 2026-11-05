@@ -1,4 +1,4 @@
-"""The default role agents (orchestrator, architect, docs) that fa init gives every project.
+"""The default role agents and the PM that fa init gives every project.
 
 Projects differ only in memory and project skills: the agent definitions come
 from the template below, and the role skills are copied from the ones Foragent
@@ -15,7 +15,8 @@ from foragent import lane_memory
 from foragent.paths import repo_path
 
 
-ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs"}
+ROLES = {"fa-orchestrator": "orchestrator", "fa-architect": "architect", "fa-docs": "docs",
+         "fa-ux-researcher": "UX researcher (UX 리서처)"}
 MEMORY = {"fa-docs": "# fa-docs memory\n\n## Proposals\n\n## Lessons\n"}
 # Shared by every role (#1233): writes go through fa, a missing command becomes an issue proposal.
 GITHUB_WRITES = (
@@ -23,6 +24,24 @@ GITHUB_WRITES = (
     "go through FA commands such as `fa order`, `fa inspect` and `fa orch`. Read-only `gh` inspection\n"
     "stays available. When no FA command fits a write you need, do not hand the write to the person:\n"
     "propose an issue that asks for the missing FA command.\n"
+)
+# The person's one entrance (#1493). Not a roles-source entry: init scaffolds it once and the
+# PM session curates its own notebook, so the definition carries no skills to copy.
+PM = "fa-pm"
+PM_TEXT = (
+    f"---\nname: {PM}\ndescription: Foragent PM, the person's one entrance to this project\n"
+    "memory: project\nskills: []\n---\n"
+    "You are this repository's Foragent PM: the person's one entrance, through the `fa` skill.\n"
+    "Orchestration and inspection reach the person through you; FA work lives in FA, not in this session.\n"
+    "\n"
+    "Append project lessons at the end of `.claude/agent-memory/fa-pm/MEMORY.new.md`, one line each as\n"
+    "`- [id:<unique id>] <lesson>`; never rewrite or remove a line there. Project lessons are what this\n"
+    "project taught you: the checks you learned to run before approving, where a fix needs no choice\n"
+    "from the person, and how to put a real decision to them as a multiple-choice question.\n"
+    "You alone curate `.claude/agent-memory/fa-pm/MEMORY.md`: fold the pending lessons of MEMORY.new.md\n"
+    "into it and record their ids in `MEMORY.consumed.ids`.\n"
+    "The person's language, tone and personal preferences stay in their personal memory, not here.\n"
+    f"\n{GITHUB_WRITES}"
 )
 _CHECKOUT_SKILLS = Path(__file__).resolve().parents[2] / "skills"
 
@@ -32,10 +51,13 @@ def agent_text(role: str, skills: list[str] | None = None) -> str:
     title = ROLES[role]
     skills = [role] if skills is None else skills
     listed = "skills:" + (" []\n" if not skills else "\n" + yaml.safe_dump(skills, allow_unicode=True))
+    memory = ("Keep only broken flows in your project memory, following the role skill.\n"
+              if role == "fa-ux-researcher" else
+              "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n")
     return (
         f"---\nname: {role}\ndescription: Foragent {title} role\nmemory: project\n{listed}---\n"
         f"You are this repository's Foragent {title}; follow the {role} skill.\n"
-        "Record durable, project-specific lessons (patterns, pitfalls, commands) in your memory.\n"
+        f"{memory}"
         f"\n{GITHUB_WRITES}"
     )
 
@@ -83,6 +105,8 @@ def _templates(root: Path, *, existing_skills: bool = False,
                     if file.is_file() and not file.is_symlink():
                         # Bytes: a skill may hold images, and CRLF text must stay CRLF.
                         contents[f"{skill}/{file.relative_to(source).as_posix()}"] = file.read_bytes()
+    contents[f".claude/agents/{PM}.md"] = PM_TEXT
+    contents[lane_memory.memory_directory(PM, PM) + "MEMORY.md"] = f"# {PM} memory\n"
     return contents
 
 
@@ -104,9 +128,10 @@ def missing_files(root: Path,
     """Files to create (relative path -> text or bytes) and agent files left alone with bad frontmatter."""
     contents = {path: text for path, text in _templates(root, skills=skills).items()
                 if not repo_path(root, path).exists()}
-    invalid = [f".claude/agents/{role}.md" for role in ROLES
+    expected = {**{role: _skills(role, skills) for role in ROLES}, PM: []}
+    invalid = [f".claude/agents/{role}.md" for role, names in expected.items()
                if repo_path(root, f".claude/agents/{role}.md").exists()
-               and not _valid_agent(repo_path(root, f".claude/agents/{role}.md"), role, _skills(role, skills))]
+               and not _valid_agent(repo_path(root, f".claude/agents/{role}.md"), role, names)]
     return contents, invalid
 
 

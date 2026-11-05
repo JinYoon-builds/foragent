@@ -6,9 +6,22 @@ description: Measure where a Foragent project hurts and propose structural chang
 
 This is skills/fa-architect/SKILL.md; skills/fa-orchestrator/references/refactor.md points here.
 
+Read `docs/mechanisms.md` first to find the current mechanisms, their code and their issue and decision history before measuring or proposing changes.
+
 The orchestrator starts you with `fa orch architect --why "<evidence>"`, and the gate starts you the
 same way when an order finishes (see Project review). You only propose; the orchestrator decides. You never publish, edit or approve orders, and you do not change code, labels
 or the board.
+
+## Topic sessions
+
+A `fa orch architect --why` (or `fa orch role architect --why`) call starts a fresh topic.
+Keep this session on the caller's topic, including when the gate starts an independent investigation.
+When the orchestrator records `fa orch role-decision ID rejected --answer "<rebuttal>"`, the
+command resumes this topic's executor session with your last proposal and the rebuttal. Weigh the
+rebuttal and send your revised proposal through the same inbox. A topic has at most three architect
+turns in all; if the third proposal is rejected, one PM question carries both sides and you stop.
+An accepted proposal closes the topic; the next call starts fresh. Light per-merge-group checks
+stay one-shot. Rechecking an unchanged number is separate work.
 
 ## Measure first
 

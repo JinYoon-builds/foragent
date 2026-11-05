@@ -118,6 +118,7 @@ class Tracker(Protocol):
     def list_comments(self, n: int) -> list[Comment]: ...
     def create_issue(self, title: str, body: str, labels: Iterable[str]) -> int: ...
     def ensure_labels(self, specs: list[LabelSpec]) -> None: ...
+    def label_names(self) -> set[str]: ...
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None: ...
     def create_pr(self, *, head: str, base: str, title: str, body: str) -> int: ...
     def update_pr(self, pr: int, *, base: str, title: str, body: str) -> None: ...
@@ -130,6 +131,7 @@ class Tracker(Protocol):
     def pr_checks(self, pr: int) -> CheckStatus: ...
     def cancel_workflow_runs(self, head: str, *, branch: str) -> None: ...
     def pr_acceptance_reports(self, head: str) -> list[dict]: ...
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None: ...
     def pr_default_branch(self) -> str: ...
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> str: ...
     def pr_head_sha(self, pr: int) -> str: ...
@@ -402,7 +404,10 @@ class RecordingTracker:
         # would overwrite concurrent writes before the final version check.
         # Open PRs come last so a new PR wins over an older merged one for the same issue.
         merged, listing = self._merged_prs(store, observed_at)
-        prs = merged + self._tracker.list_prs("open", "foragent/")
+        # GitHub lists every open PR before applying a head prefix locally.
+        # Share that complete observation with the planning briefing.
+        open_prs = self._tracker.list_prs("open", "")
+        prs = merged + [pr for pr in open_prs if pr.head.startswith("foragent/")]
         comments, missing = {}, set()
         for issue in issues:
             if issue.is_pull_request or not (
@@ -450,6 +455,11 @@ class RecordingTracker:
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
             self._outbox_dropped(number, reason)
+        try:
+            store.record_planning_prs([pr for pr in open_prs if pr.head.startswith("pm/")], observed_at)
+        except OSError as exc:
+            # This optional briefing observation must not undo a successful issue refresh.
+            log.warning("Could not refresh planning PRs: %s", exc)
         return bool(changed or dropped or previous.keys() - observed)
 
     def _merged_prs(self, store, observed_at):
@@ -799,6 +809,7 @@ class FakeTracker:
         self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_mergeable: dict[int, str] = {}
         self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
@@ -940,6 +951,9 @@ class FakeTracker:
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         self.labels.update((spec.name, spec) for spec in specs)
 
+    def label_names(self) -> set[str]:
+        return set(self.labels)
+
     def close_issue(self, n: int, comment: str | None = None, *, reason: str | None = None) -> None:
         self._close(n, comment, reason=reason)
 
@@ -1001,6 +1015,13 @@ class FakeTracker:
     def set_pr_checks(self, pr: int, status: CheckStatus) -> None:
         self._pr_checks[pr] = status
 
+    def set_pr_mergeable(self, pr: int, state: str) -> None:
+        """GitHub's literal answer: MERGEABLE, CONFLICTING or UNKNOWN."""
+        self._pr_mergeable[pr] = state
+
+    def pr_mergeable(self, pr: int) -> str:
+        return self._pr_mergeable.get(pr, "UNKNOWN")
+
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
 
@@ -1009,6 +1030,9 @@ class FakeTracker:
 
     def pr_acceptance_reports(self, head: str) -> list[dict]:
         return []
+
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None:
+        return None
 
     def pr_default_branch(self) -> str:
         return "main"
@@ -1364,6 +1388,9 @@ class GhTracker:
         data = _items(self._call(["api", "--paginate", f"{self._path}/issues/{n}/comments?per_page=100"]))
         return [Comment(item["id"], item["user"]["login"], item["body"], item["created_at"]) for item in data]
 
+    def label_names(self) -> set[str]:
+        return {item["name"] for item in _items(self._call(["api", "--paginate", f"{self._path}/labels?per_page=100"]))}
+
     def ensure_labels(self, specs: list[LabelSpec]) -> None:
         for spec in specs:
             payload = json.dumps({"name": spec.name, "color": spec.color, "description": spec.description})
@@ -1550,6 +1577,19 @@ class GhTracker:
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
 
+    def pr_mergeable(self, pr: int) -> str:
+        """GitHub's mergeable answer as MERGEABLE, CONFLICTING or UNKNOWN.
+
+        Read from the same pull request endpoint as ``pr_head_sha``: GitHub's REST
+        ``mergeable`` is true, false (conflicts with the base) or null (still computing)."""
+        try:
+            state = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"])).get("mergeable")
+        except (AttributeError, TypeError, ValueError):
+            return "UNKNOWN"
+        if state is True:
+            return "MERGEABLE"
+        return "CONFLICTING" if state is False else "UNKNOWN"
+
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""
         try:
@@ -1621,6 +1661,82 @@ class GhTracker:
             if isinstance(exc, TrackerError):
                 raise
             raise self._artifact_error(f"Unusable acceptance artifacts: {exc}") from exc
+
+    def pr_unit_passed_tests(self, head: str) -> tuple[int, set[str]] | None:
+        """Exact-head JUnit passes; incomplete or unreadable evidence uses local checks."""
+        import xml.etree.ElementTree as ET
+        import yaml
+        from foragent.run_checks import junit_node_id
+
+        workflow = ".github/workflows/ci.yml"
+        try:
+            runs = _items(self._call([
+                "api", "--paginate", "--jq", ".workflow_runs",
+                f"{self._path}/actions/runs?head_sha={quote(head, safe='')}&per_page=100",
+            ]))
+            candidates = [run for run in runs if run.get("head_sha") == head
+                          and run.get("path", "").split("@", 1)[0] == workflow]
+            if not candidates or any(type(run.get("id")) is not int or run["id"] <= 0
+                                     for run in candidates):
+                return None
+            run = max(candidates, key=lambda value: value["id"])
+            if (run.get("status") != "completed" or run.get("conclusion") != "success"
+                    or run["repository"]["full_name"] != self.repo
+                    or run["head_repository"]["full_name"] != self.repo):
+                return None
+            # The immutable workflow gives the shard roster, never a guessed test selection.
+            document = yaml.safe_load(self._call([
+                "api", "-H", "Accept: application/vnd.github.raw+json",
+                f"{self._path}/contents/{workflow}?ref={quote(head, safe='')}",
+            ]))
+            matrix = document["jobs"]["test"]["strategy"]["matrix"]
+            shards = matrix["shard"]
+            if (set(matrix) != {"shard"} or not isinstance(shards, list) or not shards
+                    or any(type(shard) is not int or shard < 0 for shard in shards)
+                    or len(set(shards)) != len(shards)):
+                return None
+            expected = {f"unit-{shard}" for shard in shards}
+            artifacts = _items(self._call([
+                "api", "--paginate", "--jq", ".artifacts",
+                f"{self._path}/actions/runs/{run['id']}/artifacts?per_page=100",
+            ]))
+            units = [artifact for artifact in artifacts if artifact["name"].startswith("unit-")]
+            if len(units) != len(expected) or {artifact["name"] for artifact in units} != expected:
+                return None
+            passed, failed, ids = set(), set(), set()
+            for artifact in units:
+                artifact_id = artifact["id"]
+                if (type(artifact_id) is not int or artifact_id <= 0 or artifact_id in ids
+                        or artifact.get("expired") is not False
+                        or type(artifact["workflow_run"]["id"]) is not int
+                        or artifact["workflow_run"]["id"] != run["id"]
+                        or artifact["workflow_run"]["head_sha"] != head):
+                    return None
+                ids.add(artifact_id)
+                data = self._call(["api", f"{self._path}/actions/artifacts/{artifact_id}/zip"], binary=True)
+                with ZipFile(BytesIO(data)) as archive:
+                    filename = f"{artifact['name']}.xml"
+                    if archive.namelist() != [filename]:
+                        return None
+                    report = ET.fromstring(archive.read(filename))
+                if report.tag not in {"testsuites", "testsuite"}:
+                    return None
+                suites = list(report.iter("testsuite"))
+                if not suites or any([
+                    prop.get("value") for prop in suite.findall("properties/property")
+                    if prop.get("name") == "foragent_tested_commit"
+                ] != [head] for suite in suites):
+                    return None
+                for case in report.iter("testcase"):
+                    node_id = junit_node_id(case)
+                    if node_id is None:
+                        return None
+                    (failed if any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+                     else passed).add(node_id)
+            return run["id"], passed - failed
+        except (LookupError, TypeError, ValueError, AttributeError, BadZipFile, OSError,
+                EOFError, RuntimeError, zlib.error, ET.ParseError, yaml.YAMLError):
+            return None
 
     def pr_failed_logs(self, pr: int, *, full_text_dir: Path | None = None) -> CIEvidence:
         """Failed Actions evidence for the PR head: jobs, annotations and log tails.

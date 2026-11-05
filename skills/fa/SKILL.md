@@ -3,6 +3,8 @@ name: fa
 description: The single Foragent entry point. Brief the user on the project, confirm the profile once per session, and route to setup, the inbox or a new order. Use whenever the user types /fa or asks what Foragent is doing.
 ---
 
+Read `docs/mechanisms.md` first for the current mechanisms, their code and the decisions behind them.
+
 People type only `/fa`. The command names `/fa-init`, `/fa-inspect` and `/fa-order` stay,
 but you open them yourself; never ask the user to type them (D59 addendum 2).
 
@@ -28,7 +30,29 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    facts behind the choices. The switch keeps `/fa` offline: the report already carries
    the update line, so this second command must not look up a release.
    - If it prints `"setup": false` (no config in this folder), follow the init flow after
-     the greeting: read `skills/fa-init/SKILL.md` (the `fa-init` skill) and do it.
+     the greeting: run `fa doctor --setup --json` and read its `items` top to bottom in
+     the returned order (git installed, gh installed, uv installed, gh logged in, gh
+     project scope, repository linked). A nonzero exit with JSON reports unfinished setup.
+     Show each failing item's exact `fix` for this OS.
+     - For an install item, ask with AskUserQuestion (or the available question tool)
+       whether to install it (recommend installing, offer waiting), and run the install
+       command only after the person agrees to that item. On Linux the fix links the
+       official install page: read it, show the applicable command, and ask before
+       running it. If they decline, pause setup.
+     - Ask the same way before creating or linking a repository, and run the chosen
+       command only after the answer.
+     - An item that waits on another item must wait: complete the earlier prerequisite
+       first, then refresh the checklist. Never try an auth command while gh is missing.
+     - For login, the person runs `! gh auth login` in their own session; show it and
+       wait. For permissions, show the exact command or settings pane and wait too.
+       FA never runs login or permission changes and never asks for, reads or stores a
+       token.
+     - After a fix or the person's confirmation, rerun `fa doctor --setup --json` and
+       continue from the first failing item.
+     With no question tool, stop and print the next command and repository choices.
+     Read `skills/fa-init/SKILL.md` (the `fa-init` skill) for the choices and fixes,
+     finish the checklist, then run `fa init` in the background after agreement and
+     continue to the first order. Reuse completed answers when entering that flow.
      Stop this skill there.
    - Otherwise, when the person asks for more than the report, show the briefing in four
      short parts, each one line or a short list:
@@ -56,8 +80,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    `fa profile set --kind "<kind>" --stage "<stage>" --priority "<priority>"`.
    If `profile` is empty, skip this step; the planning interview fills it.
 
-4. **Open the lane view at session start.** Run `fa gate watch --open` in the project
-   folder beside this planning session, once at the start of every session.
+4. **Open the dashboard yourself when work starts.** The dashboard is the live terminal
+   screen of the work. Run `fa gate watch --open` in the project folder once at the start
+   of every session; it opens the dashboard beside this planning session. When the
+   dashboard is already open, it leaves it as it is; then say it is already open.
+   Never tell the person to type a dashboard command: opening it is your job.
 
 5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as

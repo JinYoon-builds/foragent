@@ -32,11 +32,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
-import json
 import logging
 import re
 from typing import Any
 
+from foragent.file_cache import read_jsonl
 from foragent import orch_architect, orch_inbox, orch_plan
 from foragent.board_parents import plan_references
 from foragent.config import Config, in_run_hours
@@ -85,19 +85,8 @@ def _configured(config: Config, role: str) -> bool:
 
 
 def _events(store: StateStore) -> list[dict]:
-    try:
-        lines = (store.root / "orch-events.jsonl").read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    events = []
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and stamp(event.get("at")) is not None:
-            events.append(event)
-    return events
+    return [event for event in read_jsonl(store.root / "orch-events.jsonl", tolerant=True)
+            if stamp(event.get("at")) is not None]
 
 
 def _orders(events: list[dict]) -> list[dict]:
@@ -379,7 +368,7 @@ def _start_session(ctx, roles: list[str], budget: int, report) -> None:
         now = ctx.now()
         try:
             report.actions.append(orch_architect.call(ctx.repo_root, ctx.store, ctx.config,
-                                                      _why(ctx, role, now), now, role))
+                                                      _why(ctx, role, now), now, role, tier="m"))
         except orch_architect.ArchitectRefused as exc:  # No free slot after all: it stays due, with no penalty.
             report.actions.append(f"{role} deferred: {exc}")
             return

@@ -19,11 +19,24 @@ from foragent.git import GitError, GitRepo, main_write_lock
 from foragent.i18n import text
 from foragent.labels import LABELS
 from foragent.order import detect_test_commands
-from foragent.skills import Skill, SkillManager, with_vendored_library
+from foragent.skills import Skill, SkillManager, entry_directory, with_vendored_library
 from foragent.tracker import GhTracker, Tracker, TrackerError
 
 
 CONFIG_COMMENT = "# Configuration: Foragent docs/gate.md (section 9), docs/contract.md (section 4).\n"
+# D117 layer A: only a new project without a person's global table gets these defaults.
+ROLE_DEFAULT_SKILLS = {
+    "workers": ["principle-prove-it-works", "principle-fix-root-causes", "principle-attack-the-premise",
+                "principle-sequence-verifiable-units"],
+    "reviewers": ["principle-prove-it-works", "review-procedure", "principle-attack-the-premise",
+                  "principle-test-behavior-not-implementation"],
+    "orchestrator": ["principle-prove-it-works", "principle-attack-the-premise", "principle-never-block-on-the-human",
+                     "principle-encode-lessons-in-structure"],
+    "architect": ["principle-attack-the-premise", "principle-redesign-from-first-principles",
+                  "principle-exhaust-the-design-space", "principle-separate-before-serializing-shared-state",
+                  "principle-subtract-before-you-add", "principle-foundational-thinking"],
+    "docs": ["principle-minimize-reader-load"],
+}
 ISSUE_TEMPLATE = """---
 name: Foragent task
 about: Define a task for Foragent with executable acceptance checks.
@@ -261,33 +274,37 @@ def init_repo(
 ) -> InitReport:
     requested_map = _parse_board_map(board_map) if board_map is not None else None
     root = Path(repo_root).resolve()
+    tools = setup.installed_tools()
     git = git or GitRepo(root)
-    git.check_worktree()
-    top_level = git.worktree_root()
-    normalized_root = top_level if top_level != root else None
-    if normalized_root is not None:
-        root = top_level
-        git = git.at(root)
+    normalized_root = None
     preflight_language = _preflight_language(root, language)
-    try:
-        repo = git.remote_slug()
-    except GitError as exc:
-        # A failed `git remote get-url` (non-zero exit) means no origin; a readable url that
-        # the remote parser rejects means origin is not GitHub.
-        key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
-        raise GitError(text(key, preflight_language, error=exc)) from exc
+    if tools["git"]:
+        try:
+            git.check_worktree()
+        except GitError as exc:
+            raise GitError(setup.repository_fix("init_git_missing", exc, preflight_language)) from exc
+        top_level = git.worktree_root()
+        normalized_root = top_level if top_level != root else None
+        if normalized_root is not None:
+            root = top_level
+            git = git.at(root)
+        preflight_language = _preflight_language(root, language)
+        try:
+            repo = git.remote_slug()
+        except GitError as exc:
+            # A failed get-url means no origin; a rejected URL means it is not GitHub.
+            key = "init_origin_missing" if exc.__cause__ is not None else "init_origin_not_github"
+            raise GitError(setup.repository_fix(key, exc, preflight_language)) from exc
     run = gh_run or _run_gh
-    try:
-        auth_status = run(["auth", "status"], input=None)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        # OSError: gh cannot be started (not installed); non-zero exit: not logged in.
-        message = exc.stderr if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-        key = "init_gh_logged_out" if isinstance(exc, subprocess.CalledProcessError) else "init_gh_missing"
-        raise TrackerError(text(key, preflight_language, error=(message or str(exc)).strip())) from exc
-
-    fixes = [item["fix"] for item in setup.checklist(auth_status) if not item["ok"]]
+    facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools, language=preflight_language)
+    failed = [item for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
+    fixes = [item["fix"] for item in failed if not item.get("advice", False)]
     if fixes:
-        raise TrackerError(text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes)))
+        message = text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {item['fix']}" for item in failed))
+        if not facts.logged_in:
+            key = "init_gh_logged_out" if facts.installed["gh"] else "init_gh_missing"
+            message = text(key, preflight_language, error=facts.auth_error) + "\n" + message
+        raise TrackerError(message)
 
     config_path = root / ".foragent.yml"
     contents = {".github/ISSUE_TEMPLATE/foragent-task.md": ISSUE_TEMPLATE}
@@ -295,7 +312,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
-    notes: list[str] = []
+    notes: list[str] = [item["fix"] for item in failed if item.get("advice", False)]
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
@@ -345,10 +362,15 @@ def init_repo(
         values["approvers"] = approvers
         values["checks"] = initial_checks(repo, run, command=next(iter(detect_test_commands(root)), None))
         values["roles"] = roles.with_defaults(root, {})
+        global_path = Path.home() / ".config/foragent/config.yml"
+        global_values = _read_yaml(global_path) if global_path.exists() else {}
+        values["default_skills"] = (load_global_config().default_skills if "default_skills" in global_values
+                                    else ROLE_DEFAULT_SKILLS)
         _validate({**DEFAULTS, **values})
         config = Config(**{**DEFAULTS, **values})
         minimal = {key: value for key, value in values.items()
-                   if key in {"review", "approvers", "checks", "roles"} or options[key] is not None or value != DEFAULTS[key]}
+                   if key in {"review", "approvers", "checks", "roles", "default_skills"}
+                   or options[key] is not None or value != DEFAULTS[key]}
         if claude_quota is not None:
             minimal["claude_quota"] = {"mode": claude_quota}
             _validate({**asdict(config), "claude_quota": {**config.claude_quota, "mode": claude_quota}})
@@ -370,7 +392,8 @@ def init_repo(
               "memory: project and the skills of its roles entry.", file=sys.stderr)
 
     # Before anything is written: one default without license facts stops the whole setup.
-    skill_manager, default_skills = _checked_default_skills(root, config if config_path.exists() else None)
+    skill_scope = config if config_path.exists() else replace(load_global_config(), default_skills=config.default_skills)
+    skill_manager, default_skills = _checked_default_skills(root, skill_scope)
     default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
                          for skill in default_skills.values())
 
@@ -398,6 +421,7 @@ def init_repo(
         *([".gitignore"] if default_ignore else []),
         # Files an interrupted earlier run migrated but never committed are found by their state.
         *git.uncommitted_paths(lane_memory.managed_paths(root, config)),
+        *_default_ignore_recovery(root, config, git),
         *git.uncommitted_paths([*SETUP_PATHS, *legacy_paths, *role_agents.setup_paths(root, role_skills), *([WORKFLOW] if config.checks == "ci" else [])]),
     ]))
     board_planned = not no_board
@@ -494,17 +518,34 @@ def init_repo(
                       notes=notes, tracker=tracker)
 
 
-def _checked_default_skills(root: Path, config: Config | None) -> tuple[SkillManager | None, dict[str, Skill | None]]:
-    """Every role's default skills, each with license facts that allow redistribution.
-
-    A new project has no settings file yet, so its table and libraries come from the person's global config.
-    """
-    scope = config if config is not None else load_global_config()
-    names = session_skills.assigned_entries(scope)
+def _checked_default_skills(root: Path, config: Config) -> tuple[SkillManager | None, dict[str, Skill | None]]:
+    """Check the chosen role table against local, redistributable files before setup writes."""
+    names = session_skills.assigned_entries(config)
     if not names:
         return None, {}
-    manager = SkillManager(with_vendored_library(scope, root))
+    manager = SkillManager(with_vendored_library(config, root))
     return manager, {name: manager.check_default(name, root) for name in names}
+
+
+def _default_ignore_recovery(root: Path, config: Config, git: GitRepo) -> list[str]:
+    """Recover only the installer's exact append to HEAD; other ignore edits stay the person's."""
+    names = session_skills.assigned_entries(config)
+    path = root / ".gitignore"
+    if not names or not path.is_file() or path.is_symlink():
+        return []
+    try:
+        head = git._call(["rev-parse", "--verify", "--quiet", "HEAD"]).strip()
+    except GitError as exc:
+        cause = exc.__cause__
+        if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode != 1:
+            raise
+        head = None  # An unborn branch has an empty committed baseline.
+    tracked = git._call(["ls-tree", "--name-only", head, "--", ".gitignore"]).strip() if head else ""
+    original = git._call(["show", f"{head}:.gitignore"]).encode("utf-8") if tracked else b""
+    expected = SkillManager.default_ignore_content(original, [entry_directory(name) for name in names])
+    if expected != original and path.read_bytes() == expected:
+        return git.uncommitted_paths([".gitignore"])
+    return []
 
 
 FA_ALLOW_RULE = "Bash(fa:*)"

@@ -12,6 +12,8 @@ from uuid import uuid4
 from foragent.i18n import text
 from foragent.order import PlanError
 
+CANDIDATES = "decision-candidates.jsonl"
+
 
 def entries(store, journal: str = "notes.jsonl", *, with_offsets: bool = False) -> list[dict]:
     try:
@@ -38,7 +40,8 @@ def entries(store, journal: str = "notes.jsonl", *, with_offsets: bool = False) 
 
 
 def append(store, *, kind: str, boundary: str, content: str,
-           replaces: str | None = None, replace: str | None = None, language: str = "en") -> dict:
+           replaces: str | None = None, replace: str | None = None, language: str = "en",
+           source: str | None = None, confirmed_candidate: str | None = None) -> dict:
     if kind not in {"decision", "idea", "rule"} or not content.strip() or not boundary.strip():
         raise PlanError(text("order_notes_invalid", language))
     if (kind == "rule" and (replace is None or not replace.strip()
@@ -54,7 +57,15 @@ def append(store, *, kind: str, boundary: str, content: str,
         row["replaces"] = replaces
     if replace is not None:
         row["replace"] = replace
-    append_entry(store, row, language=language)
+    candidate = kind == "decision" and boundary == "decision-sweep"
+    if candidate:
+        row["source"] = os.environ.get("FORAGENT_DECISION_SOURCE", "")
+        row["candidate"] = True
+    if source is not None:
+        row["source"] = source
+    if confirmed_candidate is not None:
+        row["confirmed_candidate"] = confirmed_candidate
+    append_entry(store, row, journal=CANDIDATES if candidate else "notes.jsonl", language=language)
     return {**row, "status": "waiting"}
 
 
@@ -76,9 +87,13 @@ def pending(store) -> dict:
     from foragent import order_flush_journal, order_submissions
 
     published = order_flush_journal.published_entries(store)
+    notes = entries(store, with_offsets=True)
+    confirmed = {row.get("confirmed_candidate") for row in notes}
     return {"orders": order_submissions.pending(store),
-            "notes": [{**row, "status": "published" if row["entry_id"] in published else "waiting"}
-                      for row in entries(store, with_offsets=True)]}
+            "notes": [{**row, "status": "confirmed" if row.get("candidate") and row["id"] in confirmed
+                       else "published" if row["entry_id"] in published else "waiting"}
+                      for row in [*notes,
+                                  *entries(store, CANDIDATES, with_offsets=True)]]}
 
 
 def run(args, root) -> int:

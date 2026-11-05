@@ -64,7 +64,7 @@ fa command, as an `issues[]` entry in the order, and let it go through the same 
 
 ## Local preparation progress
 At order start, immediately run `fa order progress start --title "<request summary>"`,
-then `fa gate watch --open` so the lane view is available while the order is prepared.
+then `fa gate watch --open` so the dashboard is open while the order is prepared.
 Report facts after every preparation step with `fa order progress`; its JSON output is
 the persisted state shared with the view. Bubble text is built deterministically from
 these facts, with no LLM calls or separate model generation for bubbles.
@@ -128,6 +128,14 @@ Run `fa order context --json` and read it fully. Then read the repository yourse
 - Existing open issues without the Foragent format: propose per issue — rewrite (contract +
   acceptance test), split, merge duplicates, close (with reason, original kept) or leave
   (not finished by code). Apply only what the user approves; never delete.
+- Board cleanup when /fa adopts an existing project (after `fa adopt survey`): propose
+  the cleanup items one by one, each with its evidence, and let the person agree or decline
+  each one. A rewrite goes into `edits`. A duplicate folded into another existing issue goes
+  into the plan's `closes` as `{"number": N, "into": M}`. An issue that history already
+  resolved goes into `closes` as `{"number": N, "commit": "<sha>"}` with the fixing commit.
+  Put only the agreed items in the plan; a declined item stays out and stays untouched.
+  `fa order publish` writes each close only when it is approved (`--approve`, or its number
+  in `--approve-numbers`), and `--dry-run` previews each close with its evidence.
 - Never ask what the code, docs, specs or earlier decisions already answer.
 - A **starter order** (the person says `starter: ...` after `fa init`) is one tiny task
   a lane can finish in about 10 minutes, to show the flow to a merged PR. Their example is
@@ -151,6 +159,14 @@ The person's current words take precedence over old documents and the ledger.
   only flush owns publication checkpoints. Choose what deserves recording and the
   publication boundary through planning judgment, and inspect retained notes with
   `fa order pending --json` in later sessions.
+  Notes marked `candidate: true` and `status: waiting` come from decision sweeps and keep the transcript
+  source and the person's quote. They are unconfirmed and never enter a flush.
+  PM confirms each candidate with the person in one line, then runs
+  `fa decisions add <candidate-id> --text '<confirmed decision>' --defer <boundary>`
+  to retain a confirmed record for the normal publication batch. The planning
+  session need not remember or run sweeps: installed hooks preserve each new
+  transcript segment before compaction, at session end, and every 20 person
+  messages. Their fresh Foragent sessions do not start more sweeps.
   At publication, include both record updates in the same approved order: append the
   dated replacement with its reason and Supersedes link to `docs/decisions.md` (or the
   project's decision log), and replace the affected line in existing `docs/rules.md`.
@@ -467,7 +483,8 @@ takes over its work; it only makes sure one runs and talks to it:
 - Run `fa orch alive --json`. If it prints `"alive": false`, run `fa orch ensure`. It
   opens one orchestrator in the background and prints one line; when it opened nothing,
   tell the user that line. If the orchestrator is already alive, do not start a second one.
-- Open the lane view beside this planning session with `fa gate watch --open`.
+- Open the dashboard beside this planning session yourself with `fa gate watch --open`;
+  it leaves an open dashboard as it is. Never ask the person to type a dashboard command.
 - Send every request to the orchestrator twice: as a cross-session message to the
   `orch: <project>` session (SendMessage) and with
   `fa orch request --from planning --text "<request>"`, so it survives a restart.

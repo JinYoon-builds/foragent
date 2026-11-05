@@ -42,22 +42,29 @@ def add(commands) -> None:
             command.add_argument("--tried", required=True)
             command.add_argument("--option", action="append", default=[])
             command.add_argument("--recommend", type=int)
-    stop = orch_actions.add_parser("stop", help="Stop a running issue, keep its work and return it to ready")
+    stop = orch_actions.add_parser("stop", help="Stop a running issue (or --all), keep its work and return it to ready")
     stop.set_defaults(pm_task="stop an issue")
     stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    stop.add_argument("number", type=int)
+    stop.add_argument("number", type=int, nargs="?")
+    stop.add_argument("--all", action="store_true",
+                      help="Project-wide stop: hold every lane and stop every running issue, keeping its work")
     stop.add_argument("--keep-work", action="store_true", required=True,
                       help="Save unfinished changes as a WIP commit on the issue branch")
     stop.add_argument("--why", required=True, help="Why the run is stopped; named in the WIP commit and event")
+    release = orch_actions.add_parser("release", help="The pair of `fa orch stop --all`: lift the project stop "
+                                                      "and resume the lanes it held")
+    release.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
+    release.add_argument("--why", default="", help="Optional: why the stop ends, kept in the journal")
     dream = orch_actions.add_parser("dream", help="Replace a lane's stale dream with a fresh one")
     dream.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     dream.add_argument("--redo", metavar="LANE", required=True,
                        help="Record a redo: the next tick closes this lane's stale dream PR and starts a fresh dream")
-    from foragent.commands import _orch_park, _orch_seat
+    from foragent.commands import _orch_close, _orch_park, _orch_seat
     from foragent.commands._orch_architect import add_orch
     from foragent.commands._orch_box import _add_inbox
 
     _orch_park.add_parsers(orch_actions)
+    _orch_close.add_parsers(orch_actions)
     _orch_seat.add_parsers(orch_actions)
     _add_inbox(orch_actions)
     add_orch(orch_actions)
@@ -106,8 +113,10 @@ def run(args) -> int:
     ctx = cli.RunContext(repo=repo, repo_root=root, tracker=tracker, store=store,
                          config=config, git=git, now=lambda: cli.datetime.now(cli.UTC))
     orch = cli.orch
-    from foragent.commands import _orch_park
+    from foragent.commands import _orch_close, _orch_park
 
+    if args.action in _orch_close.ACTIONS:
+        return _orch_close.run(ctx, args)
     if args.action in _orch_park.ACTIONS:
         return _orch_park.run(ctx, args)
     if args.action == "dream":
@@ -159,5 +168,9 @@ def run(args) -> int:
     elif args.action == "merge":
         print(orch.merge(ctx, args.number, approved_by=args.approved_by, at=args.at))
     elif args.action == "stop":
-        print(orch.stop(ctx, args.number, args.why))
+        if args.all == (args.number is not None):
+            raise SystemExit("fa orch stop: give an issue number or --all, not both")
+        print(orch.stop_all(ctx, args.why) if args.all else orch.stop(ctx, args.number, args.why))
+    elif args.action == "release":
+        print(orch.release(ctx, args.why))
     return 0

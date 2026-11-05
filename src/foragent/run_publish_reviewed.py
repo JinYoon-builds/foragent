@@ -14,6 +14,14 @@ if TYPE_CHECKING:
     from foragent.state import Approval
 
 
+def push_refresh(ctx: RunContext, n: int, git: GitRepo, branch: str, lease: str, head: str) -> None:
+    """The one leased refresh push; GitHub server errors wait with this head and lease."""
+    from foragent import orch_github
+
+    orch_github.wait_out_push(ctx, n, lambda: git.push_head(branch, lease=lease),
+                              head=head, lease=lease, branch=branch, kind="refresh")
+
+
 def _reviewed_base_changed(n: int, ctx: RunContext, pr) -> str:
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
     run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
@@ -60,10 +68,10 @@ def _refresh_reviewed_head(
     run_publish._check_publication(git, pr.base, target_sha)
     if before_push is not None:
         before_push(new_head)
-    git.push_head(pr.head, lease=head)
+    push_refresh(ctx, n, git, pr.head, head, new_head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
-    if ctx.tracker.pr_head_sha(pr.number) != new_head:
+    if not run_publish._head_after_push(ctx, pr.number, new_head, head):
         link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
         return new_head, run_publish._hold_changed_head(n, ctx, link)
     return new_head, None
@@ -105,6 +113,7 @@ def _publish_reviewed_in_turn(
     """
     from foragent import run_group_check, run_group_ci, run_group_evidence, runner
     from foragent.run_waits import activity
+    from foragent.ci_mode import OlderMeasuredBase
 
     log = ctx.store.log_path(n)
     link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
@@ -158,6 +167,21 @@ def _publish_reviewed_in_turn(
             n, ctx, git, sorted(set(git.changed_paths(base_sha)) | set(ctx.tracker.pr_changed_files(pr.number))),
             ctx.tracker.get_issue(n).labels)):
         return stopped
+    refreshed_pairs = set()
+
+    def older_base(reported: str) -> bool:
+        try:
+            return ((reported, base_sha) not in refreshed_pairs
+                    and git.is_ancestor(reported, base_sha)
+                    and not git.is_ancestor(base_sha, head))
+        except run_publish.GitError:
+            return False  # Unproved ancestry keeps the existing CI wait.
+
+    def refresh_older(reported: str) -> str | None:
+        refreshed_pairs.add((reported, base_sha))
+        run_publish._append(log, f"CI measured an older base: {reported} (expected {base_sha}); refreshing once")
+        return refresh(base_sha)
+
     started = ctx.now().timestamp()
     ci_wait = run_publish._CIWait(started)
     queued_status = None
@@ -194,10 +218,16 @@ def _publish_reviewed_in_turn(
 
             comparison = None
             if comparison_attempt is not None:
-                comparison = run_publish.require_comparison(
-                    comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                    base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
-                )
+                try:
+                    comparison = run_publish.require_comparison(
+                        comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                        base_sha=base_sha, status=ci_wait.status, deadline=ci_wait.deadline,
+                        older_base=older_base,
+                    )
+                except OlderMeasuredBase as moved:
+                    if stopped := refresh_older(moved.reported):
+                        return stopped
+                    continue
             else:
                 from foragent import ci_local, ci_mode
 
@@ -228,9 +258,14 @@ def _publish_reviewed_in_turn(
                     return stopped
                 continue
         if comparison is None and comparison_attempt is not None:
-            comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
-                                                        base_sha=base_sha, status=ci_wait.status,
-                                                        deadline=ci_wait.deadline)
+            try:
+                comparison = run_publish.require_comparison(comparison_attempt, pr.number, head, ci_wait.infrastructure,
+                                                            base_sha=base_sha, status=ci_wait.status,
+                                                            deadline=ci_wait.deadline, older_base=older_base)
+            except OlderMeasuredBase as moved:
+                if stopped := refresh_older(moved.reported):
+                    return stopped
+                continue
             if stopped := unchanged():
                 return stopped
         failed_merge = None
@@ -253,9 +288,10 @@ def _publish_reviewed_in_turn(
                     body=lambda: merge_retitle_body(pr.head, ctx), note=lambda line: run_publish._append(log, line),
                 )
                 pr = run_publish.replace(pr, title=title)
-                run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
                 try:
-                    ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
+                    with orch_stop.merging(ctx, n):  # A stop during the retitle merges nothing (#1491).
+                        run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "merged")
+                        ctx.tracker.merge_pr(pr.number, method="squash", expected_head_sha=head, **subject)
                 except run_publish.TrackerError as exc:
                     run_publish.merge_turn.record_turn(ctx, place, inputs.base_sha, "failed")
                     if exc.waits:
@@ -309,4 +345,4 @@ def _publish_reviewed_in_turn(
 
 
 # Call-time lookups go through the facade so patches of foragent.run_publish.<name> apply.
-from foragent import run_publish, size_signal  # noqa: E402
+from foragent import orch_stop, run_publish, size_signal  # noqa: E402

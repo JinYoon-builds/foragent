@@ -6,6 +6,8 @@ ORDER = 50
 
 
 def add(commands) -> None:
+    from foragent.commands.order import _help_language
+
     cli = facade()
     init = commands.add_parser("init", help="Set up this repository for Foragent")
     init.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
@@ -27,6 +29,8 @@ def add(commands) -> None:
                       help="Answer the project Bash(fa:*) permission offer without a prompt")
     init.add_argument("--starter", choices=("yes", "no"),
                       help="Answer the starter order offer without a prompt")
+    init.add_argument("--decision-hooks", choices=("yes", "no"),
+                      help=cli.text("decisions_hooks_help", _help_language()))
 
 
 def _offer_statusline(answer: str | None) -> None:
@@ -139,6 +143,11 @@ def run(args) -> int:
     )
     print(report.summary())
     if not args.dry_run:
+        if args.decision_hooks == "yes":
+            from foragent.commands.decisions import install_stop_hook
+            install_stop_hook(report.normalized_root or root)
+            from foragent import decision_sweep
+            decision_sweep.install(report.normalized_root or root)
         cli._offer_statusline(args.statusline)
         _offer_fa_allow(report.normalized_root or root, args.fa_allow)
         _offer_upstream_reports(report.normalized_root or root)

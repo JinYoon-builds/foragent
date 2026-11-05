@@ -17,6 +17,24 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     return "held"
 
 
+def _head_after_push(ctx: RunContext, pr: int, head: str, replaced: str | None) -> bool:
+    """Wait only for the exact head replaced by our successful leased push."""
+    delays = iter((2, 4, 8, 16, 30))
+    while True:
+        reads = getattr(ctx, "reads", None)
+        if reads is not None:
+            reads.clear()  # Both the owner snapshot and its underlying gh GET cache.
+        actual = ctx.tracker.pr_head_sha(pr)
+        if actual == head:
+            return True
+        if not replaced or actual != replaced:
+            return False
+        delay = next(delays, None)
+        if delay is None:
+            return False
+        ctx.sleep(delay)
+
+
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
     if not getattr(logs, "not_started", False):
@@ -93,9 +111,12 @@ class _CIWait:
 def _wait_for_ci(
     n: int, ctx: RunContext, git: GitRepo, pr: int, head: str, ready_at: float,
     wait: _CIWait, failed: Callable[[], None], status: str | None = None,
-    *, comparison_mode: bool = False,
+    *, comparison_mode: bool = False, conflicting: Callable[[], bool] | None = None,
 ) -> str | None:
-    """Consume even a status observed under the lock, but only wait unlocked."""
+    """Consume even a status observed under the lock, but only wait unlocked.
+
+    ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
+    starts no CI for a head that conflicts with its base."""
     from foragent import runner
 
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
@@ -138,6 +159,10 @@ def _wait_for_ci(
                       else "CI ran past the wait limit.")
             run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
             return "timeout"
+        if conflicting is not None and conflicting():
+            from foragent.ci_mode import ConflictingPR
+
+            raise ConflictingPR(head)
         ctx.sleep(min(30, remaining, runner._remaining(n, ctx)))
         if not wait.queue_aware or wait.running_since is not None:
             wait.polls += 1

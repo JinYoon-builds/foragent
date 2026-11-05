@@ -122,6 +122,26 @@ def _planning_session(cwd: Path, store) -> bool:
     return not cwd.resolve().is_relative_to((store.root / "worktrees").resolve())
 
 
+FRESH_SESSION_BYTES = 50 * 1024 * 1024
+
+
+def fresh_session(cwd: Path, transcript_path, *, channel: str = "statusline") -> str | None:
+    """A read-only suggestion for a large planning transcript, independent of box binding."""
+    from foragent.i18n import text
+
+    try:
+        if not isinstance(transcript_path, str) or not transcript_path:
+            return None
+        project = _project(cwd)
+        if project is None or not project[0].presence[channel] or not _planning_session(cwd, project[1]):
+            return None
+        if Path(transcript_path).stat().st_size < FRESH_SESSION_BYTES:
+            return None
+        return text("pm_fresh_session", project[0].language)
+    except Exception:  # An unavailable transcript or project must never disturb a hook.
+        return None
+
+
 def _parse_at(value) -> datetime | None:
     """A timezone-aware time from an ISO string, else None."""
     try:
@@ -488,6 +508,70 @@ def session_start_message(cwd: Path, session_id: str | None, now: datetime) -> s
         merged = sum(since < at <= now for at in brief_report._merges(store).values())
         turns = counts(store, now)[1]
     return text("presence_session_start", config.language, merged=merged, turns=turns)
+
+
+def _session_role(config, store, cwd: Path, agent_type) -> tuple[str, str | None] | None:
+    """(role, lane slug) for the session starting in ``cwd``, else None (a launched helper).
+
+    The ``--agent`` Claude Code reports wins when it is an agent the launchers would pass:
+    a role's configured agent (roles.load_roles) or a lane's (``_lane_agents``). Without
+    one, the orchestrator launcher's FORAGENT_ROLE=orchestrator mark is the orchestrator and
+    a planning session (no FORAGENT_ROLE at all) is the PM.
+    """
+    import os
+
+    from foragent import roles
+
+    if isinstance(agent_type, str) and agent_type:
+        for name, entry in roles.load_roles(config).items():
+            if entry["agent"] == agent_type:
+                return "role", name
+        for slug, agent in _lane_agents(config).items():
+            if agent == agent_type:
+                return "lane", slug
+    if os.environ.get("FORAGENT_ROLE") == "orchestrator":
+        return "role", "orchestrator"
+    if _planning_session(cwd, store):
+        return "pm", None
+    return None
+
+
+def _lane_agents(config) -> dict[str, str]:
+    """Each lane's agent: its ``agent`` setting as executors read it, else the ``fa-<lane>`` default.
+
+    A lane with an ``agent`` setting the executors refuse (lane_memory.lane_agent) has none.
+    """
+    from foragent import lane_memory
+
+    agents = {}
+    for slug, settings in config.lanes.items():
+        explicit = (settings or {}).get("agent")
+        agent = lane_memory.lane_agent(config, slug) if explicit else f"fa-{slug}"
+        if agent:
+            agents[slug] = agent
+    return agents
+
+
+def session_title(cwd: Path, agent_type) -> str | None:
+    """One-line terminal title naming the session's role and the project; None when there is none.
+
+    None outside a Foragent project, with presence.session_start off, and for a
+    launched session without a role agent (a review, for example).
+    """
+    from foragent.i18n import text
+
+    project = _project(cwd)
+    if project is None or not project[0].presence["session_start"]:
+        return None
+    config, store = project
+    role = _session_role(config, store, cwd, agent_type)
+    if role is None:
+        return None
+    root = project_root(cwd)
+    repo = _repo(config, root)
+    name = repo.rstrip("/").rsplit("/", 1)[-1] if repo else root.name
+    title = text(f"presence_title_{role[0]}", config.language, project=name, name=role[1] or "")
+    return " ".join("".join(c if c.isprintable() else " " for c in title).split()) or None
 
 
 def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:

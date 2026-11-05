@@ -345,7 +345,9 @@ def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, t
     measured["binding"] = {"kind": "quota", "normal": True, "detail": "usage-limit pause"}
     store.clock[0] = NOW + timedelta(hours=13)
     assert orch_role_raise.raise_due(store, tmp_path, store.clock[0]) == [], f"{kind} ignores the binding"
-    measured["numbers"] = {kind: {"n": 1, "new-entity": 3}}
+    # Double the hot-file threshold: inside a window kind's window (#1840) a member that merely
+    # reaches the threshold is drift, so the new entity must be real evidence for every kind.
+    measured["numbers"] = {kind: {"n": 1, "new-entity": 2 * orch_facts_kinds.OVERLAP_RUNS}}
     assert len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 1, f"{kind}'s own facts re-arm it"
 
 
@@ -615,3 +617,22 @@ def test_other_kinds_keep_the_answer_as_their_baseline():
     record = {"facts": {"kinds": {"hot_overlap_files": {"numbers": {"runs_by_file": {"a.py": 3}}}}},
               "answer_facts": {"kinds": {"hot_overlap_files": {"numbers": {"runs_by_file": {"a.py": 3, "b.py": 3}}}}}}
     assert orch_role_raise.baseline(record) == record["answer_facts"]
+
+
+def test_a_window_kind_treats_a_file_reaching_the_threshold_as_drift_until_the_window_passes():
+    """#1840: inside the window since the answer a new hot file is drift unless it doubles the threshold."""
+    def facts(runs):
+        return {"kinds": {"hot_overlap_files": {"numbers": {"runs_by_file": runs}}}}
+
+    before, window = facts({"a.py": 3, "b.py": 5}), orch_facts_kinds.OVERLAP_WINDOW
+    inside, after = window - timedelta(minutes=1), window + timedelta(minutes=1)
+    drift = facts({"a.py": 4, "b.py": 6, "c.py": 3})
+    assert not orch_role_raise.worse(before, drift, inside)
+    assert not orch_role_raise.worse(before, drift, None), "An unknown answer time counts as inside"
+    assert orch_role_raise.worse(before, drift, after), "After the window a new hot file is new evidence"
+    assert orch_role_raise.worse(before, facts({"a.py": 3, "b.py": 10}), inside), "A doubled count calls at once"
+    assert orch_role_raise.worse(before, facts({"a.py": 3, "b.py": 5, "c.py": 6}), inside)
+    other = {"kinds": {"repeated_design_holds": {"numbers": {"holds_by_issue": {"#1": 2}}}}}
+    grown = {"kinds": {"repeated_design_holds": {"numbers": {"holds_by_issue": {"#1": 2, "#2": 2}}}}}
+    assert orch_role_raise.worse(other, grown, inside), "Other kinds keep the new-member rule"
+    assert orch_role_raise.answered_at({"updated_at": NOW.isoformat()}) == NOW, "Legacy done records use their last write"
