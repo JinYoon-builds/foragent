@@ -6,6 +6,37 @@ from typing import Any
 
 
 class IssueRefreshMixin:
+    def planning_prs(self) -> list[dict[str, Any]]:
+        """Open pm/* PRs observed by the gate; an unavailable record is empty."""
+        try:
+            data = _state.json.loads((self.root / "planning_prs.json").read_text(encoding="utf-8"))
+            prs = data["prs"]
+            if not isinstance(prs, list):
+                return []
+            return [row for row in prs if isinstance(row, dict)
+                    and isinstance(row.get("number"), int)
+                    and all(isinstance(row.get(key), str) for key in ("head", "title", "url"))
+                    and row["head"].startswith("pm/")]
+        except (OSError, ValueError, TypeError, KeyError):
+            return []
+
+    def record_planning_prs(self, prs: list, observed_at: datetime) -> None:
+        """Replace the full successful observation, including an empty listing."""
+        from foragent.state_observations import stamp
+
+        with self._state_lock():
+            path = self.root / "planning_prs.json"
+            try:
+                previous = stamp(_state.json.loads(path.read_text(encoding="utf-8"))["observed_at"])
+            except (OSError, ValueError, TypeError, KeyError):
+                previous = None
+            if previous is not None and previous > observed_at:
+                return
+            self._write_json(path, {"observed_at": observed_at.isoformat(), "prs": [
+                {"number": pr.number, "head": pr.head, "title": pr.title, "url": pr.url}
+                for pr in prs if pr.head.startswith("pm/") and pr.merged_at is None
+            ]})
+
     def refresh_local_issues(
         self, issues: list, prs: list, lanes: dict, now: datetime,
         *, comments: dict[int, list[dict]] | None = None, since_revision: int | None = None,

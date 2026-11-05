@@ -83,3 +83,26 @@ A `conflicted: true` record names the file the run saw, not where the peers coll
 For merge_owner.py (r748) the src file auto-merged; the real conflict was both peers appending tests
 after the same line of tests/test_merge_owner_regressions.py (341 lines). Also map each peer's hunks to
 functions (`git diff -U0 main...branch | grep ^@@`): two peers in one function (_advance) mean no split helps.
+
+## Slow test file: measure inside before splitting (PM r771, 11-05)
+r743 found the slow unit CI shard was one file (tests/test_merge_owner_batch.py, 10.8 min, by summing
+JUnit artifact time per file) and proposed a split by concern. That treated the symptom. Inside the
+file, ~80% of each test rebuilt the same starting queue with ~2,200 real git calls. The cost also hit
+every lane run touching the file (#2103 waited ~70 of 84 implementing minutes on tests). Before
+proposing a split, run `pytest <file> --durations=0` (setup vs call rows) or a cProfile of one test,
+and look for a repeated fixture/start state. Fix owner: PM order 'batch-tests-shared-start'.
+
+## Exempt-match check for post-PASS FAILs (r741)
+When a hot_overlap/conflict case ends in post-PASS FAILs, test the exempt match directly: `risks.matching(risks.load_at(git, base), git diff --name-only base..head)` with the fa python (~/.local/share/uv/tools/foragent/bin/python). #1514 (r741): a 2-line flag rename in scheduler_recovery.py reopened full scope, and the reviewer blocked on main's new merge-owner code.
+
+## Detect broadly, accept exactly (r344)
+When a scope hint makes the reviewer accept the label NOTE, the executor often widens *detection* and *acceptance* together (#1652 r9: fuzzy `_DECLARATION` regex then accepted `License: MIT` as the short form, a regression vs main). Hint 'detect broadly, accept exactly': fuzzy match only decides what to inspect; acceptance is byte-exact plus an allowlist. (r344)
+
+## Moved from index (11-05)
+
+- Before lowering a Goal bar again, check whether the repeat findings already fall inside the stated bar (#1619 r4-r5: license-with-appended-ban and symlink root both named as holds). If they do, the cause is the method (prefix matching), so give a fail-closed definition as a retry hint (exact template match, realpath equality) instead of editing the Goal.
+- Before redesigning a held issue, read its locked test for an allowed minimal branch (`if code:` refusal in test_night_shared_locks) and check whether the reviewers' race scenario appears in any locked case (test_team_v1_scope has none mid-operation). If neither, the fix is to lower the Goal to that bar and name the race a non-goal. (#1004, #1107)
+- When a Goal demands that 'every exit' of a run preserve work and each round finds another path (#1491: 3,2,2, then 9 after an 'every path' redesign), find the single irreversible point instead: all worktree discards go through git.remove_worktree (--force). Guard that one call and name the reversible paths (extra turn, push, PR) non-goals. (r377)
+- Before accepting a review finding as above-bar or not, check two facts: does a config turn that path off (#1526 group path under `merge_group_max: 1`, 0 group rows in merge-queue.jsonl), and does the finding's input appear in real issue bodies (#1570 fence and marker cases: 0 of the last 400)? Counting the construct beats arguing about the race.
+- To measure CI flips after base moves, use gh run list per day (--limit caps at 1000) plus a bare blob:none clone with `+refs/pull/*/head` fetched; a refresh head is a 2-parent commit whose first parent is the passing head. Before calling a flip a collision, check main's own push CI at the merged main sha: most flips were main already red.
+- A run that ends 'crashed' ('Crash recovery for running label generation N') within a minute of a `kind=retry` event is the gate's intended restart after a Goal edit (#1491 r377, 11-03), not a crash. Only 2 of 21 such outcomes since 10-27 followed a retry; most come from batch restarts. Match against retry events before you count crashes.

@@ -715,7 +715,7 @@ def _check_review_head(
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
-            with skipping(n, ctx, command, skips, locked) as selected:
+            with skipping(n, ctx, command, skips, locked, root=worktree) as selected:
                 check = run_done_when(n, ctx, selected, worktree, log,
                                       min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
                                       progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))

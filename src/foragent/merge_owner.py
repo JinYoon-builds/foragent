@@ -458,6 +458,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                 if not may_write_target(ctx, pr.base):
                     return False
                 git.push_head(pr.head, lease=remote)
+                if not run_publish._head_after_push(ctx, pr.number, job["head"], remote):
+                    run_publish._hold_changed_head(n, ctx, pr.url)
+                    _end(ctx, place, job, "held")
+                    return False
             job["phase"] = "waiting"
             _save(ctx, place, job)
             return

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
-import secrets
+import re
 import shlex
 import shutil
 import tempfile
@@ -88,120 +88,208 @@ def _ci_evidence(ctx, head, *, published=True):
     return unit[0], frozenset(found)
 
 
-SKIP_PLUGIN = """\
-import json
-import os
-import pytest
-
-# Tests may start pytest themselves; those inner sessions must not load this plugin.
-_names = [name for name in os.environ.get("PYTEST_PLUGINS", "").split(",") if name.strip() not in ("", {name!r})]
-if _names:
-    os.environ["PYTEST_PLUGINS"] = ",".join(_names)
-else:
-    os.environ.pop("PYTEST_PLUGINS", None)
-_paths = [path for path in os.environ.get("PYTHONPATH", "").split(os.pathsep) if path and path != {directory!r}]
-if _paths:
-    os.environ["PYTHONPATH"] = os.pathsep.join(_paths)
-else:
-    os.environ.pop("PYTHONPATH", None)
-
-with open({listing!r}, encoding="utf-8") as stream:
-    _skip = json.load(stream)
-_ci, _ran, _locked = set(_skip["ci"]), set(_skip["ran"]), tuple(_skip["locked"])
-try:  # Earlier lines of the same Done when block already passed these on this commit.
-    with open({ran!r}, encoding="utf-8") as stream:
-        for line in stream:
-            _ran.update(json.loads(line)["passed"])
-except FileNotFoundError:
-    pass
-_seen, _failed, _counts = set(), set(), {{"collected": 0, "skipped": 0}}
+# pytest options that take the next word as their value (others are flags or carry `=value`).
+_VALUE_OPTIONS = {
+    "-k", "-m", "-p", "-o", "-c", "-W", "-r", "-n", "--deselect", "--ignore", "--ignore-glob", "--maxfail",
+    "--junitxml", "--junit-xml", "--verbosity", "--color", "--config-file", "--override-ini", "--rootdir",
+    "--confcutdir", "--basetemp", "--import-mode", "--tb", "--capture", "--code-highlight", "--junit-prefix",
+    "--durations", "--durations-min", "--pythonwarnings", "--dist", "--numprocesses", "--log-level",
+    "--log-cli-level", "--log-file", "--log-file-level", "--log-format", "--log-date-format", "--timeout",
+    "--cov", "--cov-report", "--cov-config", "--cov-fail-under", "--pyargs", "--deselect",
+}
+_VERBOSITY = {"-q", "-v", "--quiet", "--verbose"}
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*=.*", re.S)
+_NODE_LINE = re.compile(r"^([\w./-]+\.py)::\S")
 
 
-def _keep(item):
-    if item.nodeid in _ran:
-        return False
-    if item.nodeid not in _ci:
-        return True
-    path = item.nodeid.split("::", 1)[0]
-    if any(path == locked or path.startswith(locked.rstrip("/") + "/") for locked in _locked):
-        return True
-    return item.get_closest_marker("local_only") is not None
+@dataclass
+class _PlainPytest:
+    """One Done when line that is a single plain pytest command, split into what pytest reads."""
+
+    assignments: list[str]
+    launcher: list[str]  # Everything up to and including the pytest word.
+    options: list[str]
+    selection: list[str]
+
+    def shell(self, options, selection):
+        prefix = [f"{name}={shlex.quote(value)}" for name, value in
+                  (word.split("=", 1) for word in self.assignments)]
+        return " ".join([*prefix, shlex.join([*self.launcher, *options, *selection])])
 
 
-@pytest.hookimpl(wrapper=True, tryfirst=True)
-def pytest_collection_modifyitems(config, items):
-    result = yield
-    deselected = [item for item in items if not _keep(item)]
-    _counts.update(collected=len(items), skipped=len(deselected))
-    if deselected:
-        items[:] = [item for item in items if _keep(item)]
-        config.hook.pytest_deselected(items=deselected)
-    return result
+def _certain_text(line):
+    """The line without a trailing comment when the shell reads its words literally; otherwise None.
+
+    Outside quotes: expansions, escapes, globs, braces, tildes and operators are not
+    certain, and a ``#`` must start a word (a comment to the end of the line).
+    Inside double quotes only ``$``, backquote and backslash expand. Single quotes are literal.
+    """
+    quote = None
+    for i, char in enumerate(line):
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif quote == '"':
+            if char in "$`\\":
+                return None
+            quote = None if char == '"' else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#":
+            if i and not line[i - 1].isspace():
+                return None
+            return line[:i] if line[:i].strip() else None
+        elif char in "$`\\*?[]{}~;&|<>()!":
+            return None
+    return None if quote else line
 
 
-def pytest_runtest_logreport(report):
-    if report.passed and report.when == "call":
-        _seen.add(report.nodeid)
-    elif report.failed:
-        _failed.add(report.nodeid)
+def _plain_pytest(line):
+    """The line's pytest parts, or None for any form whose shell meaning is not certain.
+
+    Certain means: no expansions, globs, quoting-sensitive comments, escapes,
+    operators, redirections or unknown options that may take a value. Anything
+    else runs exactly as written, without skipping.
+    """
+    line = _certain_text(line)
+    if line is None:
+        return None
+    words = shlex.split(line)
+    if not words or any(any(char in "();<>|&!" for char in word) for word in words):
+        return None
+    index = next((i for i, word in enumerate(words) if Path(word).name in {"pytest", "py.test"}), None)
+    if index is None:
+        return None
+    assignments = []
+    while assignments.__len__() < index and _ASSIGNMENT.fullmatch(words[len(assignments)]):
+        assignments.append(words[len(assignments)])
+    options, selection, rest = [], [], iter(words[index + 1:])
+    for word in rest:
+        if word == "--":
+            selection.extend(rest)
+            break
+        if not word.startswith("-"):
+            selection.append(word)
+            continue
+        options.append(word)
+        if word in _VALUE_OPTIONS:
+            value = next(rest, None)
+            if value is None:
+                return None
+            options.append(value)
+        elif word.startswith("--") and "=" not in word:
+            known_flag = word in {"--quiet", "--verbose", "--exitfirst", "--strict-markers", "--strict-config",
+                                  "--lf", "--last-failed", "--ff", "--failed-first", "--sw", "--stepwise",
+                                  "--disable-warnings", "--showlocals", "--runxfail", "--no-header",
+                                  "--no-summary", "--strict", "--collect-only", "--co", "--setup-show"}
+            if not known_flag:
+                return None  # An unknown long option may take the next word as its value.
+        elif not word.startswith("--") and len(word) == 2 and word not in {"-q", "-v", "-x", "-s", "-l", "-h"}:
+            return None
+    if any(word in {"--collect-only", "--co", "--junitxml", "--junit-xml"} or word.startswith("--junit")
+           for word in options):
+        return None
+    if any(word.startswith("-") for word in selection):
+        return None  # After `--` a test path may look like an option; rebuilt commands would misread it.
+    return _PlainPytest(assignments, words[assignments.__len__():index + 1], options, selection)
 
 
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session, exitstatus):
-    if exitstatus == 5 and _counts["skipped"] and _counts["skipped"] == _counts["collected"]:
-        session.exitstatus = 0  # Every selected test already passed on this commit.
-    with open({ran!r}, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps({{"passed": sorted(_seen - _failed), **_counts}}) + "\\n")
-"""
+def _collect(n, ctx, root, plain, options, log):
+    """Node ids pytest itself collects for these options; None when collection is not clean."""
+    from foragent import runner
+
+    quiet = [word for word in options if word not in _VERBOSITY and not re.fullmatch(r"-[qv]+", word)]
+    command = plain.shell([*quiet, "--collect-only", "-q", "-p", "no:cacheprovider"], plain.selection)
+    log.unlink(missing_ok=True)
+    result = runner._check(command, root, log, max(1, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
+                           slot=_test_slot(n, ctx), clock=ctx.monotonic)
+    if result.exit_code == 5 and not result.timed_out:
+        return []  # pytest collected no tests for these options.
+    if result.exit_code != 0 or result.timed_out:
+        return None
+    text = log.read_text(encoding="utf-8").split("\nCheck exit_code=", 1)[0]
+    ids = [line for line in text.splitlines()[1:] if _NODE_LINE.match(line) and line != command]
+    if not ids or not all((root / _NODE_LINE.match(node).group(1)).is_file() for node in ids):
+        return None  # Output that is not one repository-relative node id per test proves nothing.
+    return ids
+
+
+def _with_local_only(options):
+    """These options with a marker expression that also requires local_only."""
+    result, words = [], iter(options)
+    expression = None
+    for word in words:
+        if word == "-m":
+            expression = next(words)
+        else:
+            result.append(word)
+    return [*result, "-m", f"({expression}) and local_only" if expression else "local_only"]
 
 
 @contextmanager
-def skipping(n, ctx, command, skips, locked=(), label="Done when"):
-    """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
+def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root):
+    """Yield the command to run so that it leaves out what ``skips`` covers (D124).
 
-    The command text is never rewritten: one environment line in front of it
-    activates the plugin through PYTEST_PLUGINS, so quoting, globs, expansions,
-    comments, ``--`` and line continuations keep their shell meaning. Locked
-    paths and ``local_only`` tests always run despite CI evidence; tests that
-    passed earlier in this pass on the same commit are left out as well.
+    pytest itself collects each plain pytest line; the tests CI passed on
+    exactly this commit, or that passed earlier in this pass, are subtracted,
+    and the rest runs by node id with the line's own invocation and options.
+    Locked paths and ``local_only`` tests always stay. A block with any line
+    that is not a plain pytest command, or whose collection is not clean, runs
+    exactly as written.
     """
-    from foragent.run_checks import _append
+    from foragent.run_checks import _append, _passing_acceptance_ids
 
-    # A command that sets these itself would replace the activation and cannot load the plugin.
-    if skips is None or "PYTHONPATH" in command or "PYTEST_PLUGINS" in command:
+    lines = command.splitlines()
+    plains = [None if not line.strip() else _plain_pytest(line) for line in lines]
+    if skips is None or not any(plains) or any(line.strip() and plain is None
+                                               for line, plain in zip(lines, plains)):
+        if skips is not None:
+            _append(ctx.store.log_path(n), f"{label}: no CI skip for this command form; running it as written")
         yield command
         return
     runs = ctx.store.root / "runs"
     runs.mkdir(parents=True, exist_ok=True)
+    passed = skips.passed()
     with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
-        listing, ran = Path(directory) / "skip.json", Path(directory) / "ran.jsonl"
-        listing.write_text(json.dumps({"ci": sorted(skips.ci or ()), "ran": sorted(skips.ran),
-                                       "locked": sorted(locked)}), encoding="utf-8")
-        plugin = f"_foragent_owner_skip_{secrets.token_hex(8)}"
-        (Path(directory) / f"{plugin}.py").write_text(
-            SKIP_PLUGIN.format(listing=str(listing), ran=str(ran), name=plugin, directory=directory),
-            encoding="utf-8")
-        activation = (f"PYTEST_PLUGINS={plugin}${{PYTEST_PLUGINS:+,$PYTEST_PLUGINS}}; "
-                      f"PYTHONPATH={shlex.quote(directory)}${{PYTHONPATH:+:$PYTHONPATH}}; "
-                      "export PYTEST_PLUGINS PYTHONPATH\n")
-        yield activation + command
-        try:
-            outcomes = [json.loads(line) for line in ran.read_text(encoding="utf-8").splitlines()]
-        except FileNotFoundError:
-            outcomes = []  # No pytest session ran (a command without pytest).
-        except (OSError, ValueError) as exc:
-            _append(ctx.store.log_path(n), f"{label}: no skip record for {skips.head}: {exc}")
-            return
-        try:
-            skipped = sum(outcome["skipped"] for outcome in outcomes)
-            collected = sum(outcome["collected"] for outcome in outcomes)
-            for outcome in outcomes:
-                skips.ran.update(outcome["passed"])
-        except (KeyError, TypeError):
-            _append(ctx.store.log_path(n), f"{label}: no skip record for {skips.head}")
-            return
-        _append(ctx.store.log_path(n), f"{label}: skipped {skipped} of {collected} "
-                f"using CI evidence for {skips.head}")
+        rewritten, reports, collected, skipped = [], [], 0, 0
+        for i, (line, plain) in enumerate(zip(lines, plains)):
+            if plain is None:
+                rewritten.append(line)
+                continue
+            log = Path(directory) / f"collect-{i}.log"
+            ids = _collect(n, ctx, root, plain, plain.options, log)
+            machine = _collect(n, ctx, root, plain, _with_local_only(plain.options), log) if ids else None
+            if not ids or machine is None:
+                _append(ctx.store.log_path(n), f"{label}: collection unavailable; running the command as written")
+                yield command
+                return
+            local = set(machine)
+
+            def keep(node):
+                path = node.split("::", 1)[0]
+                if node in skips.ran:
+                    return False
+                if node not in passed:
+                    return True
+                return (any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
+                        or node in local)
+
+            remaining = [node for node in ids if keep(node)]
+            collected += len(ids)
+            skipped += len(ids) - len(remaining)
+            if not remaining:
+                rewritten.append("true")
+                continue
+            report = Path(directory) / f"line-{i}.xml"
+            reports.append(report)
+            rewritten.append(plain.shell([*plain.options, f"--junitxml={report}", "-o", "junit_family=legacy"],
+                                         remaining))
+        _append(ctx.store.log_path(n), f"{label}: skipped {skipped} of {collected} using CI evidence for {skips.head}")
+        yield "\n".join(rewritten)
+        for report in reports:
+            try:
+                skips.ran.update(_passing_acceptance_ids(report))
+            except (OSError, ET.ParseError):
+                continue
 
 
 def report_ids(report, result, measurement):
@@ -332,7 +420,8 @@ def verify_local_only_units(attempt, command, *, skips=None):
                 "Local-only unit discovery unavailable; continuing with related tests")
         return None
 
-    with skipping(attempt.n, attempt.ctx, selection, skips, label="Local-only units") as selected:
+    with skipping(attempt.n, attempt.ctx, selection, skips, label="Local-only units",
+                  root=attempt.worktree) as selected:
         result = check(attempt.n, attempt.ctx, selected, attempt.worktree)
     result = replace(result, command=selection)
     # pytest's no-tests-selected status is valid for this optional marker set.
@@ -372,7 +461,7 @@ def fallback_comparison(attempt, base_sha, *, skips=None):
         with in_phase(n, ctx, "checking"):
             command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
             with skipping(n, ctx, command, skips if skips is not None and skips.head == head else None,
-                          label="Acceptance comparison") as selected:
+                          label="Acceptance comparison", root=attempt.worktree) as selected:
                 result = check(n, ctx, selected, attempt.worktree)
     if (attempt.git.head_sha() != head
             or attempt.git._call(["status", "--porcelain=v1", "--untracked-files=no"])):
