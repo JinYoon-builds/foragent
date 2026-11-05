@@ -27,6 +27,8 @@
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
 - r749 (2026-11-05): orders #1704/#1740/#1775/#1984/#2012/#2049/#2051 — README en/ko one sentence for `fa review <branch>` (#1873, contributor PRs). Wait: orchestrator judges; also when #1492 (fa stop) merges, check README team section 'stop the affected factories'.
 - r759 (2026-11-05): orders #1205/#1211/#1706/#1719/#1759/#1858 — add #1206 Done-when executable refusal to docs/order.md after collection paragraph (~:192). Wait: orchestrator judges.
+- r767 (2026-11-05): orders #1705/#1853/#1855/#1881/#1953/#2079 — duplicate '### D125' (#1856 review rule :946 vs #1472 merge-owner switch-on :1028); renumber later to D126 + mechanisms.md:34; README :77/:166 add `fa stop`. Wait: orchestrator judges.
+- r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -84,3 +86,5 @@
 - New person-facing top-level commands (e.g. `fa review`, #1873) get no README line by themselves; README names only fa init, /fa, fa gate. Check the Goal's dated purpose and propose one sentence. `fa orch stop/release` (#1491) waits for the person shortcut #1492.
 - Dashboard art (squirrel ears/wordmark #1894), conflicting-PR refresh (#2035) and push-refusal waits (#2061) touch no reader doc; README names no logo. A plan's acceptance map can list issues merged by earlier orders (#1893: 1499/1501/1892); check only the `map=` children.
 - Children 'Remove superseded #NNNN locked tests (superseded by #MMMM)' (e.g. #1208/#1760/#1859 → #1970 merge trains) mean the child's code never landed as specced; check only the superseding PR.
+- Orders landing in one merge batch can each take the 'next free' Dnn from the same base; after batch merges run `grep '^### D' docs/decisions.md | sort | uniq -d` style check (#1856 vs #1472 both D125).
+- docs/mechanisms.md (#1472) is the docs owner's map, rewritten in place per merge group; check merge-path/role entries against each order's diff and its D-citations.

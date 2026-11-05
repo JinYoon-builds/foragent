@@ -46,6 +46,7 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "working": _working(status, titles, now),
         "queued": _queued(status),
         "to_see": _to_see(status),
+        "planning": _planning(store),
         "team": _team(store, config),
         "profile": config.profile,
         "usage": store.usage(),
@@ -129,6 +130,16 @@ def _team(store: StateStore, config: Config) -> list[dict[str, Any]]:
     return team
 
 
+def _planning(store: StateStore) -> dict[str, list[dict[str, Any]]]:
+    requests = [{key: row[key] for key in ("id", "text", "status")}
+                for row in orch_inbox.requests(store, pending=True)
+                if row.get("from") == "planning" and row.get("status") in {"new", "processing"}]
+    branches = {}
+    for pr in store.planning_prs():
+        branches.setdefault(pr["head"], pr)
+    return {"requests": requests, "branches": list(branches.values())}
+
+
 def render(brief: dict[str, Any], language: str = "en") -> str:
     if brief.get("setup") is False:
         return text("brief_setup_missing", language)
@@ -156,6 +167,11 @@ def render(brief: dict[str, Any], language: str = "en") -> str:
                    kind=text("brief_kind_needs_human" if item["kind"] == NEEDS_HUMAN else "brief_kind_pr",
                              language))
               for item in brief["to_see"]]
+    planning = brief.get("planning") or {}
+    if planning.get("requests") or planning.get("branches"):
+        lines.append(text("brief_planning_heading", language))
+        lines += [text("brief_planning_request", language, **row) for row in planning["requests"]]
+        lines += [text("brief_planning_branch", language, **row) for row in planning["branches"]]
     none = text("brief_team_none", language)
     lines.append(text("brief_team_heading", language))
     for member in brief["team"]:
