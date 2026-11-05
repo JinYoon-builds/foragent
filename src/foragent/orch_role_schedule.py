@@ -368,7 +368,7 @@ def _start_session(ctx, roles: list[str], budget: int, report) -> None:
         now = ctx.now()
         try:
             report.actions.append(orch_architect.call(ctx.repo_root, ctx.store, ctx.config,
-                                                      _why(ctx, role, now), now, role))
+                                                      _why(ctx, role, now), now, role, tier="m"))
         except orch_architect.ArchitectRefused as exc:  # No free slot after all: it stays due, with no penalty.
             report.actions.append(f"{role} deferred: {exc}")
             return

@@ -25,6 +25,8 @@
 - r672 (2026-11-04): orders #1634/#1837/#1958 — README:81/:159 terminal list add Ghostty (#1959). Wait: orchestrator judges, then docs edits.
 - r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
+- r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
+- r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -65,7 +67,7 @@
 - Orchestrator launch surface (#1490: always hidden `claude --bg`, no Orca tab/tmux window) appears in no reader doc; README's Orca/tmux lines (81/159) are about the lane view (watch_open), not the orchestrator.
 - New read-only `fa order` checks (collect #1523, red #1725) land with no reader-doc line; docs/order.md near the preread paragraph is the one place for them. Bundle such proposals.
 - Test-only orders ('Unit test ...', e.g. #1768/#1769, tests/ + lane memory only) need no doc check beyond `git log --grep` --stat on the child.
-- Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line; facts held/Binding replay fixes (#2011 via #2010) neither. Alarm-rule Dnn ask stays r369.
+- Architect fact kinds (merge_stall, lane_concentration, waiting_on_person #1733) appear in no reader doc or skill; new kinds need no doc line; facts held/Binding replay fixes (#2011 via #2010), repeated_design_holds narrowed to reviewer holds (#2036; rules.md:71 D106 unaffected) neither. Alarm-rule Dnn ask stays r369.
 - 'Accepted' in `fa orch inbox` does not mean the doc was edited (r324/r383 accepted, docs/order.md unchanged days later); grep the doc before treating a wait as closed, and fold new items into it.
 - '#NNNN redesign' orders (e.g. #1809 for #1786) have near-empty bodies; check the named issue's merge. Try-command isolation (#1786, empty env) is named in no reader doc; inspect.md:65 only says try results are pre-run.
 - An order's merge can write its own decision as '## date title (#NNNN)' with no Dnn and add a rules.md section citing the issue number (#1651); check both diffs for missing IDs, and gate.md config yaml for stale defaults or blocks appended in the wrong section.
@@ -79,3 +81,10 @@
 - Setup checklist / gh `project` scope (#1799 setup.py, #1800 notice once) need no README requirement line: README names no board or `fa doctor`, and fa init/doctor print the fix. D117 skill-source tables (#1892) appear in no reader doc; rules.md D37/D117 drift is already r720.
 - Gate lane-label/board Lane sync (#1230, board_lanes.py, via #1845 redesign) and dream redo (#1231, skill reference only) need no reader-doc line; README Lanes already says issues go to the owning lane. #1232 fa-allow is in README :33/:111 both languages.
 - Orders whose only child closed NOT_PLANNED with `foragent:replaced plan=...` (e.g. #1898/#1899 D112 → #2078 r53) changed nothing; check the replacing issue's merge later. D64 보강 5 (decisions.md:519 acorn-number link) gets its 대체 mark only after D112 code lands.
+- New person-facing top-level commands (e.g. `fa review`, #1873) get no README line by themselves; README names only fa init, /fa, fa gate. Check the Goal's dated purpose and propose one sentence. `fa orch stop/release` (#1491) waits for the person shortcut #1492.
+- Dashboard art (squirrel ears/wordmark #1894), conflicting-PR refresh (#2035) and push-refusal waits (#2061) touch no reader doc; README names no logo. A plan's acceptance map can list issues merged by earlier orders (#1893: 1499/1501/1892); check only the `map=` children.
+- Children 'Remove superseded #NNNN locked tests (superseded by #MMMM)' (e.g. #1208/#1760/#1859 → #1970 merge trains) mean the child's code never landed as specced; check only the superseding PR.
+- Orders landing in one merge batch can each take the 'next free' Dnn from the same base; after batch merges run `grep '^### D' docs/decisions.md | sort | uniq -d` style check (#1856 vs #1472 both D125).
+- docs/mechanisms.md (#1472) is the docs owner's map, rewritten in place per merge group; check merge-path/role entries against each order's diff and its D-citations.
+- Before any docs write, run `gh pr list` for foragent/batch-merge-* branches; an open one blocks writing even when it touches no docs. Record exact texts in the wait request so the next call only applies them.
+- When applying a wait's 'exact texts', re-read each accepted answer first: the orchestrator's answer can change wording (r749 → /fa phrasing, Jin q7) and override the text the wait recorded. When renumbering a Dnn, grep every doc for the old ID, not only the citations the wait lists (gate.md:149 was missed).

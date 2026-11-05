@@ -17,10 +17,6 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 BRANCH = re.compile(r"foragent/issue-(\d+)")
-# What each recorded CI read says, in the view's words.
-READS = {"pass": "passed", "fail": "failed", "none": "no_checks", "not-started": "not_started", "pending": "pending"}
-
-
 def infer(folder: Path) -> int | None:
     """The issue whose lane branch is checked out in ``folder``, if any."""
     try:
@@ -58,42 +54,19 @@ def latest_run(store: StateStore, number: int):
     return next((run for run in reversed(store.read_history()) if run.number == number), None)
 
 
-def _at(value) -> datetime | None:
-    try:
-        moment = datetime.fromisoformat(value) if isinstance(value, str) else None
-    except ValueError:
-        return None
-    return moment if moment is not None and moment.tzinfo is not None else None
-
-
-def recorded_ci(store: StateStore, number: int, run) -> str | None:
-    """This run's newest recorded CI result, or None when the run recorded none.
-
-    The runner keeps every CI read it acts on (``ci-read``: the CI wait, the final merge inputs,
-    jobs that never started) and every CI code failure (``ci-failure``, also a comparison that
-    fails a head GitHub passed). The newest wins; at equal times the one written last wins
-    (the flow log keeps written order, and a comparison failure is written after the read it overrides).
-    """
-    found: list[tuple[datetime, int, str]] = []
-    for index, record in enumerate(store.flow_records()):
-        if record["issue"] != number or record["run_started_at"] != run.started_at:
-            continue
-        if (at := _at(record["at"])) is None:
-            continue
-        if record["kind"] == "ci-failure":
-            found.append((at, index, "failed"))
-        elif record["kind"] == "ci-read" and record["data"].get("status") in READS:
-            found.append((at, index, READS[record["data"]["status"]]))
-    return max(found, key=lambda item: item[:2])[2] if found else None
+def _failure_recorded(store: StateStore, number: int, started_at: str) -> bool:
+    """Whether this execution wrote its per-run ``ci-failure`` record (run_publish_ci._record_failure)."""
+    return any(record["kind"] == "ci-failure" and record["issue"] == number
+               and record["run_started_at"] == started_at for record in store.flow_records())
 
 
 def ci_state(store: StateStore, number: int) -> str:
-    """The CI line for the issue's newest run, from recorded facts only.
+    """The CI line for the issue's newest run, from the one CI fact the run recorded.
 
-    A live run in its CI step: running. Otherwise the run's newest recorded CI read decides
-    (a pending read means CI is still running while the run lives, and no result once it ended).
-    Without a record: a live run has not started CI; a finished run, whatever step it stopped in,
-    recorded no CI result. finish_run keeps the last step, so no step ever stands for a result.
+    A live run in its CI step: running. Otherwise the run's own ``ci_result`` (state_runs.CI_RESULTS),
+    read as is: it lives in the run record, so no later record or history length changes it. Without
+    one: a live run has not reached CI yet; a finished run recorded no CI result (or, by its own
+    outcome, failed CI). finish_run keeps the last step, so no step ever stands for a result.
     """
     run = latest_run(store, number)
     if run is None:
@@ -101,11 +74,10 @@ def ci_state(store: StateStore, number: int) -> str:
     live = run.status == "running"
     if live and run.phase == "ci":
         return "running"
-    recorded = recorded_ci(store, number, run)
-    if recorded == "pending" and live:
-        return "running"
-    if recorded not in {None, "pending"}:
+    if (recorded := store.ci_result(number, run.started_at)) is not None:
         return recorded
+    if _failure_recorded(store, number, run.started_at):
+        return "failed"  # the run's ci-failure record is the same fact, for runs that predate ci_result
     if run.outcome == "ci-failed":
         return "failed"  # the runner's own terminal fact: CI failed after every attempt
     return "none" if live else "unrecorded"

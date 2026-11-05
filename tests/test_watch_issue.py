@@ -28,9 +28,15 @@ def _fail_ci(store):
     store.record_flow("ci-failure", issue=7, run_started_at=store.get_run(7).started_at, pr=1)
 
 
-def _read(store, status, number=7):
+def _result(store, result, number=7):
     store.clock[0] += timedelta(minutes=1)
-    store.record_flow("ci-read", issue=number, run_started_at=store.get_run(number).started_at, pr=1, status=status)
+    store.record_ci_result(number, result)
+
+
+def _ticks(store, count):
+    """Ordinary gate tick records written after the run: the history a replay would have to scan."""
+    for _ in range(count):
+        store.record_flow("tick", outcome="idle")
 
 
 def test_ci_state_follows_the_current_run(tmp_path):
@@ -38,18 +44,16 @@ def test_ci_state_follows_the_current_run(tmp_path):
     assert watch_issue.ci_state(store, 7) == "none"
     _step(store, "ci")
     assert watch_issue.ci_state(store, 7) == "running"
-    _read(store, "pass")
+    _result(store, "passed")
     _step(store, "merging")
-    assert watch_issue.ci_state(store, 7) == "passed", "the recorded read, not the step"
+    assert watch_issue.ci_state(store, 7) == "passed", "the recorded result, not the step"
     _step(store, "implementing")
-    store.record_flow("ci-failure", issue=7, run_started_at="2000-01-01T00:00:00+00:00", pr=1)
-    assert watch_issue.ci_state(store, 7) == "passed", "another run's failure is not this run's"
-    _fail_ci(store)
-    assert watch_issue.ci_state(store, 7) == "failed", "the newest CI fact wins"
+    _result(store, "failed")
+    assert watch_issue.ci_state(store, 7) == "failed", "the run's latest conclusion"
+    _step(store, "ci")
+    assert watch_issue.ci_state(store, 7) == "running", "a live run back in CI"
     _step(store, "merge-lock-wait")
-    _read(store, "pending")
-    assert watch_issue.ci_state(store, 7) == "running", "a live run whose last read was pending"
-    _read(store, "pass")
+    _result(store, "passed")
     assert watch_issue.ci_state(store, 7) == "passed", "a later attempt passed after the failure"
     assert watch_issue.ci_state(store, 8) == "none"
 
@@ -63,45 +67,48 @@ OUTCOMES = ["merged", "merge-queued", "pr-open", "held", "ci-failed", "retries-e
 STEPS = [None, "baseline", "implementing", "resolving", "checking", "reviewing", "ci", "merge-turn-wait",
          "merge-lock-wait", "merging", "resolving-conflict", "overlap-wait", "test-slot-wait",
          "baseline-wait", "limit-wait", "executor-wait", "run-slot-wait"]
-# What this run recorded about CI before it ended, oldest first: a read's status, or a code failure.
-HISTORIES = {"nothing": [], "pass": ["pass"], "fail": ["fail"], "no-checks": ["none"], "pending": ["pending"],
-             "not-started": ["fail", "not-started"], "failure": ["ci-failure"], "pass-then-failure": ["pass", "ci-failure"],
-             "failure-then-pass": ["ci-failure", "pending", "pass"], "pass-then-final-fail": ["pass", "fail"]}
-WORDS = {"pass": "passed", "fail": "failed", "none": "no_checks", "not-started": "not_started", "ci-failure": "failed"}
+RESULTS = [None, "passed", "no_checks", "failed", "timed_out", "not_started"]
 
 
-def _history(store, entries):
-    for entry in entries:
-        if entry == "ci-failure":
-            _fail_ci(store)
-        else:
-            _read(store, entry)
-
-
-def _expected(outcome, history):
-    """The finished-run table: the newest recorded CI fact, never the outcome's or the step's meaning."""
-    newest = (HISTORIES[history] or [None])[-1]
-    if newest in WORDS:
-        return WORDS[newest]
+def _expected(outcome, result):
+    """The finished-run table: the run's recorded CI result as is; the outcome only fills its absence."""
+    if result is not None:
+        return result
     return "failed" if outcome == "ci-failed" else "unrecorded"
 
 
-@pytest.mark.parametrize("history", list(HISTORIES))
-@pytest.mark.parametrize("step", STEPS)
-@pytest.mark.parametrize("outcome", OUTCOMES)
-def test_every_terminal_outcome_in_every_stop_step(tmp_path, outcome, step, history):
-    from foragent.config import Config
-    from foragent.i18n import text
-    from foragent.watch_sections import lane_bubble
-
-    store = _store(tmp_path)
-    _history(store, HISTORIES[history])
+def _finish(store, outcome, step, result):
+    if result is not None:
+        _result(store, result)
     if step is not None:
         _step(store, step)
     store.clock[0] += timedelta(minutes=1)
     store.finish_run(7, outcome)
     assert store.get_run(7).phase == step, "the premise: the last step survives finish_run"
-    assert watch_issue.ci_state(store, 7) == _expected(outcome, history)
+
+
+@pytest.mark.parametrize("ticks", [0, 2500], ids=["no-later-history", "2500-later-ticks"])
+@pytest.mark.parametrize("result", RESULTS)
+@pytest.mark.parametrize("outcome", OUTCOMES)
+def test_every_terminal_outcome_and_ci_result_whatever_history_follows(tmp_path, outcome, result, ticks):
+    """Review 6: a recorded pass (or failure) must survive thousands of later tick records."""
+    store = _store(tmp_path)
+    _finish(store, outcome, "ci", result)
+    _ticks(store, ticks)
+    assert watch_issue.ci_state(store, 7) == _expected(outcome, result)
+
+
+@pytest.mark.parametrize("step", STEPS)
+@pytest.mark.parametrize("outcome", OUTCOMES)
+def test_every_terminal_outcome_in_every_stop_step(tmp_path, outcome, step):
+    from foragent.config import Config
+    from foragent.i18n import text
+    from foragent.watch_sections import lane_bubble
+
+    store = _store(tmp_path)
+    _finish(store, outcome, step, "passed" if outcome in {"merged", "merge-queued"} else None)
+    expected = "passed" if outcome in {"merged", "merge-queued"} else _expected(outcome, None)
+    assert watch_issue.ci_state(store, 7) == expected
 
     def working(*args, **kwargs):
         raise AssertionError("a finished run is never described by the live acorn explanation")
@@ -113,60 +120,51 @@ def test_every_terminal_outcome_in_every_stop_step(tmp_path, outcome, step, hist
             shown = watch_issue.plain(watch_issue.rows(None, store, Config(language=language), tmp_path, 7,
                                                        now=store.clock[0], width=120))
             assert text("issue_view_ci_running", language) not in shown
+            assert text(f"issue_view_ci_{expected}", language) in shown
             assert shown.count(text("issue_view_ended", language, outcome="")) == 1, shown
     finally:
         lane_bubble.explain = original
 
 
-def test_a_journaled_move_past_ci_without_a_read_is_not_a_pass(tmp_path):
-    """Review 5: checks=ci with billing-blocked jobs; the run left `ci` for the merge turn, then was held."""
+def test_the_result_lives_in_history_after_the_next_run_starts(tmp_path):
     store = _store(tmp_path)
     _step(store, "ci")
-    _step(store, "merge-lock-wait")  # journals `ci -> merge-lock-wait`
+    _result(store, "passed")
     store.clock[0] += timedelta(minutes=1)
-    store.finish_run(7, "held")
-    assert watch_issue.ci_state(store, 7) == "unrecorded"
-    _read(store, "fail")
-    _read(store, "not-started")
-    assert watch_issue.ci_state(store, 7) == "not_started"
-
-
-def test_the_final_read_before_a_stop_decides(tmp_path):
-    """Review 5: CI passed, a rerun failed at the final merge read, then approval was removed."""
-    store = _store(tmp_path)
-    _step(store, "ci")
-    _read(store, "pass")
-    _step(store, "merge-lock-wait")
-    _read(store, "fail")
-    store.clock[0] += timedelta(minutes=1)
-    store.finish_run(7, "hash-mismatch")
-    assert watch_issue.ci_state(store, 7) == "failed"
-
-
-def test_an_earlier_runs_reads_are_not_this_runs(tmp_path):
-    store = _store(tmp_path)
-    _step(store, "ci")
-    _read(store, "pass")
-    store.clock[0] += timedelta(minutes=1)
-    store.finish_run(7, "crashed")
+    finished = store.finish_run(7, "crashed")
     store.clock[0] += timedelta(minutes=1)
     store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "wt")
+    assert store.ci_result(7, finished.started_at) == "passed", "kept as long as the run record"
     _step(store, "resolving-conflict")
-    assert watch_issue.ci_state(store, 7) == "none"
+    assert watch_issue.ci_state(store, 7) == "none", "a new run starts without the earlier run's result"
     store.clock[0] += timedelta(minutes=1)
     store.finish_run(7, "timeout")
     assert watch_issue.ci_state(store, 7) == "unrecorded"
 
 
-def test_a_failure_recorded_with_a_pass_read_wins_at_the_same_time(tmp_path):
-    """A CI comparison can fail a head GitHub passed; both facts may carry the same clock."""
+def test_a_runs_own_ci_failure_record_counts_when_it_has_no_result(tmp_path):
+    """Runs that predate ci_result kept only their per-run ci-failure record; a ci_result always wins."""
+    store = _store(tmp_path)
+    _step(store, "implementing")
+    _fail_ci(store)
+    assert watch_issue.ci_state(store, 7) == "failed"
+    store.record_flow("ci-failure", issue=8, run_started_at=store.get_run(7).started_at, pr=1)
+    _result(store, "passed")
+    assert watch_issue.ci_state(store, 7) == "passed", "the run's latest recorded result wins"
+
+
+def test_only_the_live_run_writes_its_result(tmp_path):
     store = _store(tmp_path)
     _step(store, "ci")
-    started = store.get_run(7).started_at
-    store.record_flow("ci-read", issue=7, run_started_at=started, pr=1, status="pass")
-    store.record_flow("ci-failure", issue=7, run_started_at=started, pr=1, head="abc")
-    store.finish_run(7, "retries-exceeded")
-    assert watch_issue.ci_state(store, 7) == "failed"
+    _result(store, "passed")
+    store.clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "merge-queued")
+    record = (store.root / "runs" / "7.json").read_bytes()
+    store.record_ci_result(7, "failed")  # e.g. a later merge-owner read: not this run's writer
+    assert (store.root / "runs" / "7.json").read_bytes() == record, "a finished record is never rewritten"
+    assert watch_issue.ci_state(store, 7) == "passed"
+    with pytest.raises(ValueError):
+        store.record_ci_result(7, "running")
 
 
 def test_ci_lines_state_a_result_and_never_what_the_lane_is_doing():

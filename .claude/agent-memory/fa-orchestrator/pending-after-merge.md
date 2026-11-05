@@ -259,7 +259,7 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - 6 h after #1924 merges (architect r570): 'CI did not finish' per hour should drop from 5-8/h to <=1/h; orch executions per distinct issue from 1.9 to ~1.2.
 - L1 (union paths from base) plan drafts/2026-11-04-cleanup1/plan-l1.json: publish after #1635 and #1915 merge (it rewrites their lock test_orch_facts.py).
 - 11-04 09:37-09:48Z: four GitHub push 500s (remote rejected, Internal Server Error) on #1954 #1892 #1894 while githubstatus said operational; if it repeats, call the architect with push counts per minute (trains + refreshes + retries).
-- 3 h after merge_batch_size 2 lands (architect r615): construction failures <=1/5, used members per CI'd batch 2, merges to main >=2/h. If used_members stays 1, merge_batch off is the next step (Jin decision, D110).
+- (dropped 11-05: Jin set merge_batch_size back to 6 after v4 #1970; one tip CI per batch, so the r615 size-2 re-measure no longer applies.)
 - #1914 got 3 push 500s (10:00, 10:15, 10:42Z). If a 4th: fa orch park 1914 until the push-wait fix (architect r618, plan drafts/2026-11-04-batch-push) merges, then unpark + re-approve by edit.
 - Candidate order (11-04 #1952): a PR that is CONFLICTING with main gets no GitHub merge ref, so no CI runs; the gate waited and held 'missing acceptance shards: observed []' instead of noticing mergeable=CONFLICTING and rebasing. Ask the architect for the reading point (ci_mode missing shards vs tracker pr mergeable) before ordering.
 - #435 split (drafts/435split/plan.json, preread clean 2026-11-04 13Z): publish --approve right after #1641 merges (both use tests/acceptance/test_silence_watchdog.py). PM r655 item b.
@@ -267,3 +267,5 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - Accepted docs-role proposals are not applied by themselves: r672/r716/r720 sat accepted until I ordered #2041. After accepting a docs proposal, order it (main lane, small lock) in the next batch.
 - After #2078 (r53 dashboard) merges: re-draft the scene-contract unit-test tidy (#2053's goal) against main's new test names; close PR #2056 if still open (`fa orch close 2056 --superseded-by 2078`).
 - After #1952 merges: preread and publish `drafts/2026-11-05-mobsplit/plan.json` (split test_merge_owner_batch.py; fixes the green-but-late CI hold loop, architect r743). Check test_unit_helpers_split on main then: it must fail only for reasons this order fixes.
+- Jin q13 (11-05) chose option 2 for r732: while a train waits on CI, refresh one excluded member's head so it joins the next train. merge_owner._tick is the PM's v4 area; check that v4 includes it, else order it after v4 merges.
+- When the mobsplit order publishes: answer PM request r760 with its issue number (PM makes 'batch-tests-shared-start' blocked_by it).

@@ -51,7 +51,7 @@ when the questions end. When a lesson recurs across projects, add it to
 
 Design mode continues in the same window as the planning session. Keep the
 conversation here while the right pane shows references or running drafts next
-to the lane view. The gate schedules implementation; it never watches this
+to the dashboard. The gate schedules implementation; it never watches this
 conversation, counts it as a lane worker, or times it out.
 
 Read the request, project decisions, existing screens and `docs/design/CONTRACT.md`
@@ -108,7 +108,7 @@ missing.
 - Terminal UI: use existing Orca panes or tmux splits to execute scripts side by
   side. Repeat `--command` for each draft. Shell-quote paths with spaces inside
   each command. `fa design done` closes only the saved preview panes, preserving
-  the planning pane and lane view.
+  the planning pane and the dashboard.
 - Web UI: start a local server for each runnable draft. Repeat `--url` to embed
   the live drafts side by side in one browser comparison page. Test interactions
   in the browser and use gstack screenshots or Playwright MCP to inspect states.
@@ -146,7 +146,7 @@ Write `docs/design/<topic>/HANDOFF.md` with:
   Done when evidence: the same screen as the draft, plus flow/accessibility
   checks appropriate to this medium.
 
-Run `fa design done` to return the right pane to the lane view and stop the local
+Run `fa design done` to return the right pane to the dashboard and stop the local
 board server. It leaves draft sources, reference assets and picks available for
 later work. Draft application servers remain owned by the planning session;
 stop those explicitly when finished with them.

@@ -17,11 +17,29 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     return "held"
 
 
+def _head_after_push(ctx: RunContext, pr: int, head: str, replaced: str | None) -> bool:
+    """Wait only for the exact head replaced by our successful leased push."""
+    delays = iter((2, 4, 8, 16, 30))
+    while True:
+        reads = getattr(ctx, "reads", None)
+        if reads is not None:
+            reads.clear()  # Both the owner snapshot and its underlying gh GET cache.
+        actual = ctx.tracker.pr_head_sha(pr)
+        if actual == head:
+            return True
+        if not replaced or actual != replaced:
+            return False
+        delay = next(delays, None)
+        if delay is None:
+            return False
+        ctx.sleep(delay)
+
+
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
     if not getattr(logs, "not_started", False):
         return
-    run_publish._record_read(n, ctx, pr, "not-started")
+    run_publish._record_result(n, ctx, "not_started")
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     run_publish._append(ctx.store.log_path(n), f"CI did not start:\n{logs}")
     run_publish.flag(ctx, n, run_publish.Reason.CI_NOT_STARTED,
@@ -34,6 +52,7 @@ def _record_failure(n: int, ctx: RunContext, pr: int, head: str) -> None:
 
     Every exit that handles a code failure of this run's head calls this once, after the
     not-started hold (infrastructure, not code) and before its own retry or block decision."""
+    run_publish._record_result(n, ctx, "failed")
     try:
         run = ctx.store.get_run(n)
         ctx.store.record_flow("ci-failure", issue=n, run_started_at=run.started_at, pr=pr, head=head)
@@ -41,17 +60,20 @@ def _record_failure(n: int, ctx: RunContext, pr: int, head: str) -> None:
         return
 
 
-def _record_read(n: int, ctx: RunContext, pr: int, status: str) -> None:
-    """Keep one CI read of this run as a local ``ci-read`` fact: pass, fail, none, pending or not-started.
+def _record_result(n: int, ctx: RunContext, result: str) -> None:
+    """Save what this run's CI concluded as the run's own ``ci_result`` fact (state_runs.CI_RESULTS).
 
-    Every read the run acts on is kept (the CI wait and the final merge inputs both read through
-    ``_ci_status``), so a view takes the run's newest CI result from these facts and ``ci-failure``,
-    never from the step the run stopped in. Recording never changes the run."""
+    Called where a CI conclusion is reached: the CI wait (pass, no checks, timeout, jobs that never
+    started), every code-failure exit (``_record_failure``) and the final merge read. The latest
+    conclusion of the run stands; recording never changes the run."""
     try:
-        run = ctx.store.get_run(n)
-        ctx.store.record_flow("ci-read", issue=n, run_started_at=run.started_at, pr=pr, status=status)
+        ctx.store.record_ci_result(n, result)
     except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
         return
+
+
+# The run's CI result for each status the run acts on; a pending status concludes nothing.
+STATUS_RESULTS = {"pass": "passed", "none": "no_checks", "fail": "failed"}
 
 
 def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str) -> None:
@@ -76,14 +98,14 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
 
 
 def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float, *, n: int | None = None) -> str:
-    """The PR's CI status as the run acts on it; with the issue ``n`` the read is also kept as a fact."""
+    """The PR's CI status as the run acts on it; with the issue ``n`` a concluded status is the run's CI result."""
     status = ctx.tracker.pr_checks(pr)
     has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
                         for path in (worktree / ".github/workflows").glob(pattern))
     if status == "none" and has_workflows and ctx.now().timestamp() - ready_at < 180:
         status = "pending"
-    if n is not None:
-        run_publish._record_read(n, ctx, pr, status)
+    if n is not None and status in STATUS_RESULTS:
+        run_publish._record_result(n, ctx, STATUS_RESULTS[status])
     return status
 
 
@@ -122,6 +144,7 @@ def _wait_for_ci(
     wait.infrastructure = ""
     while True:
         if runner._remaining(n, ctx) <= 0:
+            run_publish._record_result(n, ctx, "timed_out")
             return run_publish._timeout(n, ctx)
         if status is None:
             status = run_publish._ci_status(ctx, pr, git.root, ready_at, n=n)
@@ -145,7 +168,7 @@ def _wait_for_ci(
             if comparison_mode:
                 evidence = ctx.tracker.pr_failed_logs(pr)
                 if getattr(evidence, "not_started", False):
-                    run_publish._record_read(n, ctx, pr, "not-started")
+                    run_publish._record_result(n, ctx, "not_started")
                     wait.infrastructure = str(evidence)
                     return None
             failed()
@@ -158,6 +181,7 @@ def _wait_for_ci(
                       if wait.queue_aware and wait.running_since is None
                       else "CI ran past the wait limit.")
             run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
+            run_publish._record_result(n, ctx, "timed_out")
             return "timeout"
         if conflicting is not None and conflicting():
             from foragent.ci_mode import ConflictingPR

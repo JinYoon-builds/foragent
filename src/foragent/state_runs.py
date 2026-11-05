@@ -38,6 +38,11 @@ def owner_facts_of(values) -> dict[tuple[int, str], dict]:
             if _owner_fact_matches(value)}
 
 
+# What a run's CI concluded: GitHub passed, no checks ran, failed (GitHub or the run's own
+# comparison), the wait ran out of time, or the jobs never started. No record: CI not reached.
+CI_RESULTS = frozenset({"passed", "no_checks", "failed", "timed_out", "not_started"})
+
+
 def record_merged(value, owner_facts) -> bool:
     """The one merge rule on a raw run record: outcome merged, or a recorded owner merge of it."""
     if not isinstance(value, dict) or type(value.get("number")) is not int:
@@ -98,6 +103,7 @@ class RunRecordsMixin:
             value = self._run_value(run)
             value["run_generation"] = uuid4().hex  # Distinguishes starts even on an unchanged injected clock.
             value.pop("finished_at", None)
+            value.pop("ci_result", None)  # Each execution records its own CI result.
             # Owner completion fields belong to an execution, not to the issue.
             if "owner_merge" in value:
                 for key in ("owner_merge", "owner_merge_started_at", "merged_at"):
@@ -213,6 +219,33 @@ class RunRecordsMixin:
             value = _state.json.loads(path.read_text(encoding="utf-8"))
             value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
             self._write_json(path, value)
+
+    def record_ci_result(self, number: int, result: str) -> None:
+        """Save the CI result this live run concluded (``CI_RESULTS``) beside the record's fields.
+
+        The run is the only writer: a finished record is left as it is. The key travels with the
+        record into history (finish_run writes it back) and ``ci_result`` reads it as is."""
+        if result not in CI_RESULTS:
+            raise ValueError(f"unknown CI result {result!r}")
+        with self._state_lock():
+            path = self.root / "runs" / f"{number}.json"
+            value = _state.json.loads(path.read_text(encoding="utf-8"))
+            if value.get("status") != "running":
+                return
+            value["ci_result"] = result
+            self._write_json(path, value)
+
+    def ci_result(self, number: int, started_at: str) -> str | None:
+        """The CI result execution (number, started_at) recorded, or None when it recorded none."""
+        try:
+            current = self._read_issue_run(number)
+        except FileNotFoundError:
+            current = None
+        if current is not None and current.get("started_at") == started_at:
+            return current.get("ci_result")
+        row = next((row for row in reversed(self._run_history())
+                    if row["number"] == number and row["started_at"] == started_at), None)
+        return row.get("ci_result") if row is not None else None
 
     def record_owner_merge(self, number: int, started_at: str, fact: dict) -> None:
         """Attach a validated GitHub merge fact to the admitted worker generation."""
