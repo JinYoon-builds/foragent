@@ -110,3 +110,4 @@ writes this file.
 - A 'Stale acceptance shard' held outcome after #1925 (merged 11-04 18:28Z) is the refresh-once path: #2036 went held 22:14Z -> baseline -> ci within 5 min. Read the issue's next phase events before counting it as a stall (7 in 7d, owned by #1922).
 - When a hot_overlap/conflict case ends in post-PASS FAILs, test the exempt match directly: `risks.matching(risks.load_at(git, base), git diff --name-only base..head)` with the fa python (~/.local/share/uv/tools/foragent/bin/python). #1514 (r741): a 2-line flag rename in scheduler_recovery.py reopened full scope, and the reviewer blocked on main's new merge-owner code.
 - Slow unit CI shard = one big test file (r743: merge_owner_batch 10.8 min); sum JUnit artifact time per file. [detail](lessons_detail.md)
+- A 'role ran a person command' incident may be shell command substitution: backticks inside --text "..." ran fa stop x3 (11-05, r768). Scan tool_use commands in logs/<role>-*.log first.
