@@ -75,3 +75,10 @@ A stuck merge-owner state is often one long tick, not a missing path: check `ps`
 
 ## Unit CI shard slow: find the one file (r743, 11-05)
 ci.yml unit shards use sorted round-robin by file (ci_unit_shard.select), no duration table; only acceptance shards use scripts/shard_times.json. To find the cause: `gh run download <run> -p 'unit-*'` and sum testcase time per `file` attribute. On 11-04 test_merge_owner_batch.py was 10.8 of 17.2 min in shard 3 (74 queue_workers calls, each a real runner.run_issue x6). The heavy shard index moves as files are added, so 'shard 3' is not a stable name. The locked test_ci_unit_shards pins a file partition, so a balanced select cannot go below the biggest file; split or speed up that file instead.
+
+## Reproduce a conflicted overlap_record before blaming the file (r750, 11-05)
+A `conflicted: true` record names the file the run saw, not where the peers collide now. Run
+`git merge-tree --write-tree origin/foragent/issue-A origin/foragent/issue-B` on the live peer branches.
+For merge_owner.py (r748) the src file auto-merged; the real conflict was both peers appending tests
+after the same line of tests/test_merge_owner_regressions.py (341 lines). Also map each peer's hunks to
+functions (`git diff -U0 main...branch | grep ^@@`): two peers in one function (_advance) mean no split helps.
