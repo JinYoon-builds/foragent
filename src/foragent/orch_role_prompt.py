@@ -1,9 +1,16 @@
 """The prompt a role session starts with, built from its entry in the roles source (D95).
 
 The architect keeps its measurement prompt; every other role shares ``ROLE_PROMPT``.
+
+A user-view role (one the gate calls when an order finishes or once a day, such as the UX
+researcher) sees what a person sees: its session runs in a fresh folder outside the checkout
+holding the README, its agent, skills and memory, and never the source or the state directory.
 """
 
+import json
+import os
 from pathlib import Path
+import shutil
 
 from foragent.config import Config
 from foragent.roles import load_roles
@@ -72,6 +79,95 @@ wait so the owner can continue it after a restart.
 End with a one-line summary of what you proposed, or "Nothing to change.".
 """
 
+
+
+# Signal kinds the gate schedules itself: one pass per finished order, one pass a day (#1874).
+USER_VIEW_KINDS = ("order_finished", "daily")
+# The file in a user-view session's folder where `fa orch request` leaves its reports (#1874).
+REPORTS = ".foragent-reports.jsonl"
+REPORTS_ENV = "FORAGENT_ROLE_REPORTS"
+
+USER_VIEW_NOTE = """## What you see
+
+You work as a person would: your working folder holds only the project's README, your agent,
+skills and memory. Use the product as the README tells a person to; never read its source.
+Report with `fa orch request --repo-root {root} --from {role} --text "<find>"`; a separate session
+confirms each find before it reaches the orchestrator.
+{readme}"""
+
+
+def readme_section(workspace: Path) -> str:
+    """The README a person starts from, also kept as a file in the session's folder."""
+    for name in ("README.md", "README.rst", "README.txt", "README"):
+        path = workspace / name
+        if path.is_file():
+            return f"\n## {name}\n\n{path.read_text(encoding='utf-8', errors='replace').strip()}\n"
+    return ""
+
+
+def user_view_kinds(entry: dict | None) -> set[str]:
+    """The gate-scheduled kinds the role's signals declare."""
+    kinds = {kind for signal in (entry or {}).get("signals") or [] for kind in signal.get("kinds") or []}
+    return kinds & set(USER_VIEW_KINDS)
+
+
+def is_user_view(entry: dict | None) -> bool:
+    return bool(user_view_kinds(entry))
+
+
+def _copy(source: Path, target: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, target, dirs_exist_ok=True)
+    elif source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+def prepare_workspace(root: Path, workspace: Path, entry: dict) -> None:
+    """Fill a user-view session's folder: README files, the role's agent, skills and memory."""
+    for readme in sorted(root.glob("README*")):
+        _copy(readme, workspace / readme.name)
+    _copy(root / ".claude/agents" / f"{entry['agent']}.md", workspace / ".claude/agents" / f"{entry['agent']}.md")
+    for skill in entry["skills"]:
+        source = root / ".claude/skills" / skill
+        _copy(source if source.is_dir() else root / "skills" / skill, workspace / ".claude/skills" / skill)
+    _copy(root / entry["memory"], workspace / entry["memory"])
+    (workspace / REPORTS).touch()
+
+
+def keep_memory(root: Path, workspace: Path, entry: dict) -> None:
+    """Bring the session's memory edits back to the checkout, where role memory is published."""
+    memory = workspace / entry["memory"]
+    if memory.is_dir():
+        shutil.copytree(memory, root / entry["memory"], dirs_exist_ok=True)
+
+
+def reports(workspace: Path) -> list[str]:
+    """The texts the session reported through `fa orch request`, in order."""
+    try:
+        lines = (workspace / REPORTS).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    found = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+            found.append(item["text"].strip())
+    return found
+
+
+def spool(source: str, text: str) -> Path | None:
+    """Inside a user-view session of ``source``, append the report to its folder and return the file."""
+    target = os.environ.get(REPORTS_ENV)
+    role, _, path = (target or "").partition("=")
+    if not path or role != source:
+        return None
+    with Path(path).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+    return Path(path)
 
 
 def _entry(config: Config, role: str) -> dict | None:

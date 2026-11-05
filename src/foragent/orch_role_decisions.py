@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from foragent import orch_inbox
+from foragent import orch_inbox, orch_role_prompt
 from foragent.config import Config
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.roles import load_roles
@@ -17,7 +17,19 @@ from foragent.state import StateStore
 
 
 def add_request(store: StateStore, config: Config, source: str, text: str) -> dict[str, Any]:
-    """Role sessions deliver proposals; the orchestrator hands ordinary requests to planning."""
+    """Role sessions deliver proposals; the orchestrator hands ordinary requests to planning.
+
+    A user-view role's report never enters the inbox here: inside its session it goes to the
+    session's folder, which the session hands to the gate when it ends; anywhere else it is an
+    unconfirmed find that a second session must reproduce (#1874).
+    """
+    entry = load_roles(config).get(source)
+    if orch_role_prompt.is_user_view(entry):
+        if orch_role_prompt.spool(source, text) is not None:
+            return {"id": "report", "status": "reported"}
+        from foragent import orch_role_schedule
+
+        return orch_role_schedule.record_find(store, source, text, store._now())
     extra = {"role": source} if source != "orchestrator" and source in load_roles(config) else None
     return orch_inbox.add_request(store, source, text, extra)
 
