@@ -14,6 +14,11 @@ sub-issues, so the close waits for those references as well (#837). A closed
 reference or sub-issue counts as ended whatever its reason. While any child is
 open, a cancelled child only flags the order for a decision. Until a record
 closes, its card keeps today's handling.
+
+A parent that has closed still owes its card: while the last board read
+shows it without a card in Done, each listing tick continues the card's
+creation and move to Done under the same retained-read rule, until the board
+records Done. This covers parents closed before this rule existed as well.
 """
 
 import hashlib
@@ -114,6 +119,20 @@ def order_records(rows: list[dict[str, Any]]) -> tuple[dict[int, set[int]], set[
         else:
             records[row["number"]] = references
     return records, unparseable
+
+
+def closed_parents(rows: list[dict[str, Any]]) -> set[int]:
+    """Closed issues that show order-parent facts: sub-issues, or a plan marker without a lane label.
+
+    The listing reads sub-issue edges for open issues only, so a closed row's
+    ``children`` is empty after the next refresh; its sub-issues show in the
+    listing's native summary instead. An approved issue is ordinary work, as while open.
+    """
+    return {row["number"] for row in rows
+            if row.get("state") == "closed" and APPROVED not in (labels := row.get("labels", ()))
+            and (row.get("children") or (_summary(row).get("total") or 0) > 0
+                 or (_MARKER_START in (row.get("body") or "")
+                     and not any(label.startswith("lane:") for label in labels)))}
 
 
 def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]],
@@ -385,11 +404,15 @@ def follow_children(ctx, report) -> None:
         if state is not None and state != moved:
             board.sync_status(view, number, state, parent=True)
 
+    def finish_card(number: int, calls: _ActionCalls) -> None:
+        view = SimpleNamespace(tracker=calls, store=ctx.store, config=ctx.config, repo=getattr(ctx, "repo", None))
+        board.sync_status(view, number, "Done", parent=True)
+
     def visit(number: int) -> None:
         linked = [*(by_number[number].get("children") or []), *records.get(number, ())]
         calls = _ActionCalls(ctx, number, [n for n in dict.fromkeys(linked) if n != number and is_listed(n)], is_listed)
         try:
-            act(number, calls)
+            (finish_card if number in unfinished_cards else act)(number, calls)
         except TrackerError:
             calls.interrupted = True
             raise
@@ -404,6 +427,13 @@ def follow_children(ctx, report) -> None:
 
     def drawn(number: int) -> bytes:
         return hashlib.sha256(f"{seed}/{number}".encode()).digest()
+
+    # Closed parents whose card the last board read found outside Done.
+    recorded, board_id = getattr(ctx.tracker, "board_value", None), getattr(ctx.config, "board", None)
+    done = board.board_column("Done", getattr(ctx.config, "board_map", None)) if board_id else None
+    unfinished_cards = {number for number in closed_parents(rows) if done is not None and recorded is not None
+                        and recorded(number, board_id, "Status") not in {None, done}}
+    others.extend(sorted(unfinished_cards))
 
     failure = None
     for number in [*sorted(closing), *sorted(others, key=drawn)]:

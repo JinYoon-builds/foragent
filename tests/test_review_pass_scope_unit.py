@@ -2,29 +2,25 @@
 
 from dataclasses import replace
 from pathlib import Path
-import sys
 
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 from conftest import git_command
-from foragent import orch_events, review_pass_scope, risks  # noqa: E402
-from foragent.issue import body_hash  # noqa: E402
-from foragent.run_review import _journal_review  # noqa: E402
-from foragent.runner import review_only, run_issue  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from test_order_machine_budget import fake_workloads  # noqa: F401
-from test_review_pass_scope import (
+from foragent import orch_events, review_pass_scope, risks
+from foragent.issue import body_hash
+from foragent.run_review import _journal_review
+from foragent.runner import review_only, run_issue
+from foragent.state import StateStore
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_scope import (
     FIRST_FINDING, NEW_FINDING, OLD_FINDING, PASS, capture_review, case_for, content, implement,
 )
 from foragent.review_perspectives import DEFAULT_PERSPECTIVES
 from runner_support import GROUNDED_SCORE, scoring_request
-from test_review_perspectives import review_offline  # noqa: F401
-from test_risk_map import entry, offline  # noqa: F401
-from test_skills_autosync import isolated_home  # noqa: F401
-
+from helpers.review_panel import review_offline  # noqa: F401
+from helpers.risk import entry, offline  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 LIMITED = "Limit blocking findings to code changed after that PASS"
 

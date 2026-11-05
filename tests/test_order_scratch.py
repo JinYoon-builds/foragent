@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from foragent import order_scratch
 from foragent.git import GitRepo
 from conftest import git_command
@@ -59,3 +61,24 @@ def test_empty_folder_in_an_ignored_new_directory_is_still_listed(git_history, t
     git, tree, manifest = _scratch(git_history, tmp_path, {".gitignore": "cache/\n"})
     (tree / "cache/empty").mkdir(parents=True)
     assert _changes(git, tree, manifest) == ({}, [], ["cache"])
+
+
+@pytest.mark.parametrize("change", ["created", "modified", "restored", "deleted"])
+def test_gitignored_files_anywhere_are_output_not_changes(git_history, tmp_path, change):
+    names = ["run.log", "src/foragent/_build.py", "tests/acceptance/run.log", "pkg/local-output"]
+    files = {".gitignore": "*.log\n/src/foragent/_build.py\n", "pkg/.gitignore": "local-*\n"}
+    if change != "created":
+        files.update(dict.fromkeys(names, "original\n"))
+    git, tree, manifest = _scratch(git_history, tmp_path, files)
+    before = order_scratch.stamps(tree, manifest)
+    for name in names:
+        path = tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if change == "deleted":
+            path.unlink()
+        else:
+            path.write_text("regenerated\n")
+            if change == "restored":
+                path.write_text("original\n")
+    assert order_scratch.changes(git, tree, manifest, "tests/acceptance", before=before) == (
+        {}, [], sorted(names))
