@@ -50,10 +50,15 @@ class GitError(RuntimeError):
 
 
 def push_server_error(stderr: str) -> bool:
-    """Only explicit server faults in a push diagnostic are retryable."""
+    """Only explicit server faults in a push diagnostic are retryable.
+
+    GitHub's bare ``[remote rejected] <ref> (failed)`` names no rule, permission
+    or lease problem, so it counts as a server fault too (#2061).
+    """
     return bool(re.search(
         r"remote: Internal Server Error|\[remote rejected\].*\(Internal Server Error\)"
-        r"|\bHTTP 5\d\d\b|returned error: 5\d\d\b", stderr))
+        r"|^\s*! \[remote rejected\][^\n]*\(failed\)[ \t]*$"
+        r"|\bHTTP 5\d\d\b|returned error: 5\d\d\b", stderr, re.MULTILINE))
 
 
 class PublicationError(GitError):
