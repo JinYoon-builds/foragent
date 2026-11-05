@@ -1,6 +1,6 @@
 """The ordered, read-only setup checklist shared by doctor, init and /fa.
 
-Checks evaluate collected facts; they never repair credentials or persist results.
+Checks read facts; they never repair credentials or persist results.
 Add later checks here in setup order (tools, login, scopes, repository, ...).
 """
 
@@ -21,6 +21,7 @@ class SetupItem(TypedDict):
     id: str
     ok: bool
     fix: NotRequired[str]
+    advice: NotRequired[bool]
 
 
 def gh_project_scope(auth_status: str) -> SetupItem:
@@ -138,6 +139,56 @@ def project_scope(facts: Facts) -> SetupItem:
     return gh_project_scope(facts.auth_status)
 
 
+def _standing_blocker(assertions: str) -> bool:
+    """Keep each assertion's type and lifetime together, even for a shared pid.
+
+    An assertion starts with its hex id, elapsed time and type. Its owner prefix
+    can be repeated or omitted on subsequent assertions of the same process.
+    Details belong only to that assertion, up to the next assertion header.
+    """
+    headers = list(re.finditer(
+        r"(?m)^[ \t]*(?:pid[ \t]+\d+\([^\n]*\):[ \t]*)?"
+        r"\[0x[0-9a-fA-F]+\][ \t]+\S+[ \t]+(?P<kind>\w+)[ \t]+named:",
+        assertions,
+    ))
+    for index, header in enumerate(headers):
+        if header["kind"] not in {"PreventUserIdleSystemSleep", "PreventSystemSleep"}:
+            continue
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(assertions)
+        details = assertions[header.end():end]
+        if ("asserting forever" in details
+                and not re.search(r"Process ID|Created for PID|asserting for \d|Timeout", details, re.IGNORECASE)):
+            return True
+    return False
+
+
+def no_idle_sleep(facts: Facts) -> SetupItem | None:
+    """Read macOS power configuration through the same subprocess probe as init tools."""
+    item: SetupItem = {"id": "no-idle-sleep", "ok": True, "advice": True}
+    if sys.platform != "darwin":
+        return None
+    try:
+        settings = subprocess.run(["pmset", "-g"], capture_output=True, text=True,
+                                  timeout=10, check=False)
+        if settings.returncode != 0:
+            return None
+        sleep = re.search(r"(?m)^\s*sleep\s+(\d+)\b", settings.stdout)
+        if sleep is None:
+            return None
+        if int(sleep[1]) == 0:
+            return item
+        assertions = subprocess.run(["pmset", "-g", "assertions"], capture_output=True,
+                                   text=True, timeout=10, check=False)
+        if assertions.returncode != 0:
+            return None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    item["ok"] = _standing_blocker(assertions.stdout)
+    if not item["ok"]:
+        item["fix"] = text("setup_no_idle_sleep_fix", facts.language)
+    return item
+
+
 CHECKS = (git_installed, gh_installed, uv_installed, gh_logged_in, project_scope)
 
 
@@ -165,10 +216,15 @@ def repository_linked(root: Path, *, git: GitRepo | None = None, language: str =
 
 def checklist(facts: Facts, *, root: Path | None = None,
               git: GitRepo | None = None) -> list[SetupItem]:
-    """Return fresh items in check order from the same facts for every reader."""
+    """Return fresh items in check order from the same facts for every reader.
+
+    Items without the advice mark are blocking; init stops on them.
+    """
     items = [check(facts) for check in CHECKS]
     if facts.installed["git"]:
         items.append(repository_linked(root if root is not None else Path.cwd(), git=git, language=facts.language))
     else:
         items.append(waiting_item("repository-linked", "git-installed", facts.language))
+    if (sleep := no_idle_sleep(facts)) is not None:
+        items.append(sleep)
     return items
