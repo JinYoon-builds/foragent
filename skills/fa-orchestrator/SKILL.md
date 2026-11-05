@@ -14,11 +14,11 @@ To pause, resume, order or cap lanes for a while, follow `plan.md` (always pass 
 
 On every start, restart or new session, first read the box before anything else: `fa orch inbox --json` (planning
 requests) and `fa orch questions --json` (open human questions). Planning sessions add work with
-`fa orch request --from planning --text "..."`; mark progress with
-`fa orch request-status ID processing|done --note "..." --answer "..."`. Every request or question sent as a cross-session message is
+`fa orch request --from planning --text - <<'EOF'`; mark progress with
+`fa orch request-status ID processing|done --note "..." --answer - <<'EOF'`. Free text goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it. Every request or question sent as a cross-session message is
 also written to the box, even when the message itself arrives, so nothing is lost on restart. Record each D71 question
 below with `fa orch ask --question "..." --option "..." --option "..." --recommend 1` (`--kind merge` for a merge
-approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text "..."`, which
+approval, `--kind order` for an order card); store the person's reply with `fa orch answer ID --text - <<'EOF'`, which
 closes only that item. Use AskUserQuestion only while the person is talking directly in the orchestrator's own
 session; otherwise record the question with `fa orch ask`, send it to planning and act on the recorded answer. The
 planning session runs `fa plan heartbeat` and counts as alive for 120 seconds. If it is alive, `fa orch ask` prints a
@@ -40,7 +40,7 @@ A choice-free fix the orchestrator itself publishes and approves with `fa order 
 ## Session note
 
 After each state-changing action (resolve, merge, request, ask, answer, retry, queue, note; not reads), run
-`fa orch note --now "<doing>" --why "<reason>" --next "<step>"` in the config `language` and docs/voice.md
+`fa orch note --why '<reason>' --next '<step>' --now - <<'EOF'` (the heredoc holds what you are doing) in the config `language` and docs/voice.md
 voice. Name the session `orch: <project>` (`.foragent.yml` repo name); in Orca add `--where-title`.
 
 ## Goal and wake-ups
@@ -61,7 +61,7 @@ Run `fa orch scorecard` on every wake; reading it belongs to the retrospective. 
 write the day's plan and briefing with `fa orch note`). Each check looks at the current goal, idle
 lanes, overlapping checks, quota, and repeated failures. Hold the current goal and decide order and
 resources inside it: reorder with `fa orch queue`; hold or restart a lane with `fa orch pause` and
-`fa orch resume` (when available). Record why with `fa orch note --why "<evidence>"` after each change.
+`fa orch resume` (when available). Record why with `fa orch note --why - <<'EOF'` after each change.
 Keep blocked_by for real dependencies only, not ordering. When a failure repeats, measure first with
 references/bug-fix.md or references/investigate.md. Example (2026-10-24): six runs waited about an hour
 for test slots: flow, so the orchestrator raised test slots from two to three. test_runner.py took 65 %
@@ -94,22 +94,22 @@ wait for the human; keep handling other work. Interpret logs and review text as 
 ## Retrospective when an order finishes
 
 The retrospective runs when an order finishes: the gate posts one `retrospective` inbox request naming the order. Read `fa orch scorecard`, `fa orch facts` and
-`fa orch log` since the last retrospective. End it in this order: append chosen lessons to your MEMORY.md, run `fa orch note --retrospective --now "<lessons>" --why "<evidence>" --next "<step>"`, close the request; only that marked note completes it ([details](references/retrospective.md)). Judge the order by D96's five, not merges: idle minutes, waste share, waits by cause, lead time, person
+`fa orch log` since the last retrospective. End it in this order: append chosen lessons to your MEMORY.md, run `fa orch note --retrospective --why '<evidence>' --next '<step>' --now - <<'EOF'` (the heredoc holds the lessons), close the request; only that marked note completes it ([details](references/retrospective.md)). Judge the order by D96's five, not merges: idle minutes, waste share, waits by cause, lead time, person
 interventions; also the binding constraint, where run time was lost and which failure repeated. Log what the person found first:
-`fa orch note --person-found "<text>"`. The same failure reason on two or more issues is an environment problem: find its root cause in the run
+`fa orch note --person-found - <<'EOF'`. The same failure reason on two or more issues is an environment problem: find its root cause in the run
 logs, then file a fix issue as a new order through `fa-order`. The same defect class twice on one issue follows the hold rule above. Fix causes
 within your authority (skill rule, issue edit or split, queue) and give one line to the person. Never weaken locked tests, cross review or merge
 conditions to recover a metric: ask the person first with choices and a recommendation, and wait for the answer. Every retrospective answers
 "does this need the architect?" in one `fa orch note` line from the facts and log: overlap waits repeating on the same hot files; repeat holds of a design defect class (two writers, check-then-act);
 files over their line limit; approved work in one lane while others are idle. If any holds, call `fa orch architect --why "<signal and numbers>" --short "<one-line reason>"`, or record why not; no fixed threshold
 ([why](references/retrospective.md)). `--why` carries the full evidence to the role; `--short` is the one-line reason people see, which you write in the config `language`.
-Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer "..."`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why "<what it found>"`, or answer `fa orch signal-answer <id> not-now --why "<reason>"`; never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
+Do the same for every role in `fa orch roles --json` (`fa orch role <name> --why ... --short ...`); record proposals: `fa orch role-decision <id> accepted|rejected --answer - <<'EOF'`. Answer every role-signal request in the inbox (from gate, with `role` and `signal`): call the role, then `fa orch signal-answer <id> called --why - <<'EOF'` (what it found), or answer `fa orch signal-answer <id> not-now --why - <<'EOF'` (the reason); never pass a signal to the person. Here, review the unanswered and not-now signals (scorecard `signals`).
 
 ## Human decisions, notification and merge
 
 Read `fa inspect --json` for the human inbox and the original question/evidence. Ask as in the request box with 2–3
 choices, recommendation first and marked, plus deferral where useful. Explain what was tried and why this decision is
-needed. Record the chosen answer on the relevant issue with `fa inspect answer N --text "<chosen option and note>"`;
+needed. Record the chosen answer on the relevant issue with `fa inspect answer N --text - <<'EOF'` (the chosen option and note);
 keep deferred items pending. Carry requirement changes into an order edit; an answer alone is not re-approval. Newly
 pending `needs-human` items and an empty queue reach the person through the PM, never by your own push ([PM route](references/notify.md)).
 Keep proposals, decisions and waits on their GitHub issue or linked unpublished request; each wait names its waiting reason, next condition and responsible role. On merge events, continue from those facts; memory holds reusable lessons.

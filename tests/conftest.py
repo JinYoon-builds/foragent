@@ -239,6 +239,19 @@ def no_real_machine_sleep(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_host_power_probe(request, monkeypatch):
+    """The idle-sleep item reads the host's `pmset` on macOS (#1818); elsewhere it cannot check.
+
+    Every module except the ones that test that item gets the "cannot check" answer CI gets on
+    Linux, so a Mac's power settings never reach fixtures that forbid outside commands.
+    """
+    from foragent import setup
+
+    if request.module.__name__ not in {"test_setup", "test_init", "test_setup_checklist_no_sleep"}:
+        monkeypatch.setattr(setup, "no_idle_sleep", lambda facts: None)
+
+
+@pytest.fixture(autouse=True)
 def isolated_github_call_counter():
     """A context's gh counter must not leak into later tests' gh calls."""
     from foragent import gh

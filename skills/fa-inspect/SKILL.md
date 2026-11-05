@@ -21,7 +21,7 @@ description: Walk through the Foragent human inbox and record decisions and feed
      If evidence is absent, say so without inventing it.
      If `answered` is true, mention that a decision is already recorded
      for the next planning interview (`/fa`); ask for a replacement only if the user wants one.
-     On an answer, run `fa inspect answer N --text "<chosen option, plus any note>"`.
+     On an answer, run `fa inspect answer N --text - <<'EOF'` with the chosen option, plus any note, on the next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in the text).
      If the gate supplied no options, collect the user's own decision or Later.
    - **reapprove:** Show what changed from the summary and details. Give the
      issue link and explain that the user reapproves by adding the `approved`
@@ -30,7 +30,7 @@ description: Walk through the Foragent human inbox and record decisions and feed
      The user merges or closes on GitHub; record nothing for this choice.
    - **human-check:** List the unchecked items with the PR link and ask whether
      they pass ("Pass / Report a failure / Later"). Turn failures into
-     `fa inspect feedback --title "<failure>" --body "<details>" --about N`.
+     `fa inspect feedback --title '<failure>' --about N --body - <<'EOF'` (the details).
      A pass is part of the recap; checklist updates belong to the user on GitHub.
    - **try (cli):** Show `try_card.what_changed`, each exact command,
      `try_card.expect`, and `prepared.results` (combined output, exit code and
@@ -38,7 +38,7 @@ description: Walk through the Foragent human inbox and record decisions and feed
      explain that no try instructions were provided and show the PR link.
      Ask "Does this look right?" with "Yes / Not what I wanted / Later".
      For "Not what I wanted", collect feedback text and run
-     `fa inspect feedback --title "<short title>" --body "<feedback>" --about N`.
+     `fa inspect feedback --title '<short title>' --about N --body - <<'EOF'` (the feedback).
    - **try (web):** Run `fa inspect serve N`. Show What changed, the returned
      URLs, `try_card.web.steps` and Expect. The tailnet URL works from a phone
      or laptop connected to the tailnet. If a headless browser skill or tool

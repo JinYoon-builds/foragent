@@ -113,11 +113,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
      tell the user that line. If the orchestrator is already alive, do not start a second one.
    - Send every request to the orchestrator twice: as a cross-session message to the
      `orch: <project>` session (SendMessage) and with
-     `fa orch request --from planning --text "<request>"`, so it survives a restart.
+     `fa orch request --from planning --text - <<'EOF'`, so it survives a restart.
    - While this session is open, renew `fa plan heartbeat` about every minute, so
      questions reach this session by message instead of a push notification.
    - Show the open questions from `fa orch questions` and record answers with
-     `fa orch answer <id> --text "<answer>"`.
+     `fa orch answer <id> --text - <<'EOF'`. Free text always goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it.
 
 8. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:

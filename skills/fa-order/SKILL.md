@@ -153,7 +153,7 @@ The person's current words take precedence over old documents and the ledger.
   Recommend the option that best fits the current request and explain the tradeoff.
   Apply the answer without repeating the conflict question.
 - For Change, update the session's decision ledger immediately, then retain a dated
-  replacement and its reason with `fa order note --defer <boundary> --kind decision --text '<dated decision, reason, Supersedes link to the earlier entry>'`.
+  replacement and its reason with `fa order note --defer <boundary> --kind decision --text - <<'EOF'`, with the dated decision, its reason and a Supersedes link to the earlier entry on the next lines, then a line `EOF`.
   For an earlier waiting decision, add `--replaces <id>` as a new append; keep the old
   entry intact. This history is append-only. Planning only appends waiting entries;
   only flush owns publication checkpoints. Choose what deserves recording and the
@@ -162,7 +162,7 @@ The person's current words take precedence over old documents and the ledger.
   Notes marked `candidate: true` and `status: waiting` come from decision sweeps and keep the transcript
   source and the person's quote. They are unconfirmed and never enter a flush.
   PM confirms each candidate with the person in one line, then runs
-  `fa decisions add <candidate-id> --text '<confirmed decision>' --defer <boundary>`
+  `fa decisions add <candidate-id> --defer <boundary> --text - <<'EOF'` (the confirmed decision)
   to retain a confirmed record for the normal publication batch. The planning
   session need not remember or run sweeps: installed hooks preserve each new
   transcript segment before compaction, at session end, and every 20 person
@@ -175,7 +175,7 @@ The person's current words take precedence over old documents and the ledger.
   scope in a decision note and the order spec without replacing the standing rule.
   For Keep, adapt the plan.
 - Retain an idea worth carrying to later planning sessions with
-  `fa order note --defer <boundary> --kind idea --text '<idea>'`. Choose its boundary
+  `fa order note --defer <boundary> --kind idea --text - <<'EOF'` (the idea). Choose its boundary
   yourself; an interruption requires no shared-checkout edits to undo.
 
 ## 2. Interview
@@ -472,7 +472,7 @@ checklist text. To drop a line, name it exactly in `done_when_removals` with the
 any other loss. Record `progress publish --issue <number>` for each
 published or updated issue in the result. After this planning session successfully publishes
 a plan the orchestrator drafted, mark the originating request done with
-`fa orch request-status ID done --note "<issues>" --answer "<issues>"`, using the originating request ID and the
+`fa orch request-status ID done --note "<issues>" --answer - <<'EOF'` (the issues), using the originating request ID and the
 published issue numbers. A failed publication leaves the request processing.
 Show the printed summary and one line on what
 happens next ("the gate starts within 5 minutes; /fa shows results"), then run
@@ -487,12 +487,12 @@ takes over its work; it only makes sure one runs and talks to it:
   it leaves an open dashboard as it is. Never ask the person to type a dashboard command.
 - Send every request to the orchestrator twice: as a cross-session message to the
   `orch: <project>` session (SendMessage) and with
-  `fa orch request --from planning --text "<request>"`, so it survives a restart.
+  `fa orch request --from planning --text - <<'EOF'`, so it survives a restart.
 - While this session is open, renew `fa plan heartbeat` about every minute, so
   questions reach this session by message instead of a push notification.
 - Show the open questions from `fa orch questions`, each with its context as in Talking
   to the person, and record answers with
-  `fa orch answer <id> --text "<answer>"`.
+  `fa orch answer <id> --text - <<'EOF'`. Free text always goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it.
 
 Never add `approved` yourself outside `fa order publish`, never edit acceptance tests of
 issues that are already running, never merge.

@@ -79,8 +79,15 @@ Keep your edits small. Outside the mechanism map, do not rewrite a doc when a fe
 
 ## Proposals
 
-Send proposals to the orchestrator with `fa orch request --from docs --text "<proposal>"`. A
-proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
+Send proposals to the orchestrator through a quoted heredoc, so the shell runs nothing in the text:
+
+```sh
+fa orch request --from docs --text - <<'EOF'
+<proposal>
+EOF
+```
+
+A proposal is for anything you cannot fix inside your scope, or anything that needs a decision.
 
 GitHub writes (issues, pull requests, comments, labels, board items and fields) go through FA commands such as
 `fa orch request`. When no FA command fits a write you need, propose an issue for the missing command in a request.

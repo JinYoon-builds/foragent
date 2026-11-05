@@ -28,7 +28,8 @@ example `fa test --durations=25`) for the slow tests.
 "Nothing to change" is a valid and often the best outcome.
 
 Every proposal cites fa orch facts numbers or a real incident, and states its expected measurable
-effect. Deliver each proposal through `fa orch request --from architect --text "<proposal>"` and mark
+effect. Deliver each proposal through `fa orch request --from architect --text - <<'EOF'`, with the
+proposal on the next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it), and mark
 each proposal with its decision owner on its first line: `Decision: orchestrator` for an orchestrator
 decision, or `Decision: person` for a person decision (lane boundary changes, anything irreversible,
 scope, or taste), which the orchestrator forwards to the person as a multiple-choice question.
@@ -58,7 +59,8 @@ person. The orchestrator judges each proposal and decides whether it becomes an 
 
 {procedure}
 
-Deliver each proposal through `fa orch request --from {role} --text "<proposal>"`. "Nothing to change"
+Deliver each proposal through `fa orch request --from {role} --text - <<'EOF'`, with the proposal on the
+next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it). "Nothing to change"
 is a valid outcome.
 
 ## Memory

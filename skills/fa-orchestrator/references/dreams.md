@@ -39,7 +39,7 @@ instead, the lane dreams again from the current base, over the same runs.
   `fa orch merge PR --approved-by "$(gh api user --jq .login)"`, your own gh login.
 - A dream PR whose diff touches anything else is not a memory edit: do not merge it; run
   `fa orch dream --redo <lane>` so the next tick closes it, and record the one-line reason with
-  `fa orch note --why "<reason>"`.
+  `fa orch note --why - <<'EOF'`.
 - While a lane's dream PR is open, the lane does not dream; merge it, or run
   `fa orch dream --redo <lane>`, to let it dream again. Every dream starts from the base: a dream PR
   a redo closes is not carried into the next one.
@@ -56,7 +56,7 @@ instead, the lane dreams again from the current base, over the same runs.
   change (a hand edit of `MEMORY.md` on the base, or a PR head that is no longer the dream's work)
   makes the PR stale: `fa orch merge` refuses it, or one with no recorded digests, and names the
   changed files. Run `fa orch dream --redo <lane>` and record that reason with
-  `fa orch note --why "<reason>"`; the lane dreams again from the current base.
+  `fa orch note --why - <<'EOF'`; the lane dreams again from the current base.
 
 ## Moving a project to the split
 
@@ -118,6 +118,6 @@ them in this order:
    closing both PRs. Do not infer approval.
 4. Only after the person confirms: run `fa orch dream --redo <lane>` for each of the two lanes, so
    the next tick closes #898 and #901 without merging, and record the commit from step 2 with
-   `fa orch note --why "<commit>"`. The lanes then dream again from the current base. The dream folds the
+   `fa orch note --why - <<'EOF'` (the commit). The lanes then dream again from the current base. The dream folds the
    carried lessons and records their ids; the evidence block stays in `MEMORY.new.md` and in Git
    history.
