@@ -154,8 +154,8 @@ def _records(root: Path) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
     """Every run and issue record of a state folder, with the keys that time it.
 
     Runs: the current record of each run (runs/<n>.json) and every finished entry
-    (runs.jsonl). Issues: the issue rows (issues.json) and their merged PRs
-    (merged_prs.json). Approval records name no repository, so they cannot name one.
+    (runs.jsonl). Issues: the issue rows (issues.json) and the merged PRs each row
+    keeps. Approval records name no repository, so they cannot name one.
     """
     found: list[tuple[dict[str, Any], tuple[str, ...]]] = []
     try:
@@ -168,11 +168,15 @@ def _records(root: Path) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
     except OSError:
         records = []
     found += [(record, RUN_TIMES) for record in records]
-    for name, field, keys in (("issues.json", "issues", ISSUE_TIMES), ("merged_prs.json", "prs", PR_TIMES)):
-        data = _read_json(root / name)
-        rows = data.get(field) if isinstance(data, dict) else None
-        rows = list(rows.values()) if isinstance(rows, dict) else rows if isinstance(rows, list) else []
-        found += [(row, keys) for row in rows if isinstance(row, dict)]
+    data = _read_json(root / "issues.json")
+    rows = data.get("issues") if isinstance(data, dict) else None
+    rows = list(rows.values()) if isinstance(rows, dict) else rows if isinstance(rows, list) else []
+    for row in rows:
+        if isinstance(row, dict):
+            found.append((row, ISSUE_TIMES))
+            merges = row.get("merges")
+            found += [(merge, PR_TIMES) for merge in (merges.values() if isinstance(merges, dict) else [])
+                      if isinstance(merge, dict)]
     return found
 
 

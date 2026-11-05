@@ -47,9 +47,10 @@ def test_flag_off_role_reader_ignores_malformed_or_partial_current_run(store, tm
 
 
 def test_merge_times_keeps_recorded_time_with_mismatched_owner_metadata(store, tmp_path):
+    store.update_local_issue(1, title="t", labels=[], state="open", body="")  # The issue cache row
     run = store.start_run(1, branch="merged", worktree=tmp_path / "worktree")
     merged = NOW + timedelta(seconds=1)
-    store.record_merge(1, merged)
+    store.record_merge(1, merged, pr=10, base="main")
     store.finish_run(1, "merged")
     path = store.root / "runs.jsonl"
     value = json.loads(path.read_text())
@@ -57,7 +58,8 @@ def test_merge_times_keeps_recorded_time_with_mismatched_owner_metadata(store, t
                  owner_merge_started_at=(NOW - timedelta(hours=1)).isoformat())
     path.write_text(json.dumps(value) + "\n")
 
-    assert store.owner_merge_facts() == {}
+    # Legacy owner keys in run history are ignored; the issue cache dates the merge.
+    assert store.owner_merge_facts() == {(1, run.started_at): {"pr": 10, "merged_at": merged.isoformat()}}
     assert store.merge_times() == {(1, run.started_at): merged.isoformat()}
 
 
@@ -966,17 +968,27 @@ def test_one_state_directory_shares_one_parse_across_path_spellings(store, tmp_p
     '{"watermark": "2026-10-20T09:00:00+00:00", "prs": [{"number": 1}]}',
 ])
 def test_unreadable_merged_pr_listing_means_a_full_listing(store, content):
+    # A legacy merged_prs.json, readable or not, is never a cursor: the issue cache has none.
     store.root.mkdir(parents=True, exist_ok=True)
     (store.root / "merged_prs.json").write_text(content, encoding="utf-8")
-    assert store.merged_pr_listing() is None
+    assert store.merged_pr_watermark() is None
+    assert store.cached_merged_prs() == []
 
 
 def test_merged_pr_listing_round_trips(store):
-    listing = {"watermark": NOW.isoformat(), "prs": [{
-        "number": 1, "head": "foragent/issue-1", "base": "main", "merged_at": NOW.isoformat(),
-        "url": "u", "updated_at": None}]}
-    store.record_merged_pr_listing(listing)
-    assert store.merged_pr_listing() == listing
+    from foragent.tracker import Issue, PullRequest
+
+    store.root.mkdir(parents=True, exist_ok=True)
+    (store.root / "merged_prs.json").write_text("{}", encoding="utf-8")
+    merged_at = NOW.isoformat()
+    store.refresh_local_issues([Issue(1, "t", "b", frozenset(), "closed")],
+                               [PullRequest(5, "foragent/issue-1", "main", "", "", merged_at, "u")], {}, NOW)
+    store.record_merged_pr_watermark(NOW)
+    assert store.merged_pr_watermark() == NOW
+    assert store.cached_merged_prs() == [{
+        "number": 5, "head": "foragent/issue-1", "base": "main", "merged_at": merged_at,
+        "updated_at": merged_at, "url": "u"}]
+    assert not (store.root / "merged_prs.json").exists(), "The cursor's first write tidies the old listing"
 
 
 def test_github_calls_buckets_by_utc_hour_prunes_30_days_and_filters_since(tmp_path):

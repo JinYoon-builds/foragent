@@ -462,7 +462,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
                         failed_merge = exc
                 else:
                     run_group_evidence.record_merge(n, ctx, attempt.target_branch, inputs.base_sha, verified_head_sha)  # own merge provenance
-                    ctx.store.record_merge(n, ctx.now())
+                    ctx.store.record_merge(n, ctx.now(), pr=pr, base=attempt.target_branch)
                     size_signal.record(n, ctx, git, attempt.approval, inputs.base_sha, verified_head_sha, pr,
                                        lambda line: run_publish._append(log, line))
                     if inputs.decision.kind == "merge":

@@ -1,7 +1,4 @@
-"""Flush records batch membership and issue progress; Git owns commit/push facts.
-
-Legacy Git checkpoint rows remain readable but play no part in recovery.
-"""
+"""Flush records batch membership and issue progress; Git owns commit/push facts."""
 
 from contextlib import contextmanager
 import fcntl

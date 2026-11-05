@@ -320,7 +320,8 @@ def _complete_fact(ctx, place, job, fact):
                for row in queue._rows(ctx.store)):
         queue.record_turn(ctx, place, base, "merged")
     run_group_evidence.record_merge(place.n, ctx, fact["target"], base, fact["head"])
-    ctx.store.record_owner_merge(place.n, place.started_at, fact)
+    # The merge is a GitHub fact for the issue cache; the run keeps only its measurement.
+    ctx.store.record_owner_merge(place.n, place.started_at, fact, branch=job["branch"])
     # The admitted head's landing remains true if this issue authorizes follow-up
     # work. Only the admitted run and approval may receive completion side effects.
     with ctx.reads.fresh():

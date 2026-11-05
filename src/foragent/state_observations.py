@@ -285,11 +285,16 @@ class IssueObservationsMixin:
                 absent[key] = at.isoformat()
             dropped = self._retire(snapshot, number, None, at)
             if not any(intent["issue"] == number for intent in snapshot.get("outbox", [])):
-                snapshot["issues"].pop(key, None)
+                gone = snapshot["issues"].pop(key, None)
+                if (gone or {}).get("merges"):
+                    # A merged PR stays merged when its issue leaves the listing: keep what the cache saw.
+                    snapshot.setdefault("unlisted_merges", {})[key] = gone["merges"]
             if (absent.get(key), len(snapshot.get("outbox", [])), key in snapshot["issues"]) == before:
                 return "stale"  # Already known missing since then: this absence changes nothing.
             return "dropped" if dropped else "applied"
         snapshot.setdefault("absent", {}).pop(key, None)
+        if key not in snapshot["issues"] and key in snapshot.get("unlisted_merges", {}):
+            snapshot["issues"][key] = {**self._new_row(number), "merges": snapshot["unlisted_merges"].pop(key)}
         row = snapshot["issues"].setdefault(key, self._new_row(number))
         if observed_facts(row) != facts:
             _state._forget_reads(row)

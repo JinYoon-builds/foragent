@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from uuid import uuid4
 
 from foragent import order, order_flush_journal as journal, order_flush_recovery as recovery
-from foragent import order_collect, order_notes, order_references, order_reviewed
+from foragent import order_collect, order_notes, order_references, order_reviewed, order_submissions
 from foragent.git import GitError
 from foragent.i18n import text
 from foragent.main_write import wait_for_merge_train
@@ -178,9 +178,10 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
         order._publish_issues(row["plan"], root, config, tracker, repo=repo, publication=publication,
                               published_blobs=git.blob_shas(sha, publication.files),
                               approve=row["approve"])
-        journal.append(store, "issues", batch["batch"], entry=row["entry_id"],
-                       order=row["id"], mapping=publication.mapping)
+        # The published issue map lives in GitHub's parent/child markers, not here.
+        journal.append(store, "issues", batch["batch"], entry=row["entry_id"], order=row["id"])
     journal.append(store, "done", batch["batch"])
+    order_submissions.tidy_published(store)
     return {"boundary": batch["boundary"], "batch": batch["batch"], "status": "published", "sha": sha}
 
 

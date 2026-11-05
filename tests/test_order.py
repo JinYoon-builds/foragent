@@ -3822,10 +3822,14 @@ def test_flush_checkpoint_keeps_waiting_logs_and_distinguishes_order_revisions(p
     publish(publishing, plan, defer="chosen", approve_keys=["client"])
     note = order_notes.append(store, kind="decision", boundary="chosen", content="Keep this decision")
     order_notes.append(store, kind="idea", boundary="other", content="Keep waiting")
-    before = {name: (store.root / name).read_bytes() for name in ("orders.jsonl", "notes.jsonl")}
+    before = (store.root / "notes.jsonl").read_bytes()
+    retained = [(row["id"], row["entry_id"]) for row in order_notes.entries(store, "orders.jsonl", with_offsets=True)]
     result = flush_waiting(publishing)
     assert result["status"] == "published"
-    assert all((store.root / name).read_bytes() == data for name, data in before.items())
+    assert (store.root / "notes.jsonl").read_bytes() == before, "Waiting planning logs stay byte for byte"
+    after = order_notes.entries(store, "orders.jsonl", with_offsets=True)
+    assert [(row["id"], row["entry_id"]) for row in after] == retained, "Both revisions keep their own ids"
+    assert not any("plan" in row or "files" in row for row in after), "Published plans live in Git and GitHub"
     rows = order_notes.pending(store)
     assert len(rows["orders"]) == 2 and all(row["status"] == "published" for row in rows["orders"])
     assert next(row for row in rows["notes"] if row["id"] == note["id"])["status"] == "published"

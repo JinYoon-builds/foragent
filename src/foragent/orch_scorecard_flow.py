@@ -16,7 +16,7 @@ from foragent import capacity, orch_scorecard_history as history, orch_scorecard
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
-    _pauses, _phase_intervals, _run_value, _siblings, _value_at,
+    _pauses, _phase_intervals, _siblings, _value_at,
 )
 from foragent.state import StateStore
 
@@ -215,11 +215,13 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     from foragent.config import in_run_hours, lane_executors
     from foragent.issue import parse_body
     from foragent.orch_facts_resources import _binding
-    from foragent.overlap_files import Claim, admits, approved_issue, claim, recorded_union
+    from foragent.overlap_files import repository
+    from foragent.overlap_files import Claim, admits, approved_issue, claim
     from foragent.scheduler_start import _ranked
     from foragent.state import Run
 
-    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: moment)
+    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: moment,
+                          git=repository(root))
     issues = _issues(store, config.lanes)
     executions, phases = _executions(store, moment), _phase_intervals(store, moment)
     occupied, _ = _occupancy(store, moment, executions, phases, open_end=moment + 3650 * DAY)
@@ -262,7 +264,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
     if config.max_parallel is not None:
         free = min(free, max(0, config.max_parallel - len(busy)))
     held: dict[int, str] = {}
-    remaining, union = free, recorded_union(store)
+    remaining = free
     for position, (lane, number) in enumerate(ranked):
         parsed = parse_body(approvals[number].body)
         if github or outside:
@@ -273,7 +275,7 @@ def binding_at(store: StateStore, config: Any, root, moment: datetime, *, curren
         elif _inside(pauses.get(lane, []), moment) or current and (store.lane_paused(lane, moment) or any(
                 store.executor_paused(name, moment) for name in lane_executors(config, lane))):
             held[number] = "quota"
-        elif not admits(ctx, lane, parsed, known, unknown, union=union):
+        elif not admits(ctx, lane, parsed, known, unknown):
             held[number] = "structure"
         else:
             remaining -= 1

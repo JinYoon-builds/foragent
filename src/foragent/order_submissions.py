@@ -1,6 +1,7 @@
 """Publication-owned retained orders; planning's journal provides lock-free appends."""
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from foragent import order_notes
 from foragent.i18n import text
@@ -15,7 +16,7 @@ def retain(plan: dict, repo: str, boundary: str, *, approve: bool,
         raise PlanError(text("order_submission_boundary", language))
     # Selection is evidence supplied by the caller, never a derived "approved" fact.
     # A future publisher must validate the retained plan and preread again.
-    row = {"id": plan["id"], "plan": plan, "approve": approve,
+    row = {"id": plan["id"], "entry": uuid4().hex, "plan": plan, "approve": approve,
            "approve_keys": approve_keys or [], "approve_numbers": approve_numbers or [],
            "boundary": boundary, "recorded_at": datetime.now(UTC).isoformat(), "status": "waiting"}
     if files is not None:
@@ -36,5 +37,18 @@ def pending(store) -> list[dict]:
     latest = {}
     for row in rows:
         latest[row["id"]] = row
-    return [{**row, "status": "published" if row["entry_id"] in published else "waiting"}
+    # A published plan lives in Git and GitHub; a row's old copy of it is never shown.
+    return [{**({key: value for key, value in row.items() if key not in PUBLISHED_COPIES}
+                if row["entry_id"] in published else row),
+             "status": "published" if row["entry_id"] in published else "waiting"}
             for row in rows if row["entry_id"] in published or row is latest[row["id"]]]
+
+
+PUBLISHED_COPIES = ("plan", "files")
+
+
+def tidy_published(store) -> None:
+    """Drop published plans and files from the retained orders; ids and selections stay."""
+    from foragent.order_flush_journal import published_entries
+
+    order_notes.compact(store, "orders.jsonl", published_entries(store), PUBLISHED_COPIES)

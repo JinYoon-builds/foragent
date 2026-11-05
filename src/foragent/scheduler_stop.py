@@ -267,7 +267,7 @@ def _merged_own_issue(ctx: TickContext, run: Run) -> bool:
     admission only says the run may merge later, so a close during it is an outside close (#2136).
     Every gate merge path writes its record before calling GitHub, so a merge that closed the issue
     before the tick listed it always left one: the run's merge-turn row (flow and reviewed paths),
-    the merge owner's job in phase merging or merged (single and train), or the run's merge time.
+    the merge owner's job in phase merging or merged (single and train), or the issue cache's merge of this execution.
     A person's `fa orch merge` writes its own seat, never this execution's.
     """
     from foragent import run_merge_turn
@@ -277,7 +277,7 @@ def _merged_own_issue(ctx: TickContext, run: Run) -> bool:
              if (row["n"], row.get("started_at")) == key and row.get("event") == "turn"]
     if turns and turns[-1] == "merged":
         return True  # A failed call writes "failed" after it, so only an unresolved or succeeded call counts.
-    for name in (f"merge-owner/{run.number}.json", f"runs/{run.number}.json"):
+    for name in (f"merge-owner/{run.number}.json",):
         try:
             saved = json.loads((ctx.store.root / name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -287,9 +287,6 @@ def _merged_own_issue(ctx: TickContext, run: Run) -> bool:
         if name.startswith("merge-owner/") and saved.get("started_at") == run.started_at and (
                 saved.get("phase") in {"merging", "merged"} or saved.get("merge_fact")):
             return True
-        if name.startswith("runs/") and isinstance(merged := saved.get("merged_at"), str) and (
-                scheduler.datetime.fromisoformat(merged) >= scheduler.datetime.fromisoformat(run.started_at)):
-            return True  # record_merge saves the moment beside the running record's fields.
     return key in ctx.store.merge_times()
 
 

@@ -1693,8 +1693,12 @@ def test_landed_member_completes_from_immutable_head_despite_mutable_pr_or_issue
     else:
         case.tracker.close_issue(5)
     support.gate(case)
-    facts = case.store.owner_merge_facts()
-    assert {fact["head"] for fact in facts.values()} == set(original.values())
+    # The issue cache records both completions; Git shows that the admitted heads are what landed.
+    assert sorted(number for number, _ in case.store.owner_merge_facts()) == [1, 5]
+    origin = case.git.at(case.history.origin)
+    assert all(origin.is_ancestor(head, "main") for head in original.values())
+    if change == "head":
+        assert not origin.is_ancestor(updated, "main"), "The mutable PR head never lands"
     assert not merge_owner.admissions(case.store) and not merge_owner.pending(case.store, 5)
     assert len(case.target_pushes) == 1 and not case.merges
     assert case.tracker.get_pr(support.pr_for(case, 5).number).state == "open"

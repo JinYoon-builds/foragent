@@ -4,10 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from glob import escape, has_magic
 from itertools import combinations, product
-import json
 from pathlib import Path
 
-from foragent.git import GitError, REVIEW_SCOPE_FILE
+from foragent.git import GitError, GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, parse_body
 from foragent.state_records import Run
 
@@ -110,6 +109,11 @@ def any_overlap(ctx, left: list[str], right: list[str]) -> bool:
     return any(intersects(ctx, a, b) for a in left for b in right)
 
 
+def repository(root) -> GitRepo | None:
+    """A read-only view's Git repository at ``root``; a folder without one has no attributes to read."""
+    return GitRepo(Path(root)) if root is not None and (Path(root) / ".git").exists() else None
+
+
 def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
     """Only exempt concrete paths; a glob alone cannot prove every match is union."""
     paths = {path for path in [*files, *(path for peer in peers for path in peer.files)]
@@ -118,36 +122,10 @@ def union_patterns(ctx, files: list[str], peers: list[Claim]) -> set[str]:
         paths.update(peer.run.changed_files or [])
         if peer.run.files_committed:
             paths.update(peer.run.effective_files or [])
-    union = ctx.git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths)
-    record_union(ctx.store, paths, union)
+    # Read Git's merge attributes at the moment of use; no repository known means no exemption.
+    git = getattr(ctx, "git", None)
+    union = git.union_merge_paths(f"origin/{ctx.config.base_branch}", paths) if git is not None else set()
     return {escape(path) for path in union}
-
-
-UNION_FILE = "union-merge-paths.json"
-
-
-def record_union(store, checked: set[str], union: set[str]) -> None:
-    """Keep the gate's merge=union answers, so read-only views apply the same exemptions."""
-    if not checked:
-        return
-    path = store.root / UNION_FILE
-    try:
-        saved = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        saved = {}
-    known = saved.get("paths") if isinstance(saved, dict) and isinstance(saved.get("paths"), dict) else {}
-    updated = {**known, **{name: name in union for name in checked}}
-    if updated != known:
-        store._write_json(path, {"paths": dict(sorted(updated.items()))})
-
-
-def recorded_union(store) -> set[str]:
-    """Escaped paths the gate last found to merge with union; unchecked paths keep their limits."""
-    try:
-        saved = json.loads((store.root / UNION_FILE).read_text(encoding="utf-8"))
-        return {escape(name) for name, union in saved["paths"].items() if union is True}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return set()
 
 
 def file_limits(ctx) -> dict[str, int]:
@@ -180,7 +158,9 @@ def _full_groups(ctx, files: list[str], peers: list[Claim], union: set[str] | No
     (``shared_limit``), so a glob claim is held only where an overlapping file is full.
     """
     if union is None:
-        union = union_patterns(ctx, files, peers)
+        # Ask Git only when a peer shares one of these files: otherwise no exemption can matter.
+        shared = any(any_overlap(ctx, [path], peer.files) for path in files for peer in peers)
+        union = union_patterns(ctx, files, peers) if shared else set()
     files = [path for path in files if path not in union]
     peers = [Claim(peer.run, peer.parsed, [path for path in peer.files if path not in union])
              for peer in peers]

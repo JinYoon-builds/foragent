@@ -203,10 +203,9 @@ def test_merged_pr_record_names_the_repo_when_runs_and_issues_do_not(home, monke
     launchctl(monkeypatch, {})
     root = tick(home, "owner/folder", NOW)
     (root / "issues.json").write_text(json.dumps({"refreshed_at": None, "issues": {
-        "1": {"number": 1, "updated_at": "2026-10-21T08:00:00+00:00"}}}), encoding="utf-8")
-    (root / "merged_prs.json").write_text(json.dumps({"watermark": "2026-10-22T00:00:00+00:00", "prs": [
-        {"number": 7, "head": "h", "base": "main", "merged_at": "2026-10-21T08:00:00Z",
-         "url": "https://github.com/real/name/pull/7"}]}), encoding="utf-8")
+        "1": {"number": 1, "updated_at": "2026-10-21T08:00:00+00:00", "merges": {"7": {
+            "head": "h", "base": "main", "merged_at": "2026-10-21T08:00:00Z",
+            "url": "https://github.com/real/name/pull/7"}}}}}), encoding="utf-8")
     assert "real/name" in collect(home) and "owner/folder" not in collect(home)
 
 
@@ -215,7 +214,6 @@ def test_unreadable_record_files_fall_back_to_the_folder_name(home, monkeypatch)
     root = tick(home, "owner/folder", NOW)
     (root / "runs").mkdir()
     (root / "runs/1.json").write_text("{broken", encoding="utf-8")
-    (root / "merged_prs.json").write_text(json.dumps({"prs": "not a list"}), encoding="utf-8")
     (root / "issues.json").write_text("[]", encoding="utf-8")
     assert "owner/folder" in collect(home)
 
@@ -259,6 +257,11 @@ def test_gate_lookup_releases_individual_records_after_return(tmp_path, monkeypa
         return value
 
     monkeypatch.setattr(json, "loads", tracked_loads)
+    if name == "merged_prs.json":
+        # The legacy listing duplicated the issue cache; discovery no longer parses it at all.
+        assert gates._recorded_repo(tmp_path) == tmp_path.name.replace("__", "/")
+        assert references == []
+        return
     assert gates._recorded_repo(tmp_path) == "owner/current"
     assert len(references) == 1
     assert references[0]() is None, "Gate discovery retained a per-record JSON value"

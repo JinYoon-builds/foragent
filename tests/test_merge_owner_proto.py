@@ -1125,7 +1125,8 @@ def test_owner_merge_fact_drives_scorecard_and_ownership(proto):
     assert run.outcome == "merge-queued"
     fact = case.store.owner_merge_facts()[5, run.started_at]
     pr = case.tracker.get_pr(fact["pr"])
-    assert fact == {"pr": pr.number, "target": pr.base, "head": pr.head_sha, "merged_at": pr.merged_at}
+    # The issue cache keeps the GitHub merge; target and head stay GitHub's to tell.
+    assert fact == {"pr": pr.number, "merged_at": pr.merged_at}
     # world also has an earlier fixture-unused execution of #5. Inspect the
     # admitted execution without treating that unrelated history row as a merge.
     issues = orch_scorecard_records._issues(case.store, case.config.lanes)
@@ -1163,7 +1164,8 @@ def test_flag_off_ci_default_branch_failure_keeps_original_fallback(proto, monke
     case.tracker.add_labels(5, ["running"])
     assert runner.run_issue(5, case.ctx) == "merged", case.store.log_path(5).read_text()
     assert measured and not merge_owner.admissions(case.store)
-    assert not case.store.owner_merge_facts()
+    # The gate's own merge reaches the issue cache once; no merge-owner job is involved.
+    assert list(case.store.owner_merge_facts()) == [(5, case.store.get_run(5).started_at)]
 
 
 def test_completed_failed_acceptance_producer_is_terminal(proto, monkeypatch):

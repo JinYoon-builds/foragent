@@ -20,7 +20,8 @@ from typing import Any, Iterator
 from foragent import capacity, gh
 from foragent.brief import STAR_PROMPT_MERGE_THRESHOLD
 from foragent.i18n import text
-from foragent.state_runs import owner_facts_of, record_merged
+from foragent.state_refresh import merge_facts_of
+from foragent.state_runs import record_merged
 
 FORAGENT_REPO = "JinYoon-builds/foragent"
 RECORD = "star-prompt.json"
@@ -92,7 +93,10 @@ def local_merges(root: Path | None = None) -> int:
                 runs.append(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, ValueError):
                 continue  # A run record being rewritten adds nothing its history row lacks.
-        owner_facts = owner_facts_of(runs)
+        try:
+            owner_facts = merge_facts_of(json.loads((history.parent / "issues.json").read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            owner_facts = {}  # Without the issue cache only the runs' own merged outcomes count.
         for run in runs:
             if record_merged(run, owner_facts):
                 merged.add((history.parent.name, run["number"]))

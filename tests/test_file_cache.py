@@ -104,13 +104,16 @@ def test_history_readers_share_parse_and_return_detached_runs(tmp_path, monkeypa
         store = StateStore(tmp_path)
         assert store.read_history()[0].number == 1
         assert store.finish_times() == {(1, NOW.isoformat()): NOW.isoformat()}
-        assert store.merge_times() == {(1, NOW.isoformat()): NOW.isoformat()}
-        assert store.owner_merge_facts() == {(1, NOW.isoformat()): first["owner_merge"]}
+        # A legacy merge copy in history is ignored: merges come from the issue cache.
+        assert store.merge_times() == {}
+        assert store.owner_merge_facts() == {}
     assert len(parsed) == 1
     store.read_history()[0].pause_regions["wait"].append("caller mutation")
     assert len(store.read_history()[0].pause_regions["wait"]) == 2
-    store.owner_merge_facts()[1, NOW.isoformat()]["target"] = "caller mutation"
-    assert store.owner_merge_facts()[1, NOW.isoformat()]["target"] == "main"
+    store.update_local_issue(1, title="Issue", labels=[], state="open", body="")
+    store.observe_merge(1, 17, head="head", base="main", merged_at=NOW.isoformat(), started_at=NOW.isoformat())
+    store.owner_merge_facts()[1, NOW.isoformat()]["pr"] = "caller mutation"
+    assert store.owner_merge_facts()[1, NOW.isoformat()]["pr"] == 17, "Cache-derived facts are detached"
     with path.open("a") as stream:
         stream.write(json.dumps({**first, "number": 2}) + "\n")
     assert [run.number for run in store.read_history()] == [1, 2]

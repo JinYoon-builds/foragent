@@ -36,8 +36,10 @@ def test_running_refusal_accepts_either_evidence(git_history, tmp_path, monkeypa
 
 def test_confirmed_merge_time_protects_even_nonmerged_outcome(git_history, tmp_path, monkeypatch):
     case = superseded_case(git_history, tmp_path, monkeypatch)
+    if not any(row["number"] == 1 for row in case.store.local_issues()):
+        case.store.update_local_issue(1, title="Issue 1", labels=[], state="open", body="")
     case.store.start_run(1, branch=BRANCH, worktree=case.store.worktree_path(1))
-    case.store.record_merge(1, case.clock[0])
+    case.store.record_merge(1, case.clock[0], pr=10, base="main")
     case.store.finish_run(1, outcome='error')
     assert close(case) == 1
     assert_nothing_changed(case)

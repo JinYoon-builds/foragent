@@ -1,10 +1,13 @@
 """Append-only planning history, outside the shared checkout (#1262).
 
 Planning owns this journal. Publication checkpoints belong to flush, never here.
-No publication, flush or store lock is needed for a single O_APPEND write.
+No publication, flush or store lock is needed for a single O_APPEND write; only the
+journal's own short lock, which a rewrite (``compact``) takes too.
 """
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from uuid import uuid4
@@ -34,7 +37,9 @@ def entries(store, journal: str = "notes.jsonl", *, with_offsets: bool = False) 
                 continue
             if isinstance(row, dict):
                 if with_offsets:
-                    row["entry_id"] = f"{journal}:{start}"
+                    # A stable id survives a rewrite; a legacy row is named by its byte offset.
+                    entry = row.get("entry")
+                    row["entry_id"] = entry if isinstance(entry, str) else f"{journal}:{start}"
                 rows.append(row)
     return rows
 
@@ -73,14 +78,50 @@ def append_entry(store, row: dict, *, journal: str = "notes.jsonl", language: st
     """Append one durable record without taking publication, flush or store locks."""
     # A leading separator isolates a partial tail without rewriting any earlier byte.
     payload = ("\n" + json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+    with _journal_lock(store, journal):
+        fd = os.open(store.root / journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            if os.write(fd, payload) != len(payload):
+                raise OSError(text("order_notes_short_write", language))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def _journal_lock(store, journal: str):
     store.root.mkdir(parents=True, exist_ok=True)
-    fd = os.open(store.root / journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    # Persistent inode: never unlink a lock that another writer may already have opened.
+    fd = os.open(store.root / f"{journal}.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        if os.write(fd, payload) != len(payload):
-            raise OSError(text("order_notes_short_write", language))
-        os.fsync(fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
     finally:
         os.close(fd)
+
+
+def compact(store, journal: str, published: set[str], dropped: tuple[str, ...]) -> None:
+    """Rewrite a journal with stable ids, dropping ``dropped`` keys from published rows.
+
+    Each row keeps its current id (a legacy row its byte offset), so batches that
+    already name it still resolve. Appends wait on the same lock, so none is lost."""
+    with _journal_lock(store, journal):
+        rows = entries(store, journal, with_offsets=True)
+        if not rows:
+            return
+        lines = []
+        for row in rows:
+            entry = row.pop("entry_id")
+            if entry in published:
+                row = {key: value for key, value in row.items() if key not in dropped}
+            lines.append(json.dumps({**row, "entry": entry}, ensure_ascii=False) + "\n")
+        path = store.root / journal
+        temporary = path.with_name(f".{journal}.{uuid4().hex}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write("".join(lines))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
 
 
 def pending(store) -> dict:

@@ -22,7 +22,10 @@ def _store(tmp_path, clock):
 
 def _queued(store, clock, number, *, finished, merge=True, write_snapshot=True):
     clock[0] = finished - timedelta(minutes=10)
+    if not any(row["number"] == number for row in store.local_issues()):
+        store.update_local_issue(number, title=f"Issue {number}", labels=[], state="open", body="")
     run = store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
+    store.update_run(number, last_review_pass_at=clock[0].isoformat())  # The owner merge has a measurement.
     clock[0] = finished
     store.finish_run(number, outcome="merge-queued")
     if merge:
@@ -32,7 +35,14 @@ def _queued(store, clock, number, *, finished, merge=True, write_snapshot=True):
         if write_snapshot:
             store.record_owner_merge(number, run.started_at, fact)
         else:
-            with patch.object(store, "_write_json", side_effect=OSError("snapshot interrupted")):
+            write = store._write_json
+
+            def interrupted(path, value):
+                if path.parent.name == "runs":  # The run snapshot; the issue cache write succeeds.
+                    raise OSError("snapshot interrupted")
+                return write(path, value)
+
+            with patch.object(store, "_write_json", side_effect=interrupted):
                 with pytest.raises(OSError, match="snapshot interrupted"):
                     store.record_owner_merge(number, run.started_at, fact)
     return run
@@ -66,14 +76,11 @@ def test_merge_stall_dates_owner_merges_without_their_history_rows(tmp_path):
     # Worker finishes long ago; the owner merged both just now, but neither history row landed.
     for number, minutes in ((1, 12), (2, 2)):
         run = _queued(store, clock, number, finished=NOW - timedelta(hours=10, minutes=minutes), merge=False)
-        fact = {"pr": number, "target": "main", "head": f"{number:040x}",
-                "merged_at": (NOW - timedelta(minutes=minutes)).isoformat()}
-        path = store.root / "runs" / f"{number}.json"
-        value = json.loads(path.read_text())
-        value.pop("run_generation", None)  # Legacy writers saved the snapshot before history.
-        value.update(owner_merge=fact, owner_merge_started_at=run.started_at, merged_at=fact["merged_at"])
-        path.write_text(json.dumps(value))
-        expected[number, run.started_at] = fact["merged_at"]
+        merged_at = (NOW - timedelta(minutes=minutes)).isoformat()
+        # Only the issue cache saw the merge: no run record or history row carries it.
+        store.observe_merge(number, number, head=f"foragent/issue-{number}", base="main",
+                            merged_at=merged_at, started_at=run.started_at)
+        expected[number, run.started_at] = merged_at
     store.update_local_issue(90, title="Queued work", labels=[], state="open", body="")
     clock[0] = NOW
     assert store.merge_times() == expected

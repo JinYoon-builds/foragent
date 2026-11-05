@@ -406,9 +406,11 @@ def test_gate_merge_ends_at_the_recorded_merge_not_the_later_finish(tmp_path):
 
     clock = [NOW - timedelta(hours=10)]
     store = StateStore(tmp_path / "repo", now=lambda: clock[0])
+    if not any(row["number"] == 7 for row in store.local_issues()):  # The issue cache row the merge lands in.
+        store.update_local_issue(7, title=f"Issue {7}", labels=[], state="open", body="")
     store.start_run(7, branch="foragent/issue-7", worktree="unused")
     merged_at = NOW - timedelta(hours=8)
-    store.record_merge(7, merged_at)
+    store.record_merge(7, merged_at, pr=70, base="main")
     clock[0] = NOW - timedelta(hours=7)  # installation and cleanup after the merge
     store.finish_run(7, "merged")
     assert [(end, end - start) for *_, start, end in progress.merged_work(store)] == [

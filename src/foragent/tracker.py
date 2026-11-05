@@ -450,7 +450,7 @@ class RecordingTracker:
             dropped = sorted(set(dropped) | set(store.ingest(read, started, self._context.config.lanes)))
         if listing is not None:
             # Advanced only now: a failed read or refresh keeps the old watermark.
-            store.record_merged_pr_listing(listing)
+            store.record_merged_pr_watermark(listing)
         observed = {issue.number for issue in issues}
         for number in dropped:
             reason = "remote change" if number in observed else "issue not found"
@@ -465,25 +465,24 @@ class RecordingTracker:
     def _merged_prs(self, store, observed_at):
         """Every merged foragent PR, newest update first, as a full listing returns them.
 
-        With a stored listing only closed PRs updated since its watermark (less
-        a margin for clock skew) are read; they replace their stored records.
-        Returns the PRs and the listing to store after a successful refresh.
+        With a cursor in the issue cache only closed PRs updated since it (less a
+        margin for clock skew) are read; the cache supplies the merges it saw earlier.
+        Returns the PRs and the cursor to store after a successful refresh.
         """
         read = getattr(self._tracker, "merged_prs_updated_since", None)
         if read is None:
             return self._tracker.list_prs("merged", "foragent/"), None
-        known = store.merged_pr_listing()
-        since = None
-        if known:
-            watermark = datetime.fromisoformat(known["watermark"])
+        watermark = store.merged_pr_watermark()
+        since, records = None, {}
+        if watermark is not None:
             since = (watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)) - _WATERMARK_MARGIN
-        records = {record["number"]: record for record in (known or {}).get("prs", [])}
+            records = {record["number"]: record for record in store.cached_merged_prs()}
         records.update((record["number"], record) for record in read(since, "foragent/"))
         ordered = sorted(records.values(), key=lambda record: _parse_time(record.get("updated_at"))
                          or datetime.min.replace(tzinfo=UTC), reverse=True)
         prs = [PullRequest(record["number"], record["head"], record["base"], "", "",
-                           record["merged_at"], record["url"]) for record in ordered]
-        return prs, {"watermark": observed_at.isoformat(), "prs": ordered}
+                           record["merged_at"], record.get("url", "")) for record in ordered]
+        return prs, observed_at
 
     def observe_closed_issues(self, *, observed_at):
         """Record issues closed since the stored watermark: one light read per tick.

@@ -163,10 +163,12 @@ def _admission(
     Each startable issue gets the first reason the loop would hold it for (cap,
     plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
-    from foragent.overlap_files import admits, any_overlap, claim, claims, recorded_union
+    from foragent.overlap_files import repository
+    from foragent.overlap_files import admits, any_overlap, claim, claims
     from foragent.scheduler_start import _lane_hold
 
-    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
+    ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now,
+                          git=repository(root))
     if not probe:
         ctx.case_sensitive = None  # Unknown: intersects() then compares paths case-sensitively.
     state = capacity.read_state(store)
@@ -187,8 +189,6 @@ def _admission(
         ctx, [*item.parsed.files, *item.parsed.exclusive], running)]
     held: dict[int, str] = {}
     remaining = free
-    # The gate's merge=union answers, recorded when it last checked them (unchecked paths keep limits).
-    union = recorded_union(store)
     items = {item.number: item for item in waiting if item.startable}
     lanes: dict[str, list[int]] = {}
     for item in items.values():
@@ -211,7 +211,7 @@ def _admission(
             break
         if (hold := _lane_hold(ctx, lane, now, number)) is not None:  # The tick's own lane hold, per issue.
             held[number] = hold
-        elif not admits(ctx, lane, item.parsed, known, unknown, union=union):
+        elif not admits(ctx, lane, item.parsed, known, unknown):
             held[number] = "structure"
         elif hold_all == "machine":
             # Passed every start check; critical memory ends the tick, so nothing after it starts.

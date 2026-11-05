@@ -268,7 +268,9 @@ def test_owner_local_fallback_autodetects_without_worker_baseline(proto, monkeyp
 def test_owner_merge_fact_is_bound_and_timestamp_is_parsed(tmp_path):
     clock = [datetime(2026, 10, 20, 9, 0, 0, tzinfo=UTC)]
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.update_local_issue(1, title="Issue", labels=[], state="open", body="")  # The cache row merges land in.
     old = store.start_run(1, branch="old", worktree=tmp_path / "old")
+    store.update_run(1, last_review_pass_at=clock[0].isoformat())  # A measurement for the owner merge to commit.
     store.finish_run(1, "merge-queued")
     fact = {"pr": 9, "target": "main", "head": "abc", "merged_at": "2026-10-20T09:00:01Z"}
     store.record_owner_merge(1, old.started_at, fact)
@@ -412,6 +414,7 @@ def test_restarted_push_hold_targets_issue_and_continues_next_candidate(proto, m
 def test_late_owner_merge_fact_updates_its_history_without_changing_new_run(tmp_path):
     clock = [datetime(2026, 10, 20, 9, 0, 0, tzinfo=UTC)]
     store = StateStore(tmp_path / "state", now=lambda: clock[0])
+    store.update_local_issue(1, title="Issue", labels=[], state="open", body="")  # The cache row merges land in.
     old = store.start_run(1, branch="old", worktree=tmp_path / "old")
     store.update_run(1, last_review_pass_at=clock[0].isoformat())
     clock[0] += timedelta(seconds=1)
@@ -427,10 +430,11 @@ def test_late_owner_merge_fact_updates_its_history_without_changing_new_run(tmp_
     with pytest.raises(ValueError, match="generation is unavailable"):
         store.record_owner_merge(1, (clock[0] - timedelta(days=1)).isoformat(), fact)
     assert path.read_bytes() == newer and history.read_bytes() == before
+    assert store.merge_times() == {}, "An unknown generation puts no merge into the issue cache"
 
     store.record_owner_merge(1, old.started_at, fact)
     assert path.read_bytes() == newer
-    assert store.owner_merge_facts() == {(1, old.started_at): fact}
+    assert store.owner_merge_facts() == {(1, old.started_at): {"pr": 9, "merged_at": fact["merged_at"]}}
     assert store.run_merged(old) and not store.run_merged(new)
     recorded = history.read_bytes()
     assert len(recorded.splitlines()) == 2
@@ -449,4 +453,5 @@ def test_late_owner_merge_fact_updates_its_history_without_changing_new_run(tmp_
     store.finish_run(1, "merge-queued")
     new_fact = {**fact, "pr": 10, "head": "def", "merged_at": clock[0].isoformat()}
     store.record_owner_merge(1, new.started_at, new_fact)
-    assert store.owner_merge_facts() == {(1, old.started_at): fact, (1, new.started_at): new_fact}
+    assert store.owner_merge_facts() == {(1, old.started_at): {"pr": 9, "merged_at": fact["merged_at"]},
+                                         (1, new.started_at): {"pr": 10, "merged_at": new_fact["merged_at"]}}

@@ -54,9 +54,10 @@ def test_a_failed_rerun_does_not_count_the_earlier_merge_again(tmp_path):
     now = datetime(2026, 10, 27, 12, tzinfo=UTC)
     clock = [now - timedelta(hours=3)]
     store = StateStore(tmp_path / "state", lambda: clock[0])
+    store.update_local_issue(7, title="t", labels=[], state="open", body="")  # The issue cache row
     store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "w7", lane="api")
     clock[0] = now - timedelta(hours=2)
-    store.record_merge(7, clock[0])
+    store.record_merge(7, clock[0], pr=70, base="main")
     store.finish_run(7, outcome="merged")
     assert presence.counts(store, now)[2] == 1
     clock[0] = now - timedelta(hours=1)
@@ -75,9 +76,10 @@ def test_a_gate_merge_counts_before_its_run_is_finished_and_only_once(tmp_path):
     now = datetime(2026, 10, 27, 12, tzinfo=UTC)
     clock = [now - timedelta(hours=2)]
     store = StateStore(tmp_path / "state", lambda: clock[0])
+    store.update_local_issue(8, title="t", labels=[], state="open", body="")  # The issue cache row
     store.start_run(8, branch="foragent/issue-8", worktree=tmp_path / "w8", lane="api")
     clock[0] = now - timedelta(hours=1)
-    store.record_merge(8, clock[0])
+    store.record_merge(8, clock[0], pr=80, base="main")
     # The gate still has GitHub calls to make before finish_run moves the merge into history.
     assert presence.counts(store, now) == (1, 0, 1)
     store.finish_run(8, outcome="merged")

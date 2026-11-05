@@ -249,7 +249,7 @@ def _overlap(ctx, number: int, lane: str, parsed) -> tuple[bool, set[str]]:
     peers, _unknown = overlap_files.claims(ctx, exclude=number, measured=False)
     if not parsed.files or not peers:
         return False, set()
-    union = overlap_files.recorded_union(ctx.store)
+    union = overlap_files.union_patterns(ctx, parsed.files, peers)
     # Without unknown runs admits checks only files: exclusive reservations, then overlap_per_file.
     held = not overlap_files.admits(ctx, lane, parsed, peers, [], union=union)
     paths = set()

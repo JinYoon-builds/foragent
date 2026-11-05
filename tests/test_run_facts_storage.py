@@ -18,7 +18,14 @@ INPUT_DETAIL = "Command: " + "test_node " * 150 + "\r\n\tCause: protected check 
 
 def start(root):
     store = StateStore(root, now=lambda: NOW)
+    # The issue cache row a merge observation lands in; GitHub merge facts live there.
+    store.update_local_issue(1, title="Issue", labels=[], state="open", body="")
     return store, store.start_run(1, branch="branch", worktree=root / "worktree")
+
+
+def cached(fact):
+    """What the issue cache derives for an execution from an owner merge fact."""
+    return {"pr": fact["pr"], "merged_at": fact["merged_at"]}
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -120,11 +127,12 @@ def test_detail_saved_while_running_keeps_the_complete_reason(tmp_path, side):
 @pytest.mark.parametrize("destination", ["runs.jsonl", "runs/1.json"])
 def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch, destination):
     store, run = start(tmp_path)
+    store.update_run(1, last_review_pass_at=NOW.isoformat())  # So the merge has a measurement to commit.
     initial = store.finish_run(1, "pr-open", "waiting for merge")
     peer = StateStore(tmp_path, now=lambda: NOW)
     # Warm both caches before another process writes a new completion fact.
     assert store.get_run(1) == peer.get_run(1) == initial
-    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "head"}
+    fact = {"pr": 7, "target": "main", "merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "head"}
     original = store._atomic_write
 
     def fail(path, content):
@@ -140,9 +148,8 @@ def test_completed_metadata_updates_commit_through_history(tmp_path, monkeypatch
     assert peer.get_run(1) == store.get_run(1) == StateStore(tmp_path).get_run(1) == latest
     if destination == "runs.jsonl":
         assert latest == initial  # Failed writes cannot mutate a warmed read cache.
-        assert peer.merge_times() == {}
-    else:
-        assert peer.merge_times() == {(1, run.started_at): fact["merged_at"]}
+    # The merge is a GitHub fact in the issue cache, whatever happened to the run's measurement.
+    assert peer.merge_times() == {(1, run.started_at): fact["merged_at"]}
     store.record_owner_merge(1, run.started_at, fact)
     assert peer.merge_times() == {(1, run.started_at): fact["merged_at"]}
     before = (tmp_path / "runs.jsonl").read_bytes()
@@ -168,7 +175,7 @@ def completed_record(root, legacy):
 @pytest.mark.parametrize("action", ["owner", "ownership"])
 @pytest.mark.parametrize("after_replace", [False, True])
 def test_finished_metadata_crashes_keep_latest_and_history_equal(tmp_path, monkeypatch, legacy, action, after_replace):
-    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "head"}
+    fact = {"pr": 7, "target": "main", "merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "head"}
     real_replace = os.replace
     for fail_at in range(1, 5):
         root = tmp_path / str(fail_at)
@@ -214,8 +221,8 @@ def test_finished_metadata_crashes_keep_latest_and_history_equal(tmp_path, monke
 @pytest.mark.parametrize("legacy", [False, True])
 def test_owner_readers_use_committed_fact_when_snapshot_is_stale(tmp_path, monkeypatch, legacy):
     store, run = completed_record(tmp_path, legacy)
-    first = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "first"}
-    second = {"merged_at": (NOW + timedelta(minutes=2)).isoformat(), "head": "second"}
+    first = {"pr": 7, "target": "main", "merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "first"}
+    second = {"pr": 8, "target": "main", "merged_at": (NOW + timedelta(minutes=2)).isoformat(), "head": "second"}
     store.record_owner_merge(1, run.started_at, first)
     write = store._write_json
 
@@ -232,7 +239,7 @@ def test_owner_readers_use_committed_fact_when_snapshot_is_stale(tmp_path, monke
     latest, = reopened.read_history()
     assert reopened.get_run(1) == latest
     assert latest.review_pass_to_merge_seconds == 120.0
-    assert reopened.owner_merge_facts() == {(1, run.started_at): second}
+    assert reopened.owner_merge_facts() == {(1, run.started_at): cached(second)}
     assert reopened.merge_times() == {(1, run.started_at): second["merged_at"]}
 
 
@@ -249,7 +256,7 @@ def test_historical_owner_write_preserves_current_generation(tmp_path, monkeypat
         assert path != snapshot, "An old completion must not write the current snapshot"
         return write(path, value)
 
-    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old"}
+    fact = {"pr": 7, "target": "main", "merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old"}
     monkeypatch.setattr(store, "_write_json", refuse_current)
     store.record_owner_merge(1, old.started_at, fact)
     reopened = StateStore(tmp_path)
@@ -257,7 +264,7 @@ def test_historical_owner_write_preserves_current_generation(tmp_path, monkeypat
     assert reopened.get_run(1) == current
     recorded, = reopened.read_history()
     assert recorded.review_pass_to_merge_seconds == 60.0
-    assert reopened.owner_merge_facts() == {(1, old.started_at): fact}
+    assert reopened.owner_merge_facts() == {(1, old.started_at): cached(fact)}
     history = (tmp_path / "runs.jsonl").read_bytes()
     reopened.record_owner_merge(1, old.started_at, fact)
     assert (tmp_path / "runs.jsonl").read_bytes() == history
@@ -266,7 +273,7 @@ def test_historical_owner_write_preserves_current_generation(tmp_path, monkeypat
 
 def test_legacy_owner_replay_commits_a_fact_previously_saved_only_in_snapshot(tmp_path):
     store, run = completed_record(tmp_path, True)
-    fact = {"merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old-writer"}
+    fact = {"pr": 7, "target": "main", "merged_at": (NOW + timedelta(minutes=1)).isoformat(), "head": "old-writer"}
     path = tmp_path / "runs/1.json"
     value = json.loads(path.read_text())
     value.update(owner_merge=fact, owner_merge_started_at=run.started_at, merged_at=fact["merged_at"],
@@ -276,6 +283,8 @@ def test_legacy_owner_replay_commits_a_fact_previously_saved_only_in_snapshot(tm
     reopened = StateStore(tmp_path)
     assert reopened.get_run(1) == reopened.read_history()[0]
     assert reopened.get_run(1).review_pass_to_merge_seconds == 60.0
+    stored = json.loads((tmp_path / "runs/1.json").read_text())
+    assert not {"owner_merge", "owner_merge_started_at", "merged_at"} & stored.keys(), "The replay drops the copy"
     before = (tmp_path / "runs.jsonl").read_bytes()
     reopened.record_owner_merge(1, run.started_at, fact)
     assert (tmp_path / "runs.jsonl").read_bytes() == before

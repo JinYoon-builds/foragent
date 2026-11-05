@@ -18,10 +18,12 @@ def store_at(tmp_path, clock):
 
 
 def merge(store, clock, number, at):
+    if not any(row["number"] == number for row in store.local_issues()):  # The issue cache row the merge lands in.
+        store.update_local_issue(number, title=f"Issue {number}", labels=[], state="open", body="")
     clock[0] = at - timedelta(minutes=10)
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number), lane="api")
     clock[0] = at
-    store.record_merge(number, at)
+    store.record_merge(number, at, pr=1000 + number, base="main")
     store.finish_run(number, outcome="merged")
 
 
@@ -183,7 +185,7 @@ def test_report_json_prints_the_same_sections_and_records_the_time(tmp_path, mon
     assert cli.main(["brief", "--report", "--json", "--repo-root", str(root)]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert {"since", "judgment", "merged", "resolved", "working", "now", "questions", "person_issues"} <= printed.keys()
-    assert printed["merged"] == [{"issue": 3, "title": None}]
+    assert printed["merged"] == [{"issue": 3, "title": "Issue 3"}]  # The cached issue the merge landed in
     assert brief_report.last_report(store, NOW) == NOW
 
 

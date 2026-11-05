@@ -104,8 +104,9 @@ def test_merges_since_tidy_event_use_the_merge_time_not_the_finish(env):
     store, root = env
     clock = [NOW - timedelta(hours=3)]
     store._now = lambda: clock[0]
+    store.update_local_issue(1, title="t", labels=[], state="open", body="")  # The issue cache row
     store.start_run(1, branch="b", worktree=store.worktree_path(1))
-    store.record_merge(1, NOW - timedelta(hours=2, minutes=50))
+    store.record_merge(1, NOW - timedelta(hours=2, minutes=50), pr=10, base="main")
     clock[0] = NOW - timedelta(hours=2)  # Cleanup finishes after the tidy below.
     store.finish_run(1, outcome="merged")
     store._now = lambda: NOW
@@ -143,16 +144,19 @@ def test_replay_follows_the_lane_queue_order(env):
     assert facts["binding"]["kind"] == "cap"
 
 
-def test_replay_applies_the_gates_recorded_union_answers(env):
-    from foragent.overlap_files import record_union
+def test_replay_applies_the_gates_recorded_union_answers(env, monkeypatch):
+    from foragent.git import GitRepo
 
     store, root = env
+    (root / ".git").mkdir(exist_ok=True)  # A repository: the facts view reads its merge attributes.
+    union: set[str] = set()
+    monkeypatch.setattr(GitRepo, "union_merge_paths", lambda self, ref, paths: union & set(paths))
     capacity.write_state(store, 4, NOW)
     approve(store, 1, ["src/shared.py"], labels=("approved", "running"), active=True)
     approve(store, 2, ["src/shared.py"])
     approve(store, 3, ["src/shared.py"])
     assert collect(store, root)["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
-    record_union(store, {"src/shared.py"}, {"src/shared.py"})
+    union.add("src/shared.py")  # Git's merge attribute now says union; no state file is written.
     facts = collect(store, root)
     assert facts["resources"]["parallelizable_work"]["held"] == {} and facts["binding"] is None
 

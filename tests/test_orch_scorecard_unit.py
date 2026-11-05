@@ -35,7 +35,10 @@ def finish(store, number, *, at, minutes=10, outcome="merged", detail="", merged
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     store.clock[0] = at
     if merged_at is not None:
-        store.record_merge(number, merged_at)
+        if not any(row["number"] == number for row in store.local_issues()):
+            # The gate's merge lands in the issue cache row of its issue.
+            store.update_local_issue(number, title=f"Issue {number}", labels=[], state="open", body="")
+        store.record_merge(number, merged_at, pr=1000 + number, base="main")
     store.finish_run(number, outcome=outcome, detail=detail)
     store.clock[0] = NOW
 
@@ -244,7 +247,8 @@ def test_flow_waste_counts_ongoing_runtime_and_merged_running_records(store):
     today = orch_scorecard.collect(store, 2)["window"]["today"]
     assert today["waste_share"] == pytest.approx(0.1), "10 failed of 100 runtime minutes, 90 still running"
     assert today["merges"] == 0
-    store.record_merge(2, NOW - timedelta(minutes=5))
+    store.update_local_issue(2, title="Issue 2", labels=[], state="open", body="")
+    store.record_merge(2, NOW - timedelta(minutes=5), pr=1002, base="main")
     assert orch_scorecard.collect(store, 2)["window"]["today"]["merges"] == 1, (
         "A merged runner still cleaning up has merged")
 

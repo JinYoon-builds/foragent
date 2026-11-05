@@ -3232,7 +3232,7 @@ OWN_MERGE_CALLS = {
     "turn-merged": lambda ctx, run, seat, turn: turn.record_turn(ctx, seat, "base", "merged"),
     "owner-merging": lambda ctx, run, seat, turn: _owner_job(ctx, run, "merging"),
     "owner-merged": lambda ctx, run, seat, turn: _owner_job(ctx, run, "merged"),
-    "merged-at": lambda ctx, run, seat, turn: ctx.store.record_merge(1, NOW),
+    "merged-at": lambda ctx, run, seat, turn: ctx.store.record_merge(1, NOW, pr=10, base="main"),
 }
 
 
@@ -3253,7 +3253,8 @@ NO_OWN_MERGE = {
                                                  turn.record_turn(ctx, seat, "base", "failed")),
     "person-merge-seat": lambda ctx, run, seat, turn: turn.record_turn(
         ctx, turn.Seat(1, "orch-merge now", "main"), "base", "merged"),
-    "earlier-execution-merge": lambda ctx, run, seat, turn: ctx.store.record_merge(1, NOW - timedelta(hours=1)),
+    "earlier-execution-merge": lambda ctx, run, seat, turn: ctx.store.record_merge(
+        1, NOW - timedelta(hours=1), pr=10, base="main"),
 }
 
 

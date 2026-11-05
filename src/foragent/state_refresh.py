@@ -152,24 +152,76 @@ class IssueRefreshMixin:
                                      edges=blocked_by, gone=gone, since_revision=since_revision)
             return sorted(dropped)
 
-    def merged_pr_listing(self) -> dict[str, Any] | None:
-        """The stored merged-PR listing and the refresh start it covers, if any."""
+    def merged_pr_watermark(self) -> datetime | None:
+        """When the last merged-PR listing that reached the issue cache began, if any."""
         try:
-            listing = _state.json.loads((self.root / "merged_prs.json").read_text(encoding="utf-8"))
-            datetime.fromisoformat(listing["watermark"])
-        except (FileNotFoundError, ValueError, TypeError, KeyError):
-            # Without a readable listing the next refresh lists every closed PR.
+            return datetime.fromisoformat(self._issue_snapshot()["merged_prs_watermark"])
+        except (ValueError, TypeError, KeyError):
+            # Without a readable cursor the next refresh lists every merged PR.
             return None
-        prs = listing.get("prs")
-        fields = ("number", "head", "base", "merged_at", "url")
-        if not isinstance(prs, list) or not all(
-                isinstance(record, dict) and all(key in record for key in fields) for record in prs):
-            return None
-        return listing
 
-    def record_merged_pr_listing(self, listing: dict[str, Any]) -> None:
+    def record_merged_pr_watermark(self, at: datetime) -> None:
+        """Advance the merged-PR cursor kept beside the issue cache; tidy the old duplicate listings."""
         with self._state_lock():
-            self._write_json(self.root / "merged_prs.json", listing)
+            snapshot = self._issue_snapshot()
+            snapshot["merged_prs_watermark"] = at.isoformat()
+            self._write_json(self.root / "issues.json", snapshot)
+            for name in ("merged_prs.json", "union-merge-paths.json"):
+                (self.root / name).unlink(missing_ok=True)
+
+    def merge_facts(self) -> dict[tuple[int, str], dict]:
+        """GitHub merges the issue cache attributes to an execution, by (number, started_at)."""
+        return merge_facts_of(self._issue_record())  # Read-only: no detached copy needed.
+
+    def observe_merge(self, number: int, pr: int | None, *, head: str, base: str, merged_at: str,
+                      started_at: str, url: str = "") -> None:
+        """Put a merge Foragent itself just made or confirmed into the issue cache.
+
+        The entry follows the listing's rules (_record_merge): kept once, never changed. The
+        execution is known here (a merge before its start is not its own), and whether the
+        merge closed the issue stays undecided until a listing after the merge shows it.
+        Without a cached row the merge waits beside the rows (``unlisted_merges``) until
+        the issue is observed. A merge whose PR is not known yet is keyed ``run:<start>``
+        until a listing shows that execution's PR."""
+        from types import SimpleNamespace
+
+        with self._state_lock():
+            snapshot = self._issue_snapshot()
+            key = str(number)
+            row = snapshot["issues"].get(key)
+            if pr is None and row is not None and type(row.get("pr_number")) is int:
+                pr = row["pr_number"]  # The PR the cache already knows for this issue.
+            name = str(pr) if pr is not None else f"{RUN_MERGE}{started_at}"
+            holder = row if row is not None else {
+                "number": number, "labels": [], "merges": dict(snapshot.get("unlisted_merges", {}).get(key) or {})}
+            known = holder.get("merges") or {}
+            if name in known or pr is None and any(
+                    key.isdigit() and entry.get("started_at") == started_at for key, entry in known.items()):
+                return  # Already cached, by this key or by the execution's PR.
+            observed = SimpleNamespace(number=name, head=head, base=base, merged_at=merged_at, url=url)
+            # The execution is ``started_at`` only if it began by the merge (_record_merge's rule).
+            _record_merge(holder, observed, {started_at}, None)
+            holder["merges"][name]["closed"] = None
+            if row is None:
+                snapshot.setdefault("unlisted_merges", {})[key] = holder["merges"]
+            self._write_json(self.root / "issues.json", snapshot)
+
+    def cached_merged_prs(self) -> list[dict[str, Any]]:
+        """Merged PRs the issue cache already saw, as incremental-listing records."""
+        records = []
+        for row in self._issue_snapshot()["issues"].values():
+            for number, entry in (row.get("merges") or {}).items():
+                if not number.isdigit():
+                    continue  # An execution's merge whose PR no listing has shown yet.
+                same = row.get("pr_number") == int(number)
+                records.append({
+                    "number": int(number),
+                    "head": entry.get("head") or (same and row.get("pr_head")) or f"foragent/issue-{row['number']}",
+                    "base": entry.get("base") or (same and row.get("pr_base")) or "",
+                    "merged_at": entry.get("merged_at"), "updated_at": entry.get("merged_at"),
+                    "url": entry.get("url") or "",
+                })
+        return records
 
     def closed_issue_watermark(self) -> datetime | None:
         """When the last light read of closed issues began, if one was recorded."""
@@ -246,6 +298,32 @@ def _size_of(labels: Any) -> str:
     return size_of(labels)
 
 
+RUN_MERGE = "run:"  # Key prefix of an execution's merge whose PR the cache has not seen.
+
+
+def merge_facts_of(snapshot: Any) -> dict[tuple[int, str], dict]:
+    """Each cached merge with a known execution: {"pr", "merged_at"} by (number, started_at)."""
+    facts: dict[tuple[int, str], dict] = {}
+    rows = snapshot.get("issues") if isinstance(snapshot, dict) else None
+    gone = snapshot.get("unlisted_merges") if isinstance(snapshot, dict) else None
+    rows = [*(rows.values() if isinstance(rows, dict) else []),
+            *({"number": int(key), "merges": merges} for key, merges in
+              (gone.items() if isinstance(gone, dict) else []) if key.isdigit())]
+    for row in rows:
+        merges = row.get("merges") if isinstance(row, dict) else None
+        if type(row.get("number") if isinstance(row, dict) else None) is not int or not isinstance(merges, dict):
+            continue
+        for pr, entry in merges.items():
+            if not (isinstance(entry, dict) and isinstance(started := entry.get("started_at"), str)
+                    and isinstance(at := entry.get("merged_at"), str)):
+                continue
+            key, when = (row["number"], started), _merge_time(at)
+            known = _merge_time(facts[key]["merged_at"]) if key in facts else None
+            if key not in facts or when is not None and (known is None or when > known):
+                facts[key] = {"pr": int(pr) if pr.isdigit() else None, "merged_at": at}
+    return facts
+
+
 def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None) -> None:
     """Keep every merged PR of the issue, in any listing order and across reopening.
 
@@ -273,12 +351,17 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
             "size": _size_of(labels),
             "started_at": max(before)[1] if before else None,
         }
+    # Enough of the PR for a later incremental listing to list it again from this cache.
+    entry = {**{"head": pr.head, "base": pr.base, "url": pr.url}, **entry}
     if entry.get("closed") is None:
         seen = _merge_time(updated_at)
         # Without an update time the listing cannot be placed before the merge.
         if seen is None or at is None or seen >= at:
             entry = {**entry, "closed": row.get("state") == "closed"}
     merges[str(pr.number)] = entry
+    if str(pr.number).isdigit() and entry.get("started_at"):
+        # The listing now shows the PR of an execution's merge recorded without one.
+        merges.pop(f"{RUN_MERGE}{entry['started_at']}", None)
     row["merges"] = merges
 
 

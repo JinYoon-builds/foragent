@@ -41,25 +41,12 @@ def project_root(start: Path) -> Path | None:
 
 
 def gate_merges(store) -> dict[tuple[int, str], str]:
-    """Merge times from the gate's record_merge records, by (number, started_at).
+    """Merge times of the gate's executions, by (number, started_at), from the issue cache.
 
-    The one merge source (#754): merges outside the gate, in issue snapshots or PR
-    listings, are not counted. record_merge writes runs/<n>.json at the merge;
-    finish_run copies it into the history merge_times() reads, after the gate's
-    GitHub calls. Reading both shows a merge at once; the key counts it once.
+    The gate puts each merge it makes into the cache at once (record_merge, the merge
+    owner), and every listing confirms it, so a merge shows at once and counts once.
     """
-    import json
-
-    times = dict(store.merge_times())
-    for path in (store.root / "runs").glob("*.json"):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(record, dict) and isinstance(record.get("merged_at"), str) \
-                and isinstance(record.get("started_at"), str) and isinstance(record.get("number"), int):
-            times[record["number"], record["started_at"]] = record["merged_at"]
-    return times
+    return dict(store.merge_times())
 
 
 def counts(store, now: datetime) -> tuple[int, int, int]:
