@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from foragent import orch_scorecard_history
+from foragent import orch_facts_stall, orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
@@ -33,7 +33,7 @@ CONCENTRATION_IDLE = 2
 STALL_MERGES = 4
 STALL_FACTOR = 3
 KINDS = ("repeated_design_holds", "hot_overlap_files", "files_over_limit", "idle_lanes_with_backlog",
-         "lane_concentration", "merge_stall", "waiting_on_person")
+         "lane_concentration", "merge_stall", "waiting_on_person", *orch_facts_stall.KINDS)
 WAITING_LABEL = "needs-human"
 # Gate alarms (#1469): the gate calls the architect on these directly, whatever its configured
 # signals. Repeated holds and idle lanes with ready work reach it through its default signals.
@@ -59,6 +59,10 @@ RISING_FACTS = {"waiting_on_person": ("waiting",)}
 # those at its answer (#1733): a clear (the kind absent for a tick) never re-arms them, so a wait
 # that ends and the same oldest item returning at the same count stay quiet.
 EVIDENCE_ONLY = frozenset({"waiting_on_person"})
+# Flow stalls (#2088) are signalled once per episode: while one lasts its numbers never make it
+# worse (a free lane changing or one more stuck request is the same stall); only a clear, the
+# stall ending, re-arms the next one.
+EPISODE_KINDS = frozenset(orch_facts_stall.KINDS)
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
@@ -247,6 +251,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
         "waiting_on_person": waiting_on_person_numbers(store, now),
+        **orch_facts_stall.collect(store, config, root, now, running, waiting),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}

@@ -333,8 +333,10 @@ def test_a_clear_outlives_the_journal_retention(store, tmp_path, measured):
     assert len(clears(store)) == 0 and len(orch_role_raise.raise_due(store, tmp_path, store.clock[0])) == 0
 
 
+# Flow-stall kinds (#2088) re-arm only by ending (tests/test_orch_facts_stall.py), never by their facts.
 @pytest.mark.parametrize("kind", [kind for kind in orch_facts_kinds.KINDS
-                                  if "binding" not in orch_facts_kinds.SHARED_FACTS.get(kind, ())])
+                                  if "binding" not in orch_facts_kinds.SHARED_FACTS.get(kind, ())
+                                  and kind not in orch_facts_kinds.EPISODE_KINDS])
 def test_a_binding_change_leaves_a_not_now_signal_of_another_kind_quiet(store, tmp_path, measured, kind):
     """#1155: only kinds about the binding constraint fingerprint it; the others keep their own facts."""
     measured["signals"][:] = [{"paths": [], "kinds": [kind]}]

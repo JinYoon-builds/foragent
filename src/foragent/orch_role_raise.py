@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-from foragent import orch_events, orch_facts_kinds, orch_inbox, orch_roles
+from foragent import orch_events, orch_facts_kinds, orch_facts_stall, orch_inbox, orch_roles
 from foragent.config import load_config
 from foragent.i18n import text
 from foragent.orch_facts_resources import _jsonl, _time
@@ -49,6 +49,9 @@ GATE_CALLED = ("architect",)
 # as a failed scheduled role session is (orch_role_schedule.RETRY_AFTER).
 RETRY_AFTER = timedelta(hours=1)
 ALARM_SIGNAL = {"paths": [], "kinds": list(orch_facts_kinds.ALARM_KINDS)}
+# Flow stalls (#2088) reach the orchestrator, one signal per kind, whatever its configured signals.
+STALL_ROLE = "orchestrator"
+STALL_SIGNALS = [{"paths": [], "kinds": [kind]} for kind in orch_facts_stall.KINDS]
 
 
 def cooldown(repo_root: Path) -> timedelta:
@@ -101,6 +104,11 @@ def _clears(store: StateStore) -> dict[str, list[datetime]]:
 
 def _text(name: str, signal: dict[str, Any], files: set[str], kinds: set[str], numbers: dict[str, Any]) -> str:
     """The role, the signal and each matched part's numbers: matching files, or the kind's facts numbers."""
+    if name == STALL_ROLE and signal in STALL_SIGNALS:
+        return (f"Flow stall: {_parts(signal, files, kinds, numbers)}. Order work for the free lanes, raise the "
+                "stuck request, or propose to close or unpark the parked issue; a choice that is the person's "
+                "goes to the PM as multiple choice. Then answer `fa orch signal-answer <id> called --why ...`, "
+                "or `not-now --why <reason>`.")
     return (f"Role signal for {name}: {json.dumps(source(signal))} is met ({_parts(signal, files, kinds, numbers)}). "
             f"Call the role (fa orch {name} or its call command) and answer `fa orch signal-answer <id> called "
             f"--why ...`, or answer `not-now --why <reason>`.")
@@ -134,6 +142,8 @@ def burden_numbers(kind: str, numbers: Any) -> Any:
     """One kind's numbers as a burden: shares added, elapsed and context numbers left out."""
     if not isinstance(numbers, dict):
         return numbers
+    if kind in orch_facts_kinds.EPISODE_KINDS:
+        return {}  # One signal per episode: nothing inside it is a worse burden.
     numbers = dict(numbers)
     for name, (part, whole) in orch_facts_kinds.SHARE_FACTS.get(kind, {}).items():
         if isinstance(numbers.get(part), (int, float)) and numbers.get(whole):
@@ -289,6 +299,8 @@ def _signals(name: str, entry: dict[str, Any], config) -> list[dict[str, Any]]:
     signals = list(entry["signals"])
     if name in GATE_CALLED and name in config.roles and ALARM_SIGNAL not in signals:
         signals.append(ALARM_SIGNAL)
+    if name == STALL_ROLE:
+        signals += [signal for signal in STALL_SIGNALS if signal not in signals]
     return signals
 
 
@@ -474,6 +486,9 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
     """
     with step("role_signals"):
         try:
+            if (Path(repo_root) / ".foragent.yml").is_file():
+                # The tick is the one writer of the supply-low hold its facts read (#2088).
+                orch_facts_stall.hold(store, load_config(Path(repo_root)), Path(repo_root), now)
             return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
         except Exception as exc:  # noqa: BLE001 - one failed check must not stop the tick.
             print(text("tick_step_failed", language, step="role_signals", error=f"{type(exc).__name__}: {exc}"),
