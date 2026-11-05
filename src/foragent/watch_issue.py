@@ -17,8 +17,8 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 BRANCH = re.compile(r"foragent/issue-(\d+)")
-# What a CI segment closes into when CI passed: a merge step, or the run's merge outcome.
-AFTER_CI = frozenset({"merging", "merge-lock-wait", "merge-turn-wait", "merged", "merge-queued"})
+# What each recorded CI read says, in the view's words.
+READS = {"pass": "passed", "fail": "failed", "none": "no_checks", "not-started": "not_started", "pending": "pending"}
 
 
 def infer(folder: Path) -> int | None:
@@ -66,58 +66,49 @@ def _at(value) -> datetime | None:
     return moment if moment is not None and moment.tzinfo is not None else None
 
 
-def _ci_passes(store: StateStore, number: int, since: datetime) -> list[datetime]:
-    """When this run's CI segments closed into a merge step: the recorded move past CI.
+def recorded_ci(store: StateStore, number: int, run) -> str | None:
+    """This run's newest recorded CI result, or None when the run recorded none.
 
-    The phase journal writes one ``phase`` event per closed segment, ``ci -> <next step
-    or run outcome>``; a step name alone never says CI ran in this run.
+    The runner keeps every CI read it acts on (``ci-read``: the CI wait, the final merge inputs,
+    jobs that never started) and every CI code failure (``ci-failure``, also a comparison that
+    fails a head GitHub passed). The newest wins; at equal times the one written last wins
+    (the flow log keeps written order, and a comparison failure is written after the read it overrides).
     """
-    from foragent import orch_events
-
-    try:
-        events = orch_events.read_events(store)
-    except OSError:
-        return []
-    found = []
-    for event in events:
-        opened, closed = _at(event.get("phase_started_at")), _at(event.get("at"))
-        summary = event.get("summary")
-        if (event.get("kind") == "phase" and event.get("issue") == number and event.get("phase") == "ci"
-                and opened is not None and closed is not None and opened >= since
-                and isinstance(summary, str) and summary.rpartition(" -> ")[2] in AFTER_CI):
-            found.append(closed)
-    return found
+    found: list[tuple[datetime, int, str]] = []
+    for index, record in enumerate(store.flow_records()):
+        if record["issue"] != number or record["run_started_at"] != run.started_at:
+            continue
+        if (at := _at(record["at"])) is None:
+            continue
+        if record["kind"] == "ci-failure":
+            found.append((at, index, "failed"))
+        elif record["kind"] == "ci-read" and record["data"].get("status") in READS:
+            found.append((at, index, READS[record["data"]["status"]]))
+    return max(found, key=lambda item: item[:2])[2] if found else None
 
 
 def ci_state(store: StateStore, number: int) -> str:
-    """running, failed, passed, stopped or none, for the issue's newest run.
+    """The CI line for the issue's newest run, from recorded facts only.
 
-    Only recorded facts of this run count: its live step, its outcome, its CI failure
-    records and its journaled CI segments. finish_run keeps the last phase, and a resumed
-    run can reach a merge or conflict step without CI, so a step name is never a CI result.
+    A live run in its CI step: running. Otherwise the run's newest recorded CI read decides
+    (a pending read means CI is still running while the run lives, and no result once it ended).
+    Without a record: a live run has not started CI; a finished run, whatever step it stopped in,
+    recorded no CI result. finish_run keeps the last step, so no step ever stands for a result.
     """
     run = latest_run(store, number)
-    started = _at(run.started_at) if run is not None else None
-    if run is None or started is None:
+    if run is None:
         return "none"
     live = run.status == "running"
     if live and run.phase == "ci":
         return "running"
+    recorded = recorded_ci(store, number, run)
+    if recorded == "pending" and live:
+        return "running"
+    if recorded not in {None, "pending"}:
+        return recorded
     if run.outcome == "ci-failed":
-        return "failed"
-    if run.outcome == "merge-queued":
-        return "passed"  # The merge owner admits a run only after its CI passed.
-    failures = [at for record in store.flow_records()
-                if record["kind"] == "ci-failure" and record["issue"] == number
-                and record["run_started_at"] == run.started_at and (at := _at(record["at"])) is not None]
-    passes = _ci_passes(store, number, started)
-    if passes and (not failures or max(passes) > max(failures)):
-        return "passed"  # A later CI attempt of this run passed after an earlier failure.
-    if failures:
-        return "failed"
-    if not live and run.phase == "ci":
-        return "stopped"  # The run ended (timeout, stop, crash) before CI gave a result.
-    return "none"
+        return "failed"  # the runner's own terminal fact: CI failed after every attempt
+    return "none" if live else "unrecorded"
 
 
 def _title(store: StateStore, number: int) -> str:
@@ -132,18 +123,40 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     from foragent.watch_sections import lane_bubble
 
     language = config.language
-    found = lane_bubble.explain(("acorn", number), snapshot, config, repo_root,
-                                now=now, width=width, state=None)
-    if found is None:
-        run = latest_run(store, number)
-        found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
-        if run is not None:
-            state = run.phase if run.status == "running" and run.phase else (run.outcome or run.status)
-            found.append([(text("issue_view_state", language, state=state), "")])
+    run = latest_run(store, number)
+    if run is not None and run.status != "running":
+        # A finished run: what it ended with, never what its last step was doing.
+        found = _ended(store, config, number, run)
+    else:
+        found = lane_bubble.explain(("acorn", number), snapshot, config, repo_root,
+                                    now=now, width=width, state=None)
+        if found is None:
+            found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
+            if run is not None and run.phase:
+                found.append([(text("issue_view_state", language, state=run.phase), "")])
     review = last_review(store, number)
     found.append([(text("issue_view_review", language, verdict=review[0], round=review[1]) if review
                    else text("issue_view_review_none", language), "")])
     found.append([(text(f"issue_view_ci_{ci_state(store, number)}", language), "")])
+    return found
+
+
+def _ended(store: StateStore, config: Config, number: int, run) -> list[Line]:
+    """Title, lane, the recorded outcome and its recorded detail, for a finished run."""
+    from foragent import watch
+    from foragent.i18n import MESSAGES
+    from foragent.labels import lane_display
+
+    language = config.language
+    key = f"issue_view_outcome_{run.outcome}"
+    word = text(key, language) if key in MESSAGES.get(language, MESSAGES["en"]) else (run.outcome or run.status)
+    found = [[(watch._clean(f"#{number} {_title(store, number)}".rstrip()), "bold")]]
+    if run.lane:
+        found.append([(text("issue_view_lane", language, lane=lane_display(config, run.lane, language)), "")])
+    found.append([(text("issue_view_ended", language, outcome=word), "")])
+    detail = " ".join(run.detail.split())
+    if detail and detail != f"Run finished with outcome {run.outcome}.":  # finish_run's default repeats the outcome
+        found.append([(watch._clean(detail), "")])
     return found
 
 

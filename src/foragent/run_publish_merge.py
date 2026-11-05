@@ -94,7 +94,7 @@ def _final_merge_inputs(
         run_publish.flag(ctx, n, run_publish.Reason.RISK_HIGH, "PR base changed after verification; retry implementation.", link)
         return "base-changed"
 
-    status = run_publish._ci_status(ctx, pr, git.root, ready_at)
+    status = run_publish._ci_status(ctx, pr, git.root, ready_at, n=n)
     issue = ctx.tracker.get_issue(n)
     if getattr(ctx.config, "merge_owner", False) and issue.state == "closed":
         return run_publish._MergeInputs(stop=lambda: "issue-closed")

@@ -21,6 +21,7 @@ def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
     if not getattr(logs, "not_started", False):
         return
+    run_publish._record_read(n, ctx, pr, "not-started")
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
     run_publish._append(ctx.store.log_path(n), f"CI did not start:\n{logs}")
     run_publish.flag(ctx, n, run_publish.Reason.CI_NOT_STARTED,
@@ -36,6 +37,19 @@ def _record_failure(n: int, ctx: RunContext, pr: int, head: str) -> None:
     try:
         run = ctx.store.get_run(n)
         ctx.store.record_flow("ci-failure", issue=n, run_started_at=run.started_at, pr=pr, head=head)
+    except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
+        return
+
+
+def _record_read(n: int, ctx: RunContext, pr: int, status: str) -> None:
+    """Keep one CI read of this run as a local ``ci-read`` fact: pass, fail, none, pending or not-started.
+
+    Every read the run acts on is kept (the CI wait and the final merge inputs both read through
+    ``_ci_status``), so a view takes the run's newest CI result from these facts and ``ci-failure``,
+    never from the step the run stopped in. Recording never changes the run."""
+    try:
+        run = ctx.store.get_run(n)
+        ctx.store.record_flow("ci-read", issue=n, run_started_at=run.started_at, pr=pr, status=status)
     except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
         return
 
@@ -61,12 +75,15 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     raise failure
 
 
-def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
+def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float, *, n: int | None = None) -> str:
+    """The PR's CI status as the run acts on it; with the issue ``n`` the read is also kept as a fact."""
     status = ctx.tracker.pr_checks(pr)
     has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
                         for path in (worktree / ".github/workflows").glob(pattern))
     if status == "none" and has_workflows and ctx.now().timestamp() - ready_at < 180:
-        return "pending"
+        status = "pending"
+    if n is not None:
+        run_publish._record_read(n, ctx, pr, status)
     return status
 
 
@@ -107,7 +124,7 @@ def _wait_for_ci(
         if runner._remaining(n, ctx) <= 0:
             return run_publish._timeout(n, ctx)
         if status is None:
-            status = run_publish._ci_status(ctx, pr, git.root, ready_at)
+            status = run_publish._ci_status(ctx, pr, git.root, ready_at, n=n)
         started_reader = getattr(ctx.tracker, "pr_checks_started", None)
         wait.queue_aware = callable(started_reader)
         if wait.queue_aware:
@@ -128,6 +145,7 @@ def _wait_for_ci(
             if comparison_mode:
                 evidence = ctx.tracker.pr_failed_logs(pr)
                 if getattr(evidence, "not_started", False):
+                    run_publish._record_read(n, ctx, pr, "not-started")
                     wait.infrastructure = str(evidence)
                     return None
             failed()
