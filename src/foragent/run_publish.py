@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 # name above through this module at call time, so tests that patch
 # foragent.run_publish.<name> still reach the code that uses it.
 from foragent.run_publish_ci import (  # noqa: E402
-    _CIWait, _ci_failure, _ci_status, _hold_changed_head, _hold_if_not_started, _record_failure, _wait_for_ci,
+    _CIWait, _ci_failure, _ci_status, _hold_changed_head, _head_after_push, _hold_if_not_started, _record_failure, _wait_for_ci,
 )
 from foragent.run_publish_merge import (  # noqa: E402
     _MergeInputs, _batch_pr, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,

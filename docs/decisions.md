@@ -943,7 +943,7 @@ an idle factory may then pull waiting work from other people. They are not v1.
 - 결정: PASS 뒤 head가 바뀌어 다시 리뷰할 때는 현재 main과의 merge-base diff를 기준으로 이 PR이 바꾼 코드만 입력으로 준다. main을 합치기만 해서 들어온 코드는 그 이슈에서 이미 리뷰했으므로 이번 리뷰 입력에서 뺀다. 충돌을 해결하며 바꾼 줄과 이 PR의 새 커밋은 리뷰한다. 같은 본문의 PASS, 본문 수정 시 전체 리뷰, 표시된 위험 예외의 전체 범위, review_pass_scope 설정은 그대로 둔다. 조합이 깨지는지는 CI가 확인하며 CI 규칙은 바꾸지 않는다.
 - 대체하는 규칙: #1599의 "including code integrated from main". [이전 주문](specs/2026-11-02-review-pass-scope.md)의 main 유입 포함 규칙만 이 결정으로 대체한다. 나머지 동작은 유지한다.
 
-## 2026-11-02 리뷰 FAIL은 근거가 있을 때만 막는다 (#1651)
+### D126. 리뷰 FAIL은 근거가 있을 때만 막는다 (2026-11-02, Jin)
 
 - 결정: Anthropic code-review 플러그인 절차(Apache 2.0)를 거의 그대로 들인다. 모든 라운드의 FAIL 지적마다 새 채점 세션 하나가 0–100 점수와 근거(Goal·Out of scope 인용 줄, 잠긴 인수 시험, 실제로 깨지는 입력)를 낸다. 근거가 있고 80점 이상이면 막고, 근거 있는 치명 경로는 경로가 있으면 점수와 상관없이 막는다. 나머지는 점수와 함께 NOTE로 남긴다. Goal이 정하지 않은 점은 재작업이 아니라 spec-question으로 기획에 묻는다. 패널은 지금처럼 위험 메모가 있는 첫 라운드에서만 돌고 기본 관점은 플러그인 다섯 개와 fatal-path다. `review_scoring: false`로 끈다.
 - 근거: 2026-11-02 최근 FAIL 30건 중 실제 결함 11건, 취향·Goal 밖 요구 9건, Goal·잠긴 시험 결함 9건; 22건이 2라운드 이후.
@@ -1024,3 +1024,8 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D124. 넣기 전 검사는 CI가 그 커밋에서 통과시킨 시험만 건너뛴다 (2026-11-05, Jin)
 - 결정: 건너뛰는 조건은 하나다. 그 커밋을 그대로 시험한 CI의 통과 목록에 이름이 있다. 목록에 없거나, 못 받거나, 커밋이 다르면 돌린다. 명령을 읽고 어떤 시험이 고를지 추측하지 않는다. 잠긴 시험과 이 기계 전용 시험은 늘 돌린다.
+
+### D125. 이 저장소의 merge owner를 켠다 (2026-11-04, Jin)
+
+- 결정: PM이 이 저장소의 `.foragent.yml`에서 `merge_owner: true`를 켜고 결과를 측정해요. 구현 작업자는 검증한 PR을 넘기고, 별도 merge owner가 최신 기준선 반영과 마지막 확인, 병합을 맡아요.
+- 근거: #1797이 기본값이 꺼진 merge owner를 넣었고, #1502의 전환·측정에 따라 2026-11-04에 이 저장소에서 켰어요. 설정의 날짜와 근거 이슈를 기록해 두고, 측정 결과는 실제 기록으로 확인해요.
