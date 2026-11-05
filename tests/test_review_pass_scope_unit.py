@@ -203,9 +203,9 @@ def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path
 def test_later_fail_on_the_same_body_leaves_the_boundary(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
     head = case.tracker.pr_head_sha(2)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         later = capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
         assert head in later[0] and LIMITED in later[0]
 
 
@@ -280,9 +280,9 @@ def _at_head(case, tmp_path):
 
 def test_scoped_note_reaches_the_issue_once(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING + "\nNOTE: " + OLD_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
     comments = [c.body for c in case.tracker.list_comments(1) if c.body.startswith("Review notes")]
     assert len(comments) == 1 and "NOTE: " + OLD_FINDING in comments[0]
 
