@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,68 @@ def test_a_scorer_edit_is_undone_before_publication(git_history, tmp_path, monke
     names = published_names(case)
     assert "scorer-extra.txt" not in names and INVENTED not in names
     assert "Scorer changed repository state" in records(case)
+
+
+@pytest.mark.parametrize("exists,wrong,ordinary,irreversible,expected", [
+    (True, True, True, False, "blocks"),
+    (True, True, False, False, "note"),
+    (True, False, True, False, "note"),
+    (True, False, False, False, "note"),
+    (True, True, True, True, "blocks"),
+    (True, True, False, True, "blocks"),
+    (True, False, True, True, "blocks"),
+    (True, False, False, True, "blocks"),
+    (False, True, True, True, "note"),
+    (False, True, True, False, "note"),
+])
+@pytest.mark.parametrize("critical", [False, True])
+def test_consequence_facts_decide_blocking(exists, wrong, ordinary, irreversible, expected, critical):
+    from foragent.review_scoring import outcome
+
+    reply = {**UNGROUNDED, "exists": exists, "wrong_result": wrong, "ordinary_input": ordinary,
+             "irreversible": irreversible, "critical_path": critical}
+    assert outcome(reply, ["breaking_input"]) == expected
+    assert outcome(reply, []) == "note"
+
+
+@pytest.mark.parametrize("field", ["wrong_result", "ordinary_input", "irreversible", "finding_class"])
+@pytest.mark.parametrize("value", [None, 0, "false", []])
+def test_invalid_consequence_facts_never_authorize_a_pass(field, value):
+    from foragent.review_scoring import parse_reply
+
+    # A string is valid only for the class name; remove it to exercise a missing field instead.
+    reply = {**UNGROUNDED, field: value}
+    if field == "finding_class" and value == "false":
+        reply.pop(field)
+    assert parse_reply(json.dumps(reply)) is None
+
+
+def test_repeated_classes_count_distinct_failed_rounds_in_the_approved_scope(tmp_path):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from foragent import orch_events, review_scoring
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    store.save_approval(1, body="scope", body_sha="current", acceptance_blobs={},
+                        approved_by="human", approved_at=datetime.now(UTC).isoformat())
+    ctx = SimpleNamespace(store=store)
+
+    def record(issue, number, classes, verdict="FAIL", body="current"):
+        orch_events.append_event(store, datetime.now(UTC), issue, "review", verdict,
+                                 round=number, verdict=verdict, finding_classes=classes, body_sha=body)
+
+    record(2, 1, ["A"])
+    record(1, 1, ["A"], body="old")
+    record(1, 2, ["A", "A"])
+    record(1, 2, ["A"])
+    record(1, 3, ["B"])
+    assert review_scoring.repeated_classes(1, ctx) == []
+    record(1, 4, ["A"])
+    assert review_scoring.repeated_classes(1, ctx) == ["A"]
+    record(1, 5, [], verdict="PASS")
+    record(1, 6, ["A"])
+    assert review_scoring.repeated_classes(1, ctx) == []
 
 
 def test_a_locked_test_the_scorer_wrote_is_not_a_ground(git_history, tmp_path, monkeypatch):
