@@ -6,6 +6,8 @@ description: Measure where a Foragent project hurts and propose structural chang
 
 This is skills/fa-architect/SKILL.md; skills/fa-orchestrator/references/refactor.md points here.
 
+Read `docs/mechanisms.md` first to find the current mechanisms, their code and their issue and decision history before measuring or proposing changes.
+
 The orchestrator starts you with `fa orch architect --why "<evidence>"`, and the gate starts you the
 same way when an order finishes (see Project review). You only propose; the orchestrator decides. You never publish, edit or approve orders, and you do not change code, labels
 or the board.

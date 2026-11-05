@@ -17,6 +17,24 @@ def _hold_changed_head(n: int, ctx: RunContext, link: str) -> str:
     return "held"
 
 
+def _head_after_push(ctx: RunContext, pr: int, head: str, replaced: str | None) -> bool:
+    """Wait only for the exact head replaced by our successful leased push."""
+    delays = iter((2, 4, 8, 16, 30))
+    while True:
+        reads = getattr(ctx, "reads", None)
+        if reads is not None:
+            reads.clear()  # Both the owner snapshot and its underlying gh GET cache.
+        actual = ctx.tracker.pr_head_sha(pr)
+        if actual == head:
+            return True
+        if not replaced or actual != replaced:
+            return False
+        delay = next(delays, None)
+        if delay is None:
+            return False
+        ctx.sleep(delay)
+
+
 def _hold_if_not_started(n: int, ctx: RunContext, pr: int, logs: str) -> None:
     """Jobs that never ran are infrastructure: hold with the evidence, keep the PR open."""
     if not getattr(logs, "not_started", False):
