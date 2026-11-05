@@ -297,9 +297,10 @@ def init_repo(
             raise GitError(setup.repository_fix(key, exc, preflight_language)) from exc
     run = gh_run or _run_gh
     facts = setup.collect(lambda: run(["auth", "status"], input=None), installed=tools, language=preflight_language)
-    fixes = [item["fix"] for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
+    failed = [item for item in setup.checklist(facts, root=root, git=git) if not item["ok"]]
+    fixes = [item["fix"] for item in failed if not item.get("advice", False)]
     if fixes:
-        message = text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {fix}" for fix in fixes))
+        message = text("init_setup_fixes", preflight_language, fixes="\n".join(f"  {item['fix']}" for item in failed))
         if not facts.logged_in:
             key = "init_gh_logged_out" if facts.installed["gh"] else "init_gh_missing"
             message = text(key, preflight_language, error=facts.auth_error) + "\n" + message
@@ -311,7 +312,7 @@ def init_repo(
     added = {}
     updated_config = None
     role_source = None
-    notes: list[str] = []
+    notes: list[str] = [item["fix"] for item in failed if item.get("advice", False)]
     if config_path.exists():
         config = load_config(root)
         base_branch = config.base_branch
