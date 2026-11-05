@@ -111,3 +111,4 @@ writes this file.
 - Post-PASS FAILs after a conflict: test the exempt match with `risks.matching` directly (#1514, r741). [detail](lessons_detail.md)
 - Slow test file: measure inside it (--durations setup vs call, profile) before any split; r743 split idea missed shared queue setup (~2,200 git calls/test). [detail](lessons_detail.md)
 - A 'role ran a person command' incident may be shell command substitution: backticks inside --text "..." ran fa stop x3 (11-05, r768). Scan tool_use commands in logs/<role>-*.log first.
+- 'Fix merged but it did not fire': a run keeps the tool version it started with (`tool-versions/<ts>-<sha>`) until it ends, often 5 h. Compare the run's started_at with the first install dir whose files contain the fix (grep), not with the merge time; #2078 started 3 min before the #2035 merge and 43 min before its install (r772).
