@@ -30,7 +30,7 @@ def _fail_ci(store):
 
 def _result(store, result, number=7):
     store.clock[0] += timedelta(minutes=1)
-    store.record_ci_result(number, result)
+    store.record_ci_result(number, store.get_run(number).started_at, result)
 
 
 def _ticks(store, count):
@@ -158,13 +158,30 @@ def test_only_the_live_run_writes_its_result(tmp_path):
     _step(store, "ci")
     _result(store, "passed")
     store.clock[0] += timedelta(minutes=1)
-    store.finish_run(7, "merge-queued")
+    finished = store.finish_run(7, "merge-queued")
     record = (store.root / "runs" / "7.json").read_bytes()
-    store.record_ci_result(7, "failed")  # e.g. a later merge-owner read: not this run's writer
+    store.record_ci_result(7, finished.started_at, "failed")  # a later read: not this run's writer
     assert (store.root / "runs" / "7.json").read_bytes() == record, "a finished record is never rewritten"
     assert watch_issue.ci_state(store, 7) == "passed"
     with pytest.raises(ValueError):
-        store.record_ci_result(7, "running")
+        store.record_ci_result(7, finished.started_at, "running")
+
+
+def test_an_older_execution_never_writes_into_a_newer_live_run(tmp_path):
+    """Review 7: a merge-owner read of an old admission while a direct rerun is live."""
+    store = _store(tmp_path)
+    old = store.get_run(7).started_at
+    store.clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "merge-queued")
+    store.clock[0] += timedelta(minutes=1)
+    store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "wt")
+    record = (store.root / "runs" / "7.json").read_bytes()
+    store.record_ci_result(7, old, "passed")
+    assert (store.root / "runs" / "7.json").read_bytes() == record
+    _step(store, "implementing")
+    store.clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "crashed")
+    assert watch_issue.ci_state(store, 7) == "unrecorded"
 
 
 def test_ci_lines_state_a_result_and_never_what_the_lane_is_doing():

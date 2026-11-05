@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from foragent import board, cuts, irreversible_paths, review_perspectives, risks
 from foragent import run_merge_turn as merge_turn
 from foragent.actions import FlagContext, flag, invalidate_approval
-from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled, require_comparison
+from foragent.ci_mode import ComparisonEvidence, commit_exclusions, enabled
 from foragent.git import GitError, GitRepo, PublicationError
 from foragent.i18n import text
 from foragent.issue import ParsedIssue, body_hash
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # foragent.run_publish.<name> still reach the code that uses it.
 from foragent.run_publish_ci import (  # noqa: E402
     _CIWait, _ci_failure, _ci_status, _hold_changed_head, _head_after_push, _hold_if_not_started,
-    _record_failure, _record_result, _wait_for_ci,
+    _failing_execution, _record_failure, _record_result, _wait_for_ci, require_comparison,
 )
 from foragent.run_publish_merge import (  # noqa: E402
     _MergeInputs, _batch_pr, _check_publication, _final_merge_inputs, _merge_lock, _policy_allows, retitle_for_merge,

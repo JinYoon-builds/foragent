@@ -220,17 +220,18 @@ class RunRecordsMixin:
             value["merged_at"] = merged_at.astimezone(_state.UTC).isoformat()
             self._write_json(path, value)
 
-    def record_ci_result(self, number: int, result: str) -> None:
-        """Save the CI result this live run concluded (``CI_RESULTS``) beside the record's fields.
+    def record_ci_result(self, number: int, started_at: str, result: str) -> None:
+        """Save the CI result execution (number, started_at) concluded (``CI_RESULTS``) beside its fields.
 
-        The run is the only writer: a finished record is left as it is. The key travels with the
-        record into history (finish_run writes it back) and ``ci_result`` reads it as is."""
+        That execution is the only writer: nothing is written unless it is the live record, so a
+        finished record, or a newer execution of the same issue, is left as it is. The key travels
+        with the record into history (finish_run writes it back) and ``ci_result`` reads it as is."""
         if result not in CI_RESULTS:
             raise ValueError(f"unknown CI result {result!r}")
         with self._state_lock():
             path = self.root / "runs" / f"{number}.json"
             value = _state.json.loads(path.read_text(encoding="utf-8"))
-            if value.get("status") != "running":
+            if value.get("status") != "running" or value.get("started_at") != started_at:
                 return
             value["ci_result"] = result
             self._write_json(path, value)

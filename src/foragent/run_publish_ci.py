@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,25 +56,77 @@ def _record_failure(n: int, ctx: RunContext, pr: int, head: str) -> None:
     not-started hold (infrastructure, not code) and before its own retry or block decision."""
     run_publish._record_result(n, ctx, "failed")
     try:
-        run = ctx.store.get_run(n)
-        ctx.store.record_flow("ci-failure", issue=n, run_started_at=run.started_at, pr=pr, head=head)
+        started = run_publish._failing_execution(n, ctx)
+        ctx.store.record_flow("ci-failure", issue=n, run_started_at=started, pr=pr, head=head)
     except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
         return
+
+
+def _failing_execution(n: int, ctx: RunContext) -> str | None:
+    """The execution a CI failure belongs to, from a record, never from whichever run is live now.
+
+    Inside the run's own CI wait it is that run. Outside it, only the merge owner meets a CI
+    failure, and it works on the issue's admitted execution (its own admission record). A newer
+    direct rerun is neither, so it is never credited with the owner's failure. Unknown: None."""
+    identity = _WAITING_RUN.get()
+    if identity is not None and identity[0] == n:
+        return identity[1]
+    from foragent import merge_owner
+
+    admitted = {started for issue, started in merge_owner.admissions(ctx.store) if issue == n}
+    return admitted.pop() if len(admitted) == 1 else None
+
+
+# The run whose own CI wait is executing, as (issue, started_at): the only writer of its CI result.
+_WAITING_RUN: ContextVar[tuple[int, str] | None] = ContextVar("waiting_run", default=None)
+
+
+@contextmanager
+def _run_ci_wait(n: int, ctx: RunContext):
+    """Mark the code that is the run's own CI wait, so what it concludes is that run's CI result.
+
+    Taken once at entry from the run's live record: only the run's own flows enter here (the CI
+    wait and the comparison right after it). The merge owner's reads, holds and comparisons never
+    enter, so they never write a run's result, whichever run is live at that moment."""
+    try:
+        run = ctx.store.get_run(n)
+        identity = (n, run.started_at) if run is not None and run.status == "running" else None
+    except Exception:  # noqa: BLE001 - without an identity nothing is recorded; the wait itself goes on.
+        identity = None
+    token = _WAITING_RUN.set(identity)
+    try:
+        yield
+    finally:
+        _WAITING_RUN.reset(token)
 
 
 def _record_result(n: int, ctx: RunContext, result: str) -> None:
-    """Save what this run's CI concluded as the run's own ``ci_result`` fact (state_runs.CI_RESULTS).
+    """Save what this run's CI wait concluded as the run's own ``ci_result`` (state_runs.CI_RESULTS).
 
-    Called where a CI conclusion is reached: the CI wait (pass, no checks, timeout, jobs that never
-    started), every code-failure exit (``_record_failure``) and the final merge read. The latest
-    conclusion of the run stands; recording never changes the run."""
+    Only inside the run's own CI wait (``_run_ci_wait``) and only into that execution's record:
+    pass, no checks, timeout, jobs that never started, or a code failure (``_record_failure``).
+    The latest conclusion of the run's waits stands; recording never changes the run."""
+    identity = _WAITING_RUN.get()
+    if identity is None or identity[0] != n:
+        return
     try:
-        ctx.store.record_ci_result(n, result)
+        ctx.store.record_ci_result(n, identity[1], result)
     except Exception:  # noqa: BLE001 - a missing fact is unknown later, never a different outcome now.
         return
 
 
-# The run's CI result for each status the run acts on; a pending status concludes nothing.
+def require_comparison(attempt, *args, **kwargs):
+    """The run's comparison-mode check after its CI wait: part of that wait, so a regression it
+    finds is the run's CI result. The merge owner calls ``ci_mode.require_comparison`` directly."""
+    from foragent import ci_mode
+
+    n, ctx = getattr(attempt, "n", None), getattr(attempt, "ctx", None)
+    if not isinstance(n, int) or ctx is None:
+        return ci_mode.require_comparison(attempt, *args, **kwargs)
+    with _run_ci_wait(n, ctx):
+        return ci_mode.require_comparison(attempt, *args, **kwargs)
+
+
 STATUS_RESULTS = {"pass": "passed", "none": "no_checks", "fail": "failed"}
 
 
@@ -97,15 +151,12 @@ def _ci_failure(n: int, ctx: RunContext, pr: int, head: str, target_branch: str)
     raise failure
 
 
-def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float, *, n: int | None = None) -> str:
-    """The PR's CI status as the run acts on it; with the issue ``n`` a concluded status is the run's CI result."""
+def _ci_status(ctx: RunContext, pr: int, worktree: Path, ready_at: float) -> str:
     status = ctx.tracker.pr_checks(pr)
     has_workflows = any(path.is_file() for pattern in ("*.yml", "*.yaml")
                         for path in (worktree / ".github/workflows").glob(pattern))
     if status == "none" and has_workflows and ctx.now().timestamp() - ready_at < 180:
-        status = "pending"
-    if n is not None and status in STATUS_RESULTS:
-        run_publish._record_result(n, ctx, STATUS_RESULTS[status])
+        return "pending"
     return status
 
 
@@ -137,7 +188,14 @@ def _wait_for_ci(
     """Consume even a status observed under the lock, but only wait unlocked.
 
     ``conflicting()`` answering True before a wait raises ConflictingPR: GitHub
-    starts no CI for a head that conflicts with its base."""
+    starts no CI for a head that conflicts with its base. It is the run's own CI wait, so what it
+    concludes (and what its ``failed`` callback concludes) is recorded as the run's CI result."""
+    with _run_ci_wait(n, ctx):
+        return _wait(n, ctx, git, pr, head, ready_at, wait, failed, status,
+                     comparison_mode=comparison_mode, conflicting=conflicting)
+
+
+def _wait(n, ctx, git, pr, head, ready_at, wait, failed, status, *, comparison_mode, conflicting):
     from foragent import runner
 
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
@@ -147,7 +205,7 @@ def _wait_for_ci(
             run_publish._record_result(n, ctx, "timed_out")
             return run_publish._timeout(n, ctx)
         if status is None:
-            status = run_publish._ci_status(ctx, pr, git.root, ready_at, n=n)
+            status = run_publish._ci_status(ctx, pr, git.root, ready_at)
         started_reader = getattr(ctx.tracker, "pr_checks_started", None)
         wait.queue_aware = callable(started_reader)
         if wait.queue_aware:
@@ -163,8 +221,12 @@ def _wait_for_ci(
         if ctx.tracker.pr_head_sha(pr) != head:
             return run_publish._hold_changed_head(n, ctx, link)
         if status in {"pass", "none"}:
+            run_publish._record_result(n, ctx, STATUS_RESULTS[status])
             return None
         if status == "fail":
+            # GitHub's failing checks are the result read; recorded before any log read can be cut
+            # short (a rate limit). Jobs that never started replace it below or in _ci_failure.
+            run_publish._record_result(n, ctx, "failed")
             if comparison_mode:
                 evidence = ctx.tracker.pr_failed_logs(pr)
                 if getattr(evidence, "not_started", False):
@@ -175,13 +237,14 @@ def _wait_for_ci(
         remaining = wait.deadline - ctx.now().timestamp()
         if remaining <= 0 or wait.polls >= 40:
             if comparison_mode and ctx.config.checks_fallback == "local":
+                run_publish._record_result(n, ctx, "timed_out")
                 wait.infrastructure = "CI did not finish before the poll deadline."
                 return None
             detail = ("CI never left the queue before the 3-hour ceiling."
                       if wait.queue_aware and wait.running_since is None
                       else "CI ran past the wait limit.")
+            run_publish._record_result(n, ctx, "timed_out")  # before flag(), which can be rate limited
             run_publish.flag(ctx, n, run_publish.Reason.TIMEOUT, "CI did not finish", f"{detail}\n\n{link}")
-            run_publish._record_result(n, ctx, "timed_out")
             return "timeout"
         if conflicting is not None and conflicting():
             from foragent.ci_mode import ConflictingPR
