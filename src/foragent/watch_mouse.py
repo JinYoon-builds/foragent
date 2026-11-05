@@ -95,6 +95,7 @@ def handle_mouse(
         _select(state, target)
         return
     state.pop("explanation_target", None)  # Any other click clears the selection, then acts.
+    state.pop("explanation_detail", None)
     if target == ("settings", None):
         # The header's text button opens the same window as the s key.
         if state.get("issue") is None:
@@ -114,6 +115,7 @@ EXPLAINED = frozenset({"acorn", "role", "squirrel"})
 
 def _select(state: dict[str, Any], target: tuple[str, Any]) -> None:
     """Select ``target``; the selected one again clears the selection."""
+    state.pop("explanation_detail", None)
     if state.pop("explanation_target", None) != target:
         state["explanation_target"] = target
 
@@ -149,6 +151,7 @@ def handle_key(key: str, store: StateStore | None, config: Config, *, state: dic
         return False
     if key in ("esc", "x") and state.get("explanation_target") is not None:
         del state["explanation_target"]
+        state.pop("explanation_detail", None)
     elif key in ("esc", "x"):
         if legacy_box_open:
             state["issue"] = None

@@ -97,19 +97,17 @@ def test_selecting_an_authored_wait_shows_its_canonical_context_not_a_guessed_tu
     top = next(i for i, line in enumerate(lines) if line.startswith('+'))
     body = '\n'.join(lines[top:top + 8])
     for label, value in zip(labels, ('Locale  choice pending', 'Record locale', 'planner')):
-        assert block.count(f'{label} {value}') == 1, block
-        if state in {'facts-only', 'queued'}:
-            assert body.count(f'{label} {value}') == 1, body
+        assert f'{label} {value}' not in block, block
+        assert body.count(f'{label} {value}') == 1, body
     primary = {
-        'working': ('working', '일하고 있어요'),
+        'working': ('measuring the baseline', '기준 재는 중'),
         'blocked': ('handled by the orchestrator', '오케스트레이터가 보는 중'),
         'waiting-human': ('I will ask you in the planning session.', '기획 세션에서 물어볼게요.'),
         'parked': ('Parked in lane work.', 'work 레인에서 보류 중이에요.'),
     }
     if state in primary:
         assert primary[state][language == 'ko'] in body, body
-    if state == 'blocked':
-        assert ('순서를 기다려요' if language == 'ko' else 'waiting its turn') in block, block
+    assert '순서를 기다려요' not in block and 'waiting its turn' not in block
     for value in ('waiting its turn', 'Waiting its turn', '순서를 기다려요'):
         assert value not in body
         if state != 'blocked':
@@ -118,12 +116,12 @@ def test_selecting_an_authored_wait_shows_its_canonical_context_not_a_guessed_tu
 
 @pytest.mark.parametrize('language', ['en', 'ko'])
 @pytest.mark.parametrize('phase,english,korean', [
-    ('implementing', 'writing code', '코드를 쓰고 있어요'),
-    ('baseline', 'checking that the acceptance tests fail now', '완료 테스트가 지금 실패하는지 확인하고 있어요'),
-    ('checking', 'running related tests on this computer', '내 컴퓨터에서 관련 테스트를 돌리고 있어요'),
-    ('reviewing', 'another AI is reviewing', '다른 AI가 리뷰하고 있어요'),
-    ('ci', 'running CI on GitHub', 'GitHub에서 CI를 돌리고 있어요'),
-    ('merging', 'merging into main', 'main에 머지하고 있어요'),
+    ('implementing', 'writing code', '코드 쓰는 중'),
+    ('baseline', 'measuring the baseline', '기준 재는 중'),
+    ('checking', 'goal tests', '목표 시험 중'),
+    ('reviewing', 'in review', '리뷰 받는 중'),
+    ('ci', 'full tests', '전체 시험 중'),
+    ('merging', 'testing merged', '합쳐서 시험 중'),
     ('overlap-wait', 'waiting for shared files', '공유 파일 기다려요'),
     ('test-slot-wait', 'waiting for a test slot', '시험 자리 기다리는 중'),
     ('baseline-wait', 'waiting for the baseline', '기준선 기다려요'),
@@ -149,18 +147,16 @@ def test_authored_context_keeps_the_recorded_phase_time_and_warning(
     body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
         snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', 2)}))
     expected = ['#2 Choice', 'work 레인' if language == 'ko' else 'lane work',
-                korean if language == 'ko' else english,
-                '이 단계를 12분째 하고 있어요.' if language == 'ko' else '12m in this step',
-                '? 15분째 조용해요' if language == 'ko' else '? quiet for 15 min']
+                korean if language == 'ko' else english, 'Locale pending', 'Record locale', 'planner']
     positions = [body.index(value) for value in expected]
     assert positions == sorted(positions), body
     block = '\n'.join(''.join(value for value, _ in line) for line in lane_blocks.render(
         snapshot, config, tmp_path, width=120, now=NOW))
     for value in ('Locale pending', 'Record locale', 'planner'):
-        assert block.count(value) == 1, block
+        assert value not in block, block
     if phase.endswith('-wait'):
         assert ('순서를 기다려요 | 자리가 다 찼어요' if language == 'ko'
-                else 'waiting its turn | slots full') in block, block
+                else 'waiting its turn | slots full') not in block, block
 
 
 @pytest.mark.parametrize('language', ['en', 'ko'])
@@ -189,7 +185,7 @@ def test_authored_context_keeps_question_and_park_priority_over_an_active_wait(
     assert 'test slot' not in body and '시험 자리' not in body
     block = '\n'.join(''.join(value for value, _ in line) for line in lane_blocks.render(
         snapshot, config, tmp_path, width=120, now=NOW))
-    assert block.count('Canonical waiting context') == 1, block
+    assert 'Canonical waiting context' not in block
     assert 'waiting its turn' not in block and '순서를 기다려요' not in block
 
 
@@ -276,7 +272,7 @@ def test_unresolved_authored_lane_keeps_the_recorded_acorn_and_its_selection(
     hits = [hit for hit in layout['hits'] if hit[-1] == ('acorn', 2)]
     assert len(hits) == 1, frame
     for value in ('Locale pending', 'Record locale', 'planner'):
-        assert frame.count(value) == 1, frame
+        assert value not in frame, frame
     if source == 'running':
         assert ('레인 1곳에서 이슈 1개를 작업하고 있어요.' if language == 'ko'
                 else 'Working on 1 issue in 1 lane.') in frame, frame
@@ -292,7 +288,7 @@ def test_unresolved_authored_lane_keeps_the_recorded_acorn_and_its_selection(
         'held-blocked': ('handled by the orchestrator', '오케스트레이터가 보는 중'),
         'held-question': ('I will ask you in the planning session.', '기획 세션에서 물어볼게요.'),
         'queued': ('Waiting: Locale pending', '기다리는 이유: Locale pending'),
-    }.get(source, ('writing code', '코드를 쓰고 있어요'))
+    }.get(source, ('writing code', '코드 쓰는 중'))
     assert expected[language == 'ko'] in body, body
     assert snapshot.waiting_facts == before
 
@@ -312,7 +308,7 @@ def test_resolved_authored_lane_still_routes_one_acorn_to_its_recorded_lane(lang
     frame = watch.render_frame(snapshot, config, tmp_path, width=120, now=NOW, layout=layout)
     targets = [hit[-1] for hit in layout['hits'] if hit[-1][0] == 'acorn']
     assert targets.count(('acorn', 2)) == targets.count(('acorn', 7)) == 1, frame
-    assert frame.count('Canonical waiting context') == frame.count('Another recorded wait') == 1, frame
+    assert 'Canonical waiting context' not in frame and 'Another recorded wait' not in frame
     for number, lane in ((2, 'work'), (7, 'rest')):
         body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
             snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', number)}))
@@ -342,7 +338,7 @@ def _worker(phase, state="working"):
 
 
 WAIT_PHASES = frozenset({"overlap-wait", "test-slot-wait", "baseline-wait", "limit-wait", "executor-wait",
-                        "run-slot-wait"})
+                        "run-slot-wait", "merge-owner-wait"})
 
 
 def test_the_source_scan_finds_the_phases_of_each_setter():
@@ -363,16 +359,21 @@ def test_every_phase_the_runner_can_set_has_a_word_on_the_acorn(phase, language)
         "slug": "work", "state": "working", "issue": 7, "phase": phase, "running": [{"number": 7}]})
     word = lane_blocks._word(current[0], language)
     assert word and word.strip(), f"{phase} leaves the acorn with only its number"
-    assert word != watch.text("lane_blocks_word_wait", language), f"{phase} has no word of its own"
+    generic = watch.text("lane_blocks_word_wait", language)
+    if phase in WAIT_PHASES - {"merge-owner-wait"}:
+        # D112: a waiting acorn only says it waits; the reason is in its bubble.
+        assert word == generic, f"{phase} must show only the wait word"
+    else:
+        assert word != generic, f"{phase} has no word of its own"
     assert f"#7 {word}" in "".join(value for value, _ in lane_blocks._acorn(current[0], language, 0, True))
 
 
 @pytest.mark.parametrize("language, phase, word", [
-    ("en", "overlap-wait", "wait: shared files"), ("ko", "overlap-wait", "대기: 공유 파일"),
-    ("en", "test-slot-wait", "wait: test slot"), ("ko", "test-slot-wait", "대기: 시험 자리"),
-    ("en", "baseline-wait", "wait: baseline"), ("ko", "baseline-wait", "대기: 기준선"),
-    ("en", "limit-wait", "wait: usage limit"), ("ko", "limit-wait", "대기: 사용량 한도"),
-    ("en", "executor-wait", "wait: model retry"), ("ko", "executor-wait", "대기: 모델 재시도"),
+    ("en", "overlap-wait", "wait"), ("ko", "overlap-wait", "대기"),
+    ("en", "test-slot-wait", "wait"), ("ko", "test-slot-wait", "대기"),
+    ("en", "baseline-wait", "wait"), ("ko", "baseline-wait", "대기"),
+    ("en", "limit-wait", "wait"), ("ko", "limit-wait", "대기"),
+    ("en", "executor-wait", "wait"), ("ko", "executor-wait", "대기"),
     ("en", None, "prep"), ("ko", None, "준비"),
 ])
 def test_a_worker_says_what_it_waits_for_or_that_it_is_preparing(language, phase, word):
@@ -399,3 +400,47 @@ def test_a_wait_phase_explains_itself_on_click(phase, language, tmp_path):
                                now=NOW, width=80, state={})
     value = "\n".join("".join(part for part, _ in line) for line in rows)
     assert watch.text(phase, language) in value
+
+
+@pytest.mark.parametrize('language', ['en', 'ko'])
+@pytest.mark.parametrize('worker', ['stalled', 'quiet', 'missing'])
+@pytest.mark.parametrize('phase', ['implementing', 'test-slot-wait'])
+def test_authored_context_never_hides_a_stalled_or_missing_worker_warning(
+    language, worker, phase, tmp_path, monkeypatch,
+):
+    """#2078 review: a recorded wait adds rows to the click bubble; it never drops the step,
+    its time, the worker warning, the orchestrator's block or the run's detail."""
+    from foragent import watch_scene
+
+    work = row()
+    work.update(state='working', phase=phase, running=work['queued'], queued=[])
+    authored = {'text': 'Original wait', 'reason': 'Locale pending',
+                'next_condition': 'Record locale', 'responsible_role': 'planner'}
+    snapshot = _snapshot(work, log_ages={2: 3600} if worker == 'quiet' else {}, waiting_facts={2: {
+        'lane': 'work', 'kind': 'capacity', 'blocker': 'Needs the locale table', 'authored': authored}})
+    snapshot.status['active_runs'] = [{
+        'number': 2, 'lane': 'work', 'phase': phase, 'detail': 'runner said hello',
+        'started_at': (NOW - timedelta(minutes=90)).isoformat(),
+        'phase_started_at': (NOW - timedelta(minutes=25)).isoformat(),
+        'last_activity_at': (NOW - timedelta(minutes=60)).isoformat(),
+        **({'pid': 4242} if worker == 'missing' else {}),
+    }]
+
+    def gone(pid, signal):
+        raise ProcessLookupError(pid)  # No real process is signalled.
+
+    monkeypatch.setattr(watch.os, 'kill', gone)
+    config = Config(language=language, view_glyphs='ascii', lanes={'work': {}})
+    current, _ = watch_scene.lane_items(snapshot, snapshot.status['lanes']['work'])
+    item = next(item for item in current if item['number'] == 2)
+    warning = watch_scene.activity_warning(snapshot, config, snapshot.status['lanes']['work'], item, NOW)
+    assert warning, 'the fixture must produce a worker warning'
+    body = '\n'.join(''.join(value for value, _ in line) for line in lane_bubble.render(
+        snapshot, config, tmp_path, width=120, now=NOW, state={'explanation_target': ('acorn', 2)}))
+    elapsed = '25분' if language == 'ko' else '25m'
+    expected = [elapsed, warning, 'Locale pending', 'Record locale', 'planner',
+                'Needs the locale table', 'runner said hello']
+    assert all(value in body for value in expected), body
+    positions = [body.index(value) for value in expected]
+    assert positions == sorted(positions), body
+    assert body.count(warning) == 1, body

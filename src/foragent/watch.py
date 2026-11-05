@@ -66,8 +66,8 @@ def should_reload(started: str, current: str) -> bool:
 class _Refresh:
     """One snapshot read with the view's current configuration.
 
-    The settings window (#173) saves and reloads the configuration; setting ``config``
-    makes the next refresh read the usage meter (mode, budget) and lanes with it.
+    The settings window saves and reloads the configuration; setting ``config``
+    gives the next snapshot read its current display language.
     """
 
     def __init__(self, read: Callable[[Config], Snapshot], config: Config) -> None:
@@ -87,20 +87,21 @@ def run(
     config: Config, repo_root: Path, *, once: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> None:
+    """Watch the gate's projection. ``status`` and ``tracker`` remain compatibility arguments."""
     if not once and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise ConfigError(text("watch_terminal", config.language))
     argv = sys.argv.copy()
     reload_requested = False
     def read(current: Config) -> Snapshot:
-        # Bound inside the worker that calls it, so root-dependent facts read this checkout.
-        with collection_root(repo_root):
-            return collect(status(), tracker, store, current, now())
+        from foragent import watch_now
+
+        return watch_now.read(store, now(), current.language)
 
     refresh = _Refresh(read, config)
     if once:
         # A single printed frame is the calm finished scene, never fireworks.
         with calm():
-            print(render_frame(refresh(), config, repo_root))
+            print(render_frame(refresh(), config, repo_root, now=now()))
         return
     with exclusive(store) as lock:
         if lock is None:
