@@ -3,6 +3,8 @@ name: fa
 description: The single Foragent entry point. Brief the user on the project, confirm the profile once per session, and route to setup, the inbox or a new order. Use whenever the user types /fa or asks what Foragent is doing.
 ---
 
+Read `docs/mechanisms.md` first for the current mechanisms, their code and the decisions behind them.
+
 People type only `/fa`. The command names `/fa-init`, `/fa-inspect` and `/fa-order` stay,
 but you open them yourself; never ask the user to type them (D59 addendum 2).
 
