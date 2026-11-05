@@ -4,6 +4,8 @@ import json as _json
 
 
 _CONFIRMED_SCORE = _json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                               "wrong_result": True, "ordinary_input": True, "irreversible": False,
+                               "finding_class": "scripted defect",
                                "locked_test": None, "breaking_input": "the input this fixture's reviewer reports",
                                "spec_question": None})
 
