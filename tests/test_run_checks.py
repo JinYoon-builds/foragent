@@ -607,6 +607,7 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
     monkeypatch.setattr(run_checks, "_progress", lambda *args: None)
     monkeypatch.setattr(run_checks, "_test_slot", lambda *args: None)
     monkeypatch.setattr(run_checks, "flag", lambda *args: flags.append(args))
+    monkeypatch.setattr("foragent.run_waits.flag", lambda *args: flags.append(args))
 
     if recovered:
         assert run_checks._check_protected(attempt).exit_code == 0
@@ -616,7 +617,6 @@ def test_protected_timeout_retries_only_with_larger_budget(tmp_path, monkeypatch
         with pytest.raises(ExecutorStopped):
             run_checks._check_protected(attempt)
         assert calls == [1000]
-        assert flags[0][2] == Reason.TIMEOUT
-        assert "elapsed 1007s, allowed 1000s" in flags[0][3]
+        assert flags[0][2] == Reason.TOO_LARGE
         assert store.get_run(1).resume_whole
     assert f"elapsed {calls[0] + 7}s, allowed {calls[0]}s" in attempt.log.read_text()

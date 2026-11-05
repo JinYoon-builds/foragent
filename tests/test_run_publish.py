@@ -528,7 +528,7 @@ def test_staged_runner_files_and_locked_edits_alone_do_not_create_wip(run_case, 
     assert git_command(c.history.origin, "rev-parse", "foragent/issue-1") == c.history.tip
 
 
-@pytest.mark.parametrize("reason", ["spec-question", "timeout", "retries-exceeded"])
+@pytest.mark.parametrize("reason", ["spec-question", "too-large", "retries-exceeded"])
 @pytest.mark.parametrize("pr_timing", ["before-worker", "during-worker"])
 def test_wip_stop_keeps_open_pr_head_unchanged(run_case, monkeypatch, reason, pr_timing):
     c = run_case
@@ -545,7 +545,7 @@ def test_wip_stop_keeps_open_pr_head_unchanged(run_case, monkeypatch, reason, pr
     c.executor.steps = [{"feature.txt": "unfinished"}]
     if reason == "spec-question":
         c.executor.steps[0][".foragent/QUESTION.md"] = "Choose A or B (recommended).\n"
-    c.executor.timed_out = reason == "timeout"
+    c.executor.timed_out = reason == "too-large"
     execute = c.executor.run
 
     def implement(**kwargs):

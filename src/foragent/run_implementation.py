@@ -27,7 +27,7 @@ from foragent.run_parent import parent_context
 from foragent.run_prompts import bug_fix_steps, build_prompt, build_resume_prompt, lane_plan_section
 from foragent.run_review import _read_rebuttals
 from foragent.run_overlap import wait_for_overlap
-from foragent.run_waits import _phase, _timeout
+from foragent.run_waits import _phase, _timeout, record_session
 
 if TYPE_CHECKING:
     from foragent.config import Config
@@ -360,7 +360,9 @@ def _implement(
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
     remaining = runner._remaining(n, ctx)
     if remaining <= 0:
+        # No session starts: the budget went to whatever this run did last, PASS and base following included.
         raise ExecutorStopped(_timeout(n, ctx))
+    record_session(n, ctx)  # A new implementer session spends the budget on its own work (#1514).
     run = ctx.store.get_run(n)
     # Every executor turn writes one new key; a key is never rewritten (#238).
     key, tier = choose_tier(ctx, run, attempt.size)
