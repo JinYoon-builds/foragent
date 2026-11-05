@@ -47,6 +47,7 @@ def test_watch_split_original_names_remain_importable():
 
 
 def test_watch_split_collect_and_render_patches_reach_run_once(tmp_path, monkeypatch, capsys):
+    """r53/D112: run once renders the gate's now-snapshot; the raw collector is never called."""
     from conftest import BASE_TIME
     from foragent import watch
     from foragent.config import Config
@@ -54,27 +55,28 @@ def test_watch_split_collect_and_render_patches_reach_run_once(tmp_path, monkeyp
     from foragent.tracker import FakeTracker
 
     store, config, tracker = StateStore(tmp_path / "state"), Config(), FakeTracker()
-    status, snapshot, calls = {"probe": "status"}, object(), []
+    calls = []
     store.root.mkdir()
     pid_file = store.root / "watch.pid"
     pid_file.write_text("123\n", encoding="utf-8")
 
-    def collect(*args):
-        calls.append(("collect", args))
-        return snapshot
+    def collect(*args, **kwargs):
+        calls.append("collect")
+        raise AssertionError("the main screen must not collect raw state")
 
-    def render_frame(*args):
-        calls.append(("render_frame", args))
+    def status():
+        calls.append("status")
+        raise AssertionError("the main screen must not read the raw status")
+
+    def render_frame(snapshot, *args, **kwargs):
+        calls.append(("render_frame", type(snapshot).__name__, args))
         return "facade-rendered frame"
 
     # Both bindings are patched by tests/test_watch_open.py too.
     monkeypatch.setattr(watch, "collect", collect)
     monkeypatch.setattr(watch, "render_frame", render_frame)
-    watch.run(lambda: status, tracker, store, config, tmp_path, once=True, now=lambda: BASE_TIME)
-    assert calls == [
-        ("collect", (status, tracker, store, config, BASE_TIME)),
-        ("render_frame", (snapshot, config, tmp_path)),
-    ]
+    watch.run(status, tracker, store, config, tmp_path, once=True, now=lambda: BASE_TIME)
+    assert calls == [("render_frame", "Snapshot", (config, tmp_path))]
     assert capsys.readouterr().out == "facade-rendered frame\n"
     assert pid_file.read_text(encoding="utf-8") == "123\n"
 
@@ -97,9 +99,8 @@ def test_watch_split_frame_patch_reaches_render_frame(tmp_path, monkeypatch):
                       {"tick": 3, "width": 80, "selected": None, "now": BASE_TIME})]
 
 
-def test_watch_split_collection_error_patch_propagates_without_printing(
-    tmp_path, monkeypatch, capsys,
-):
+def test_watch_split_unreadable_snapshot_prints_the_pending_frame(tmp_path, monkeypatch, capsys):
+    """r53: before the gate's first tick the view says it waits for the gate; it never collects."""
     from foragent import watch
     from foragent.config import Config
     from foragent.state import StateStore
@@ -107,14 +108,14 @@ def test_watch_split_collection_error_patch_propagates_without_printing(
 
     calls = []
 
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         calls.append(args)
         raise RuntimeError("offline snapshot unavailable")
 
     monkeypatch.setattr(watch, "collect", unavailable)
-    with pytest.raises(RuntimeError, match="offline snapshot unavailable"):
-        watch.run(lambda: {}, FakeTracker(), StateStore(tmp_path / "state"), Config(),
-                  tmp_path, once=True)
-    assert len(calls) == 1
-    assert capsys.readouterr().out == ""
+    store = StateStore(tmp_path / "state")
+    watch.run(unavailable, FakeTracker(), store, Config(language="en"), tmp_path, once=True)
+    out = capsys.readouterr().out
+    assert "gate" in out.lower() and "#" not in out, "a missing snapshot says the view waits for the gate"
+    assert calls == []
     assert not (tmp_path / "state/watch.pid").exists()
