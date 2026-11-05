@@ -557,17 +557,31 @@ def test_issue_box_keeps_whitespace_of_goal_title_and_commands(tmp_path):
 
 
 def test_a_wrapped_box_line_joins_back_to_the_exact_text(tmp_path):
-    from foragent.watch_sections.acorns import _verbatim_wrap
+    from foragent.watch_sections import acorns
+    from helpers.cells import cells
 
     line = "  run --flag  'two  spaces'  다람쥐도토리 " + "x" * 30
-    for width in (2, 7, 12, 20):
-        pieces = _verbatim_wrap(line, width)
-        assert "".join(pieces) == line
-        assert all(watch._cells(piece) <= width for piece in pieces)
     store, config = box_case(tmp_path, "## Done when\n```sh\n" + line + "\n```\n")
-    frame = box_frame(config, tmp_path, {"issue": 5, "store": store}, 24)
-    inside = [row[1:-1] for row in frame.splitlines() if row.startswith("│")]
-    assert "".join(inside).find("  " + line) >= 0, "the wrapped rows hold every character in order"
+    texts = watch.issue_box(5, store, config)
+    assert "  " + line in texts
+    snapshot = lane_case()[0]
+    for width in (2, 7, 12, 20, 22):
+        # The box's border takes one cell each side; each row's first span is the wrapped piece
+        # as written, before the padding that fills the row.
+        drawn = acorns.render(snapshot, config, tmp_path, tick=0, width=width + 2, selected=None,
+                              now=snapshot.captured_at, top=0, hits=[], marks=[],
+                              state={"issue": 5, "store": store})
+        pieces = [row[1][0] for row in drawn[1:-1]]
+        assert all(cells(piece) <= width for piece in pieces), (width, pieces)
+        # The rows give back every box line exactly, in order, and nothing more: each line's
+        # pieces join to that line, the next line starts on the next row.
+        rows = iter(pieces)
+        for text in texts:
+            joined = next(rows)
+            while len(joined) < len(text):
+                joined += next(rows)
+            assert joined == text, (width, text, joined)
+        assert list(rows) == [], (width, "the wrapped rows hold every character in order, once")
 
 
 def test_issue_box_drops_terminal_controls_but_not_spaces(tmp_path):
