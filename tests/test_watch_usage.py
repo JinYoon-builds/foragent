@@ -153,7 +153,7 @@ def test_help_line_lists_m(tmp_path):
 
 
 def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
-    from foragent.watch_cells import _cells
+    from helpers.cells import cells
 
     left = {"usage": {"codex": record(10, NOW + timedelta(hours=1))}}
     lanes = {f"lane{index}": {} for index in range(30)}
@@ -166,12 +166,12 @@ def test_short_screen_keeps_keys_invite_and_usage_on_their_own_rows(tmp_path):
     reset = (NOW + timedelta(hours=1)).astimezone().strftime("%H:%M")
     # The usage and hint rows stay one row each: no invite, count or merge item (lane_footer).
     assert rows[-2:] == [f"Claude — · Codex 10% (10 min ago · {reset}) · keep 80%", "Click an acorn to see what it is · s settings · m usage mode · q quit"]
-    assert all(_cells(row) <= 80 for row in rows[-2:])
+    assert all(cells(row) <= 80 for row in rows[-2:])
 
 
 @pytest.mark.parametrize("width", [20, 30, 44])
 def test_a_narrow_frame_wraps_the_footer_between_items_instead_of_losing_its_end(tmp_path, width):
-    from foragent.watch_cells import _cells
+    from helpers.cells import cells
 
     soon = NOW + timedelta(hours=1)
     snap = snapshot({"usage": {"claude": record(6, soon), "codex": record(67, soon)},
@@ -179,7 +179,7 @@ def test_a_narrow_frame_wraps_the_footer_between_items_instead_of_losing_its_end
     rows = [[value for value, _ in row]
             for row in usage.render(snap, config(), tmp_path, now=NOW, width=width)]
     text = [" ".join(row) for row in rows]
-    assert all(_cells(row) <= width for row in text)
+    assert all(cells(row) <= width for row in text)
     joined = " ".join(text)
     for item in ("Claude 6%", "Codex 67%", "memory critical", "running 2/3", "keep 80%",
                  "All lanes idle with quota left"):

@@ -34,7 +34,7 @@ WAITING_PHASES = frozenset({"checking", "ci", "merging", "reviewing", "overlap-w
                             "merge-lock-wait", "run-slot-wait"})
 
 
-def _activity(
+def activity(
     row: dict[str, Any], language: str, age: float, stall_minutes: float, pid: int | None,
     log_seconds: float | None = None, progress_seconds: float | None = None,
     phase_seconds: float | None = None,
@@ -81,6 +81,10 @@ def _activity(
         return watch.text("watch_in_phase", language, phase=watch.text(row["phase"], language),
                           minutes=int((phase_seconds + age) // 60))
     return "●"
+
+
+# The original binding: sections call watch._activity, so replacing it there reaches them.
+_activity = activity
 
 
 def _clones(status: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:

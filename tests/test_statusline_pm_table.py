@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from foragent import presence, statusline
-from foragent.commands import _pm_table
 
 
 @pytest.fixture
@@ -58,13 +57,16 @@ def test_worktree_and_missing_project_get_no_table(hook, monkeypatch):
 
 def test_table_failure_preserves_summary(hook, monkeypatch):
     invoke, _ = hook
-    def broken():
+    def broken(self, *args, **kwargs):
         raise RuntimeError("parser unavailable")
-    monkeypatch.setattr(_pm_table, "render", broken)
+    # The table follows the registered parser, so a parser that cannot be built fails it.
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", broken)
     assert invoke() == {"systemMessage": "original summary"}
 
 
-def test_option_rename_and_removal_follow_registered_actions(monkeypatch):
+def test_option_rename_and_removal_follow_registered_actions(hook, monkeypatch):
+    invoke, _ = hook
+    table = lambda: invoke()["hookSpecificOutput"]["additionalContext"]
     original = argparse.ArgumentParser.add_argument
     remove = False
 
@@ -78,8 +80,8 @@ def test_option_rename_and_removal_follow_registered_actions(monkeypatch):
         return action
 
     monkeypatch.setattr(argparse.ArgumentParser, "add_argument", add_argument)
-    context = _pm_table.render()
+    context = table()
     assert "`fa gate watch --show`" in context
     assert "--open" not in context
     remove = True
-    assert "open the dashboard" not in _pm_table.render()
+    assert "open the dashboard" not in table()
