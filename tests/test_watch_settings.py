@@ -1,6 +1,7 @@
 """Unit tests for the lane view's settings window and `fa settings get` without a key (#173)."""
 
 import json
+import sys
 from dataclasses import replace
 
 import pytest
