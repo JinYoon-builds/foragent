@@ -1,51 +1,60 @@
 # Board lane 기억
 
-- 보드의 진실은 이슈 라벨이다. `board.sync_status(ctx, issue, status)`가 저장소 문맥을 잠시 연결하고 공개 함수 `board.set_status(issue, status)`를 호출한다. 초기화·상태 동기화 실패는 로그에 남기고 계속 진행한다. 저장소 문맥은 호출 뒤 복원한다.
-- Projects v2 전송은 `Tracker.graphql(query, variables)` 한 곳으로 모은다. `GhTracker`는 `gh api graphql --input -`에 JSON을 넘겨 숫자·null·목록 타입을 보존한다. HTTP 성공이어도 응답의 `errors`를 확인한다.
-- 보드 소유자는 인증 사용자 대신 `repository.owner.id`로 찾는다. 개인·조직의 `projectsV2`와 보드 필드 조회 모두 페이지를 순회한다. 저장된 보드 ID가 없더라도 같은 소유자와 제목의 보드를 재사용한다.
-- GitHub는 보드 생성 시 Status 필드를 기본으로 만든다. 이번 호출에서 직접 만든 새 보드만 지정된 일곱 상태로 초기화한다(`ensure_fields(..., new_project=True)`). 제목으로 찾거나 저장된 ID로 재사용하는 보드와 상태 갱신에서는 Todo·In Progress·사용자 옵션을 모두 보존한다. Foragent 상태는 Approved → Ready → Running → Blocked → Needs human → PR open → Done 순서로 앞에 두고 나머지 기존 옵션을 뒤에 유지한다. 옵션 갱신 시 기존 옵션 ID·색·설명을 전달해야 이미 선택된 값이 유지된다. Lane 옵션은 새 레인을 추가하면서 기존 옵션을 보존한다.
-- 보존 회귀 테스트는 Foragent 초기화 전의 보드·옵션·카드를 GraphQL로 준비하고, 제목 검색·저장된 ID·상태 갱신 각각을 반복한 뒤 옵션 메타데이터와 기존 카드 값을 확인한다. FakeProjects는 삭제된 옵션의 카드 값을 지우는 동작을 유지해야 실제 데이터 손실을 드러낼 수 있다. `uv run pytest -q tests/test_board.py -k existing_status`로 집중 확인한다.
-- API 근거: [GitHub Projects GraphQL 참조](https://docs.github.com/en/graphql/reference/projects#projectv2singleselectfieldoptioninput)의 옵션 입력 `id`는 기존 선택값을 보존하는 용도다. `UpdateProjectV2FieldInput.singleSelectOptions`는 기존 목록을 덮어쓰므로 일부만 추가할 때도 보존할 옵션을 함께 보내야 한다.
-- 보드 생성 후 필드 설정만 실패한 경우에도 생성된 ID를 저장해서 다음 init에서 보완한다. `--no-board`와 `--dry-run`에서는 Projects API를 호출하지 않는다.
-- init은 기존 YAML의 주석과 값을 보존하며 board 키를 추가한다. `board: null`처럼 기존 키를 교체할 때는 중복 키를 만들지 않는다.
-- 설정 추가 시 `tests/test_config.py::test_exact_defaults`, init CLI 옵션 추가 시 `tests/test_cli.py`의 두 kwargs 완전 일치 검사를 함께 갱신한다. 기존 파일 설정 테스트는 `no_board=True`로 격리하고 보드 동작을 별도 검증한다.
-- 검증: `uv run pytest -q tests/acceptance/test_board_projects.py`, `uv run pytest -q --ignore=tests/acceptance`. 인수 테스트는 수정하지 않는다. 샌드박스에서 기본 uv 캐시에 쓸 수 없으면 쓰기 가능한 임시 `UV_CACHE_DIR`를 사용한다.
-- 발행 중 보드 추가의 `TrackerError`는 호출자에게 전달해 CLI가 실패와 원인을 표시하게 한다. 단, `addProjectV2ItemById`의 `Content already exists in this project` 응답은 이미 가입된 상태이므로 traceback·경고 없이 성공 처리한다. 이 응답에는 item ID가 없어 필드 갱신을 건너뛴다. 같은 문구라도 조회·필드 갱신에서 난 오류에는 적용하지 않는다. gh 비정상 종료와 GraphQL errors 응답 양쪽을 `tests/test_board.py`로 검증한다.
-- 새 저장소의 `init` 기본 도구는 설치 여부가 아니라 `codex login status`의 종료 코드와 `claude auth status`의 JSON `loggedIn`으로 확인한다. 누락·시간 초과·잘못된 응답은 로그인 사실로 인정하지 않는다. 기존 설정은 재탐지하지 않고 보존한다.
-- Claude 작업자에 기본 교차 리뷰를 그대로 두면 `resolved_reviewer`가 Codex를 고르므로, Claude를 고를 때 `reviewer: claude`도 저장한다. 리뷰의 새 세션은 기존 `ClaudeExecutor`의 별도 `claude -p /code-review ...` 프로세스로 보장된다.
-- `tests/test_init.py::setup`은 도구 상태 확인을 subprocess 경계에서 오프라인으로 대체한다. 이 fixture를 가져오는 잠긴 인수 테스트는 같은 경계에서 로그인 사실을 다시 주입하므로, 초기화 함수 자체를 가짜로 바꾸지 않는다. 집중 검증은 `uv run pytest tests/acceptance/test_claude_only.py`다.
-- `fa statusline`(statusline.py)는 Claude Code가 매 갱신마다 부르므로 `cli.main`에서 parser 전에 분기한다. init의 설치 질문은 `builtins.input`으로 하고 EOF/OSError(pytest 캡처 stdin)는 "unanswered"로 기억하지 않는다. 비대화형은 `fa init --statusline yes|no`. 집중 확인: `fa test tests/acceptance/test_statusline_wrapper.py tests/test_statusline.py`.
-- 재시도 사유가 "내가 안 건드린 테스트/인수 파일 삭제"라면 작업 브랜치가 뒤처진 main 기준이라서다. `git fetch` 후 겹치는 파일이 없고 HEAD가 origin/main의 조상이면 `git reset --keep origin/main`으로 앞당긴다(커밋·브랜치 전환 없음, 작업 변경 유지).
-- 재시도에서 "작업 트리를 다시 만들었다"는 안내가 오면 `origin/foragent/issue-<N>`에 이전 시도 커밋이 있는지 본다. `git cherry-pick --no-commit <sha>` 뒤 `git reset -q`로 커밋 없이 가져온다. 전체 테스트(약 25분)는 실행 예산을 넘겨 작업 트리를 잃게 하므로 돌리지 않는다. 완료 기준과 바꾼 파일의 테스트만 돌린다.
-- 보드 Status는 #184부터 사람용 다섯 칸이다(`board.board_column`). 팀 보드는 `.foragent.yml`의 `board_map`을 쓴다. 막힌 카드의 ⚠는 기존 `blocked` 라벨로 대신한다(소유자 결정). `card_warning()`은 다른 화면용 공개 판정 함수다.
-- init은 남의 보드를 처음 받아들일 때만 `board_map`을 저장한다(`board_id != config.board`이고 `board.ensure(..., created=set)`에 없을 때). 칸이 Foragent 다섯 칸과 같으면 묻지 않고 `DEFAULT_MAP`을 저장한다. 새로 만든 보드와 이미 저장된 보드는 설정을 다시 쓰지 않는다(`test_board_default_is_persisted_and_idempotent`).
-- 리뷰가 "acceptance 파일 삭제"를 지적하면 `git diff --name-status HEAD origin/main -- <file>`을 본다. `A`면 기준 커밋 뒤 main에 추가된 파일이므로 `.foragent/REBUTTAL.md`로 반박한다.
-- main을 병합하면 새로 들어온 보드 테스트가 옛 상태 이름(`"Ready"`, `"PR open"`)을 기대하는 경우가 있다. #184 뒤로 보드 값은 칸 이름이다. 기대값은 `board.board_column(state)`로 쓰고, 같은 칸 안의 이동(Approved→Ready)은 쓰기가 없어야 한다. 테스트 이름은 유지한다.
-- 리뷰가 "내가 안 건드린 파일의 삭제"를 지적하면 `git diff origin/main...HEAD -- <file>`(점 세 개, 브랜치 쪽 변경만)으로 확인한다. 비어 있으면 main이 앞서간 것이다. `git merge`는 권한이 막혀 있으므로 `git log HEAD..origin/main`의 커밋을 `git cherry-pick --no-commit` 후 `git reset -q`로 가져온다.
-- main은 #346에서 `tests/test_runner.py`를 `tests/test_run_*.py`로 나눴다. 병합 충돌에서 HEAD 쪽에만 있는 테스트는 먼저 `git grep -n 'def <name>' MERGE_HEAD -- tests`로 옮겨진 곳을 찾는다. 옮겨졌으면 main대로 빼고 이 브랜치의 변경만 남긴다.
-- `test_tick_cleans_worktree_when_real_runner_is_terminated_between_logged_commands[True]`는 검사 환경이 `os.killpg`를 막으면 `PermissionError`로 실패한다. 환경에 따라 통과하기도 한다. 보드 변경과 무관하므로 실제 kill을 다시 돌리지 않고 REBUTTAL로 답한다.
-- 빈 목록 판정(#163): `GhTracker.list_issues`는 빈 결과를 한 번 재조회하고, 같은 인스턴스의 앞선 비어 있지 않은 목록이나 `StateStore.for_repo(repo).local_issues()`가 근거이면 `TrackerError("...empty listing...")`를 낸다. 단위 테스트는 `_EMPTY_RETRY_DELAY`를 0으로 바꾼다. 인수 테스트가 다른 레인의 미구현 API에 기대면 직접 만들지 말고 blocked-by를 제안한다. 재시작 때 작업 트리의 미커밋 변경이 사라질 수 있다.
-- 여러 테스트 파일을 한 pytest 호출로 돌리면 출력이 비는 경우가 있었다. 변경 전후 비교는 파일별로 `-rf`를 붙여 돌린다.
-- 닫힌 이슈와 미승인 이슈의 보드 동기화는 `board.sync_status(..., existing_only=True)`로 한다(#184 리뷰). 보드에 이미 있는 카드만 옮기고, 카드를 새로 추가하지 않는다. 카드 상태는 이슈 목록을 새로 읽는 tick(5분 주기)에서 `board.refresh_cards`가 보드 전체를 한 번 읽어 맞춘다. 카드가 없으면 `board.NO_CARD`를 기록한다. 그래서 사람이 추가하거나 옮긴 카드도 다음 새로 읽기 때 반영된다. 이슈마다 따로 캐시해서 영원히 건너뛰게 하면 리뷰에서 막힌다. 잠긴 인수 테스트가 `board.set_status(issue, status)`를 인자 두 개짜리로 바꿔치기하므로 공개 `set_status`의 모양은 바꾸지 않는다. 실제 kill 테스트는 `-k 'not real_runner_is_terminated'`로 뺀다.
-- 메시지 레지스트리: 새 문구는 `src/foragent/messages/<기능>.py`의 `MESSAGES`에 두고 `from foragent.i18n import text`로 부른다(`foragent.messages`에는 `text`가 없다). 저장소 밖 명령의 언어는 `load_config(Path.cwd()).language`를 시도하고 실패하면 "en". settings.json 바이트 보존 편집은 `statusline._member_span`(#412).
-- JSON 바이트 편집 리뷰 함정: 중복 키는 마지막 값이 유효하다. 키를 지울 때는 같은 이름을 모두 지우고, 쓰기 전에 `json.loads(편집본) == 의도한 dict`를 확인해 다르면 쓰지 않는다(#412).
-- 주문 상위 이슈(#411): 열린·미승인 이슈(자기 blocked·needs-human 라벨과 무관, 리뷰 지적)에 로컬 `children`이 있으면 `board_parents.follow_children`가 목록을 새로 읽은 tick에서만 `sub_issues`로 칸을 계산한다. 승인된 상위 이슈는 일반 작업이다. 취소된 하위 이슈는 `parent-child-not-planned` 플래그와 orch 이벤트로 알린다. `Issue.state_reason`이 있다. 열린 주문의 카드는 `sync_status(..., parent=True)`만 쓴다(복구·에스컬레이션·flag의 쓰기는 무시, 리뷰 지적). 상위 이슈를 닫는 주체는 `follow_children` 하나다(완료 댓글 먼저, not_planned면 열어 둠). 그래서 `_batch_pr` 본문에는 `Closes #부모` 대신 메시지 키 `batch_pr_parent`(en·ko, 닫기 키워드 없음)를 쓴다. 새 사람용 문구는 PR 본문 한 줄이라도 레지스트리를 거쳐야 리뷰를 통과한다. 이 키워드가 있으면 배치 PR 머지가 tick 전에 부모를 닫아서 리뷰에서 막혔다. `_reconcile_batches`는 배치 PR이 머지되지 않은 닫힌 상위 이슈도 마무리하고, `_batch_pr`은 닫힌 상위 이슈 카드를 "PR open"으로 되돌리지 않는다.
+## 보드 (Projects v2)
+- 보드의 진실은 이슈 라벨이다. `board.sync_status(ctx, issue, status)`가 저장소 문맥을 잠시 연결하고 공개 함수 `board.set_status(issue, status)`를 호출한 뒤 복원한다. 초기화·동기화 실패는 로그에 남기고 계속한다. 잠긴 인수 테스트가 `set_status`를 인자 두 개짜리로 바꿔치기하므로 공개 모양은 바꾸지 않는다.
+- Projects v2 전송은 `Tracker.graphql(query, variables)` 한 곳이다. `GhTracker`는 `gh api graphql --input -`에 JSON을 넘겨 타입을 보존한다. HTTP 성공이어도 응답의 `errors`를 확인한다.
+- 보드 소유자는 `repository.owner.id`로 찾는다. 개인·조직 `projectsV2`와 필드 조회 모두 페이지를 순회한다. 저장된 ID가 없어도 같은 소유자·제목의 보드를 재사용한다. 생성 후 필드 설정만 실패해도 ID를 저장해 다음 init에서 보완한다. `--no-board`·`--dry-run`은 Projects API를 부르지 않는다.
+- Status는 #184부터 사람용 다섯 칸이다(`board.COLUMNS`/`DEFAULT_MAP`, 상태→칸은 `board.board_column`; 내부 `STATUSES` 일곱 개는 칸으로 묶인다). `ensure_fields`는 이번 호출에서 만든 새 보드(`new_project=True`)에서만 Status를 다섯 칸으로 바꾸고, 기존 보드의 Status 옵션은 건드리지 않는다. 다른 필드(Lane 등)는 기존 옵션 뒤에 새 옵션만 붙인다. `UpdateProjectV2FieldInput.singleSelectOptions`는 목록을 덮어쓰므로 기존 옵션의 id·색·설명을 함께 보내야 카드 값이 남는다([참조](https://docs.github.com/en/graphql/reference/projects#projectv2singleselectfieldoptioninput)). FakeProjects는 삭제된 옵션의 카드 값을 지우는 동작을 유지해야 손실을 드러낸다.
+- 팀 보드는 `.foragent.yml`의 `board_map`을 쓴다. init은 남의 보드를 처음 받아들일 때만(`board_id != config.board`이고 `board.ensure(..., created=set)`에 없을 때) 저장하고, 칸이 같으면 묻지 않고 `DEFAULT_MAP`을 저장한다(`test_board_default_is_persisted_and_idempotent`). 막힌 카드의 ⚠는 `blocked` 라벨로 대신한다(소유자 결정). `card_warning()`은 다른 화면용 판정 함수다.
+- 같은 칸 안의 이동(Approved→Ready)은 쓰기가 없어야 한다. main에서 들어온 보드 테스트가 옛 상태 이름을 기대하면 기대값을 `board.board_column(state)`로 바꾸고 테스트 이름은 유지한다.
+- 닫힌·미승인 이슈는 `sync_status(..., existing_only=True)`로 기존 카드만 옮긴다. 카드 상태는 목록을 새로 읽는 tick에서 `board.refresh_cards`가 보드 전체를 한 번 읽어 맞추고, 카드가 없으면 `board.NO_CARD`를 기록한다. 이슈별로 영구 캐시해 건너뛰면 리뷰에서 막힌다.
+- Your turn(#694): `sync_status`에서 열린 이슈가 needs-human·waiting-person 라벨이나 열린 질문(`orch_inbox.waiting_issues`)에 걸리면 Done/closed/merged와 `parent=True`를 빼고 "Needs human"으로 바꾼다. 질문 읽기 실패는 경고만(`test_board_parents`의 가짜 store에 `root` 없음).
+- 발행 중 보드 추가의 `TrackerError`는 호출자에게 전달한다. 단 `addProjectV2ItemById`의 `Content already exists in this project`는 성공으로 보고 필드 갱신을 건너뛴다(item ID 없음). 조회·필드 갱신의 같은 문구에는 적용하지 않는다.
+- 빈 목록 판정(#163): `GhTracker.list_issues`는 빈 결과를 한 번 재조회하고, 같은 인스턴스의 앞선 목록이나 `StateStore.for_repo(repo).local_issues()`가 근거이면 `TrackerError("...empty listing...")`. 단위 테스트는 `_EMPTY_RETRY_DELAY`를 0으로.
+- 집중 검증: `uv run pytest -q tests/test_board.py -k existing_status`, `uv run pytest -q tests/acceptance/test_board_projects.py`.
+
+## 주문 상위 이슈와 기록
+- #411: 열린·미승인 이슈(자기 blocked·needs-human 라벨과 무관)에 로컬 `children`이 있으면 `board_parents.follow_children`가 목록을 새로 읽은 tick에서만 `sub_issues`로 칸을 계산한다. 승인된 상위 이슈는 일반 작업이다. 취소된 하위 이슈는 `parent-child-not-planned` 플래그와 orch 이벤트(`Issue.state_reason`). 열린 주문 카드는 `sync_status(..., parent=True)`만 쓴다. 상위 이슈를 닫는 주체는 `follow_children` 하나다(완료 댓글 먼저, not_planned면 열어 둠). 그래서 `_batch_pr` 본문은 `Closes #부모` 대신 `batch_pr_parent` 키(닫기 키워드 없음)를 쓴다. `_reconcile_batches`는 배치 PR 없이 닫힌 상위 이슈도 마무리하고, `_batch_pr`은 닫힌 상위 카드를 "PR open"으로 되돌리지 않는다.
+- #705: publish만 하위 이슈 없는 주문(`not plan["issues"] and not mapping`)의 기록을 보드에 넣지 않고 닫는다. tick은 하위 이슈 없는 기록을 닫지 않는다("빈 작업은 완료가 아니다"). 닫힌 이슈 가벼운 읽기는 `RecordingTracker.observe_closed_issues`(watermark `closed_issues.json`, 없으면 `issues_observation()["as_of"]`부터)를 `_reconcile_batches` 맨 앞에서 부른다. 첫 호출에 읽기를 건너뛰거나 캐시 행으로 원격 변경을 거르면 막힌다.
+- #837(최종): 기록의 참조 닫기에 상한·캐시·순서 돌리기 없음(오케 결정). 목록 안 참조가 모두 닫히고 하위 이슈가 완료일 때만 목록 밖 참조를 그 tick에 기록마다 새로 `get_issue`.
+- "공유 메시지 키" 요구는 같은 일을 하는 모든 쓰기 지점(publish의 기록 닫기 + tick의 부모 닫기)이 한 키를 쓰라는 뜻이다. 옛 키를 남기면 막힌다. 개수 포함 문구는 `{count}` 인자로.
 - [issues.json 캐시 (#588)](issue_record_cache.md) — 읽기만 캐시, 잠금 쓰기는 새로 해석; fstat으로 버전 고정; deepcopy 금지
-- [닫힌 PR watermark (#589)](closed_pr_watermark.md) — merged_prs.json 목록+watermark, GhTracker만 증분, 성공 뒤에만 기록
-- `tests/acceptance/test_scheduler_split.py`가 `scheduler.py`를 250줄로 제한한다(#411에서 251줄로 기준선 회귀). scheduler에 줄을 더할 때는 `wc -l`로 확인하고, 주석은 줄 끝에 붙인다. 새 로직은 board_parents 같은 별도 모듈에 둔다.
-- Your turn 덮어쓰기(#694): `board.sync_status` 안에서 열린 이슈가 needs-human·waiting-person 라벨이나 열린 질문(`orch_inbox.waiting_issues`)에 걸리면 Done/closed/merged와 `parent=True`를 빼고 "Needs human"으로 바꾼다. `test_board_parents`의 가짜 store에는 `root`가 없으므로 질문 읽기 실패는 경고만 남기고 계속한다.
-- 다른 이슈가 주인인 상수(예: park 이슈의 `WAITING_PERSON`)는 main에 들어오기 전까지 정의하지 말고 문자열을 직접 쓴다. 지시에 "do not define it here"가 있으면 리뷰가 소유권 위반으로 막는다(#694).
-- 주문 기록 닫기(#705): publish만 하위 이슈 없는 주문(`not plan["issues"] and not mapping`)의 기록을 보드에 넣지 않고 닫는다. tick은 하위 이슈 없는 기록을 닫지 않는다(#411 "빈 작업은 완료가 아니다", 오케 답변). 닫힌 이슈 가벼운 읽기는 `RecordingTracker.observe_closed_issues`(watermark `closed_issues.json`, 없으면 `issues_observation()["as_of"]`부터; 로컬에 closed가 아닌 모든 닫힌 이슈 기록)를 `_reconcile_batches` 맨 앞에서 부른다. 증분 읽기 리뷰 함정: 첫 호출에 읽기를 건너뛰거나 캐시된 행으로 원격 변경을 거르면 막힌다. scheduler.py는 Files에 없으면 손대지 않는다.
-- `test_github_outbox.py::...rate_limited_close`는 #705 기준선에서 이미 실패한다. 기준선 비교는 `git diff > .foragent/wip.patch; git apply -R`, 시험, `git apply`로 한다(`git checkout --`은 권한 거부).
-- 가짜 추적기에 가벼운 읽기를 더할 때 `self.list_issues()`를 재사용하지 말고 `self.issues`를 직접 거른다. `test_tick_step_times.py` 등은 `list_issues` 호출을 GitHub 단계로 세므로 tick당 한 번을 넘으면 기준선이 깨진다(#705).
-- "공유 메시지 키" 요구는 같은 일을 하는 모든 쓰기 지점(#705: publish의 주문 기록 닫기 + tick의 #411 부모 닫기)이 한 키를 쓰라는 뜻이다. 새 키만 만들고 기존 경로의 옛 키를 두면 리뷰가 막는다. 잠긴 시험의 요구(개수 포함 한 줄)는 `{count}` 인자로 맞춘다.
+- [닫힌 PR watermark (#589)](closed_pr_watermark.md) — merged_prs.json 목록+watermark, GhTracker만 증분, 성공 뒤에만 기록; state_*.py 300줄 제한
+
+## init
+- init은 기존 YAML의 주석·값을 보존하며 키를 더한다. `board: null` 같은 교체에 중복 키를 만들지 않는다. 설정 추가 시 `tests/test_config.py::test_exact_defaults`, init CLI 옵션 추가 시 `tests/test_cli.py`의 kwargs 완전 일치 검사를 함께 고친다. 기존 파일 설정 테스트는 `no_board=True`로 격리한다.
+- 기본 도구는 설치가 아니라 로그인으로 판정한다: `codex login status` 종료 코드, `claude auth status` JSON `loggedIn`. 누락·시간 초과·잘못된 응답은 로그아웃. 기존 설정은 재탐지하지 않는다. Claude를 고르면 `reviewer: claude`도 저장한다(아니면 `resolved_reviewer`가 Codex를 고름).
+- `tests/test_init.py::setup`은 도구 확인을 subprocess 경계에서 오프라인으로 대체하고 API 키 환경 변수 두 개를 지운다. 잠긴 인수 테스트도 같은 경계에서 주입하므로 초기화 함수를 가짜로 바꾸지 않는다(`tests/acceptance/test_claude_only.py`).
+- 사전 점검 문구(#843): `messages/init_preflight.py`. origin 없음/비GitHub는 `remote_slug`의 GitError `__cause__` 유무, gh 미설치/로그아웃은 OSError/CalledProcessError. 기존 시험이 영어 앞머리를 match하므로 ko에도 앞머리를 유지한다. 언어는 `--language` → 기존 설정 → en.
 - [init 역할 에이전트 (#717)](role_agents_init.md) — skill은 data-files로 배포, 커밋 실패 복구는 내용 일치 파일만, test_init ALL_PATHS
-- [roles 원본 (#769)](roles_source.md) — roles.py 단독 writer, init 기본 역할, 새 설정 키면 `uv run fa test`
-- presence 상태 줄(#754): `presence.py`가 로컬 상태만 읽어 사용자 출력 마지막 줄에 붙인다. 시각은 `statusline.datetime.now(UTC)`로 넘긴다(잠긴 테스트가 cli·state·statusline의 datetime만 바꾼다). presence는 다른 기능의 전제(이전 상태 줄 명령, 상태 폴더)에 묶이면 리뷰에서 막힌다: 이전 명령이 없어도 붙이고, 상태가 없으면 0으로 보인다. 겹친 wrapper(NESTED_ENV)만 아무것도 내지 않는다. 저장소 루트에서 도는 `tests/test_statusline.py`는 fixture에서 tmp로 chdir한다. `merge_times()`는 재실행 기록에 이전 실행의 merged_at을 물려주므로, merged_at >= started_at인 것만 그 실행의 머지로 센다(progress.py:63과 같은 규칙). 오늘 머지의 출처는 record_merge 하나뿐이다(Goal 수정, 이슈 스냅숏·PR 목록 금지). record_merge는 runs/<n>.json에 바로 쓰고 finish_run이 늦게 이력으로 옮기므로 `presence.gate_merges`가 둘 다 읽는다. `presence` 하위 키는 `_overlay`에서 병합한다.
-- CI 실패가 내 변경과 무관해 보이면 `gh run list --branch main --workflow ci`로 main도 같은 테스트로 실패하는지 본다. 코드 변경 없는 커밋에서 깨졌다면 고정 `NOW`와 실제 시계가 섞인 시한폭탄이다(#769: test_cli inspect, 2026-10-27 09:00Z부터 7일 cutoff에 걸림). 다른 레인 파일이면 REBUTTAL로 원인과 file:line을 남긴다.
-- 세션 시작 훅(#755): `fa statusline --session-start`가 `presence.session_start_message`로 systemMessage JSON을 내고 `$XDG_DATA_HOME/foragent/presence-sessions/<sha>.json`에 시작 시각을 쓴다(유일한 writer; 저장소 store에 두면 repo 없는 프로젝트에서 다람쥐가 사라져 리뷰에서 막힘). 다람쥐는 `watch_art.ansi_rows`, 커서는 `brief_report.last_report`. 사용자 settings.json의 훅은 #755 답(선택 1)로 `test_statusline_wrapper.py`가 허용한다. 잠긴 시험과 이슈가 부딪치면 QUESTION.md로 올리면 오케가 시험을 고쳐 준다. 재시도 때 작업 트리가 다시 만들어져도 WIP 커밋이 HEAD에 합쳐져 있을 수 있다(`git show --stat HEAD`로 먼저 확인). 리뷰 함정: 훅 정리를 wrapper 소유(기록 enabled·statusLine이 wrapper)에 묶지 않는다. uninstall은 기록이 없거나 statusLine을 사용자가 바꿔도 훅을 지우고, init은 wrapper가 실제로 켜져 있을 때만 훅을 더한다. 바뀐 게 없으면 다시 쓰지 않는다(inode·mtime으로 시험).
-- 상태 줄 저장소 찾기(#802): repo 키가 없으면 `git.origin_slug_from_files(root)`가 .git/config(작업 트리면 gitdir→commondir)를 직접 읽는다. url 규칙은 `git.slug_from_url` 하나이고 `remote_slug`도 이를 쓴다. presence는 자식 프로세스 금지(잠긴 fixture). presence 단위 시험은 origin 대체 제거를 못 잡으므로 인수 시험 `test_statusline_repo_slug.py`로 확인.
-- 게이트가 "Acceptance baseline regression"으로 남의 영역 시험(예: #755의 `test_orch_facts...no_selection`)을 지목해도 실패 출력은 `runs/<n>.json`의 `resume_reason`에 이름만 있다. 현재 HEAD에서 단독·파일 전체·내 시험과 한 프로세스로 돌려 재현되지 않고 고정 시계면 코드를 건드리지 말고 REBUTTAL에 반복 횟수를 적는다.
-- 주문 기록 참조 닫기(#837, 최종): 상한·캐시·순서 돌리기 없음(오케 결정, 되돌릴 수 있는 잘못 닫기는 다시 열면 됨). 목록의 참조가 모두 닫히고 하위 이슈가 완료일 때만 목록 밖 참조를 그 tick에 기록마다 새로 `get_issue`. 교훈: 리뷰가 "굶주림"과 "낡은 캐시"를 번갈아 막으면 캐시를 더 정교하게 만들지 말고 QUESTION.md로 올려 요구(상한)를 바꾸게 한다. 3라운드를 날렸다.
-- init 사전 점검 문구(#843): `messages/init_preflight.py`(Files 밖이지만 레지스트리 규칙). origin 없음/비GitHub 구분은 `remote_slug`의 GitError `__cause__` 유무(get-url 비정상 종료), gh 미설치/로그아웃은 OSError/CalledProcessError. 기존 시험이 영어 앞머리("origin remote on github.com", "gh auth status failed")를 match하므로 ko에도 앞머리를 유지한다. 언어는 `--language` → 기존 설정 → en.
-- API 키 Claude(#889): 게이트의 `os.environ`에서 파생(`scheduler_quota.api_key_billing`, OAuth 토큰 우선)하고 `billed()`가 `entry_for`·`fallback_order`에서 claude를 api로 바꾼다. 실행기 항목을 직접 dict로 만들지 말고 `entry_for`를 쓴다(이어지는 실행의 kept 항목이 billed를 건너뛰어 리뷰에서 막힘). 상한 없는 api는 `blocked`가 `switch_reason_uncapped`로 막고 `can_review`도 거른다. init은 `claude --version` 성공+키일 때만 사용 가능으로 세고 `InitReport.notes`로 안내 한 줄. `tests/test_init.py::setup`은 두 환경 변수를 지워 개발자 셸의 키를 막는다. `test_quota_executors.py`의 init 시험은 #848 `--starter` 전까지 실패가 기준선.
+- [roles 원본 (#769)](roles_source.md) — roles.py 단독 writer, 새 설정 키면 `uv run fa test`. 최종 답(옵션 3): `roles:` 키가 없으면 re-init은 파일을 바이트 그대로 두고 첫 `fa role` 명령이 블록을 쓴다. 그 파일의 "round 12 QUESTION 추천: 항상 이전"과 "every init writes roles"는 이 답으로 대체됐다.
+
+## API 키 Claude (#889)
+- 게이트의 `os.environ`에서 파생한다(`scheduler_quota.api_key_billing`, OAuth 토큰 우선). `billed()`가 `entry_for`·`fallback_order`에서 claude를 api로 바꾼다. 실행기 항목을 dict로 직접 만들지 말고 `entry_for`를 쓴다(재개 실행의 kept 항목·남은 implementer 기본값이 billed를 건너뛰어 리뷰에서 막힘; 과금 파생은 승인 경계에서 한다). 상한 없는 api는 `blocked`가 `switch_reason_uncapped`로 막고 `can_review`도 거른다. init은 `claude --version` 성공+키일 때만 사용 가능으로 세고 `InitReport.notes`로 한 줄 안내. `test_quota_executors.py`의 init 시험은 #848 `--starter` 전까지 실패가 기준선.
+
+## 상태 줄과 presence
+- `fa statusline`은 Claude Code가 매번 부르므로 `cli.main`에서 parser 전에 분기한다. 설치 질문은 `builtins.input`, EOF/OSError는 "unanswered"로 기억하지 않는다. 비대화형은 `fa init --statusline yes|no`. 집중: `tests/acceptance/test_statusline_wrapper.py tests/test_statusline.py`. settings.json 바이트 보존 편집은 `statusline._member_span`.
+- JSON 바이트 편집(#412): 중복 키는 마지막 값이 유효하다. 지울 때 같은 이름을 모두 지우고, 쓰기 전 `json.loads(편집본) == 의도한 dict`가 아니면 쓰지 않는다.
+- presence(#754): 로컬 상태만 읽어 사용자 출력 마지막 줄에 붙인다. 시각은 `statusline.datetime.now(UTC)`(잠긴 테스트가 cli·state·statusline의 datetime만 바꿈). 다른 기능의 전제에 묶지 않는다: 이전 명령이 없어도 붙이고 상태가 없으면 0. 겹친 wrapper(NESTED_ENV)만 침묵. 오늘 머지의 출처는 record_merge 하나이고 `presence.gate_merges`가 runs/<n>.json과 이력을 둘 다 읽는다. merged_at >= started_at만 센다. `tests/test_statusline.py`는 tmp로 chdir한다.
+- 세션 시작 훅(#755): `fa statusline --session-start` → `presence.session_start_message`(systemMessage JSON), 시작 시각은 `$XDG_DATA_HOME/foragent/presence-sessions/<sha>.json`(유일한 writer; 저장소 store에 두면 repo 없는 프로젝트에서 사라짐). 훅 정리를 wrapper 소유에 묶지 않는다: uninstall은 기록이 없거나 statusLine이 바뀌어도 훅을 지우고, init은 wrapper가 켜져 있을 때만 더한다. 바뀐 게 없으면 다시 쓰지 않는다(inode·mtime으로 시험).
+- 저장소 찾기(#802): repo 키가 없으면 `git.origin_slug_from_files(root)`가 .git/config(작업 트리면 gitdir→commondir)를 읽는다. url 규칙은 `git.slug_from_url` 하나. presence는 자식 프로세스 금지. 확인은 `test_statusline_repo_slug.py`.
+
+## 문구
+- 새 사람용 문구는 PR 본문 한 줄이라도 `src/foragent/messages/<기능>.py`의 `MESSAGES`에 두고 `from foragent.i18n import text`로 부른다. Files 밖이어도 레지스트리 규칙이 이긴다. 저장소 밖 명령의 언어는 `load_config(Path.cwd()).language`, 실패하면 "en".
+
+## 범위와 소유권
+- `scheduler.py`는 `test_scheduler_split.py`가 250줄로 제한한다(지금 250줄, 여유 없음). Files에 없으면 손대지 않고, 새 로직은 board_parents 같은 별도 모듈에 둔다. `test_cli_split`은 src/foragent/*.py 각 300줄.
+- 다른 이슈가 주인인 상수는 main에 들어오기 전까지 정의하지 말고 문자열을 쓴다("do not define it here", #694). 인수 테스트가 다른 레인의 미구현 API에 기대면 만들지 말고 blocked-by를 제안한다.
+- 잠긴 시험과 이슈 문구가 부딪치면 QUESTION.md로 올린다. 오케가 시험이나 요구를 고친다(#755·#769·#837). 리뷰가 서로 반대 방향(예: "굶주림" ↔ "낡은 캐시")을 번갈아 막으면 구현을 더 정교하게 만들지 말고 바로 QUESTION.md로 요구를 바꾸게 한다(#837에서 3라운드 낭비).
+
+## git과 재시도
+- 리뷰가 "내가 안 건드린 파일 삭제"를 지적하면 `git diff origin/main...HEAD -- <file>`(점 세 개)을 본다. 비어 있으면 main이 앞서간 것이다(`--name-status HEAD origin/main`에서 `A`). 겹치는 파일이 없고 HEAD가 origin/main의 조상이면 `git reset --keep origin/main`, 아니면 `git log HEAD..origin/main` 커밋을 `git cherry-pick --no-commit` 후 `git reset -q`(`git merge`는 권한 거부). 그래도 남으면 `.foragent/REBUTTAL.md`로 반박한다.
+- 병합 충돌에서 HEAD 쪽에만 있는 테스트는 `git grep -n 'def <name>' MERGE_HEAD -- tests`로 옮겨진 곳을 먼저 찾는다(#346이 test_runner.py를 test_run_*.py로 나눔).
+- "작업 트리를 다시 만들었다"는 재시도: 먼저 `git show --stat HEAD`로 WIP가 합쳐졌는지 보고, 없으면 `origin/foragent/issue-<N>`의 이전 커밋을 `cherry-pick --no-commit` + `reset -q`로 가져온다. 재시작 때 미커밋 변경은 사라질 수 있다.
+- 기준선 비교는 `git diff > .foragent/wip.patch; git apply -R`, 시험, `git apply`(`git checkout --`은 권한 거부).
+
+## 시험과 기준선
+- 전체 테스트(약 25분)는 실행 예산을 넘겨 작업 트리를 잃게 하므로 돌리지 않는다. 완료 기준과 바꾼 파일의 시험만 파일별로 `-rf`를 붙여 돌린다(여러 파일 한 호출은 출력이 빈 적이 있음). 인수 테스트는 수정하지 않는다. 샌드박스에서 uv 캐시를 못 쓰면 임시 `UV_CACHE_DIR`.
+- 실제 kill 시험(`...real_runner_is_terminated...`)은 환경이 `os.killpg`를 막으면 `PermissionError`로 실패한다. 다시 돌리지 말고 `-k 'not real_runner_is_terminated'`로 빼고 REBUTTAL로 답한다.
+- 남의 영역 시험이 "Acceptance baseline regression"이나 CI 실패로 지목되면: `gh run list --branch main --workflow ci`로 main도 깨지는지, 현재 HEAD에서 단독·파일 전체로 재현되는지 본다. 코드 변경 없는 커밋에서 깨졌다면 고정 `NOW`와 실제 시계가 섞인 시한폭탄이다(#769 test_cli inspect). 재현되지 않으면 코드를 건드리지 말고 REBUTTAL에 원인·file:line·반복 횟수를 적는다. 알려진 기준선 실패: `test_github_outbox.py::...rate_limited_close`(#705).
+- 가짜 추적기에 가벼운 읽기를 더할 때 `self.list_issues()`를 재사용하지 말고 `self.issues`를 거른다. `test_tick_step_times.py`가 `list_issues` 호출을 tick당 한 번으로 센다.
