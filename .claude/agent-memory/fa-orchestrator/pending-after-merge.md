@@ -268,3 +268,4 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - After #2078 (r53 dashboard) merges: re-draft the scene-contract unit-test tidy (#2053's goal) against main's new test names; close PR #2056 if still open (`fa orch close 2056 --superseded-by 2078`).
 - After #1952 merges: preread and publish `drafts/2026-11-05-mobsplit/plan.json` (split test_merge_owner_batch.py; fixes the green-but-late CI hold loop, architect r743). Check test_unit_helpers_split on main then: it must fail only for reasons this order fixes.
 - Jin q13 (11-05) chose option 2 for r732: while a train waits on CI, refresh one excluded member's head so it joins the next train. merge_owner._tick is the PM's v4 area; check that v4 includes it, else order it after v4 merges.
+- When the mobsplit order publishes: answer PM request r760 with its issue number (PM makes 'batch-tests-shared-start' blocked_by it).
