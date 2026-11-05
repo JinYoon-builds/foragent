@@ -416,7 +416,7 @@ def test_main_screen_acorn_numbers_never_write_osc8_links(tmp_path, monkeypatch)
     assert "\x1b]8;" not in written
 
 
-def test_selected_acorn_bubble_link_restores_the_cursor_curses_expects(tmp_path, monkeypatch):
+def test_links_restore_the_cursor_curses_expects(tmp_path, monkeypatch):
     _, written = paint_terminal(tmp_path, monkeypatch, [10, ord("q")], sizes=((40, 100),) * 2)
     url = "https://github.com/owner/repo/issues/3"
     assert written.count(watch.osc8(url, url)) == 1
