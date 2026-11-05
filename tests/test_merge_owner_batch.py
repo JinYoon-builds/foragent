@@ -9,6 +9,7 @@ from datetime import timedelta
 import fcntl
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -30,6 +31,7 @@ def batched(proto, monkeypatch):
     case = proto
     case.config = replace(case.config, merge_batch=True)
     case.ctx.config = case.config
+    case.ctx.reads = merge_owner.Snapshot(case.tracker)
     case.pending_batch = case.github_lag = case.merge_tip_metadata = False
     case.batch_pushes, case.target_pushes, case.target_attempts = [], [], []
     case.target_failure = case.after_target_push = None
@@ -335,9 +337,11 @@ def test_uncomposable_failed_half_falls_through_to_normal_batching(batched, monk
     queue_workers(case, [4, 2])
     report = support.gate(case)
     assert len(groups(case)) == 2 and composed_numbers(case) == [1, 4], report.actions
-    assert any("#5 merge batch excluded" in action for action in report.actions)
+    assert [action for action in report.actions if "#5" in action] == [
+        f"#5 sent back to lane: conflicts with {case.history.tip[:8]}"]
     assert len(batch.retirements(case.ctx)) == 1
-    assert {p.n for p, _, _ in batch_candidates(case)} == {5, 1, 4, 2}
+    assert {p.n for p, _, _ in batch_candidates(case)} == {1, 4, 2}
+    assert support.retry_marker(case.store.root, 5).exists()
     assert not case.target_pushes and not case.merges
 
 
@@ -373,7 +377,8 @@ def test_failed_half_uses_join_exclusions_without_filling_from_outsiders(retry_c
     proof = batch.prepare(case.ctx, report, batch_candidates(case))
     assert proof, report.actions
     assert [n for n, *_ in proof.chain] == [5, 4]
-    assert any("#1 merge batch excluded" in action for action in report.actions)
+    assert [action for action in report.actions if "#1" in action] == [
+        f"#1 sent back to lane: conflicts with {case.history.tip[:8]}"]
     excluded = case.tracker.pr_acceptance_reports(proof.chain[-1][2])[0]["report"]["excluded"]
     assert "tests/acceptance/test_own_1.py" in excluded
     assert all(f"tests/acceptance/test_own_{n}.py" not in excluded for n in [5, 4])
@@ -1042,7 +1047,7 @@ def test_restart_recreates_missing_prefix_prs_from_refs_without_republishing(bat
     assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2 and not refs(case)
 
 
-def test_main_conflict_skips_member_and_fills_batch_from_later_candidates(batched, monkeypatch):
+def test_main_conflict_returns_member_to_lane_and_fills_batch_from_later_candidates(batched, monkeypatch):
     case = batched
     case.config = replace(case.config, merge_batch_size=3)
     case.ctx.config = case.config
@@ -1058,12 +1063,19 @@ def test_main_conflict_skips_member_and_fills_batch_from_later_candidates(batche
     _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert chain == proof.chain
     skipped = [action for action in report.actions if "#1" in action]
-    assert len(skipped) == 1 and ("conflict" in skipped[0].lower() or "status 1" in skipped[0])
+    assert skipped == [f"#1 sent back to lane: conflicts with {case.history.tip[:8]}"]
     excluded = case.tracker.pr_acceptance_reports(proof.chain[-1][2])[0]["report"]["excluded"]
     assert "tests/acceptance/test_own_1.py" in excluded
     assert all(f"tests/acceptance/test_own_{n}.py" not in excluded for n in [5, 4, 2])
     assert not batch.retirements(case.ctx)
-    assert set(merge_owner.admissions(case.store)) == {(p.n, p.started_at) for p, _, _ in candidates}
+    assert set(merge_owner.admissions(case.store)) == {(p.n, p.started_at) for p, _, _ in candidates if p.n != 1}
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "closed"
+    issue = case.tracker.get_issue(1)
+    assert issue.state == "open" and "ready" in issue.labels and "blocked" not in issue.labels
+    assert support.retry_marker(case.store.root, 1).exists()
+    job = json.loads((case.store.root / "merge-owner/1.json").read_text())
+    assert job["phase"] == "repair-requested"
+    assert job["failure"] == f"Base refresh failed (base-changed); repair the PR on {case.history.tip}."
 
 
 def test_conflict_with_earlier_member_skips_only_that_member(batched, monkeypatch):
@@ -1081,6 +1093,218 @@ def test_conflict_with_earlier_member_skips_only_that_member(batched, monkeypatc
     assert [n for n, *_ in proof.chain] == [5, 4, 2]
     assert len([action for action in report.actions if "#1" in action]) == 1
     assert not batch.retirements(case.ctx)
+    assert set(merge_owner.admissions(case.store)) == {(p.n, p.started_at) for p, _, _ in candidates}
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "open"
+    assert not support.retry_marker(case.store.root, 1).exists()
+
+
+@pytest.mark.parametrize("conflicting", [(1,), (1, 4)])
+def test_all_main_conflicts_return_to_lanes_in_one_pass_and_only_once(batched, monkeypatch, conflicting):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, set(conflicting))
+    queue_workers(case, [5, *conflicting, 2])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    base = case.history.tip
+    close, closed = case.tracker.close_pr, []
+
+    def closing(pr, *args, **kwargs):
+        if pr in {support.pr_for(case, n).number for n in conflicting}:
+            closed.append(pr)
+        return close(pr, *args, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "close_pr", closing)
+    report = support.gate(case)
+    assert composed_numbers(case) == [5, 2], report.actions
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert not merge_owner.admissions(case.store)
+    for n in conflicting:
+        assert report.actions.count(f"#{n} sent back to lane: conflicts with {base[:8]}") == 1
+        assert case.tracker.get_pr(support.pr_for(case, n).number).state == "closed"
+        assert "ready" in case.tracker.get_issue(n).labels
+        assert support.retry_marker(case.store.root, n).exists()
+    assert len(closed) == len(conflicting)
+    again = support.gate(case)
+    assert len(closed) == len(conflicting)
+    assert not any("sent back to lane" in action for action in again.actions)
+
+
+def test_single_main_conflict_returns_to_lane_without_a_batch(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {5})
+    queue_workers(case, [5])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    report = support.gate(case)
+    assert report.actions.count(f"#5 sent back to lane: conflicts with {case.history.tip[:8]}") == 1
+    assert not groups(case) and not case.target_pushes and not case.merges
+    assert not merge_owner.admissions(case.store)
+    assert case.tracker.get_pr(support.pr_for(case, 5).number).state == "closed"
+    assert "ready" in case.tracker.get_issue(5).labels
+    assert support.retry_marker(case.store.root, 5).exists()
+    job = json.loads((case.store.root / "merge-owner/5.json").read_text())
+    assert job["phase"] == "repair-requested"
+
+
+def test_workflow_exclusion_does_not_send_a_main_conflict_to_lane(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    edit_member_workflows(case, monkeypatch, {1: ".github/workflows/foragent-acceptance.yml"})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    assert proof and [n for n, *_ in proof.chain] == [5, 4], report.actions
+    assert any("#1 merge batch excluded: acceptance workflow differs from target" == action
+               for action in report.actions)
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "open"
+    assert not support.retry_marker(case.store.root, 1).exists()
+
+
+def test_unavailable_base_conflict_probe_keeps_admission_for_single_path(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    base, head = case.history.tip, case.tracker.pr_head_sha(support.pr_for(case, 1).number)
+    transport, probes = case.git._run, []
+
+    def unavailable(args):
+        if args == ["merge-tree", "--write-tree", base, head]:
+            probes.append(args)
+            raise subprocess.CalledProcessError(128, ["git", *args], stderr="base probe unavailable")
+        return transport(args)
+
+    monkeypatch.setattr(case.git, "_run", unavailable)
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, batch_candidates(case))
+    assert proof and [n for n, *_ in proof.chain] == [5, 4], report.actions
+    assert len(probes) == 1
+    assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "open"
+    assert not support.retry_marker(case.store.root, 1).exists()
+    assert not any("sent back to lane" in action for action in report.actions)
+
+
+def test_main_conflict_rechecks_pr_head_before_returning_to_lane(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    candidates = batch_candidates(case)
+    pr = support.pr_for(case, 1).number
+    changed_head = case.tracker.pr_head_sha(support.pr_for(case, 4).number)
+    assert not case.git.is_ancestor(changed_head, case.history.tip)
+    case.tracker.set_pr_head_sha(pr, changed_head)
+    report = TickReport()
+    proof = batch.prepare(case.ctx, report, candidates)
+    assert proof and [n for n, *_ in proof.chain] == [5, 4], report.actions
+    assert case.tracker.get_pr(pr).state == "open"
+    assert not support.retry_marker(case.store.root, 1).exists()
+    job = json.loads((case.store.root / "merge-owner/1.json").read_text())
+    assert job["phase"] == "held"
+    assert not any("sent back to lane" in action for action in report.actions)
+
+
+def test_main_conflict_repair_resumes_after_lost_close_response(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    pr = support.pr_for(case, 1).number
+    close, closed = case.tracker.close_pr, []
+
+    def lost_response(number, *args, **kwargs):
+        close(number, *args, **kwargs)
+        if number == pr:
+            closed.append(number)
+            raise TrackerError("Lost close response")
+
+    monkeypatch.setattr(case.tracker, "close_pr", lost_response)
+    support.gate(case)
+    assert composed_numbers(case) == [5, 4]
+    assert case.tracker.get_pr(pr).state == "closed"
+    assert merge_owner.pending(case.store, 1)
+    assert not support.retry_marker(case.store.root, 1).exists()
+    job = json.loads((case.store.root / "merge-owner/1.json").read_text())
+    assert job["phase"] == "repair"
+    support.gate(case)
+    assert closed == [pr]
+    assert not merge_owner.pending(case.store, 1)
+    assert "ready" in case.tracker.get_issue(1).labels
+    assert support.retry_marker(case.store.root, 1).exists()
+
+
+def test_main_conflict_repair_rate_limit_stops_batch_publication_until_resumed(batched, monkeypatch):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    pr = support.pr_for(case, 1).number
+    close, failed = case.tracker.close_pr, []
+
+    def throttled(number, *args, **kwargs):
+        if number == pr and not failed:
+            failed.append(number)
+            raise TrackerError("HTTP 429 API rate limit exceeded")
+        return close(number, *args, **kwargs)
+
+    monkeypatch.setattr(case.tracker, "close_pr", throttled)
+    report = support.gate(case)
+    backoff = case.store.github_wait_until(case.clock[0])
+    assert failed == [pr] and backoff is not None
+    assert not groups(case) and not refs(case) and not case.batch_pushes
+    assert not case.target_pushes and not case.merges
+    assert merge_owner.pending(case.store, 1)
+    assert not any("sent back to lane" in action for action in report.actions)
+    support.gate(case)
+    assert not case.batch_pushes and not case.target_pushes
+    case.clock[0] = backoff + timedelta(seconds=1)
+    support.gate(case)
+    assert composed_numbers(case) == [5, 4]
+    assert len(case.target_pushes) == 1 and not case.merges
+    assert not merge_owner.admissions(case.store)
+    assert case.tracker.get_pr(pr).state == "closed"
+    assert "ready" in case.tracker.get_issue(1).labels
+    assert support.retry_marker(case.store.root, 1).exists()
+
+
+@pytest.mark.parametrize("failure", ["save", "withdraw"])
+def test_main_conflict_partial_repair_does_not_report_return_to_lane(batched, monkeypatch, failure):
+    case = batched
+    edit_member_shared_file(case, monkeypatch, {1})
+    queue_workers(case, [5, 1, 4])
+    update_base(case, {"src/shared.py": "VALUE = -1\n"})
+    failed = []
+    if failure == "save":
+        save = merge_owner._save
+
+        def interrupted(ctx, place, job):
+            if place.n == 1 and job["phase"] == "repair-requested" and not failed:
+                failed.append(place.n)
+                raise OSError("repair completion save unavailable")
+            return save(ctx, place, job)
+
+        monkeypatch.setattr(merge_owner, "_save", interrupted)
+    else:
+        withdraw = merge_owner.queue.withdraw
+
+        def interrupted(ctx, place):
+            if place.n == 1 and not failed:
+                failed.append(place.n)
+                raise OSError("admission withdrawal unavailable")
+            return withdraw(ctx, place)
+
+        monkeypatch.setattr(merge_owner.queue, "withdraw", interrupted)
+    report = support.gate(case)
+    assert failed == [1]
+    assert composed_numbers(case) == [5, 4]
+    assert merge_owner.pending(case.store, 1)
+    assert not any("#1 sent back to lane" in action for action in report.actions)
+    support.gate(case)
+    assert not merge_owner.pending(case.store, 1)
+    assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "closed"
+    assert "ready" in case.tracker.get_issue(1).labels
+    assert support.retry_marker(case.store.root, 1).exists()
 
 
 def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, monkeypatch):
