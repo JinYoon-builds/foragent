@@ -1070,6 +1070,7 @@ LAUNCHED_REFUSED = [
     ["orch", "merge", "2", "--approved-by", "human"],
     ["skills", "add", "https://github.com/offline/pack", "--approve"],
     ["settings", "set", "review", "careful"],
+    ["stop"],
     ["init", "--fa-allow", "no"],
     ["role", "add", "auditor"],
     ["role", "set", "architect"],
@@ -1192,3 +1193,57 @@ def test_dashboard_and_gate_watch_draw_and_open_the_same_dashboard(app, monkeypa
     assert opened == []
     assert cli.main([*argv, "--open", "--repo-root", str(root)]) == 0
     assert len(drawn) == 1 and opened == [(root, store, "en")]
+
+
+STDIN_TEXT = "Run `fa stop` or $(gh pr view 1)?\n\t\"q\" 'q' C:\\tmp\n"
+FREE_TEXT_CASES = [
+    (["orch", "request", "--from", "architect", "--text", "-"], "text"),
+    (["orch", "request-status", "r1", "done", "--answer", "-"], "answer"),
+    (["orch", "request-status", "r1", "done", "--note", "-"], "note"),
+    (["orch", "answer", "q1", "--text", "-"], "text"),
+    (["orch", "note", "--now", "-"], "now"),
+    (["orch", "note", "--why", "-"], "why"),
+    (["orch", "note", "--next", "-"], "next_step"),
+    (["orch", "role-decision", "r1", "rejected", "--role", "architect", "--answer", "-"], "answer"),
+    (["orch", "signal-answer", "s1", "not-now", "--why", "-"], "why"),
+    (["inspect", "answer", "41", "--text", "-"], "text"),
+    (["inspect", "feedback", "--title", "t", "--body", "-"], "body"),
+    (["order", "note", "--defer", "next-code-merge", "--kind", "decision", "--text", "-"], "text"),
+    (["decisions", "drop", "D9", "--why", "-"], "why"),
+]
+
+
+def received(monkeypatch, stdin):
+    seen = []
+    monkeypatch.delenv("FORAGENT_ROLE", raising=False)
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(stdin))
+    monkeypatch.setattr(cli.commands, "module", lambda name: SimpleNamespace(run=lambda args: seen.append(args) or 0))
+    return seen
+
+
+@pytest.mark.parametrize("argv,name", FREE_TEXT_CASES, ids=lambda value: " ".join(value[:3]) if isinstance(value, list) else value)
+def test_free_text_dash_reads_stdin_exactly_once(tmp_path, monkeypatch, argv, name):
+    monkeypatch.chdir(tmp_path)
+    seen = received(monkeypatch, STDIN_TEXT + "\n")
+    assert cli.main(argv) == 0
+    assert getattr(seen[0], name) == STDIN_TEXT
+
+
+def test_free_text_other_values_stay_literal_and_empty_stdin_is_empty(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    seen = received(monkeypatch, "unused")
+    assert cli.main(["orch", "answer", "q1", "--text", " - "]) == 0
+    assert cli.main(["orch", "answer", "q1", "--text=-x"]) == 0
+    assert [args.text for args in seen] == [" - ", "-x"]
+    assert sys.stdin.read() == "unused", "Only the exact value - reads stdin"
+    seen = received(monkeypatch, "")
+    assert cli.main(["orch", "answer", "q1", "--text", "-"]) == 0 and seen[0].text == ""
+
+
+def test_free_text_dash_twice_is_refused_before_reading(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    seen = received(monkeypatch, "kept")
+    assert cli.main(["orch", "note", "--now", "-", "--next", "-"]) == 2
+    err = capsys.readouterr().err
+    assert seen == [] and err.count("\n") == 1 and "--now, --next" in err
+    assert sys.stdin.read() == "kept"
