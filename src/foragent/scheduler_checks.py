@@ -75,7 +75,8 @@ def _check_prerequisites(
         return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None
-        and (latest_run is None or latest_run.outcome != "limit-wait")
+        # These outcomes return to ready by themselves; the next run continues the same branch and PR (#1514).
+        and (latest_run is None or latest_run.outcome not in {"limit-wait", "base-changed"})
     ):
         if scheduler.READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])

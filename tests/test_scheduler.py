@@ -2578,6 +2578,22 @@ def test_limit_wait_can_resume_an_issue_with_an_existing_retry_pr(ctx):
     assert (ctx.store.get_run(1).attempts, ctx.store.get_run(1).restarts) == (2, 1)
 
 
+@pytest.mark.parametrize("outcome,resumes", [("base-changed", True), ("limit-wait", True), ("error", False)])
+def test_a_run_that_returned_to_ready_resumes_with_its_open_pr(ctx, outcome, resumes):
+    """base-changed returns to ready by itself like limit-wait: its open PR is the work the
+    next run continues, so the PR does not take ready away (#1514). Other outcomes keep the guard."""
+    approve(ctx)
+    tick(ctx)
+    ctx.store.start_run(1, branch="foragent/issue-1", worktree=ctx.store.worktree_path(1))
+    ctx.store.finish_run(1, outcome)
+    ctx.tracker.add_labels(1, ["ready"])
+    ctx.tracker.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+    ctx.start_runs = True
+    tick(ctx)
+    assert ("ready" in ctx.tracker.get_issue(1).labels or ctx.store.get_run(1).status == "running") is resumes
+    assert (ctx.store.get_run(1).status == "running") is resumes
+
+
 def recovery_events(ctx):
     path = ctx.store.root / "orch-events.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []

@@ -10,7 +10,6 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from foragent import cuts
-from foragent import run_waits
 from foragent.run_attempt import AttemptFailure
 from foragent.run_checks import _passing_acceptance_ids, _pytest_command, junit_node_id
 from foragent.run_waits import _phase, _progress, _test_slot, in_phase, phase_identity, restore_phase
@@ -40,16 +39,6 @@ def check(n, ctx, command, root):
     return runner._check(command, root, ctx.store.log_path(n), max(1, runner._remaining(n, ctx)),
                          progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
                          full_text_dir=cuts.issue_dir(ctx.store.root, n))
-
-
-def budget_spent(n, ctx, result):
-    from foragent import runner
-    return result is not None and result.timed_out and runner._remaining(n, ctx) <= 0
-
-
-def stop_if_budget_spent(n, ctx, result):
-    if result is not None:
-        run_waits.stop_if_budget_spent(n, ctx, result.timed_out, f"{result.command}\n{result.output}")
 
 
 @contextmanager
@@ -106,7 +95,6 @@ def _capture_local_only(n, ctx, git, command, base_sha, excluded):
             result = check(n, ctx, f"{environment} {selection} -p fa_local_measurement "
                            f"-o junit_family=legacy --junit-prefix= --junitxml={shlex.quote(str(report))}", root)
             _validate_baseline_checkout(git.at(root), base_sha)
-            stop_if_budget_spent(n, ctx, result)
             try:
                 collected, passing = report_ids(report, result, json.loads(evidence.read_text()))
             except (OSError, ValueError, ET.ParseError) as exc:
@@ -148,8 +136,6 @@ def verify_local_only_units(attempt, command):
     _append(attempt.ctx.store.log_path(attempt.n),
             f"Local-only unit collection exit_code={collected.exit_code}, timed_out={collected.timed_out}\n"
             f"{collected.output}")
-    if budget_spent(attempt.n, attempt.ctx, collected):
-        return collected  # The caller names the spent run budget; continuing would outrun it.
     if collected.exit_code == 5 and not collected.timed_out:
         return None
     if collected.exit_code != 0 or collected.timed_out:
@@ -201,7 +187,6 @@ def fallback_comparison(attempt, base_sha):
         attempt.baseline = baseline
         raise AttemptFailure("Acceptance comparison modified tracked files; reverify with the local baseline.",
                              attempt.target_branch)
-    stop_if_budget_spent(n, ctx, result)
     if result is not None and (result.exit_code != 0 or result.timed_out):
         raise AttemptFailure(f"Acceptance baseline regression:\n{result.command}\n{result.output}", attempt.target_branch)
     ctx.store.update_run(n, comparison={"source": "local", "duration_seconds": max(0, ctx.monotonic() - started)})

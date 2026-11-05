@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, run_waits, runner
+from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
@@ -129,10 +129,6 @@ def enqueue(ctx, n, git, pr, branch, target, head, base, approval, ready_at, com
         "base": base, "approval": asdict(approval), "ready_at": ready_at,
         "comparison": asdict(comparison) if comparison is not None else None,
         "authorization": ctx.merge_authorization,
-        # The worker's standing review PASS travels with the handoff: the owner's
-        # turns run in other contexts and must still name a budget spent following
-        # a moved base as base-changed (#1514).
-        "review_pass": getattr(ctx, "_budget_review_pass", None) == n,
         "phase": "waiting",
     }
     with ctx.store._state_lock():
@@ -257,15 +253,6 @@ def _end(ctx, place, job, phase):
     queue.withdraw(ctx, place)
 
 
-def _stop(ctx, place, job, outcome):
-    if outcome == "base-changed" and getattr(ctx, "_budget_base_changed", None) == place.n:
-        # Ready must be startable: an open PR otherwise removes it on the next tick.
-        job["repair_outcome"] = outcome
-        _repair(ctx, place, job, "Run budget spent following a changed base; retry implementation.")
-    else:
-        _end(ctx, place, job, outcome)
-
-
 def _repair_intent(ctx, place, job, detail):
     # Every fallible read and label side effect must follow durable intent.
     job.update(phase="repair", failure=detail)
@@ -281,14 +268,10 @@ def _repair(ctx, place, job, detail):
     if pr.merged_at:
         _complete(ctx, place, job, pr)
         return
-    if (job.get("repair_outcome") == "base-changed"
-            and ctx.tracker.get_issue(place.n).labels & {BLOCKED, NEEDS_HUMAN}):
-        _end(ctx, place, job, "base-changed")
-        return  # A real base/target hold is not budget recovery, including on replay.
     with ctx.reads.fresh():
         _retry(ctx, place.n, detail, expected_pr=pr.number, expected_head_sha=job["head"],
                expected_target=job["target"])
-    _end(ctx, place, job, job.get("repair_outcome", "repair-requested"))
+    _end(ctx, place, job, "repair-requested")
 
 
 def close_for_repair(ctx, n, pr_number, head, target, *, branch=None, comment=None):
@@ -361,8 +344,6 @@ def _reverify(ctx, place, job, git, head):
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
     if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link):
-        if stopped in run_waits.TIME_OUTCOMES:
-            return stopped
         raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
     attempt = ci_mode.review_checks(n, ctx, git, target)  # local_only stays on the machine in either mode.
     if not ci_mode.enabled(ctx, target):
@@ -419,7 +400,8 @@ def _ready(ctx, place, job, pr, git, base, comparison):
     if closed or held or superseded:
         _end(ctx, place, job, "superseded" if superseded else "closed" if closed else "held")
     elif inputs.stop:
-        _stop(ctx, place, job, inputs.stop())  # Flags/approval invalidation happen outside the lock.
+        inputs.stop()
+        _end(ctx, place, job, "held")
     elif inputs.status == "fail":
         raise AttemptFailure("CI failed at final merge recheck", pr.base)
     return False
@@ -445,7 +427,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 approval, job["ready_at"], approved_body_sha=approval.body_sha,
             )
             if inputs.stop:
-                _stop(ctx, place, job, inputs.stop())
+                inputs.stop()
+                _end(ctx, place, job, "held")
                 return False
             if not run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
                                               authorization=job.get("authorization")):
@@ -504,10 +487,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                     ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
             )
             if stopped:
-                if stopped == "base-changed" and job["phase"] == "repair":
+                if stopped == "base-changed":
                     _repair(ctx, place, job, f"Base refresh failed ({stopped}); repair the PR on {base}.")
                 else:
-                    _stop(ctx, place, job, stopped)
+                    _end(ctx, place, job, "held")
                 return False
             job.update(phase="waiting", head=head)
             _save(ctx, place, job)
@@ -564,8 +547,8 @@ def _try_admission(ctx, place, job, step):
             return False
     except (ci_mode.MissingComparison, ci_mode.StaleComparison):
         return False  # No waiting process or arbitrary healthy-run wait limit.
-    except ExecutorStopped as exc:
-        _stop(ctx, place, job, exc.outcome)
+    except ExecutorStopped:
+        _end(ctx, place, job, "held")
         return False
     except Exception as exc:
         if isinstance(exc, TrackerError):
@@ -585,17 +568,12 @@ def advance_members(ctx, members, comparison=None):
     advanced = False
     for place, job, pr in members:
         ctx.merge_owner_started_at = ctx.now()
-        # Each turn starts its own budget: only the handed-off PASS stands, no base was followed yet.
-        run_waits.new_budget_turn(ctx, place.n if job.get("review_pass") else None)
         with _track_checks(ctx, place, job):
             advanced |= _try_admission(ctx, place, job, lambda: _advance(ctx, place, job, pr, comparison))
     return advanced
 
 
 def _reconcile(ctx, place, job):
-    if job["phase"] not in {"repair", "waiting", "publishing", "merging"} and not job.get("merge_fact"):
-        queue.withdraw(ctx, place)
-        return None  # A saved terminal result survives an interrupted withdrawal; a landing replays below.
     if any(processes.recorded_identity_evidence(item["pid"], item["start_time"], fresh=True).alive is not False
            for item in job.get("process_identities", [])):
         return None  # Cleanup was refused or could not establish absence.
@@ -658,6 +636,9 @@ def _reconcile(ctx, place, job):
         return None
     if job.get("merge_failure"):
         _repair(ctx, place, job, f"Merge failed: {job['merge_failure']}")
+        return None
+    if job["phase"] in {"held", "closed", "repair-requested", "merged", "superseded"}:
+        queue.withdraw(ctx, place)
         return None
     if issue.labels & {BLOCKED, NEEDS_HUMAN}:
         _end(ctx, place, job, "held")

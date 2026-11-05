@@ -523,7 +523,7 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
     """Rechecking an existing issue PR uses the same CI and machine evidence."""
     from types import SimpleNamespace
     from foragent import harness_guard, runner
-    from foragent.ci_local import capture_local_only, check, stop_if_budget_spent, verify_local_only_units
+    from foragent.ci_local import capture_local_only, check, verify_local_only_units
     from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
     from foragent.run_waits import in_phase
     import shlex
@@ -557,8 +557,6 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
                 ci_passed = ctx.tracker.pr_unit_passed_tests(head)
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),
                                             max(1, runner._remaining(n, ctx)), ci_passed=ci_passed, head_sha=head))
-    for result in checks:
-        stop_if_budget_spent(n, ctx, result)  # every check here ran on the run's remaining time
     for result in checks:
         if result.exit_code != 0 or result.timed_out:
             raise AttemptFailure(f"{result.command}\n{result.output}", target_branch)

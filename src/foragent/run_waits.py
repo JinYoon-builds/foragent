@@ -97,11 +97,6 @@ def paused_seconds(n: int, ctx: RunContext) -> float:
     return run.waited_seconds + run.talk_pause_seconds(now)
 
 
-# The names ``_timeout`` gives a run that ran out of time, plus the gate's runtime backstop.
-# Consumers pass them on unchanged; they are never a repairable check failure (#1514).
-TIME_OUTCOMES = frozenset({"timeout", "too-large", "base-changed", "runtime-exceeded"})
-
-
 def new_budget_turn(ctx: RunContext, review_pass: int | None = None) -> None:
     """Start the timeout-attribution marks of one invocation (#1514).
 

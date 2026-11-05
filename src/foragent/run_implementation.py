@@ -355,13 +355,14 @@ def _implement(
     from foragent import runner
 
     n, ctx = attempt.n, attempt.ctx
-    runner.new_budget_turn(ctx)
     wait_for_overlap(attempt)
     worktree, log = attempt.worktree, attempt.log
     _phase(n, ctx, "resolving-conflict" if merge_conflicts is not None else "implementing")
     remaining = runner._remaining(n, ctx)
     if remaining <= 0:
+        # No session starts: the budget went to whatever this run did last, PASS and base following included.
         raise ExecutorStopped(_timeout(n, ctx))
+    runner.new_budget_turn(ctx)  # A new implementer session spends the budget on its own work (#1514).
     run = ctx.store.get_run(n)
     # Every executor turn writes one new key; a key is never rewritten (#238).
     key, tier = choose_tier(ctx, run, attempt.size)

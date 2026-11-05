@@ -239,3 +239,50 @@ def test_baseline_measurement_cut_by_the_run_budget_names_the_run(
     assert (flag.reason if flag else None) == (None if moved else "too-large")
     assert case.tracker.get_issue(1).labels & {"ready", "running", "blocked"} == (
         {"ready"} if moved else {"blocked"})
+
+
+@pytest.mark.parametrize("followed", [False, True])
+def test_no_session_left_after_a_pass_keeps_the_runs_attribution(git_history, tmp_path, monkeypatch, followed):
+    """After a PASS the run followed a moved base and its rechecks failed, so the loop came back
+    to implementation with no run time left. No implementer session starts, so the budget went
+    to what the run did last: following the base is base-changed, and without it too-large (#1514)."""
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_implementation import _implement, _prepare_implementation
+
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    case.git.fetch("origin", "main")
+    worktree = case.store.worktree_path(1)
+    case.git.add_worktree(worktree, "foragent/issue-1", "origin/main")
+    case.store.start_run(1, branch="foragent/issue-1", worktree=worktree)
+    attempt = _prepare_implementation(1, case.ctx, case.git.at(worktree), target_branch="main",
+                                      capture_baseline=False)
+    case.ctx._budget_review_pass = 1
+    case.ctx._budget_base_changed = 1 if followed else None
+    case.clock[0] += timedelta(minutes=RUNTIME_MINUTES, seconds=1)
+    with pytest.raises(ExecutorStopped) as caught:
+        _implement(attempt, "Done when failed on the moved base")
+    expected = "base-changed" if followed else "too-large"
+    assert caught.value.outcome == expected
+    assert case.implementer.calls == []
+    assert case.tracker.get_issue(1).labels & {"ready", "blocked"} == ({"ready"} if followed else {"blocked"})
+
+
+@pytest.mark.parametrize("pushed", [True, None])
+def test_a_resumed_reviewed_push_keeps_its_pass_for_later_base_following(git_history, tmp_path, monkeypatch, pushed):
+    """A reviewed head whose publication push resumed after an outage reuses that PASS; budget
+    then spent following a moved base must still count as after that PASS (#1514)."""
+    from foragent import orch_github, runner
+    from foragent.run_attempt import ExecutorStopped
+
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(orch_github, "resume_push", lambda ctx, n, git: pushed)
+
+    def first_check(attempt):
+        seen.append(getattr(attempt.ctx, "_budget_review_pass", None))
+        raise ExecutorStopped("held", "stop after the first check")
+
+    monkeypatch.setattr(runner, "_verify_implementation", first_check)
+    monkeypatch.setattr(runner, "_implement", lambda *args, **kwargs: None)
+    runner.run_issue(1, case.ctx)
+    assert seen == [1 if pushed else None]

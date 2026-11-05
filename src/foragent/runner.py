@@ -274,6 +274,7 @@ def _implement_and_publish(
             reviewed = not resume_verified and not failure and (
                 (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
+            new_budget_turn(ctx, n if reviewed else None)  # a reused PASS (also after a resumed push) stands (#1514)
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:
