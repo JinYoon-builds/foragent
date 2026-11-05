@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import re
-from types import SimpleNamespace
 from typing import Any
 
 from foragent import orch_inbox, orch_park
@@ -32,67 +31,22 @@ KINDS = ("supply_low", "request_stuck", "park_resolved")
 HELD = {BLOCKED, NEEDS_HUMAN, WAITING_PERSON}
 
 
-def _ctx(store: StateStore, config: Config, root, now: datetime) -> SimpleNamespace:
-    return SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
+def supply(config: Config, running: list[Run], waiting, work: dict[str, Any]) -> dict[str, Any]:
+    """Free lanes and the approved issues the gate's admission would start in them now.
 
-
-def free_lanes(store: StateStore, config: Config, root, now: datetime, running: list[Run]) -> list[str]:
-    """Lanes (with main) the gate could start in now: no live run and no lane hold.
-
-    A lane the plan paused, that dreams, or that quota holds waits on that hold, not on supply
-    (``scheduler_start._lane_hold``, the tick's own rule)."""
-    from foragent.scheduler_start import _lane_hold
-
-    busy = {run.lane or "main" for run in running}
-    ctx = _ctx(store, config, root, now)
-    return sorted(lane for lane in (set(config.lanes) | {"main"}) - busy if _lane_hold(ctx, lane, now) is None)
-
-
-def startable(store: StateStore, config: Config, root, now: datetime, running: list[Run], waiting) -> list[int]:
-    """Approved issues the gate's start loop would admit now, in its own order.
-
-    Each must be ``_Waiting.startable`` (ready, not blocked or awaiting a person) and pass the
-    gate's file rule (``overlap_files.admits``: lane serialisation, exclusive reservations,
-    per-file limits) against the live runs' claims and the claims of those admitted before it,
-    as `fa orch facts` replays it (``orch_facts_resources._admission``). Machine slots and lane
-    holds are left out: they bind capacity, not supply. Approved work that cannot start therefore
-    never covers a free lane.
+    ``work`` is the read-only replay of the tick's start loop (``orch_facts_resources._admission``,
+    which decides through ``scheduler_start.local_hold``, the loop's own rule): every issue it holds
+    (a cap, a lane pause, dream or quota hold, plan width, labels, a recorded blocker, the file rule
+    or an exclusive reservation, a GitHub wait, run hours or critical memory) is not startable. A
+    free lane has no live run; only admitted issues of free lanes count, since a start in a busy lane
+    feeds no free one. ``short``: fewer startable issues than free lanes.
     """
-    from foragent import orch_queue
-    from foragent.orch_facts_resources import _simulated_start
-    from foragent.overlap_files import admits, claim, claims, recorded_union
-    from foragent.scheduler_start import _ranked
-
-    items = {item.number: item for item in waiting if item.startable}
-    if not items:
-        return []
-    ctx = _ctx(store, config, root, now)
-    live = {(run.number, run.started_at) for run in running}
-    known, unknown = claims(ctx, measured=False)
-    known = [entry for entry in known if (entry.run.number, entry.run.started_at) in live]
-    unknown = [run for run in unknown if (run.number, run.started_at) in live]
-    lanes: dict[str, list[int]] = {}
-    for item in items.values():
-        lanes.setdefault(item.lane, []).append(item.number)
-    ready = {lane: orch_queue.ordered(store, lane, numbers) for lane, numbers in lanes.items()}
-    union, admitted = recorded_union(store), []
-    for lane, number in _ranked(ctx, ready, claims=list(known)):
-        item = items[number]
-        if not admits(ctx, lane, item.parsed, known, unknown, union=union):
-            continue
-        admitted.append(number)
-        run = _simulated_start(store, number, lane, now)
-        if item.parsed.files:
-            known.append(claim(run, item.parsed))
-        else:
-            unknown.append(run)
-    return admitted
-
-
-def is_low(store: StateStore, config: Config, root, now: datetime, running: list[Run], waiting) -> bool:
-    """Startable approved work is below the free lane slots right now."""
-    free = free_lanes(store, config, root, now, running)
-    return bool(free) and len(startable(store, config, root, now, running, waiting)) < len(free)
+    free = sorted((set(config.lanes) | {"main"}) - {run.lane or "main" for run in running})
+    lanes = {item.number: item.lane for item in waiting}
+    held = set(work.get("held") or {})
+    admitted = [number for number in work.get("waiting_issues") or []
+                if str(number) not in held and lanes.get(number) in free]
+    return {"free_lanes": free, "startable": len(admitted), "short": len(admitted) < len(free)}
 
 
 def _unapproved_ready(store: StateStore) -> int:
@@ -127,36 +81,26 @@ def _since(store: StateStore) -> datetime | None:
         return None
 
 
-def hold(store: StateStore, config: Config, root, now: datetime) -> None:
-    """The gate tick's record of when supply went low; removed once supply covers the free lanes."""
-    from foragent.orch_facts import _current_runs
-    from foragent.orch_facts_resources import _still_running
-    from foragent.orch_facts_runs import _waiting_issues
-
-    running = _still_running(store, _current_runs(store))
-    low = is_low(store, config, root, now, running, _waiting_issues(store, config, running))
+def hold(store: StateStore, current: dict[str, Any] | None, now: datetime) -> None:
+    """The gate tick's record of when supply went low, from the facts' ``supply`` it just measured;
+    removed once supply covers the free lanes. The facts read it next tick (``supply_low_numbers``)."""
     path = store.root / HOLD_FILE
     with store._state_lock():
-        if not low:
+        if not (current or {}).get("short"):
             path.unlink(missing_ok=True)
         elif _since(store) is None:
             store._write_json(path, {"since": now.isoformat()})
 
 
-def supply_low_numbers(store: StateStore, config: Config, root, now: datetime, running: list[Run],
-                       waiting) -> dict[str, Any]:
+def supply_low_numbers(store: StateStore, now: datetime, current: dict[str, Any]) -> dict[str, Any]:
     """Free lanes (by name), their count, startable approved issues and issues waiting only for approval.
 
-    The hold writer and this reader apply the same ``free_lanes`` and ``startable`` rules."""
+    Present once supply has been short since the tick's hold for ``SUPPLY_HOLD`` and still is."""
     since = _since(store)
-    if since is None or now - since < SUPPLY_HOLD:
+    if since is None or now - since < SUPPLY_HOLD or not current.get("short"):
         return {}
-    free = free_lanes(store, config, root, now, running)
-    admitted = startable(store, config, root, now, running, waiting)
-    if not free or len(admitted) >= len(free):
-        return {}
-    return {"free_lanes": free, "free_slots": len(free), "startable": len(admitted),
-            "unapproved_ready": _unapproved_ready(store)}
+    return {"free_lanes": current["free_lanes"], "free_slots": len(current["free_lanes"]),
+            "startable": current["startable"], "unapproved_ready": _unapproved_ready(store)}
 
 
 def processing_since(record: dict[str, Any]) -> datetime | None:
@@ -224,7 +168,7 @@ def park_resolved_numbers(store: StateStore) -> dict[str, Any]:
     return {"parked": resolved} if resolved else {}
 
 
-def collect(store: StateStore, config: Config, root, now: datetime, running: list[Run], waiting) -> dict[str, Any]:
-    return {"supply_low": supply_low_numbers(store, config, root, now, running, waiting),
+def collect(store: StateStore, now: datetime, current: dict[str, Any]) -> dict[str, Any]:
+    return {"supply_low": supply_low_numbers(store, now, current),
             "request_stuck": request_stuck_numbers(store, now),
             "park_resolved": park_resolved_numbers(store)}

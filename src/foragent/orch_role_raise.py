@@ -486,10 +486,16 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
     """
     with step("role_signals"):
         try:
+            facts = None
             if (Path(repo_root) / ".foragent.yml").is_file():
-                # The tick is the one writer of the supply-low hold its facts read (#2088).
-                orch_facts_stall.hold(store, load_config(Path(repo_root)), Path(repo_root), now)
-            return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
+                # One facts read per tick: the tick writes the supply-low hold from it (its one
+                # writer, #2088) and every role signal is measured on the same read.
+                from foragent import orch_facts
+
+                facts = orch_facts.collect(store, load_config(Path(repo_root)), Path(repo_root), checkout=True)
+                orch_facts_stall.hold(store, facts.get("supply"), now)
+            with orch_roles.tick_facts(facts):
+                return raise_due(store, repo_root, now, start=True) if start else raise_due(store, repo_root, now)
         except Exception as exc:  # noqa: BLE001 - one failed check must not stop the tick.
             print(text("tick_step_failed", language, step="role_signals", error=f"{type(exc).__name__}: {exc}"),
                   file=sys.stderr, flush=True)

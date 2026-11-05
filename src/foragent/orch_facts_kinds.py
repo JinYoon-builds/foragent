@@ -241,7 +241,8 @@ def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any
             "oldest_waiting_seconds": max(0, int((now - start).total_seconds()))}
 
 
-def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting) -> dict[str, Any]:
+def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting,
+            supply: dict[str, Any] | None = None) -> dict[str, Any]:
     """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
     numbers = {
         "repeated_design_holds": repeated_design_holds_numbers(store, now),
@@ -251,7 +252,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
         "waiting_on_person": waiting_on_person_numbers(store, now),
-        **orch_facts_stall.collect(store, config, root, now, running, waiting),
+        **orch_facts_stall.collect(store, now, supply or {}),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}
