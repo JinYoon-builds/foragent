@@ -7,7 +7,7 @@ import json
 import subprocess
 
 from foragent import ci_mode, harness_guard, orch_stop
-from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
+from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope, parse_exclusions
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import GitError, main_write_lock
 from foragent.issue import parse_body
@@ -48,6 +48,20 @@ def _exclusions(ctx, base, chain):
     return pending_acceptance_exclusions(
         ctx, (base, *(head for _, head, _, _ in chain)), ctx.store.log_path(chain[0][0]),
         own=[n for n, *_ in chain])
+
+
+def _recorded_exclusions(git, tip):
+    """The exclusions a train tip was built and measured with, from its own commit.
+
+    None means a tip published before the list was recorded; it is recomputed.
+    """
+    value = git._call(["show", "-s", f"--format=%(trailers:key={EXCLUSIONS_TRAILER},valueonly)", tip]).strip()
+    if not value:
+        return None
+    try:
+        return parse_exclusions(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("tip exclusions trailer invalid") from exc
 
 
 def retirements(ctx):
@@ -218,8 +232,10 @@ class Evidence:
     infrastructure = ""
     substitutes_ci = True
 
-    def __init__(self, base, chain, pr, born):
+    def __init__(self, base, chain, pr, born, excluded=None):
         self.base, self.chain, self.pr, self.born = base, chain, pr, born
+        # Fixed when the train was built; the moving open-issue set never changes it.
+        self.excluded = excluded
         self.reason = None
         self.pending = False
         self.accepted = None
@@ -271,7 +287,7 @@ class Evidence:
         status, origin, sha, reports = self.reports(ctx)
         if status == "fail":
             return "fail"
-        excluded = _exclusions(ctx, self.base, self.chain)
+        excluded = self.judged_exclusions(ctx)
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
         lost, _ = ci_mode.comparison(reports, ctx.repo, origin, sha, excluded, expected_scope=scope,
                                     expected_shards=range(ctx.config.ci_shards))
@@ -279,6 +295,9 @@ class Evidence:
             raise ci_mode.StaleComparison("tip measurement scope no longer covers the current one")
         self.passed = not lost
         return "pass" if self.passed else "fail"
+
+    def judged_exclusions(self, ctx):
+        return list(self.excluded) if self.excluded is not None else _exclusions(ctx, self.base, self.chain)
 
     def current(self, n, ctx, git, pr, head, base_sha, status):
         if status == "fail":
@@ -452,7 +471,8 @@ def prepare(ctx, report, candidates):
         available = {(p.n, p.started_at) for p, _, _ in candidates}
         if any((n, started) not in available for n, _, _, started in chain):
             raise ValueError("member left the single path")
-        proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born)
+        excluded = _recorded_exclusions(ctx.git, chain[-1][2])
+        proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born, excluded)
         try:
             status = proof.outcome(ctx)
         except ci_mode.MissingComparison:
@@ -488,7 +508,7 @@ def land(ctx, report, candidates, proof):
                 if job["head"] != head:
                     raise ValueError("member head changed")
                 git = stack.enter_context(owner._member_worktree(ctx, job))
-                evidence = Evidence(proof.base, proof.chain, proof.pr, proof.born)
+                evidence = Evidence(proof.base, proof.chain, proof.pr, proof.born, proof.excluded)
                 prepared.append((place, job, pr, git, evidence))
             tip = stack.enter_context(owner._member_worktree(ctx, {
                 "head": proof.chain[-1][2], "target": ctx.config.base_branch,
@@ -511,7 +531,7 @@ def land(ctx, report, candidates, proof):
             place, job, *_ = prepared[0]
             with owner._track_checks(ctx, place, job):
                 ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch,
-                                      files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
+                                      files=files, excluded=proof.judged_exclusions(ctx))
             untracked = tip._call([
                 "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
                 *(f":(exclude,literal){path}" for path in sorted(tip.artifact_paths())),
