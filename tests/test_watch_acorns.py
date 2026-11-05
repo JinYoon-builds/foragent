@@ -3,18 +3,14 @@
 from dataclasses import replace
 from datetime import timedelta
 import re
-import sys
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+from helpers.lane_view import plain_frame, running_snapshot
 
-from test_squirrel_running import plain_frame, running_snapshot  # noqa: E402
-
-from foragent import watch  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from foragent.tracker import FakeTracker  # noqa: E402
+from foragent import watch
+from foragent.state import StateStore
+from foragent.tracker import FakeTracker
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +55,7 @@ def numbers(frame):
 
 def bubble_of(frame):
     """The orchestrator bubble's six body rows (the shared acceptance helper)."""
-    from test_lane_m2_contract import bubble
+    from helpers.lane_view import bubble
 
     return bubble(frame)
 

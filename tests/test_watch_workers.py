@@ -47,11 +47,8 @@ def acorns_in(text):
 
 def explained(tracker, store, config, clock, number, width=160):
     """The bubble rows after clicking an acorn (the lane scene explains it in place)."""
-    import sys
-    from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-    from test_lane_m2_contract import bubble
+    from helpers.lane_view import bubble
 
     snapshot = watch.collect(local_status(tracker, store, config), tracker, store, config, clock[0])
     return bubble(watch.render_frame(snapshot, config, store.root, width=width, now=clock[0],

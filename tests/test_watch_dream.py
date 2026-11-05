@@ -2,17 +2,13 @@
 
 from dataclasses import replace
 import json
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+from helpers.lane_view import plain_frame
+from helpers.lane_view import done_snapshot
 
-from test_squirrel_running import plain_frame  # noqa: E402
-from test_view_done_state import done_snapshot  # noqa: E402
-
-from foragent.state import StateStore  # noqa: E402
-from foragent.status import collect as status_collect  # noqa: E402
-from foragent.watch import render_frame  # noqa: E402
+from foragent.state import StateStore
+from foragent.status import collect as status_collect
+from foragent.watch import render_frame
 
 
 def dreaming(snapshot, lane, **row):
