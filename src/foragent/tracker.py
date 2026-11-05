@@ -801,6 +801,7 @@ class FakeTracker:
         self._parents: dict[int, int] = {}
         self._pr_files: dict[int, list[str]] = {}
         self._pr_checks: dict[int, CheckStatus] = {}
+        self._pr_mergeable: dict[int, str] = {}
         self._pr_failed_logs: dict[int, str] = {}
         self._pr_heads: dict[int, str] = {}
         self._next_comment_id = 1
@@ -1005,6 +1006,13 @@ class FakeTracker:
 
     def set_pr_checks(self, pr: int, status: CheckStatus) -> None:
         self._pr_checks[pr] = status
+
+    def set_pr_mergeable(self, pr: int, state: str) -> None:
+        """GitHub's literal answer: MERGEABLE, CONFLICTING or UNKNOWN."""
+        self._pr_mergeable[pr] = state
+
+    def pr_mergeable(self, pr: int) -> str:
+        return self._pr_mergeable.get(pr, "UNKNOWN")
 
     def pr_checks(self, pr: int) -> CheckStatus:
         return self._pr_checks.get(pr, "none")
@@ -1560,6 +1568,19 @@ class GhTracker:
 
     def pr_head_sha(self, pr: int) -> str:
         return json.loads(self._call(["api", f"{self._path}/pulls/{pr}"]))["head"]["sha"]
+
+    def pr_mergeable(self, pr: int) -> str:
+        """GitHub's mergeable answer as MERGEABLE, CONFLICTING or UNKNOWN.
+
+        Read from the same pull request endpoint as ``pr_head_sha``: GitHub's REST
+        ``mergeable`` is true, false (conflicts with the base) or null (still computing)."""
+        try:
+            state = json.loads(self._call(["api", f"{self._path}/pulls/{pr}"])).get("mergeable")
+        except (AttributeError, TypeError, ValueError):
+            return "UNKNOWN"
+        if state is True:
+            return "MERGEABLE"
+        return "CONFLICTING" if state is False else "UNKNOWN"
 
     def pr_default_branch(self) -> str:
         """The repository's default branch supplies trusted PR workflow code."""

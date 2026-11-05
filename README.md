@@ -10,6 +10,8 @@ task ends → done-when commands → adversarial review → merge → next issue
 
 Foragent built itself: 397 merged PRs in 15 days (counted from `git log` on 2026-11-03).
 
+**Type `/fa` in Claude Code.** That is the one command to learn. `/fa` sets up the project, briefs you, takes your next order and opens the dashboard, the live terminal screen of the work.
+
 [한국어 README](#한국어)
 
 ## Install
@@ -25,10 +27,11 @@ Codex CLI is optional.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
-fa init
 ```
 
-Foragent needs Python 3.12 or newer. You do not have to install it first: if no suitable Python is on your machine, uv fetches one automatically and installs the `fa` command with it. Run `fa init` inside the project folder you want Foragent to work on.
+Then open Claude Code in your project folder and type `/fa`. The first time, `/fa` runs `fa init` for you to set up the project.
+
+Foragent needs Python 3.12 or newer. You do not have to install it first: if no suitable Python is on your machine, uv fetches one automatically and installs the `fa` command with it.
 
 When this project already has Claude Code settings (`.claude/settings.json` or `.claude/settings.local.json`), `fa init` also asks once whether Claude may run Foragent commands here without a prompt each time. Without them, the summary marks this permission as not yet decided, and the `/fa` setup flow asks you with Yes/No choices and runs `fa init --fa-allow yes|no` with your answer. It asks again on each setup run until you answer; it never chooses for you. If you accept, it adds exactly one rule, `Bash(fa:*)`, to this project's `.claude/settings.local.json`; your other settings and your account-wide settings stay unchanged. If you decline, nothing changes. Either answer is remembered; run `fa init --fa-allow yes|no` to revise it. Choosing No leaves existing Claude settings, including any existing rules, unchanged. `--dry-run` never asks. FA commands do not expose permanent deletion, money transactions, sending to others, or widening permissions.
 
@@ -40,7 +43,7 @@ If Claude Code runs on `ANTHROPIC_API_KEY`, it bills the API. The gate starts it
 executors: [{name: claude, quota: api, spend_cap: <USD per day>}]
 ```
 
-Then open Claude Code in the project and type `/fa`. It sets up the project the first time, and later it briefs you and takes your next order.
+After setup, `/fa` briefs you and takes your next order. When work starts, it opens the dashboard beside your session; if the dashboard is already open, it leaves it as it is.
 
 ## Lanes
 
@@ -71,6 +74,14 @@ Each person runs their own factory: their own machine, their own Claude Code sub
 - **Permissions.** Each person needs write access to the repository, including labels. If GitHub does not apply the owner label, publishing stops and closes the unlabelled issue, so no other factory takes it.
 - **Labels are trusted.** `by:` is reserved for orderer logins. Anyone who can edit labels can move an issue; Foragent cannot tell a correction from a mistake. To hand work over (someone leaves, a login is renamed, a label is wrong), stop the affected factories, keep their unfinished work, agree on the new owner, change the one `by:` label (and `legacy_owner` if needed), then start only the owning factory. An issue with two `by:` labels is refused until one is removed. An issue Foragent published without its `by:` label (for example, the label was removed) is not legacy work: no factory works it until one `by:` label is added.
 
+## Command reference
+
+You do not need these to use Foragent; `/fa` runs them for you.
+
+- `fa dashboard` opens the dashboard. It takes `--open` (open it in a split beside your session), `--once` (print one frame and exit) and `--repo-root`.
+- `fa gate watch` draws the same dashboard with the same flags. Scripts and terminal openers use it.
+- `fa init` sets up a project folder. `/fa` runs it the first time.
+
 ## Known limits, contributions welcome
 
 These limits are known. Each item names the file where a change would start.
@@ -78,7 +89,7 @@ These limits are known. Each item names the file where a change would start.
 - **Codex-only setups are not supported yet.** Foragent runs on Claude Code; Codex CLI is optional. Running with Codex CLI and without Claude Code is not supported at launch. Start at `config.resolved_reviewer` (the default reviewer) and `orch_spawn` (`src/foragent/orch_spawn.py`, which starts the orchestrator with `claude`).
 - **The background gate is macOS only.** It runs as a launchd service. A Linux service (for example systemd) is not written yet. Start at `src/foragent/launchd.py`.
 - **Native Windows is not supported yet.** WSL will follow the Linux gate when it exists. Start at `src/foragent/launchd.py`.
-- **Terminal switching works only in Orca.** Foragent opens the lane view beside your session in tmux, WezTerm, kitty, iTerm2 or Terminal, but only Orca lets it switch back to the terminal it opened before. Other terminals open a new split instead. Start at `src/foragent/watch_open.py`.
+- **Terminal switching works only in Orca.** Foragent opens the dashboard beside your session in tmux, WezTerm, kitty, iTerm2 or Terminal, but only Orca lets it switch back to the terminal it opened before. Other terminals open a new split instead. Start at `src/foragent/watch_open.py`.
 - **One factory per person per repository.** Two machines signed in as the same person would both work that person's issues. Run one gate per person. Start at `src/foragent/ownership.py`.
 - **Update checks always use the main repository.** A fork still checks `JinYoon-builds/foragent` for updates and installs from it. Start at `src/foragent/update_check.py`.
 
@@ -89,6 +100,8 @@ These limits are known. Each item names the file where a change would start.
 ```
 작업이 끝남 → 완료 확인 명령 → 적대적 리뷰 → 머지 → 다음 이슈
 ```
+
+**Claude Code에서 `/fa`를 입력해요.** 배울 명령은 이것 하나예요. `/fa`가 프로젝트를 설정하고, 상황을 알려 주고, 다음 주문을 받고, 대시보드를 열어요. 대시보드는 일이 돌아가는 모습을 보여 주는 터미널 화면이에요.
 
 ### 설치
 
@@ -103,10 +116,11 @@ Codex CLI는 선택이에요.
 
 ```sh
 uv tool install git+https://github.com/JinYoon-builds/foragent
-fa init
 ```
 
-Foragent는 Python 3.12 이상이 필요해요. 먼저 설치하지 않아도 돼요. 알맞은 Python이 없으면 uv가 자동으로 받아서 `fa` 명령을 함께 설치해요. `fa init`은 Foragent가 일할 프로젝트 폴더 안에서 실행해요.
+그다음 프로젝트 폴더에서 Claude Code를 열고 `/fa`를 입력해요. 처음에는 `/fa`가 `fa init`을 대신 실행해서 프로젝트를 설정해요.
+
+Foragent는 Python 3.12 이상이 필요해요. 먼저 설치하지 않아도 돼요. 알맞은 Python이 없으면 uv가 자동으로 받아서 `fa` 명령을 함께 설치해요.
 
 이 프로젝트에 Claude Code 설정(`.claude/settings.json`이나 `.claude/settings.local.json`)이 이미 있으면, `fa init`은 Claude가 여기서 Foragent 명령을 매번 묻지 않고 실행해도 되는지 한 번 물어요. 설정이 없으면 요약에 아직 결정하지 않았다고 표시하고, `/fa` 설정 흐름이 예/아니요로 물은 뒤 그 답으로 `fa init --fa-allow yes|no`를 실행해요. 답하기 전에는 설정할 때마다 다시 묻고, 대신 선택하지 않아요. 수락하면 이 프로젝트의 `.claude/settings.local.json`에 규칙 `Bash(fa:*)` 하나만 넣어요. 다른 설정과 계정 전체 설정은 그대로예요. 거절하면 아무것도 바꾸지 않아요. 어느 답이든 기억하며, `fa init --fa-allow yes|no`로 답을 바꿀 수 있어요. 아니요를 선택해도 이미 있는 규칙을 포함한 Claude 설정은 그대로예요. `--dry-run`은 묻지 않아요. FA 명령으로는 영구 삭제, 돈 거래, 남에게 보내기, 권한 넓히기를 할 수 없어요.
 
@@ -118,7 +132,7 @@ Claude Code가 `ANTHROPIC_API_KEY`로 돌면 API 비용이 나가요. gate는 �
 executors: [{name: claude, quota: api, spend_cap: <하루 USD>}]
 ```
 
-그다음 프로젝트에서 Claude Code를 열고 `/fa`를 입력해요. 처음에는 프로젝트를 설정하고, 그 뒤로는 상황을 알려 주고 다음 주문을 받아요.
+설정이 끝나면 `/fa`가 상황을 알려 주고 다음 주문을 받아요. 일이 시작되면 세션 옆에 대시보드를 열어요. 대시보드가 이미 열려 있으면 그대로 둬요.
 
 ### 레인
 
@@ -149,6 +163,14 @@ Codex CLI는 선택이에요. Codex CLI에 로그인되어 있으면 gate가 Cod
 - **권한.** 사람마다 저장소 쓰기 권한(라벨 포함)이 필요해요. GitHub가 주인 라벨을 붙이지 않으면 발행이 멈추고, 라벨 없는 이슈를 닫아서 다른 공장이 가져가지 않게 해요.
 - **라벨은 믿고 써요.** `by:`는 주문한 사람의 로그인에만 써요. 라벨을 고칠 수 있는 사람은 이슈를 옮길 수 있어요. Foragent는 고친 것과 실수를 구별하지 못해요. 일을 넘길 때(누가 떠나거나, 로그인 이름이 바뀌거나, 라벨이 틀렸을 때)는 관련 공장을 멈추고, 끝나지 않은 일을 지키고, 새 주인을 정하고, `by:` 라벨 하나를 바꾸고(필요하면 `legacy_owner`도), 주인 공장만 다시 시작하세요. `by:` 라벨이 둘인 이슈는 하나를 지울 때까지 거절해요. Foragent가 발행했는데 `by:` 라벨이 없는 이슈(예: 라벨을 지운 경우)는 옛 일이 아니에요. `by:` 라벨을 하나 붙일 때까지 어느 공장도 일하지 않아요.
 
+### 명령 참고
+
+Foragent를 쓰는 데 이 명령들은 필요 없어요. `/fa`가 대신 실행해요.
+
+- `fa dashboard`는 대시보드를 열어요. `--open`(세션 옆 분할 창에 열기), `--once`(한 화면만 출력하고 끝내기), `--repo-root`를 받아요.
+- `fa gate watch`는 같은 옵션으로 같은 대시보드를 그려요. 스크립트와 터미널 열기 도구가 써요.
+- `fa init`은 프로젝트 폴더를 설정해요. 처음에 `/fa`가 실행해요.
+
 ### 알려진 한계, 기여 환영
 
 알고 있는 한계예요. 항목마다 고칠 때 시작할 파일을 적었어요.
@@ -156,7 +178,7 @@ Codex CLI는 선택이에요. Codex CLI에 로그인되어 있으면 gate가 Cod
 - **Codex만으로는 아직 못 써요.** Foragent는 Claude Code 위에서 돌고 Codex CLI는 선택이에요. Claude Code 없이 Codex CLI만으로 돌리는 것은 출시 때 지원하지 않아요. `config.resolved_reviewer`(기본 리뷰어)와 `orch_spawn`(`src/foragent/orch_spawn.py`, `claude`로 오케스트레이터를 시작해요)에서 시작해요.
 - **백그라운드 gate는 macOS에서만 돌아요.** launchd 서비스로 돌아요. Linux 서비스(예: systemd)는 아직 없어요. `src/foragent/launchd.py`에서 시작해요.
 - **Windows는 아직 지원하지 않아요.** WSL은 Linux gate가 생기면 따라가요. `src/foragent/launchd.py`에서 시작해요.
-- **터미널 전환은 Orca에서만 돼요.** Foragent는 tmux, WezTerm, kitty, iTerm2, Terminal에서 세션 옆에 레인 화면을 열어요. 하지만 전에 열었던 터미널로 돌아가는 것은 Orca에서만 돼요. 다른 터미널은 새 분할 창을 열어요. `src/foragent/watch_open.py`에서 시작해요.
+- **터미널 전환은 Orca에서만 돼요.** Foragent는 tmux, WezTerm, kitty, iTerm2, Terminal에서 세션 옆에 대시보드를 열어요. 하지만 전에 열었던 터미널로 돌아가는 것은 Orca에서만 돼요. 다른 터미널은 새 분할 창을 열어요. `src/foragent/watch_open.py`에서 시작해요.
 - **한 사람은 저장소마다 공장 하나예요.** 같은 사람으로 로그인한 두 컴퓨터는 둘 다 그 사람의 이슈를 일해요. 사람마다 gate 하나만 돌리세요. `src/foragent/ownership.py`에서 시작해요.
 - **업데이트 확인은 늘 원래 저장소를 봐요.** 포크도 `JinYoon-builds/foragent`에서 업데이트를 확인하고 설치해요. `src/foragent/update_check.py`에서 시작해요.
 

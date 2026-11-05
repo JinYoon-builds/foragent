@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import json
 import subprocess
 
-from foragent import ci_mode, harness_guard
+from foragent import ci_mode, harness_guard, orch_stop
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import GitError, main_write_lock
@@ -536,12 +536,13 @@ def land(ctx, report, candidates, proof):
                 else:
                     checking = None
                     _validate_trees(ctx.git, proof.base, proof.chain)
-                    for place, job, _, _, _ in prepared:
-                        job.update(phase="merging", merge_base=proof.base)
-                        owner._save(ctx, place, job)
-                    target = f"refs/heads/{ctx.config.base_branch}"
-                    ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
-                                   "origin", f"{proof.chain[-1][2]}:{target}"])
+                    with orch_stop.merging(ctx, prepared[0][0].n):
+                        for place, job, _, _, _ in prepared:
+                            job.update(phase="merging", merge_base=proof.base)
+                            owner._save(ctx, place, job)
+                        target = f"refs/heads/{ctx.config.base_branch}"
+                        ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
+                                       "origin", f"{proof.chain[-1][2]}:{target}"])
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
@@ -549,6 +550,8 @@ def land(ctx, report, candidates, proof):
     except ci_mode.MissingComparison:
         return  # CI registration/status can change during the unlocked checks too.
     except Exception as exc:
+        if isinstance(exc, ExecutorStopped) and exc.outcome == "stopped":
+            return  # Keep the published train and its admissions for the release.
         if isinstance(exc, TrackerError) and exc.waits:
             raise
         reason = str(exc) or type(exc).__name__

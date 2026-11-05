@@ -15,6 +15,7 @@ from foragent import orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
+from foragent.reasons import REVIEWER_HOLDS
 from foragent.state import Run, StateStore
 from foragent.state_observations import observed_facts
 
@@ -69,12 +70,13 @@ WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Issues with two or more executions held in the last 7 days, from the run history."""
+    """Issues with two or more executions that ended on a reviewer hold in the last 7 days."""
     finished = store.finish_times()
     counts: dict[int, int] = {}
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
-        if run.outcome == "held" and at is not None and now - HOLD_WINDOW < at <= now:
+        if (run.outcome == "held" and run.hold_reason in REVIEWER_HOLDS
+                and at is not None and now - HOLD_WINDOW < at <= now):
             counts[run.number] = counts.get(run.number, 0) + 1
     held = {f"#{number}": count for number, count in sorted(counts.items()) if count >= HOLDS}
     return {"holds_by_issue": held} if held else {}
