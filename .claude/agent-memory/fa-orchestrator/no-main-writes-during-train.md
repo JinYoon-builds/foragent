@@ -13,4 +13,5 @@ While any `foragent/batch-merge-*` ref exists on origin, do not publish orders o
 
 **11-04 21:33Z:** after a train, `fa order publish` failed with "Not possible to fast-forward": the shared checkout held an unpushed Foragent role-memory commit (97fe35fa) while main moved 30 commits. Before any publish run `git pull -q --rebase --autostash origin main` (keeps that commit), and put the same line in every wait-then-publish loop.
 
-**11-05 10:17-10:24 KST:** my exscope and #1422 publishes (plus PM closes and role memory) moved main 8 times during batch #2090 (open 00:55-01:22Z) and retired it: 5 merges and ~30 min lost. My loops checked only `git ls-remote refs/heads/foragent/batch-merge-*`, which read 0 while the batch PR was open. Use `drafts/bin/no-train.sh` (branch AND open PR check) immediately before every publish, edit, close or memory push, until PM's main-write-requests/main-write-orders merge (r761).
+
+**11-05 (PM r762 corrected r761):** batch #2090 was broken only by `fa orch close` lock-removal commits (10:17-10:19 KST); fa orch close has no batch wait. Order publishes and role memory landed after the batch retired, so those waits work. Hold `fa orch close` while a batch is in flight; drafts/bin/no-train.sh (branch AND open batch PR) is the stricter check for it.
