@@ -15,6 +15,18 @@ class _UnverifiedBase(Exception):
     """CI failed on a later base that a source move reached; refresh, do not fail the lane."""
 
 
+def reviewed(n: int, ctx, git, head: str) -> bool:
+    """A reviewer PASS for the approved body covers exactly this commit's contents (#2147)."""
+    from foragent import review_pass_scope
+
+    approval = ctx.store.load_approval(n)
+    if approval is None:
+        return False
+    tree = git._call(["rev-parse", f"{head}^{{tree}}"]).strip()
+    return any(event["tree"] == tree and event.get("body_sha") == approval.body_sha
+               for event in review_pass_scope._passes(n, ctx))
+
+
 def _publish(attempt: Implementation) -> str:
     run_publish.wait_for_overlap(attempt)
     return run_publish._publish_locked(attempt)
@@ -58,6 +70,9 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     review_pass_scope.bind(n, ctx, git)
     ci_cause = "initial"
 
+    # A head that only merged the base into a reviewer-PASS head keeps that PASS (#2147).
+    passed_head_sha = None
+
     def finish_base() -> None:
         nonlocal verified_head_sha
         if runner._remaining(n, ctx) <= 0:
@@ -79,18 +94,23 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         return True
 
     def refresh_base(move: BaseMove, conflicts: list[str] | None = None, *, cause: str | None = None,
-                     neutral: bool | None = None) -> str:
+                     neutral: bool | None = None, related_local: bool = False) -> str:
+        """``related_local`` keeps related unit tests on this machine: a CI failure
+        on a later base or a failed joint check asks for them here (#2147)."""
         nonlocal ci_cause
         ci_cause = cause or run_group_check.refresh_cause(ctx, n)
         attempt.base_refresh = True  # This whole interval is one base-refresh record.
         try:
             with activity(n, ctx, "base-refresh", ci_cause):
-                return refresh_moved_base(move, conflicts, neutral)
+                return refresh_moved_base(move, conflicts, neutral, related_local)
         finally:
             attempt.base_refresh = False
+            attempt.related_to_ci = False
 
-    def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None) -> str:
+    def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None,
+                           related_local: bool) -> str:
         # Only the run's time budget (finish_base) bounds repeated base moves (#712).
+        nonlocal passed_head_sha
         run_publish._phase(n, ctx, "checking")
         if neutral is None:
             neutral = conflicts is None and run_publish.base_move_is_neutral(attempt, move)
@@ -105,17 +125,25 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             follow_base(attempt)
         if conflicts is None:
             conflicts = _merge_moved_base(attempt, move.target_sha)
-        changed = False
+        changed = covered = False
         if conflicts:
             _resolve_conflicts(attempt, conflicts)
-        elif not neutral:
+        else:
+            # Only the base merged in: a reviewer PASS of the previous head still covers the code (#2147).
+            covered = run_publish.enabled(ctx, attempt.target_branch) and (
+                passed_head_sha == verified_head_sha or reviewed(n, ctx, git, verified_head_sha))
+        if not conflicts and not neutral:
             merged_tree = git.staged_tree_sha()
+            # In CI mode PR CI runs the related units on the new head of a plain post-PASS move.
+            attempt.related_to_ci = covered and not related_local
             check_failure = _verify_implementation(attempt)
             if check_failure:
                 raise run_publish.AttemptFailure(check_failure)
             # A check that edited tracked files left contents no review has seen.
             changed = git.staged_tree_sha() != merged_tree
         finish_base()
+        # Changed contents or a resolution need a PASS of their own (read again at the next move).
+        passed_head_sha = verified_head_sha if covered and not changed else None
         if changed and ctx.config.reviewer != "none":
             run_publish._append(log, "Checks on the moved base changed the contents: reviewing them")
             _review_implementation(attempt)
@@ -342,7 +370,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         except _UnverifiedBase as moved:
             run_publish._append(log, f"CI measured an unverified source move: {moved}")
             queued_status = None
-            target_sha = refresh_base(run_publish.capture_move(git, f"origin/{attempt.target_branch}"), neutral=False)
+            target_sha = refresh_base(run_publish.capture_move(git, f"origin/{attempt.target_branch}"),
+                                      neutral=False, related_local=True)
             if stopped := publish_refresh(target_sha):
                 return stopped
             continue
@@ -400,7 +429,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         if run_publish.enabled(ctx, attempt.target_branch):
             comparison = run_group_ci.evidence(attempt, verified_head_sha, verified_base_sha)
             if comparison is None and reused_base == verified_base_sha:
-                target_sha = refresh_base(run_publish.capture_move(git, verified_base_sha), cause="group-failed")
+                target_sha = refresh_base(run_publish.capture_move(git, verified_base_sha), cause="group-failed",
+                                          related_local=True)
                 reused_base = None
                 if stopped := publish_refresh(target_sha):
                     return stopped
