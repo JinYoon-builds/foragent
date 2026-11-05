@@ -13,8 +13,8 @@ def add(commands) -> None:
     briefing.add_argument("--report", action="store_true",
                           help="Print the three-line report since the previous report, and record it")
     briefing.add_argument("--full", action="store_true",
-                          help="With --report: print the full detail of the last report's window "
-                               "(merges, holds, questions with options); records nothing")
+                          help="With --report: the same report with the full detail "
+                               "(every merge, hold, question and option); records the report time too")
     briefing.add_argument("--star", metavar="ANSWER", help="Answer the one-time GitHub star request (yes stars)")
     briefing.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
@@ -42,40 +42,33 @@ def run(args) -> int:
         _print_offer(cli, "en")
         return 0
     config, _repo, store = repo_store(root)
-    if args.full:
-        # The full detail reads the window the last report covered and records nothing.
-        now = cli.datetime.now(cli.UTC)
-        report = cli.brief_report.collect(store, now, cli.brief_report.last_window(store, now))
-        report["update"] = cli.update_check.cached(config)
-        print(cli.json.dumps(report, ensure_ascii=False) if args.json
-              else cli.brief_report.render(report, config.language))
-        return 0
-    if args.report and config.presence["report"]:
+    if (args.report or args.full) and config.presence["report"]:
         # The report reads local state only: no update check and no star request.
         now = cli.datetime.now(cli.UTC)
-        since = cli.brief_report.last_report(store, now) or now - cli.brief_report.FIRST_WINDOW
-        report = cli.brief_report.collect(store, now, since)
+        report = cli.brief_report.collect(store, now)
         # /fa relays the update offer from the cached daily check, without a lookup.
         report["update"] = cli.update_check.cached(config)
         if args.json:
             print(cli.json.dumps(report, ensure_ascii=False))
+        elif args.full:  # The same report and window, with every detail (D127).
+            print(cli.brief_report.render(report, config.language))
         else:
             if not report["judgment"]:  # Line 2 falls back to the worst-moved metric.
                 report["scorecard_line"] = cli.brief_report.scorecard_line(store, config.language)
             print(cli.brief_report.render_short(report, config.language))
-        cli.brief_report.record_report(store, now, since)  # Only after the report printed.
+        cli.brief_report.record_report(store, now)  # Only after the report printed.
         return 0
     facts = cli.brief.collect(store, config, cli.datetime.now(cli.UTC))
     # --report never calls GitHub, also when presence.report is off and it prints the
     # plain briefing: the update offer comes from the cached check only, and the
     # one-time star request (which runs `gh auth status`) waits for a plain `fa brief`.
-    if offer := (cli.update_check.cached if args.report else cli.update_check.check)(config):
+    if offer := (cli.update_check.cached if args.report or args.full else cli.update_check.check)(config):
         facts["update"] = offer
     if args.json:
         print(cli.json.dumps(facts, ensure_ascii=False))
         return 0
     print(cli.brief.render(facts, config.language))
-    if not args.report:
+    if not (args.report or args.full):
         _print_offer(cli, config.language)
     return 0
 

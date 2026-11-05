@@ -1,8 +1,9 @@
 """`fa brief --report`: a three-line report since the previous report (#756, D127).
 
 `render_short` is the report /fa shows: counts, the one thing that matters most, and
-what happens next. `render` is the full detail (`fa brief --report --full`): every
-merge, resolved hold, open question with its options and needs-human issue.
+what happens next. `render` is the same report with the full detail
+(`fa brief --report --full`): every merge, resolved hold, open question with its
+options and needs-human issue.
 
 Reads local state only: gate merge records, the orchestrator journal
 (orch-events.jsonl), the question box, the orchestrator note and the issue
@@ -47,26 +48,10 @@ def last_report(store: StateStore, now: datetime) -> datetime | None:
     return at if at is not None and at <= now else None
 
 
-def last_window(store: StateStore, now: datetime) -> datetime | None:
-    """The start of the window the previous report covered, for the full detail.
-
-    A record without its window start (written before D127) falls back to its report time.
-    """
-    try:
-        value = json.loads((store.root / REPORT_FILE).read_text(encoding="utf-8")).get("since")
-    except (OSError, ValueError, AttributeError):
-        value = None
-    at = _time(value)
-    return at if at is not None and at <= now else last_report(store, now)
-
-
-def record_report(store: StateStore, now: datetime, since: datetime | None = None) -> None:
-    """The one writer of the report time, with the start of the window it covered."""
+def record_report(store: StateStore, now: datetime) -> None:
+    """The one writer of the report time."""
     store.root.mkdir(parents=True, exist_ok=True)
-    record = {"reported_at": now.isoformat()}
-    if since is not None:
-        record["since"] = since.isoformat()
-    store._write_json(store.root / REPORT_FILE, record)
+    store._write_json(store.root / REPORT_FILE, {"reported_at": now.isoformat()})
 
 
 def _time(value: Any) -> datetime | None:
@@ -116,9 +101,9 @@ def _resolved_holds(events: list[dict[str, Any]], merges: dict[int, datetime],
     return resolved
 
 
-def collect(store: StateStore, now: datetime, since: datetime | None = None) -> dict[str, Any]:
-    """The report facts for the window since the previous report (or since ``since``)."""
-    since = since or last_report(store, now) or now - FIRST_WINDOW
+def collect(store: StateStore, now: datetime) -> dict[str, Any]:
+    """The report facts for the window since the previous report."""
+    since = last_report(store, now) or now - FIRST_WINDOW
 
     def inside(at: datetime) -> bool:
         return since < at <= now

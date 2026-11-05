@@ -177,7 +177,7 @@ def test_report_is_one_judgment_first_message_with_finished_now_and_persons_turn
         case.clock[0] += timedelta(seconds=1)
         append_event(case.store, case.clock[0], None, "note", "Agent's current judgment", say=judgment)
         orch_inbox.write_note(case.store, CURRENT, "No open decision.", judgment, {"kind": "terminal"})
-    output = case.brief("--report")
+    output = case.brief("--report", "--full")
     lines = [line for line in output.splitlines() if line.strip()]
     assert judgment in lines[0], "Lead with the agent's current judgment, before lists of facts"
     for number in (101, 102):
@@ -200,7 +200,7 @@ def test_report_is_one_judgment_first_message_with_finished_now_and_persons_turn
 def test_report_persists_its_time_and_only_reports_new_merges_after_a_fresh_read(report_case):
     case = report_case
     before = snapshot(case.store)
-    first = case.brief("--report")
+    first = case.brief("--report", "--full")
     assert "#101" in first and "#102" in first, "The first report must include recent merges"
     after = snapshot(case.store)
     changed = [path for path in after if before.get(path) != after[path]]
@@ -208,7 +208,7 @@ def test_report_persists_its_time_and_only_reports_new_merges_after_a_fresh_read
     assert any(contains_time(after[path], NOW) for path in changed), "Record the report's time, not a merge's time"
     case.merge(104, NOW + timedelta(minutes=5))
     case.clock[0] = NOW + timedelta(minutes=10)
-    second = case.brief("--report")
+    second = case.brief("--report", "--full")
     assert "#104" in second, "The next report must include the new merge"
     for number in (101, 102, 103, 201, 202):
         assert f"#{number}" not in second, f"Do not repeat old finished work: #{number}"
@@ -236,7 +236,7 @@ def test_only_the_report_command_writes_or_advances_the_report_time(report_case)
 
 def test_first_report_covers_a_rolling_twenty_four_hours_not_just_today(report_case):
     case = report_case
-    output = case.brief("--report")
+    output = case.brief("--report", "--full")
     assert "#102" in output, "The first report includes a merge 23h59m ago, even before midnight"
     assert "#101" in output, "Include today's merge as well"
     assert "#103" not in output, "The first report excludes a merge 24h01m ago"

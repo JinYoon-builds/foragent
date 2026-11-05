@@ -18,9 +18,10 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    decisions waiting), the one thing that matters most, and what happens next. Add
    nothing to it: no lists, no decision text. Running it records the report time, so run
    it once per `/fa`. When the person asks what finished or what is held, run
-   `fa brief --report --full`: it shows the full detail of the window the last report
-   covered and records nothing. With `presence.report: false` in the config
-   `fa brief --report` prints the plain briefing instead and records nothing.
+   `fa brief --report --full`: the same report with every merge, hold, question and
+   option. It also records the report time, so the next report counts from then.
+   With `presence.report: false` in the config `fa brief --report` prints the plain
+   briefing instead and records nothing.
 
    On the first run in an empty folder (no `.foragent.yml`), `fa brief --report` prints
    the big squirrel and a greeting. Show both exactly as printed (the squirrel in a code
