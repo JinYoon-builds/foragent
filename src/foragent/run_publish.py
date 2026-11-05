@@ -29,7 +29,7 @@ from foragent.run_prompts import review_scope_rules
 from foragent.run_pr_body import _pr_body
 from foragent.run_overlap import wait_for_overlap
 from foragent.run_skill_catalog import report_line
-from foragent.run_waits import _credited_wait, _phase, _progress, _timeout
+from foragent.run_waits import _credited_wait, _phase, _progress, _timeout, record_base_follow
 from foragent.state import Approval, Run
 from foragent.tracker import TrackerError
 

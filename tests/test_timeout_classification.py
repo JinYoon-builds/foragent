@@ -9,6 +9,12 @@ sys.path.insert(0, str(Path(__file__).parent / 'acceptance'))
 from test_timeout_names import runner_case, run_and_observe, RUNTIME_MINUTES
 
 
+def stand_and_follow(case):
+    """The run's record after a PASS given with time left and a non-neutral base follow after it."""
+    now = case.clock[0].isoformat()
+    case.store.update_run(1, standing_pass_at=now, followed_base_at=now)
+
+
 def test_base_follow_before_review_still_counts_as_own_work(git_history, tmp_path, monkeypatch):
     case = runner_case(git_history, tmp_path, monkeypatch)
 
@@ -34,7 +40,8 @@ def test_pr_head_deadline_names_the_limit_that_stopped_it(git_history, tmp_path,
 
     case = runner_case(git_history, tmp_path, monkeypatch)
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - budget)
-    case.ctx._budget_base_changed = 1 if moved else None
+    if moved:  # the run's record: a PASS that stands, then a non-neutral base follow (#1514)
+        stand_and_follow(case)
     limits = []
 
     def check_process(argv, *, timeout_s, **kwargs):
@@ -66,7 +73,8 @@ def test_protected_deadline_names_initial_or_retry_cap(git_history, tmp_path, mo
 
     case = runner_case(git_history, tmp_path, monkeypatch)
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - budget)
-    case.ctx._budget_base_changed = 1 if moved else None
+    if moved:  # the run's record: a PASS that stands, then a non-neutral base follow (#1514)
+        stand_and_follow(case)
     baseline = AcceptanceBaseline("pytest", ("test_keep.py::test_a",), duration_seconds=450)
     attempt = SimpleNamespace(n=1, ctx=case.ctx, baseline=baseline, worktree=case.root,
                               log=case.store.log_path(1), checks=[])
@@ -110,7 +118,7 @@ def test_reviewed_refresh_counts_only_non_neutral_moves_after_pass(
     git_history.update({path: 'Changed\n'}, message='Main advanced')
     case.git.fetch('origin', 'main')
     if after_pass:
-        case.ctx._budget_review_pass = 1
+        case.store.update_run(1, standing_pass_at=case.clock[0].isoformat())
 
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - 300)
     limits = []
@@ -127,14 +135,15 @@ def test_reviewed_refresh_counts_only_non_neutral_moves_after_pass(
         return _verify_review_head(1, case.ctx, case.git, parsed, new_head, "PR link")
 
     _, outcome = _refresh_reviewed_head(1, case.ctx, case.git, pr, head, git_history.tip, reverify)
-    expected = 'base-changed' if after_pass and path.startswith('src/') else 'too-large'
+    # After a PASS with no implementer session the run is never too-large (#1514).
+    expected = ('base-changed' if path.startswith('src/') else 'runtime-exceeded') if after_pass else 'too-large'
     assert limits == [300]
     assert outcome == expected
     assert case.tracker.get_issue(1).labels & {'blocked', 'running', 'ready'} == (
         {'ready'} if expected == 'base-changed' else {'blocked'}
     )
     flag = case.store.load_flag(1)
-    assert (flag.reason if flag else None) == (None if expected == 'base-changed' else 'too-large')
+    assert (flag.reason if flag else None) == (None if expected == 'base-changed' else expected)
 
 
 def test_review_that_used_whole_budget_is_too_large_even_if_main_moves(git_history, tmp_path, monkeypatch):
@@ -165,7 +174,8 @@ def test_optional_local_check_uses_run_budget_not_done_when_deadline(git_history
     attempt = _prepare_implementation(1, case.ctx, case.git, target_branch="main", capture_baseline=False)
     (case.root / "feature.txt").write_text("done\n")
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - 300)
-    case.ctx._budget_base_changed = 1 if moved else None
+    if moved:  # the run's record: a PASS that stands, then a non-neutral base follow (#1514)
+        stand_and_follow(case)
     limits = []
 
     def check_process(argv, *, timeout_s, **kwargs):
@@ -207,7 +217,8 @@ def test_baseline_measurement_cut_by_the_run_budget_names_the_run(
     own = capture_limit(None)
     budget = {"run-budget": 300, "already-spent": 0}.get(cut_by, own + 600)
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - budget)
-    case.ctx._budget_base_changed = 1 if moved else None
+    if moved:  # the run's record: a PASS that stands, then a non-neutral base follow (#1514)
+        stand_and_follow(case)
     limits = []
 
     def check_process(argv, *, timeout_s, **kwargs):
@@ -256,15 +267,19 @@ def test_no_session_left_after_a_pass_keeps_the_runs_attribution(git_history, tm
     case.store.start_run(1, branch="foragent/issue-1", worktree=worktree)
     attempt = _prepare_implementation(1, case.ctx, case.git.at(worktree), target_branch="main",
                                       capture_baseline=False)
-    case.ctx._budget_review_pass = 1
-    case.ctx._budget_base_changed = 1 if followed else None
+    if followed:
+        stand_and_follow(case)
+    else:
+        case.store.update_run(1, standing_pass_at=case.clock[0].isoformat())
     case.clock[0] += timedelta(minutes=RUNTIME_MINUTES, seconds=1)
     with pytest.raises(ExecutorStopped) as caught:
         _implement(attempt, "Done when failed on the moved base")
-    expected = "base-changed" if followed else "too-large"
+    expected = "base-changed" if followed else "runtime-exceeded"
     assert caught.value.outcome == expected
     assert case.implementer.calls == []
     assert case.tracker.get_issue(1).labels & {"ready", "blocked"} == ({"ready"} if followed else {"blocked"})
+    flag = case.store.load_flag(1)
+    assert (flag.reason if flag else None) == (None if followed else "runtime-exceeded")
 
 
 @pytest.mark.parametrize("pushed", [True, None])
@@ -279,10 +294,78 @@ def test_a_resumed_reviewed_push_keeps_its_pass_for_later_base_following(git_his
     monkeypatch.setattr(orch_github, "resume_push", lambda ctx, n, git: pushed)
 
     def first_check(attempt):
-        seen.append(getattr(attempt.ctx, "_budget_review_pass", None))
+        seen.append(attempt.ctx.store.get_run(1).standing_pass_at is not None)
         raise ExecutorStopped("held", "stop after the first check")
 
     monkeypatch.setattr(runner, "_verify_implementation", first_check)
     monkeypatch.setattr(runner, "_implement", lambda *args, **kwargs: None)
     runner.run_issue(1, case.ctx)
-    assert seen == [1 if pushed else None]
+    assert seen == [pushed is True]
+
+
+RECORDS = {  # the run's own record before the continuation, and the name it must get (#1514)
+    "no-pass": ((False, False), "too-large"),
+    "pass": ((True, False), "runtime-exceeded"),
+    "pass-then-follow": ((True, True), "base-changed"),
+}
+
+
+@pytest.mark.parametrize("record", sorted(RECORDS))
+@pytest.mark.parametrize("kind", ["ci-repair", "base-follow", "review-rerun"])
+def test_every_continuation_names_the_run_from_its_whole_record(git_history, tmp_path, monkeypatch, kind, record):
+    """A continuation inside one run (CI repair, a neutral base refresh, a review rerun) that
+    meets the end of the budget never resets what the run did before it: zero implementer
+    sessions after the last PASS is never too-large (#1514)."""
+    from foragent import runner
+    from foragent.issue import parse_body
+    from foragent.run_attempt import ExecutorStopped
+    from foragent.run_checks import _verify_review_head
+    from foragent.run_implementation import _implement, _prepare_implementation
+    from foragent.run_publish_reviewed import _refresh_reviewed_head
+    from foragent.run_review import _review_implementation
+
+    (passed, followed), expected = RECORDS[record]
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    case.git.fetch("origin", "main")
+    worktree = case.store.worktree_path(1)
+    case.git.add_worktree(worktree, "foragent/issue-1", "origin/main")
+    case.store.start_run(1, branch="foragent/issue-1", worktree=worktree)
+    git = case.git.at(worktree)
+    now = case.clock[0].isoformat()
+    case.store.update_run(1, standing_pass_at=now if passed else None, followed_base_at=now if followed else None)
+    left = 300 if kind == "base-follow" else 0  # the base refresh starts with a little time left
+    case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - left)
+
+    if kind == "ci-repair":
+        with pytest.raises(ExecutorStopped) as caught:
+            runner._implement_and_publish(1, case.ctx, git, target_branch="main", failure="CI failed on the PR head")
+        outcome = caught.value.outcome
+    elif kind == "base-follow":
+        head = git.head_sha()
+        number = case.tracker.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+        case.tracker.set_pr_head_sha(number, head)
+        git_history.update({"docs/guide.md": "Changed\n"}, message="Main advanced")  # neutral: no new follow
+        case.git.fetch("origin", "main")
+
+        def check_process(argv, *, timeout_s, **kwargs):
+            case.clock[0] += timedelta(seconds=timeout_s)
+            return -9, True, "Stopped at the run budget"
+
+        monkeypatch.setattr(runner, "run_logged", check_process)
+        parsed = parse_body(case.store.load_approval(1).body)
+        _, outcome = _refresh_reviewed_head(
+            1, case.ctx, git, case.tracker.get_pr(number), head, git_history.tip,
+            lambda new: _verify_review_head(1, case.ctx, git, parsed, new, "PR link"))
+    else:
+        attempt = _prepare_implementation(1, case.ctx, git, target_branch="main", capture_baseline=False)
+        case.reviewer.steps = [lambda kwargs: "VERDICT: FAIL\nsrc/feature.py:1 still wrong"]
+        _review_implementation(attempt)
+        with pytest.raises(ExecutorStopped) as caught:
+            _implement(attempt, attempt.failure)
+        outcome = caught.value.outcome
+    assert outcome == expected
+    assert case.implementer.calls == []
+    flag = case.store.load_flag(1)
+    assert (flag.reason if flag else None) == (None if expected == "base-changed" else expected)
+    assert case.tracker.get_issue(1).labels & {"ready", "blocked"} == (
+        {"ready"} if expected == "base-changed" else {"blocked"})

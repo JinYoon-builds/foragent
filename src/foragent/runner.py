@@ -54,7 +54,7 @@ from foragent.run_prompts import (
     build_resume_prompt,
 )
 from foragent.run_waits import (
-    new_budget_turn,
+    record_pass,
     paused_seconds,
     poll_executor,
     _remaining,
@@ -255,7 +255,6 @@ def _implement_and_publish(
     n: int, ctx: RunContext, git: GitRepo, *, target_branch: str, failure: str | CIFailure = "",
 ) -> str:
     """Run named implementation, check, review and publication steps."""
-    new_budget_turn(ctx)
     attempt = _prepare_implementation(n, ctx, git, target_branch=target_branch, failure=failure)
     outcome = "error"
     try:
@@ -274,7 +273,8 @@ def _implement_and_publish(
             reviewed = not resume_verified and not failure and (
                 (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
-            new_budget_turn(ctx, n if reviewed else None)  # a reused PASS (also after a resumed push) stands (#1514)
+            if reviewed:
+                record_pass(n, ctx)  # a reused PASS (also after a resumed push) stands in this run (#1514)
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
                 if resume_verified:

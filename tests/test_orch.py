@@ -306,7 +306,8 @@ def test_rerun_review_timeout_is_not_named_by_an_earlier_calls_marks(review_case
     must not turn a later call's reviewer timeout into base-changed (#1514)."""
     c = review_case
     enable_reviewer(c, [ExecResult(0, True, "review timed out", Path("unused"))])
-    c.ctx._budget_review_pass = c.ctx._budget_base_changed = 1  # what the earlier call left on c.ctx
+    now = c.ctx.now().isoformat()  # what the earlier call's run record ended with
+    c.store.update_run(1, standing_pass_at=now, followed_base_at=now)
     assert "too-large" in orch.rerun_review(c.ctx, 1)
     assert_blocked(c, Reason.TOO_LARGE)
     assert "ready" not in c.tracker.get_issue(1).labels

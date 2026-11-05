@@ -30,7 +30,7 @@ from foragent.run_prompts import (
     build_review_prompt, lane_decisions_section, review_scope_rules,
 )
 from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
-from foragent.run_waits import _phase, _progress, _timeout
+from foragent.run_waits import _phase, _progress, _timeout, record_pass
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -212,22 +212,9 @@ def _lane_decisions(n: int, ctx: RunContext, worktree: Path) -> str:
     return lane_decisions_section([str(line) for line in (proposal or {}).get("decisions") or []])
 
 
+@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
 def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
             *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
-    """One review round; a standing PASS is marked on the run's own context.
-
-    A reviewer at its limit reviews on a copy of the context (``moving_review``), so the
-    mark for timeout attribution (#1514) is set here, never inside the session.
-    """
-    review = _review_session(n, ctx, git, parsed, base_ref, round_number=round_number, pr=pr)
-    if review.verdict == "PASS" and not review.conflicts:
-        ctx._budget_review_pass = n
-    return review
-
-
-@quota_reviewer.moving_review  # A reviewer at a hard limit moves to the worker, never waits (#186).
-def _review_session(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str,
-                    *, round_number: int = 1, pr: int | None = None) -> ReviewResult:
     _phase(n, ctx, "reviewing")
     reviewer = resolved_reviewer(ctx.config)
     rebuttals = _read_rebuttals(git.root)
@@ -267,6 +254,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        record_pass(n, ctx)
     facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
@@ -500,10 +488,7 @@ def passed_head(n: int, ctx: RunContext, git: GitRepo) -> bool:
         return False
     branch = f"foragent/issue-{n}"
     pr = next((pr for pr in ctx.tracker.list_prs("open", branch) if pr.head == branch), None)
-    passed = pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
-    if passed:
-        ctx._budget_review_pass = n
-    return passed
+    return pr is not None and ctx.tracker.pr_head_sha(pr.number) == head
 
 
 def unchanged_since_pass(git: GitRepo, head: str) -> bool:
@@ -597,7 +582,6 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     from foragent import runner
     from foragent.run_publish import _check_publication, _hold_changed_head, _publish_reviewed_head, _refresh_reviewed_head
 
-    runner.new_budget_turn(ctx)
     approval = ctx.store.load_approval(n)
     if approval is None:
         invalidate_approval(ctx, n, "Review requires a current approved snapshot. Re-approve to run it.")
@@ -622,8 +606,8 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
     if verdict_head is not None and head != verdict_head:
         return _hold_changed_head(n, ctx, link)
     if verdict_head is not None:
-        ctx._budget_review_pass = n
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        record_pass(n, ctx)
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
         _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator")
 

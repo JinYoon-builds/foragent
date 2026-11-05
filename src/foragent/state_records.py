@@ -78,6 +78,11 @@ class Run:
     skills_reported: bool = False
     skills_used: list[str] = field(default_factory=list)
     last_review_pass_at: str | None = None
+    # What this run did since its last review PASS decides how a spent budget is named (#1514):
+    # a PASS given with run time left stands until a new implementer session starts, and a
+    # non-neutral base follow after it is recorded. Only run_waits.record_* write these.
+    standing_pass_at: str | None = None
+    followed_base_at: str | None = None
     review_pass_to_merge_seconds: float | None = None
     merge_lock_held_seconds: float | None = None
     comparison: dict | None = None

@@ -97,15 +97,24 @@ def paused_seconds(n: int, ctx: RunContext) -> float:
     return run.waited_seconds + run.talk_pause_seconds(now)
 
 
-def new_budget_turn(ctx: RunContext, review_pass: int | None = None) -> None:
-    """Start the timeout-attribution marks of one invocation (#1514).
+def record_pass(n: int, ctx: RunContext) -> None:
+    """A review PASS (or a reused one) given while the run had time left now stands (#1514).
 
-    The marks live on the context, and one context can serve several runs, review-only
-    calls or owner turns in a row. Every entry that spends a run budget calls this first,
-    so only its own PASS and its own base following can name a timeout base-changed.
+    A PASS on the run's last second does not: that review itself spent the budget.
     """
-    ctx._budget_review_pass = review_pass
-    ctx._budget_base_changed = None
+    if _remaining(n, ctx) > 0:
+        ctx.store.update_run(n, standing_pass_at=ctx.now().isoformat(), followed_base_at=None)
+
+
+def record_session(n: int, ctx: RunContext) -> None:
+    """A new implementer session spends the budget on new work: no PASS stands any more."""
+    ctx.store.update_run(n, standing_pass_at=None, followed_base_at=None)
+
+
+def record_base_follow(n: int, ctx: RunContext) -> None:
+    """The run starts following a non-neutral base move with time left."""
+    if _remaining(n, ctx) > 0:
+        ctx.store.update_run(n, followed_base_at=ctx.now().isoformat())
 
 
 def stop_if_budget_spent(n: int, ctx: RunContext, cut: bool, detail: str) -> None:
@@ -124,11 +133,17 @@ def _timeout(n: int, ctx: RunContext, *, check: bool = False) -> str:
     if check:
         flag(ctx, n, Reason.TIMEOUT, "Check reached its time limit")
         return "timeout"
-    if getattr(ctx, "_budget_base_changed", None) == n:
+    # The name comes from what this whole run did (its record), never from the step that ran out.
+    run = ctx.store.get_run(n)
+    if run is not None and run.standing_pass_at and run.followed_base_at:
         ctx.store.update_run(n, detail="Run budget spent following a changed base; returning to ready.")
         ctx.tracker.add_labels(n, ["ready"])
         ctx.tracker.remove_labels(n, ["running"])
         return "base-changed"
+    if run is not None and run.standing_pass_at:
+        # No implementer session after the PASS: the work fit, so this is not too-large.
+        flag(ctx, n, Reason.RUNTIME_EXCEEDED, "Run budget ran out after its review PASS.")
+        return "runtime-exceeded"
     flag(ctx, n, Reason.TOO_LARGE, "Too big for one session; split it in order")
     return "too-large"
 
