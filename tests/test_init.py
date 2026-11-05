@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
+import shutil
 from pathlib import Path
 import subprocess
 
@@ -178,6 +179,9 @@ def setup(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(argv, 0, stdout='{"loggedIn": true}', stderr="")
         return run(argv, *args, **kwargs)
 
+    which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw:
+                        f"/offline/{name}" if name in {"git", "gh", "uv"} else which(name, *a, **kw))
     monkeypatch.setattr(subprocess, "run", offline_tools)
     origin, root = tmp_path / "origin.git", tmp_path / "project"
     git_command(tmp_path, "init", "--bare", "--initial-branch=main", str(origin))
