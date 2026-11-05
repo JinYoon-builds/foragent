@@ -271,3 +271,5 @@ Fact (2026-10-31): blocked_by lives as GitHub issue relations created at publish
 - When the mobsplit order publishes: answer PM request r760 with its issue number (PM makes 'batch-tests-shared-start' blocked_by it).
 - If #2103 round 2 FAILs on command syntax (shell parsing, '--', continuations, quoting): retry with architect r782's hint (collect node ids with pytest --collect-only, subtract exact-head passing set, run by node id; fail-closed = run unchanged). #2103 is PM-urgent: tell PM.
 - PM r788 (11-05 18:10 KST, Jin-approved): global priority 2103 > 2078 > 2129 > 2125 2128 2126 2124 1874 > 1641 1957 1952 1642 > 1422 1821 1475; merge-path chain runs strictly in sequence. Tell PM when a listed item is blocked over 1 h.
+- 7 days after #2136 merged (11-05 12:53Z): re-measure run minutes after outside issue close (architect r787 query), expected 294 min/7d -> 0.
+- If #2125 review round 6 (started 14:39Z 11-05) FAILs in the startable/admission class: apply architect r810's Goal bar (startable = fa orch facts admission replay; live GitHub-read start checks are NOTE) by order edit + retry. If it PASSes, drop.
