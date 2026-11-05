@@ -69,8 +69,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    `fa profile set --kind "<kind>" --stage "<stage>" --priority "<priority>"`.
    If `profile` is empty, skip this step; the planning interview fills it.
 
-4. **Open the lane view at session start.** Run `fa gate watch --open` in the project
-   folder beside this planning session, once at the start of every session.
+4. **Open the dashboard yourself when work starts.** The dashboard is the live terminal
+   screen of the work. Run `fa gate watch --open` in the project folder once at the start
+   of every session; it opens the dashboard beside this planning session. When the
+   dashboard is already open, it leaves it as it is; then say it is already open.
+   Never tell the person to type a dashboard command: opening it is your job.
 
 5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as

@@ -1,0 +1,1 @@
+- [id:1820-dashboard-terms] test_dashboard_terms의 문서 검사는 docs/ 아래 보관함(decisions.md, design, research, impl, specs) 밖의 모든 .md를 읽고 TUI를 대소문자 무시로 잡아요. docs/_proto 같은 기록 파일의 경로 목록(예: tui.py, lane-view-sketch)도 걸리므로, 사람 문서 용어 정리 때 docs 전체를 `grep -rniE "\bTUI\b|lane[ -]views?|레인 *화면"`으로 먼저 훑어요. 기본 HEAD 실패와 비교하려면 `git worktree add --detach $(mktemp -d) HEAD`에서 같은 시험을 돌려요.
