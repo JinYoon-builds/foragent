@@ -105,4 +105,7 @@ def close(plan, items, tracker, approve, selected_numbers, language):
             comment, reason = text("cleanup_comment_commit", language, commit=item["commit"]), "completed"
         else:
             comment, reason = text("cleanup_comment_into", language, into=item["into"]), "not_planned"
-        tracker.close_issue(number, comment + "\n\n" + marker, reason=reason)
+        # Lazy: orch_close pulls in the scheduler, which order publishing does not need first.
+        from foragent.orch_close import close_with_pr
+
+        close_with_pr(tracker, number, comment + "\n\n" + marker, reason=reason, issue_open=True)

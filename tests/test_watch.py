@@ -286,9 +286,7 @@ def test_header_warns_when_nothing_was_read_and_summary_keeps_the_snapshot_time(
 
 @pytest.mark.parametrize('language,label', [('en', 'waiting for shared files'), ('ko', '공유 파일 기다려요')])
 def test_overlap_wait_activity_uses_translated_waiting_phase(language, label):
-    from foragent.watch_layout import _activity
-
     row = {'state': 'working', 'phase': 'overlap-wait', 'last_activity_seconds': 0}
-    assert _activity(row, language, 0, 10, None, phase_seconds=120) == (
+    assert watch.activity(row, language, 0, 10, None, phase_seconds=120) == (
         f'● {label} ' + ('2 min' if language == 'en' else '2분')
     )
