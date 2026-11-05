@@ -141,7 +141,7 @@ def row(key: str, entry: dict | None, config: Config, owner: dict | None = None)
     entry = project(entry, owner, config) if entry else {
         "status": "not_prepared", "reason": text("prepare_none", config.language)}
     result = {"key": key, "status": entry["status"], "phase": entry.get("phase"),
-              "questions": entry.get("questions", []), "holds": len(holds(entry)),
+              "questions": entry.get("questions", []), "notes": entry.get("notes", []), "holds": len(holds(entry)),
               "reason": entry.get("reason"), "updated_at": entry.get("updated_at"),
               "base_revision": entry.get("base_revision")}
     for name in ("scratch", "done_when", "ignored", "red", "coverage"):

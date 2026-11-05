@@ -24,3 +24,4 @@ Durable lessons of this project's orchestrator. Only the orchestrator session wr
 - [Unpark needs re-approval](unpark-and-reapprove.md) — park removes approved; unpark+retry leaves issues "ready" but never started; re-approve by edit
 - [CI timeout loop, parser defect (11-04)](ci-timeout-loop-and-review-parser.md) — green CI held = runner saturation; resolve loops; issue ≠ its PR
 - [No main writes during a train](no-main-writes-during-train.md) — check batch-merge refs before publish/memory push; wait until empty
+- [Review bar for command rewrites](hint-defect-class-gate-rewrites.md) — gate changes that parse user commands need 'only unsafe results block' in the first Goal
