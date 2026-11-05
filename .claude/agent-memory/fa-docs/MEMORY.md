@@ -26,6 +26,7 @@
 - r716 (2026-11-05): orders #1790/#1847 (=#1791, merge 96b7dfd5) — add plan `closes` bullet to docs/order.md §6 after :103. Wait: orchestrator judges.
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
 - r749 (2026-11-05): orders #1704/#1740/#1775/#1984/#2012/#2049/#2051 — README en/ko one sentence for `fa review <branch>` (#1873, contributor PRs). Wait: orchestrator judges; also when #1492 (fa stop) merges, check README team section 'stop the affected factories'.
+- r759 (2026-11-05): orders #1205/#1211/#1706/#1719/#1759/#1858 — add #1206 Done-when executable refusal to docs/order.md after collection paragraph (~:192). Wait: orchestrator judges.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -82,3 +83,4 @@
 - Orders whose only child closed NOT_PLANNED with `foragent:replaced plan=...` (e.g. #1898/#1899 D112 → #2078 r53) changed nothing; check the replacing issue's merge later. D64 보강 5 (decisions.md:519 acorn-number link) gets its 대체 mark only after D112 code lands.
 - New person-facing top-level commands (e.g. `fa review`, #1873) get no README line by themselves; README names only fa init, /fa, fa gate. Check the Goal's dated purpose and propose one sentence. `fa orch stop/release` (#1491) waits for the person shortcut #1492.
 - Dashboard art (squirrel ears/wordmark #1894), conflicting-PR refresh (#2035) and push-refusal waits (#2061) touch no reader doc; README names no logo. A plan's acceptance map can list issues merged by earlier orders (#1893: 1499/1501/1892); check only the `map=` children.
+- Children 'Remove superseded #NNNN locked tests (superseded by #MMMM)' (e.g. #1208/#1760/#1859 → #1970 merge trains) mean the child's code never landed as specced; check only the superseding PR.
