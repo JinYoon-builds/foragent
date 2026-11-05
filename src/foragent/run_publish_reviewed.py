@@ -57,6 +57,8 @@ def _refresh_reviewed_head(
     view = SimpleNamespace(n=n, ctx=ctx, git=git, approval=ctx.store.load_approval(n), baseline=None)
     # Only a follow after a standing PASS names a spent budget (#1514); judge the move only then.
     neutral = not ctx.store.get_run(n).standing_pass_at or base_move_is_neutral(view, capture_move(git, target_sha))
+    if not neutral:
+        run_publish.record_base_follow(n, ctx)  # before the merge spends the budget (#1514)
     try:
         git.merge_base(target_sha)
     except run_publish.GitError:
@@ -64,8 +66,6 @@ def _refresh_reviewed_head(
             raise
         git.quit_merge()
         return head, base_changed()
-    if not neutral:
-        run_publish.record_base_follow(n, ctx)
     if prepare is not None:
         prepare()
     new_head = git.head_sha()

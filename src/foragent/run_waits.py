@@ -100,10 +100,11 @@ def paused_seconds(n: int, ctx: RunContext) -> float:
 def record_pass(n: int, ctx: RunContext) -> None:
     """A review PASS (or a reused one) given while the run had time left now stands (#1514).
 
-    A PASS on the run's last second does not: that review itself spent the budget.
+    A PASS on the run's last second does not: that review itself spent the budget. A re-review
+    while following a base keeps the follow: only a new implementer session ends it.
     """
     if _remaining(n, ctx) > 0:
-        ctx.store.update_run(n, standing_pass_at=ctx.now().isoformat(), followed_base_at=None)
+        ctx.store.update_run(n, standing_pass_at=ctx.now().isoformat())
 
 
 def record_session(n: int, ctx: RunContext) -> None:
@@ -112,8 +113,12 @@ def record_session(n: int, ctx: RunContext) -> None:
 
 
 def record_base_follow(n: int, ctx: RunContext) -> None:
-    """The run starts following a non-neutral base move with time left."""
-    if _remaining(n, ctx) > 0:
+    """The run starts following a non-neutral base move with time left after a standing PASS.
+
+    Callers record it before the following work (merge, checks, re-review) spends the budget.
+    """
+    run = ctx.store.get_run(n)
+    if run is not None and run.standing_pass_at and _remaining(n, ctx) > 0:
         ctx.store.update_run(n, followed_base_at=ctx.now().isoformat())
 
 

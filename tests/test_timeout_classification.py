@@ -311,7 +311,7 @@ RECORDS = {  # the run's own record before the continuation, and the name it mus
 
 
 @pytest.mark.parametrize("record", sorted(RECORDS))
-@pytest.mark.parametrize("kind", ["ci-repair", "base-follow", "review-rerun"])
+@pytest.mark.parametrize("kind", ["ci-repair", "base-follow", "review-rerun", "review-pass-then-ci-repair"])
 def test_every_continuation_names_the_run_from_its_whole_record(git_history, tmp_path, monkeypatch, kind, record):
     """A continuation inside one run (CI repair, a neutral base refresh, a review rerun) that
     meets the end of the budget never resets what the run did before it: zero implementer
@@ -333,10 +333,22 @@ def test_every_continuation_names_the_run_from_its_whole_record(git_history, tmp
     git = case.git.at(worktree)
     now = case.clock[0].isoformat()
     case.store.update_run(1, standing_pass_at=now if passed else None, followed_base_at=now if followed else None)
-    left = 300 if kind == "base-follow" else 0  # the base refresh starts with a little time left
+    left = 0 if kind in {"ci-repair", "review-rerun"} else 300  # these steps start with a little time left
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - left)
 
-    if kind == "ci-repair":
+    if kind == "review-pass-then-ci-repair":
+        # A re-review of the run's own head passes again, then a CI repair meets the end of the budget.
+        attempt = _prepare_implementation(1, case.ctx, git, target_branch="main", capture_baseline=False)
+        case.reviewer.steps = [lambda kwargs: "VERDICT: PASS"]
+        _review_implementation(attempt)
+        assert not attempt.failure
+        if not passed:
+            expected = "runtime-exceeded"  # this PASS is the run's first standing PASS
+        case.clock[0] += timedelta(seconds=left)
+        with pytest.raises(ExecutorStopped) as caught:
+            runner._implement_and_publish(1, case.ctx, git, target_branch="main", failure="CI failed on the PR head")
+        outcome = caught.value.outcome
+    elif kind == "ci-repair":
         with pytest.raises(ExecutorStopped) as caught:
             runner._implement_and_publish(1, case.ctx, git, target_branch="main", failure="CI failed on the PR head")
         outcome = caught.value.outcome
@@ -369,3 +381,54 @@ def test_every_continuation_names_the_run_from_its_whole_record(git_history, tmp
     assert (flag.reason if flag else None) == (None if expected == "base-changed" else expected)
     assert case.tracker.get_issue(1).labels & {"ready", "blocked"} == (
         {"ready"} if expected == "base-changed" else {"blocked"})
+
+
+@pytest.mark.parametrize("path", ["docs/guide.md", "src/other_lane.py"])
+def test_a_base_merge_that_spends_the_last_seconds_still_counts_as_following(git_history, tmp_path, monkeypatch, path):
+    """The follow is recorded when it starts, so a merge that uses up the budget keeps it (#1514)."""
+    from foragent import runner
+    from foragent.git import GitRepo
+    from foragent.issue import parse_body
+    from foragent.run_checks import _verify_review_head
+    from foragent.run_publish_reviewed import _refresh_reviewed_head
+
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    head = case.git.head_sha()
+    number = case.tracker.create_pr(head="foragent/issue-1", base="main", title="Feature", body="Closes #1")
+    case.tracker.set_pr_head_sha(number, head)
+    git_history.update({path: "Changed\n"}, message="Main advanced")
+    case.git.fetch("origin", "main")
+    case.store.update_run(1, standing_pass_at=case.clock[0].isoformat())
+    case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - 30)
+    original = GitRepo.merge_base
+
+    def slow_merge(git, target):
+        result = original(git, target)
+        case.clock[0] += timedelta(seconds=60)  # the merge itself spends the last 30 seconds
+        return result
+
+    monkeypatch.setattr(GitRepo, "merge_base", slow_merge)
+    monkeypatch.setattr(runner, "run_logged", lambda *a, **k: pytest.fail("no check starts without time"))
+    parsed = parse_body(case.store.load_approval(1).body)
+    _, outcome = _refresh_reviewed_head(
+        1, case.ctx, case.git, case.tracker.get_pr(number), head, git_history.tip,
+        lambda new: _verify_review_head(1, case.ctx, case.git, parsed, new, "PR link"))
+    expected = "base-changed" if path.startswith("src/") else "runtime-exceeded"
+    assert outcome == expected
+    assert case.implementer.calls == []
+    assert case.tracker.get_issue(1).labels & {"ready", "blocked"} == (
+        {"ready"} if expected == "base-changed" else {"blocked"})
+    flag = case.store.load_flag(1)
+    assert (flag.reason if flag else None) == (None if expected == "base-changed" else expected)
+
+
+def test_a_follow_before_any_pass_is_not_counted_after_a_later_pass(git_history, tmp_path, monkeypatch):
+    """Only a follow that starts under a standing PASS can name the run base-changed (#1514)."""
+    from foragent.run_waits import _timeout, record_base_follow, record_pass
+
+    case = runner_case(git_history, tmp_path, monkeypatch)
+    case.store.start_run(1, branch="foragent/issue-1", worktree=case.store.worktree_path(1))
+    record_base_follow(1, case.ctx)
+    record_pass(1, case.ctx)
+    assert case.store.get_run(1).followed_base_at is None
+    assert _timeout(1, case.ctx) == "runtime-exceeded"

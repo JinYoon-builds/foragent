@@ -208,7 +208,13 @@ def test_each_changed_merge_input_is_rejected_after_queuing(queued_publish, monk
     case.change = change
     if case.reviewed and changed == "publication":
         outcome = "ci-failed"
+    if case.reviewed and changed == "runtime-budget":
+        # A re-review run passed and started no implementer session after it (#1514).
+        outcome = "runtime-exceeded"
     assert case.publish() == outcome
+    if changed == "runtime-budget":
+        flag = case.store.load_flag(1)
+        assert flag is not None and flag.reason == outcome
     assert case.acquisitions == 1
     assert case.tracker.merged_prs == []
     assert case.sleeps == []
