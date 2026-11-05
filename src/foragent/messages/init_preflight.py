@@ -17,7 +17,7 @@ MESSAGES = {
             "Start a git work tree, then choose how to link it and rerun fa init:\n"
             "  git init\n{choices}"
         ),
-        "init_setup_fixes": "Setup checks failed. Run these fixes, then rerun fa init:\n{fixes}",
+        "init_setup_fixes": "Setup checks failed. Complete these items, then rerun fa init:\n{fixes}",
         "init_gh_missing": (
             "gh auth status failed: {error}\n"
             "The GitHub CLI (gh) is not installed. Install it, then rerun fa init:\n"
@@ -52,7 +52,7 @@ MESSAGES = {
             "Git 저장소를 시작하고 연결 방법을 고른 뒤 fa init을 다시 실행하세요:\n"
             "  git init\n{choices}"
         ),
-        "init_setup_fixes": "설정 점검을 통과하지 못했어요. 다음 명령을 실행한 뒤 fa init을 다시 실행하세요:\n{fixes}",
+        "init_setup_fixes": "설정 점검을 통과하지 못했어요. 다음 항목을 마친 뒤 fa init을 다시 실행하세요:\n{fixes}",
         "init_gh_missing": (
             "gh auth status failed: {error}\n"
             "GitHub CLI(gh)가 설치되어 있지 않아요. 설치한 뒤 fa init을 다시 실행하세요:\n"
