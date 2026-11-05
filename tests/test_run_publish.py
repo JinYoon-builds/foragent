@@ -87,8 +87,8 @@ def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(t
         assert capacity.machine_runs(store, clock[0]) == 1
         effects.append(name)
 
-    def merge(base):
-        assert base == "new-base"
+    def merge(base, *, commit):
+        assert base == "new-base" and commit is True  # Without prepare the refresh commits the merge itself.
         effect("merge")
         local_head[0] = "refreshed"
 

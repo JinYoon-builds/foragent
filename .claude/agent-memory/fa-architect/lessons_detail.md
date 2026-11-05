@@ -106,3 +106,15 @@ When a scope hint makes the reviewer accept the label NOTE, the executor often w
 - Before accepting a review finding as above-bar or not, check two facts: does a config turn that path off (#1526 group path under `merge_group_max: 1`, 0 group rows in merge-queue.jsonl), and does the finding's input appear in real issue bodies (#1570 fence and marker cases: 0 of the last 400)? Counting the construct beats arguing about the race.
 - To measure CI flips after base moves, use gh run list per day (--limit caps at 1000) plus a bare blob:none clone with `+refs/pull/*/head` fetched; a refresh head is a 2-parent commit whose first parent is the passing head. Before calling a flip a collision, check main's own push CI at the merged main sha: most flips were main already red.
 - A run that ends 'crashed' ('Crash recovery for running label generation N') within a minute of a `kind=retry` event is the gate's intended restart after a Goal edit (#1491 r377, 11-03), not a crash. Only 2 of 21 such outcomes since 10-27 followed a retry; most come from batch restarts. Match against retry events before you count crashes.
+
+## Command-text handling (moved from index)
+
+A merge gate that re-runs the user's test command on base to get evidence grows one command-rewriting rule per review round (#1105: shlex, -x, -c, conftest, PYTHONPATH). Reuse the run baseline's fixed invocation and its cached passing set (`node_ids`) instead, and keep the user's command verbatim and on head only. Same class recurred in #2103's skip path (r782): skip by collected node ids, never by parsing command text.
+
+Sort a command-handling hold's findings by effect: missed skip (time only), wrong red (passing -> fail), unsafe skip. #2103 r1-r5: 9/5/0; a method hint (r782) did not stop missed-skip findings. Bar: hold on wrong red and unsafe skip only; close wrong red by pytest exit code 2-5 -> rerun verbatim (exit 1 stands, locked once-run tests). (r797)
+
+The merged #2103 wrapper (ci_local.skipping) avoids parsing: --deselect via a PYTEST_ADDOPTS @file, rerun verbatim on exit 5 (r803).
+
+## Function split (moved from index)
+
+When a design splits a function 'after step X' to reuse its tail, read what the head computes that the tail uses (order.publish 581-685: mapping, owner, selection refusals). A 2-way split makes the new caller copy the head, or run the head's refusals after irreversible-ish effects (push). Split 3 ways: prepare / effects / tail.
