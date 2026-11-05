@@ -1398,7 +1398,7 @@ def test_incomplete_train_retirements_have_distinct_member_identities(batched, m
     update_base(case, {"src/shared.py": "VALUE = -1\n"})
     candidates = {place.n: (place, job) for place, job, _ in batch_candidates(case)}
     case.pending_batch = True
-    support.gate(case)
+    first = support.gate(case)
     tip, = groups(case)
     _, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert [n for n, *_ in chain] == [5, 4, 2]
@@ -1410,7 +1410,9 @@ def test_incomplete_train_retirements_have_distinct_member_identities(batched, m
     assert retired["identity"] == batch._identity(case.base, chain)
     assert retired["identity"] != batch._identity(case.base, with_left_out)
     assert [member["n"] for member in retired["members"]] == [5, 4, 2]
-    assert 1 in [place[0] for place in merge_owner.admissions(case.store)]
+    # The left-out member went back to its lane for the main conflict; the retirement does not spend it.
+    assert [a for a in first.actions if a.startswith("#1 ")] == [f"#1 sent back to lane: conflicts with {case.base[:8]}"]
+    assert 1 not in [member["n"] for member in retired["spent"]] and 1 not in [place[0] for place in merge_owner.admissions(case.store)]
 
 
 def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
