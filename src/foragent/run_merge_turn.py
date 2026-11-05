@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, NoReturn
 from uuid import uuid4
 
 from foragent import orch_queue
+from foragent.file_cache import invalidate, read_jsonl
 from foragent.run_waits import WaitPhase, note_activity
 
 if TYPE_CHECKING:
@@ -64,19 +65,9 @@ def seat(ctx: RunContext, n: int, target: str) -> Seat:
 
 
 def _rows(store: StateStore) -> list[dict]:
-    try:
-        raw = (store.root / QUEUE).read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return []
-    rows = []
-    for line in raw.splitlines():
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and isinstance(row.get("n"), int):
-            rows.append(row)
-    return rows
+    """Shared read-only queue rows, parsed only when the file version changes."""
+    return [row for row in read_jsonl(store.root / QUEUE, tolerant=True)
+            if isinstance(row.get("n"), int)]
 
 
 def _waiting(rows: list[dict], target: str) -> dict[tuple[int, str | None], dict]:
@@ -109,6 +100,7 @@ def _append(store: StateStore, row: dict) -> None:
     store.root.mkdir(parents=True, exist_ok=True)
     with (store.root / QUEUE).open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row) + "\n")
+    invalidate(store.root / QUEUE)
 
 
 def _row(ctx: RunContext, place: Seat, event: str, **fields) -> dict:

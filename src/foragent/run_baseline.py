@@ -171,9 +171,8 @@ def _baseline_environment(root: Path) -> dict:
 
 def unmerged_acceptance_owners(ctx: RunContext) -> dict[str, set[int]]:
     """Locked file -> approved issues that own it and have not merged (#327)."""
-    merged = {run.number for run in ctx.store.read_history() if run.outcome == "merged"}
-    if getattr(ctx.config, "merge_owner", False):
-        merged.update(number for number, _ in ctx.store.owner_merge_facts())
+    owner_facts = ctx.store.owner_merge_facts()
+    merged = {run.number for run in ctx.store.read_history() if ctx.store.run_merged(run, owner_facts=owner_facts)}
     owners: dict[str, set[int]] = {}
     for path in (ctx.store.root / "approvals").glob("*.json"):
         approval = ctx.store.load_approval(int(path.stem))
@@ -189,10 +188,11 @@ def _baseline_exclusions(ctx: RunContext, base_sha: str, log: Path) -> list[str]
     return pending_acceptance_exclusions(ctx, (base_sha,), log)
 
 
-def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path) -> list[str]:
-    """Pending locks present in any input tree of a proposed merge."""
+def pending_acceptance_exclusions(ctx: RunContext, refs: tuple[str, ...], log: Path, *, own=()) -> list[str]:
+    """Pending locks in the input trees, except files required by ``own`` members."""
     owners = unmerged_acceptance_owners(ctx)
-    excluded = sorted(name for name in owners
+    own = set(own)
+    excluded = sorted(name for name in owners if not owners[name] & own
                       if any(ctx.git.blob_sha(ref, name) is not None for ref in refs))
     issues = sorted({number for name in excluded for number in owners[name]})
     _append(log, f"Acceptance baseline skipped {len(excluded)} files owned by open issues: "

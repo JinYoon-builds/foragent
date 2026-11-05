@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from foragent import machine_budget, orch_plan, orch_queue, overlap_files, quota_events, resource_sample, scheduler, scheduler_flow, scheduler_quota
+from foragent import machine_budget, orch_plan, orch_queue, overlap_files, quota_events, resource_sample, scheduler, scheduler_flow, scheduler_quota, step_weights
 # The facade re-exports these capacity and baseline bindings from here; calls below go through it.
 from foragent.capacity import (  # noqa: F401
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, append_budget_history, append_memory_hold, decrease_allowed, machine_load,
@@ -322,7 +322,8 @@ def _start_ready(
             report.actions.append(scheduler_quota.switch_line(number, start.switch, ctx.config.language))
         ctx.store.clear_run_start(number)
         pid = ctx.launcher(number)
-        ctx.store.update_run(number, pid=pid)
+        launched = ctx.store.update_run(number, pid=pid)
+        step_weights.started(ctx.store, launched)
         report.actions.append(f"#{number} started running (pid={pid})")
         scheduler_flow.started(ctx, number, run.started_at)  # Kept from before the launch: the run may end at once.
         started = True

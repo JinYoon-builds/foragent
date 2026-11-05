@@ -110,6 +110,8 @@ class Run:
     contract_published: bool = False
     continued: bool = False
     build_id: str | None = None
+    # The reason of the last flag() on this running execution (#2036); a held history row reads it.
+    hold_reason: str | None = None
 
     @property
     def key(self) -> int | str:

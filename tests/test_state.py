@@ -418,7 +418,8 @@ def test_runs_round_trip_update_active_and_history(store):
     history = [json.loads(line) for line in (store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
     # Each history entry also saves when the run finished, beside the Run fields.
     ended = store._timestamp()
-    assert history == [{**asdict(finished), "finished_at": ended}, {**asdict(store.get_run(2)), "finished_at": ended}]
+    assert [{key: value for key, value in row.items() if key != "run_generation"} for row in history] == [
+        {**asdict(finished), "finished_at": ended}, {**asdict(store.get_run(2)), "finished_at": ended}]
     assert store.finish_times() == {(1, finished.started_at): ended, (2, store.get_run(2).started_at): ended}
     assert store.read_history() == [finished, store.get_run(2)]
     assert store.finish_run(1, "success") == finished
@@ -465,8 +466,8 @@ def test_failed_history_write_can_be_retried(store, monkeypatch):
     assert store.read_history() == [finished]
 
 
-def test_failed_finish_record_write_can_be_retried_without_duplicate_history(store, monkeypatch):
-    running = store.start_run(1, branch="branch", worktree="worktree")
+def test_failed_finish_snapshot_write_is_already_committed_without_duplicate_history(store, monkeypatch):
+    store.start_run(1, branch="branch", worktree="worktree")
     write_json = store._write_json
 
     def fail_record_write(path, value):
@@ -478,14 +479,14 @@ def test_failed_finish_record_write_can_be_retried_without_duplicate_history(sto
         patch.setattr(store, "_write_json", fail_record_write)
         with pytest.raises(OSError, match="record write failed"):
             store.finish_run(1, "success", "Checks passed.")
-    assert store.get_run(1) == running
-    assert len(store.read_history()) == 1
-    finished = store.finish_run(1, "success", "Checks passed.")
-    assert store.get_run(1) == finished
-    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
-    assert store.read_history() == [finished]
+    reopened = StateStore(store.root)
+    finished, = reopened.read_history()
+    assert reopened.get_run(1) == finished
+    assert finished.status == "finished" and finished.detail == "Checks passed."
+    assert reopened.active_runs() == []
+    assert reopened.finish_run(1, "success", "Checks passed.") == finished
     assert store.finish_run(1, "failed") == finished
-    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+    assert len((store.root / "runs.jsonl").read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_history_deduplicates_by_number_and_start_time_using_latest_entry(store):
@@ -894,21 +895,22 @@ def test_locked_write_reads_the_current_file_not_the_read_cache(store):
 
 
 def test_replace_between_stat_and_read_is_parsed_once(store, monkeypatch):
-    from foragent import state_issues
+    from pathlib import Path
 
     store.update_local_issue(7, title="first")
     peer = StateStore(store.root, now=lambda: NOW)
     parses = _counted_parses(monkeypatch)
-    read_issue_file = state_issues._read_issue_file
+    open_file = Path.open
 
-    def replaced_first(path):
-        # A peer's atomic replace lands after the reader's stat and before its read.
-        monkeypatch.setattr(state_issues, "_read_issue_file", read_issue_file)
-        peer.update_local_issue(7, title="second")
-        parses.clear()
-        return read_issue_file(path)
+    def replaced_first(path, *args, **kwargs):
+        if path == store.root / "issues.json":
+            # A peer's atomic replace lands after the reader's stat and before its open.
+            monkeypatch.setattr(Path, "open", open_file)
+            peer.update_local_issue(7, title="second")
+            parses.clear()
+        return open_file(path, *args, **kwargs)
 
-    monkeypatch.setattr(state_issues, "_read_issue_file", replaced_first)
+    monkeypatch.setattr(Path, "open", replaced_first)
     assert store.local_issues()[0]["title"] == "second"
     assert store.github_outbox() == []
     assert store.local_board_value(7, "p", "f") is None

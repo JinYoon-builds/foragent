@@ -1323,13 +1323,13 @@ def test_view_opener_failure_keeps_all_runs_and_reports_success(ctx, monkeypatch
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했어요" in captured.err
+    assert "대시보드를 열지 못했어요" in captured.err
     tick(ctx)
     assert capsys.readouterr() == ("", "")
     # Every failure kind is retried once the spacing has passed.
     ctx.now = lambda: NOW + timedelta(minutes=5)
     tick(ctx)
-    assert "레인 화면을 열지 못했어요" in capsys.readouterr().err
+    assert "대시보드를 열지 못했어요" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("failure", [
@@ -1355,7 +1355,7 @@ def test_view_opener_exception_preserves_tick_report_and_next_tick(ctx, monkeypa
     assert {action for action in report.actions if "started running" in action} == {
         "#1 started running (pid=7001)", "#2 started running (pid=7002)",
     }
-    assert report.actions[-1] == "Couldn't open the lane view (" + " ".join(str(failure).split()) + "). Try again."
+    assert report.actions[-1] == "Couldn't open the dashboard (" + " ".join(str(failure).split()) + "). Try again."
     assert opened == [(ctx.repo_root, ctx.store, ctx.config.language)]
     assert tick(ctx).actions == []
     assert len(opened) == 1
@@ -2054,7 +2054,8 @@ def test_dead_run_finishes_without_requeueing_closed_or_flagged_issue(ctx, monke
     ctx.process_table.exit(ctx.store.get_run(1).pid)
     tick(ctx)
     assert ctx.store.active_runs() == []
-    assert ctx.store.get_run(1).outcome == "crashed"
+    # #2136: a run whose issue was closed outside the gate takes the stop path, not crash recovery.
+    assert ctx.store.get_run(1).outcome == ("stopped" if state == "closed" else "crashed")
     assert not ctx.tracker.get_issue(1).labels & {"ready", "running"}
 
 
@@ -3204,3 +3205,91 @@ def test_refresh_failure_with_queued_writes_starts_nothing(ctx, monkeypatch):
     assert "No run starts this tick: queued GitHub writes are not delivered yet" in report.actions
     assert {"approved", "ready"} <= ctx.tracker._tracker.get_issue(1).labels
     assert ctx.store.github_outbox()  # The queued write waits for a successful refresh.
+
+
+def _closed_run_case(ctx, setup):
+    from foragent import run_merge_turn
+
+    approve(ctx)
+    tick(ctx)
+    run = mark_running(ctx, pid=5432)
+    seat = run_merge_turn.Seat(1, run.started_at, "main")
+    setup(ctx, run, seat, run_merge_turn)
+    killed = []
+    ctx.kill_runner = record_stop(ctx, killed.append)
+    ctx.tracker.close_issue(1, "Closed.")
+    tick(ctx)
+    return killed
+
+
+def _owner_job(ctx, run, phase):
+    path = ctx.store.root / "merge-owner" / "1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"started_at": run.started_at, "phase": phase}), encoding="utf-8")
+
+
+OWN_MERGE_CALLS = {
+    "turn-merged": lambda ctx, run, seat, turn: turn.record_turn(ctx, seat, "base", "merged"),
+    "owner-merging": lambda ctx, run, seat, turn: _owner_job(ctx, run, "merging"),
+    "owner-merged": lambda ctx, run, seat, turn: _owner_job(ctx, run, "merged"),
+    "merged-at": lambda ctx, run, seat, turn: ctx.store.record_merge(1, NOW),
+}
+
+
+@pytest.mark.parametrize("own_merge", list(OWN_MERGE_CALLS))
+def test_closed_issue_run_whose_own_merge_call_closed_it_is_not_stopped(ctx, own_merge):
+    # #2136: a run whose own merge (or the merge owner's) closed its issue keeps going.
+    assert _closed_run_case(ctx, OWN_MERGE_CALLS[own_merge]) == []
+    assert ctx.store.get_run(1).status == "running"
+
+
+NO_OWN_MERGE = {
+    # Phases and admissions say only that a merge may come later; a close meanwhile is outside.
+    **{f"phase-{phase}": (lambda phase: lambda ctx, run, seat, turn: ctx.store.update_run(1, phase=phase))(phase)
+       for phase in ("merging", "merge-lock-wait", "merge-turn-wait", "resolving-conflict")},
+    "owner-admission": lambda ctx, run, seat, turn: turn.join(ctx, seat, "head", merge_owner=True),
+    "owner-waiting": lambda ctx, run, seat, turn: _owner_job(ctx, run, "waiting"),
+    "turn-failed": lambda ctx, run, seat, turn: (turn.record_turn(ctx, seat, "base", "merged"),
+                                                 turn.record_turn(ctx, seat, "base", "failed")),
+    "person-merge-seat": lambda ctx, run, seat, turn: turn.record_turn(
+        ctx, turn.Seat(1, "orch-merge now", "main"), "base", "merged"),
+    "earlier-execution-merge": lambda ctx, run, seat, turn: ctx.store.record_merge(1, NOW - timedelta(hours=1)),
+}
+
+
+@pytest.mark.parametrize("state", list(NO_OWN_MERGE))
+def test_closed_issue_run_without_its_own_merge_call_is_stopped(ctx, state):
+    # #2136: only a record of this execution's merge call exempts it.
+    assert _closed_run_case(ctx, NO_OWN_MERGE[state]) == [5432]
+    run = ctx.store.get_run(1)
+    assert (run.status, run.outcome) == ("finished", "stopped")
+
+
+def test_closed_issue_dead_runner_is_stopped_once_not_crashed(ctx):
+    # #2136: a gone runner on a closed issue takes the stop path (work kept, reason names the close).
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=5432)
+    ctx.process_table.exit(5432)
+    ctx.tracker.close_issue(1, "Closed by hand.")
+    tick(ctx)
+    tick(ctx)
+    history = [past for past in ctx.store.read_history() if past.number == 1]
+    assert [(past.outcome, "closed outside the gate" in past.detail) for past in history] == [("stopped", True)]
+    assert not ctx.tracker.get_issue(1).labels & {"running", "ready", "blocked"}
+    stops = [json.loads(line) for line in (ctx.store.root / "orch-events.jsonl").read_text().splitlines()]
+    assert [event["kind"] for event in stops if event.get("issue") == 1 and event["kind"] in {"stop", "crash-restart"}] == ["stop"]
+
+
+def test_closed_issue_run_with_an_earlier_executions_merge_is_stopped(ctx):
+    # #2136: only this execution's merge exempts it; an older merged_at on the record does not.
+    approve(ctx)
+    tick(ctx)
+    mark_running(ctx, pid=5432)
+    ctx.store.record_merge(1, NOW - timedelta(hours=1))
+    killed = []
+    ctx.kill_runner = record_stop(ctx, killed.append)
+    ctx.tracker.close_issue(1, "Closed by hand.")
+    tick(ctx)
+    assert killed == [5432]
+    assert ctx.store.get_run(1).outcome == "stopped"

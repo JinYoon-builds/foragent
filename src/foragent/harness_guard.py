@@ -233,11 +233,12 @@ def review_guard(ctx, n: int, git: GitRepo, base_ref: str, files, link: str,
     return guarded
 
 
-def guard_or_stop(ctx, n: int, git: GitRepo, target_ref: str, measured: str, link: str = "") -> None:
+def guard_or_stop(ctx, n: int, git: GitRepo, target_ref: str, measured: str, link: str = "", *, files=None) -> None:
     """Guard a commit about to be measured; hold and stop the run if it changes the harness."""
     from foragent.run_attempt import ExecutorStopped
 
-    if held := guard_measured(ctx, n, git, target_ref, measured, lambda: issue_files(ctx, n)):
+    if held := guard_measured(ctx, n, git, target_ref, measured,
+                              files if files is not None else lambda: issue_files(ctx, n)):
         raise ExecutorStopped(hold(ctx, n, held, link), hold_details(ctx, held))
 
 
@@ -263,11 +264,11 @@ def guard_staged(attempt) -> None:
         raise HarnessHeld(hold_details(ctx, held))
 
 
-def guard_comparison(attempt, head: str, pr: int | None = None) -> None:
+def guard_comparison(attempt, head: str, pr: int | None = None, *, files=None) -> None:
     """Guard the head an acceptance comparison is about to measure."""
     ctx, target = attempt.ctx, getattr(attempt, "target_branch", None) or attempt.ctx.config.base_branch
     link = f"https://github.com/{ctx.repo}/pull/{pr}" if pr is not None else ""
-    guard_or_stop(ctx, attempt.n, attempt.git, f"origin/{target}", head, link)
+    guard_or_stop(ctx, attempt.n, attempt.git, f"origin/{target}", head, link, files=files)
 
 
 def publish_hold(attempt) -> str:

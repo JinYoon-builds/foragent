@@ -55,7 +55,7 @@ def run_orch(args) -> int:
     config, _, store = repo_store(root)
     try:
         print(orch_architect.call(root, store, config, args.why, cli.datetime.now(cli.UTC),
-                                 args.role, short=args.short))
+                                 args.role, short=args.short, topic=args.role == "architect"))
     except orch_architect.ArchitectRefused as exc:
         print(f"foragent: {exc}", file=cli.sys.stderr)
         return 1

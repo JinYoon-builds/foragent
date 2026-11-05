@@ -42,10 +42,10 @@ def run(args) -> int:
         else:
             if args.action == "add":
                 print(("Registered: " if args.approve else "Preview: ") + args.source)
-            print("ID\tName\tLicense\tDescription\tRole\tRuns scripts\tCopies")
+            print("ID\tName\tLicense\tSource\tDescription\tRole\tRuns scripts\tCopies")
             for skill in catalog:
                 description = " ".join(skill["description"].split())
-                print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{description}\t"
+                print(f"{skill['id']}\t{skill['name']}\t{skill['license']}\t{skill['source']}\t{description}\t"
                       f"{skill['role'] or 'unassigned'}\t{'yes' if skill['runs_scripts'] else 'no'}\t"
                       + ", ".join(skill["copies"]))
             for item in payload.get("skipped", []) if args.action == "add" else []:

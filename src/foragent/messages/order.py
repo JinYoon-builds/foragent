@@ -1,4 +1,4 @@
-"""Order replacement messages."""
+"""Order replacement and board cleanup messages."""
 
 MESSAGES = {
     "en": {
@@ -11,6 +11,21 @@ MESSAGES = {
         "replaces_running": "Cannot replace #{number}: it is running.",
         "replaces_preview": "Would close as not planned: #{number} (replaced by {successors}).",
         "replaces_comment": "Replaced by {successors}; closing as not planned.",
+        "cleanup_invalid": "{field} must be a list of unique items, each {{number, commit}} or {{number, into}}.",
+        "cleanup_commit_invalid": "{field} must be a 7 to 40 character lowercase hex commit SHA.",
+        "cleanup_into_invalid": "{field} must be a positive issue number other than the closed one.",
+        "cleanup_missing": "Cannot clean up #{number}: the issue could not be found.",
+        "cleanup_edited": "Cannot close #{number}: it is edited by this order.",
+        "cleanup_replaced": "Cannot close #{number}: it is already replaced by this order.",
+        "cleanup_child": "Cannot close #{number}: it is a child of this order.",
+        "cleanup_parent": "Cannot close #{number}: it is this order's parent.",
+        "cleanup_pr": "Cannot close #{number}: it is a pull request.",
+        "cleanup_running": "Cannot close #{number}: it is running.",
+        "cleanup_into_pr": "Cannot fold #{number} into #{into}: #{into} is a pull request.",
+        "cleanup_preview_commit": "Would close as completed: #{number} (resolved by {commit}).",
+        "cleanup_preview_into": "Would close as not planned: #{number} (duplicate of #{into}).",
+        "cleanup_comment_commit": "Resolved by {commit}; closing as completed.",
+        "cleanup_comment_into": "Duplicate of #{into}; closing as not planned.",
     },
     "ko": {
         "replaces_invalid": "{field}에는 중복 없는 양의 이슈 번호 목록을 넣어 주세요.",
@@ -22,5 +37,20 @@ MESSAGES = {
         "replaces_running": "#{number} 이슈를 대체할 수 없어요: 실행 중이에요.",
         "replaces_preview": "진행하지 않음으로 닫을 이슈: #{number} (대체: {successors}).",
         "replaces_comment": "{successors} 이슈로 대체해서 진행하지 않음으로 닫아요.",
+        "cleanup_invalid": "{field}에는 {{number, commit}} 또는 {{number, into}} 항목을 중복 없이 넣어 주세요.",
+        "cleanup_commit_invalid": "{field}에는 7~40자 소문자 16진수 커밋 SHA를 넣어 주세요.",
+        "cleanup_into_invalid": "{field}에는 닫는 이슈가 아닌 양의 이슈 번호를 넣어 주세요.",
+        "cleanup_missing": "#{number} 이슈를 정리할 수 없어요: 이슈를 찾을 수 없어요.",
+        "cleanup_edited": "#{number} 이슈를 닫을 수 없어요: 같은 주문에서 수정하는 이슈예요.",
+        "cleanup_replaced": "#{number} 이슈를 닫을 수 없어요: 같은 주문에서 이미 대체하는 이슈예요.",
+        "cleanup_child": "#{number} 이슈를 닫을 수 없어요: 이 주문의 자식 이슈예요.",
+        "cleanup_parent": "#{number} 이슈를 닫을 수 없어요: 이 주문의 부모 이슈예요.",
+        "cleanup_pr": "#{number} 이슈를 닫을 수 없어요: 풀 리퀘스트예요.",
+        "cleanup_running": "#{number} 이슈를 닫을 수 없어요: 실행 중이에요(running).",
+        "cleanup_into_pr": "#{number} 이슈를 #{into}에 합칠 수 없어요: #{into}는 풀 리퀘스트예요.",
+        "cleanup_preview_commit": "완료로 닫을 이슈: #{number} (해결 커밋: {commit}).",
+        "cleanup_preview_into": "진행하지 않음으로 닫을 이슈: #{number} (중복: #{into}).",
+        "cleanup_comment_commit": "{commit} 커밋으로 해결돼서 완료로 닫아요.",
+        "cleanup_comment_into": "#{into} 이슈와 중복이라 진행하지 않음으로 닫아요.",
     },
 }

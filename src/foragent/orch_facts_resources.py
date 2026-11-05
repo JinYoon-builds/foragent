@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+from foragent.file_cache import read_jsonl
 from foragent import capacity, orch_facts_machine, orch_plan, orch_queue
 from foragent.config import Config, in_run_hours, lane_executors
 from foragent.processes import read_process_identity
@@ -26,19 +29,10 @@ def _time(value: Any) -> datetime | None:
 
 def _jsonl(path) -> list[dict[str, Any]]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError):
-        # A missing journal or a non-directory ancestor both mean no records exist.
+        return read_jsonl(path, tolerant=True)
+    except NotADirectoryError:
+        # A non-directory ancestor also means no records exist.
         return []
-    rows = []
-    for line in text.splitlines():
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            rows.append(value)
-    return rows
 
 
 def _seconds(value: Any) -> float | None:
@@ -144,6 +138,22 @@ def _machine_runs(store: StateStore, now: datetime, running: list[Run], alive: d
     return count
 
 
+def _simulated_start(store: StateStore, number: int, lane: str, now: datetime) -> Run:
+    """A start the replay simulates, carrying what the gate will measure on its existing branch.
+
+    The gate measures a started run's worktree: once its branch has commits it claims the
+    committed files, otherwise its declared Files. Facts start no process, so they use the
+    last recorded measurement while its worktree still exists (a file-system stat only).
+    """
+    run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
+    previous = store.get_run(number)
+    if (previous is not None and previous.files_committed and previous.effective_files is not None
+            and previous.worktree and Path(previous.worktree).exists()):
+        run = replace(run, worktree=previous.worktree, files_committed=True,
+                      effective_files=list(previous.effective_files))
+    return run
+
+
 def _admission(
     store: StateStore, config: Config, root, now: datetime, waiting: list[_Waiting], running: list[Run],
     hold_all: str | None = None, machine: dict[str, Any] | None = None, *, probe: bool = True,
@@ -153,7 +163,7 @@ def _admission(
     Each startable issue gets the first reason the loop would hold it for (cap,
     plan_pause, dream, quota, structure), or starts and claims its Files for the issues after it.
     """
-    from foragent.overlap_files import Claim, admits, any_overlap, claims, recorded_union
+    from foragent.overlap_files import admits, any_overlap, claim, claims, recorded_union
     from foragent.scheduler_start import _lane_hold
 
     ctx = SimpleNamespace(store=store, config=config, repo_root=root, now=lambda: now)
@@ -209,9 +219,10 @@ def _admission(
             break
         else:
             remaining -= 1
-            run = Run(number, "", "", None, now.isoformat(), now.isoformat(), lane=lane)
+            run = _simulated_start(store, number, lane, now)
             if item.parsed.files:
-                known.append(Claim(run, item.parsed, item.parsed.files))
+                # The gate's own claim rule: committed files once recorded, else the declared Files.
+                known.append(claim(run, item.parsed))
             else:
                 unknown.append(run)
     paused = orch_plan.load(store, now)["paused"]

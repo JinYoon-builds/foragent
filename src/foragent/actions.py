@@ -29,7 +29,7 @@ def flag(
     """
     run = ctx.store.get_run(n)
     if run is not None and run.status == "running":
-        ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary)
+        ctx.store.update_run(n, detail=f"{summary}\n{details}" if details else summary, hold_reason=reason.value)
     ctx.store.save_flag(n, reason, flagged_at=ctx.now().astimezone(UTC).isoformat())
     ctx.tracker.add_labels(n, [BLOCKED, NEEDS_HUMAN] if needs_human else [BLOCKED])
     ctx.tracker.remove_labels(n, [READY, RUNNING])

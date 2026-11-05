@@ -12,7 +12,6 @@ The gate tick alone appends ``talk-closed`` events; nothing writes a talk credit
 
 from datetime import datetime
 from itertools import pairwise
-import json
 from typing import Any
 
 from foragent.state_records import Run, union_seconds
@@ -63,25 +62,17 @@ class TalkRecordsMixin:
             return updated
 
     def talk_events(self, number: int) -> list[dict]:
-        """This issue's talk events in journal order; the scan is cached by the file's size and mtime."""
-        path = self.root / "orch-events.jsonl"
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            return []
-        key = (stat.st_size, stat.st_mtime_ns)
+        """This issue's talk events, indexed once per shared journal version."""
+        from foragent.orch_events import read_events
+
+        events = read_events(self)
         cached = getattr(self, "_talk_cache", None)
-        if cached is None or cached[0] != key:
+        if cached is None or cached[0] is not events:
             by_issue: dict[int, list[dict]] = {}
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(event, dict) and event.get("kind") in (TALK_OPENED, TALK_CLOSED):
-                        by_issue.setdefault(event.get("issue"), []).append(event)
-            cached = (key, by_issue)
+            for event in events:
+                if event.get("kind") in (TALK_OPENED, TALK_CLOSED):
+                    by_issue.setdefault(event.get("issue"), []).append(event)
+            cached = (events, by_issue)
             self._talk_cache = cached
         return list(cached[1].get(number, []))
 

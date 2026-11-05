@@ -1,10 +1,17 @@
-# The pstack principle skills vendored with Foragent. Code reads this list; nothing else decides membership.
+# Skills vendored with Foragent. This manifest defines membership and per-skill source overrides.
 name: pstack
 repo: https://github.com/cursor/plugins
 revision: 9b93e81fb2921b9263d9463c15bafeabfe3903aa
 license: MIT
 copyright: Copyright (c) 2026 Lauren Tan
+sources:
+  review-procedure:
+    name: Anthropic official
+    license: Apache-2.0
+    repo: https://github.com/anthropics/claude-plugins-official
+    revision: 4ca561fb8532594e7a5faef945e85096fcec0616
 skills:
+  review-procedure: plugins/code-review/commands/code-review.md
   principle-attack-the-premise: pstack/skills/principle-attack-the-premise/SKILL.md
   principle-boundary-discipline: pstack/skills/principle-boundary-discipline/SKILL.md
   principle-build-the-lever: pstack/skills/principle-build-the-lever/SKILL.md

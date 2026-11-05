@@ -18,7 +18,7 @@ from test_state_split import offline_acceptance
 
 RELATED_TEST = "tests/test_stop_probe.py"
 STOPS = {
-    "timeout": "timeout",
+    "timeout": "too-large",  # #1514: a session that used the whole run budget is too large
     "related-check-timeout": "timeout",
     "retries-exceeded": "retries-exceeded",
     "spec-question": "spec-question",

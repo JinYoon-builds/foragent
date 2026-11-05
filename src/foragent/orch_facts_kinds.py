@@ -15,6 +15,7 @@ from foragent import orch_scorecard_history
 from foragent.config import Config
 from foragent.labels import READY
 from foragent.orch_facts_resources import _time
+from foragent.reasons import REVIEWER_HOLDS
 from foragent.state import Run, StateStore
 from foragent.state_observations import observed_facts
 
@@ -61,15 +62,21 @@ EVIDENCE_ONLY = frozenset({"waiting_on_person"})
 # Top-level `fa orch facts` fields a kind is about besides its own numbers (#1155). Idle lanes
 # with ready work are explained by the binding constraint; every other kind is only its numbers.
 SHARED_FACTS: dict[str, tuple[str, ...]] = {"idle_lanes_with_backlog": ("binding",)}
+# Kinds measured over a sliding window: kind -> (window, threshold) (#1840). Until that window
+# has passed since the last answer, a member newly reaching the threshold is drift of the same
+# window, not new evidence; it is worse only at double the threshold, as an existing member's
+# count is. After the window a new member is worse as usual.
+WINDOW_FACTS: dict[str, tuple[timedelta, int]] = {"hot_overlap_files": (OVERLAP_WINDOW, OVERLAP_RUNS)}
 
 
 def repeated_design_holds_numbers(store: StateStore, now: datetime) -> dict[str, Any]:
-    """Issues with two or more executions held in the last 7 days, from the run history."""
+    """Issues with two or more executions that ended on a reviewer hold in the last 7 days."""
     finished = store.finish_times()
     counts: dict[int, int] = {}
     for run in store.read_history():
         at = _time(finished.get((run.number, run.started_at)))
-        if run.outcome == "held" and at is not None and now - HOLD_WINDOW < at <= now:
+        if (run.outcome == "held" and run.hold_reason in REVIEWER_HOLDS
+                and at is not None and now - HOLD_WINDOW < at <= now):
             counts[run.number] = counts.get(run.number, 0) + 1
     held = {f"#{number}": count for number, count in sorted(counts.items()) if count >= HOLDS}
     return {"holds_by_issue": held} if held else {}
@@ -163,15 +170,25 @@ def lane_concentration(store: StateStore, config: Config, now: datetime, running
     return bool(lane_concentration_numbers(store, config, now, running))
 
 
+def _merge_time(run: Run, merged_at: dict, finished: dict) -> datetime | None:
+    """When a merged execution merged: its own merge time, else (merged by the worker) its finish."""
+    key, started = (run.number, run.started_at), _time(run.started_at)
+    moment = _time(merged_at.get(key))
+    if moment is None or (started is not None and moment < started):
+        moment = _time(finished.get(key))  # A key's older merge time belongs to an earlier execution.
+    return moment
+
+
 def merge_stall_numbers(store: StateStore, now: datetime, running: list[Run]) -> dict[str, Any]:
     """Open issues wait while no merge came for three recent merge intervals (#1469).
 
-    The interval is the median gap between the latest merges; with fewer than two there is none.
+    The interval is the median gap between the latest merges, worker or merge-owner merges alike
+    (store.run_merged); with fewer than two there is none.
     Any open issue not running counts as queued, approved or not: none of them can merge.
     """
-    finished = store.finish_times()
-    merges = sorted(at for run in store.read_history() if run.outcome == "merged"
-                    and (at := _time(finished.get((run.number, run.started_at)))) is not None and at <= now)
+    finished, merged_at, owner_facts = store.finish_times(), store.merge_times(), store.owner_merge_facts()
+    merges = sorted(at for run in store.read_history() if store.run_merged(run, owner_facts=owner_facts)
+                    and (at := _merge_time(run, merged_at, finished)) is not None and at <= now)
     merges = merges[-STALL_MERGES:]
     if len(merges) < 2:
         return {}

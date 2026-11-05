@@ -121,3 +121,117 @@ def test_changed_build_restarts_without_waiting_for_a_stuck_refresh(tmp_path, mo
         assert result == [True]
     finally:
         release.set()
+
+
+def _gate_version(root, name, sha, *, build=True, launcher=True):
+    """One gate tool version under `root`, optionally half-published."""
+    version = root / name
+    package = version / "tools/foragent/lib/python3.12/site-packages/foragent"
+    package.mkdir(parents=True)
+    if build:
+        (package / "_build.py").write_text(f"GIT_SHA = {sha!r}\n")
+    (version / "bin").mkdir()
+    if launcher:
+        fa = version / "bin" / "fa"
+        fa.write_text("#!/bin/sh\n")
+        fa.chmod(0o755)
+    return version
+
+
+@pytest.fixture
+def gate_root(tmp_path, monkeypatch):
+    from foragent import capacity
+
+    monkeypatch.setattr(capacity, "machine_root", lambda: tmp_path / "data")
+    root = tmp_path / "data/tool-versions"
+    root.mkdir(parents=True)
+    return root
+
+
+def _publish(root, version):
+    current = root / "current"
+    current.unlink(missing_ok=True)
+    current.symlink_to(version, target_is_directory=True)
+
+
+def test_gate_build_different_from_the_running_one_reexecs_its_launcher(gate_root, monkeypatch):
+    from foragent import tool_install, watch_terminal
+
+    version = _gate_version(gate_root, "v2", "bbbbbbb")
+    _publish(gate_root, version)
+    monkeypatch.setattr(watch, "_installed_build", lambda: "aaaaaaa")
+
+    assert tool_install.installed_tool() == ("bbbbbbb", version.resolve() / "bin" / "fa")
+    assert watch_terminal._stale("aaaaaaa") == version.resolve() / "bin" / "fa"
+    monkeypatch.setattr(watch, "_installed_build", lambda: "bbbbbbb")
+    assert watch_terminal._stale("bbbbbbb") is False, "The installed build must not restart itself"
+
+
+@pytest.mark.parametrize("state", ["no-root", "no-current", "dangling", "no-build", "no-launcher", "unknown"])
+def test_missing_or_half_published_gate_install_reads_as_unknown(gate_root, monkeypatch, state):
+    from foragent import tool_install, watch_terminal
+
+    if state == "no-root":
+        gate_root.rmdir()
+    elif state == "dangling":
+        (gate_root / "current").symlink_to(gate_root / "gone", target_is_directory=True)
+    elif state != "no-current":
+        version = _gate_version(gate_root, "v2", "bbbbbbb" if state != "unknown" else "unknown",
+                                build=state != "no-build", launcher=state != "no-launcher")
+        _publish(gate_root, version)
+    monkeypatch.setattr(watch, "_installed_build", lambda: "aaaaaaa")
+
+    assert tool_install.installed_tool() is None
+    assert watch_terminal._stale("aaaaaaa") is False
+
+
+def test_own_package_reload_stays_the_fallback_without_a_gate_build(gate_root, monkeypatch):
+    from foragent import watch_terminal
+
+    monkeypatch.setattr(watch, "_installed_build", lambda: "ccccccc")
+    assert watch_terminal._stale("aaaaaaa") is True
+    # A gate build equal to the running one still lets the own package reload.
+    _publish(gate_root, _gate_version(gate_root, "v1", "aaaaaaa"))
+    assert watch_terminal._stale("aaaaaaa") is True
+
+
+def test_build_and_launcher_come_from_one_version_when_current_switches(gate_root, monkeypatch):
+    from foragent import tool_install
+
+    first = _gate_version(gate_root, "v2", "bbbbbbb")
+    second = _gate_version(gate_root, "v3", "ccccccc")
+    _publish(gate_root, first)
+    reads = []
+    real = tool_install.runpy.run_path
+
+    def run_path(path):
+        reads.append(path)
+        _publish(gate_root, second)  # The gate switches while the build is read.
+        return real(path)
+
+    monkeypatch.setattr(tool_install.runpy, "run_path", run_path)
+    assert tool_install.installed_tool() == ("bbbbbbb", first.resolve() / "bin" / "fa")
+    assert reads and reads[0].startswith(str(first.resolve()))
+
+
+def test_gate_launcher_reexec_keeps_arguments_after_pid_cleanup(tmp_path, monkeypatch):
+    import curses
+
+    store = StateStore(tmp_path / "state")
+    launcher = tmp_path / "gate/bin/fa"
+    argv = [str(tmp_path / "uv/bin/fa"), "gate", "watch", "--repo-root", str(tmp_path)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(watch, "collect", lambda *args: object())
+    monkeypatch.setattr(curses, "wrapper", lambda *args: launcher)
+    calls = []
+
+    def execv(executable, args):
+        assert not (store.root / "watch.pid").exists()
+        calls.append((executable, args))
+
+    monkeypatch.setattr(os, "execv", execv)
+    watch.run(lambda: {}, FakeTracker(), store, Config(), tmp_path)
+
+    assert calls == [(str(launcher), [str(launcher), *argv[1:]])]

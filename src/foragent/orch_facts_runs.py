@@ -16,6 +16,7 @@ from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING, issu
 from foragent.orch_facts_resources import _jsonl, _seconds, _time
 from foragent.state import Run, StateStore
 from foragent.state_phases import work_event
+from foragent.state_runs import record_merged
 
 RECENT = timedelta(days=7)
 PHASES = {"implementing": "implementing_seconds", "checking": "checking_seconds",
@@ -111,7 +112,15 @@ def _row(execution: _Execution, now: datetime) -> dict[str, Any]:
     }
 
 
-def _file_conflicts(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def merged_keys(store: StateStore, rows: list[dict[str, Any]]) -> set[tuple[int, str]]:
+    """The (issue, started_at) of rows that merged, by the store's one rule (state_runs.record_merged)."""
+    owner_facts = store.owner_merge_facts()
+    return {(row["issue"], row["started_at"]) for row in rows
+            if record_merged({"number": row["issue"], "started_at": row["started_at"], "outcome": row["outcome"]},
+                             owner_facts)}
+
+
+def _file_conflicts(rows: list[dict[str, Any]], merged: set[tuple[int, str]]) -> dict[str, dict[str, Any]]:
     """Per file: merged executions that overlapped on it, how many conflicted, and their cost.
 
     Rows are already one per execution; a file counts once per execution however many peers.
@@ -119,7 +128,7 @@ def _file_conflicts(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """
     totals: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if row["status"] != "finished" or row["outcome"] != "merged":
+        if row["status"] != "finished" or (row["issue"], row["started_at"]) not in merged:
             continue
         seen: dict[str, dict[str, Any]] = {}
         for record in row["overlap_records"]:
@@ -218,11 +227,14 @@ def _hot_files(waiting: list[_Waiting]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda item: -item[1]))
 
 
-def _failure_reasons(rows: list[dict[str, Any]]) -> dict[str, int]:
-    """Recorded details of recent executions that did not merge, grouped as written."""
+def _failure_reasons(rows: list[dict[str, Any]], merged: set[tuple[int, str]]) -> dict[str, int]:
+    """Recorded details of recent executions that did not merge, grouped as written.
+
+    A merge-queued execution the owner has not merged yet waits on the merge owner: no failure."""
     counts: dict[str, int] = {}
     for row in rows:
-        if row["status"] != "finished" or row["outcome"] == "merged":
+        if (row["status"] != "finished" or (row["issue"], row["started_at"]) in merged
+                or row["outcome"] == "merge-queued"):
             continue
         if detail := row["detail"].strip():
             counts[detail] = counts.get(detail, 0) + 1

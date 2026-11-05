@@ -19,6 +19,8 @@ from test_order_machine_budget import fake_workloads  # noqa: F401
 from test_review_pass_scope import (
     FIRST_FINDING, NEW_FINDING, OLD_FINDING, PASS, capture_review, case_for, content, implement,
 )
+from foragent.review_perspectives import DEFAULT_PERSPECTIVES
+from runner_support import GROUNDED_SCORE, scoring_request
 from test_review_perspectives import review_offline  # noqa: F401
 from test_risk_map import entry, offline  # noqa: F401
 from test_skills_autosync import isolated_home  # noqa: F401
@@ -42,7 +44,7 @@ def passed_case(git_history, tmp_path, monkeypatch, **settings):
     """One published PASS held open for a person, ready for review_only in a new store."""
     case = case_for(git_history, tmp_path, monkeypatch, review="careful", **settings)
     case.implementer.steps = [implement(content())]
-    capture_review(case, [PASS] * 5)  # A mapped change also needs its perspectives and merger.
+    capture_review(case, [PASS] * (len(DEFAULT_PERSPECTIVES) + 1))  # A mapped change also needs its perspectives and merger.
     assert run_issue(1, case.ctx) == "pr-open"
     case.ctx = replace(case.ctx, store=StateStore(case.store.root, now=case.ctx.now),
                        config=replace(case.ctx.config, review="fast"))
@@ -159,6 +161,16 @@ def test_only_a_real_reviewer_pass_makes_a_boundary(git_history, tmp_path, monke
 CONFIRMING = "Limit this review to confirming"
 
 
+def scored(texts):
+    """Reviewer replies in order; every scoring session (#1651) grounds the scripted FAIL instead."""
+    texts = iter(texts)
+
+    def reply(call):
+        return GROUNDED_SCORE if scoring_request(call["prompt"]) else next(texts)
+
+    return [reply] * 32
+
+
 def anchored_case(git_history, tmp_path, monkeypatch, *, replies=("VERDICT: FAIL\n" + FIRST_FINDING, PASS), **settings):
     """FAIL then PASS on one body, published and held open, ready for review_only after a restart."""
     case = case_for(git_history, tmp_path, monkeypatch, review="careful", review_max=1, **settings)
@@ -173,12 +185,15 @@ def anchored_case(git_history, tmp_path, monkeypatch, *, replies=("VERDICT: FAIL
 def test_exempt_change_keeps_todays_confirmation_with_the_pass_evidence(git_history, tmp_path, monkeypatch):
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"], pass_scope_exempt=True)])})
     # A mapped first review is a panel: four perspectives and a merger.
-    case = anchored_case(git_history, tmp_path, monkeypatch, replies=["VERDICT: FAIL\n" + FIRST_FINDING] * 5 + [PASS])
+    case = anchored_case(git_history, tmp_path, monkeypatch, replies=scored(["VERDICT: FAIL\n" + FIRST_FINDING] * (len(DEFAULT_PERSPECTIVES) + 1) + [PASS]))
     head = case.tracker.pr_head_sha(2)
     exempt = capture_review(case, ["VERDICT: PASS"])
     review_only(1, case.ctx)
-    assert CONFIRMING in exempt[0] and FIRST_FINDING in exempt[0]
+    # q14 option A: the exempt path is reviewed in full, so the separate confirmation of round 1 goes away.
+    assert CONFIRMING not in exempt[0] and FIRST_FINDING not in exempt[0]
     assert head in exempt[0] and "pass_scope_exempt" in exempt[0]
+    # The exempt file's whole change since its base reaches the reviewer, though nothing changed after the PASS.
+    assert "+accepted = 'reviewed'" in exempt[0] and "feature.txt" in exempt[0]
 
 
 def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path, monkeypatch):
@@ -230,7 +245,10 @@ def test_only_a_yaml_true_mark_is_an_exemption(git_history, tmp_path, monkeypatc
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["feature.txt"], pass_scope_exempt=value)])})
     case = passed_case(git_history, tmp_path, monkeypatch)
     boundary = review_pass_scope.for_review(1, case.ctx, _at_head(case, tmp_path), "origin/main")
-    assert (boundary.diff is None) is exempt
+    # Only a real YAML true shows the file's whole change; otherwise the PASS head is the boundary (no change since).
+    assert ("+accepted = 'reviewed'" in boundary.diff) is exempt
+    assert ("Exempt paths: feature.txt" in boundary.section) is exempt
+    assert (boundary.diff == "") is not exempt
 
 
 def test_mark_added_only_on_the_branch_grants_nothing(git_history, tmp_path, monkeypatch):

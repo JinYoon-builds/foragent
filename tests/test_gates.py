@@ -234,3 +234,31 @@ def test_pending_reload_without_error_text_still_shows_failure_and_recovery_comm
     row["reload"] = {**row["reload"], "loaded": True, "pending": False}
     assert "fa gate install" not in "\n".join(gates.human_lines([row], datetime.now(UTC), language)), (
         "A clean reload shows no failure")
+
+
+@pytest.mark.parametrize("name", ["runs/1.json", "merged_prs.json"])
+def test_gate_lookup_releases_individual_records_after_return(tmp_path, monkeypatch, name):
+    import weakref
+
+    class Parsed(dict):
+        pass
+
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"repo": "owner/current", "finished_at": NOW.isoformat(), "record_probe": True}
+    if name == "merged_prs.json":
+        record = {"prs": [{"repo": "owner/current", "merged_at": NOW.isoformat()}], "record_probe": True}
+    path.write_text(json.dumps(record), encoding="utf-8")
+    loads, references = json.loads, []
+
+    def tracked_loads(text, *args, **kwargs):
+        value = loads(text, *args, **kwargs)
+        if isinstance(value, dict) and value.get("record_probe"):
+            value = Parsed(value)
+            references.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(json, "loads", tracked_loads)
+    assert gates._recorded_repo(tmp_path) == "owner/current"
+    assert len(references) == 1
+    assert references[0]() is None, "Gate discovery retained a per-record JSON value"

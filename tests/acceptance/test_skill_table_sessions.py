@@ -16,11 +16,14 @@ from test_skills_autosync import isolated_home  # noqa: F401
 ROOT = Path(__file__).resolve().parents[2]
 TABLE = {
     'workers': ['prove-it-works', 'fix-root-causes', 'attack-the-premise', 'sequence-verifiable-units'],
-    'reviewers': ['prove-it-works'],
-    'orchestrator': ['prove-it-works', 'attack-the-premise'],
-    'architect': ['attack-the-premise', 'redesign-from-first-principles'],
-    'docs': [],
-}
+    'reviewers': ['prove-it-works', 'attack-the-premise', 'test-behavior-not-implementation'],
+    'orchestrator': ['prove-it-works', 'attack-the-premise', 'never-block-on-the-human',
+                     'encode-lessons-in-structure'],
+    'architect': ['attack-the-premise', 'redesign-from-first-principles', 'exhaust-the-design-space',
+                  'separate-before-serializing-shared-state', 'subtract-before-you-add',
+                  'foundational-thinking'],
+    'docs': ['minimize-reader-load'],
+}  # D117 (Jin 2026-11-04): two-layer default skills, layer A.
 TABLE = {role: [f'principle-{name}' for name in names] for role, names in TABLE.items()}
 TABLE['reviewers'].append('review-procedure')  # #1651: the review procedure is a reviewer default skill.
 ALL = {name for names in TABLE.values() for name in names}

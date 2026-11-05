@@ -31,7 +31,7 @@ from foragent.tracker import Issue, Tracker
 from foragent.watch_cells import Line, Span, _beside, _cells, _clean, _columns, _fit, _line, _panel, _wrap
 from foragent.watch_data import Snapshot, collect, collection_root, recent_events
 from foragent.watch_art import ORCHESTRATOR, PALETTE, half_blocks
-from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, render_frame
+from foragent.watch_layout import PICK, _activity, _frame, _has_work, _window, activity, render_frame
 from foragent.watch_sections.acorns import issue_box, issue_url
 from foragent.watch_sections.detail import render_detail
 from foragent.watch_sections.finished import FIREWORKS_SECONDS, calm
@@ -126,7 +126,10 @@ def run(
             return
         # Curses and PID registration unwind before exec; the inherited lock leaves no gap.
         os.environ[LOCK_FD_ENV] = str(lock)
-        if Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
+        if isinstance(reload_requested, Path):
+            # The fa the gate installed, with this view's own arguments.
+            os.execv(str(reload_requested), [str(reload_requested), *argv[1:]])
+        elif Path(argv[0]).resolve() == Path(__file__).with_name("cli.py").resolve():
             os.execv(sys.executable, [sys.executable, "-m", "foragent.cli", *argv[1:]])
         else:
             os.execv(argv[0], argv)

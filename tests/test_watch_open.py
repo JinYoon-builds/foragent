@@ -43,7 +43,7 @@ def test_recorded_absolute_orca_path_survives_a_minimal_path(opening, tmp_path, 
     assert calls[1][0][:5] == [executable, "terminal", "split", "--terminal", "term_original"]
 
 
-@pytest.mark.parametrize("terminal", ["Terminal", "iTerm.app", "tmux"])
+@pytest.mark.parametrize("terminal", ["Terminal", "iTerm.app", "tmux", "ghostty"])
 def test_terminal_command_preserves_shell_and_applescript_special_characters(opening, tmp_path, monkeypatch, terminal):
     store, calls = opening
     root = tmp_path / '한글 "double" \'single\' $HOME `echo nope` \\ newline\nrepo'
@@ -57,6 +57,18 @@ def test_terminal_command_preserves_shell_and_applescript_special_characters(ope
     if terminal == "tmux":
         assert argv[:5] == ["/fake/tmux", "split-window", "-h", "-c", str(root)]
         command = argv[5]
+    elif terminal == "ghostty":
+        assert argv[:2] == ["/fake/osascript", "-e"]
+        assert argv[1::2] == ["-e"] * 6
+        lines = argv[2::2]
+        assert lines[0] == 'tell application "Ghostty"'
+        assert lines[1] == 'set cfg to new surface configuration'
+        assert lines[4:] == [
+            'split (focused terminal of selected tab of front window) direction right with configuration cfg',
+            'end tell',
+        ]
+        command = json.loads(lines[2].removeprefix("set command of cfg to "))
+        assert json.loads(lines[3].removeprefix("set initial working directory of cfg to ")) == str(root)
     else:
         assert argv[:2] == ["/fake/osascript", "-e"]
         prefix = ('tell application "iTerm2" to tell current session of current window'
@@ -68,6 +80,7 @@ def test_terminal_command_preserves_shell_and_applescript_special_characters(ope
     assert "--open" not in shlex.split(command)
     assert Path(shlex.split(command)[0]).is_absolute()
     assert cwd == root
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("terminal", ["wezterm", "kitty"])
@@ -176,7 +189,7 @@ def test_open_failure_is_one_localized_nonfatal_line(opening, tmp_path, monkeypa
     captured = capsys.readouterr()
     assert captured.out == ""
     assert len(captured.err.splitlines()) == 1
-    assert "레인 화면을 열지 못했어요" in captured.err
+    assert "대시보드를 열지 못했어요" in captured.err
 
 
 @pytest.mark.parametrize("language", ["en", "ko"])
@@ -363,3 +376,51 @@ def test_launch_with_an_empty_role_splits_beside_its_handle_without_recording(op
     watch_open._launch(tmp_path, store, "en", None)
     assert [argv[:5] for argv, _ in calls] == [["/bin/orca", "terminal", "split", "--terminal", "term_role"]]
     assert record.read_bytes() == b'{"handle": "term_person", "executable": "/bin/orca"}\n'
+
+
+@pytest.mark.parametrize("editor", ["code", "cursor"])
+def test_editor_terminal_opens_one_terminal_window(opening, tmp_path, monkeypatch, editor):
+    store, calls = opening
+    monkeypatch.setenv("TERM_PROGRAM", "vscode")
+    monkeypatch.setenv("VSCODE_PID", "4242")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/" + name if name in {"osascript", editor} else None)
+    watch_open.open_view(tmp_path, store)
+    assert len(calls) == 1
+    argv, _ = calls[0]
+    assert argv[:2] == ["/fake/osascript", "-e"]
+    assert argv[2].startswith('tell application "Terminal" to do script ')
+
+
+def test_tmux_owns_the_pane_inside_ghostty(opening, tmp_path, monkeypatch):
+    store, calls = opening
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setenv("TMUX", "/tmp/tmux,1,0")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/" + name)
+    watch_open.open_view(tmp_path, store)
+    assert len(calls) == 1
+    assert calls[0][0][:5] == ["/fake/tmux", "split-window", "-h", "-c", str(tmp_path)]
+
+
+def test_ghostty_resources_alone_does_not_select_ghostty(opening, tmp_path, monkeypatch):
+    store, calls = opening
+    monkeypatch.setenv("GHOSTTY_RESOURCES_DIR", "/Applications/Ghostty.app/Contents/Resources/ghostty")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+    watch_open.open_view(tmp_path, store)
+    assert len(calls) == 1
+    assert calls[0][0][2].startswith('tell application "Terminal" to do script ')
+
+
+def test_ghostty_split_failure_does_not_open_a_window(opening, tmp_path, monkeypatch, capsys):
+    store, calls = opening
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(watch_open.shutil, "which", lambda name: "/fake/osascript" if name == "osascript" else None)
+
+    def fail(argv, root):
+        calls.append((argv, root))
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr(watch_open, "_call", fail)
+    watch_open.open_view(tmp_path, store, "ko")
+    assert len(calls) == 1
+    assert calls[0][0][2] == 'tell application "Ghostty"'
+    assert len(capsys.readouterr().err.splitlines()) == 1

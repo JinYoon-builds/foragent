@@ -1,5 +1,6 @@
 """Acceptance test for acorn-interact. Locked by Foragent; do not edit."""
 
+import re
 from dataclasses import replace
 from io import StringIO
 
@@ -90,8 +91,10 @@ def test_acorn_interact_collapsed_neighbours_expand_all_and_more_hits_are_real(t
     hits=hit_positions(layout,frame,80)
     assert ('acorn',3) in hits
     visible={target[1] for target in hits if target[0]=='acorn' and 4<=target[1]<=52}
-    assert len(visible)>1, 'replacement: fill available next rows before truncating the queue'
-    assert f'…{49-len(visible)}' in plain_frame(frame)
+    assert len(visible)>1, 'replacement: fill available next rows'
+    # r53: every queued acorn stays on the scrollable screen as its own real hit; none folds into …N.
+    assert visible==set(range(4,53)), sorted(set(range(4,53))-visible)
+    assert not re.search(r'…\d', plain_frame(frame)), 'no acorn is hidden behind an overflow count'
     assert hit_test(layout,-1,-1) is None and hit_test(layout,80,0) is None
     for n in visible: acorn_row(frame,n)
 
@@ -215,10 +218,13 @@ def test_acorn_interact_live_numbers_use_osc8_and_live_setup_enters_alternate_sc
     monkeypatch.setattr(watch, "osc8", link)
     monkeypatch.setattr(watch, "terminal_setup_sequences", setup)
     watch.run(lambda: status, case.tracker, case.store, case.config, case.root, now=lambda: case.clock[0])
-    assert (url, "#1") in linked, "the live renderer must use the public OSC 8 builder"
+    # D112 (2026-11-04): the main screen writes no OSC 8 over acorn numbers; only a
+    # selected acorn's bubble holds a GitHub link (locked in test_lane_m2_skeleton).
+    assert linked == [], "the main screen must not link acorn numbers"
     assert painted
     terminal_output = output.getvalue() + "".join(
         value for args in painted for value in args if isinstance(value, str))
-    assert osc8(url, "#1") in terminal_output, "the linked number must actually reach the terminal"
+    assert "#1" in terminal_output, "the acorn number is still painted"
+    assert "\x1b]8;" not in terminal_output, "no OSC 8 link reaches the terminal without a selection"
     assert setup_calls and "\x1b[?1049h" in output.getvalue()
 

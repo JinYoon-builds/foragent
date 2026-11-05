@@ -347,3 +347,69 @@ def test_a_retired_spawned_session_never_returns_even_on_a_timestamp_tie(setup):
     assert spawned in _history(store)
     fresh = _heartbeat(store)["session_id"]
     assert fresh != spawned and orch_sessions.active(store)["session_id"] == fresh
+
+
+def test_compactions_releases_parsed_transcripts_between_rows_and_sessions(tmp_path, monkeypatch):
+    import weakref
+
+    class Parsed(dict):
+        pass
+
+    loads, references = json.loads, []
+
+    def tracked_loads(text, *args, **kwargs):
+        value = loads(text, *args, **kwargs)
+        if isinstance(value, dict) and value.get("transcript_probe"):
+            # A streaming count can still hold its preceding row during the next parse.
+            assert sum(reference() is not None for reference in references) <= 1
+            value = Parsed(value)
+            references.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(json, "loads", tracked_loads)
+    for index in range(3):
+        session = f"session-{index}"
+        path = tmp_path / f"{session}.jsonl"
+        row = json.dumps({"type": "system", "subtype": "compact_boundary", "sessionId": session,
+                          "transcript_probe": True, "summary": "x" * 4096}) + "\n"
+        path.write_text(row * 4, encoding="utf-8")
+        assert orch_refresh.compactions(path, session) == 4
+        assert all(reference() is None for reference in references), "A finished scan retained transcript rows"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(row)
+        assert orch_refresh.compactions(path, session) == 5
+        assert all(reference() is None for reference in references), "A growing transcript remained cached"
+    assert len(references) == 27
+
+
+def test_compactions_reads_transcripts_by_iteration_without_a_whole_file_buffer(tmp_path, monkeypatch):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(json.dumps({"type": "system", "subtype": "compact_boundary", "sessionId": "s"}) + "\n")
+    open_file = Path.open
+
+    class Iterated:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def __iter__(self):
+            return iter(self.stream)
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def read(self, size=-1):
+            assert size >= 0, "Transcript scan allocated a whole-file buffer"
+            return self.stream.read(size)
+
+    def opened(file, *args, **kwargs):
+        stream = open_file(file, *args, **kwargs)
+        return Iterated(stream) if file == path else stream
+
+    monkeypatch.setattr(Path, "open", opened)
+    assert orch_refresh.compactions(path, "s") == 1

@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from foragent.git import GitError
+from foragent.main_write import push_base
 from foragent.roles import load_roles
 
 if TYPE_CHECKING:
@@ -104,7 +105,7 @@ def _deliver(ctx: TickContext, base: str, folders: dict[str, list[str]]) -> str:
         if not _owed(ctx, base, folders):
             return "not-owed"  # Other unpushed work shares the base; its own writer integrates it.
         _rebuild(ctx, base, folders)
-    ctx.git.push_base(base)
+    push_base(ctx.git, ctx.config)
     return "pushed"
 
 

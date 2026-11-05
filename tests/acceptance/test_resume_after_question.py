@@ -366,6 +366,8 @@ def test_resume_after_question_stopped_run_retry_resumes_with_stop_reason_and_hi
     case, commands, identity = question_case(
         git_history, tmp_path, monkeypatch, executor, first_outcome=stop_reason,
     )
+    # #1514: an implementer session over the run budget stops as too-large (case id kept).
+    stop_reason = {"timeout": "too-large"}.get(stop_reason, stop_reason)
     assert run_issue(1, case.ctx) == stop_reason
     paused = StateStore(case.store.root).get_run(1)
     if stop_reason == "limit-wait":

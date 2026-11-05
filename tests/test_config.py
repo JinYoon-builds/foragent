@@ -62,12 +62,12 @@ def test_exact_defaults(repo):
         "acceptance_dir": "tests/acceptance/", "notify": None, "notify_summary_hour": 8, "notify_filter": "all", "run_hours": "always", "scheduled_roles": True,
         "stall_minutes": 30, "max_runtime_minutes": 90, "max_retries": 2, "conflict_retries": 2, "merge_turn_size": 1, "merge_group_max": "auto", "base_branch": "main",
         "orchestrator_timeout_minutes": 30,
-        "merge_owner": False,
+        "merge_owner": False, "merge_batch": False, "merge_batch_size": 4,
         "orch_silent_alert_minutes": 30,
         "orch_refresh_compactions": 4,
         "orch_refresh_hours": 24,
         "tick_failure_alert": 3,
-        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True,
+        "repo": None, "board": None, "board_map": None, "roles": {}, "language": "en", "codex_goal": False, "review_level": "low", "review_pass_scope": True, "review_scoring": True,
         "review_scope": "claude-local", "review_perspectives": [], "review_reviewers": 1,
         "test_command": None, "runner_unit_tests": "auto",
         "checks": "local", "checks_fallback": None, "ci_shards": 4, "ci_runs_on": "ubuntu-latest",
@@ -582,6 +582,15 @@ def test_default_skills_local_table_replaces_the_global_one_and_blank_means_empt
         "docs": ["kwp:engineering/one"], "workers": ["two"]}
     (tmp_path / ".foragent.yml").write_text("default_skills:\n  architect: [three]\n  docs:\n")
     assert load_config(tmp_path, global_path=other).default_skills == {"architect": ["three"], "docs": None}
+
+
+def test_review_scoring_defaults_on_loads_and_rejects_non_bool(repo):
+    assert load_config(repo).review_scoring is True
+    write_settings(repo / ".foragent.yml", {"review_scoring": False})
+    assert load_config(repo).review_scoring is False
+    write_settings(repo / ".foragent.yml", {"review_scoring": "no"})
+    with pytest.raises(ConfigError, match="review_scoring"):
+        load_config(repo)
 
 
 def test_size_limits_merge_per_label_and_reject_bad_values(repo):

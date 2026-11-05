@@ -19,7 +19,7 @@ The pending lessons are derived: the lines of `MEMORY.new.md` whose id is not in
 or reorder lines, but it cannot bring back a consumed id, so lane PRs merge as usual.
 
 Every reader shows the curated memory and the pending lessons: Codex lane notes, the Claude memory
-notice, the dream prompt and the lane view. Every lane executor gets the same append-only
+notice, the dream prompt and the dashboard. Every lane executor gets the same append-only
 instruction: from its agent file, or from the gate when the lane has no agent file or its agent is
 not migrated yet.
 

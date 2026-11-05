@@ -17,3 +17,7 @@ build/
 /.claude/skills/principle-attack-the-premise/
 /.claude/skills/principle-sequence-verifiable-units/
 /.claude/skills/principle-redesign-from-first-principles/
+/.claude/skills/principle-make-operations-idempotent/
+/.claude/skills/principle-separate-before-serializing-shared-state/
+/.claude/skills/principle-experience-first/
+/.claude/skills/principle-minimize-reader-load/

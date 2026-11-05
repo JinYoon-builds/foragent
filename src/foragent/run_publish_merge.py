@@ -81,6 +81,9 @@ def _final_merge_inputs(
     CI (including workflow registration grace), and the remaining run budget. Verification/review
     evidence stays pinned to the supplied head and approval snapshot.
     """
+    from foragent import orch_stop
+    if (why := orch_stop.active(ctx.store)) is not None:  # Every merge path reads this first (#1491).
+        return run_publish._MergeInputs(stop=lambda: orch_stop.halt(ctx, n, why))
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
 
     def invalid_approval() -> str:
@@ -134,8 +137,8 @@ def _final_merge_inputs(
     comparison_current = True
     if run_publish.enabled(ctx, base):
         comparison_current = comparison is not None and comparison.current(n, ctx, git, pr, head, target_sha, status)
-        if comparison_current and comparison.infrastructure:
-            # The unlocked comparison already handled this infrastructure state.
+        if comparison_current and (comparison.infrastructure or getattr(comparison, "substitutes_ci", False)):
+            # The unlocked comparison supplied usable CI evidence for this head.
             status = "pass"
     return run_publish._MergeInputs(base_sha=target_sha, paths=paths, decision=decision, status=status,
                                     batch_branch=batch_branch, comparison_current=comparison_current)

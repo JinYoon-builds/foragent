@@ -161,12 +161,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `docs/contract-proposal.md` | Not read |
 | `docs/contract.md` | Not read |
 | `docs/decisions.md` | Not read |
-| `docs/design/lane-view-sketch/README.md` | Not read |
-| `docs/design/lane-view-sketch/anim.py` | Not read |
-| `docs/design/lane-view-sketch/cast.py` | Not read |
-| `docs/design/lane-view-sketch/interview_scene.py` | Not read |
-| `docs/design/lane-view-sketch/tui.py` | Not read |
-| `docs/design/lane-view-sketch/tui_narrow.py` | Not read |
+| `docs/design/` dashboard sketch folder (6 files, archived) | Not read |
 | `docs/design/review-procedure/LICENSE` | Not read |
 | `docs/design/review-procedure/NOTICE` | Not read |
 | `docs/design/review-procedure/procedure-source.md` | Not read |
@@ -301,7 +296,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `docs/specs/2026-10-25-eta-remaining-work.md` | Not read |
 | `docs/specs/2026-10-25-facts-baseline-trend.md` | Not read |
 | `docs/specs/2026-10-25-harness-guard.md` | Not read |
-| `docs/specs/2026-10-25-lane-view-survives.md` | Not read |
+| One `docs/specs/` dashboard spec (archived; name holds the old screen name) | Not read |
 | `docs/specs/2026-10-25-lane-width-by-overlap.md` | Not read |
 | `docs/specs/2026-10-25-launch-fa-entry.md` | Not read |
 | `docs/specs/2026-10-25-launch-squirrel-deps.md` | Not read |
@@ -338,7 +333,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `docs/specs/2026-10-26-reapprove-127.md` | Not read |
 | `docs/specs/2026-10-26-resource-facts.md` | Not read |
 | `docs/specs/2026-10-26-risk-map-every-finding.md` | Not read |
-| `docs/specs/2026-10-26-single-lane-view.md` | Not read |
+| One `docs/specs/` dashboard spec (archived; name holds the old screen name) | Not read |
 | `docs/specs/2026-10-26-test-fixes-eq-eta.md` | Not read |
 | `docs/specs/2026-10-26-tick-config-from-base.md` | Not read |
 | `docs/specs/2026-10-26-tick-cost-robustness.md` | Not read |
@@ -461,7 +456,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `docs/specs/2026-10-30-harness-committed-diff.md` | Not read |
 | `docs/specs/2026-10-30-lane-talk-view-files.md` | Not read |
 | `docs/specs/2026-10-30-lane-talk-view-reserved.md` | Not read |
-| `docs/specs/2026-10-30-lane-view-m2.md` | Not read |
+| One `docs/specs/` dashboard spec (archived; name holds the old screen name) | Not read |
 | `docs/specs/2026-10-30-load-tick-architect-park.md` | Not read |
 | `docs/specs/2026-10-30-merge-groups-single-writer.md` | Not read |
 | `docs/specs/2026-10-30-orca-handle-and-silent-orch.md` | Not read |
@@ -521,7 +516,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `docs/specs/2026-10-31-flush-recovery-rule.md` | Not read |
 | `docs/specs/2026-10-31-github-writes-via-fa.md` | Not read |
 | `docs/specs/2026-10-31-host-independent-checks.md` | Not read |
-| `docs/specs/2026-10-31-lane-view-contract-done-when.md` | Not read |
+| One `docs/specs/` dashboard spec (archived; name holds the old screen name) | Not read |
 | `docs/specs/2026-10-31-lane-writes-tests.md` | Not read |
 | `docs/specs/2026-10-31-launches-reapprove.md` | Not read |
 | `docs/specs/2026-10-31-memory-path-one-resolver.md` | Not read |
@@ -705,7 +700,7 @@ This inventory covers repository files and port additions; generated .port-merge
 | `skills/fa-design-session/media/cli.md` | Not read |
 | `skills/fa-design-session/media/mobile.md` | Not read |
 | `skills/fa-design-session/media/pixel.md` | Not read |
-| `skills/fa-design-session/media/tui.md` | Not read |
+| `skills/fa-design-session/media/` terminal-screen medium notes (1 file) | Not read |
 | `skills/fa-design-session/media/web.md` | Not read |
 | `skills/fa-docs/SKILL.md` | Not read |
 | `skills/fa-init/SKILL.md` | Not read |

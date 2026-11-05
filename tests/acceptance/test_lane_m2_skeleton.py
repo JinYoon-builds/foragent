@@ -192,12 +192,12 @@ def test_pin_metadata_uses_surviving_absolute_rows(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('colors', [8, 256])
 def test_live_structured_acorn_links_keep_foreground_background_and_bold(tmp_path, monkeypatch, colors):
+    """D112: a structured acorn span keeps its ink and bold, and the main screen writes no OSC 8 over it."""
     import curses
     from io import StringIO
     from unittest.mock import Mock
     from foragent import watch, watch_terminal
     from foragent.state import StateStore
-    from test_presence_session_start import _colored_cells, _rgb
     snapshot, config = single_worker()
     config = replace(config, repo='owner/repo')
     output, initialized, painted = StringIO(), [], []
@@ -223,15 +223,79 @@ def test_live_structured_acorn_links_keep_foreground_background_and_bold(tmp_pat
         lambda: snapshot.captured_at, StateStore(tmp_path/'state'))
     fg, bg = (232,220) if colors == 256 else (0,3)
     assert (11,fg,bg) in initialized and len(initialized) == 8
-    assert any(value == '#7 write' and attr & curses.A_BOLD for value, attr in painted)
-    linked = output.getvalue()
-    start = linked.index('\x1b]8;;https://github.com/owner/repo/issues/7')
-    before, after = linked[:start], linked[start:]
-    attrs = before[before.rfind('H')+1:]
-    assert '\x1b[0m' in attrs and any('1' in seq.split('m')[0].split(';') for seq in attrs.split('\x1b[')[1:])
-    assert '\x1b[0m' in after
-    # The existing terminal parser checks actual ink, not just presence of a colour escape.
+    registered = {i: (f, b) for i, f, b in initialized}
+    spans = [attr for value, attr in painted if value == '#7 write']
+    assert spans, 'the acorn number is painted on the main screen'
+    assert all(attr & curses.A_BOLD for attr in spans), 'the acorn number stays bold'
+    assert all(registered[(attr & curses.A_COLOR) >> 8] == (fg, bg) for attr in spans), \
+        'the acorn number keeps its own foreground and background'
+    assert '\x1b]8;' not in output.getvalue(), 'D112: no OSC 8 hyperlink over acorn numbers on the main screen'
+
+
+def _click_acorn(tmp_path, monkeypatch, config, number=101):
+    """Drive the live view: one frame, a left click on the painted #number, one more frame, q."""
+    import curses
     import re
-    printable = re.sub(r'\x1b\]8;;[^\x1b]*\x1b\\', '', attrs + after.split('\x1b[0m')[0])
-    cells = _colored_cells(printable)
-    assert [cell for cell in cells if cell[0] == '#'] == [('#',_rgb(fg),_rgb(bg))]
+    from io import StringIO
+    from unittest.mock import Mock
+    from foragent import watch, watch_terminal
+    from foragent.state import StateStore
+    from test_squirrel_running import display_cells
+    snapshot, _ = single_worker()
+    output, painted, frames = StringIO(), [], []
+    screen = Mock()
+    screen.getmaxyx.return_value = (40, 100)
+    screen.getch.side_effect = [curses.KEY_MOUSE, ord('q')]
+    screen.addstr.side_effect = lambda y, x, value, attr: painted.append((y, x, value))
+    screen.refresh.side_effect = lambda: frames.append((len(painted), len(output.getvalue())))
+
+    def mouse():
+        for y, x, value in painted:
+            found = re.search(rf'#{number}(?!\d)', value)
+            if found:
+                return 0, x + display_cells(value[:found.start()]), y, 0, curses.BUTTON1_CLICKED
+        raise AssertionError(f'#{number} is painted on the main screen before the click')
+
+    monkeypatch.setattr(watch.sys, 'stdout', output)
+    monkeypatch.setattr(watch, 'time', SimpleNamespace(monotonic=lambda: 0))
+    monkeypatch.setattr(watch, '_installed_build', lambda: 'unknown')
+    monkeypatch.setattr(curses, 'has_colors', lambda: False)
+    monkeypatch.setattr(curses, 'curs_set', lambda *a: None)
+    monkeypatch.setattr(curses, 'mousemask', lambda *a: None)
+    monkeypatch.setattr(curses, 'mouseinterval', lambda *a: None)
+    monkeypatch.setattr(curses, 'getmouse', mouse)
+    watch_terminal._terminal(screen, lambda: snapshot, snapshot, config, tmp_path,
+        lambda: snapshot.captured_at, StateStore(tmp_path/'state'))
+    assert len(frames) == 2, 'one frame before the click and one after it'
+    (cut, written_before), _ = frames
+    before = [(y, value) for y, _, value in painted[:cut]]
+    after = [(y, value) for y, _, value in painted[cut:]]
+    return before, after, output.getvalue(), written_before
+
+
+def _rows_with(lines, text):
+    return {y for y, value in lines if text in value}
+
+
+def test_clicked_acorn_opens_a_bubble_with_exactly_one_github_link(tmp_path, monkeypatch):
+    """D112: clicking an acorn opens its bubble only; the bubble holds the one GitHub link line."""
+    import re
+    _, config = single_worker()
+    config = replace(config, repo='owner/repo')
+    url = 'https://github.com/owner/repo/issues/101'
+    before, after, written, written_before = _click_acorn(tmp_path, monkeypatch, config)
+    assert not _rows_with(before, url) and written_before == 0, 'nothing is linked before the click'
+    assert _rows_with(after, '#101') - _rows_with(before, '#101'), 'the click opens the bubble explaining #101'
+    shown = [y for y, value in after if url in value]
+    assert len(shown) == 1, 'the bubble shows the issue link on exactly one line'
+    targets = re.findall(r'\x1b\]8;;([^\x1b\x07]+)', written)
+    assert targets == [url], 'the only OSC 8 link written is the selected issue, written once'
+
+
+def test_clicked_acorn_without_a_repo_opens_the_bubble_and_writes_no_link(tmp_path, monkeypatch):
+    _, config = single_worker()
+    config = replace(config, repo=None)
+    before, after, written, _ = _click_acorn(tmp_path, monkeypatch, config)
+    assert _rows_with(after, '#101') - _rows_with(before, '#101'), 'the bubble still opens for the clicked acorn'
+    assert not _rows_with(after, 'https://'), 'no link line without a repository'
+    assert '\x1b]8;' not in written

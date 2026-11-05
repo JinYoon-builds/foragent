@@ -1,6 +1,6 @@
 """Review perspectives on risk-map PRs: each one gets its own whole-change reviewer.
 
-Four core defaults come first, in a fixed order; a project adds its own from
+Six core defaults (#1651) come first, in a fixed order; a project adds its own from
 `.foragent.yml` `review_perspectives` ({name, focus} items). A project item
 named like a default replaces that default's focus in place; other items follow
 the defaults in the order written. The defaults are never mutated.
@@ -14,18 +14,24 @@ if TYPE_CHECKING:
     from foragent.config import Config
 
 DEFAULT_PERSPECTIVES: tuple[dict[str, str], ...] = (
-    {"name": "goal-fidelity",
-     "focus": "Does the change deliver the issue's goal and make its acceptance checks pass for the right "
-              "reason, without dropping a stated requirement or doing work the issue puts out of scope?"},
-    {"name": "concurrency",
-     "focus": "Races and ordering between processes, threads and ticks: a gap between a check and its use, "
-              "and stale reads or writes of shared state."},
-    {"name": "interruption-rollback",
-     "focus": "An interrupt, crash, timeout or kill at any step: does a rollback restore a clean state, "
-              "or can a partial write, half-applied change or leftover lock remain?"},
-    {"name": "test-quality",
-     "focus": "Would each new or changed test fail if the code returned a wrong value, skipped an effect "
-              "or did the effect twice? Tests that pass on a broken change prove nothing."},
+    # The code-review plugin's five reviewers plus fatal-path (#1651); skills/review-procedure
+    # holds the procedure, this tuple only the names and one-line focus each reviewer gets.
+    {"name": "rule-documents",
+     "focus": "Does the change comply with each rule and instruction in the project's rule documents "
+              "(CLAUDE.md, AGENTS.md, docs/rules.md) and the issue's Goal and Out of scope?"},
+    {"name": "obvious-bugs",
+     "focus": "A shallow scan of the changed lines for obvious, large bugs; no nitpicks and no likely "
+              "false positives."},
+    {"name": "git-history",
+     "focus": "Read the git blame and history of the modified code: is there a bug in light of that history?"},
+    {"name": "earlier-pr-comments",
+     "focus": "Read the comments on earlier PR reviews that touched these files: do they also apply here?"},
+    {"name": "code-comments",
+     "focus": "Read the code comments in the modified files: does the change comply with their guidance?"},
+    {"name": "fatal-path",
+     "focus": "A path, however rare, that loses work or data, puts wrong code on main, merges without "
+              "approval, hands another person's permission to an agent, or makes the gate stall: name "
+              "the input that reaches it."},
 )
 
 

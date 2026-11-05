@@ -12,11 +12,34 @@ def add(commands) -> None:
                         help="Run each executor once on a throwaway task in a temporary clone")
     doctor.add_argument("--executor", choices=("codex", "claude"),
                         help="Executor to check (default: the configured executor)")
+    doctor.add_argument("--setup", action="store_true", help="Read the machine setup checklist (works before init)")
+    doctor.add_argument("--json", action="store_true", help="Print the setup checklist as one JSON object")
     doctor.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
 
 
 def run(args) -> int:
     cli = facade()
+    if args.setup:
+        from foragent import setup
+
+        def read_auth():
+            result = cli.gh.run(["auth", "status"], capture_output=True, text=True, check=False, timeout=10)
+            result.check_returncode()
+            return result.stdout + "\n" + result.stderr
+
+        try:
+            language = cli.load_config(args.repo_root).language
+        except (cli.ConfigError, OSError):
+            language = "en"
+        facts = setup.collect(read_auth, language=language)
+        items = setup.checklist(facts, root=args.repo_root.resolve())
+        if args.json:
+            print(cli.json.dumps({"items": items}))
+        else:
+            for item in items:
+                print(f"{'PASS' if item['ok'] else 'FAIL'} {item['id']}" +
+                      (f": {item['fix']}" if not item['ok'] else ""))
+        return 0 if all(item["ok"] for item in items) else 1
     root = args.repo_root.resolve()
     if not (root / ".foragent.yml").is_file():
         print("foragent: not a Foragent repo: .foragent.yml missing; run `fa init` first", file=cli.sys.stderr)

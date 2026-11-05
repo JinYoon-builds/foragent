@@ -271,7 +271,8 @@ def test_completion_without_new_answer_preserves_the_recorded_answer(store, init
     assert (store.root / "inbox/requests" / f"{request['id']}.json").read_bytes() == before
 
 
-@pytest.mark.parametrize("source,role", [("architect", None), ("security", None), ("gate", "security")])
+@pytest.mark.parametrize("source,role", [("architect", None), ("security", None), ("gate", "security"),
+                                         ("orchestrator", "security")])
 @pytest.mark.parametrize("answer", [None, "Recorded outcome"])
 def test_request_status_cli_requires_an_explicit_proposal_decision(store, source, role, answer):
     from types import SimpleNamespace
@@ -287,6 +288,32 @@ def test_request_status_cli_requires_an_explicit_proposal_decision(store, source
         _orch_inbox(args, store, config, "owner/repo")
     assert request_path.read_bytes() == before
     assert (store.root / "orch-events.jsonl").read_bytes() == journal
+
+
+@pytest.mark.parametrize("legacy_role", [False, True])
+@pytest.mark.parametrize("take_first", [False, True])
+def test_orchestrator_request_cli_can_be_taken_and_closed_as_an_ordinary_request(store, legacy_role, take_first):
+    from types import SimpleNamespace
+    from foragent.commands._orch_box import _orch_inbox
+    from foragent.config import Config
+
+    config = Config()
+    if legacy_role:
+        request = orch_inbox.add_request(store, "orchestrator", "handoff", {"role": "orchestrator"})
+    else:
+        _orch_inbox(SimpleNamespace(action="request", source="orchestrator", text="handoff"),
+                    store, config, "owner/repo")
+        request = orch_inbox.requests(store)[0]
+        assert "role" not in request
+    if take_first:
+        _orch_inbox(SimpleNamespace(action="request-status", id=request["id"], status="processing",
+                                   note=None, answer=None), store, config, "owner/repo")
+        assert orch_inbox.requests(StateStore(store.root))[0]["status"] == "processing"
+    _orch_inbox(SimpleNamespace(action="request-status", id=request["id"], status="done",
+                               note=None, answer="Handled by planning"), store, config, "owner/repo")
+    closed = orch_inbox.requests(StateStore(store.root))[0]
+    assert closed["status"] == "done"
+    assert closed["answer"] == "Handled by planning"
 
 
 def test_role_request_cli_keeps_its_identity_after_the_role_is_removed(store):

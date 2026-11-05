@@ -18,7 +18,7 @@ from foragent.config import resolved_reviewer
 from foragent.git import GitRepo, REVIEW_SCOPE_FILE
 from foragent.issue import ParsedIssue, authored_body, body_hash, has_machine_check, parse_body
 from foragent.labels import APPROVED
-from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, risks
+from foragent import capacity, orch_events, orch_reviewers, quota_reviewer, review_notes, review_pass_scope, review_perspectives, review_scoring, risks
 from foragent.executors import ExecResult
 from foragent.reasons import Reason
 from foragent.run_attempt import WholeFailure
@@ -83,16 +83,30 @@ def parse_review(message: str) -> ReviewResult:
     return ReviewResult(verdict, "\n".join(findings), review_notes=notes)
 
 
+def _beside_marker(text: str) -> str | None:
+    """The text beside the empty findings marker, or None when there is no marker.
+
+    The marker is "(none)" alone on the first or the last non-blank line; every parser that
+    reads it uses this one rule. Any other text is a note, which the caller still checks.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    if lines and lines[0].strip() == "(none)":
+        return "\n".join(lines[1:])
+    if lines and lines[-1].strip() == "(none)":
+        return "\n".join(lines[:-1])
+    return None
+
+
 def _empty_findings(message: str) -> bool:
     """Convert the tool's empty findings marker, without judging any review prose."""
     text = review_notes.strip(message).strip()
     if not text:
         return True
-    lines = text.splitlines()
-    return (lines[-1].strip() == "(none)"
-            and not any(FINDING_LINE.match(line) for line in lines[:-1])
+    rest = _beside_marker(text)
+    return (rest is not None
+            and not any(FINDING_LINE.match(line) for line in rest.splitlines())
             and "```" not in text
-            and not code_review_findings("\n".join(lines[:-1]))[1])
+            and not code_review_findings(rest)[1])
 
 
 FINDING_LINE = re.compile(r"^(?:[-*]|\d+[.)])?\s*`?\S+?:\d+`?\s+(—|-|--)\s+")
@@ -129,7 +143,7 @@ def code_review_findings(text: str) -> tuple[str, list[str] | list[dict], str]:
         if any(not isinstance(item, dict) or not {"file", "line", "summary"}.intersection(item) for item in items):
             return "UNUSABLE", [], "/code-review gave invalid findings"
         return "FAIL", items, ""
-    if not blocks and lines and lines[0].strip() == "(none)":
+    if not blocks and _beside_marker(text) is not None:
         return "PASS", [], ""
     return "UNUSABLE", [], "/code-review gave no verdict"
 
@@ -224,14 +238,19 @@ def _review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref
 
 
 def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: int,
-                   texts: tuple[str, ...], *, git: GitRepo | None = None) -> ReviewResult:
+                   texts: tuple[str, ...], *, git: GitRepo | None = None,
+                   parsed: ParsedIssue | None = None, journal: bool = True) -> ReviewResult:
     """Log and journal one round; a round with spec conflicts is journaled as SPEC-CONFLICT.
 
     Every NOTE line in ``texts`` (each reviewer's raw text), whatever the verdict, is recorded
     once per issue as a review-note event.
     """
     review = replace(review, review_notes=review_notes.extract(*texts))
+    if not journal:
+        return review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed, record=False)
     _record_notes(n, ctx, round_number, *texts)
+    # Every FAIL finding, in any round, gets one scoring session; only a grounded one blocks (#1651).
+    review = review_scoring.score(n, ctx, review, round_number, git=git, parsed=parsed)
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
@@ -274,7 +293,7 @@ def _save_review(n: int, ctx: RunContext, name: str, raw: str) -> None:
 def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, base_ref: str, reviewer: str,
                   rebuttals: str, notes: str, shares: list[list[dict[str, str]]],
                   round_number: int, *, lane_decisions: str = "", workers: int = 1,
-                  pass_scope: str = "", diff: str | None = None) -> ReviewResult:
+                  pass_scope: str = "", diff: str | None = None, journal: bool = True) -> ReviewResult:
     """One independent whole-change reviewer per perspective share; one merge call decides.
 
     At most `workers` reviewers (the issue's reviewer count) and the shared machine budget run at
@@ -289,7 +308,7 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     settings = risks.review_options(ctx.config, reviewer, ctx.config.reviewer_model)
     executor = ctx.executor_factory(reviewer)
-    record = notes_of(n, ctx, reviewer, round_number)
+    record = notes_of(n, ctx, reviewer, round_number) if journal else None
     diff = git.staged_diff(base_ref) if diff is None else diff
     acceptance = ctx.config.acceptance_dir
     log = ctx.store.log_path(n)
@@ -419,7 +438,8 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
         review = replace(review, notes=(*review.notes, "Reviewer changes discarded; staged index restored."))
     # A member's conflict stops the round even when the merge call drops it.
     return _finish_review(n, ctx, replace(review, raw=raw, timed_out=timed_out,
-                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git)
+                                          conflicts=spec_conflicts(*raws, raw)), round_number, (*raws, raw), git=git,
+                          parsed=parsed, journal=journal)
 
 
 def notes_of(n: int, ctx: RunContext, reviewer: str, round_number: int):
@@ -551,6 +571,8 @@ def _review_implementation(attempt: Implementation) -> None:
             attempt.review_hold_reason = Reason.REVIEW_DISPUTE
         attempt.previous_rebutted_findings = findings
         if attempt.review_failures > ctx.config.review_max:
+            if not attempt.review_hold:
+                attempt.review_hold_reason = Reason.REVIEW_DEFECTS
             attempt.review_hold = True
 
 

@@ -13,11 +13,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox, watch_lane_facts, watch_role_facts
+from foragent import orch_events, orch_inbox, watch_lane_facts, watch_role_facts
 from foragent.config import Config
 from foragent.labels import issue_lane
 from foragent.status import issue_state
 from foragent.state import StateStore
+from foragent.state_issues import _copy
 from foragent.tracker import Issue, Tracker
 from foragent.watch_sections import orch_panel, progress
 
@@ -142,41 +143,27 @@ def recent_events(store: StateStore) -> list[dict[str, Any]]:
 
     events: deque[dict[str, Any]] = watch.deque(maxlen=5)
     try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = watch.json.loads(line)
-                except watch.json.JSONDecodeError:
-                    continue
-                if isinstance(event, dict) and isinstance(event.get("summary"), str):
-                    events.append(event)
+        for event in orch_events.read_events(store):
+            if isinstance(event.get("summary"), str):
+                events.append(event)
     except OSError:
         pass  # Missing or unreadable: no recent events.
-    return list(reversed(events))
+    return [_copy(event) for event in reversed(events)]
 
 
 def journal_facts(store: StateStore) -> tuple[dict[int, list[dict[str, Any]]], dict[str, Any] | None]:
     """Every closed phase event by issue and the latest event with a say line, from the whole journal."""
-    from foragent import watch
-
     phases: dict[int, list[dict[str, Any]]] = {}
     say = None
     try:
-        with (store.root / "orch-events.jsonl").open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = watch.json.loads(line)
-                except watch.json.JSONDecodeError:
-                    continue  # An append still being written.
-                if not isinstance(event, dict):
-                    continue
-                if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
-                    phases.setdefault(event["issue"], []).append(event)
-                if isinstance(event.get("say"), str) and event["say"].strip():
-                    say = event
+        for event in orch_events.read_events(store):
+            if event.get("kind") == "phase" and isinstance(event.get("issue"), int) and event.get("phase"):
+                phases.setdefault(event["issue"], []).append(_copy(event))
+            if isinstance(event.get("say"), str) and event["say"].strip():
+                say = event
     except OSError:
         pass  # Missing or unreadable: no phase events and no say line.
-    return phases, say
+    return phases, _copy(say)
 
 
 def evidence(store: StateStore, numbers: list[int], now: datetime) -> tuple[dict[str, float], dict[int, float]]:

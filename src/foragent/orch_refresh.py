@@ -19,6 +19,7 @@ import json
 from pathlib import Path
 import re
 
+from foragent.file_cache import read_jsonl
 from foragent import orch_inbox, orch_rules, orch_sessions, orch_spawn, watch_open
 from foragent.config import Config
 from foragent.i18n import text
@@ -139,14 +140,10 @@ def accept_handoff(store: StateStore, config: Config, source: Path, now: datetim
 
 
 def _events(store: StateStore, kind: str) -> list[datetime]:
-    path = store.root / "orch-events.jsonl"
-    if not path.exists():
-        return []
     times = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for row in read_jsonl(store.root / "orch-events.jsonl", tolerant=True, errors="replace"):
         try:
-            row = json.loads(line)
-            if isinstance(row, dict) and row.get("kind") == kind:
+            if row.get("kind") == kind:
                 times.append(datetime.fromisoformat(row["at"]))
         except (ValueError, KeyError, TypeError):
             continue

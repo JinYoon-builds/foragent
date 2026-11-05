@@ -7,6 +7,7 @@ import pytest
 
 from foragent import orch_facts_kinds, orch_inbox, orch_roles, orch_scorecard
 from foragent.orch_facts_resources import _jsonl
+from foragent.reasons import Reason
 from foragent.state import StateStore
 
 NOW = datetime(2026, 10, 27, 12, tzinfo=UTC)
@@ -20,10 +21,12 @@ def store(tmp_path):
     return store
 
 
-def finish(store, number, *, at, outcome):
+def finish(store, number, *, at, outcome, hold_reason=Reason.REVIEW_DEFECTS):
     store.clock[0] = at - timedelta(minutes=5)
     store.start_run(number, branch=f"foragent/issue-{number}", worktree=store.worktree_path(number))
     store.clock[0] = at
+    if hold_reason is not None:
+        store.update_run(number, hold_reason=hold_reason.value)
     store.finish_run(number, outcome=outcome)
     store.clock[0] = NOW
 
@@ -39,6 +42,16 @@ def test_repeated_design_holds_counts_held_executions_of_one_issue_in_7_days(sto
         finish(store, number, at=NOW - timedelta(hours=hours), outcome="held")
     finish(store, 3, at=NOW - timedelta(hours=1), outcome="merged")
     assert orch_facts_kinds.repeated_design_holds(store, NOW) is expected
+
+
+@pytest.mark.parametrize("other", (Reason.RISK_HIGH, Reason.CI_NOT_STARTED, None),
+                         ids=("pr-head-changed", "ci-not-started", "unmarked-old-row"))
+def test_repeated_design_holds_counts_only_reviewer_hold_markers(store, other):
+    finish(store, 1, at=NOW - timedelta(hours=3), outcome="held", hold_reason=Reason.REVIEW_DISPUTE)
+    finish(store, 1, at=NOW - timedelta(hours=2), outcome="held", hold_reason=other)
+    assert orch_facts_kinds.repeated_design_holds_numbers(store, NOW) == {}
+    finish(store, 1, at=NOW - timedelta(hours=1), outcome="held")
+    assert orch_facts_kinds.repeated_design_holds_numbers(store, NOW) == {"holds_by_issue": {"#1": 2}}
 
 
 def row(issue, hours, files):

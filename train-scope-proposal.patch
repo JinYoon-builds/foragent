@@ -1,0 +1,2490 @@
+--- a/src/foragent/ci_mode.py
++++ b/src/foragent/ci_mode.py
+@@ -223,7 +223,7 @@
+     return type(value) is int and value > 0
+ 
+ 
+-def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
++def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope, expected_shards, original=None):
+     """Validate every shard; the first failing field names its observed and expected value.
+ 
+     Only a moved base or a superseded measurement producer is stale. Those wait
+@@ -331,6 +331,13 @@
+                                 f"expected {_shown(sorted(expected_shards)) if expected_shards else 'at least one shard'}")
+     if stale:
+         raise StaleComparison(f"Stale acceptance shard: {stale}")
++    if original is not None:
++        original_sha, before, origin = original
++        comparison(before, repo, origin, original_sha, excluded,
++                   expected_scope=expected_scope, expected_shards=expected_shards)
++        passing = {node for item in before for node in item["report"]["base"]["passing_ids"]}
++        passing_now = {node for item in artifacts for node in item["report"]["head"]["passing_ids"]}
++        lost = passing - passing_now
+     return sorted(lost), duration
+ 
+ 
+--- a/src/foragent/merge_owner.py
++++ b/src/foragent/merge_owner.py
+@@ -5,7 +5,7 @@
+ Merge prerequisites still come from run_publish's fresh locked read.
+ """
+ 
+-from contextlib import contextmanager
++from contextlib import ExitStack, contextmanager
+ from dataclasses import asdict, replace
+ from datetime import UTC, datetime
+ from io import StringIO
+@@ -350,6 +350,8 @@
+ 
+     if target != ctx.config.base_branch:
+         return True
++    if batch.unfinished(ctx):
++        return False
+     retired = {(branch, sha) for row in batch.retirements(ctx)
+                for branch, sha in row.get("refs", {}).items()}
+     refs = ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{batch.PREFIX}*"])
+@@ -368,6 +370,123 @@
+             yield ctx.git.at(root)
+         finally:
+             ctx.git.remove_worktree(root)
++
++
++def _prepare_member(ctx, place, job, pr, git, comparison=None):
++    n, root = place.n, git.root
++    train = comparison if getattr(comparison, "substitutes_ci", False) else None
++    remote = pr.head_sha or ctx.tracker.pr_head_sha(pr.number)
++    publishing = job["phase"] == "publishing"
++    if remote != job["head"] and not (publishing and remote == job["previous_head"]):
++        run_publish._hold_changed_head(n, ctx, pr.url)
++        _end(ctx, place, job, "held")
++        return False
++    approval = load_record(Approval, job["approval"])
++    # Validate approval, acceptance hashes, policy and PR target before
++    # refreshing too. During a resumed push the lease pins the old head.
++    if not publishing:
++        inputs = run_publish._final_merge_inputs(
++            n, ctx, git, pr.number, job["branch"], job["target"], job["head"],
++            approval, job["ready_at"], approved_body_sha=approval.body_sha,
++        )
++        if inputs.stop:
++            inputs.stop()
++            _end(ctx, place, job, "held")
++            return False
++        if not run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
++                                          authorization=job.get("authorization")):
++            _end(ctx, place, job, "held")
++            return False
++    if publishing:
++        if remote == job["previous_head"]:
++            if not may_write_target(ctx, pr.base) and not train:
++                return False
++            git.push_head(pr.head, lease=remote)
++        job["phase"] = "waiting"
++        _save(ctx, place, job)
++        return
++    target = git.ref_sha(f"origin/{pr.base}")
++    base = (train.chain[train.index - 1][2] if train.index else train.base) if train else target
++    job_comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job.get("comparison") else None
++    measured_base = job_comparison.base_sha if job_comparison else job["base"]
++    needs_proof = base != job["base"] or measured_base != base
++    neutral = not train and needs_proof and ci_mode.enabled(ctx, pr.base) and job_comparison is not None and move_is_neutral(
++        git, BaseMove(measured_base, base), ctx=ctx, n=n,
++        own_locked=approval.acceptance_blobs, strict=True,
++    )
++    if neutral:
++        if inputs.status == "pending":
++            return False
++        followed = job_comparison.follow(base)
++        # The same proved range also covers a trusted default ref
++        # moving from the previously accepted base. Reports and
++        # their measured base remain immutable.
++        if job_comparison.trusted_sha == (job_comparison.accepted_sha or job_comparison.base_sha):
++            followed = replace(followed, trusted_sha=base)
++        neutral = followed.current(n, ctx, git, pr.number, job["head"], base, inputs.status)
++        if neutral:
++            comparison = followed
++    if neutral:
++        runner._append(ctx.store.log_path(n), f"{REUSED}: {base}")
++    if needs_proof and not neutral:
++        def before_push(head):
++            if not may_write_target(ctx, pr.base) and not train:
++                raise ci_mode.MissingComparison("target reserved by merge train")
++            # A progress SHA alone is not a Git reachability root.
++            ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
++            job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
++            job.update(phase="publishing", previous_head=job["head"], head=head,
++                       base=base, comparison=None, ready_at=ctx.now().timestamp())
++            _save(ctx, place, job)
++            ctx.reads.clear()  # The following leased push changes the PR fact.
++
++        head, stopped = run_publish._refresh_reviewed_head(
++            n, ctx, git, pr, job["head"], base,
++            lambda head: _reverify(ctx, place, job, git, head), before_push=before_push,
++            prepare=lambda: ci_mode.commit_exclusions(SimpleNamespace(
++                ctx=ctx, git=git, start_ref=base, log=ctx.store.log_path(n),
++                target_branch=pr.base,
++            ), f"Refresh PR #{pr.number} onto {base}"),
++            before_base_changed=lambda: _repair_intent(
++                ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
++        )
++        if stopped:
++            if stopped == "base-changed":
++                _repair(ctx, place, job, f"Base refresh failed ({stopped}); repair the PR on {base}.")
++            else:
++                _end(ctx, place, job, "held")
++            return False
++        job.update(phase="waiting", head=head)
++        _save(ctx, place, job)
++        return  # The changed head reaches CI handling on a later tick.
++    status = inputs.status
++    if comparison:
++        if comparison.current(n, ctx, git, pr.number, job["head"], target if train else base, status):
++            status = "pass"
++        else:
++            if train:
++                return False
++            comparison = None
++    if status == "pending":
++        return False
++    if status == "fail":
++        logs = ctx.tracker.pr_failed_logs(pr.number)
++        run_publish._hold_if_not_started(n, ctx, pr.number, logs)
++        raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
++    if ci_mode.enabled(ctx, pr.base):
++        comparison = comparison or job_comparison
++        if not neutral and (comparison is None or not comparison.current(
++                n, ctx, git, pr.number, job["head"], target if train else base, status)):
++            attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
++                                      target_branch=pr.base, baseline=None, approval=approval,
++                                      log=ctx.store.log_path(n))
++            comparison = ci_mode.require_comparison(attempt, pr.number, job["head"],
++                                                   base_sha=base, status=status, wait=False)
++        # Batch substitutes are reconstructed from refs, not job-file evidence.
++        if not getattr(comparison, "substitutes_ci", False):
++            job["comparison"] = asdict(comparison)
++    _save(ctx, place, job)
++    return target if train else base, comparison
+ 
+ 
+ def _ready(ctx, place, job, pr, git, base, comparison):
+@@ -401,134 +520,88 @@
+     return False
+ 
+ 
++def _merge(ctx, place, job, pr, base):
++    issue = ctx.tracker.get_issue(place.n)
++    subject = run_publish.retitle_for_merge(
++        ctx, pr.number, title=f"{issue.title} (#{place.n})",
++        current_title=pr.title, base=pr.base, body=lambda: pr.body,
++        note=lambda line: runner._append(ctx.store.log_path(place.n), line),
++    )
++    job.update(phase="merging", merge_base=base)
++    _save(ctx, place, job)
++    ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
++
++
+ def _advance(ctx, place, job, pr, comparison=None):
+     if not may_write_target(ctx, job["target"]):
+         return False
+     with _member_worktree(ctx, job) as git:
+-        n, root = place.n, git.root
+-        remote = pr.head_sha or ctx.tracker.pr_head_sha(pr.number)
+-        publishing = job["phase"] == "publishing"
+-        if remote != job["head"] and not (publishing and remote == job["previous_head"]):
+-            run_publish._hold_changed_head(n, ctx, pr.url)
+-            _end(ctx, place, job, "held")
++        prepared = _prepare_member(ctx, place, job, pr, git, comparison)
++        if prepared is None:
++            return
++        if not prepared:
+             return False
+-        approval = load_record(Approval, job["approval"])
+-        # Validate approval, acceptance hashes, policy and PR target before
+-        # refreshing too. During a resumed push the lease pins the old head.
+-        if not publishing:
+-            inputs = run_publish._final_merge_inputs(
+-                n, ctx, git, pr.number, job["branch"], job["target"], job["head"],
+-                approval, job["ready_at"], approved_body_sha=approval.body_sha,
+-            )
+-            if inputs.stop:
+-                inputs.stop()
+-                _end(ctx, place, job, "held")
+-                return False
+-            if not run_publish._policy_allows(inputs.decision, pr.base, inputs.batch_branch,
+-                                              authorization=job.get("authorization")):
+-                _end(ctx, place, job, "held")
+-                return False
+-        if publishing:
+-            if remote == job["previous_head"]:
+-                if not may_write_target(ctx, pr.base):
+-                    return False
+-                git.push_head(pr.head, lease=remote)
+-            job["phase"] = "waiting"
+-            _save(ctx, place, job)
+-            return
+-        base = git.ref_sha(f"origin/{pr.base}")
+-        job_comparison = load_record(ci_mode.ComparisonEvidence, job["comparison"]) if job.get("comparison") else None
+-        measured_base = job_comparison.base_sha if job_comparison else job["base"]
+-        needs_proof = base != job["base"] or measured_base != base
+-        neutral = needs_proof and ci_mode.enabled(ctx, pr.base) and job_comparison is not None and move_is_neutral(
+-            git, BaseMove(measured_base, base), ctx=ctx, n=n,
+-            own_locked=approval.acceptance_blobs, strict=True,
+-        )
+-        if neutral:
+-            if inputs.status == "pending":
+-                return False
+-            followed = job_comparison.follow(base)
+-            # The same proved range also covers a trusted default ref
+-            # moving from the previously accepted base. Reports and
+-            # their measured base remain immutable.
+-            if job_comparison.trusted_sha == (job_comparison.accepted_sha or job_comparison.base_sha):
+-                followed = replace(followed, trusted_sha=base)
+-            neutral = followed.current(n, ctx, git, pr.number, job["head"], base, inputs.status)
+-            if neutral:
+-                comparison = followed
+-        if neutral:
+-            runner._append(ctx.store.log_path(n), f"{REUSED}: {base}")
+-        if needs_proof and not neutral:
+-            def before_push(head):
+-                if not may_write_target(ctx, pr.base):
+-                    raise ci_mode.MissingComparison("target reserved by merge train")
+-                # A progress SHA alone is not a Git reachability root.
+-                ctx.git._call(["update-ref", f"refs/foragent/merge-owner/{n}", head])
+-                job.pop("merge_base", None)  # The old merge intent names the replaced head/base.
+-                job.update(phase="publishing", previous_head=job["head"], head=head,
+-                           base=base, comparison=None, ready_at=ctx.now().timestamp())
+-                _save(ctx, place, job)
+-                ctx.reads.clear()  # The following leased push changes the PR fact.
+-
+-            head, stopped = run_publish._refresh_reviewed_head(
+-                n, ctx, git, pr, job["head"], base,
+-                lambda head: _reverify(ctx, place, job, git, head), before_push=before_push,
+-                prepare=lambda: ci_mode.commit_exclusions(SimpleNamespace(
+-                    ctx=ctx, git=git, start_ref=base, log=ctx.store.log_path(n),
+-                    target_branch=pr.base,
+-                ), f"Refresh PR #{pr.number} onto {base}"),
+-                before_base_changed=lambda: _repair_intent(
+-                    ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."),
+-            )
+-            if stopped:
+-                if stopped == "base-changed":
+-                    _repair(ctx, place, job, f"Base refresh failed ({stopped}); repair the PR on {base}.")
+-                else:
+-                    _end(ctx, place, job, "held")
+-                return False
+-            job.update(phase="waiting", head=head)
+-            _save(ctx, place, job)
+-            return  # The changed head reaches CI handling on a later tick.
+-        status = inputs.status
+-        if comparison:
+-            if comparison.current(n, ctx, git, pr.number, job["head"], base, status):
+-                status = "pass"
+-            else:
+-                comparison = None
+-        if status == "pending":
+-            return False
+-        if status == "fail":
+-            logs = ctx.tracker.pr_failed_logs(pr.number)
+-            run_publish._hold_if_not_started(n, ctx, pr.number, logs)
+-            raise AttemptFailure(f"CI failed:\n{logs}", pr.base)
+-        if ci_mode.enabled(ctx, pr.base):
+-            comparison = comparison or job_comparison
+-            if not neutral and (comparison is None or not comparison.current(
+-                    n, ctx, git, pr.number, job["head"], base, status)):
+-                attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=root,
+-                                          target_branch=pr.base, baseline=None, approval=approval,
+-                                          log=ctx.store.log_path(n))
+-                comparison = ci_mode.require_comparison(attempt, pr.number, job["head"],
+-                                                       base_sha=base, status=status, wait=False)
+-            # Batch substitutes are reconstructed from refs, not job-file evidence.
+-            if not getattr(comparison, "substitutes_ci", False):
+-                job["comparison"] = asdict(comparison)
+-        _save(ctx, place, job)
++        base, comparison = prepared
+         with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
+             if not _ready(ctx, place, job, pr, git, base, comparison):
+                 return False
+-            issue = ctx.tracker.get_issue(place.n)
+-            subject = run_publish.retitle_for_merge(
+-                ctx, pr.number, title=f"{issue.title} (#{place.n})",
+-                current_title=pr.title, base=pr.base, body=lambda: pr.body,
+-                note=lambda line: runner._append(ctx.store.log_path(place.n), line),
+-            )
+-            job.update(phase="merging", merge_base=base)
+-            _save(ctx, place, job)
+-            ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
++            _merge(ctx, place, job, pr, base)
+         with ctx.reads.fresh():
+             _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
+         return True
++
++
++def _advance_train(ctx, report, members, proof):
++    from foragent import merge_owner_batch as batch
++
++    prepared, failed = [], None
++    try:
++        with ExitStack() as stack:
++            for index, (place, job, pr) in enumerate(members):
++                evidence = batch.Evidence(proof.base, proof.chain, index, proof.pr, proof.born)
++                git = stack.enter_context(_member_worktree(ctx, job))
++                ctx.merge_owner_started_at = ctx.now()
++                with _track_checks(ctx, place, job):
++                    ready = _try_admission(ctx, place, job,
++                                           lambda: _prepare_member(ctx, place, job, pr, git, evidence))
++                if not ready or job["head"] != pr.head_sha or evidence.accepted is None:
++                    if job["phase"] not in {"waiting", "publishing"} or evidence.reason:
++                        failed = (place, job, job.get("failure") or evidence.reason or f"single path {job['phase']}")
++                    return
++                prepared.append((place, job, pr, git, evidence))
++            with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
++                for place, job, pr, git, evidence in prepared:
++                    if not _try_admission(ctx, place, job, lambda: _ready(
++                            ctx, place, job, pr, git, proof.base, evidence)):
++                        failed = (place, job, job.get("failure") or evidence.reason or f"single path final check {job['phase']}")
++                        return
++                for index, (place, job, pr, _, _) in enumerate(prepared):
++                    ctx.git.fetch("origin", ctx.config.base_branch)
++                    base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
++                    expected = proof.chain[index - 1][2] if index else proof.base
++                    if batch._tree(ctx.git, base) != batch._tree(ctx.git, expected):
++                        raise ValueError("target tree differs from preflight prefix")
++                    if not _try_admission(ctx, place, job, lambda: _merge(ctx, place, job, pr, base)):
++                        failed = (place, job, "merge API failed")
++                        return
++            for place, job, pr, _, _ in prepared:
++                with ctx.reads.fresh():
++                    _try_admission(ctx, place, job, lambda: _complete(ctx, place, job, ctx.tracker.get_pr(pr.number)))
++            ctx.git.fetch("origin", ctx.config.base_branch)
++            target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
++            if batch._tree(ctx.git, target) != batch._tree(ctx.git, proof.chain[-1][2]):
++                raise ValueError("landed target tree differs from tip")
++            batch._close(ctx, report, proof.base, proof.chain, "train merged", used=len(members), verified=True)
++    except Exception as exc:
++        if isinstance(exc, TrackerError) and exc.waits:
++            raise
++        failed = (None, {}, str(exc) or type(exc).__name__)
++    finally:
++        if failed:
++            place, job, reason = failed
++            spent = [m for m in proof.chain if place and m[0] == place.n and m[3] == place.started_at
++                     and job["phase"] in {"repair", "repair-requested"}]
++            batch._close(ctx, report, proof.base, proof.chain, reason, spent=spent)
+ 
+ 
+ def _try_admission(ctx, place, job, step):
+@@ -583,13 +656,6 @@
+     if pr.merged_at:
+         _complete(ctx, place, job, pr)
+         return None
+-    ctx.git.fetch("origin", job["target"])
+-    if ctx.git.is_ancestor(job["head"], ctx.git.ref_sha(f"origin/{job['target']}")):
+-        return None  # The immutable landing fact survives a lost push response and GitHub lag.
+-    run = ctx.store.get_run(place.n)
+-    if run is None or run.started_at != place.started_at:
+-        _end(ctx, place, job, "superseded")
+-        return None
+     try:
+         issue = ctx.tracker.get_issue(place.n)
+     except TrackerError as exc:
+@@ -655,13 +721,15 @@
+             return
+         place = queue.Seat(row["n"], row["started_at"], row["target"])
+         run = ctx.store.get_run(place.n)
+-        if run is not None and run.started_at == place.started_at and run.status == "running":
++        if run is not None and run.status == "running":
+             continue  # The worker has not finished its cleanup yet.
+         job = dict(row["publication"])
+ 
+         def reconcile():
+             job.update(_load(owner, place, row))
+-            if (pr := _reconcile(owner, place, job)) is not None:
++            if run is None or run.started_at != place.started_at:
++                _end(owner, place, job, "superseded")
++            elif (pr := _reconcile(owner, place, job)) is not None:
+                 candidates[key] = (place, job, pr)
+ 
+         _try_admission(owner, place, job, reconcile)
+@@ -680,10 +748,10 @@
+         batch = merge_owner_batch.prepare(ctx, report, [candidates[k] for k in turn_order if k in candidates])
+     else:
+         merge_owner_batch.retire(ctx, report)
+-    if batch is False:
+-        return
+     if batch:
+-        merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
++        if not batch.blocked:
++            members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates.values()}
++            _advance_train(ctx, report, [members[(n, started)] for n, _, _, started in batch.chain], batch)
+         return
+     for key in turn_order:
+         if ctx.store.github_wait_until(ctx.now()):
+--- a/src/foragent/merge_owner_batch.py
++++ b/src/foragent/merge_owner_batch.py
+@@ -1,20 +1,19 @@
+-"""Test a merge train tip, then publish the whole train with one leased update."""
+-
+-from contextlib import ExitStack
++"""Disposable tip CI and durable recovery; the owner alone merges members."""
++
++from tempfile import NamedTemporaryFile
+ from hashlib import sha256
+ from types import SimpleNamespace
+ import json
+ 
+ from foragent import ci_mode
+ from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
+-from foragent.ci_local import LocalComparisonUnavailable
+-from foragent.git import main_write_lock
+-from foragent.run_attempt import AttemptFailure, ExecutorStopped
+ from foragent.run_baseline import _baseline_exclusions
+ from foragent.run_publish_ci import _CIWait
+ from foragent.tracker import TrackerError
+ 
+ PREFIX = "foragent/batch-merge-"
++CHECKPOINT = f"{PREFIX}checkpoint-"
++BASELINE = "refs/foragent/batch-baseline/"
+ SPENT = "refs/foragent/batch-spent/"
+ DEADLINE_SECONDS = 3 * _CIWait(0).deadline
+ 
+@@ -33,10 +32,23 @@
+             if line.strip()]
+ 
+ 
++def unfinished(ctx):
++    finished = {row.get("identity") for row in retirements(ctx)}
++    return [row for line in ctx.git._call([
++        "for-each-ref", "--format=%(contents:trailers:key=Foragent-Baseline,valueonly)", BASELINE]).splitlines()
++            if line.strip() and (row := json.loads(line))
++            and _identity(row["base"], row["chain"]) not in finished]
++
++
+ def _landed(ctx, base, chain):
+     ctx.git.fetch("origin", ctx.config.base_branch)
+-    target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+-    return sum(ctx.git.is_ancestor(head, target) for _, head, _, _ in chain)
++    trees = ctx.git._call(["log", "--first-parent", "--reverse", "--format=%T",
++                           f"{base}..origin/{ctx.config.base_branch}"]).splitlines()
++    used = 0
++    for tree in trees:
++        if used < len(chain) and tree == _tree(ctx.git, chain[used][2]):
++            used += 1
++    return used
+ 
+ 
+ def _identity(base, chain):
+@@ -101,45 +113,93 @@
+     return _prefix_pr(ctx, base, k)
+ 
+ 
+-def _close(ctx, report, base, chain, reason, used=None, spent=()):
++def _remember_base(ctx, base, chain, sha, origin, reports):
++    """Pin the original measured suite and member identities before any landing."""
++    marker = f"{BASELINE}{_identity(base, chain)}"
++    if _tree(ctx.git, origin) != _tree(ctx.git, base) or ctx.git._call([
++            "for-each-ref", "--format=%(objectname)", marker]).strip():
++        return
++    ledger = json.dumps(dict(sha=sha, origin=origin, reports=reports, base=base, chain=chain),
++                        separators=(",", ":"))
++    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=ctx.store.root) as message:
++        message.write(f"Original merge batch measurement\n\nForagent-Baseline: {ledger}")
++        message.flush()
++        saved = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
++                               "commit-tree", _tree(ctx.git, sha),
++                               *[arg for parent in dict.fromkeys([sha, origin, chain[-1][2]]) for arg in ("-p", parent)],
++                               "-F", message.name]).strip()
++    ctx.git._call(["update-ref", marker, saved, "0" * len(saved)])
++
++
++def _original_base(ctx, base, chain):
++    marker = f"{BASELINE}{_identity(base, chain)}"
++    saved = ctx.git._call(["for-each-ref", "--format=%(contents:trailers:key=Foragent-Baseline,valueonly)",
++                           marker]).strip()
++    if saved:
++        row = json.loads(saved)
++        return row["sha"], row["reports"], row["origin"]
++    for _, _, sha, _ in reversed(chain):
++        reports = ctx.tracker.pr_acceptance_reports(sha)
++        origin = ci_mode.reported_base(reports)
++        if origin is None or _tree(ctx.git, origin) != _tree(ctx.git, base):
++            continue
++        scope = reports[0]["report"]["scope"]
++        ci_mode.comparison(reports, ctx.repo, origin, sha, scope["excluded"], expected_scope=scope,
++                           expected_shards=range(scope["shard_count"]))
++        _remember_base(ctx, base, chain, sha, origin, reports)
++        return sha, reports, origin
++    raise ci_mode.MissingComparison("original train baseline unavailable")
++
++
++def _close(ctx, report, base, chain, reason, used=None, spent=(), verified=False):
+     from foragent.merge_owner import close_for_repair
+ 
++    if ctx.store.github_wait_until(ctx.now()):
++        return False
++    identity = _identity(base, chain)
++    used = _landed(ctx, base, chain) if used is None else used
++    finished = any(row.get("identity") == identity for row in retirements(ctx))
++    if used and not (verified or finished) and not _checkpoint(ctx, report, base, chain):
++        return False
+     minutes = 0
+-    try:
+-        minutes = sum(item["report"]["duration_seconds"]
+-                      for item in ctx.tracker.pr_acceptance_reports(chain[-1][2])) / 60
+-    except Exception as exc:
+-        if isinstance(exc, TrackerError) and exc.waits:
+-            raise
+-        pass  # Missing measurements are unknown; cleanup must still proceed.
++    for _, _, prefix, _ in chain:
++        try:
++            minutes += sum(item["report"]["duration_seconds"]
++                           for item in ctx.tracker.pr_acceptance_reports(prefix)) / 60
++        except Exception as exc:
++            if isinstance(exc, TrackerError) and exc.waits:
++                raise
++            pass  # Missing measurements are unknown; cleanup must still proceed.
++    rows = ctx.store.flow_records()
+     members = [dict(n=n, head=head, started_at=started) for n, head, _, started in chain]
+-    # Persist retirement before deleting the tip, so cleanup can resume after a crash.
+-    refs = {_name(base, len(chain)): chain[-1][2]} if chain[-1][2] != base else {}
+-    reason = _record_retirement(ctx, _identity(base, chain), chain[-1][2], reason=reason,
+-                               members=members, refs=refs,
++    # Retire the attempt separately from its members' own failures. Publish the
++    # whole intent before deleting the tip so cleanup can resume after a crash.
++    refs = {_name(base, k): p for k, (_, _, p, _) in enumerate(chain, 1) if p != base}
++    refs.update({ref.removeprefix("refs/heads/"): sha for sha, ref in (line.split() for line in
++                 ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{CHECKPOINT}{identity[:12]}-*"]).splitlines())})
++    reason = _record_retirement(ctx, identity, chain[-1][2], reason=reason, members=members,
++                               refs=refs,
+                                spent=[dict(n=n, head=h, started_at=s) for n, h, _, s in spent])
+-    if used is None:
+-        used = _landed(ctx, base, chain)
+-    if not any(row["kind"] == "merge-batch" and row["data"].get("members") == members
+-               for row in ctx.store.flow_records()):
++    if not any(row["kind"] == "merge-batch" and row["data"].get("members") == members for row in rows):
+         ctx.store.record_flow("merge-batch", members=members, candidate=chain[-1][2],
+                               result="used" if used else "unused", used_members=used,
+                               reason=reason, ci_minutes=minutes)
+-    for branch, tip in refs.items():
+-        try:
+-            if ctx.git.remote_branch_sha(branch) != tip:
++    for branch, prefix in refs.items():
++        try:
++            if prefix == base or ctx.git.remote_branch_sha(branch) != prefix:
+                 continue
+             with ctx.reads.fresh():
+                 pr = ctx.tracker.find_pr(branch)
+                 if pr is not None and not ctx.tracker.get_pr(pr).merged_at:
+-                    close_for_repair(ctx, None, pr, tip, ctx.config.base_branch, branch=branch)
+-            ctx.tracker.cancel_workflow_runs(tip, branch=branch)
+-            ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:{tip}",
++                    close_for_repair(ctx, None, pr, prefix, ctx.config.base_branch, branch=branch)
++            ctx.tracker.cancel_workflow_runs(prefix, branch=branch)
++            ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:{prefix}",
+                            "origin", f":refs/heads/{branch}"])
+         except Exception as exc:
+             if isinstance(exc, TrackerError) and exc.waits:
+                 raise
+             report.actions.append(f"{branch} cleanup deferred: {exc}")
++            break
+ 
+ 
+ def _discover(ctx, report):
+@@ -147,10 +207,20 @@
+     refs = ctx.git._call(["ls-remote", "--heads", "origin", f"refs/heads/{PREFIX}*"])
+     recovered, damaged = [], []
+     retired = {row.get("identity") for row in retirements(ctx)}
++
++    def remember(base, chain):
++        nonlocal recovered
++        if any(b == base and c[:len(chain)] == chain for b, c in recovered):
++            return
++        recovered = [(b, c) for b, c in recovered if b != base or chain[:len(c)] != c]
++        recovered.append((base, chain))
++
+     for candidate, ref in (line.split() for line in refs.splitlines()):
+         branch = ref.removeprefix("refs/heads/")
++        if branch.startswith(CHECKPOINT):
++            continue
+         if sha256(json.dumps([branch, candidate]).encode()).hexdigest() in retired:
+-            continue  # A retained damaged ref has already surrendered its reservation.
++            continue  # Retained damaged refs have already surrendered their reservation.
+         try:
+             ctx.git.fetch("origin", branch)
+             base, chain = _decode(ctx.git, branch, candidate)
+@@ -160,7 +230,9 @@
+             damaged.append((candidate, branch))
+             report.actions.append(f"{branch} ledger unavailable: {exc}")
+             continue
+-        recovered.append((base, chain))
++        remember(base, chain)
++    for row in unfinished(ctx):
++        remember(row["base"], [tuple(member) for member in row["chain"]])
+     return recovered, damaged
+ 
+ 
+@@ -190,11 +262,14 @@
+ class Evidence:
+     infrastructure = ""
+     substitutes_ci = True
+-
+-    def __init__(self, base, chain, pr, born):
+-        self.base, self.chain, self.pr, self.born = base, chain, pr, born
++    blocked = False
++
++    def __init__(self, base, chain, index, pr, born):
++        self.base, self.chain, self.index = base, chain, index
++        self.born = born
+         self.reason = None
+         self.pending = False
++        self.pr = pr
+         self.accepted = None
+ 
+     def reports(self, ctx):
+@@ -224,13 +299,16 @@
+             raise ci_mode.MissingComparison("prefix CI pending")
+         reports = ctx.tracker.pr_acceptance_reports(prefix)
+         measured_base = ci_mode.reported_base(reports)
+-        if measured_base != self.base:
++        if measured_base is None or _tree(ctx.git, measured_base) != _tree(ctx.git, self.base):
+             raise ValueError("tip measurement base changed")
+         return status, measured_base, prefix, reports
+ 
+     def measurement(self, attempt, head, base_sha):
+-        if base_sha != self.base or not any(n == attempt.n and member == head for n, member, _, _ in self.chain):
+-            raise ValueError("member head or target changed")
++        git = attempt.git
++        n, _, prefix, _ = self.chain[self.index]
++        if (n != attempt.n or _tree(git, head) != _tree(git, prefix)
++                or _tree(git, base_sha) != _tree(git, self.base)):
++            raise ValueError("refreshed tree differs from prefix")
+         status, measured_base, measured, reports = self.reports(attempt.ctx)
+         if status == "fail":
+             raise ValueError("tip CI red")
+@@ -246,27 +324,80 @@
+                                     expected_shards=range(ctx.config.ci_shards))
+         if any(not ci_mode.scope_covers(item["report"]["scope"], scope) for item in reports):
+             raise ci_mode.StaleComparison("tip measurement scope no longer covers the current one")
++        _remember_base(ctx, self.base, self.chain, sha, origin, reports)
+         return "fail" if lost else "pass"
+ 
+     def current(self, n, ctx, git, pr, head, base_sha, status):
+-        if status == "fail":
+-            self.reason = "member CI red"
++        self.pending = False
++        try:
++            if status == "fail":
++                raise ValueError("member CI red")
++            attempt = SimpleNamespace(n=n, ctx=ctx, git=git, target_branch=ctx.config.base_branch,
++                                      log=ctx.store.log_path(n))
++            if self.accepted is None:
++                self.accepted = ci_mode.require_comparison(attempt, pr, head, base_sha=base_sha, status=status,
++                                                           wait=False, source=self)
++            else:
++                self.measurement(attempt, head, base_sha)
++            if not self.accepted.current(n, ctx, git, pr, head, base_sha, self.accepted.status):
++                raise ValueError("prefix comparison changed")
++            return True
++        except Exception as exc:
++            if isinstance(exc, TrackerError) and exc.waits:
++                raise
++            if not self.pending:
++                self.reason = str(exc) or type(exc).__name__
+             return False
+-        attempt = SimpleNamespace(n=n, ctx=ctx, git=git, target_branch=ctx.config.base_branch,
+-                                  log=ctx.store.log_path(n))
+-        if self.accepted is None:
+-            self.accepted = ci_mode.require_comparison(attempt, pr, head, base_sha=base_sha, status=status,
+-                                                       wait=False, source=self)
+-        else:
+-            self.measurement(attempt, head, base_sha)
+-        if not self.accepted.current(n, ctx, git, pr, head, base_sha, self.accepted.status):
+-            raise ci_mode.StaleComparison("tip comparison changed")
+-        return True
++
++
++def _checkpoint(ctx, report, base, chain):
++    """Compare the current target only against the original suite and saved scope."""
++    try:
++        ctx.git.fetch("origin", ctx.config.base_branch)
++        target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
++        branch = f"{CHECKPOINT}{_identity(base, chain)[:12]}-{target}"
++        remote = ctx.git.remote_branch_sha(branch)
++        if remote is None:
++            original = _original_base(ctx, base, chain)
++            scope = original[1][0]["report"]["scope"]
++            message = f"Target checkpoint {target}\n\n{EXCLUSIONS_TRAILER}: {json.dumps(scope['excluded'])}"
++            remote = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
++                                    "commit-tree", _tree(ctx.git, target), "-p", target, "-m", message]).strip()
++            ctx.git._call(["push", f"--force-with-lease=refs/heads/{branch}:",
++                           "origin", f"{remote}:refs/heads/{branch}"])
++        if (_tree(ctx.git, remote) != _tree(ctx.git, target)
++                or ctx.git._call(["show", "-s", "--format=%P", remote]).strip() != target):
++            raise ValueError("checkpoint ref changed")
++        pr = ctx.tracker.find_pr(branch)
++        if pr is None:
++            pr = ctx.tracker.create_pr(head=branch, base=ctx.config.base_branch,
++                                       title="Foragent target checkpoint", body=f"Interrupted train on {base}.")
++        row = ctx.tracker.get_pr(pr)
++        if row.head_sha != remote or row.head != branch or row.base != ctx.config.base_branch or row.state != "open":
++            raise ValueError("checkpoint PR changed")
++        if ctx.tracker.pr_checks(pr) != "pass":
++            return False
++        original = _original_base(ctx, base, chain)
++        scope = original[1][0]["report"]["scope"]
++        reports = ctx.tracker.pr_acceptance_reports(remote)
++        origin = ci_mode.reported_base(reports)
++        lost, _ = ci_mode.comparison(reports, ctx.repo, origin, remote, scope["excluded"],
++                                    expected_scope=scope, expected_shards=range(scope["shard_count"]),
++                                    original=original)
++        ctx.git.fetch("origin", ctx.config.base_branch)
++        return not lost and ctx.git.ref_sha(f"origin/{ctx.config.base_branch}") == target
++    except ci_mode.MissingComparison:
++        return False
++    except Exception as exc:
++        if isinstance(exc, TrackerError) and exc.waits:
++            raise
++        report.actions.append(f"target checkpoint CI unavailable: {exc}")
++        return False
+ 
+ 
+ def prepare(ctx, report, candidates):
+-    """None permits single admissions; False ends a retired attempt's tick."""
+-    base, chain = None, []
++    """Publish only the tip; uncertain evidence returns to the ordinary path."""
++    base, chain, used, born = None, [], None, None
+     try:
+         retired = retirements(ctx)
+         recovered, damaged = _discover(ctx, report)
+@@ -279,10 +410,10 @@
+             base, chain = recovered[0]
+             if any(row.get("identity") == _identity(base, chain)
+                    or "identity" not in row and row["candidate"] == chain[-1][2] for row in retired):
+-                _close(ctx, report, base, chain, "candidate already retired")
+-                return None
++                raise ValueError("candidate already retired")
+         else:
+-            spent = {(m["n"], m["started_at"]) for row in retired for m in row.get("spent", [])}
++            spent = {(m["n"], m["started_at"]) for row in retired
++                     for m in row.get("spent", [])}
+             ctx.git.fetch("origin", ctx.config.base_branch)
+             base = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+             eligible = [(p, j) for p, j, _ in candidates if (p.n, p.started_at) not in spent
+@@ -297,6 +428,7 @@
+             if len(selected) < 2:
+                 return None
+             excluded = sorted(set(_baseline_exclusions(ctx, base, ctx.store.log_path(selected[0][0].n))))
++            # Keep all selected identities even if construction conflicts before a prefix exists.
+             chain = [(p.n, j["head"], base, p.started_at) for p, j in selected]
+             before = base
+             for k, (p, j) in enumerate(selected):
+@@ -310,21 +442,26 @@
+                 chain[k] = (p.n, j["head"], before, p.started_at)
+         used = _landed(ctx, base, chain)
+         if used:
+-            _close(ctx, report, base, chain, "member heads already reachable from target", used=used)
++            _close(ctx, report, base, chain, "interrupted train checkpoint passed", used=used)
+             return None
+-        if ctx.git.ref_sha(f"origin/{ctx.config.base_branch}") != base:
+-            raise ValueError("target changed")
++        target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
++        if not ctx.git.is_ancestor(base, target) or _tree(ctx.git, target) != _tree(ctx.git, base):
++            raise ValueError("target tree differs from prefix")
+         born = int(ctx.git._call(["show", "-s", "--format=%ct", chain[0][2]]))
+         available = {(p.n, p.started_at) for p, _, _ in candidates}
+         if any((n, started) not in available for n, _, _, started in chain):
+             raise ValueError("member left the single path")
+-        proof = Evidence(base, chain, _publish(ctx, base, chain, len(chain)), born)
+-        try:
+-            status = proof.outcome(ctx)
++        proof = Evidence(base, chain, 0, _publish(ctx, base, chain, len(chain)), born)
++        try:
++            outcome = proof.outcome(ctx)
+         except ci_mode.MissingComparison:
++            member_pr = next(pr for p, _, pr in candidates if (p.n, p.started_at) == (chain[0][0], chain[0][3]))
++            if ctx.tracker.pr_checks(member_pr.number) != "pass":
++                return SimpleNamespace(blocked=True)
++            # Retire before ordinary CI can land a member of a pending train.
+             _close(ctx, report, base, chain, "tip CI pending; members return to single path", used=0)
+             return None
+-        if status == "fail":
++        if outcome == "fail":
+             raise ValueError("tip CI red")
+         return proof
+     except Exception as exc:
+@@ -332,71 +469,7 @@
+             raise
+         if chain:
+             _close(ctx, report, base, chain, str(exc) or type(exc).__name__)
+-            return False
+-        report.actions.append(f"merge batch unavailable: {exc}")
++        else:
++            report.actions.append(f"merge batch unavailable: {exc}")
+         return None
+ 
+-
+-def land(ctx, report, candidates, proof):
+-    """Reuse every member's final check before the sole target ref update."""
+-    from foragent import merge_owner as owner
+-
+-    members = {(p.n, p.started_at): (p, j, pr) for p, j, pr in candidates}
+-    failed, checking = None, None
+-    reason = "train merged"
+-    try:
+-        ctx.merge_owner_started_at = ctx.now()
+-        with ExitStack() as stack:
+-            prepared = []
+-            for member in proof.chain:
+-                n, head, _, started = member
+-                place, job, pr = members[(n, started)]
+-                if job["head"] != head:
+-                    raise ValueError("member head changed")
+-                git = stack.enter_context(owner._member_worktree(ctx, job))
+-                evidence = Evidence(proof.base, proof.chain, proof.pr, proof.born)
+-                prepared.append((place, job, pr, git, evidence))
+-            tip = stack.enter_context(owner._member_worktree(ctx, {
+-                "head": proof.chain[-1][2], "target": ctx.config.base_branch,
+-            }))
+-            place, job, *_ = prepared[0]
+-            with owner._track_checks(ctx, place, job):
+-                ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch)
+-            with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
+-                if proof.outcome(ctx) != "pass":
+-                    raise ValueError("tip CI red")
+-                owner.run_publish._check_publication(tip, ctx.config.base_branch, proof.base)
+-                for member, (place, job, pr, git, evidence) in zip(proof.chain, prepared):
+-                    checking = member
+-                    if not owner._ready(ctx, place, job, pr, git, proof.base, evidence):
+-                        failed = member
+-                        reason = evidence.reason or f"single path final check {job['phase']}"
+-                        break
+-                else:
+-                    checking = None
+-                    for place, job, _, _, _ in prepared:
+-                        job.update(phase="merging", merge_base=proof.base)
+-                        owner._save(ctx, place, job)
+-                    target = f"refs/heads/{ctx.config.base_branch}"
+-                    ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
+-                                   "origin", f"{proof.chain[-1][2]}:{target}"])
+-        if failed is None:
+-            for place, job, _, _, _ in prepared:
+-                with ctx.reads.fresh():
+-                    owner._try_admission(ctx, place, job, lambda: owner._reconcile(ctx, place, job))
+-    except Exception as exc:
+-        if isinstance(exc, TrackerError) and exc.waits:
+-            raise
+-        reason = str(exc) or type(exc).__name__
+-        if checking:
+-            place, job, _ = members[(checking[0], checking[3])]
+-
+-            def rejected():
+-                raise exc
+-
+-            owner._try_admission(ctx, place, job, rejected)
+-            if isinstance(exc, (AttemptFailure, ExecutorStopped, LocalComparisonUnavailable)):
+-                failed = checking
+-    if failed:
+-        reason = f"member #{failed[0]}: {reason}"
+-    _close(ctx, report, proof.base, proof.chain, reason, spent=[failed] if failed else [])
+--- a/tests/test_merge_owner_batch.py
++++ b/tests/test_merge_owner_batch.py
+@@ -1,14 +1,9 @@
+-"""Real Git and measured tip CI; target publication is one compare-and-swap.
+-
+-The offline transport uses fetch/update-ref, never forbidden Git commands.
+-"""
++"""Real Git prefixes and measured CI, with the normal owner as the only merger."""
+ 
+ from contextlib import contextmanager
+ from dataclasses import replace
+ from datetime import timedelta
+-import fcntl
+ import json
+-from pathlib import Path
+ 
+ import pytest
+ 
+@@ -16,12 +11,12 @@
+ from conftest import git_command
+ from test_merge_owner_proto import proto  # noqa: F401
+ import test_merge_owner_proto as support
+-from foragent import merge_owner, merge_owner_batch as batch, orch_queue, run_group_evidence
++from foragent import merge_owner, merge_owner_batch as batch, orch_queue
+ from foragent.config import ConfigError, load_config
+ from foragent.git import GitError
+ from foragent.issue import body_hash
+ from foragent.state import StateStore
+-from foragent.tracker import FakeTracker, GhTracker, RejectedEvidence, TrackerError
++from foragent.tracker import GhTracker, RejectedEvidence, TrackerError
+ 
+ 
+ @pytest.fixture
+@@ -29,52 +24,32 @@
+     case = proto
+     case.config = replace(case.config, merge_batch=True)
+     case.ctx.config = case.config
+-    case.pending_batch = case.github_lag = case.merge_tip_metadata = False
+-    case.batch_pushes, case.target_pushes, case.target_attempts = [], [], []
+-    case.target_failure = case.after_target_push = None
++    case.pending_batch = False
++    case.pending_checkpoint = False
++    case.batch_pushes = []
+     for key in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"):
+         monkeypatch.setenv(key, case.clock[0].isoformat())
+     transport = case.git._run
+ 
+     def git_transport(argv):
+-        root, args = case.root, list(argv)
+-        while args[:1] == ["-C"]:
+-            root, args = Path(args[1]), args[2:]
++        args = list(argv)
++        if args[:1] == ["-C"]:
++            args = args[2:]
+         if args[:1] == ["push"]:
+             source, destination = args[-1].split(":", 1) if ":" in args[-1] else (args[-1], args[-1])
++            assert destination not in {"main", "refs/heads/main"}, "Batch pushed the target"
+             lease = next((a.split("=", 1)[1] for a in args if a.startswith("--force-with-lease=")), None)
+             if lease is not None:
+                 ref, expected = lease.split(":", 1)
+                 actual = git_command(case.history.origin, "for-each-ref", "--format=%(objectname)", ref)
+                 if actual != expected:
+                     raise GitError("lease rejected")
+-            if destination in {"main", "refs/heads/main"}:
+-                assert lease is not None and ref in {"main", "refs/heads/main"}
+-                owner_lock = case.store.lock_acceptance_baseline("merge-owner", blocking=False)
+-                if owner_lock is not None:
+-                    owner_lock.close()
+-                assert owner_lock is None, "Target push escaped the independent owner lock"
+-                with (case.git.common_dir() / "foragent-publish.lock").open("a") as main_lock:
+-                    with pytest.raises(BlockingIOError):
+-                        fcntl.flock(main_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+-                case.target_attempts.append((source, destination, expected))
+-                if case.target_failure:
+-                    raise GitError(case.target_failure)
+-                head = git_command(root, "rev-parse", source)
+-                git_command(case.history.origin, "merge-base", "--is-ancestor", expected, head)
+-                git_command(case.history.origin, "fetch", str(root), source)
+-                git_command(case.history.origin, "update-ref", "refs/heads/main", head, expected)
+-                case.history.tip = head
+-                case.target_pushes.append((head, destination, expected))
+-                if case.after_target_push:
+-                    case.after_target_push()
+-                return ""
+             if source and batch.PREFIX in destination:
+                 case.batch_pushes.append((source, destination))
+         return transport(argv)
+ 
+     monkeypatch.setattr(case.git, "_run", git_transport)
+-    create, get = case.tracker.create_pr, case.tracker.get_pr
++    create = case.tracker.create_pr
+ 
+     def created(**kwargs):
+         if kwargs["head"].startswith(batch.PREFIX) and any(
+@@ -82,21 +57,12 @@
+                 for pr in case.tracker.created_prs):
+             raise TrackerError("A pull request already exists for this head/base")
+         pr = create(**kwargs)
+-        if kwargs["head"].startswith(batch.PREFIX) and case.pending_batch:
++        if (kwargs["head"].startswith(batch.PREFIX) and case.pending_batch
++                or kwargs["head"].startswith(batch.CHECKPOINT) and case.pending_checkpoint):
+             case.tracker.set_pr_checks(pr, "pending")
+         return pr
+ 
+-    def github_metadata(pr):
+-        row = get(pr)
+-        eligible = row.head.startswith("foragent/issue-") or case.merge_tip_metadata and row.head.startswith(batch.PREFIX)
+-        if eligible and not case.github_lag and not row.merged_at and row.state == "open":
+-            if case.git.at(case.history.origin).is_ancestor(row.head_sha, case.history.tip):
+-                FakeTracker.merge_pr(case.tracker, pr, expected_head_sha=row.head_sha, delete_branch=False)
+-                row = get(pr)
+-        return row
+-
+     monkeypatch.setattr(case.tracker, "create_pr", created)
+-    monkeypatch.setattr(case.tracker, "get_pr", github_metadata)
+     reports = case.tracker.pr_acceptance_reports
+ 
+     def measured(head):
+@@ -115,11 +81,11 @@
+ 
+ 
+ def groups(case):
+-    return [pr for pr in case.tracker.created_prs if pr.head.startswith(batch.PREFIX)]
++    return [pr for pr in case.tracker.created_prs if pr.head.startswith((batch.PREFIX, batch.CHECKPOINT))]
+ 
+ 
+ def refs(case):
+-    return git_command(case.history.origin, "for-each-ref", "--format=%(refname)", f"refs/heads/{batch.PREFIX}*")
++    return git_command(case.history.origin, "for-each-ref", "--format=%(refname)", "refs/heads/foragent/batch-*")
+ 
+ 
+ def events(case):
+@@ -127,27 +93,23 @@
+ 
+ 
+ def green(case):
+-    case.pending_batch = False
++    case.pending_batch = case.pending_checkpoint = False
+     for pr in case.tracker.created_prs:
+         case.tracker.set_pr_checks(pr.number, "pass")
+ 
+ 
+-def published_train(case, monkeypatch):
+-    """Interrupt after publication to exercise durable remote-ledger recovery."""
+-    checks = case.tracker.pr_checks
+-
+-    def interrupted(pr):
+-        if case.tracker.get_pr(pr).head.startswith(batch.PREFIX):
+-            raise KeyboardInterrupt("Owner stopped after tip publication")
+-        return checks(pr)
+-
+-    with monkeypatch.context() as patch:
+-        patch.setattr(case.tracker, "pr_checks", interrupted)
+-        with pytest.raises(KeyboardInterrupt):
+-            support.gate(case)
+-    assert len(groups(case)) == 1 and refs(case)
+-    assert not case.target_pushes and not events(case)
+-
++def shared_locks(case, numbers=(5, 1, 4, 2)):
++    # An open owner shares these locks: completing one member leaves the same
++    # measurement scope, so the tests exercise tree reuse rather than scope refresh.
++    approval = case.store.load_approval(5)
++    paths = [f"tests/acceptance/test_own_{n}.py" for n in numbers]
++    body = approval.body.replace("tests/acceptance/test_own_5.py", " ".join(paths))
++    case.clock[0] += timedelta(seconds=1)
++    case.tracker.add_issue(79, "Shared acceptance owner", body, labels=["approved"])
++    case.tracker.record_label(79, "approved", "human")
++    blobs = {p: case.git.blob_sha(case.base, p) for p in paths}
++    case.store.save_approval(79, body=body, body_sha=body_hash(body), acceptance_blobs=blobs,
++                             approved_by="human", approved_at=case.clock[0].isoformat())
+ 
+ 
+ @pytest.mark.parametrize("numbers", [[5, 1], [2, 4, 1, 5], [5, 1, 4, 2, 6, 3]])
+@@ -158,59 +120,77 @@
+     case = request.getfixturevalue("batched")
+     case.config = replace(case.config, merge_batch_size=6)
+     case.ctx.config = case.config
++    shared_locks(case, numbers if len(numbers) > 4 else (5, 1, 4, 2))
+     queue_workers(case, numbers)
+     orch_queue.set_global(case.store, numbers)
+     base = case.history.tip
+     heads = {n: case.tracker.pr_head_sha(support.pr_for(case, n).number) for n in numbers}
+     report = support.gate(case)
+-    assert len(groups(case)) == len(case.batch_pushes) == len(case.target_pushes) == 1, report.actions
+-    pr = groups(case)[0]
+-    tip = case.tracker.pr_head_sha(pr.number)
+-    decoded_base, chain = batch._decode(case.git, pr.head, tip)
+-    assert decoded_base == base and pr.head == f"{batch.PREFIX}{base[:8]}-{len(numbers)}"
+-    assert [(n, head) for n, head, _, _ in chain] == [(n, heads[n]) for n in numbers]
+-    assert git_command(case.root, "show", "-s", "--format=%cn <%ce>", tip) == "foragent <foragent@localhost>"
+-    assert case.target_pushes == [(tip, "refs/heads/main", base)]
+-    assert case.history.tip == tip and not case.merges and not refs(case)
+-    assert all(case.git.is_ancestor(head, tip) for head in heads.values())
++    assert case.store.load_approval(79) is not None, report.actions
++    assert len(groups(case)) == 1
++    assert not case.merges  # Prepare all members before the locked pass.
++    for pr in groups(case):
++        k = len(numbers)
++        assert pr.head == f"{batch.PREFIX}{base[:8]}-{k}"
++        prefix = case.tracker.pr_head_sha(pr.number)
++        decoded_base, chain = batch._decode(case.git, pr.head, prefix)
++        assert decoded_base == base
++        assert [(n, head) for n, head, _, _ in chain] == [(n, heads[n]) for n in numbers[:k]]
++        assert git_command(case.root, "show", "-s", "--format=%cn <%ce>", prefix) == "foragent <foragent@localhost>"
++    # Refreshed member CI never completes: only matching prefix reports can land it.
++    checks, reports = case.tracker.pr_checks, case.tracker.pr_acceptance_reports
++
++    def own_round_pending(pr):
++        row = case.tracker.get_pr(pr)
++        return "pending" if row.head.startswith("foragent/issue-") and row.head_sha not in heads.values() else checks(pr)
++
++    def no_new_own_reports(head):
++        row = case.ci.by_head[head]
++        assert not (row.branch.startswith("foragent/issue-") and head not in heads.values())
++        return reports(head)
++
++    monkeypatch.setattr(case.tracker, "pr_checks", own_round_pending)
++    monkeypatch.setattr(case.tracker, "pr_acceptance_reports", no_new_own_reports)
++    # Each gate reconstructs its context/store from disk. No batch state file is needed.
++    support.drain(case, count=len(numbers))
++    assert not refs(case)
++    assert len(case.merges) == len(numbers)
++    assert case.merges[0]["head"] == heads[numbers[0]]
++    assert all(m["head"] != heads[n] for n, m in zip(numbers[1:], case.merges[1:]))
++    assert all(any(frame["function"] == "_merge" and frame["path"].endswith("/merge_owner.py")
++                   for frame in merge["client"]) for merge in case.merges)
++    assert all(not any(frame["path"].endswith("/merge_owner_batch.py") for frame in merge["client"])
++               for merge in case.merges)
++    assert events(case)[-1]["result"] == "used"
++    assert events(case)[-1]["used_members"] == len(numbers)
++    assert events(case)[-1]["ci_minutes"] == pytest.approx(2 / 60)
+     assert len(case.store.owner_merge_facts()) == len(numbers)
+-    assert all(case.tracker.get_issue(n).state == "closed" for n in numbers)
+-    assert events(case)[-1]["result"] == "used" and events(case)[-1]["used_members"] == len(numbers)
+-    assert events(case)[-1]["ci_minutes"] == pytest.approx(2 / 60)
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == len(numbers)
+-
+-
+-def test_green_tip_lands_members_whose_own_ci_is_pending(batched):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    for n in [5, 1]:
+-        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not case.merges
+-    assert len(case.store.owner_merge_facts()) == 2
++    turns = [row for row in merge_owner.queue._rows(case.store)
++             if row.get("event") == "turn" and row.get("result") == "merged"]
++    assert [row["base_sha"] for row in turns] == [
++        git_command(case.history.origin, "rev-parse", f"{merge['main']}^1") for merge in case.merges]
+ 
+ 
+ def test_pending_tip_does_not_publish_other_prefixes(batched):
+     case = batched
++    shared_locks(case)
+     case.pending_batch = True
+     queue_workers(case, [5, 1, 4, 2])
+     support.gate(case)
+-    assert len(groups(case)) == len(case.batch_pushes) == 1
+-    assert not refs(case) and not case.target_pushes and not case.merges
+-    assert events(case)[-1]["result"] == "unused"
+-    assert not batch.retirements(case.ctx)[0]["spent"]
+-    support.gate(case)
+-    assert len(case.batch_pushes) == 1
++    assert len(groups(case)) == 1 and len(refs(case).splitlines()) == 1
++    assert not case.merges
++    original = list(case.batch_pushes)
++    support.gate(case)
++    assert case.batch_pushes == original and not case.merges
+     green(case)
+     support.drain(case)
+-    assert len(case.store.owner_merge_facts()) == 4
+-    assert len(case.batch_pushes) == 2  # A new base permits a fresh eligible suffix.
++    assert len(case.merges) == 4 and not refs(case)
+ 
+ 
+ @pytest.mark.parametrize("configured,expected", [(None, 4), (6, 6)], ids=["default", "configured-six"])
+ def test_batch_size_limits_prefixes_and_survives_restart(request, monkeypatch, configured, expected):
+     from acceptance import test_merge_path_real_settings as contract
++
+     numbers = (5, 1, 4, 2, 6, 3, 7)
+     monkeypatch.setattr(contract, "NUMBERS", numbers)
+     case = request.getfixturevalue("batched")
+@@ -219,19 +199,29 @@
+         settings.write_text(settings.read_text() + f"merge_batch_size: {configured}\n")
+     case.config = replace(case.config, merge_batch_size=load_config(case.root).merge_batch_size)
+     case.ctx.config = case.config
++    assert case.config.merge_batch_size == expected
++    case.pending_batch = True
+     queue_workers(case, numbers)
+-    published_train(case, monkeypatch)
+-    base, chain = batch._decode(case.git, groups(case)[0].head, case.tracker.pr_head_sha(groups(case)[0].number))
++    support.gate(case)
++    assert len(groups(case)) == len(refs(case).splitlines()) == 1
++    pushes = list(case.batch_pushes)
++    support.gate(case)  # Rebuild the owner from disk and decode the longest prefix.
++    assert len(groups(case)) == len(refs(case).splitlines()) == 1
++    assert case.batch_pushes == pushes and not case.merges and not events(case)
++    pr = groups(case)[-1]
++    base, chain = batch._decode(case.git, pr.head, case.tracker.pr_head_sha(pr.number))
+     assert base == case.base and [n for n, *_ in chain] == list(numbers[:expected])
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == expected
+-
+-
+-@pytest.mark.parametrize("change", ["approval", "blocked", "needs-human", "generation", "approval-generation", "closed", "ci", "head", "prefix-ci", "prefix-reports", "policy"])
++
++
++@pytest.mark.parametrize("change", ["approval", "blocked", "needs-human", "generation", "approval-generation", "closed", "ci", "head", "prefix-ci", "prefix-reports"])
+ def test_ci_green_cannot_bypass_any_fresh_locked_single_path_check(batched, monkeypatch, change):
+     case = batched
+-    queue_workers(case, [5, 1, 4])
+-    base, lock, changed = case.history.tip, StateStore.merge_lock, []
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    support.gate(case)  # Stage the later member before checking the whole train.
++    assert not case.merges
++    lock = StateStore.merge_lock
++    changed = []
+ 
+     @contextmanager
+     def changed_under_lock(store):
+@@ -255,154 +245,36 @@
+                     case.tracker.set_pr_checks(groups(case)[0].number, "fail")
+                 elif change == "prefix-reports":
+                     case.pending_batch = True
+-                elif change == "policy":
+-                    case.tracker.add_labels(1, ["merge-hold"])
+                 else:
+                     support.update_pr_branch(case, 1)
+             yield
+ 
+-    if change == "policy":
+-        allows = merge_owner.run_publish._policy_allows
+-        monkeypatch.setattr(merge_owner.run_publish, "_policy_allows", lambda *a, **kw: False if changed else allows(*a, **kw))
+     monkeypatch.setattr(StateStore, "merge_lock", changed_under_lock)
+     support.gate(case)
+-    assert changed and case.history.tip == base
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert not case.store.owner_merge_facts() and events(case)[-1]["result"] == "unused"
+-
+-
+-@pytest.mark.parametrize("red", ["checks", "regression"])
+-def test_red_tip_retires_whole_train_without_landing(batched, monkeypatch, red):
+-    case = batched
+-    queue_workers(case, [5, 1, 4])
+-    checks, reports = case.tracker.pr_checks, case.tracker.pr_acceptance_reports
+-
+-    def status(pr):
+-        return "fail" if case.tracker.get_pr(pr).head.startswith(batch.PREFIX) else checks(pr)
+-
+-    def regression(head):
+-        values = reports(head)
+-        if case.ci.by_head[head].branch.startswith(batch.PREFIX):
+-            for value in values:
+-                value["report"]["head"]["passing_ids"] = []
+-        return values
+-
+-    monkeypatch.setattr(case.tracker, "pr_checks" if red == "checks" else "pr_acceptance_reports", status if red == "checks" else regression)
+-    base = case.history.tip
+-    support.gate(case)
+-    assert case.history.tip == base and not case.target_pushes and not case.merges and not refs(case)
+-    assert len(groups(case)) == 1 and events(case)[-1]["used_members"] == 0
+-    assert "red" in events(case)[-1]["reason"]
+-
+-
+-@pytest.mark.parametrize("failure", ["lease lost", "branch protection rejected"])
+-def test_rejected_target_push_retires_train_and_members_resume_single_path(batched, failure):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    base = case.history.tip
+-    case.target_failure = failure
+-    support.gate(case)
+-    assert len(case.target_attempts) == 1 and not case.target_pushes
+-    assert case.history.tip == base and not case.merges and not refs(case)
+-    assert failure in events(case)[-1]["reason"] and not batch.retirements(case.ctx)[0]["spent"]
+-    case.target_failure = None
+-    support.drain(case, count=2)
+-    assert len(case.merges) == 2 and not case.target_pushes
+-
+-
+-def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    lock = StateStore.merge_lock
+-
+-    @contextmanager
+-    def moved(store):
+-        with lock(store):
+-            case.history.update({})
+-            yield
+-
+-    monkeypatch.setattr(StateStore, "merge_lock", moved)
+-    support.gate(case)
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert events(case)[-1]["used_members"] == 0
+-    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+-
+-
+-@pytest.mark.parametrize("lag", [False, True], ids=["github-current", "github-lag"])
+-def test_restart_after_atomic_push_records_every_member_from_ancestry(batched, lag):
+-    case = batched
+-    case.github_lag = lag
+-    queue_workers(case, [5, 1, 4])
+-
+-    def crashed():
+-        raise KeyboardInterrupt("Owner stopped after target push, before recording")
+-
+-    case.after_target_push = crashed
+-    with pytest.raises(KeyboardInterrupt):
+-        support.gate(case)
+-    assert len(case.target_pushes) == 1 and not case.store.owner_merge_facts()
+-    case.tracker.remove_labels(1, ["approved"])
+-    case.after_target_push = None
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not case.merges and not refs(case)
+-    if lag:
+-        assert not case.store.owner_merge_facts() and merge_owner.admissions(case.store)
+-        support.gate(case)
+-        assert len(case.target_pushes) == 1 and not case.merges
+-        case.github_lag = False
+-        support.gate(case)
+-    assert len(case.store.owner_merge_facts()) == 3 and not merge_owner.admissions(case.store)
+-    assert events(case)[-1]["used_members"] == 3
+-
+-
+-def test_github_lag_after_successful_push_reconciles_without_duplicate_landing(batched):
+-    case = batched
+-    case.github_lag = True
+-    queue_workers(case, [5, 1])
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not refs(case)
+-    assert not case.store.owner_merge_facts() and merge_owner.admissions(case.store)
+-    case.history.update({"src/neighbor.py": "VALUE = 'later commit'\n"})
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not case.merges
+-    case.github_lag = False
+-    support.gate(case)
+-    facts = case.store.owner_merge_facts()
+-    assert len(facts) == 2 and all(fact["merged_at"] for fact in facts.values())
+-    assert not merge_owner.admissions(case.store)
+-
+-
+-def test_completion_io_failure_replays_all_members_after_atomic_push(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    record, failed = run_group_evidence.record_merge, []
+-
+-    def unavailable_once(*args, **kwargs):
+-        if not failed:
+-            failed.append(True)
+-            raise OSError("completion journal unavailable")
+-        return record(*args, **kwargs)
+-
+-    monkeypatch.setattr(run_group_evidence, "record_merge", unavailable_once)
+-    support.gate(case)
+-    support.gate(case)
+-    assert failed and len(case.target_pushes) == 1 and not case.merges
+-    assert len(case.store.owner_merge_facts()) == 2 and not refs(case)
+-
+-
+-def test_cleanup_accepts_tip_pr_already_marked_merged_by_github(batched):
+-    case = batched
+-    case.merge_tip_metadata = True
+-    queue_workers(case, [5, 1])
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not refs(case)
+-    assert case.tracker.get_pr(groups(case)[0].number).state == "closed"
++    assert changed and not case.merges
++    assert not refs(case) and events(case)[-1]["result"] == "unused"
++
++
++def test_changed_scope_keeps_the_ordinary_refresh_requirement(batched):
++    case = batched
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    # The scope is wider before the tip can be consumed.
++    case.store.clear_approval(1)
++    green(case)
++    support.gate(case)
++    assert not case.tracker.get_pr(support.pr_for(case, 1).number).merged_at
++    assert not refs(case)
+ 
+ 
+ def test_cleanup_restart_keeps_the_retired_tip_and_never_reuses_evidence(batched, monkeypatch, capsys):
+     case = batched
+-    queue_workers(case, [5, 1])
+-    transport, failed = case.git._run, []
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    transport = case.git._run
++    failed = []
+ 
+     def unavailable_once(argv):
+         if argv[0] == "push" and argv[-1].startswith(":refs/heads/" + batch.PREFIX) and not failed:
+@@ -414,227 +286,19 @@
+     support.gate(case)
+     assert failed and refs(case) and not merge_owner.admissions(case.store)
+     retirement, = batch.retirements(case.ctx)
+-    reason = retirement["reason"]
+-    assert len(events(case)) == 1 and events(case)[0]["reason"] == reason
+-    assert f"retired: {reason}" in capsys.readouterr().out
+-    support.gate(case)
+-    assert not refs(case) and len(events(case)) == 1 and len(case.target_pushes) == 1
+-    assert batch.retirements(case.ctx)[0]["reason"] == reason
+-
+-
+-@pytest.mark.parametrize("legacy", [False, True], ids=["new", "legacy"])
+-def test_retirement_reason_is_durable_logged_and_preserved_on_replay(batched, capsys, legacy):
+-    case = batched
+-    marker = f"{batch.SPENT}reason-test"
+-    members = [dict(n=5, head=case.base, started_at=case.store.get_run(5).started_at)]
+-    if legacy:
+-        ledger = json.dumps(dict(candidate=case.base, members=members))
+-        old = git_command(case.root, "-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
+-                          "commit-tree", batch._tree(case.git, case.base), "-p", case.base,
+-                          "-m", f"Legacy retirement\n\nForagent-Batch: {ledger}")
+-        git_command(case.root, "update-ref", marker, old)
+-    reason = batch._record_retirement(case.ctx, "reason-test", case.base, reason="construction conflict",
+-                                      members=members, refs={}, spent=[])
+-    saved = case.git.ref_sha(marker)
+-    retirement, = batch.retirements(case.ctx)
+-    assert retirement["members"] == members and retirement["reason"] == reason
+-    if legacy:
+-        assert reason.startswith("unknown (")
+-        assert git_command(case.root, "show", "-s", "--format=%P", saved) == old
+-    else:
+-        assert reason == "construction conflict"
+-    assert f"retired: {reason}" in capsys.readouterr().out
+-    assert batch._record_retirement(case.ctx, "reason-test", case.base,
+-                                    reason="candidate already retired", members=[], refs={}, spent=[]) == reason
+-    assert case.git.ref_sha(marker) == saved
+-    assert batch.retirements(case.ctx) == [retirement]
+-    output = capsys.readouterr().out
+-    assert f"retired: {reason}" in output and "candidate already retired" not in output
+-
+-def test_disabling_batching_retires_published_prefixes_idempotently(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
+-    case.config = replace(case.config, merge_batch=False)
+-    case.ctx.config = case.config
+-    monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch prepared evidence"))
+-    support.drain(case, count=2)
+-    support.gate(case)
+-    assert not refs(case) and len(events(case)) == 1
+-    assert len(case.merges) == 2 and not case.target_pushes and events(case)[0]["used_members"] == 0
+-
+-
+-@pytest.mark.parametrize("reason", ["moved", "deadline", "missing-pr", "damaged"])
+-def test_external_retirement_does_not_spend_member_generations(batched, monkeypatch, reason):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
+-    tip = case.tracker.get_pr(groups(case)[0].number)
+-    if reason == "moved":
+-        case.history.update({"src/neighbor.py": "VALUE = 37\n"})
+-    elif reason == "deadline":
+-        case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
+-    elif reason == "missing-pr":
+-        case.tracker.close_pr(support.pr_for(case, 5).number, delete_branch=False)
+-    else:
+-        git_command(case.history.origin, "update-ref", f"refs/heads/{tip.head}", case.base)
+-        case.tracker.set_pr_head_sha(tip.number, case.base)
+-    support.gate(case)
+-    retired = batch.retirements(case.ctx)
+-    assert retired and all(not row.get("spent", []) for row in retired)
+-    assert not case.target_pushes
+-
+-
+-def test_single_path_final_failure_spends_only_the_failing_member(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1, 4])
+-    lock = StateStore.merge_lock
+-
+-    @contextmanager
+-    def fail_at_final_check(store):
+-        with lock(store):
+-            case.tracker.set_pr_checks(support.pr_for(case, 1).number, "fail")
+-            yield
+-
+-    monkeypatch.setattr(StateStore, "merge_lock", fail_at_final_check)
+-    support.gate(case)
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert [m["n"] for row in batch.retirements(case.ctx) for m in row["spent"]] == [1]
+-    assert not case.store.owner_merge_facts()
+-
+-
+-def test_reservation_also_guards_direct_single_path_advancement(batched, monkeypatch):
+-    case = batched
+-    case.config = replace(case.config, merge_batch_size=2)
+-    case.ctx.config = case.config
+-    queue_workers(case, [5, 1, 4])
+-    published_train(case, monkeypatch)
+-    outsider = support.pr_for(case, 4)
+-    key, row = next((k, r) for k, r in merge_owner.admissions(case.store).items() if k[0] == 4)
+-    place = merge_owner.queue.Seat(*key, row["target"])
+-    job = merge_owner._load(case.ctx, place, row)
+-    assert not merge_owner.may_write_target(case.ctx, "main")
+-    assert merge_owner.may_write_target(case.ctx, "release")
+-    assert not merge_owner.advance_members(case.ctx, [(place, job, outsider)])
+-    assert not case.target_pushes and not case.merges
+-
+-
+-@pytest.mark.parametrize("failure", ["deadline", "missing", "rejected", "outage"])
+-def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batched, monkeypatch, failure):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
+-    if failure == "deadline":
+-        case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
+-    else:
+-        reports = case.tracker.pr_acceptance_reports
+-
+-        def broken(head):
+-            if case.ci.by_head[head].branch.startswith(batch.PREFIX):
+-                if failure == "missing":
+-                    return []
+-                raise RejectedEvidence("invalid CI") if failure == "rejected" else TrackerError("CI unavailable")
+-            return reports(head)
+-
+-        monkeypatch.setattr(case.tracker, "pr_acceptance_reports", broken)
+-    support.drain(case, count=2)
+-    assert not refs(case) and len(groups(case)) == 1 and not case.target_pushes
+-    assert events(case)[-1]["result"] == "unused"
+-    assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1])
+-
+-
+-@pytest.mark.parametrize("interruption", ["crash", "throttle"])
+-def test_restart_recreates_missing_prefix_prs_from_refs_without_republishing(batched, monkeypatch, interruption):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    create, failed = case.tracker.create_pr, []
+-
+-    def interrupted(**kwargs):
+-        if kwargs["head"].startswith(batch.PREFIX) and not failed:
+-            failed.append(True)
+-            if interruption == "crash":
+-                raise KeyboardInterrupt("Owner stopped after push, before PR creation")
+-            raise TrackerError("HTTP 429 API rate limit exceeded")
+-        return create(**kwargs)
+-
+-    monkeypatch.setattr(case.tracker, "create_pr", interrupted)
+-    if interruption == "crash":
+-        with pytest.raises(KeyboardInterrupt):
+-            support.gate(case)
+-    else:
+-        support.gate(case)
+-        assert case.store.github_wait_until(case.clock[0]) is not None
+-    pushes = list(case.batch_pushes)
+-    assert refs(case) and not groups(case)
+-    case.clock[0] += timedelta(minutes=2)
+-    support.gate(case)
+-    assert len(groups(case)) == 1 and case.batch_pushes == pushes
+-    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2 and not refs(case)
+-
+-
+-def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
+-    case = batched
+-    model = case.ctx.executor_factory("claude")
+-    implement = model.run
+-
+-    def incompatible(**kwargs):
+-        result = implement(**kwargs)
+-        if case.worker.number in {5, 4}:
+-            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
+-        return result
+-
+-    monkeypatch.setattr(model, "run", incompatible)
+-    queue_workers(case, [5, 1, 4, 2])
+-    support.gate(case)
+-    assert not groups(case) and not refs(case)
+-    assert events(case)[-1]["result"] == "unused"
+-    assert [m["n"] for m in events(case)[-1]["members"]] == [5, 1, 4, 2]
+-    support.drain(case)
+-    assert not groups(case)  # Even the healthy suffix never forms a retry batch.
+-
+-def test_incomplete_train_retirements_have_distinct_member_identities(batched, monkeypatch):
+-    case = batched
+-    case.config = replace(case.config, merge_batch_size=2)
+-    case.ctx.config = case.config
+-    model = case.ctx.executor_factory("claude")
+-    implement = model.run
+-
+-    def incompatible(**kwargs):
+-        result = implement(**kwargs)
+-        (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
+-        return result
+-
+-    monkeypatch.setattr(model, "run", incompatible)
+-    queue_workers(case, [5, 1, 4, 2])
+-    for n in [5, 1, 4, 2]:
+-        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
+-    for _ in range(3):
+-        support.gate(case)
+-    retired = batch.retirements(case.ctx)
+-    assert len(retired) == 2
+-    assert {tuple(m["n"] for m in row["members"]) for row in retired} == {(5, 1), (4, 2)}
+-    assert all(row["candidate"] == case.base and not row["spent"] for row in retired)
+-    assert not groups(case) and len(events(case)) == 2
+-
+-def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
+-    case = proto
+-    monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch was consulted"))
+-    queue_workers(case, [5, 1])
+-    support.drain(case, count=2)
+-    assert len(case.merges) == 2
+-    assert not groups(case) and not events(case)
+-
+-@pytest.mark.parametrize("settings", ["merge_batch: yes\n", "merge_owner: true\nchecks: local\nmerge_batch: true\n", "merge_batch: 1\n"])
+-def test_merge_batch_requires_owner_ci_and_a_boolean(tmp_path, settings):
+-    (tmp_path / ".foragent.yml").write_text(settings)
+-    with pytest.raises(ConfigError, match="merge_batch"):
+-        load_config(tmp_path)
++    assert retirement["reason"] == events(case)[0]["reason"] == "train merged"
++    assert "retired: train merged" in capsys.readouterr().out
++    case.pending_batch = True
++    support.gate(case)
++    assert not refs(case) and len(events(case)) == 1 and len(case.merges) == 2
++    assert batch.retirements(case.ctx)[0] == retirement
+ 
+ 
+ def test_retirement_cancels_owned_prefix_ci_before_deleting_refs_and_retries(batched, monkeypatch):
+     case = batched
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
+     runs, owned = [], []
+     for pr in groups(case):
+         head = case.tracker.pr_head_sha(pr.number)
+@@ -686,11 +350,60 @@
+     assert len(events(case)) == 1
+ 
+ 
+-def test_retargeted_prefix_is_retained_by_the_owner_close_guard(batched, monkeypatch):
+-    case = batched
+-    shared_locks(case)
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
++def test_disabling_batching_retires_published_prefixes_idempotently(batched, monkeypatch):
++    case = batched
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    pushes = list(case.batch_pushes)
++    case.config = replace(case.config, merge_batch=False)
++    case.ctx.config = case.config
++    monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch prepared evidence"))
++    transport = case.git._run
++    failed = []
++
++    def interrupted_delete(argv):
++        if argv[0] == "push" and argv[-1].startswith(":refs/heads/" + batch.PREFIX) and not failed:
++            failed.append(True)
++            raise GitError("cleanup unavailable")
++        return transport(argv)
++
++    monkeypatch.setattr(case.git, "_run", interrupted_delete)
++    support.gate(case)
++    assert failed and refs(case) and len(events(case)) == 1
++    green(case)
++    support.drain(case, count=2)
++    support.gate(case)
++    assert not refs(case) and len(events(case)) == 1 and case.batch_pushes == pushes
++    assert all(case.tracker.get_pr(pr.number).state == "closed" for pr in groups(case))
++    assert len(case.merges) == 2 and events(case)[0]["used_members"] == 0
++
++
++def test_invalid_tip_does_not_prevent_retirement_of_intact_prefixes(batched):
++    case = batched
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    intact, changed = groups(case)
++    git_command(case.history.origin, "update-ref", f"refs/heads/{changed.head}", case.base)
++    case.tracker.set_pr_head_sha(changed.number, case.base)
++    support.gate(case)
++    assert case.tracker.get_pr(intact.number).state == "closed"
++    assert refs(case).splitlines() == [f"refs/heads/{changed.head}"]
++    green(case)
++    support.drain(case, count=2)
++    support.gate(case)
++    assert len(case.merges) == 2 and len(groups(case)) == 2 and len(events(case)) == 1
++    assert refs(case).splitlines() == [f"refs/heads/{changed.head}"]
++    assert case.tracker.get_pr(changed.number).state == "open"
++
++
++def test_retargeted_prefix_is_retained_by_the_owner_close_guard(batched):
++    case = batched
++    shared_locks(case)
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
+     pr = case.tracker.get_pr(groups(case)[0].number)
+     git_command(case.history.origin, "update-ref", "refs/heads/release", case.base)
+     case.tracker.update_pr(pr.number, base="release", title=pr.title, body=pr.body)
+@@ -703,9 +416,90 @@
+     support.gate(case)
+     assert case.tracker.get_pr(pr.number).state == "open"
+     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
+-    support.drain(case, count=2)
+-    assert len(case.store.owner_merge_facts()) == 2 and not case.target_pushes
+-    assert case.git.remote_branch_sha(pr.head) == pr.head_sha
++
++
++@pytest.mark.parametrize("interference", ["empty", "different-tree"])
++def test_target_changes_still_require_refresh_and_only_identical_trees_reuse_ci(batched, monkeypatch, interference):
++    case = batched
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    merge = case.tracker.merge_pr
++
++    def altered(*args, **kwargs):
++        merge(*args, **kwargs)
++        if len(case.merges) == 1:
++            case.history.update({} if interference == "empty" else {"src/member_5.py": "VALUE = 99\n"})
++
++    monkeypatch.setattr(case.tracker, "merge_pr", altered)
++    support.gate(case)
++    support.gate(case)
++    assert len(case.merges) == (2 if interference == "empty" else 1)
++    if interference == "different-tree":
++        assert any(pr.head.startswith(batch.CHECKPOINT) for pr in groups(case))
++
++
++def test_conflict_discards_entire_candidate_without_splitting_or_retry(batched, monkeypatch):
++    case = batched
++    model = case.ctx.executor_factory("claude")
++    implement = model.run
++
++    def incompatible(**kwargs):
++        result = implement(**kwargs)
++        if case.worker.number in {5, 4}:
++            (kwargs["worktree"] / "src/shared.py").write_text(f"VALUE = {case.worker.number}\n")
++        return result
++
++    monkeypatch.setattr(model, "run", incompatible)
++    queue_workers(case, [5, 1, 4, 2])
++    support.gate(case)
++    assert not groups(case) and not refs(case)
++    assert events(case)[-1]["result"] == "unused"
++    assert [m["n"] for m in events(case)[-1]["members"]] == [5, 1, 4, 2]
++    support.drain(case)
++    assert not groups(case)  # Even the healthy suffix never forms a retry batch.
++
++
++@pytest.mark.parametrize("failure", ["deadline", "missing", "rejected", "outage"])
++def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batched, monkeypatch, failure):
++    case = batched
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    if failure == "deadline":
++        case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
++        green(case)  # Ordinary member CI can complete while the prefix expires.
++    else:
++        green(case)
++        reports = case.tracker.pr_acceptance_reports
++
++        def broken(head):
++            if case.ci.by_head[head].branch.startswith(batch.PREFIX):
++                if failure == "missing":
++                    return []
++                raise RejectedEvidence("invalid CI") if failure == "rejected" else TrackerError("CI unavailable")
++            return reports(head)
++
++        monkeypatch.setattr(case.tracker, "pr_acceptance_reports", broken)
++    support.drain(case, count=2)
++    assert not refs(case) and len(groups(case)) == 2
++    assert events(case)[-1]["result"] == "unused"
++    assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1])
++
++
++def test_merge_batch_false_uses_the_unchanged_single_path(proto, monkeypatch):
++    case = proto
++    monkeypatch.setattr(batch, "prepare", lambda *args: pytest.fail("Disabled batch was consulted"))
++    queue_workers(case, [5, 1])
++    support.drain(case, count=2)
++    assert len(case.merges) == 2
++    assert not groups(case) and not events(case)
++
++
++@pytest.mark.parametrize("settings", ["merge_batch: yes\n", "merge_owner: true\nchecks: local\nmerge_batch: true\n", "merge_batch: 1\n"])
++def test_merge_batch_requires_owner_ci_and_a_boolean(tmp_path, settings):
++    (tmp_path / ".foragent.yml").write_text(settings)
++    with pytest.raises(ConfigError, match="merge_batch"):
++        load_config(tmp_path)
+ 
+ 
+ def update_base(case, files):
+@@ -715,31 +509,39 @@
+     case.base = case.history.tip
+ 
+ 
++def test_reused_prefix_runs_machine_only_checks_on_the_merged_tree(batched):
++    case = batched
++    shared_locks(case)
++    path = "tests/test_machine_pair.py"
++    update_base(case, {path: "import pytest\nfrom pathlib import Path\n"
++        "@pytest.mark.local_only\ndef test_machine_pair():\n"
++        "    assert not (Path('src/member_5.py').exists() and Path('src/member_1.py').exists())\n"})
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    assert not case.merges and not refs(case)
++    assert path in case.store.log_path(1).read_text()
++    assert [m["n"] for row in batch.retirements(case.ctx) for m in row["spent"]] == [1]
++
++
+ def test_prefix_scope_is_rechecked_at_the_locked_consumption_boundary(batched, monkeypatch):
+     case = batched
+-    path = "tests/acceptance/test_interaction.py"
+-    update_base(case, {path: "from pathlib import Path\ndef test_interaction():\n"
+-        "    assert not (Path('src/member_5.py').exists() and Path('src/member_1.py').exists())\n"})
+-    queue_workers(case, [5, 1])
+-    body = case.store.load_approval(5).body.replace("tests/acceptance/test_own_5.py", path)
+-    case.tracker.add_issue(80, "Temporary owner", body, labels=["approved"])
+-    case.tracker.record_label(80, "approved", "human")
+-    case.store.save_approval(80, body=body, body_sha=body_hash(body),
+-                             acceptance_blobs={path: case.git.blob_sha(case.base, path)},
+-                             approved_by="human", approved_at=case.clock[0].isoformat())
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    support.gate(case)
+     lock = StateStore.merge_lock
+ 
+     @contextmanager
+     def required_again(store):
+         with lock(store):
+-            store.clear_approval(80)
+-            case.tracker.remove_labels(80, ["approved"])
++            store.clear_approval(79)
++            case.tracker.remove_labels(79, ["approved"])
+             yield
+ 
+     monkeypatch.setattr(StateStore, "merge_lock", required_again)
+     support.gate(case)
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert events(case)[-1]["used_members"] == 0
++    assert not case.merges and not refs(case)
++    assert any(row["kind"] == "ci-evidence" and row["data"].get("reason") == "scope-changed"
++               for row in case.store.flow_records())
+ 
+ 
+ def test_retired_attempt_is_not_rebuilt_after_flow_log_rotation(batched):
+@@ -747,18 +549,25 @@
+     case.pending_batch = True
+     queue_workers(case, [5, 1])
+     support.gate(case)
++    green(case)
++    case.tracker.set_pr_checks(groups(case)[0].number, "fail")
++    for n in [5, 1]:
++        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
++    support.gate(case)
+     assert not refs(case) and events(case)[-1]["result"] == "unused"
+-    assert all(not row["spent"] for row in batch.retirements(case.ctx))
+     for i in range(2048):
+         case.store.record_flow("observation", index=i)
+     assert not events(case)
+-    green(case)
+-    support.gate(case)
+-    assert len(groups(case)) == 1 and not case.target_pushes
++    for n in [5, 1]:
++        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pass")
++    support.gate(case)
++    assert len(groups(case)) == 1
+ 
+ 
+ def test_prefix_creation_identity_survives_temporary_listing_lag(batched, monkeypatch):
+     case = batched
++    shared_locks(case)
++    case.pending_batch = True
+     queue_workers(case, [5, 1])
+     find, get = case.tracker.find_pr, case.tracker.get_pr
+     reads = []
+@@ -770,18 +579,27 @@
+     monkeypatch.setattr(case.tracker, "get_pr", direct_read)
+     monkeypatch.setattr(case.tracker, "find_pr", lambda branch: None if branch.startswith(batch.PREFIX) else find(branch))
+     support.gate(case)
+-    assert len(groups(case)) == 1 and groups(case)[0].number in reads
+-    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 2
+-    assert not refs(case)
+-    support.gate(case)
+-    assert len(groups(case)) == 1 and len(case.target_pushes) == 1
++    assert len(groups(case)) == 2 and refs(case) and not events(case)
++    assert groups(case)[0].number in reads
++    assert not case.merges
++    support.gate(case)  # A restarted owner has only the temporarily empty listing.
++    assert refs(case) and not events(case) and not case.merges
++    monkeypatch.setattr(case.tracker, "find_pr", find)
++    green(case)
++    support.drain(case, count=2)
++    assert len(case.merges) == 2 and len(groups(case)) == 2
+ 
+ 
+ @pytest.mark.parametrize("boundary", ["prepare", "consume", "cleanup"])
+ def test_batch_github_wait_reaches_owner_pause_without_retirement(batched, monkeypatch, boundary):
+     case = batched
+-    queue_workers(case, [5, 1])
+-    published_train(case, monkeypatch)
++    shared_locks(case)
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    support.gate(case)
++    green(case)
++    if boundary == "consume":
++        support.gate(case)  # Stage every member before arming the locked read.
+     checks, reports = case.tracker.pr_checks, case.tracker.pr_acceptance_reports
+     armed, failed = [boundary != "consume"], []
+ 
+@@ -809,150 +627,16 @@
+         monkeypatch.setattr(StateStore, "merge_lock", arm_at_consume)
+     support.gate(case)
+     assert failed and case.store.github_wait_until(case.clock[0]) is not None
+-    assert refs(case) and not events(case) and not case.target_pushes and not case.merges
++    assert refs(case) and not events(case) and not case.merges
+     case.clock[0] += timedelta(minutes=2)
+     case.tracker.set_pr_checks(groups(case)[0].number, "pass")
+     support.drain(case, count=2)
+-    assert len(case.store.owner_merge_facts()) == 2 and not refs(case)
+-
+-
+-def test_existing_four_member_batch_survives_size_reduction(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1, 4, 2])
+-    published_train(case, monkeypatch)
+-    case.config = replace(case.config, merge_batch_size=2)
+-    case.ctx.config = case.config
+-    support.gate(case)
+-    assert len(groups(case)) == len(case.target_pushes) == 1
+-    assert len(case.store.owner_merge_facts()) == 4 and not refs(case)
+-
+-
+-def test_last_reconciliation_throttle_stops_batch_preparation(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1, 4])
+-    get, failed = case.tracker.get_pr, []
+-    last = support.pr_for(case, 4).number
+-
+-    def throttled(pr):
+-        if pr == last and not failed:
+-            failed.append(True)
+-            raise TrackerError("HTTP 429 API rate limit exceeded")
+-        return get(pr)
+-
+-    monkeypatch.setattr(case.tracker, "get_pr", throttled)
+-    support.gate(case)
+-    assert failed and case.store.github_wait_until(case.clock[0]) is not None
+-    assert not case.batch_pushes and not groups(case) and not case.merges
+-    case.clock[0] += timedelta(minutes=2)
+-    support.drain(case, count=3)
+-    assert len(case.store.owner_merge_facts()) == 3
+-
+-
+-def test_pending_prefix_does_not_hold_a_member_with_usable_own_ci(batched):
+-    case = batched
+-    case.pending_batch = True
+-    support.queue_workers(case, [5, 1])
+-    support.gate(case)
+-    assert len(case.merges) == 1 and not refs(case) and events(case)
+-    assert not case.target_pushes
+-    green(case)
+-    support.drain(case, count=2)
+-    assert len(case.merges) == 2 and not case.target_pushes
+-
+-
+-def test_new_run_after_landed_train_does_not_erase_the_old_generations_merge_fact(batched):
+-    case = batched
+-    case.github_lag = True
+-    queue_workers(case, [5, 1])
+-    original = {n: case.store.get_run(n).started_at for n in [5, 1]}
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and not case.store.owner_merge_facts()
+-    case.clock[0] += timedelta(seconds=1)
+-    replacement = case.store.start_run(1, branch="new-followup", worktree=case.store.root / "followup")
+-    case.tracker.add_labels(1, ["running"])
+-    support.gate(case)
+-    assert merge_owner.pending(case.store, 5)
+-    assert (1, original[1]) in merge_owner.admissions(case.store)
+-    assert not case.merges and len(case.target_pushes) == 1
+-    case.github_lag = False
+-    support.gate(case)
+-    facts = case.store.owner_merge_facts()
+-    assert set(facts) == {(n, started) for n, started in original.items()}
+-    assert all(fact["merged_at"] for fact in facts.values())
+-    assert case.store.get_run(1).started_at == replacement.started_at
+-    assert case.store.get_run(1).status == "running"
+-    assert not merge_owner.admissions(case.store)
+-
+-
+-def test_member_final_read_throttle_keeps_train_unspent_and_stops_landing(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1, 4])
+-    lock, get = StateStore.merge_lock, case.tracker.get_pr
+-    armed, failed = [], []
+-    second = support.pr_for(case, 1).number
+-
+-    @contextmanager
+-    def armed_under_lock(store):
+-        with lock(store):
+-            armed.append(True)
+-            yield
+-
+-    def throttled(pr):
+-        if armed and pr == second and not failed:
+-            failed.append(True)
+-            raise TrackerError("HTTP 429 API rate limit exceeded")
+-        return get(pr)
+-
+-    monkeypatch.setattr(StateStore, "merge_lock", armed_under_lock)
+-    monkeypatch.setattr(case.tracker, "get_pr", throttled)
+-    support.gate(case)
+-    assert failed and case.store.github_wait_until(case.clock[0]) is not None
+-    assert not case.target_pushes and not case.merges and not case.store.owner_merge_facts()
+-    assert refs(case) and not batch.retirements(case.ctx) and not events(case)
+-    assert all(case.tracker.get_issue(n).state == "open" for n in [5, 1, 4])
+-    case.clock[0] += timedelta(minutes=2)
+-    support.gate(case)
+-    assert len(case.target_pushes) == 1 and len(case.store.owner_merge_facts()) == 3
+-
+-
+-def test_worktree_fetch_outage_retires_attempt_without_spending_members(batched, monkeypatch):
+-    case = batched
+-    queue_workers(case, [5, 1])
+-    head = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
+-    transport, failed = case.git._run, []
+-
+-    def unavailable(argv):
+-        if list(argv) == ["fetch", "origin", head] and not failed:
+-            failed.append(True)
+-            raise GitError("member fetch unavailable")
+-        return transport(argv)
+-
+-    monkeypatch.setattr(case.git, "_run", unavailable)
+-    support.gate(case)
+-    assert failed and not case.target_pushes and not case.merges and not refs(case)
+-    assert batch.retirements(case.ctx) and all(not row["spent"] for row in batch.retirements(case.ctx))
+-    assert "fetch unavailable" in events(case)[-1]["reason"]
+-    support.drain(case, count=2)
+-    assert len(case.store.owner_merge_facts()) == 2
+-
+-
+-def test_stale_unlanded_admission_preserves_the_new_running_generation(batched):
+-    case = batched
+-    queue_workers(case, [1])
+-    original = case.store.get_run(1).started_at
+-    case.clock[0] += timedelta(seconds=1)
+-    replacement = case.store.start_run(1, branch="new-followup", worktree=case.store.root / "followup")
+-    case.tracker.add_labels(1, ["running"])
+-    support.gate(case)
+-    assert not case.merges and not case.target_pushes
+-    assert (1, original) not in merge_owner.admissions(case.store)
+-    assert case.store.get_run(1).started_at == replacement.started_at
+-    assert case.store.get_run(1).status == "running"
+-    assert "running" in case.tracker.get_issue(1).labels
++    assert len(case.merges) == 2
+ 
+ 
+ def test_union_refresh_checks_and_publishes_its_own_tree_before_ci_reuse(batched, monkeypatch):
+     case = batched
++    shared_locks(case)
+     update_base(case, {".gitattributes": "shared.txt merge=union\n", "shared.txt": "anchor\n",
+         "tests/test_union_machine.py": "import pytest\nfrom pathlib import Path\n"
+         "@pytest.mark.local_only\ndef test_union_machine():\n"
+@@ -968,14 +652,25 @@
+     monkeypatch.setattr(model, "run", append_member)
+     queue_workers(case, [5, 1])
+     support.gate(case)
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert not case.store.owner_merge_facts()
+-    assert events(case)[-1]["used_members"] == 0
+-    assert all(not row["spent"] for row in batch.retirements(case.ctx))
++    original = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
++    support.gate(case)  # Normal refresh verifies and publishes anchor,b,a.
++    refreshed = case.tracker.pr_head_sha(support.pr_for(case, 1).number)
++    assert refreshed != original
++    assert git_command(case.root, "show", f"{refreshed}:shared.txt") == "anchor\nb\na"
++    prefix = case.tracker.pr_head_sha(groups(case)[-1].number)
++    assert git_command(case.root, "show", f"{prefix}:shared.txt") == "anchor\na\nb"
++    case.tracker.set_pr_checks(support.pr_for(case, 1).number, "pending")
++    support.gate(case)
++    assert len(case.merges) == 1 and not refs(case)  # Different trees must wait for their own CI.
++    case.tracker.set_pr_checks(support.pr_for(case, 1).number, "pass")
++    support.drain(case, count=2)
++    assert len(case.merges) == 2
++    assert git_command(case.history.origin, "show", "main:shared.txt") == "anchor\nb\na"
+ 
+ 
+ def test_combined_conflict_markers_are_rejected_by_the_normal_refresh_publication_gate(batched, monkeypatch):
+     case = batched
++    shared_locks(case)
+     update_base(case, {"shared.txt": "anchor\nmiddle\nend\n"})
+     model = case.ctx.executor_factory("claude")
+     implement = model.run
+@@ -989,8 +684,399 @@
+ 
+     monkeypatch.setattr(model, "run", markers)
+     queue_workers(case, [5, 1])
+-    support.gate(case)
+-    assert not case.target_pushes and not case.merges and not refs(case)
+-    assert not case.store.owner_merge_facts()
+-    assert events(case)[-1]["used_members"] == 0
+-    assert all(not row["spent"] for row in batch.retirements(case.ctx))
++    support.drain(case, count=2)
++    assert len(case.merges) == 1
++    assert not case.tracker.get_pr(support.pr_for(case, 1).number).merged_at
++    assert "shared.txt" in "\n".join(c.body for c in case.tracker.list_comments(1))
++    assert not refs(case)
++
++
++@pytest.mark.parametrize("interruption", ["crash", "throttle"])
++def test_restart_recreates_missing_prefix_prs_from_refs_without_republishing(batched, monkeypatch, interruption):
++    case = batched
++    shared_locks(case)
++    case.pending_batch = True
++    queue_workers(case, [5, 1])
++    create = case.tracker.create_pr
++    failed = []
++
++    def interrupted(**kwargs):
++        if kwargs["head"].startswith(batch.PREFIX) and not failed:
++            failed.append(True)
++            if interruption == "crash":
++                raise KeyboardInterrupt("Owner stopped after push, before PR creation")
++            raise TrackerError("HTTP 429 API rate limit exceeded")
++        return create(**kwargs)
++
++    monkeypatch.setattr(case.tracker, "create_pr", interrupted)
++    if interruption == "crash":
++        with pytest.raises(KeyboardInterrupt):
++            support.gate(case)
++    else:
++        support.gate(case)
++        assert case.store.github_wait_until(case.clock[0]) is not None
++    pushes = list(case.batch_pushes)
++    assert refs(case) and not groups(case)
++    case.clock[0] += timedelta(minutes=2)
++    support.gate(case)
++    assert len(groups(case)) == 2 and case.batch_pushes == pushes
++    assert not case.merges and not events(case)
++    green(case)
++    support.drain(case, count=2)
++    assert len(case.merges) == 2 and len(groups(case)) == 2 and not refs(case)
++
++
++def test_existing_four_member_batch_survives_size_reduction(batched):
++    case = batched
++    shared_locks(case)
++    case.pending_batch = True
++    queue_workers(case, [5, 1, 4, 2])
++    support.gate(case)
++    case.config = replace(case.config, merge_batch_size=2)
++    case.ctx.config = case.config
++    support.gate(case)
++    assert len(groups(case)) == 1 and len(refs(case).splitlines()) == 1 and not events(case)
++    green(case)
++    support.drain(case)
++    assert len(case.merges) == 4 and not refs(case)
++
++
++def test_last_reconciliation_throttle_stops_batch_preparation(batched, monkeypatch):
++    case = batched
++    queue_workers(case, [5, 1, 4])
++    get = case.tracker.get_pr
++    last = support.pr_for(case, 4).number
++    failed = []
++
++    def throttled(pr):
++        if pr == last and not failed:
++            failed.append(True)
++            raise TrackerError("HTTP 429 API rate limit exceeded")
++        return get(pr)
++
++    monkeypatch.setattr(case.tracker, "get_pr", throttled)
++    support.gate(case)
++    assert failed and case.store.github_wait_until(case.clock[0]) is not None
++    assert not case.batch_pushes and not groups(case) and not case.merges
++    case.clock[0] += timedelta(minutes=2)
++    support.drain(case, count=3)
++    assert len(case.merges) == 3
++
++
++def test_retirement_uses_the_generation_recorded_before_two_refreshes(batched):
++    case = batched
++    shared_locks(case)
++    case.config = replace(case.config, merge_batch=False)
++    case.ctx.config = case.config
++    queue_workers(case, [5, 1])
++    generations = {n: case.store.get_run(n).started_at for n in [5, 1]}
++    case.history.update({"src/neighbor.py": "VALUE = 1\n"})
++    support.gate(case)
++    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pending")
++    support.gate(case)  # Both admissions have now been refreshed once.
++    for n in [5, 1]:
++        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pass")
++    case.config = replace(case.config, merge_batch=True)
++    case.ctx.config = case.config
++    case.pending_batch = True
++    support.gate(case)
++    assert len(groups(case)) == 2
++    case.history.update({"src/neighbor.py": "VALUE = 2\n"})
++    support.gate(case)  # Refresh again before retiring the now obsolete batch.
++    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pending")
++    support.gate(case)
++    assert not refs(case)
++    case.tracker.set_pr_checks(support.pr_for(case, 5).number, "pass")
++    assert {m["n"]: m["started_at"] for m in events(case)[-1]["members"]} == generations
++    green(case)
++    queue_workers(case, [4])
++    support.drain(case, count=3)
++    assert len(groups(case)) == 2  # Retired generations cannot form a second batch.
++
++
++def test_pending_prefix_does_not_hold_a_member_with_usable_own_ci(batched):
++    case = batched
++    shared_locks(case)
++    case.pending_batch = True
++    support.queue_workers(case, [5, 1])
++    support.gate(case)
++    assert len(case.merges) == 1 and not refs(case)
++    assert "pending" in events(case)[-1]["reason"]
++    green(case)
++    support.drain(case, count=2)
++    assert len(case.merges) == 2
++
++
++@pytest.mark.parametrize("installation", ["success", "install-error", "completion-error"])
++def test_squash_after_owner_refresh_keeps_train_and_reuses_prefix_two(batched, monkeypatch, installation):
++    case = batched
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    original = {n: case.tracker.pr_head_sha(support.pr_for(case, n).number) for n in [5, 1]}
++    case.history.update({"src/neighbor.py": "VALUE = 17\n"})
++    target = case.history.tip
++    if installation == "install-error":
++        monkeypatch.setattr(merge_owner.runner, "after_merge", lambda *args: (_ for _ in ()).throw(OSError("install unavailable")))
++    elif installation == "completion-error":
++        record = run_group_evidence.record_merge
++        failed = []
++
++        def unavailable_once(*args, **kwargs):
++            if not failed:
++                failed.append(True)
++                raise OSError("completion journal unavailable")
++            return record(*args, **kwargs)
++
++        monkeypatch.setattr(run_group_evidence, "record_merge", unavailable_once)
++    support.gate(case)
++    tip = groups(case)[0]
++    base, chain = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
++    assert base == target
++    support.drain(case, count=2)
++    assert len(case.merges) == 2 and not refs(case)
++    for index, merge in enumerate(case.merges):
++        parent = target if index == 0 else case.merges[index - 1]["main"]
++        assert git_command(case.history.origin, "show", "-s", "--format=%P", merge["main"]) == parent
++        assert batch._tree(case.git, merge["main"]) == batch._tree(case.git, chain[index][2])
++        assert merge["head"] != original[[5, 1][index]]
++    assert events(case)[-1]["used_members"] == 2
++
++
++def interrupted_pair(case, monkeypatch, *, size=3, regression=True, crash=False):
++    shared_locks(case)
++    case.config = replace(case.config, merge_batch_size=size)
++    case.ctx.config = case.config
++    case.pending_checkpoint = True
++    if regression:
++        update_base(case, {"tests/acceptance/test_intermediate.py":
++            "from pathlib import Path\ndef test_intermediate():\n"
++            "    assert not (Path('src/member_5.py').exists() and "
++            "Path('src/member_1.py').exists() and not Path('src/member_4.py').exists())\n"})
++    queue_workers(case, [5, 1, 4, 2])
++    merge = case.tracker.merge_pr
++
++    def interrupted(pr, **kwargs):
++        if pr == support.pr_for(case, 4).number:
++            if crash:
++                raise KeyboardInterrupt("Owner crashed during landing")
++            raise TrackerError("Merge API unavailable")
++        return merge(pr, **kwargs)
++
++    monkeypatch.setattr(case.tracker, "merge_pr", interrupted)
++    for _ in range(size + 1):
++        if crash:
++            try:
++                support.gate(case)
++            except KeyboardInterrupt:
++                break
++        else:
++            support.gate(case)
++        if len(case.merges) == 2:
++            break
++    assert [m["pr"] for m in case.merges] == [support.pr_for(case, n).number for n in [5, 1]]
++    assert not merge_owner.may_write_target(case.ctx, "main")
++
++
++@pytest.mark.parametrize("stop", ["api", "crash", "disabled"])
++def test_stopped_chain_measures_intermediate_target_before_any_other_merge(batched, monkeypatch, stop):
++    case = batched
++    interrupted_pair(case, monkeypatch, regression=False, crash=stop == "crash")
++    if stop == "disabled":
++        case.config = replace(case.config, merge_batch=False, checks="local", ci_shards=1,
++                              test_command="python -m pytest --strict-markers")
++        case.ctx.config = case.config
++    support.gate(case)
++    checkpoint = next(pr for pr in groups(case) if pr.head.startswith(batch.CHECKPOINT))
++    target = case.history.tip
++    assert batch._tree(case.git, case.tracker.pr_head_sha(checkpoint.number)) == batch._tree(case.git, target)
++    for _ in range(2):
++        support.gate(case)
++        assert len(case.merges) == 2 and not merge_owner.may_write_target(case.ctx, "main")
++    case.pending_checkpoint = False
++    case.tracker.set_pr_checks(checkpoint.number, "pass")
++    support.gate(case)
++    assert events(case) and not refs(case)
++    assert merge_owner.may_write_target(case.ctx, "main")
++
++
++@pytest.mark.parametrize("retained", [True, False], ids=["pinned", "red-artifact"])
++def test_checkpoint_keeps_original_passing_suite_when_tip_turns_red(batched, monkeypatch, retained):
++    case = batched
++    interrupted_pair(case, monkeypatch)
++    tip = case.tracker.get_pr(groups(case)[0].number)
++    if not retained:
++        identity = batch._identity(*batch._decode(case.git, tip.head, tip.head_sha))
++        git_command(case.root, "update-ref", "-d", f"{batch.BASELINE}{identity}")
++        reports = case.tracker.pr_acceptance_reports
++
++        def red_artifact(head):
++            values = reports(head)
++            if head == tip.head_sha:
++                for value in values:
++                    value["report"]["head"]["passing_ids"] = []
++            return values
++
++        monkeypatch.setattr(case.tracker, "pr_acceptance_reports", red_artifact)
++    green(case)
++    case.tracker.set_pr_checks(tip.number, "fail")
++    for _ in range(2):
++        support.gate(case)
++    assert len(case.merges) == 2 and not events(case) and refs(case)
++    assert not merge_owner.may_write_target(case.ctx, "main")
++
++
++def test_waiting_train_checkpoints_before_another_member_can_refresh(batched, monkeypatch):
++    case = batched
++    interrupted_pair(case, monkeypatch, size=4)
++    outsider = support.pr_for(case, 2)
++    original = case.tracker.pr_head_sha(outsider.number)
++    for _ in range(2):
++        support.gate(case)
++    assert any(pr.head.startswith(batch.CHECKPOINT) for pr in groups(case))
++    assert case.tracker.pr_head_sha(outsider.number) == original
++    assert len(case.merges) == 2 and not events(case)
++
++
++def test_waiting_interruption_cannot_fall_back_to_own_ci_on_a_broken_prefix(batched, monkeypatch):
++    case = batched
++    interrupted_pair(case, monkeypatch)
++    green(case)
++    for _ in range(2):
++        support.gate(case)
++    assert len(case.merges) == 2 and not events(case)
++    assert not merge_owner.may_write_target(case.ctx, "main")
++
++
++def test_reordered_outside_turn_cannot_bypass_train_order(batched):
++    case = batched
++    shared_locks(case)
++    case.config = replace(case.config, merge_batch_size=3)
++    case.ctx.config = case.config
++    queue_workers(case, [5, 1, 4, 2])
++    support.gate(case)
++    orch_queue.set_global(case.store, [2, 4, 1, 5])
++    for _ in range(3):
++        support.gate(case)
++        if case.merges:
++            break
++    assert [m["pr"] for m in case.merges] == [support.pr_for(case, n).number for n in [5, 1, 4]]
++    assert not refs(case) and merge_owner.may_write_target(case.ctx, "main")
++
++
++@pytest.mark.parametrize("baseline", ["missing", "rerun-on-prefix"])
++def test_checkpoint_needs_original_measurement_even_when_current_ci_passes(batched, monkeypatch, baseline):
++    case = batched
++    interrupted_pair(case, monkeypatch, regression=False)
++    tip = case.tracker.get_pr(groups(case)[0].number)
++    marker = f"{batch.BASELINE}{batch._identity(*batch._decode(case.git, tip.head, tip.head_sha))}"
++    git_command(case.root, "update-ref", "-d", marker)
++    reports = case.tracker.pr_acceptance_reports
++
++    def unavailable(head):
++        values = reports(head)
++        if head == tip.head_sha:
++            if baseline == "missing":
++                return []
++            for value in values:
++                value["report"]["base_sha"] = case.history.tip
++        return values
++
++    monkeypatch.setattr(case.tracker, "pr_acceptance_reports", unavailable)
++    green(case)
++    support.gate(case)
++    assert len(case.merges) == 2 and not events(case)
++    assert not merge_owner.may_write_target(case.ctx, "main")
++
++
++def test_single_path_final_failure_spends_only_the_failing_member(batched, monkeypatch):
++    case = batched
++    shared_locks(case)
++    queue_workers(case, [5, 1, 4])
++    support.gate(case)
++    support.gate(case)
++    assert not case.merges
++    lock = StateStore.merge_lock
++
++    @contextmanager
++    def fail_at_final_check(store):
++        with lock(store):
++            case.tracker.set_pr_checks(support.pr_for(case, 4).number, "fail")
++            yield
++
++    monkeypatch.setattr(StateStore, "merge_lock", fail_at_final_check)
++    support.gate(case)
++    assert not case.merges and not refs(case)
++    assert [m["n"] for row in batch.retirements(case.ctx) for m in row["spent"]] == [4]
++
++
++@pytest.mark.parametrize("tip_state", ["damaged", "missing"])
++def test_damaged_tip_cannot_erase_an_interrupted_target_checkpoint(batched, monkeypatch, tip_state):
++    case = batched
++    interrupted_pair(case, monkeypatch, crash=True)
++    tip = groups(case)[0]
++    if tip_state == "damaged":
++        git_command(case.history.origin, "update-ref", f"refs/heads/{tip.head}", case.base)
++        case.tracker.set_pr_head_sha(tip.number, case.base)
++    else:
++        git_command(case.history.origin, "update-ref", "-d", f"refs/heads/{tip.head}")
++    assert not merge_owner.may_write_target(case.ctx, "main")
++    outsider = support.pr_for(case, 2)
++    original = case.tracker.pr_head_sha(outsider.number)
++    support.gate(case)
++    green(case)
++    support.gate(case)
++    assert any(pr.head.startswith(batch.CHECKPOINT) for pr in groups(case))
++    assert len(case.merges) == 2 and not batch.retirements(case.ctx)
++    assert case.tracker.pr_head_sha(outsider.number) == original
++    assert not merge_owner.may_write_target(case.ctx, "main")
++
++
++@pytest.mark.parametrize("red", ["checks", "regression"])
++def test_red_tip_retires_without_probes_or_spending_members(batched, monkeypatch, red):
++    case = batched
++    shared_locks(case)
++    queue_workers(case, [5, 1])
++    for n in [5, 1]:
++        case.tracker.set_pr_checks(support.pr_for(case, n).number, "pending")
++    checks, reports = case.tracker.pr_checks, case.tracker.pr_acceptance_reports
++
++    def red_checks(pr):
++        return "fail" if red == "checks" and case.tracker.get_pr(pr).head.startswith(batch.PREFIX) else checks(pr)
++
++    def red_reports(head):
++        values = reports(head)
++        if red == "regression" and case.ci.by_head[head].branch.startswith(batch.PREFIX):
++            for value in values:
++                value["report"]["head"]["passing_ids"] = []
++        return values
++
++    monkeypatch.setattr(case.tracker, "pr_checks", red_checks)
++    monkeypatch.setattr(case.tracker, "pr_acceptance_reports", red_reports)
++    support.gate(case)
++    assert not case.merges and not refs(case) and len(groups(case)) == 1
++    retirement, = batch.retirements(case.ctx)
++    assert retirement["reason"] == "tip CI red" and not retirement["spent"]
++    green(case)
++    support.drain(case, count=2)
++    assert len(case.merges) == 2
++
++
++@pytest.mark.parametrize("lose_original", [False, True])
++def test_checkpoint_compares_only_the_original_base_suite(lose_original):
++    from copy import deepcopy
++    from test_ci_mode_unit import report
++    from foragent import ci_mode
++
++    original = [report(), report(1)]
++    current = deepcopy(original)
++    gained = "tests/acceptance/test_gained.py::test_gained"
++    for value in current:
++        value["report"]["base_sha"] = "intermediate"
++    current[0]["report"]["base"]["collected_ids"].append(gained)
++    current[0]["report"]["base"]["passing_ids"].append(gained)
++    if lose_original:
++        current[1]["report"]["head"]["passing_ids"] = []
++    lost, _ = ci_mode.comparison(current, "owner/repo", "intermediate", "head", [],
++                                expected_scope=original[0]["report"]["scope"], expected_shards=range(2),
++                                original=("head", original, "base"))
++    assert lost == (["tests/acceptance/test_keep_1.py::test_keep"] if lose_original else [])
