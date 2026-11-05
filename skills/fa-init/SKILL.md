@@ -82,6 +82,13 @@ description: Set up a project folder for Foragent.
    Claude settings and rules unchanged. A dry run neither asks
    nor grants, and must never be followed by an automatic grant.
 
+   Decision capture is an explicit option: `fa init --decision-hooks yes` installs
+   project hooks for before compaction, session end with new person messages, and
+   every 20 person messages, plus the Stop check that reminds planning about
+   unordered decisions. It adds no init question. The fresh sweep session
+   retains quoted candidates and their transcript source; planning confirms them.
+   `--decision-hooks no` leaves settings unchanged. Rerunning yes keeps one copy.
+
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
    public repositories (hosted Actions minutes are free), or `local` for private
    repositories (to avoid paid Actions minutes). Unreadable visibility selects
