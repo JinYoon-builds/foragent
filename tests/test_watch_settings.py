@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+import sys
 
 import pytest
 import yaml

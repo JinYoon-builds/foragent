@@ -34,9 +34,12 @@ from foragent.tracker import FakeTracker, GhTracker, TrackerError
 @pytest.fixture
 def proto(world, monkeypatch):
     case = world()
+    # Patch the module whose world built this case: tests/helpers here, the
+    # locked contract when a locked acceptance test supplies its own world.
+    world_module = sys.modules[world.__module__]
     # The shared factual adapter handles branch commits. Extend its external
     # commit transport to detached owner checkouts without executing git commit.
-    import_index = contract.import_index
+    import_index = world_module.import_index
 
     def detached_import(root, title):
         root = Path(root)
@@ -54,7 +57,7 @@ def proto(world, monkeypatch):
         else:
             import_index(root, title)
 
-    monkeypatch.setattr(contract, "import_index", detached_import)
+    monkeypatch.setattr(world_module, "import_index", detached_import)
     close_pr = case.tracker.close_pr
 
     def close_transport(pr, comment=None, *, delete_branch=True):
