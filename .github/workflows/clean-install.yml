@@ -1,0 +1,65 @@
+name: clean-install
+# Run the checked-out install.sh on clean runners (no uv set up beforehand), then `fa doctor`.
+# No logins and no secrets: Claude Code is not on these runners, so the plugin step only prints how to register it.
+# Runs only when a file the install path uses changes, every night, and on demand (Jin 2026-11-05):
+# a nightly run catches breakage from other code the installed fa imports.
+on:
+  pull_request:
+    paths:
+      - install.sh
+      - npm/**
+      - .claude-plugin/**
+      - pyproject.toml
+      - uv.lock
+      - setup.py
+      - src/foragent/__init__.py
+      - src/foragent/cli.py
+      - src/foragent/setup.py
+      - src/foragent/init.py
+      - src/foragent/roles.py
+      - src/foragent/runner_doctor.py
+      - src/foragent/commands/__init__.py
+      - src/foragent/commands/doctor.py
+      - src/foragent/commands/init.py
+      - .github/workflows/clean-install.yml
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - npm/**
+      - .claude-plugin/**
+      - pyproject.toml
+      - uv.lock
+      - setup.py
+      - src/foragent/__init__.py
+      - src/foragent/cli.py
+      - src/foragent/setup.py
+      - src/foragent/init.py
+      - src/foragent/roles.py
+      - src/foragent/runner_doctor.py
+      - src/foragent/commands/__init__.py
+      - src/foragent/commands/doctor.py
+      - src/foragent/commands/init.py
+      - .github/workflows/clean-install.yml
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run install.sh from this checkout
+        run: sh ./install.sh --yes
+        env:
+          FORAGENT_SOURCE: ${{ github.workspace }}
+      - name: Second run changes nothing and still succeeds
+        run: sh ./install.sh --yes
+        env:
+          FORAGENT_SOURCE: ${{ github.workspace }}
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: fa doctor
