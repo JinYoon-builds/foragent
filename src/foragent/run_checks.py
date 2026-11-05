@@ -682,12 +682,13 @@ def _verify_contents(attempt: Implementation) -> str:
 
 
 def _verify_review_head(
-    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str,
+    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, *, skips=None,
 ) -> str | None:
+    """Run Done when on the PR head; ``skips`` (ci_local.PassSkips for ``head``) applies D124."""
     checks: list[CheckResult] = []
     # The saved bundle changes only once this verification knows the replacement.
     try:
-        return _check_review_head(n, ctx, git, parsed, head, link, checks)
+        return _check_review_head(n, ctx, git, parsed, head, link, checks, skips=skips)
     except BaseException:
         _keep_gathered(ctx.store.root, n, checks)
         raise
@@ -695,19 +696,30 @@ def _verify_review_head(
 
 def _check_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, checks: list[CheckResult],
+    *, skips=None,
 ) -> str | None:
+    from dataclasses import replace
     from foragent import runner
+    from foragent.ci_local import skipping
+    from foragent.issue import acceptance_paths
 
     worktree = git.root
     log = ctx.store.log_path(n)
+    if skips is not None and skips.head != head:
+        skips = None  # Evidence of another commit never skips a check of this one.
+    # D124: the issue's own locked acceptance files always run.
+    locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
         for command in parsed.done_when_commands:
             if runner._remaining(n, ctx) <= 0:
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
-            check = run_done_when(n, ctx, command, worktree, log, min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
-                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            with skipping(n, ctx, command, skips, locked) as selected:
+                check = run_done_when(n, ctx, selected, worktree, log,
+                                      min(DONE_WHEN_SECONDS, runner._remaining(n, ctx)),
+                                      progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            check = replace(check, command=command)
             if stopped := harness_guard.before_measurement(worktree):
                 return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)

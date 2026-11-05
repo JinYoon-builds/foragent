@@ -341,15 +341,32 @@ def _complete_fact(ctx, place, job, fact):
         runner.after_merge(ctx, fact["pr"], fact["target"])
 
 
+@contextmanager
+def timed_checks(ctx, name, sha):
+    """One merge-owner.log line when the owner's machine checks start and one when they end."""
+    print(f"merge owner checks start: {name} at {sha[:12]}", flush=True)
+    started, outcome = ctx.monotonic(), "failed"
+    try:
+        yield
+        outcome = "ok"
+    finally:
+        print(f"merge owner checks end: {name} at {sha[:12]} {outcome} "
+              f"elapsed {max(0.0, ctx.monotonic() - started):.1f}s", flush=True)
+
+
 def _reverify(ctx, place, job, git, head):
     n, target = place.n, job["target"]
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
-    if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link):
-        raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
-    attempt = ci_mode.review_checks(n, ctx, git, target)  # local_only stays on the machine in either mode.
-    if not ci_mode.enabled(ctx, target):
-        ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"))
+    with timed_checks(ctx, f"#{n}", head):
+        # D124 for the exact refreshed commit; before its push it normally has no CI yet.
+        skips = ci_local.PassSkips.read(ctx, head, published=False)
+        if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link, skips=skips):
+            raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
+        # local_only stays on the machine in either mode.
+        attempt = ci_mode.review_checks(n, ctx, git, target, skips=skips)
+        if not ci_mode.enabled(ctx, target):
+            ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"), skips=skips)
 
 
 def may_write_target(ctx, target):

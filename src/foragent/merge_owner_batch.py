@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import json
 import subprocess
 
-from foragent import ci_mode, harness_guard, orch_stop
+from foragent import ci_local, ci_mode, harness_guard, orch_stop
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
 from foragent.ci_local import LocalComparisonUnavailable
 from foragent.git import GitError, main_write_lock
@@ -495,23 +495,29 @@ def land(ctx, report, candidates, proof):
             }))
             files = sorted({path for _, job, *_ in prepared
                             for path in parse_body(job["approval"]["body"]).files})
-            for member, (place, job, _, _, _) in zip(proof.chain, prepared):
-                checking = member
-                link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
+            tip_sha = proof.chain[-1][2]
+            members_named = " ".join(f"#{n}" for n, *_ in proof.chain)
+            with owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha):
+                # D124: skip exactly what CI passed on the tip these checks run on.
+                skips = ci_local.PassSkips.read(ctx, tip_sha)
+                for member, (place, job, _, _, _) in zip(proof.chain, prepared):
+                    checking = member
+                    link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
 
-                def verify(head):
-                    return owner._verify_review_head(place.n, ctx, tip, parse_body(job["approval"]["body"]), head, link)
+                    def verify(head, place=place, job=job, link=link):
+                        return owner._verify_review_head(place.n, ctx, tip, parse_body(job["approval"]["body"]), head,
+                                                         link, skips=skips)
 
-                guarded = harness_guard.review_guard(ctx, place.n, tip, f"origin/{ctx.config.base_branch}",
-                                                     files, link, verify)
+                    guarded = harness_guard.review_guard(ctx, place.n, tip, f"origin/{ctx.config.base_branch}",
+                                                         files, link, verify)
+                    with owner._track_checks(ctx, place, job):
+                        if stopped := guarded(proof.chain[-1][2]):
+                            raise AttemptFailure(f"Train tip Done when: {stopped}", ctx.config.base_branch)
+                checking = None
+                place, job, *_ = prepared[0]
                 with owner._track_checks(ctx, place, job):
-                    if stopped := guarded(proof.chain[-1][2]):
-                        raise AttemptFailure(f"Train tip Done when: {stopped}", ctx.config.base_branch)
-            checking = None
-            place, job, *_ = prepared[0]
-            with owner._track_checks(ctx, place, job):
-                ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch,
-                                      files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
+                    ci_mode.review_checks(place.n, ctx, tip, ctx.config.base_branch, skips=skips,
+                                          files=files, excluded=_exclusions(ctx, proof.base, proof.chain))
             untracked = tip._call([
                 "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
                 *(f":(exclude,literal){path}" for path in sorted(tip.artifact_paths())),

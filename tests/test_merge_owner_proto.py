@@ -710,7 +710,8 @@ def test_restart_reaps_durable_owner_checks_before_launching_more(proto, monkeyp
         checkpoints.append(checkpoint)
 
     command = parse_body(case.store.load_approval(5).body).done_when_commands[0]
-    install_popen(monkeypatch, table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+    # The owner runs the Done when command with its D124 skip plugin appended.
+    install_popen(monkeypatch, table, matches=lambda argv: argv[:2] == ["/bin/sh", "-c"] and command in argv[2],
                   children=(42001,), communicate=during_check)
     gate(case)
     assert checkpoints

@@ -533,11 +533,14 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                                   if source is not None else None))
 
 
-def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
-    """Rechecking an existing issue PR uses the same CI and machine evidence."""
+def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None, skips=None):
+    """Rechecking an existing issue PR uses the same CI and machine evidence.
+
+    ``skips`` (ci_local.PassSkips for the checked HEAD) applies D124 to every test command here.
+    """
     from types import SimpleNamespace
     from foragent import harness_guard, runner
-    from foragent.ci_local import capture_local_only, check, verify_local_only_units
+    from foragent.ci_local import capture_local_only, check, skipping, verify_local_only_units
     from foragent.run_checks import _related_unit_tests, run_related_check, trusts_ci
     from foragent.run_waits import in_phase
     import shlex
@@ -553,8 +556,10 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
         raise ExecutorStopped("held", str(exc)) from exc
     attempt = SimpleNamespace(n=n, ctx=ctx, git=git, worktree=git.root, target_branch=target_branch,
                               baseline=baseline, log=ctx.store.log_path(n))
+    if skips is not None and skips.head != git.head_sha():
+        skips = None  # Evidence of another commit never skips a check of this one.
     with in_phase(n, ctx, "checking"):
-        local_units = verify_local_only_units(attempt, baseline.command)
+        local_units = verify_local_only_units(attempt, baseline.command, skips=skips)
         checks = [local_units] if local_units is not None else []
         changed = git.changed_paths(base)
         own = _related_unit_tests(git.root, changed, ctx.config.acceptance_dir,
@@ -562,11 +567,17 @@ def review_checks(n, ctx, git, target_branch, *, files=None, excluded=None):
                                   and (enabled(ctx, target_branch) or trusts_ci(git.root, ctx.config)))
         if baseline.node_ids:
             harness_guard.guard_comparison(attempt, git.head_sha(), files=files)
-            checks.append(check(n, ctx, f"{baseline.command} {shlex.join(baseline.node_ids)}", git.root))
+            command = f"{baseline.command} {shlex.join(baseline.node_ids)}"
+            with skipping(n, ctx, command, skips, label="Local-only acceptance") as selected:
+                checks.append(check(n, ctx, selected, git.root))
         if own:
             # Related tests are a recorded check of their own, as in an implementation's verification.
             head, ci_passed = None, None
-            if ctx.config.merge_owner and ctx.config.checks == "ci":
+            if skips is not None:
+                head = skips.head
+                passed = skips.passed()
+                ci_passed = (skips.run_id, passed) if passed else None
+            elif ctx.config.merge_owner and ctx.config.checks == "ci":
                 head = git.head_sha()
                 ci_passed = ctx.tracker.pr_unit_passed_tests(head)
             checks.append(run_related_check(n, ctx, git.root, baseline.command, own, len(changed),
