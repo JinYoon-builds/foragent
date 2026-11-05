@@ -497,7 +497,7 @@ def tick(store: StateStore, repo_root: Path, now: datetime, language: str,
 
 
 def answer(store: StateStore, request_id: str, how: str, why: str,
-           facts: dict[str, Any] | None = None) -> dict[str, Any]:
+           facts: dict[str, Any] | None = None, exact: bool = False) -> dict[str, Any]:
     """Record the orchestrator's answer to one role-signal request and mark it done.
 
     ``facts`` are the signal's facts measured at the answer (``measure``); a later gate call
@@ -508,8 +508,8 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
     """
     if how not in ANSWERS:
         raise orch_inbox.InboxError(f"answer must be one of: {', '.join(ANSWERS)}")
-    why = (why or "").strip()
-    if how == "not-now" and not why:
+    why = (why or "") if exact else (why or "").strip()  # ``exact``: read from stdin, kept as written (#2110).
+    if how == "not-now" and not why.strip():
         raise orch_inbox.InboxError("not-now needs a reason in --why")
 
     def open_signal(record: dict[str, Any]) -> None:
@@ -523,7 +523,7 @@ def answer(store: StateStore, request_id: str, how: str, why: str,
             record["answer_facts"] = answered_facts(record, facts)
 
     record = orch_inbox.set_request_status(store, request_id, "done",
-                                           f"role signal {how}: {why}" if why else f"role signal {how}",
+                                           f"role signal {how}: {why}" if why.strip() else f"role signal {how}",
                                            check=open_signal)
     return orch_events.append_event(store, store._now(), None, ANSWER, f"{request_id} {record['role']} {how}: {why}",
                                     request_id=request_id, role=record["role"], answer=how, why=why,
@@ -555,7 +555,8 @@ def measure(store: StateStore, repo_root: Path, request_id: str) -> dict[str, An
 
 def command(args, store: StateStore) -> None:
     try:
-        event = answer(store, args.id, args.answer, args.why, measure(store, args.repo_root.resolve(), args.id))
+        event = answer(store, args.id, args.answer, args.why, measure(store, args.repo_root.resolve(), args.id),
+                       exact="why" in getattr(args, "from_stdin", ()))
     except orch_inbox.InboxError as exc:
         raise SystemExit(f"fa orch signal-answer: {exc}") from None
     print(f"Role {event['role']}: signal {args.id} answered {args.answer}.")
