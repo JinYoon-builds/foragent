@@ -4,9 +4,11 @@
 reviewed bytes into the plan. The reviewer, a new read-only session of the configured reviewer
 executor, returns a verdict with its evidence; this module only records it, checks the facts the
 verdict rests on (every command reported failing on current main, every statement mapped,
-unchanged candidate bytes) and never judges what a test means. Foragent itself runs no candidate
-code: the reviewer runs the commands inside the same sandbox as the writer (the scratch tree is
-its only writable place, no network, no hooks), and Claude gets no edit tools at all.
+unchanged candidate bytes) and never judges what a test means. The reviewer itself stays in the
+writer's sandbox (the scratch tree is its only writable place, no network, no hooks; Claude gets no
+edit tools at all). Because a real test command cannot start there (user caches, the test-slot
+lock), prepare runs the written commands once with host permissions in a separate throwaway copy
+(order_prepare_check, #2129) and hands the reviewer the measured results.
 
 Review attempts are appended to the issue's ``attempts`` next to the writer's::
 
@@ -21,7 +23,7 @@ import json
 import os
 from pathlib import Path
 
-from foragent import capacity, executors, order_prepare_setup as setup, order_scratch
+from foragent import capacity, executors, order_prepare_check as check, order_prepare_setup as setup, order_scratch
 from foragent.config import Config, resolved_reviewer
 from foragent.git import GitError
 from foragent.i18n import text
@@ -70,10 +72,12 @@ def _integrity(git, tree: Path, manifest: dict, config: Config, protected, befor
     candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
     wrong = {name for name in candidates.keys() | written.keys()
              if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
-    return sorted(set(refused) | wrong)
+    # A candidate edited and restored keeps its bytes but not its stamp: it was not run as recorded.
+    touched = {name for name, stamp in order_scratch.stamps(tree, before).items() if before[name] != stamp}
+    return sorted(set(refused) | wrong | touched)
 
 
-def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dict) -> str:
+def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dict, results=()) -> str:
     """What the independent reviewer reads: statements, candidate bytes, commands, contracts, risks."""
     statements = "\n".join(f"- {line}" for line in item["statements"])
     candidates = "".join(f"\n### {name}\n```\n{content}\n```\n" for name, content in sorted(entry["written"].items()))
@@ -85,9 +89,10 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "You are the independent reviewer of acceptance tests that another session (the issue's lane)\n"
         "wrote before publication. You did not write them. Do not edit any file: read, run, judge, reply.\n\n"
         f"The working directory is a scratch copy of current {config.base_branch} "
-        f"({entry.get('base_revision')}) with the candidate tests added. Run every command below here,\n"
-        "in this sandbox (only this tree is writable, there is no network); the actual results are the\n"
-        "current-main evidence. Never run them anywhere else.\n\n"
+        f"({entry.get('base_revision')}) with the candidate tests added. This sandbox has no network and\n"
+        "only this tree is writable, so the project's test command may not start here. Prepare ran every\n"
+        "command below with host permissions in a throwaway copy of the same tree; those results are the\n"
+        "current-main evidence. Read counts and the failure kind from them; rerun here only to look.\n\n"
         "Pass only when all of these hold:\n"
         "- Every behaviour statement is covered by at least one actually collected test that goes\n"
         "  through the project's public entry points and fails on current main by an assertion about\n"
@@ -99,12 +104,14 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "- The tests add no invented internal requirement (private helper names, internal layout),\n"
         "  ignore no statement, change no other issue's tests and weaken no shared test infrastructure.\n"
         "- The risk guidance is followed (process-control behaviour uses fake process tables only).\n"
+        "- No command or helper moves, rewrites, replaces or restores files of the tree (tests or project):\n"
+        "  a run of other bytes than the ones shown here is no evidence, however it is restored afterwards.\n"
         "Hold, with a reason the writer can act on, when the tests fall short. Ask a question only when\n"
         "a statement itself is unclear or cannot be observed; planning then answers it.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
         "coverage maps each statement, with its exact text, to the tests and your break-it evidence;\n"
-        "red records every command below as you ran it: actual counts, exit code, an output excerpt and\n"
-        "your reading of why it failed.\n\n"
+        "red records every command below from its measured result: actual counts, the measured exit code,\n"
+        "an output excerpt and your reading of why it failed (a wrong command is an environment failure).\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n## Spec\n{plan.get('spec_markdown', '')}\n\n"
         f"New lanes in this order (not created yet): "
         f"{json.dumps(plan.get('new_lanes', []), ensure_ascii=False, sort_keys=True)}\n\n"
@@ -115,6 +122,8 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         f"## Files expected to change later\n{listed(item.get('files'))}\n\n"
         f"## Candidate tests and helpers{candidates}\n"
         f"## Commands to run\n{commands}\n"
+        f"## Results of the commands, run with host permissions in a throwaway copy of base\n"
+        f"{check.section(list(results))}\n"
         "## Other issues of this order (contracts the tests may rely on)\nAnother issue's statements and goal\n"
         "are its public contract; its locked tests must not be changed.\n\n"
         f"{other_issues(plan, item)}\n\n"
@@ -130,7 +139,7 @@ def _options(reviewer: str, tree: Path, protected: tuple[Path, ...], config: Con
 
 
 def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[str], writers: set[str],
-             config: Config) -> dict:
+             config: Config, measured=()) -> dict:
     """The attempt's outcome. Only a well-formed verdict from an intact tree can be a hold or a pass;
     every other outcome carries no verdict, so it is never counted as a quality decision."""
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
@@ -159,6 +168,9 @@ def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[
         return facts | {"status": "hold", "reason": reply["reason"]}
     if (missing := _evidence_gaps(item, entry, facts)):
         return {"status": "interrupted", "reason": say("prepare_review_incomplete", missing="; ".join(missing))}
+    if (wrong := check.contradicted(facts["red"], list(measured))):
+        return {"status": "interrupted", "reason": say(
+            "prepare_review_incomplete", missing="exit code as measured by prepare for " + "; ".join(wrong))}
     # The pass rests on every command failing now by collected, failing tests; reported facts saying
     # otherwise contradict it.
     runs = {run["command"]: run for run in facts["red"]}
@@ -239,7 +251,7 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(context.refused))}
             return
         _place(tree, entry["written"])
-        before = order_scratch.stamps(tree, manifest)
+        before = order_scratch.stamps(tree, order_scratch._entries(tree))  # the placed candidates too
         writers = {attempt["session_id"] for attempt in entry["attempts"]
                    if attempt.get("role") == "writer" and attempt.get("session_id")}
         admitted = False
@@ -247,8 +259,15 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             # The reviewer runs the checks: it holds a machine slot and a test slot, as gate work does.
             with capacity.hold_workload(store, config, tests=True, kind="prepare", role=f"{item['key']} reviewer"):
                 admitted = True
+                measured = check.run(git, entry["base_revision"], context, lambda copy: _place(copy, entry["written"]),
+                                     lambda copy, built, stamped: _integrity(git, copy, built, lane_config, protected,
+                                                                             stamped, entry["written"]),
+                                     entry.get("done_when", []), directory, REVIEW_TIMEOUT_S)
+                if (voided := check.changed(measured)):  # measured something other than base + candidates
+                    outcome = {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(voided))}
+                    return
                 result = executors.executor_for(reviewer).run(
-                    worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry), model=model,
+                    worktree=tree, prompt=review_prompt(plan, item, lane_config, root, entry, measured), model=model,
                     timeout_s=REVIEW_TIMEOUT_S, log_path=Path(facts["log"]),
                     **_options(reviewer, tree, protected, lane_config, directory))
         except TimeoutError as exc:
@@ -258,7 +277,7 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             return
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
         changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
-        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config)
+        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config, measured)
     except OSError as exc:
         outcome = {"status": "waiting", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     except (GitError, ValueError) as exc:

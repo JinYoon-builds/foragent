@@ -39,6 +39,9 @@ MESSAGES = {
         "brief_report_recommended": "recommended",
         "brief_report_person_issue": "- {issue} needs your decision",
         "brief_report_nothing_needed": "Nothing needs you right now.",
+        "brief_report_short_counts": "{working} working · {merged} merged since the last report · {waiting} waiting for you",
+        "brief_report_short_ask": "Next: I'll ask each decision one at a time.",
+        "brief_report_short_nothing": "Next: nothing is waiting for you.",
         "brief_report_greeting": "Hi, I'm Foragent. This folder isn't set up yet. Tell me what you want to build, and I'll set it up with you.",
     },
     "ko": {
@@ -79,6 +82,9 @@ MESSAGES = {
         "brief_report_recommended": "추천",
         "brief_report_person_issue": "- {issue} 결정이 필요해요",
         "brief_report_nothing_needed": "지금은 정해 주실 일이 없어요.",
+        "brief_report_short_counts": "{working}개 일하는 중 · 지난 보고 뒤 머지 {merged}개 · 결정 기다리는 일 {waiting}개",
+        "brief_report_short_ask": "다음: 결정할 일을 하나씩 여쭤볼게요.",
+        "brief_report_short_nothing": "다음: 지금은 정해 주실 일이 없어요.",
         "brief_report_greeting": "안녕하세요, Foragent예요. 이 폴더는 아직 설정 전이에요. 무엇을 만들고 싶은지 알려 주시면 함께 설정할게요.",
     },
 }
