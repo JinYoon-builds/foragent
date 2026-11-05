@@ -113,3 +113,4 @@ writes this file.
 - A 'role ran a person command' incident may be shell command substitution: backticks inside --text "..." ran fa stop x3 (11-05, r768). Scan tool_use commands in logs/<role>-*.log first.
 - 'Fix merged but it did not fire': a run keeps its start-time tool version (`tool-versions/<ts>-<sha>`) ~5 h; compare started_at with the first install dir containing the fix (r772).
 - facts '기준선 캡처 ... 한도에 가까움' is the latest long baseline, not a trend: list phase=baseline >600 s by issue (11-05: median 30 s; only #1422/#1923/#1915, #1422 1692->2725 s).
+- A run killed/stopped long after start may be a ghost: its issue was closed outside the gate (PM direct merge via group PR) and the run never re-reads issue state. Compare runs.jsonl started_at/finished_at with GitHub closedAt (11-05 #2100: 121 min after close; r787).
