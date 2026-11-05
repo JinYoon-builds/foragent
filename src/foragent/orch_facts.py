@@ -18,7 +18,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
-from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_plan, orch_role_schedule, resource_sample, step_weights
+from foragent import capacity, capacity_sessions, machine_budget, orch_facts_baselines, orch_facts_decided, orch_facts_kinds, orch_facts_machine, orch_facts_reviews, orch_facts_stall, orch_plan, orch_role_schedule, resource_sample, step_weights
 from foragent.config import Config
 from foragent.orch_facts_resources import _binding, _probe, _resources, _still_running
 from foragent.orch_facts_runs import (
@@ -122,7 +122,7 @@ def _freeze(store: StateStore, into: Path, checkout: Path | None = None) -> tupl
             for path in names:
                 (_copy_plan if path.name == "plan.json" else _copy)(path, target / path.name)
             for directory in ("runs", "run-starts", capacity_sessions.WORKLOADS_DIR,
-                              *(("approvals",) if source == store.root else ())):
+                              *(("approvals", "inbox/requests") if source == store.root else ())):
                 for path in (source / directory).glob("*.json"):
                     _copy(path, target / directory / path.name)
             if source == store.root:
@@ -210,6 +210,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
     measured = [row for row in rows if row["waste_seconds"] is not None and row["runtime_seconds"] is not None]
     wasted, runtime = sum(row["waste_seconds"] for row in measured), sum(row["runtime_seconds"] for row in measured)
     resources = _resources(store, config, root, now, waiting, slots, running, machine)
+    supply = orch_facts_stall.supply(config, running, resources["parallelizable_work"])
     return {
         "at": now.astimezone(UTC).isoformat(),
         "window_days": RECENT.days,
@@ -228,7 +229,9 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         "binding": _binding(resources),
         "role_schedule": orch_role_schedule.facts(store, config, now),
         **orch_facts_decided.collect(store, now, RECENT),
-        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting),
+        # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
+        "supply": supply,
+        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
     }
 
 
