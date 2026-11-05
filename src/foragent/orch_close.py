@@ -59,6 +59,27 @@ def _remove_locks(ctx, n: int, superseded_by: int, merged: set[int]) -> None:
                    "origin", f"{commit}:refs/heads/{base}"])
 
 
+def close_with_pr(tracker, n: int, comment: str | None = None, *, reason: str | None = None,
+                  issue_open: bool | None = None) -> None:
+    """The one close of an issue: its open Foragent PR and branch go first, then the issue.
+
+    `fa orch close` and an order's cleanup close both call this. The PR closes before the
+    issue, so a failure between the two writes leaves the issue open for the next run to
+    finish; `find_pr` returns open PRs only, so a repeated close deletes nothing more.
+    `comment` goes with the close, or alone when the issue is already closed (gh returns
+    early on a closed issue before it posts `--comment`).
+    """
+    pr = tracker.find_pr(f"foragent/issue-{n}")
+    if pr is not None:
+        tracker.close_pr(pr, delete_branch=True)
+    if issue_open is None:
+        issue_open = tracker.get_issue(n).state != "closed"
+    if issue_open:
+        tracker.close_issue(n, comment, reason=reason)
+    elif comment is not None:
+        tracker.comment(n, comment)
+
+
 def close(ctx, n: int, superseded_by: int, why: str) -> str:
     from foragent.orch import OrchError
 
@@ -82,18 +103,12 @@ def close(ctx, n: int, superseded_by: int, why: str) -> str:
             if issue.is_pull_request:
                 raise OrchError(text("orch_close_issue_required", language, n=n))
             summary = text("orch_close_done", language, n=n, by=superseded_by, why=why.strip())
-            pr = ctx.tracker.find_pr(f"foragent/issue-{n}")
             comment = f"<!-- foragent:orch kind=closed -->\n{summary}"
             published = any(item.body == comment for item in ctx.tracker.list_comments(n))
             _remove_locks(ctx, n, superseded_by, merged)
             tracker = RecordingTracker(ctx.tracker, ctx)
-            if pr is not None:
-                tracker.close_pr(pr, delete_branch=True)
+            close_with_pr(tracker, n, None if published else comment, issue_open=issue.state != "closed")
             if issue.state == "closed" and published:
                 return summary
-            if not published:
-                tracker.comment(n, comment)
-            if issue.state != "closed":
-                tracker.close_issue(n)
             append_event(ctx.store, ctx.now(), n, "closed", summary)
             return summary

@@ -27,6 +27,8 @@
 - r720 (2026-11-05): order #1861 (files-scope for #1860, merge 902e7d09 #1882) — rules.md lacks D109-D122; D117 vs rules.md:79 D37 (folds r347); D109 README/CONTRIBUTING line. D109 ID now taken: r315/r449 asks need new IDs. Wait: orchestrator judges.
 - r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
 - r780 (2026-11-05): #2093/#2094 (merge 6bf24992, q14 exempt scope per path) — gate.md:129 rewrite (also r338's unapplied part), ask D105 보강 2 + rules.md PASS-scope line. Wait: orchestrator judges/relays.
+- r800 (2026-11-05): orders #2130/#2135 (#1874 merge b0fedd49, #2136 merge b0985e42) — mechanisms.md 'Order completion' add UX researcher order/daily calls + Origins #1654/#1874. Wait: orchestrator judges.
+- r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
@@ -54,7 +56,7 @@
 - Prompt-content changes (e.g. #1570, whole authored issue in prompts) touch no reader doc; only docs/impl/*.md (2026-10 phase briefs, e.g. p7c-native.md:9) describe prompt contents. Treat those as history, not drift. Stop-condition orders (e.g. #1750) edit p7c-native.md in the same merge.
 - An order issue's title can name another issue (#1614 titled '#1526: review standard'); the merged commit carries the child number, so grep `git log` for both.
 - Several scheduled orders can be scope-corrections of one issue ('#1523: review standard, ...'); find the one merge via `git log --grep` on the shared number, then check docs/order.md, which lists every publish refusal.
-- Orders titled '#NNNN: lock ...' or '#NNNN: re-approve' (e.g. #1657/#1663/#1665 for #1527) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
+- Orders titled '#NNNN: lock ...', '#NNNN: re-approve' or '#NNNN: the test owner moves ... locks' (e.g. #1657/#1663/#1665 for #1527, #2133 for #2128) have empty bodies and only move acceptance hashes; check the parent's merge only. Scorecard output fields live in no reader doc (only docs/specs, ideas.md).
 - New config keys (e.g. `default_skills`, #1619) need no doc line: README/docs list no config keys (only gate.md mentions max_parallel). Goals can carry Jin-dated license/policy rules; check rules.md and ask for a Dnn.
 - Decisions can land as 'Dnn 보강' headings appended by an order's merge (e.g. D105 보강 via #1677), answering an open 'ask for Dnn' wait; grep `^### D.* 보강` before re-asking.
 - Lock/serialization orders (e.g. #1661/#1662, all main writers under the merge lock) leave reader docs intact: only how-foragent-differs.md and order.md:150 name the "merge lock", at concept level; D95 already covers one writer.
@@ -91,3 +93,5 @@
 - When applying a wait's 'exact texts', re-read each accepted answer first: the orchestrator's answer can change wording (r749 → /fa phrasing, Jin q7) and override the text the wait recorded. When renumbering a Dnn, grep every doc for the old ID, not only the citations the wait lists (gate.md:149 was missed).
 - A request marked [done] in the inbox can still be unapplied (r338: gate.md:129 and the rules.md line never changed); when a later order touches the same line, fold the old text into the new proposal.
 - CI congestion fixes (#1922: #1923 workflow concurrency cancel, #1924 GitHub queue time off the CI wait, #1925 one refresh on stale-base reports) touch no reader doc; mechanisms.md merge entry says "waits for CI evidence"/"refreshes when target moved" at concept level. Child commits can carry unrelated merge_batch diffs; read the feature lines only.
+- New role callers in orch_role_schedule.py (e.g. #1874 UX researcher per order/daily) belong in docs/mechanisms.md 'Order completion' entry, which names the woken roles. Run-lifecycle fixes in scheduler_stop.py (#2136 stop on outside close) appear in no reader doc.
+- Urgent fix orders that apply an existing dated Dnn (e.g. #2103 applying D124) may be the first code for a decision that never got a rules.md line; grep rules.md for the Dnn on each check.

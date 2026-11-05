@@ -710,7 +710,11 @@ def test_restart_reaps_durable_owner_checks_before_launching_more(proto, monkeyp
         checkpoints.append(checkpoint)
 
     command = parse_body(case.store.load_approval(5).body).done_when_commands[0]
-    install_popen(monkeypatch, table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+    def done_when(argv):
+        # The owner runs the command as written, after one line that sets PYTEST_ADDOPTS (D124).
+        return argv[:2] == ["/bin/sh", "-c"] and (argv[2] == command or argv[2].endswith("\n" + command))
+
+    install_popen(monkeypatch, table, matches=done_when,
                   children=(42001,), communicate=during_check)
     gate(case)
     assert checkpoints
