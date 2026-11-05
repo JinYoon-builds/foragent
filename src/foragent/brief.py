@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from foragent import orch_inbox, orch_scorecard
+from foragent import orch_facts_stall, orch_inbox, orch_scorecard
 from foragent.config import Config
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN, lane_display, lane_order
@@ -47,6 +47,8 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "queued": _queued(status),
         "to_see": _to_see(status),
         "planning": _planning(store),
+        # Requests stuck in processing (#2088), as the gate's flow-stall signal counts them.
+        "stalled_requests": orch_facts_stall.stuck_requests(store, now),
         "team": _team(store, config),
         "profile": config.profile,
         "usage": store.usage(),

@@ -9,13 +9,13 @@ then checks them (`order_prepare_review`); only reviewed bytes reach the plan fi
 Record (``<state>/prepare/<order id>.json``)::
 
     {"plan": "<order id>", "issues": {"<key>": {
-        "key", "status", "phase", "questions", "reason", "updated_at",
+        "key", "status", "phase", "questions", "notes", "reason", "updated_at",
         "base_revision", "scratch", "cycle", "written": {path: text}, "done_when": [command],
-        "ignored": [tool output directory], "coverage", "red",
+        "ignored": [tool output path], "coverage", "red",
         "attempts": [{"attempt", "role": "writer", "cycle", "started_at", "finished_at", "status",
                       "base_revision", "scratch", "executor", "model", "options", "log",
                       "exit_code", "timed_out", "session_id", "written", "done_when",
-                      "skills_missing", "questions", "refused", "ignored", "reason"}]}}}
+                      "skills_missing", "questions", "notes", "refused", "ignored", "reason"}]}}}
 """
 
 from __future__ import annotations
@@ -109,10 +109,12 @@ def _envelope(message: str) -> dict | None:
     for value in _envelope_text(message):
         files, commands, questions = (value.get(key) if isinstance(value, dict) else None
                                       for key in ("acceptance_files", "done_when", "questions"))
+        notes = value.get("notes", []) if isinstance(value, dict) else None
         if (isinstance(files, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())
                 and isinstance(commands, list) and all(isinstance(c, str) for c in commands)
-                and isinstance(questions, list) and all(isinstance(q, str) for q in questions)):
-            return value
+                and isinstance(questions, list) and all(isinstance(q, str) for q in questions)
+                and isinstance(notes, list) and all(isinstance(note, str) for note in notes)):
+            return value | {"notes": notes}
     return None
 
 
@@ -136,7 +138,9 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
     offending path is a QUESTION either way, and partial candidates are kept as facts only.
     """
     say = lambda key, **values: text(key, config.language, **values)  # noqa: E731
-    candidates, refused, ignored = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
+    discarded = []
+    candidates, refused, ignored = order_scratch.changes(
+        git, tree, manifest, config.acceptance_dir, protected, before, discarded=discarded)
     written, questions = {}, [say("prepare_refused_path", path=name, directory=config.acceptance_dir)
                               for name in refused]
     for name, data in candidates.items():
@@ -144,13 +148,15 @@ def _judge(result, failure: dict | None, tree: Path, git: GitRepo, manifest: dic
             written[name] = data.decode("utf-8")
         except UnicodeDecodeError:
             questions.append(say("prepare_not_text", path=name))
-    facts = {"written": written, "refused": refused, "ignored": ignored, "done_when": []}
+    facts = {"written": written, "refused": refused, "ignored": ignored, "done_when": [],
+             "notes": [f"discarded stray file {name}" for name in discarded]}
     if questions:
         return facts | {"status": "question", "questions": questions, "reason": say("prepare_question")}
     if failure is not None:
         return facts | failure
     reply = _envelope(result.last_message or "")
     facts["done_when"] = reply["done_when"] if reply else []
+    facts["notes"].extend(reply["notes"] if reply else [])
     if reply and reply["questions"]:
         return facts | {"status": "question", "questions": reply["questions"], "reason": say("prepare_question")}
     if reply is None:
@@ -183,7 +189,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
     entry["attempts"].append(facts)
     for stale in ("coverage", "red"):
         entry.pop(stale, None)
-    entry.update(status="writing_tests", phase="writing_tests", questions=[], reason=None, cycle=cycle,
+    entry.update(status="writing_tests", phase="writing_tests", questions=[], notes=[], reason=None, cycle=cycle,
                  requirement=asked, updated_at=facts["started_at"], base_revision=base, scratch=str(tree),
                  behaviour=behaviour(item), published=setup.published_digest(plan, root, config))
     _write(path, record)
@@ -239,6 +245,7 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             outcome = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
         facts.update(outcome, finished_at=_now())
         entry.update(status=outcome["status"], questions=outcome.get("questions", []),
+                     notes=outcome.get("notes", []),
                      reason=outcome["reason"], updated_at=facts["finished_at"],
                      written=outcome.get("written", {}), done_when=outcome.get("done_when", []),
                      ignored=outcome.get("ignored", []))

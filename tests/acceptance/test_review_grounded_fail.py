@@ -56,7 +56,9 @@ UNDECIDED = ("VERDICT: FAIL\nsrc/foragent/skills.py:144: Complete MIT text prefi
              "`Source: Example Project` returns `unknown`, rejecting notices allowed by the Goal. Broader class: valid "
              "notice formats are excluded; also inspect line 145, which rejects multiword work names.")
 
-UNGROUNDED = {"score": 90, "critical_path": False, "exists": False, "goal_line": None,
+UNGROUNDED = {"score": 90, "critical_path": False, "exists": True, "goal_line": None,
+              "wrong_result": True, "ordinary_input": True, "irreversible": False,
+              "finding_class": "fixture defect",
               "locked_test": None, "breaking_input": None, "spec_question": None}
 GROUNDS = {
     "breaking_input": {"breaking_input": "A run whose CI reports arrive after the local fallback"},
@@ -176,8 +178,9 @@ def test_real_defects_with_a_ground_still_fail(git_history, tmp_path, monkeypatc
     assert [e["verdict"] for e in reviews] == ["FAIL"] and reviews[0]["findings"] >= finding_count(text)
 
 
-@pytest.mark.parametrize("score,blocks", [(0, False), (79, False), (80, True), (100, True)])
+@pytest.mark.parametrize("score,blocks", [(0, True), (79, True), (80, True), (100, True)])
 def test_a_grounded_finding_blocks_only_from_score_80(git_history, tmp_path, monkeypatch, score, blocks):
+    # Historical name retained: 11-05 replaces the score threshold with consequence facts.
     text = REAL["1679-r1"]
     reply = {**UNGROUNDED, **GROUNDS["breaking_input"], "score": score}
     case, script = ordinary(git_history, tmp_path, monkeypatch, [text], reply)

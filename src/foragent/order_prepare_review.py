@@ -14,7 +14,7 @@ Review attempts are appended to the issue's ``attempts`` next to the writer's::
 
     {"attempt", "role": "reviewer", "cycle", "started_at", "finished_at", "status",
      "base_revision", "scratch", "executor", "model", "log", "exit_code", "timed_out",
-     "session_id", "verdict", "coverage", "red", "questions", "reason"}
+     "session_id", "verdict", "coverage", "red", "questions", "notes", "reason"}
 """
 
 from __future__ import annotations
@@ -29,10 +29,10 @@ from foragent.git import GitError
 from foragent.i18n import text
 from foragent.order_prepare import _envelope_text, _now, _write
 from foragent.order_prepare_cycle import HOLD_LIMIT, holds
-from foragent.order_prepare_prompt import _risk_notes, other_issues
+from foragent.order_prepare_prompt import REPLY_GUIDANCE, _risk_notes, other_issues
 
 REVIEW_TIMEOUT_S = 30 * 60
-REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], '
+REPLY_SHAPE = ('{"verdict": "pass|hold|question", "reason": "<why>", "questions": [], "notes": [], '
                '"coverage": [{"statement": "<exact statement>", "tests": ["<test>"], '
                '"break_it": ["<wrong value / skipped effect / doubled effect evidence>"]}], '
                '"red": [{"command": "<command>", "collected": 0, "failed": 0, "exit_code": 0, '
@@ -45,11 +45,13 @@ def _reply(message: str) -> dict | None:
         if not isinstance(value, dict) or value.get("verdict") not in {"pass", "hold", "question"}:
             continue
         reason, questions = value.get("reason"), value.get("questions", [])
+        notes = value.get("notes", [])
         coverage, red = value.get("coverage", []), value.get("red", [])
         if (isinstance(reason, str) and isinstance(questions, list) and all(isinstance(q, str) for q in questions)
+                and isinstance(notes, list) and all(isinstance(note, str) for note in notes)
                 and isinstance(coverage, list) and all(isinstance(c, dict) for c in coverage)
                 and isinstance(red, list) and all(isinstance(r, dict) for r in red)):
-            return value
+            return value | {"notes": notes}
     return None
 
 
@@ -66,14 +68,14 @@ def _integrity(git, tree: Path, manifest: dict, config: Config, protected, befor
     """Paths of the review tree that are not current main plus exactly the recorded candidates.
 
     The writer's comparison (``order_scratch.changes``) is reused: any changed, removed or touched
-    file outside the candidates, and any candidate whose bytes differ, means the reviewer's runs
-    were not of current main with these tests.
+    nonignored file outside the candidates, and any candidate whose bytes differ, means the
+    reviewer's runs were not of current main with these tests.
     """
     candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
     wrong = {name for name in candidates.keys() | written.keys()
              if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
     # A candidate edited and restored keeps its bytes but not its stamp: it was not run as recorded.
-    touched = {name for name, stamp in order_scratch.stamps(tree, before).items() if before[name] != stamp}
+    touched = {name for name, stamp in order_scratch.stamps(tree, written).items() if before[name] != stamp}
     return sorted(set(refused) | wrong | touched)
 
 
@@ -106,9 +108,11 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "- The risk guidance is followed (process-control behaviour uses fake process tables only).\n"
         "- No command or helper moves, rewrites, replaces or restores files of the tree (tests or project):\n"
         "  a run of other bytes than the ones shown here is no evidence, however it is restored afterwards.\n"
-        "Hold, with a reason the writer can act on, when the tests fall short. Ask a question only when\n"
-        "a statement itself is unclear or cannot be observed; planning then answers it.\n\n"
+        "  Gitignored build and test output is excluded from this file-integrity rule.\n"
+        "Hold, with a reason the writer can act on, when the tests fall short. Use verdict question\n"
+        "only for an unknown that changes the behaviour statements or scope; planning then answers it.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
+        f"{REPLY_GUIDANCE}"
         "coverage maps each statement, with its exact text, to the tests and your break-it evidence;\n"
         "red records every command below from its measured result: actual counts, the measured exit code,\n"
         "an output excerpt and your reading of why it failed (a wrong command is an environment failure).\n\n"
@@ -155,7 +159,8 @@ def _outcome(result, reply: dict | None, item: dict, entry: dict, changed: list[
         return {"status": "interrupted", "reason": say("prepare_review_changed", paths=", ".join(changed))}
     if reply is None:
         return {"status": "interrupted", "reason": say("prepare_review_bad_reply")}
-    facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", [])}
+    facts = {"verdict": reply["verdict"], "coverage": reply.get("coverage", []), "red": reply.get("red", []),
+             "notes": reply.get("notes", [])}
     if reply["verdict"] == "question":
         questions = [question for question in reply["questions"] if question.strip()]
         if not questions and not reply["reason"].strip():
@@ -234,6 +239,7 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
     entry.update(status="reviewing_tests", phase="reviewing_tests", questions=[], updated_at=facts["started_at"])
     _write(path, record)
     outcome = {"status": "interrupted", "reason": say("prepare_review_stopped")}
+    reply = None
     try:
         lane_config, context = setup.lane_context(plan, item, config, root)
         context.files.update(setup.scratch_files(plan, item, root, config, record))
@@ -277,18 +283,20 @@ def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, 
             return
         facts.update(exit_code=result.exit_code, timed_out=result.timed_out, session_id=result.session_id)
         changed = _integrity(git, tree, manifest, lane_config, protected, before, entry["written"])
-        outcome = _outcome(result, _reply(result.last_message or ""), item, entry, changed, writers, config, measured)
+        reply = _reply(result.last_message or "")
+        outcome = _outcome(result, reply, item, entry, changed, writers, config, measured)
     except OSError as exc:
         outcome = {"status": "waiting", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     except (GitError, ValueError) as exc:
         outcome = {"status": "interrupted", "reason": say("prepare_review_error", error=" ".join(str(exc).split())[:300])}
     finally:
-        facts.update(outcome, finished_at=_now())
+        facts.update(outcome, notes=reply["notes"] if reply else [], finished_at=_now())
         if outcome["status"] == "hold" and len(holds(entry)) >= HOLD_LIMIT:
             outcome = {"status": "question", "reason": say("prepare_review_held"),
                        "questions": [say("prepare_review_hold_question", count=len(holds(entry)),
                                          reasons=" | ".join(holds(entry)))]}
         entry.update(status=outcome["status"], questions=outcome.get("questions", []), reason=outcome["reason"],
+                     notes=entry.get("notes", []) + facts.get("notes", []),
                      updated_at=facts["finished_at"],
                      phase="writing_tests" if outcome["status"] == "hold" else "reviewing_tests")
         for name in ("coverage", "red"):

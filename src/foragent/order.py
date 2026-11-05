@@ -480,7 +480,13 @@ def _child_marker(identity: str, key: str) -> str:
 
 def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
     """The issue body publish writes for a plan child or edit, before any plan-child marker."""
-    return issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    if "statements" in item:
+        key = item.get("key", f"#{item.get('number')}")
+        notes = order_reviewed._record(plan, repo).get(key, {}).get("notes", [])
+        if notes:
+            body += "\n## Preparation notes\n" + "".join(f"- {note}\n" for note in notes)
+    return body
 
 
 @dataclass

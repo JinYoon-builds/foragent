@@ -2,23 +2,19 @@
 
 from datetime import timedelta
 import os
-from pathlib import Path
 import subprocess
-import sys
 from threading import Barrier, Lock
 from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 from foragent import capacity, capacity_sessions, review_perspectives, runner
 from foragent.executors import ExecResult
 from foragent.state import StateStore
-from test_orch_review_handoff import make_case
-from test_review_perspectives import perspective_case
-from test_board_status_groups import offline_github  # noqa: F401
-from test_skills_autosync import isolated_home  # noqa: F401
+from helpers.review_case import make_case
+from helpers.review_panel import perspective_case
+from helpers.board_parents import offline_github  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 
 def _assert_current_run(case):
