@@ -1,15 +1,12 @@
 """Superseded closure boundaries using the same real local history as the CLI lock."""
 
 from dataclasses import replace
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / 'acceptance'))
 from conftest import git_command
 from foragent.tracker import GhTracker, TrackerError
-from test_orch_close_superseded import (
+from helpers.orch_close import (
     BRANCH, OWN, approve, assert_nothing_changed, base_files, base_tip, close, superseded_case,
 )
 

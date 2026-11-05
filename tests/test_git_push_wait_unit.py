@@ -1,8 +1,6 @@
 """Push retry facts retain a head's budget and consume each lease once."""
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from pathlib import Path
-import sys
 
 import pytest
 
@@ -11,8 +9,7 @@ from foragent.git import GitError, push_server_error
 from foragent.state import StateStore
 from foragent.tracker import TrackerError
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from helpers.home import isolated_home  # noqa: F401
 
 
 @pytest.mark.parametrize(('diagnostic', 'expected'), [
@@ -116,8 +113,8 @@ def test_different_head_starts_its_own_budget_while_an_older_push_is_waiting(pus
 
 def test_refresh_can_resume_when_only_the_remote_branch_existed(git_history, tmp_path, monkeypatch):
     from conftest import git_command
-    from test_git_push_outage import INTERNAL, Remote, start
-    from test_github_drop import outage_case, assert_wait, restart_at_wait_end, assert_merged_once
+    from helpers.git_push_outage import INTERNAL, Remote, start
+    from helpers.github_outage import outage_case, assert_wait, restart_at_wait_end, assert_merged_once
 
     case = outage_case(git_history, tmp_path, monkeypatch, 'review')
     initial = start(case, 'review')
@@ -144,8 +141,8 @@ def test_merge_owner_keeps_its_existing_tick_retry(pushing):
 
 def test_first_publish_lost_lease_holds_without_a_cleanup_overwrite(git_history, tmp_path, monkeypatch):
     from conftest import git_command
-    from test_git_push_outage import INTERNAL, BRANCH, Remote, start
-    from test_github_drop import outage_case, assert_wait, restart_at_wait_end
+    from helpers.git_push_outage import INTERNAL, BRANCH, Remote, start
+    from helpers.github_outage import outage_case, assert_wait, restart_at_wait_end
 
     case = outage_case(git_history, tmp_path, monkeypatch, 'run')
     initial = start(case, 'run')
@@ -163,8 +160,8 @@ def test_first_publish_lost_lease_holds_without_a_cleanup_overwrite(git_history,
 
 def test_pre_review_push_resumes_checks_and_review_without_repeating_implementation(git_history, tmp_path, monkeypatch):
     from dataclasses import replace
-    from test_git_push_outage import INTERNAL, Remote, start, drive
-    from test_github_drop import outage_case, assert_merged_once
+    from helpers.git_push_outage import INTERNAL, Remote, start, drive
+    from helpers.github_outage import outage_case, assert_merged_once
 
     case = outage_case(git_history, tmp_path, monkeypatch, 'run')
     initial = start(case, 'run')

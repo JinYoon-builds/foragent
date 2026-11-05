@@ -189,7 +189,7 @@ def published_train(case, monkeypatch):
 
 @pytest.fixture
 def retry_case(request, monkeypatch):
-    from acceptance import test_merge_path_real_settings as contract
+    from helpers import merge_world as contract
 
     monkeypatch.setattr(contract, "NUMBERS", (5, 1, 4, 2, 6, 3, 7))
     case = request.getfixturevalue("batched")
