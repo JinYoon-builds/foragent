@@ -46,11 +46,12 @@ def _issue(tracker, number, language):
 
 def plan_cleanup(plan, tracker, parent, mapping, language):
     """Judge every listed close, approved or not, before anything is written."""
-    items = list(plan.get("closes", []))
+    items = []
     edits = {item["number"] for item in plan.get("edits", [])}
     replaced = {n for item in plan["issues"] for n in item.get("replaces", [])}
-    for item in items:
+    for item in plan.get("closes", []):
         number = item["number"]
+        closed = False
         conflict = None
         if number in edits:
             conflict = "cleanup_edited"
@@ -66,10 +67,13 @@ def plan_cleanup(plan, tracker, parent, mapping, language):
                 conflict = "cleanup_pr"
             elif "running" in issue.labels:
                 conflict = "cleanup_running"
+            closed = issue.state == "closed"
         if conflict:
             raise ValueError(text(conflict, language, number=number))
         if "into" in item and _issue(tracker, item["into"], language).is_pull_request:
             raise ValueError(text("cleanup_into_pr", language, number=number, into=item["into"]))
+        # A copy: the flag only tells the preview a stale cleanup from a real close.
+        items.append({**item, "closed": closed})
     return items
 
 
@@ -84,10 +88,13 @@ def rejudge(plan, tracker, parent, mapping, language):
 
 
 def preview(items, language):
-    return [text("cleanup_preview_commit", language, number=item["number"], commit=item["commit"])
-            if "commit" in item else
-            text("cleanup_preview_into", language, number=item["number"], into=item["into"])
-            for item in items]
+    lines = []
+    for item in items:
+        form = "commit" if "commit" in item else "into"
+        key = f"cleanup_preview_closed_{form}" if item.get("closed") else f"cleanup_preview_{form}"
+        lines.append(text(key, language, number=item["number"], commit=item.get("commit"),
+                          into=item.get("into")))
+    return lines
 
 
 def close(plan, items, tracker, approve, selected_numbers, language):

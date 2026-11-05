@@ -673,6 +673,8 @@ def intact_units(tmp_path_factory):
     return run_units(tmp_path_factory.mktemp("run-public-intact"), [f"tests/{name}" for name in KNOWN_TESTS])
 
 
+# Machine-only (CI runs these unit files itself; whole-file subprocess runs here exceed the 30 min CI job, 2026-11-06).
+@pytest.mark.local_only
 @pytest.mark.parametrize("name", sorted(KNOWN_TESTS))
 def test_run_unit_file_keeps_all_original_cases_passing(intact_units, name):
     result, cases = intact_units
@@ -744,6 +746,7 @@ def test_break_it_cases_cover_every_target_unit_file_once_or_more():
     assert len({case for case, *_ in BREAKS}) == len(BREAKS)
 
 
+@pytest.mark.local_only
 @pytest.mark.parametrize("case,name,test,product,old,new", BREAKS, ids=[entry[0] for entry in BREAKS])
 def test_breaking_checked_behaviour_still_fails_the_original_test(
     tmp_path, intact_units, case, name, test, product, old, new,
