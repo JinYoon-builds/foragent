@@ -65,7 +65,7 @@ except ImportError:
 
 
 # The commands a person types; every other discovered command is for Foragent's own sessions.
-PERSON = ("init", "doctor", "inspect", "gate", "dashboard")
+PERSON = ("init", "doctor", "inspect", "gate", "dashboard", "stop")
 
 
 def _parser() -> argparse.ArgumentParser:
