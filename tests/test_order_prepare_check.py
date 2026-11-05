@@ -16,8 +16,8 @@ from foragent.git import GitRepo
 CANDIDATE = "tests/acceptance/test_x.py"
 
 
-def _run(git_history, tmp_path, commands):
-    git_history.update({"base.txt": "base\n", ".gitignore": ".cache/\n"})
+def _run(git_history, tmp_path, commands, *, files=None):
+    git_history.update({"base.txt": "base\n", ".gitignore": ".cache/\n", **(files or {})})
     git_command(git_history.clone, "fetch", "origin", "main")
     git = GitRepo(git_history.clone)
     written = {CANDIDATE: "candidate\n"}
@@ -82,6 +82,19 @@ def test_a_wrong_command_reports_its_real_exit_code_and_output(git_history, tmp_
     assert "missing_runner.py" in results[0]["output"]
 
 
+@pytest.mark.parametrize("existing", [False, True])
+def test_regenerated_gitignored_build_info_does_not_void_a_run(git_history, tmp_path, existing):
+    name = "src/foragent/_build.py"
+    files = {".gitignore": f".cache/\n/{name}\n"}
+    if existing:
+        files[name] = "GIT_SHA = 'before'\n"
+    command = f"mkdir -p src/foragent; echo regenerated > {name}; exit 1"
+    _git, _directory, results = _run(git_history, tmp_path, [command], files=files)
+    assert results[0]["exit_code"] == 1
+    assert results[0]["changed"] == []
+    assert order_prepare_check.changed(results) == []
+
+
 def test_the_prompt_carries_the_measured_results():
     item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api"}
     plan = {"title": "P", "issues": [item]}
@@ -124,6 +137,7 @@ RED = f"python3 -c \"import runpy, sys; ns = runpy.run_path('tests/acceptance/te
 
 @pytest.mark.parametrize("candidate, command, voided", [
     (FAILING, RED, None),
+    (FAILING, f"mkdir -p src/foragent; echo regenerated > src/foragent/_build.py; {RED}", None),
     # The reproduced bypass: a passing candidate rewritten to fail, then run.
     (PASSING, f"printf 'def test_n():\\n    assert False\\n' > tests/acceptance/test_n.py; {RED}",
      "tests/acceptance/test_n.py"),
@@ -139,7 +153,7 @@ def test_the_reviewer_tree_stays_separate_and_untouched(git_history, tmp_path, m
     from foragent.executors import ExecResult
     from foragent.state import StateStore
 
-    git_history.update({"notice.py": "print(0)\n"})
+    git_history.update({"notice.py": "print(0)\n", ".gitignore": "/src/foragent/_build.py\n"})
     root = git_history.clone
     git_command(root, "fetch", "origin", "main")
     git_command(root, "merge", "--ff-only", "origin/main")

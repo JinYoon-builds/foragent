@@ -68,14 +68,14 @@ def _integrity(git, tree: Path, manifest: dict, config: Config, protected, befor
     """Paths of the review tree that are not current main plus exactly the recorded candidates.
 
     The writer's comparison (``order_scratch.changes``) is reused: any changed, removed or touched
-    file outside the candidates, and any candidate whose bytes differ, means the reviewer's runs
-    were not of current main with these tests.
+    nonignored file outside the candidates, and any candidate whose bytes differ, means the
+    reviewer's runs were not of current main with these tests.
     """
     candidates, refused, _output = order_scratch.changes(git, tree, manifest, config.acceptance_dir, protected, before)
     wrong = {name for name in candidates.keys() | written.keys()
              if candidates.get(name) != (written[name].encode("utf-8") if name in written else None)}
     # A candidate edited and restored keeps its bytes but not its stamp: it was not run as recorded.
-    touched = {name for name, stamp in order_scratch.stamps(tree, before).items() if before[name] != stamp}
+    touched = {name for name, stamp in order_scratch.stamps(tree, written).items() if before[name] != stamp}
     return sorted(set(refused) | wrong | touched)
 
 
@@ -108,6 +108,7 @@ def review_prompt(plan: dict, item: dict, config: Config, root: Path, entry: dic
         "- The risk guidance is followed (process-control behaviour uses fake process tables only).\n"
         "- No command or helper moves, rewrites, replaces or restores files of the tree (tests or project):\n"
         "  a run of other bytes than the ones shown here is no evidence, however it is restored afterwards.\n"
+        "  Gitignored build and test output is excluded from this file-integrity rule.\n"
         "Hold, with a reason the writer can act on, when the tests fall short. Use verdict question\n"
         "only for an unknown that changes the behaviour statements or scope; planning then answers it.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"

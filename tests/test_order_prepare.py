@@ -39,7 +39,7 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
     (tree / "tests/acceptance/conftest.py").write_text("pytest_plugins = []\n")
     (tree / "app.py").unlink()
     (tree / "tests/acceptance/test_link.py").symlink_to(tree / "app.py")
-    # Ignore rules exempt only whole new ignored directories, never single files or escapes.
+    # Ignore rules cover files throughout the tree; links into protected places still refuse.
     (tree / ".venv/bin").mkdir(parents=True)
     (tree / ".venv/bin/python").symlink_to("/usr/bin/python3")
     (tree / ".venv/checkout").symlink_to(tmp_path / "checkout")
@@ -54,11 +54,10 @@ def test_only_new_files_under_the_acceptance_directory_are_candidates(git_histor
         git, tree, manifest, "tests/acceptance/", (tmp_path / "checkout", tmp_path / "scratch"))
     assert candidates == {"tests/acceptance/test_new.py": b"assert False\n",
                           "tests/acceptance/helpers/fake.py": b"TABLE = []\n"}
-    assert refused == [".venv/checkout", ".venv/state", "app.py", "src", "src/_build.py",
-                       "tests/acceptance/__pycache__/conftest.py", "tests/acceptance/conftest.py",
-                       "tests/acceptance/run.log", "tests/acceptance/test_link.py",
+    assert refused == [".venv/checkout", ".venv/state", "app.py", "tests/acceptance/conftest.py",
+                       "tests/acceptance/test_link.py",
                        "tests/acceptance/test_old.py"]
-    assert ignored == [".venv", "tests/acceptance/__pycache__"]
+    assert ignored == [".venv", "src/_build.py", "tests/acceptance/__pycache__", "tests/acceptance/run.log"]
 
 
 def test_an_unchanged_tree_has_no_candidates(git_history, tmp_path):
@@ -719,6 +718,78 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
 
 _cases = _lane_case_module()
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_gitignored_build_output_does_not_interrupt_writing_or_review(request, git_history, capsys, existing):
+    case = request.getfixturevalue("lane_case")
+    name = "src/foragent/_build.py"
+    files = {".gitignore": f"/{name}\n"}
+    if existing:
+        files[name] = "GIT_SHA = 'before'\n"
+    git_history.update(files)
+    # Both the host red check and the reviewer's own run regenerate the build information.
+    case.candidate = ("from pathlib import Path\n"
+                      f"build = Path({name!r})\n"
+                      "build.parent.mkdir(parents=True, exist_ok=True)\n"
+                      "build.write_text(\"GIT_SHA = 'after'\\n\")\n" + case.candidate)
+
+    def regenerate(tree):
+        target = tree / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("GIT_SHA = 'writer'\n")
+
+    case.writer_hook = regenerate
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["ignored"] == [name]
+    assert entry["attempts"][0]["refused"] == []
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+
+
+def test_writer_strays_are_dropped_with_notes_and_preparation_proceeds(request, capsys):
+    case = request.getfixturevalue("lane_case")
+    names = [".m-double.log", ".m-holder.log", ".t1.log", "scratch/nested/output.txt"]
+
+    def leave_strays(tree):
+        for name in names:
+            (tree / name).parent.mkdir(parents=True, exist_ok=True)
+            (tree / name).write_text("writer scratch output\n")
+
+    case.writer_hook = leave_strays
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["questions"] == []
+    expected = [f"discarded stray file {name}" for name in sorted(names)]
+    assert row["notes"] == expected
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == entry["attempts"][0]["notes"] == expected
+    assert entry["attempts"][0]["refused"] == []
+    assert entry["written"] == {_cases.TEST_PATH: case.candidate}
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == entry["written"]
+    review_tree = Path(case.calls[1]["worktree"])
+    assert all(not (review_tree / name).exists() for name in names)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_tracked_source_change_still_becomes_a_refusal_question(request, capsys, deleted):
+    case = request.getfixturevalue("lane_case")
+
+    def change_source(tree):
+        if deleted:
+            (tree / "notice.py").unlink()
+        else:
+            (tree / "notice.py").write_text("print(1)\n")
+        (tree / ".writer.log").write_text("scratch\n")
+
+    case.writer_hook = change_source
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "question" and len(row["questions"]) == 1
+    assert "notice.py" in row["questions"][0]
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["attempts"][0]["refused"] == ["notice.py"]
+    assert entry["notes"] == ["discarded stray file .writer.log"]
+    assert [call["role"] for call in case.calls] == ["writer"]
 
 
 @pytest.mark.parametrize("question_from", [None, "writer", "reviewer"])
