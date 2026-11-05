@@ -124,7 +124,7 @@ def outcome(reply: dict[str, Any] | None, found: list[str]) -> str:
 
 
 def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
-          git: GitRepo | None, parsed: ParsedIssue | None) -> ReviewResult:
+          git: GitRepo | None, parsed: ParsedIssue | None, record: bool = True) -> ReviewResult:
     """Score every finding of a FAIL; keep the blocking ones, record the rest as NOTE with its score."""
     from foragent import runner
     from foragent.config import resolved_reviewer
@@ -165,11 +165,12 @@ def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
         reply = None if result.timed_out or result.exit_code != 0 else parse_reply(raw)
         found = grounds(reply, parsed, git.root, acceptance) if reply else []
         decided = outcome(reply, found)
-        orch_events.append_event(
-            ctx.store, ctx.now(), n, "review-score", f"{decided} score={reply['score'] if reply else '-'}",
-            round=round_number, finding=finding, outcome=decided, grounds=found,
-            assessment=reply if reply is not None else {"unusable": raw[-2000:]},
-        )
+        if record:
+            orch_events.append_event(
+                ctx.store, ctx.now(), n, "review-score", f"{decided} score={reply['score'] if reply else '-'}",
+                round=round_number, finding=finding, outcome=decided, grounds=found,
+                assessment=reply if reply is not None else {"unusable": raw[-2000:]},
+            )
         if decided in ("blocks", "unusable"):
             blocking.append(finding)
         elif decided == "spec-question":
@@ -177,7 +178,8 @@ def score(n: int, ctx: RunContext, review: ReviewResult, round_number: int, *,
             questions.append(f"{SPEC_CONFLICT} Goal question: {question} (finding: {finding.splitlines()[0]})")
         else:
             notes.append(f"score {reply['score']}, not blocking: {_words(finding)}")
-    review_notes.record(ctx.store, ctx.now(), n, notes, round=round_number)
+    if record:
+        review_notes.record(ctx.store, ctx.now(), n, notes, round=round_number)
     return replace(review, verdict="FAIL" if blocking else "PASS", findings="\n".join(blocking),
                    conflicts=tuple(questions), review_notes=(*review.review_notes, *notes),
                    notes=(*review.notes, f"scored {len(findings)} findings: {len(blocking)} blocking",

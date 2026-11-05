@@ -13,6 +13,8 @@ Always pass `--by orchestrator`. Without it the command records the change as a 
 | Hold a lane | `fa orch pause LANE --until ISO --why "<reason>" --by orchestrator` |
 | Release it early | `fa orch resume LANE --by orchestrator` |
 | Order a lane's issues | `fa orch queue LANE N N ... --by orchestrator` (`--clear` removes it) |
+| Add or remove one cross-lane priority | `fa orch queue --global --add N` / `--remove N`; preserves all other positions, repeated calls are harmless |
+| Show or replace all cross-lane priorities | `fa orch queue --global [N N ...]` (`--json` shows the list; `--clear` clears it). Prefer `--add` / `--remove` for individual changes. |
 | Cap a lane's runs | `fa orch plan --width LANE=N --by orchestrator` (`LANE=off` clears; repeatable) |
 | End the whole plan | `fa orch plan --expires ISO --by orchestrator` |
 | Let N runs share one file | `fa orch plan --overlap PATH=N --why "<evidence>" --by orchestrator [--expires ISO]` (`PATH=off` clears; repeatable) |

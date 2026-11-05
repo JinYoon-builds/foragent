@@ -84,6 +84,7 @@ existing verb, always with `--say "<one line for a person>"` in the docs/voice.m
 - `fa orch resolve N --verdict pass|fail --note "<evidence and reasoning>"`: record a verdict on the current PR head. Done when and CI still apply.
 - `fa orch escalate N --summary "<why a human is needed>" --tried "<attempts>" --option "<recommendation>" --option "<alternative>" --recommend 1`: raise a human decision.
 
+For superseded work, `fa orch close N --superseded-by M --why "<reason>"` closes N, its PR and branch, and removes only its unmerged exclusive locks.
 Count attempts by defect class, not by reason code, across `fa orch log` and issue comments. When an issue is held a
 second time for the same defect class, do not retry with another hint; fix the issue itself: redesign its Goal (for
 example one writer per state, D95) through an order edit and re-approval, or split it. Use `fa orch escalate` only

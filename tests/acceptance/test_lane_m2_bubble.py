@@ -155,19 +155,20 @@ def test_new_bubble_copy_is_read_through_the_existing_messages_registry(tmp_path
     assert "MESSAGE_REGISTRY_PROBE" in "\n".join(bubble_lines(frame)), "the visible hint must call text(), not duplicate the copy"
 
 
+# D113 full phase names (r560: the merge step tests the PR combined with current main).
 @pytest.mark.parametrize("language,phase,sentence,elapsed", [
-    ("ko", "baseline", "완료 테스트가 지금 실패하는지 확인하고 있어요", "12분"),
-    ("ko", "implementing", "코드를 쓰고 있어요", "12분"),
-    ("ko", "checking", "내 컴퓨터에서 관련 테스트를 돌리고 있어요", "12분"),
-    ("ko", "reviewing", "다른 AI가 리뷰하고 있어요", "12분"),
-    ("ko", "ci", "GitHub에서 CI를 돌리고 있어요", "12분"),
-    ("ko", "merging", "main에 머지하고 있어요", "12분"),
-    ("en", "baseline", "checking that the acceptance tests fail now", "12m"),
+    ("ko", "baseline", "기준 재는 중", "12분"),
+    ("ko", "implementing", "코드 쓰는 중", "12분"),
+    ("ko", "checking", "목표 시험 중", "12분"),
+    ("ko", "reviewing", "리뷰 받는 중", "12분"),
+    ("ko", "ci", "전체 시험 중", "12분"),
+    ("ko", "merging", "합쳐서 시험 중", "12분"),
+    ("en", "baseline", "measuring the baseline", "12m"),
     ("en", "implementing", "writing code", "12m"),
-    ("en", "checking", "running related tests on this computer", "12m"),
-    ("en", "reviewing", "another AI is reviewing", "12m"),
-    ("en", "ci", "running CI on GitHub", "12m"),
-    ("en", "merging", "merging into main", "12m"),
+    ("en", "checking", "goal tests", "12m"),
+    ("en", "reviewing", "in review", "12m"),
+    ("en", "ci", "full tests", "12m"),
+    ("en", "merging", "testing merged", "12m"),
 ])
 def test_acorn_click_explains_local_title_lane_phase_and_phase_time_in_bubble(
     git_history, tmp_path, monkeypatch, language, phase, sentence, elapsed,
@@ -238,5 +239,5 @@ def test_long_selected_title_uses_one_row_and_retains_lane_phase_and_elapsed(tmp
     title_row = next(line for line in words.splitlines() if '#101' in line)
     assert '긴 제목' in title_row and '…' in title_row and 'HIDDEN_TAIL' not in words
     assert sum('긴 제목' in line for line in words.splitlines()) == 1
-    assert all(part in words for part in ('work','코드를 쓰고 있어요','12분'))
+    assert all(part in words for part in ('work','코드 쓰는 중','12분'))
     assert state['explanation_target'] == ('acorn',101) and state.get('issue') is None

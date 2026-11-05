@@ -425,6 +425,7 @@ class SkillManager:
     @staticmethod
     def _summary(skill: Skill) -> dict[str, Any]:
         return {"id": skill.id, "name": skill.name, "description": skill.description, "license": skill.license,
+                "source": skill_source(skill.path.name, skill.library, license=skill.license),
                 "runs_scripts": skill.runs_scripts, "copies": sorted(copy.relative_to(skill.library.path).as_posix()
                                                                       for copy in skill.copies), "role": skill.role}
 
@@ -511,8 +512,12 @@ class SkillManager:
 
     def check_install(self, identity: str, root: Path, *, commit: bool = False) -> Skill:
         skill = self._repo_skill(identity, root) or self._select(identity)
+        return self._check_install(skill, root, commit=commit)
+
+    def _check_install(self, skill: Skill, root: Path, *, commit: bool = False) -> Skill:
+        """Check the selected files without selecting again (defaults resolve offline)."""
         if skill.path.is_symlink() or any(path.is_symlink() for path in skill.path.rglob("*")):
-            raise SkillError(f"skill contains a symlink: {identity}")
+            raise SkillError(f"skill contains a symlink: {skill.id}")
         if commit:
             self._require_open_license(skill)
         destination = repo_path(root, f".claude/skills/{skill.path.name}")
@@ -536,7 +541,8 @@ class SkillManager:
         person left it, even when the library moved on or no longer has it.
         """
         try:
-            skill, failure = self._repo_skill(identity, root) or self._select(identity), None
+            skill, failure = (self._repo_skill(identity, root)
+                              or self._select(identity, skills=self.skills(available_only=True))), None
         except SkillError as exc:
             skill, failure = None, exc
         directory = root / ".claude/skills" / (skill.path.name if skill else entry_directory(identity))
@@ -557,7 +563,7 @@ class SkillManager:
             raise SkillError(f"refusing to install {identity} as a default: cannot confirm an open-source license "
                              f"({license_id}; {found or 'no LICENSE or LICENSE.txt'})")
         # This judge alone decides a default; the catalog's looser reading must neither veto nor warn.
-        return replace(self.check_install(identity, root), license=license_id, license_file=found)
+        return replace(self._check_install(skill, root), license=license_id, license_file=found)
 
     def default_needs_ignore(self, skill: Skill, root: Path) -> bool:
         """Whether installing this default adds a line to .gitignore."""
@@ -567,6 +573,15 @@ class SkillManager:
     @staticmethod
     def _ignore_rule(skill: Skill) -> bytes:
         return f"/.claude/skills/{skill.path.name}/".encode()
+
+    @staticmethod
+    def default_ignore_content(original: bytes, directories: list[str]) -> bytes:
+        """The installer's append-only ignore edit, also used to recognize interrupted output."""
+        for directory in directories:
+            rule = f"/.claude/skills/{directory}/".encode()
+            if rule not in original.splitlines():
+                original += (b"\n" if original and not original.endswith(b"\n") else b"") + rule + b"\n"
+        return original
 
     @staticmethod
     def _contents(path: Path) -> dict[str, bytes]:
@@ -620,10 +635,9 @@ class SkillManager:
         if not commit:
             ignore = repo_path(root, ".gitignore")
             original = ignore.read_bytes() if ignore.exists() else b""
-            rule = self._ignore_rule(skill)
-            if rule not in original.splitlines():
-                ignore.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b"")
-                                   + rule + b"\n")
+            updated = self.default_ignore_content(original, [skill.path.name])
+            if updated != original:
+                ignore.write_bytes(updated)
             return skill.path.name
         self._write_notice(skill, root)
         return skill.path.name
@@ -689,8 +703,27 @@ def vendored_library(*roots: Path | None) -> dict[str, Any] | None:
                 or not isinstance(data.get("skills"), dict)):
             raise SkillError(f"invalid vendored library manifest: {manifest}")
         return {"name": data["name"], "repo": data["repo"], "path": str(base), "revision": data["revision"],
+                "license": data.get("license", "unknown"), "sources": data.get("sources", {}),
                 "skills": sorted(data["skills"])}
     return None
+
+
+def skill_source(directory: str, library: Library | None = None, *, license: str = "unknown") -> str:
+    """A display attribution, shared by role defaults and the catalog; never a license judge.
+
+    Local copies use the shipped manifest by directory name. A configured library answers
+    for its own source, even when its skill has the same name as a shipped one.
+    """
+    if library is None or library.members is not None:
+        manifest = vendored_library(library.path if library else None)
+        if manifest and directory in manifest["skills"] and (library is None or library.name == manifest["name"]):
+            source = manifest["sources"].get(directory, manifest)
+            return f"{source['name']} ({source['license']})"
+    if library is not None and _source_key(library.repo).startswith("https://github.com/anthropics/"):
+        return f"Anthropic official ({license})"
+    if directory.startswith("fa-") and (library is None or library.name == "repo"):
+        return "Foragent-made"
+    return f"{library.name if library else 'project'} ({license})"
 
 
 def with_vendored_library(config: Config, *roots: Path | None) -> Config:

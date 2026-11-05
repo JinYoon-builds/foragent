@@ -106,7 +106,7 @@ def test_exceeding_review_max_opens_pr_with_risk_high_hold(run_case, review_max,
     assert run_issue(1, c.ctx) == "held"
     assert len(c.tracker.created_prs) == 1 and not c.tracker.merged_prs
     assert c.store.get_run(1).attempts == rounds
-    assert c.store.load_flag(1).reason == Reason.RISK_HIGH
+    assert c.store.load_flag(1).reason == Reason.REVIEW_DEFECTS
     comment = c.tracker.list_comments(1)[-1].body
     assert f"Reviewer still found defects after {rounds} rounds" in comment
     assert finding in comment and "https://github.com/owner/repo/pull/2" in comment
@@ -1149,6 +1149,23 @@ def test_break_it_rejects_a_native_scope_without_the_verdict_contract(review_con
         return rules(*args, **kwargs).replace(REVIEW_VERDICT_CONTRACT, "", 1)
 
     monkeypatch.setattr(run_review, "review_scope_rules", without_contract)
+    with pytest.raises(AssertionError):
+        test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
+
+
+def test_break_it_rejects_a_native_scope_without_the_mechanism_map(review_context, monkeypatch):
+    """The byte comparison must reject a scope that skips the map's first-read instruction."""
+    from foragent import run_review
+
+    rules = run_review.review_scope_rules
+
+    def without_map(*args, **kwargs):
+        return rules(*args, **kwargs).replace(
+            "Read docs/mechanisms.md first for the current mechanisms, their code, issues and decisions.\n",
+            "", 1,
+        )
+
+    monkeypatch.setattr(run_review, "review_scope_rules", without_map)
     with pytest.raises(AssertionError):
         test_claude_review_scope_restores_original_or_removes_temporary_file(review_context, None, "pass")
 

@@ -63,6 +63,7 @@ def test_catalog_metadata_and_multiple_library_prefixes(library, tmp_path):
     root, config, manager, _ = library
     assert manager.catalog() == [{"id": "kwp:engineering/testing-strategy", "name": "testing-strategy",
                                   "description": "Pick useful checks.", "license": "Apache-2.0", "role": None,
+                                  "source": "knowledge-work-plugins (Apache-2.0)",
                                   "runs_scripts": False, "copies": ["engineering/skills/testing-strategy"]}]
     second = tmp_path / "second"
     (second / "other/skills/testing-strategy").mkdir(parents=True)
@@ -687,7 +688,7 @@ def test_skills_cli_routes_offline(library, tmp_path, monkeypatch, capsys):
     assert row["id"] == "kwp:engineering/testing-strategy" and row["license"] == "Apache-2.0"
     assert cli.main(["skills", "catalog"]) == 0
     output = capsys.readouterr().out
-    assert "ID\tName\tLicense\tDescription" in output and "Apache-2.0" in output
+    assert "ID\tName\tLicense\tSource\tDescription" in output and "Apache-2.0" in output
     assert cli.main(["skills", "sync"]) == 0
     assert "Synced:" in capsys.readouterr().out
     assert cli.main(["skills", "install", "engineering/testing-strategy", "--repo-root", str(tmp_path)]) == 0
@@ -1073,11 +1074,12 @@ def test_install_into_another_project_keeps_the_advertised_vendored_source(tmp_p
 
 
 def test_shipped_lane_agents_carry_the_generated_github_writes_paragraph():
+    from foragent import role_agents
     from foragent.lanes import GITHUB_WRITES, agent_text
 
     root = Path(__file__).resolve().parents[1]
     assert agent_text("api", ["src/api/**"], []).endswith("\n\n" + GITHUB_WRITES + "\n")
-    roles = {"fa-orchestrator", "fa-architect", "fa-docs"}
     for path in sorted((root / ".claude/agents").glob("fa-*.md")):
-        if path.stem not in roles:
-            assert path.read_text(encoding="utf-8").count("\n\n" + GITHUB_WRITES + "\n") == 1, path
+        paragraph = (role_agents.GITHUB_WRITES.rstrip("\n") if path.stem in role_agents.ROLES
+                     else GITHUB_WRITES)
+        assert path.read_text(encoding="utf-8").count("\n\n" + paragraph + "\n") == 1, path

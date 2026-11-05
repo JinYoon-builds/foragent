@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 
-from foragent import ci_local, ci_mode, orch_github, orch_queue, processes, run_merge_turn as queue, run_publish, runner
+from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
@@ -38,6 +38,8 @@ def start(ctx, report):
     if (not getattr(ctx.config, "merge_batch", False) and not admissions(ctx.store)
             and not any((ctx.store.root / "merge-owner").glob("*.json"))):
         return
+    if orch_stop.active(ctx.store) is not None:
+        return  # A project stop starts no owner process; its queued jobs wait for the release (#1491).
     lock = ctx.store.lock_acceptance_baseline("merge-owner", blocking=False)
     if lock is None:
         return
@@ -338,15 +340,32 @@ def _complete_fact(ctx, place, job, fact):
         runner.after_merge(ctx, fact["pr"], fact["target"])
 
 
+@contextmanager
+def timed_checks(ctx, name, sha):
+    """One merge-owner.log line when the owner's machine checks start and one when they end."""
+    print(f"merge owner checks start: {name} at {sha[:12]}", flush=True)
+    started, outcome = ctx.monotonic(), "failed"
+    try:
+        yield
+        outcome = "ok"
+    finally:
+        print(f"merge owner checks end: {name} at {sha[:12]} {outcome} "
+              f"elapsed {max(0.0, ctx.monotonic() - started):.1f}s", flush=True)
+
+
 def _reverify(ctx, place, job, git, head):
     n, target = place.n, job["target"]
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
-    if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link):
-        raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
-    attempt = ci_mode.review_checks(n, ctx, git, target)  # local_only stays on the machine in either mode.
-    if not ci_mode.enabled(ctx):
-        ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"))
+    with timed_checks(ctx, f"#{n}", head):
+        # D124 for the exact refreshed commit; before its push it normally has no CI yet.
+        skips = ci_local.PassSkips.read(ctx, head, published=False)
+        if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link, skips=skips):
+            raise AttemptFailure(f"Refreshed head verification: {stopped}", target)
+        # local_only stays on the machine in either mode.
+        attempt = ci_mode.review_checks(n, ctx, git, target, skips=skips)
+        if not ci_mode.enabled(ctx):
+            ci_local.fallback_comparison(attempt, git.ref_sha(f"origin/{target}"), skips=skips)
 
 
 def may_write_target(ctx, target):
@@ -438,6 +457,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                 if not may_write_target(ctx, pr.base):
                     return False
                 git.push_head(pr.head, lease=remote)
+                if not run_publish._head_after_push(ctx, pr.number, job["head"], remote):
+                    run_publish._hold_changed_head(n, ctx, pr.url)
+                    _end(ctx, place, job, "held")
+                    return False
             job["phase"] = "waiting"
             _save(ctx, place, job)
             return
@@ -465,6 +488,8 @@ def _advance(ctx, place, job, pr, comparison=None):
             runner._append(ctx.store.log_path(n), f"{REUSED}: {base}")
         if needs_proof and not neutral:
             def before_push(head):
+                if (why := orch_stop.active(ctx.store)) is not None:
+                    orch_stop.halt(ctx, n, why)
                 if not may_write_target(ctx, pr.base):
                     raise ci_mode.MissingComparison("target reserved by merge train")
                 # A progress SHA alone is not a Git reachability root.
@@ -528,9 +553,10 @@ def _advance(ctx, place, job, pr, comparison=None):
                 current_title=pr.title, base=pr.base, body=lambda: pr.body,
                 note=lambda line: runner._append(ctx.store.log_path(place.n), line),
             )
-            job.update(phase="merging", merge_base=base)
-            _save(ctx, place, job)
-            ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
+            with orch_stop.merging(ctx, n):
+                job.update(phase="merging", merge_base=base)
+                _save(ctx, place, job)
+                ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
         with ctx.reads.fresh():
             _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
         return True
@@ -546,9 +572,10 @@ def _try_admission(ctx, place, job, step):
             return False
     except (ci_mode.MissingComparison, ci_mode.StaleComparison):
         return False  # No waiting process or arbitrary healthy-run wait limit.
-    except ExecutorStopped:
-        _end(ctx, place, job, "held")
-        return False
+    except ExecutorStopped as exc:
+        if exc.outcome != "stopped":
+            _end(ctx, place, job, "held")
+        return False  # A project stop keeps the job queued for after the release (#1491).
     except Exception as exc:
         if isinstance(exc, TrackerError):
             if exc.waits:
@@ -713,7 +740,8 @@ def _tick(owner, report):
         live = (run is not None and run.started_at == key[1]
                 if waiting[key].get("merge_owner") else queue._live(ctx.store, key))
         if live:
-            if key in candidates:
+            # Batch preparation can have repaired or held a candidate in this pass.
+            if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
                 advanced = advance_members(owner, [candidates[key]])
                 if ctx.store.github_wait_until(ctx.now()):
                     return

@@ -96,3 +96,176 @@ def test_scorecard_line_sits_just_before_the_closing_question():
     lines = brief.render(facts, "en").splitlines()
     assert lines[-2] == facts["scorecard_line"]
     assert "->" not in brief.render({**sample(), "scorecard_line": None}, "en")
+
+
+def test_planning_requests_are_pending_planning_only_and_render_once(tmp_path):
+    from datetime import UTC, datetime
+    from foragent import orch_inbox
+    from foragent.config import Config
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    waiting = orch_inbox.add_request(store, "planning", "Write the order")
+    taken = orch_inbox.add_request(store, "planning", "Adjust the spec")
+    done = orch_inbox.add_request(store, "planning", "Finished request")
+    orch_inbox.add_request(store, "gate", "Not a planning request")
+    orch_inbox.set_request_status(store, taken["id"], "processing")
+    orch_inbox.set_request_status(store, done["id"], "done")
+    facts = brief.collect(store, Config(), datetime.now(UTC))
+    assert facts["planning"] == {"requests": [
+        {"id": waiting["id"], "text": waiting["text"], "status": "new"},
+        {"id": taken["id"], "text": taken["text"], "status": "processing"},
+    ], "branches": []}
+    for language, heading in (("en", "Planning work in flight:"), ("ko", "이어서 할 기획 작업")):
+        output = brief.render(facts, language)
+        assert heading in output
+        for row in (waiting, taken):
+            assert output.count(row["text"]) == 1
+            assert output.count(f"- {row['id']} (") == 1
+        assert done["text"] not in output and "Not a planning request" not in output
+    assert "Planning work in flight:" not in brief.render(sample(), "en")
+
+
+def test_gate_records_open_planning_prs_and_brief_reads_locally(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+    from types import SimpleNamespace
+    import pytest
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import FakeTracker, RecordingTracker, TrackerError
+
+    now = datetime(2026, 11, 4, 9, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: now)
+    remote = FakeTracker(now=lambda: now)
+    live = remote.create_pr(head="pm/live", base="main", title="Live spec", body="")
+    closed = remote.create_pr(head="pm/closed", base="main", title="Closed spec", body="")
+    remote.close_pr(closed, delete_branch=False)
+    merged = remote.create_pr(head="pm/merged", base="main", title="Merged spec", body="")
+    remote.merge_pr(merged, expected_head_sha=remote.pr_head_sha(merged), delete_branch=False)
+    remote.create_pr(head="side/other", base="main", title="Side work", body="")
+    ctx = SimpleNamespace(store=store, config=Config(), now=lambda: now)
+    tracker = RecordingTracker(remote, ctx)
+    tracker.refresh_issues()
+    expected = [{"number": live, "head": "pm/live", "title": "Live spec", "url": remote.get_pr(live).url}]
+    assert store.planning_prs() == expected
+    # A second process in the new session reads the same facts, without a tracker.
+    reopened = StateStore(store.root)
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "list_prs", lambda *args: (_ for _ in ()).throw(AssertionError("remote read")))
+        facts = brief.collect(reopened, Config(), now)
+        assert facts["planning"] == {"requests": [], "branches": expected}
+        assert brief.render(facts).count("pm/live (#") == 1
+    previous = (store.root / "planning_prs.json").read_bytes()
+    previous_issues = store.local_issues()
+    original = remote.list_prs
+
+    def failed(state="open", head_prefix=""):
+        if state == "open":
+            raise TrackerError("offline")
+        return original(state, head_prefix)
+
+    monkeypatch.setattr(remote, "list_prs", failed)
+    now += timedelta(minutes=1)
+    remote.add_issue(99, "Fresh issue after shared PR read recovers")
+    with pytest.raises(TrackerError, match="offline"):
+        tracker.refresh_issues()
+    assert store.local_issues() == previous_issues
+    assert store.issues_observation()["error"] == "offline"
+    assert (store.root / "planning_prs.json").read_bytes() == previous
+    assert reopened.planning_prs() == expected
+    monkeypatch.setattr(remote, "list_prs", original)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "record_planning_prs", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+        now += timedelta(minutes=1)
+        remote.add_issue(100, "Fresh issue despite optional record write failure")
+        assert tracker.refresh_issues()
+        assert next(row for row in store.local_issues() if row["number"] == 100)["title"] == (
+            "Fresh issue despite optional record write failure")
+        assert next(row for row in store.local_issues() if row["number"] == 99)["title"] == (
+            "Fresh issue after shared PR read recovers")
+        assert store.issues_observation()["error"] is None
+        assert (store.root / "planning_prs.json").read_bytes() == previous
+    now += timedelta(minutes=5)
+    remote.close_pr(live, delete_branch=False)
+    tracker.refresh_issues()
+    assert reopened.planning_prs() == []
+    assert "Planning work in flight:" not in brief.render(brief.collect(reopened, Config(), now))
+
+
+def test_planning_pr_record_is_optional_deduplicated_and_cannot_regress(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    import json
+    from foragent.state import StateStore
+    from foragent.tracker import PullRequest
+
+    store = StateStore(tmp_path / "state")
+    assert store.planning_prs() == []
+    now = datetime(2026, 11, 4, 9, tzinfo=UTC)
+    pr = PullRequest(7, "pm/draft", "main", "Draft", "", url="https://example.test/7")
+    store.record_planning_prs([pr, pr], now)
+    assert brief._planning(store)["branches"] == [{
+        "number": 7, "head": "pm/draft", "title": "Draft", "url": "https://example.test/7"}]
+    store.record_planning_prs([], now - timedelta(seconds=1))
+    assert brief._planning(store)["branches"][0]["number"] == 7
+    path = store.root / "planning_prs.json"
+    for content in ("broken", "null", "[]", '{}', '{"prs": null}',
+                    json.dumps({"prs": [None, {}, {"number": 8, "head": None}]})):
+        path.write_text(content)
+        assert brief._planning(store) == {"requests": [], "branches": []}
+    path.unlink()
+    path.mkdir()
+    assert store.planning_prs() == []
+
+
+def test_issue_and_planning_prs_share_every_open_page_once(tmp_path):
+    from datetime import UTC, datetime, timedelta
+    import json
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
+    from foragent.config import Config
+    from foragent.state import StateStore
+    from foragent.tracker import GhTracker, RecordingTracker
+
+    now = datetime(2026, 11, 4, 9, tzinfo=UTC)
+    store = StateStore(tmp_path / "state", now=lambda: now)
+    issue_rows = [{"number": number, "title": f"Issue {number}", "body": "", "labels": [],
+                   "state": "open", "updated_at": now.isoformat()} for number in (7, 8)]
+
+    def pr(number, head):
+        return {"number": number, "head": {"ref": head}, "base": {"ref": "main"},
+                "title": f"PR {number}", "body": "", "merged_at": None,
+                "html_url": f"https://example.test/pull/{number}"}
+
+    pages = [[*(pr(number, f"side/{number}") for number in range(1000, 1099)), pr(70, "foragent/issue-7")],
+             [pr(90, "pm/draft"), pr(80, "foragent/issue-8"), pr(91, "side/unrelated")]]
+    open_pages = []
+
+    def read(argv, input=None):
+        assert argv[0] == "api" and input is None
+        endpoint = urlsplit(next(arg for arg in argv if arg.startswith("repos/owner/repo/")))
+        if endpoint.path.endswith("/issues"):
+            return json.dumps(issue_rows)
+        if endpoint.path.endswith("/sub_issues"):
+            return "[]"
+        assert endpoint.path.endswith("/pulls"), argv
+        if parse_qs(endpoint.query)["state"] == ["closed"]:
+            return "[]"
+        selected = pages if "--paginate" in argv else pages[:1]
+        open_pages.extend(range(1, len(selected) + 1))
+        return "\n".join(json.dumps(page) for page in selected)
+
+    context = SimpleNamespace(store=store, config=Config(), now=lambda: now)
+    RecordingTracker(GhTracker("owner/repo", run=read), context).refresh_issues()
+    assert open_pages == [1, 2], "One complete API observation must feed both consumers"
+    assert {row["number"]: row["pr_number"] for row in store.local_issues()} == {7: 70, 8: 80}
+    assert store.planning_prs() == [{"number": 90, "head": "pm/draft", "title": "PR 90",
+                                     "url": "https://example.test/pull/90"}]
+
+    # A fresh tracker must observe removals too, without a second listing or an open-PR cutoff.
+    pages = [[pr(70, "foragent/issue-7")]]
+    open_pages.clear()
+    now += timedelta(hours=1)
+    RecordingTracker(GhTracker("owner/repo", run=read), context).refresh_issues()
+    assert open_pages == [1]
+    assert {row["number"]: row["pr_number"] for row in store.local_issues()} == {7: 70, 8: None}
+    assert StateStore(store.root).planning_prs() == []

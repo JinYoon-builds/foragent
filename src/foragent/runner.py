@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-from foragent import board, capacity, harness_guard, orch_github
+from foragent import board, capacity, harness_guard, orch_github, orch_stop
 from foragent.actions import FlagContext, flag, invalidate_approval
 from foragent.config import Config, resolved_reviewer
 from foragent.executors import ExecResult, Executor, classify_result, executor_for, stream_session_id
@@ -180,7 +180,10 @@ def _execute(n: int, ctx: RunContext, worktree: Path) -> str:
         start_ref = saved_head
     elif ctx.git.remote_branch_sha(branch) is not None:
         ctx.git.fetch("origin", branch)
-        start_ref = f"origin/{branch}"
+        start_ref = ctx.git.ref_sha(f"origin/{branch}")
+    pending = orch_github.pending_push(ctx, n)
+    if pending and (start_ref == pending["head"] or start_ref == pending["lease"]):
+        start_ref = pending["head"]
     ctx.git.add_worktree(worktree, branch, start_ref)
     git = ctx.git.at(worktree)
     if not _restore_approved_base(n, ctx, git, approval, branch=branch):
@@ -247,12 +250,19 @@ def _implement_and_publish(
     outcome = "error"
     try:
         try:
+            try:
+                pushed = orch_github.resume_push(ctx, n, git)
+            except (GitError, ExecutorStopped):
+                attempt.tracker_available = False  # Preserve locally; this push gave up or lost its lease.
+                raise
+            pushed_head = git.head_sha() if pushed is not None else None
             resume_verified = _resume_implementation(attempt)
             if not _acceptance_matches(n, ctx, git, attempt.approval):
                 raise ExecutorStopped("hash-mismatch")
             attempt.approved_ref = git.head_sha()
             # A resumed head that already passed review returns to its checks and publication.
-            reviewed = not resume_verified and not failure and passed_head(n, ctx, git)
+            reviewed = not resume_verified and not failure and (
+                (pushed is True and git.head_sha() == pushed_head) or passed_head(n, ctx, git))
             passed = git.head_sha() if reviewed else None
             while True:
                 reuse, reviewed = reviewed, False  # only the first pass may reuse that PASS
@@ -260,8 +270,9 @@ def _implement_and_publish(
                     attempt.failure = ""
                     resume_verified = False
                 else:
-                    if not reuse:
+                    if not reuse and not (pushed is False and git.head_sha() == pushed_head):
                         _implement(attempt, attempt.failure, reviewer_text=attempt.reviewer_text)
+                    pushed = None  # A pre-review push resumes checks/review once, without another worker turn.
                     attempt.failure = _verify_implementation(attempt)
                 attempt.reviewer_text = None
                 run = ctx.store.get_run(n)
@@ -358,6 +369,11 @@ def review_only(
     previous = ctx.store.get_run(n)
     started = False
     admission = ExitStack()
+    if (stop := orch_stop.active(ctx.store)) is not None:  # The stop admission, before any write (#1491).
+        from foragent.i18n import text
+
+        _append(ctx.store.log_path(n), text("orch_stop_start_refused", ctx.config.language, n=n, why=stop))
+        return "stopped"
     try:
         if previous is not None and previous.status == "running":
             raise TrackerError(f"issue #{n} already has a running execution")
@@ -422,7 +438,8 @@ def review_only(
             finally:
                 try:
                     # A rate-limit wait is discoverable locally; defer label repair.
-                    if outcome != "limit-wait":
+                    # A stopped review keeps `running` for the tick's stop restore (_restore_stopped).
+                    if outcome not in {"limit-wait", "stopped"}:
                         current = ctx.tracker.current_issue(n)
                         if (not _handed_off(n, ctx) and outcome != "remote-ended" and current.state == "open"
                                 and not current.labels & {BLOCKED, READY}):
@@ -480,6 +497,7 @@ def _run_issue(n: int, ctx: RunContext, admission: ExitStack) -> str:
                                        process_identities=observe_tree(roots=(os.getpid(),)))
         if run.status == "running":
             admission.close()  # The record now names this live process: it holds the slot.
+        orch_stop.raise_if_requested(ctx, n)  # A run that starts under a project stop takes no step (#1491).
         if until := ctx.store.github_wait_until(ctx.now()):
             outcome = orch_github.wait_run(ctx, n, until)
             return outcome

@@ -56,10 +56,25 @@ def set_global(store: StateStore, numbers: list[int]) -> list[int]:
             changed = get_global(store) != order
         except (OSError, TypeError, ValueError):
             changed = True  # An unreadable list is replaced; what it held is unknown.
-        if order:
-            store._write_json(_global_path(store), order)
-        else:
-            _global_path(store).unlink(missing_ok=True)
-        if changed:
-            store.record_flow("priority", issues=order)
+        _write_global(store, order, changed)
     return order
+
+
+def change_global(store: StateStore, number: int, *, remove: bool = False) -> list[int]:
+    """Change one entry atomically, preserving every other entry's position."""
+    with store._state_lock():
+        previous = get_global(store)
+        order = [n for n in previous if n != number] if remove else (
+            previous if number in previous else [*previous, number])
+        _write_global(store, order, order != previous)
+    return order
+
+
+def _write_global(store: StateStore, order: list[int], changed: bool) -> None:
+    """Persist under the caller's state lock and record actual priority changes."""
+    if order:
+        store._write_json(_global_path(store), order)
+    else:
+        _global_path(store).unlink(missing_ok=True)
+    if changed:
+        store.record_flow("priority", issues=order)

@@ -3,23 +3,45 @@ name: fa-init
 description: Set up a project folder for Foragent.
 ---
 
-1. Check whether the current folder is a git work tree. If it is not, get the
-   personal login with `gh api user --jq .login` and organization logins with
-   `gh api user/orgs --jq '.[].login'`. Use AskUserQuestion (or the available
-   question tool) to choose an owner (personal login recommended first, then
-   organization logins) and visibility (private recommended first, then public).
-   Run `git init --initial-branch=main`, create an initial commit, then run
-   `gh repo create <owner>/<folder> --private|--public --source . --push` using
-   the selected owner, folder name, and visibility flag.
+1. Run `fa doctor --setup --json` in the project folder, before `fa init`.
+   Read its `items` from top to bottom: git installed, gh installed, uv installed,
+   gh logged in, gh project scope, then repository linked. The checklist is the source of setup steps;
+   a nonzero exit with JSON means there are steps to finish. For each failing
+   item, the `/fa` session shows its exact `fix` and handles it before moving on:
+   - Installation: use AskUserQuestion (or the available question tool) to ask
+     Yes (recommended) or No. Run the shown install command only after Yes.
+     If the fix is an official installation page, show it and wait for the
+     person to finish that step. After No, print the command or page and stop.
+   - Login: ask the person to run `! gh auth login` in Claude Code themselves,
+     then wait. Never ask for, read or store a token, and never run their login
+     for them. For project scope, show `! gh auth refresh -h github.com -s project`
+     and wait for the person to finish the permission step.
+   - Repository: ask New private repository (recommended), New public repository,
+     or Existing repository URL. Show the commands and ask before creating or
+     linking anything; the choice must come from the person's answer. For a new
+     repository, read `gh api user --jq .login` and
+     `gh api user/orgs --jq '.[].login'` and confirm the owner and name (personal
+     login recommended). Only after agreement, run `git init --initial-branch=main`
+     if the folder has no git work tree, create an initial commit if needed,
+     then run `gh repo create <owner>/<repo> --private|--public --source . --push`
+     with the chosen visibility. For an existing repository, ask for the URL;
+     after the answer, initialize git if needed and run
+     `git remote add origin <URL>`. If origin already exists, show the checklist's
+     `git remote set-url origin <URL>` fix and ask before replacing it.
+   An item waiting on an earlier prerequisite is handled after that prerequisite.
+   Re-run the checklist after each completed fix; continue only when all items
+   pass. If there is no question tool, stop and print the next exact command
+   and any repository choices. An unanswered question is not agreement.
 
-2. At first use, ask only these configuration questions: merge (review) mode, then Claude quota
+2. After setup prerequisites pass, ask only these configuration questions at first use: merge (review) mode, then Claude quota
    mode. Use AskUserQuestion (or the available question tool), recommendation first:
    - fast (recommended): merge passing work automatically unless a human review rule applies.
    - careful: require human review of each task before merging.
    On a re-run, skip a question whose key is already set in its own scope file
    ([settings](references/settings.md)). Leave the executor to the config default.
 
-3. Run `fa init --review <mode>` in the project folder (no `--executor`, never
+3. After the person agrees to set up Foragent, run `fa init --review <mode>` in
+   the background in the project folder and wait for its result (no `--executor`, never
    `--claude-quota`), so the answer lands in init's own commit, and show its
    summary. Only if Claude is available (`claude auth status` logged in, or
    `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` set), then ask the quota mode:
@@ -59,6 +81,13 @@ description: Set up a project folder for Foragent.
    their answer, run the same flag with that explicit answer; No leaves existing
    Claude settings and rules unchanged. A dry run neither asks
    nor grants, and must never be followed by an automatic grant.
+
+   Decision capture is an explicit option: `fa init --decision-hooks yes` installs
+   project hooks for before compaction, session end with new person messages, and
+   every 20 person messages, plus the Stop check that reminds planning about
+   unordered decisions. It adds no init question. The fresh sweep session
+   retains quoted candidates and their transcript source; planning confirms them.
+   `--decision-hooks no` leaves settings unchanged. Rerunning yes keeps one copy.
 
    When `.foragent.yml` has no `checks` key, `fa init` chooses and saves `ci` for
    public repositories (hosted Actions minutes are free), or `local` for private
@@ -104,24 +133,54 @@ description: Set up a project folder for Foragent.
 4. Run `fa adopt survey --json` after setup. When `kind` is `existing`,
    complete steps 5–8 in order. When it is `empty`, go to step 9.
 
-5. Show a short "What I read" list from the survey:
+5. Show a short "What I read" list from the survey. The survey only reads; it
+   changes nothing locally or on GitHub.
+   - `docs`: the docs it read (README, CLAUDE.md, AGENTS.md) with their opening
+     `excerpt`.
    - `hot_paths`: frequently changed paths and their commit counts.
    - `existing_setup`: settings already present that will NOT be touched,
      including existing CLAUDE.md, AGENTS.md, .claude/ files and skills.
    - `ci`: workflow files, detected test commands, and `runs_acceptance` findings.
+   - `github`: open `issues` and `pulls`. For each issue with a nonempty
+     `fixed_by`, say a commit already fixes it and quote the short sha and
+     subject as evidence; only a closing keyword (`fixes #12`) counts, a plain
+     mention does not. If `available` is false, say GitHub was not read and give
+     `reason`; the local part still stands. If `truncated` is true, say the list
+     is partial.
    Preserve existing agent setup; the only CI edit is the approved step 8 change.
+   Never overwrite existing Claude settings (`.claude/settings*.json`), agent
+   files or skills.
 
-6. Propose lanes from `hot_paths`, showing each name and path globs. Reuse
-   existing lanes where they fit and keep overlapping paths in the same lane.
-   Use AskUserQuestion (or the available question tool): Approve all (recommended),
-   Approve some, or Change lanes. Create only the approved new lanes with
-   `fa lanes add <name> --paths '<path>/**'`, substituting the approved name and
-   globs. This creates new lane definitions; it must not overwrite existing
-   agent files or install or edit existing skills.
+6. From the docs, code and hot paths, say in one sentence what kind of project it
+   is (for example "a Python command-line tool that counts words"). Then ask who
+   uses it (for example: only me, my team, outside users or customers), using
+   AskUserQuestion (or the available question tool) with your best guess first.
+   With that answer, prepare one proposal and confirm it in a single
+   AskUserQuestion: Approve all (recommended), Approve some, or Change.
+   - Lanes from `hot_paths`, showing each name and path globs. Reuse existing
+     lanes where they fit and keep overlapping paths in the same lane.
+   - Roles only where work must judge across areas (for example security review
+     for software with outside users), each with its scope and the reason.
+   - Conditional skills: skills from `fa skills catalog --json` that fit only
+     because of what the survey found (for example a web screen or payment
+     code), each with the lane it attaches to and the finding that makes it fit.
+   Do not ask a separate question per lane, role or skill. Apply only the
+   approved items: create new lanes with `fa lanes add <name> --paths '<path>/**'`,
+   substituting the approved name and globs, and add that lane's approved skills
+   to the same command (`--skill <id> <id>`). `fa lanes skills` replaces a
+   lane's whole fixed skill list, so for a reused lane read its current
+   `lanes.<lane>.skills` from `fa order context --json` and run it once as
+   `fa lanes skills <lane> <current-ids> <new-ids>`, the current skills followed by
+   every approved new one. Create approved roles with
+   `fa role add <name> --scope "<paths>" --signal "paths:<paths>" --skill <skill-id> --why "<confirmed reason>"`;
+   it refuses a name that already exists, so an existing role is reused as is.
+   These create new definitions; they must not overwrite existing agent files,
+   Claude settings or skills, or install over or edit existing skills.
 
 7. Run `fa adopt baseline --json`. Report `command`, `passed`, `exit_code`,
-   and the already-broken tests in `failing`. Record these as the starting
-   state rather than fixing them during setup. If no test command was found,
+   and the already-broken tests in `failing`. Report and record these as base
+   failures (broken before Foragent started), not as new failures, and do not fix
+   them during setup. If no test command was found,
    report `skipped`; if the run timed out, report that explicitly. An empty
    failure list with a nonzero exit code is not a passing baseline.
 
@@ -147,8 +206,11 @@ description: Set up a project folder for Foragent.
    available question tool) with the recommended choice first. Offer skills with
    role `style` from the existing catalog; if none fits, report that and leave the
    style unset. Show the paths and style choice for approval, create approved new
-   lanes with `fa lanes add <name> --paths '<path>/**'`, then fix only the chosen
-   style with `fa lanes skills <name> <style-id>` on the relevant new or reused lane.
+   lanes with `fa lanes add <name> --paths '<path>/**' --skill <style-id>`, which
+   fixes only the chosen style on a new lane. On a reused lane, `fa lanes skills`
+   replaces the whole fixed list: read the lane's current `skills` from the
+   `fa order context --json` output above and run
+   `fa lanes skills <name> <current-ids> <style-id>`, keeping every current skill.
    Each lane agent chooses tool, review, and domain skills per issue as needed;
    examples include `design-system`, `design-critique`, `accessibility-review`,
    `ux-copy`, and `webapp-testing`. These are examples, not a fixed design lane

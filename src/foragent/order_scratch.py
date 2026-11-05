@@ -230,6 +230,7 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
     and so is anything in such a directory that resolves into a ``protected`` directory.
     With ``before`` (see ``stamps``) a file whose bytes match but whose stamp differs was
     touched during the run, for example edited and restored, and is refused as changed.
+    A new folder with nothing but folders below it is not a change: it cannot carry content.
     """
     found = _entries(tree)
     touched = set() if before is None else {
@@ -245,6 +246,9 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
     above = _names_above(manifest, acceptance_dir)
     root = tree.resolve()
     candidates, refused, output = {}, [], set()
+    # Folders that hold a file, link or special entry somewhere below; any other new folder is empty.
+    holding = {str(parent) for name, (kind, _) in found.items() if kind != DIRECTORY
+               for parent in PurePosixPath(name).parents}
     for name in changed:
         path = tree / name
         if found.get(name, ("",))[0] == SPECIAL:
@@ -259,6 +263,8 @@ def changes(git: GitRepo, tree: Path, manifest: dict[str, tuple[str, str]], acce
                 output.add(min((folder for folder in new_directories if folder + "/" in ignored
                                 and PurePosixPath(name).is_relative_to(folder)), key=len))
                 continue
+            if name not in manifest and found[name][0] == DIRECTORY and name not in holding:
+                continue  # an empty new folder (tool state) carries nothing and cannot reach a commit
             refused.append(name)  # a folder made, removed or re-permissioned outside the tests
             continue
         directory = next((str(parent) for parent in reversed(PurePosixPath(name).parents)

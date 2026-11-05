@@ -87,8 +87,8 @@ def test_reviewed_refresh_waits_for_capacity_and_rechecks_head_after_admission(t
         assert capacity.machine_runs(store, clock[0]) == 1
         effects.append(name)
 
-    def merge(base):
-        assert base == "new-base"
+    def merge(base, *, commit):
+        assert base == "new-base" and commit is True  # Without prepare the refresh commits the merge itself.
         effect("merge")
         local_head[0] = "refreshed"
 
@@ -1074,3 +1074,217 @@ def test_gate_merges_with_an_explicit_subject_when_every_pr_edit_fails(run_case,
     assert edits[:2] == ["Implement feature (#1)", wip] and edits[-1] == "Implement feature (#1)"
     log = c.store.log_path(1).read_text()
     assert "retitle failed" in log and "HTTP 500" in log
+
+
+@pytest.mark.parametrize("refresh", [False, True], ids=["publication", "base-refresh"])
+def test_own_publication_waits_for_replaced_head(run_case, monkeypatch, refresh):
+    c = run_case
+    c.ctx.config = replace(c.ctx.config, merge_group_max=1)
+    if not refresh:
+        pr = c.tracker.create_pr(head="foragent/issue-1", base="main", title="Existing", body="Closes #1")
+        git_command(c.history.origin, "update-ref", "refs/heads/foragent/issue-1", c.history.tip)
+        c.tracker.set_pr_head_sha(pr, c.history.tip)
+    set_head, read = c.tracker.set_pr_head_sha, c.tracker.pr_head_sha
+    lag, waits, moved, publications = [], [], [], []
+
+    def pushed(pr, head):
+        previous = read(pr)
+        set_head(pr, head)
+        publications.append((previous, head))
+        if previous != head and (not refresh or len(publications) > 1):
+            lag[:] = [previous, previous]
+
+    def reported(pr):
+        return lag.pop(0) if lag else read(pr)
+
+    def sleep(seconds):
+        waits.append(seconds)
+        c.now[0] += timedelta(seconds=seconds)
+
+    def checks(pr):
+        if refresh and not moved:
+            c.history.update({"src/next_base.py": "VALUE = 9\n"})
+            moved.append(c.history.tip)
+        return "pass"
+
+    monkeypatch.setattr(c.tracker, "set_pr_head_sha", pushed)
+    monkeypatch.setattr(c.tracker, "pr_head_sha", reported)
+    monkeypatch.setattr(c.tracker, "pr_checks", checks)
+    c.ctx.sleep = sleep
+    assert run_issue(1, c.ctx) == "merged"
+    assert c.tracker.merged_prs == [2]
+    assert waits == [2, 4]
+    assert not lag
+    assert not c.store.load_flag(1)
+    pushes = [args for _, args in c.operations if args[:1] == ["push"]]
+    leases = [next(arg for arg in args if arg.startswith("--force-with-lease=")) for args in pushes]
+    expected = ["", publications[0][1]] if refresh else [publications[0][0]]
+    assert leases == [f"--force-with-lease=refs/heads/foragent/issue-1:{head}" for head in expected]
+    assert len(pushes) == (2 if refresh else 1)
+
+
+@pytest.mark.parametrize("heads,expected,delays", [
+    (["new"], True, []),
+    (["old", "old", "new"], True, [2, 4]),
+    (["foreign"], False, []),
+    (["old", "foreign"], False, [2]),
+    (["old"] * 6, False, [2, 4, 8, 16, 30]),
+])
+def test_post_push_head_check_is_bounded_and_fresh(heads, expected, delays):
+    from types import SimpleNamespace
+    from foragent import run_publish
+    from foragent.merge_owner_reads import Snapshot
+
+    answers, calls, sleeps = iter(heads), [], []
+
+    def read(pr):
+        calls.append(pr)
+        return next(answers)
+
+    reads = Snapshot(SimpleNamespace(pr_head_sha=read))
+    ctx = SimpleNamespace(tracker=reads, reads=reads, sleep=sleeps.append)
+    with reads.fresh():
+        assert run_publish._head_after_push(ctx, 7, "new", "old") is expected
+    assert sleeps == delays
+    assert calls == [7] * len(heads)
+
+
+def test_post_push_without_replaced_head_does_not_retry():
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    sleeps = []
+    ctx = SimpleNamespace(tracker=SimpleNamespace(pr_head_sha=lambda pr: "other"), sleep=sleeps.append)
+    assert not run_publish._head_after_push(ctx, 7, "new", None)
+    assert sleeps == []
+
+
+def test_publication_lease_reads_live_remote_despite_stale_tracking_ref(git_history, tmp_path):
+    from types import SimpleNamespace
+    from foragent import run_publish
+
+    branch = "foragent/issue-1"
+    cached = git_history.tip
+    git_command(git_history.clone, "update-ref", f"refs/remotes/origin/{branch}", cached)
+    git_history.update({"src/remote_progress.py": "VALUE = 2\n"})
+    git_command(git_history.origin, "update-ref", f"refs/heads/{branch}", git_history.tip)
+    assert git_history.tip != cached
+    git = GitRepo(git_history.clone)
+    execute, pushes = git._run, []
+
+    def transport(args):
+        if args[:1] == ["push"]:
+            pushes.append(args)
+            return ""
+        return execute(args)
+
+    git._run = transport
+    ctx = SimpleNamespace(store=StateStore(tmp_path / "state", now=lambda: BASE_TIME), now=lambda: BASE_TIME)
+    attempt = SimpleNamespace(ctx=ctx, n=1, git=git, branch=branch, rebuilt=False)
+    assert run_publish._push_branch(attempt) == git_history.tip
+    assert pushes == [["push", f"--force-with-lease=refs/heads/{branch}:{git_history.tip}", "origin", branch]]
+    assert attempt.pushed_head == git.head_sha()
+
+
+@pytest.mark.parametrize("queued,running,budget,fallback,outcome,elapsed,polls", [
+    (1800, 600, 20000, False, None, 2400, 20),
+    (None, None, 20000, False, "timeout", 10800, 0),
+    (0, None, 20000, False, "timeout", 1200, 40),
+    (-600, None, 20000, False, "timeout", 1200, 40),
+    (1800, None, 20000, False, "timeout", 3000, 40),
+    (None, None, 600, False, "work-budget", 600, 0),
+    (None, None, 20000, True, None, 10800, 0),
+])
+def test_ci_wait_counts_running_time_and_keeps_work_budget(
+    tmp_path, monkeypatch, queued, running, budget, fallback, outcome, elapsed, polls,
+):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+
+    clock, flags = [BASE_TIME], []
+    start = BASE_TIME.timestamp()
+    def seconds():
+        return clock[0].timestamp() - start
+    def sleep(value):
+        clock[0] += timedelta(seconds=value)
+    def started(pr):
+        return BASE_TIME + timedelta(seconds=queued) if queued is not None and seconds() >= queued else None
+    def checks(pr):
+        return "pass" if running is not None and seconds() >= queued + running else "pending"
+    tracker = SimpleNamespace(pr_checks=checks, pr_checks_started=started, pr_head_sha=lambda pr: "head")
+    ctx = SimpleNamespace(tracker=tracker, now=lambda: clock[0], sleep=sleep, repo="owner/repo",
+                          config=SimpleNamespace(checks_fallback="local" if fallback else "none"))
+    monkeypatch.setattr(runner, "_remaining", lambda n, ctx: budget - seconds())
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    monkeypatch.setattr(run_publish, "flag", lambda *args: flags.append(args))
+    monkeypatch.setattr(run_publish, "_timeout", lambda *args: "work-budget")
+    wait = run_publish._CIWait(start)
+    result = run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=tmp_path), 2, "head", start, wait,
+                                      lambda: pytest.fail("pending CI is not a code failure"), comparison_mode=fallback)
+    assert result == outcome
+    assert seconds() == elapsed
+    assert wait.polls == polls
+    assert bool(flags) == (outcome == "timeout")
+    if outcome == "timeout":
+        assert ("never left the queue" if queued is None else "ran past") in flags[0][-1]
+    if running is not None:
+        assert wait.deadline == start + queued + 1200  # also passed to acceptance comparison
+    if fallback:
+        assert wait.infrastructure
+
+
+def test_ci_wait_running_deadline_obeys_queue_ceiling():
+    from foragent.run_publish_ci import _CIWait
+
+    wait = _CIWait(100, queue_aware=True, running_since=100)
+    assert wait.deadline == 1300
+    wait.running_since = 100 + 10700
+    assert wait.deadline == 100 + 10800
+
+
+@pytest.mark.parametrize("status", ["pass", "none"])
+def test_finished_checks_without_start_metadata_keep_the_comparison_window(monkeypatch, status):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+
+    start = BASE_TIME.timestamp()
+    ctx = SimpleNamespace(repo="owner/repo", now=lambda: BASE_TIME,
+                          tracker=SimpleNamespace(pr_checks_started=lambda pr: None,
+                                                  pr_head_sha=lambda pr: "head"))
+    monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    wait = run_publish._CIWait(start)
+    assert run_publish._wait_for_ci(1, ctx, None, 2, "head", start, wait, pytest.fail, status=status) is None
+    assert wait.deadline == start + 1200
+
+
+@pytest.mark.parametrize("answers, raises, sleeps", [
+    (["UNKNOWN", "UNKNOWN", "CONFLICTING"], True, 2),
+    (["MERGEABLE"] * 3, False, 3),
+    (None, False, 3),
+])
+def test_ci_wait_leaves_at_once_only_when_github_says_conflicting(monkeypatch, answers, raises, sleeps):
+    from types import SimpleNamespace
+    from foragent import runner, run_publish
+    from foragent.ci_mode import ConflictingPR
+
+    clock, slept = [BASE_TIME], []
+    start = BASE_TIME.timestamp()
+
+    def sleep(value):
+        slept.append(value)
+        clock[0] += timedelta(seconds=value)
+        if len(slept) == 3:
+            raise StopIteration  # the wait would have continued
+    replies = list(answers or [])
+    conflicting = None if answers is None else (lambda: replies.pop(0) == "CONFLICTING")
+    ctx = SimpleNamespace(repo="owner/repo", now=lambda: clock[0], sleep=sleep,
+                          config=SimpleNamespace(checks_fallback="none"),
+                          tracker=SimpleNamespace(pr_checks=lambda pr: "pending", pr_head_sha=lambda pr: "head"))
+    monkeypatch.setattr(runner, "_remaining", lambda *args: 3600)
+    monkeypatch.setattr(run_publish, "_progress", lambda *args: None)
+    wait = run_publish._CIWait(start)
+    with pytest.raises(ConflictingPR if raises else StopIteration):
+        run_publish._wait_for_ci(1, ctx, SimpleNamespace(root=Path("/nonexistent")), 2, "head", start, wait,
+                                 pytest.fail, conflicting=conflicting)
+    assert len(slept) == sleeps

@@ -16,7 +16,9 @@ person wrote.
 
 One writer (D95): only the ``fa orch`` commands (pause, resume, plan, queue)
 write ``plan.json``. Readers derive the plan in force: an expired plan reads as
-empty, and a pause whose ``until`` has passed is ignored. The tick appends one
+empty, and a pause whose ``until`` has passed is ignored. A pause until
+``UNTIL_RESUMED`` (a project stop's hold) outlives the plan's expiry: only
+``fa orch release``, ``fa orch resume`` or a new pause of that lane ends it. The tick appends one
 ``plan-expired`` event per ``expires_at`` value, deciding from the events
 journal. Until a command first writes ``plan.json``, readers take the lane
 queues from a pre-plan ``lane-queues.json``; that first write moves them in and
@@ -26,16 +28,19 @@ removes the old file.
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import UTC, datetime
 from glob import has_magic
 import json
 from pathlib import Path
 import posixpath
 
 from foragent import orch_events
+from foragent.file_cache import read_lines
 from foragent.state import StateStore
 
 AUTHORS = ("human", "orchestrator")
+# A pause that holds its lane until a person resumes it; the plan's expiry never lapses it.
+UNTIL_RESUMED = datetime(9999, 12, 31, tzinfo=UTC)
 
 
 class PlanRefused(Exception):
@@ -134,7 +139,9 @@ def _in_force(plan: dict, now: datetime) -> dict:
     files = {path: item for path, item in plan["files"].items()
              if not item["expires_at"] or now < datetime.fromisoformat(item["expires_at"])}
     if _expired(plan, now):
-        plan = {**_empty(), "assignments": plan["assignments"], "goal": plan["goal"]}
+        held = {lane: item for lane, item in plan["paused"].items()
+                if datetime.fromisoformat(item["until"]) == UNTIL_RESUMED}
+        plan = {**_empty(), "paused": held, "assignments": plan["assignments"], "goal": plan["goal"]}
     plan["files"] = files
     plan["paused"] = {lane: item for lane, item in plan["paused"].items()
                       if now < datetime.fromisoformat(item["until"])}
@@ -150,11 +157,10 @@ def _record_expiry(store: StateStore, plan: dict, now: datetime) -> None:
     expired_at = plan["expires_at"]
     journal = store.root / "orch-events.jsonl"
     if journal.is_file():
-        for line in journal.read_text(encoding="utf-8").splitlines():
-            if line.strip() and '"plan-expired"' in line:
-                event = json.loads(line)
-                if event.get("kind") == "plan-expired" and event.get("expires_at") == expired_at:
-                    return
+        for line in read_lines(journal).require_utf8().matching(b'"plan-expired"'):
+            event = line.parsed()
+            if event.get("kind") == "plan-expired" and event.get("expires_at") == expired_at:
+                return
     _journal(store, now, [("plan-expired", None, f"plan expired at {expired_at}; defaults apply",
                            {"expires_at": expired_at, "by": None})])
 

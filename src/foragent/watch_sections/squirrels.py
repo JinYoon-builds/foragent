@@ -50,6 +50,7 @@ def _cut(value: str, width: int, style: str) -> Line:
 
 def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) -> list[Line]:
     from foragent import watch
+    from foragent.watch_art import pixel_rows
 
     status, language, width = snapshot.status, config.language, context["width"]
     top, hits = context.get("top", 0), context.get("hits", [])
@@ -69,8 +70,7 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     staged = any(row.get("status") == "processing" for row in snapshot.requests)
     # With animation off the header keeps its one-line form on every screen (#168).
     if (first_run or idle) and not staged and config.animation:
-        art: list[Line] = [[(glyph, "art") for glyph, foreground, background in row]
-                           for row in watch.half_blocks(watch.ORCHESTRATOR, watch.PALETTE)]
+        art = pixel_rows(watch.ORCHESTRATOR, watch.PALETTE)
         if say:
             words.append(say)
         if words and width >= 56:

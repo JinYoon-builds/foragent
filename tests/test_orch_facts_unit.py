@@ -866,3 +866,64 @@ def test_review_head_done_when_is_checking_time(env, monkeypatch):
     store._now = lambda: NOW
     row, = collect(store, root)["runs"]
     assert row["checking_seconds"] == 60 and row["test_phase_share"] == pytest.approx(0.6)
+
+
+def _retried(store, number, files, committed, *, worktree=True, lane="main"):
+    """A ready issue whose earlier execution recorded a measurement on its branch."""
+    approve(store, number, files, lane=lane)
+    path = store.worktree_path(number)
+    store.start_run(number, branch=f"foragent/issue-{number}", worktree=path, lane=lane)
+    store.update_run(number, declared_files=files, changed_files=committed or [],
+                     effective_files=committed if committed is not None else files,
+                     files_committed=committed is not None)
+    store.finish_run(number, outcome="failed", detail="review rounds used up")
+    if worktree:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _measured(store, number, files, committed):
+    approve(store, number, files, labels=("approved", "running"), active=True)
+    store.update_run(number, declared_files=files, changed_files=committed,
+                     effective_files=committed, files_committed=True)
+
+
+def test_a_committed_retried_start_claims_its_committed_files(env):
+    store, root = env
+    capacity.write_state(store, 8, NOW)
+    _measured(store, 1, ["src/pkg/**"], ["src/pkg/a.py"])
+    _retried(store, 2, ["src/pkg/**"], ["src/pkg/b.py"])
+    approve(store, 3, ["src/pkg/a.py"])
+    facts = collect(store, root, overlap_per_file=2)
+    assert facts["resources"]["parallelizable_work"]["held"] == {}
+    assert facts["binding"] is None
+
+
+def test_an_uncommitted_retried_start_still_claims_its_declared_files(env):
+    store, root = env
+    capacity.write_state(store, 8, NOW)
+    _measured(store, 1, ["src/pkg/**"], ["src/pkg/a.py"])
+    _retried(store, 2, ["src/pkg/**"], None)
+    approve(store, 3, ["src/pkg/a.py"])
+    facts = collect(store, root, overlap_per_file=2)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
+    assert facts["binding"]["kind"] == "structure"
+
+
+def test_a_recorded_commit_whose_worktree_is_gone_claims_the_declared_files(env):
+    store, root = env
+    capacity.write_state(store, 8, NOW)
+    _measured(store, 1, ["src/pkg/**"], ["src/pkg/a.py"])
+    _retried(store, 2, ["src/pkg/**"], ["src/pkg/b.py"], worktree=False)
+    approve(store, 3, ["src/pkg/a.py"])
+    facts = collect(store, root, overlap_per_file=2)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"3": "structure"}
+
+
+def test_a_committed_start_whose_own_glob_meets_a_full_group_is_held(env):
+    store, root = env
+    capacity.write_state(store, 8, NOW)
+    _measured(store, 1, ["src/pkg/**"], ["src/pkg/a.py"])
+    _retried(store, 2, ["src/pkg/**"], None)
+    _retried(store, 3, ["src/pkg/**"], ["src/pkg/c.py"])
+    facts = collect(store, root, overlap_per_file=2)
+    assert facts["resources"]["parallelizable_work"]["held"] == {"3": "structure"}

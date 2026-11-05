@@ -10,7 +10,7 @@ Save the link and a short note per reference. Do not commit screenshots or GIFs.
 
 ## Pitfalls
 
-Lessons from 2026-10-22 (the lane view):
+Lessons from 2026-10-22 (the Foragent dashboard):
 
 - Ambiguous-width glyphs: in Korean (CJK) fonts a symbol such as `◀` draws two
   cells wide and pushes the border. Do not use ambiguous-width symbols in

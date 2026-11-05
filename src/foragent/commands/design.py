@@ -27,7 +27,7 @@ def add(commands) -> None:
     picks.add_argument("--topic", required=True)
     picks.add_argument("--json", action="store_true")
     picks.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
-    done = design_actions.add_parser("done", help="Close preview panes and return to the lane view")
+    done = design_actions.add_parser("done", help="Close preview panes and return to the dashboard")
     done.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     serve = design_actions.add_parser("_serve")
     serve.add_argument("--directory", type=cli.Path, required=True)

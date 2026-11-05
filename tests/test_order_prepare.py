@@ -242,14 +242,16 @@ def test_a_fifo_or_socket_left_in_the_scratch_is_a_question_and_never_read(git_h
 def test_folders_made_removed_or_re_permissioned_outside_the_tests_are_questions(git_history, tmp_path):
     git, tree, manifest = scratch(git_history, tmp_path, {
         "src/app.py": "x = 1\n", "lib/util.py": "y = 1\n", ".gitignore": ".venv/\n"})
-    (tree / "newpkg").mkdir()                       # empty production folder
+    (tree / "newpkg").mkdir()                       # production folder that holds a file
+    (tree / "newpkg/mod.py").write_text("z = 1\n")
+    (tree / "toolstate/a").mkdir(parents=True)      # empty new folders carry nothing (#2127)
     (tree / "src").chmod(0o700)                     # permission change on an existing folder
     (tree / "lib/util.py").unlink()
     (tree / "lib").rmdir()                          # folder removed
     (tree / "tests/acceptance/helpers").mkdir(parents=True)  # new folders for tests are fine
     (tree / ".venv/bin").mkdir(parents=True)        # ignored tool output stays exempt
     candidates, refused, ignored = order_scratch.changes(git, tree, manifest, "tests/acceptance/")
-    assert refused == ["lib", "lib/util.py", "newpkg", "src"]
+    assert refused == ["lib", "lib/util.py", "newpkg", "newpkg/mod.py", "src"]
     assert candidates == {} and ignored == [".venv"]
 
 
