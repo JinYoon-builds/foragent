@@ -24,8 +24,8 @@ from typing import Any, BinaryIO
 
 WRAPPER_COMMAND = "fa statusline"
 HOOK_COMMAND = "fa statusline --session-start"
-# Sessions the person starts or resumes; not /clear or compaction inside a session.
-HOOK_MATCHER = "startup|resume"
+# Decision context must be restored whenever Claude starts a fresh context.
+HOOK_MATCHER = "startup|resume|clear|compact"
 PROMPT_COMMAND = "fa statusline --prompt-context"
 # Seconds Claude Code waits for the prompt hook before it goes on without its context.
 PROMPT_TIMEOUT = 5
@@ -136,6 +136,14 @@ def wrapper_active(settings: dict) -> bool:
 
 def with_hook(settings: dict) -> dict:
     """``settings`` with every missing Foragent hook added (unchanged when all are there)."""
+    hooks = settings.get("hooks")
+    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    if any(isinstance(group, dict) and isinstance(group.get("hooks"), list)
+           and group.get("matcher") != HOOK_MATCHER
+           and any(_is_ours("SessionStart", hook) for hook in group["hooks"])
+           for group in (groups if isinstance(groups, list) else [])):
+        # Reinstall only our commands; shared groups keep their original matcher.
+        settings = without_hook(settings)
     if has_hook(settings):
         return settings
     hooks = settings.get("hooks")
@@ -285,10 +293,11 @@ def _pm_moved_notice(payload: dict) -> str | None:
 
 
 def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
-    """Entry point for SessionStart: one JSON object with the summary and PM context, or nothing.
+    """SessionStart: PM and decision context, plus the summary line on startup and resume.
 
     Claude Code shows a hook's systemMessage to the person; plain stdout would reach only
-    Claude. The summary follows presence.session_start; PM context is independent.
+    Claude. The summary follows presence.session_start; PM and decision context are independent.
+    Clear and compaction restore that context without restarting the summary or squirrel.
     hookSpecificOutput.sessionTitle names the session's role and the project (presence.session_start too).
     It also brings an earlier install's hooks up to date and binds a planning checkout to
     its repository's box, so nobody reruns fa init for either.
@@ -312,21 +321,43 @@ def session_start(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None)
         presence.bind_checkout(folder, datetime.now(UTC))
     except Exception:  # Setup upkeep must never disturb the session that is starting.
         pass
-    try:
-        message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
-                                                 datetime.now(UTC))
-    except Exception:  # A failed summary must never disturb the session that is starting.
-        message = None
+    message = None
+    if payload.get("source", "startup") in {"startup", "resume"}:
+        try:
+            message = presence.session_start_message(folder, session_id if isinstance(session_id, str) else None,
+                                                     datetime.now(UTC))
+        except Exception:  # A failed summary must never disturb the session that is starting.
+            pass
     output: dict[str, Any] = {"systemMessage": message} if message else {}
     specific: dict[str, Any] = {}
     try:
         project = presence._project(folder)
-        if project is not None and presence._planning_session(folder, project[1]):
+        planning = project is not None and presence._planning_session(folder, project[1])
+    except Exception:  # Optional context must never disturb the session that is starting.
+        planning = False
+    contexts = []
+    if planning:
+        try:
             from foragent.commands import _pm_table
 
-            specific["additionalContext"] = _pm_table.render()
-    except Exception:  # Optional context must never disturb the session that is starting.
-        pass
+            contexts.append(_pm_table.render())
+        except Exception:  # Optional context must never disturb the session that is starting.
+            pass
+        try:
+            from foragent import decisions
+
+            root = presence.project_root(folder)
+            if root is not None:
+                config, store = project
+                ledger = (root / decisions.LEDGER).read_text(encoding="utf-8")
+                context = decisions.unordered_context(root, decisions.observed_rows(store._issue_view()),
+                                                      ledger, config.language)
+                if context:
+                    contexts.append(context)
+        except Exception:  # Decision records must never stop the session from starting.
+            pass
+    if contexts:
+        specific["additionalContext"] = "\n\n".join(contexts)
     try:
         title = presence.session_title(folder, payload.get("agent_type"))
     except Exception:  # A failed title only drops the title.
@@ -361,6 +392,13 @@ def prompt_context(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None
     moved = _pm_moved_notice(payload)
     if moved:
         context = moved + ("\n\n" + context if context else "")
+    try:
+        fresh = presence.fresh_session(folder, payload.get("transcript_path"), channel="session_start")
+    except Exception:
+        fresh = None
+    if fresh:
+        note = fresh + "\nTell the person this suggestion; the statusline may not show on Orca mobile."
+        context = note + ("\n\n" + context if context else "")
     from foragent.orch_inbox import clean
 
     # The one place box text leaves the process: whatever slipped past the row
@@ -400,9 +438,12 @@ def run(stdin: BinaryIO | None = None, stdout: BinaryIO | None = None) -> int:
     presence.renew_planning(Path.cwd())
     now = datetime.now(UTC)
     output = presence.append(output, presence.statusline_segment(Path.cwd(), now))
-    session_id = _session_input(raw).get("session_id")
-    output = presence.append(output, _pm_segment(Path.cwd(), _hook_session(_session_input(raw))))
+    payload = _session_input(raw)
+    session_id = payload.get("session_id")
+    output = presence.append(output, _pm_segment(Path.cwd(), _hook_session(payload)))
     art = presence.squirrel(Path.cwd(), session_id if isinstance(session_id, str) else None, now)
+    if fresh := presence.fresh_session(Path.cwd(), payload.get("transcript_path")):
+        output += (b"\n" if output and not output.endswith(b"\n") else b"") + fresh.encode("utf-8")
     stdout.write(art.encode("utf-8") + b"\n" + output if art else output)
     stdout.flush()
     return code

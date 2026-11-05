@@ -70,6 +70,7 @@ def installed_tools() -> dict[str, bool]:
 
 
 def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
+    """Keep the process failure and gh's explanation, including partial timeout output."""
     parts = [str(exc)]
     if isinstance(exc, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
         for output in (exc.stdout, exc.stderr):

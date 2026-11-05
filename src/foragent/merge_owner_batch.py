@@ -4,11 +4,12 @@ from contextlib import ExitStack
 from hashlib import sha256
 from types import SimpleNamespace
 import json
+import subprocess
 
-from foragent import ci_mode, harness_guard
+from foragent import ci_mode, harness_guard, orch_stop
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, measurement_scope
 from foragent.ci_local import LocalComparisonUnavailable
-from foragent.git import main_write_lock
+from foragent.git import GitError, main_write_lock
 from foragent.issue import parse_body
 from foragent.records import load_record
 from foragent.run_attempt import AttemptFailure, ExecutorStopped
@@ -296,13 +297,35 @@ class Evidence:
 
 
 def _join(ctx, report, base, before, place, job):
-    """Skip composition failures; an already included head aborts the train."""
+    """Repair target conflicts; skip other failures unless the head is included."""
     try:
         head = job["head"]
         if ci_mode.pr_changes_workflows(ctx.git, base, head):
             raise ValueError("acceptance workflow differs from target")
         if not ctx.git.is_ancestor(head, before):
-            tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
+            try:
+                tree = ctx.git._call(["merge-tree", "--write-tree", before, head]).splitlines()[0]
+            except GitError as exc:
+                cause = exc.__cause__
+                if not (isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1):
+                    raise
+                if before != base:
+                    try:
+                        ctx.git._call(["merge-tree", "--write-tree", base, head])
+                    except GitError as target_error:
+                        cause = target_error.__cause__
+                        if not (isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 1):
+                            raise
+                    else:
+                        raise exc  # This head conflicts only with an earlier member.
+                from foragent import merge_owner as owner
+
+                repaired = owner._try_admission(ctx, place, job, lambda: owner._repair(
+                    ctx, place, job, f"Base refresh failed (base-changed); repair the PR on {base}."))
+                if repaired and job["phase"] == "repair-requested":
+                    report.actions.append(f"#{place.n} sent back to lane: conflicts with {base[:8]}")
+                    return None
+                raise exc
             message = f"Merge member #{place.n}\n\nForagent-Member: #{place.n} {head} {place.started_at}\n"
             commit = ctx.git._call(["-c", "user.name=foragent", "-c", "user.email=foragent@localhost",
                                     "commit-tree", tree, "-p", before, "-p", head, "-m", message]).strip()
@@ -392,7 +415,11 @@ def prepare(ctx, report, candidates):
                     continue
                 chain, before = [], base
                 for p, j, _ in selection:
+                    if j["phase"] != "waiting":
+                        continue  # A previous selection may have returned this admission to its lane.
                     member = _join(ctx, report, base, before, p, j)
+                    if ctx.store.github_wait_until(ctx.now()):
+                        return False
                     if member is None:
                         continue
                     chain.append(member)
@@ -509,12 +536,13 @@ def land(ctx, report, candidates, proof):
                 else:
                     checking = None
                     _validate_trees(ctx.git, proof.base, proof.chain)
-                    for place, job, _, _, _ in prepared:
-                        job.update(phase="merging", merge_base=proof.base)
-                        owner._save(ctx, place, job)
-                    target = f"refs/heads/{ctx.config.base_branch}"
-                    ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
-                                   "origin", f"{proof.chain[-1][2]}:{target}"])
+                    with orch_stop.merging(ctx, prepared[0][0].n):
+                        for place, job, _, _, _ in prepared:
+                            job.update(phase="merging", merge_base=proof.base)
+                            owner._save(ctx, place, job)
+                        target = f"refs/heads/{ctx.config.base_branch}"
+                        ctx.git._call(["push", f"--force-with-lease={target}:{proof.base}",
+                                       "origin", f"{proof.chain[-1][2]}:{target}"])
         if failed is None:
             for place, job, _, _, _ in prepared:
                 with ctx.reads.fresh():
@@ -522,6 +550,8 @@ def land(ctx, report, candidates, proof):
     except ci_mode.MissingComparison:
         return  # CI registration/status can change during the unlocked checks too.
     except Exception as exc:
+        if isinstance(exc, ExecutorStopped) and exc.outcome == "stopped":
+            return  # Keep the published train and its admissions for the release.
         if isinstance(exc, TrackerError) and exc.waits:
             raise
         reason = str(exc) or type(exc).__name__

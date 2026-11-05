@@ -50,6 +50,14 @@ def view_evidence_worker_row(frame):
     return _api_row(frame)
 
 
+def view_evidence_opened(snapshot, case, *, width=90):
+    """The same frame after a click on acorn #1: the main row plus its bubble (D112)."""
+    from test_lane_m2_contract import pick
+
+    opened, _ = pick(snapshot, case.config, case.root, case.store, ("acorn", 1), width=width)
+    return opened
+
+
 def test_view_evidence_orchestrator_claim_follows_heartbeat_age(git_history, tmp_path, monkeypatch, capsys):
     from foragent.watch import render_frame
 
@@ -72,16 +80,17 @@ def test_view_evidence_working_and_quiet_use_log_age_rather_than_fresh_state_met
     case, main = view_evidence_case(git_history, tmp_path, monkeypatch)
     # Old state metadata must not override actual, recent executor output.
     case.store.update_run(1, last_activity_at=(case.clock[0] - timedelta(minutes=12)).isoformat())
-    fresh = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
-                         width=90, now=case.clock[0])
-    row = view_evidence_worker_row(fresh)
+    snapshot = view_evidence_snapshot(case, main, capsys)
+    fresh = render_frame(snapshot, case.config, case.root, width=90, now=case.clock[0])
+    row = view_evidence_worker_row(view_evidence_opened(snapshot, case))
     assert "#1" in row and "작성" in row and "조용해요" not in row and "멈춘 듯" not in row, row
     # Conversely, fresh state metadata is not evidence of executor output.
     case.store.update_run(1, last_activity_at=case.clock[0].isoformat())
     view_evidence_log(case, minutes=10)
-    quiet = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
-                         width=90, now=case.clock[0])
-    assert "10분째 조용해요" in view_evidence_worker_row(quiet)
+    snapshot = view_evidence_snapshot(case, main, capsys)
+    quiet = render_frame(snapshot, case.config, case.root, width=90, now=case.clock[0])
+    assert "조용해요" not in view_evidence_worker_row(quiet), "D112: the main screen shows the acorn only"
+    assert "10분째 조용해요" in view_evidence_worker_row(view_evidence_opened(snapshot, case))
 
 
 def test_view_evidence_dead_pid_overrides_fresh_log_and_working_record(
@@ -96,9 +105,10 @@ def test_view_evidence_dead_pid_overrides_fresh_log_and_working_record(
         raise ProcessLookupError
 
     monkeypatch.setattr("foragent.watch.os.kill", dead)
-    frame = render_frame(view_evidence_snapshot(case, main, capsys), case.config, case.root,
-                         width=90, now=case.clock[0])
-    row = view_evidence_worker_row(frame)
+    snapshot = view_evidence_snapshot(case, main, capsys)
+    frame = render_frame(snapshot, case.config, case.root, width=90, now=case.clock[0])
+    assert "작업자가 없어요" not in view_evidence_worker_row(frame), "D112: the main screen shows the acorn only"
+    row = view_evidence_worker_row(view_evidence_opened(snapshot, case))
     assert "작업자가 없어요" in row and "⚠" in row
 
 
@@ -135,3 +145,26 @@ def test_view_evidence_idle_without_heartbeats_has_no_orchestrator_warning(
                          width=90, now=case.clock[0])
     assert "⚠" not in frame and "오케스트레이터가 꺼져 있어요" not in frame
     assert "지켜보는 중" not in frame, "absence of work must not invent a live watcher"
+
+
+def test_view_evidence_dashboard_after_a_tick_says_the_orchestrator_is_off(
+    git_history, tmp_path, monkeypatch, capsys,
+):
+    """The printed dashboard (`fa gate watch --once`, fed by the gate's tick) keeps the
+    whole-system orchestrator-off warning that the old evidence row carried."""
+    from foragent.scheduler import tick
+    from test_orch_review_handoff import tick_context
+    from test_squirrel_running import plain_frame
+
+    case, main = view_evidence_case(git_history, tmp_path, monkeypatch)
+    tick(tick_context(case, start_runs=False))
+    capsys.readouterr()
+    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
+    fresh = plain_frame(capsys.readouterr().out)
+    assert "#1" in fresh and "오케스트레이터가 꺼져 있어요" not in fresh
+    heartbeats_write(case.store, "orch", case.clock[0] - timedelta(minutes=2))
+    tick(tick_context(case, start_runs=False))
+    capsys.readouterr()
+    assert main(["gate", "watch", "--once", "--repo-root", str(case.root)]) == 0
+    stale = plain_frame(capsys.readouterr().out)
+    assert stale.count("오케스트레이터가 꺼져 있어요") == 1, stale
