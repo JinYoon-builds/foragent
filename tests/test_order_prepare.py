@@ -83,6 +83,7 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
     monkeypatch.setattr("foragent.order.validate_plan", lambda plan, root, config: {})
     rows = order_prepare.prepare(plan, tmp_path, Config(), None, store, status=True)
     assert rows[0] == {"key": "a", "status": "written", "phase": "writing_tests", "questions": [],
+                       "notes": [],
                        "holds": 0, "reason": "r", "updated_at": "2026-10-31T00:00:00+00:00",
                        "base_revision": "abc", "written": ["tests/acceptance/test_a.py"], "attempts": 1}
     assert rows[1]["status"] == "legacy" and rows[1]["phase"] == "preread"
@@ -91,7 +92,23 @@ def test_status_reads_the_record_without_starting_an_agent(tmp_path, monkeypatch
 def test_writer_reply_is_read_from_a_fenced_block():
     reply = 'Done.\n```json\n{"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}\n```\n'
     assert order_prepare._envelope(reply)["done_when"] == ["c"]
+    assert order_prepare._envelope(reply)["notes"] == []
     assert order_prepare._envelope('{"acceptance_files": [], "done_when": [], "questions": []}') is None
+
+
+@pytest.mark.parametrize("notes", [["Verified locally.", "A person should check the output."], [], None, "note", [1]])
+def test_prepare_reply_notes_are_optional_lists_of_strings(notes):
+    from foragent import order_prepare_review
+
+    writer = {"acceptance_files": {"t.py": "x"}, "done_when": ["c"], "questions": []}
+    reviewer = {"verdict": "pass", "reason": "ok", "questions": []}
+    for parse, reply in ((order_prepare._envelope, writer), (order_prepare_review._reply, reviewer)):
+        assert parse(json.dumps(reply))["notes"] == []
+        parsed = parse(json.dumps(reply | {"notes": notes}))
+        if isinstance(notes, list) and all(isinstance(note, str) for note in notes):
+            assert parsed["notes"] == notes
+        else:
+            assert parsed is None
 
 
 
@@ -580,6 +597,14 @@ def test_a_pass_needs_every_command_red_mapped_statements_and_its_own_session(tm
     assert _review_outcome(tmp_path, PASS, session="writer-1")["status"] == "interrupted"
 
 
+def test_a_reviewer_pass_with_notes_is_still_a_pass(tmp_path):
+    notes = ["A person should inspect the receipt."]
+    outcome = _review_outcome(tmp_path, PASS | {"notes": notes})
+    assert outcome["status"] == "reviewed" and outcome["verdict"] == "pass"
+    assert outcome["notes"] == notes
+    assert _review_outcome(tmp_path, PASS | {"notes": notes, "red": [RUN | {"exit_code": 0}]})["status"] == "hold"
+
+
 def test_a_pass_without_the_agreed_evidence_promotes_nothing(tmp_path):
     cover = PASS["coverage"][0]
     incomplete = [
@@ -694,6 +719,65 @@ def test_results_made_on_an_older_main_are_written_and_reviewed_again(request, g
 
 _cases = _lane_case_module()
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
+
+
+@pytest.mark.parametrize("question_from", [None, "writer", "reviewer"])
+def test_preparation_keeps_writer_and_reviewer_notes_and_only_questions_block(request, capsys, monkeypatch,
+                                                                           question_from):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    notes = {"writer": ["Use the repository's unittest tooling."],
+             "reviewer": ["A person should inspect the receipt formatting."]}
+    if question_from == "writer":
+        case.writer_questions = ["Should a receipt include a delivery time?"]
+    elif question_from == "reviewer":
+        case.verdicts = ["question"]
+    for cls, role in ((executors.CodexExecutor, "writer"), (executors.ClaudeExecutor, "reviewer")):
+        run = cls.run
+
+        def with_notes(self, _run=run, _notes=notes[role], **kwargs):
+            result = _run(self, **kwargs)
+            reply = json.loads(result.last_message) | {"notes": _notes}
+            return replace(result, last_message=json.dumps(reply))
+
+        monkeypatch.setattr(cls, "run", with_notes)
+    row = _cases.prepare(case, capsys)
+    roles = ["writer"] if question_from == "writer" else ["writer", "reviewer"]
+    expected_notes = [note for role in roles for note in notes[role]]
+    assert [call["role"] for call in case.calls] == roles
+    assert row["notes"] == expected_notes
+    assert row["status"] == ("question" if question_from else "reviewed")
+    assert bool(row["questions"]) == bool(question_from)
+    entry = json.loads(_record(case).read_text())["issues"]["notice"]
+    assert entry["notes"] == expected_notes
+    assert [attempt["notes"] for attempt in entry["attempts"]] == [notes[role] for role in roles]
+    assert _cases.prepare(case, capsys, status=True)["notes"] == expected_notes
+    assert [call["role"] for call in case.calls] == roles
+    if question_from:
+        assert "acceptance_files" not in _cases.disk_plan(case)["issues"][0]
+    else:
+        assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+        code, out, err = _cases.publish(case, capsys, "--approve")
+        assert code == 0, out + err
+        child = next(issue for issue in case.tracker.issues.values() if issue.title == "Notice delivery")
+        assert "## Preparation notes\n" + "".join(f"- {note}\n" for note in expected_notes) in child.body
+
+
+@pytest.mark.parametrize("edit", [False, True])
+@pytest.mark.parametrize("notes", [[], ["Writer choice.", "Reviewer verification."]])
+def test_published_preparation_notes_use_the_child_or_edit_record(tmp_path, monkeypatch, edit, notes):
+    from foragent import order, order_reviewed
+
+    item = {"goal": "g", "out_of_scope": "o", "statements": ["s"], "done_when": ["check"],
+            **({"number": 7} if edit else {"key": "a"})}
+    plan = {"id": "p", "issues": [] if edit else [item], "edits": [item] if edit else []}
+    monkeypatch.setattr(order_reviewed, "_record", lambda plan, repo: {"#7" if edit else "a": {"notes": notes}})
+    body = order._published_body(plan, item, "owner/repo", Config())
+    if notes:
+        assert body.endswith("\n## Preparation notes\n- Writer choice.\n- Reviewer verification.\n")
+    else:
+        assert "Preparation notes" not in body
 
 
 def test_promotion_never_loses_a_planning_edit_made_meanwhile(tmp_path, monkeypatch):
