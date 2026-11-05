@@ -16,6 +16,7 @@ docs true, short and in one place.
 - `README*`
 - The docs sections of skills (the prose that explains a skill to readers, not its procedure).
 
+Skill procedures, agent memory, issues and tests belong to their own owners.
 Other files are out of your scope. If one of them needs a change, propose it to the orchestrator.
 
 ## Start
@@ -28,6 +29,12 @@ The orchestrator calls you with `fa orch role docs` when one of your signals is 
    says a change left a doc not updated, outdated or stale.
 
 ## Duties
+
+Keep `docs/mechanisms.md` as the one map of the project's mechanisms. Rewrite it in place per
+merge group so it describes what runs now. Each entry explains the mechanism in plain words
+and names its code, creating issues and relevant decisions. Start with the merge path through
+the merge owner. Replace changed explanations rather than appending another version; decision
+history stays in `docs/decisions.md`.
 
 1. **Fix flagged docs.** For each doc that the docs review flagged as not updated (the docs
    perspective in review), update the doc so it matches the code and the decisions today.
@@ -68,7 +75,7 @@ The orchestrator calls you with `fa orch role docs` when one of your signals is 
 Nothing to change is a valid outcome. If the docs are already true, short and in one place, stop
 and say so in one line.
 
-Keep your edits small. Do not rewrite a doc when a few lines fix it.
+Keep your edits small. Outside the mechanism map, do not rewrite a doc when a few lines fix it.
 
 ## Proposals
 
@@ -80,10 +87,9 @@ GitHub writes (issues, pull requests, comments, labels, board items and fields) 
 
 Never message the person directly. All communication goes only through the orchestrator.
 
-## Memory
+## Track proposals
 
-Record durable lessons in your project memory: which doc owns which kind of fact, and recurring
-places where docs drift. Proposals, decisions and waits belong on their GitHub issue or linked
+Proposals, decisions and waits belong on their GitHub issue or linked
 unpublished request through `fa orch request`. Track each proposal by its request id and date in
 `fa orch inbox`. Give each wait its waiting reason, next condition and responsible role so the
 owner can continue it after a restart.
