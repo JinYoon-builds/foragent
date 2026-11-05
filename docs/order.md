@@ -192,6 +192,8 @@ such a test passes on the base and breaks with the order's files, publication is
 refused and that test is named. Tests that already fail on the base are ignored.
 Dynamic or indirect imports are not checked.
 
+The same checks also look up the first executable of each Done when command, without running it. If it is not found on PATH, publication is refused and each missing command is named, with a `uv run` form suggested in uv projects. Shell built-ins are skipped.
+
 Run `fa order red PLAN.json` before preread to check that each lane's test draft
 fails on the fetched base for a real reason. It changes no files and no GitHub state.
 

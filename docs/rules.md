@@ -77,8 +77,8 @@ This file lists the rules in force now, one line each. Each line cites a live de
 
 - Review judges by tests, goal, principles and real defects. Other approaches, names and structure are taste: a NOTE, never a failure. ([D98](decisions.md#d98-무엇what은-계획이-어떻게how는-레인이-정한다-2026-10-30-jin))
 - The first review round is multi-perspective. Later rounds only confirm. ([D105](decisions.md#d105-첫-리뷰는-여러-관점으로-다음-회차는-확인만-2026-10-31-jin))
-- A review FAIL blocks only when it is grounded (Goal or Out of scope line, locked test, breaking input) and scores 80+; a grounded fatal path always blocks; the rest is a NOTE. ([D125](decisions.md#d125-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
-- When the Goal does not decide a point, review asks a spec-question instead of sending rework. ([D125](decisions.md#d125-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
+- A review FAIL blocks only when it is grounded (Goal or Out of scope line, locked test, breaking input) and scores 80+; a grounded fatal path always blocks; the rest is a NOTE. ([D126](decisions.md#d126-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
+- When the Goal does not decide a point, review asks a spec-question instead of sending rework. ([D126](decisions.md#d126-리뷰-fail은-근거가-있을-때만-막는다-2026-11-02-jin))
 - An unclear review goes verbatim to the implementer, who fixes or answers each point. A new reviewer judges. ([D44](decisions.md#d44-문제는-가장-가까운-층이-먼저-푼다-2026-10-21-jin))
 - When the same issue comes back twice for the same defect class, redesign it. ([D106](decisions.md#d106-같은-종류의-결함으로-두-번-돌아오면-다시-설계한다-2026-10-31-jin))
 - A PR that touches a risk-map path gets that note and a stricter review. ([D84](decisions.md#d84-리뷰어를-강화한다--프로젝트마다-자라는-위험-지도-2026-10-24-jin))
