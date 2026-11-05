@@ -158,7 +158,7 @@ def _available_executor(
     a transient retry or transient exhaustion discards, before this function decides on it.
     ``requeue=False`` records quota facts and stops, leaving the issue transition to the panel.
     """
-    from foragent import runner
+    from foragent import orch_stop, runner
     from foragent.run_checks import _append
     from foragent.scheduler_quota import credits
 
@@ -191,6 +191,8 @@ def _available_executor(
         # Every launch, including a fresh start after a failed resume and each retry, is admitted
         # here: another run may have paused this executor, or this run reached its spend_cap (#786).
         # A keep-mode switched run (#107) never pauses its lane: the lane's own pair may be free.
+        # A project stop (#1491) starts no further turn: the owner saves the run instead.
+        orch_stop.raise_if_requested(ctx, n)
         current, view = ctx.store.get_run(n), QuotaView(ctx.store, ctx.now())
         if reviewer and quota_reviewer.reviewer_limited(n, ctx, name, view):
             raise ReviewerLimited(name)  # Before _limit_wait: the review moves to the worker (#186).
@@ -207,6 +209,7 @@ def _available_executor(
             result = _run_executor(n, ctx, executor, spender=spender, on_session=live, **kwargs)
             if on_result is not None:
                 on_result(result)
+            orch_stop.raise_if_requested(ctx, n)  # A stop during the turn: its result takes no further step.
             return result
         except BaseException:
             # run_logged flushes stdout into the log during interruption cleanup.

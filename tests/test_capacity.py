@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,33 @@ def no_inherited_test_slot(monkeypatch):
 
 
 NOW = datetime(2026, 10, 23, 12, tzinfo=UTC)
+PRESSURE_WORDS = {"normal", "warn", "critical"}
+
+
+def fake_sysctl(monkeypatch, level, result=0):
+    """Fake libc at the ctypes boundary: sysctlbyname writes ``level`` and returns ``result``."""
+    def sysctl(name, output, size, new_value, new_size):
+        assert name == b"kern.memorystatus_vm_pressure_level"
+        assert size._obj.value == ctypes.sizeof(ctypes.c_int)
+        output._obj.value = level
+        return result
+
+    def cdll(*args, **kwargs):
+        if level is None:
+            raise OSError("libSystem is not available")
+        return SimpleNamespace(sysctlbyname=sysctl)
+
+    monkeypatch.setattr(capacity.sys, "platform", "darwin")
+    monkeypatch.setattr(capacity.ctypes, "CDLL", cdll)
+
+
+def _slot_free(ceiling):
+    """Whether a command with this ceiling could take a machine test slot right now."""
+    try:
+        with capacity.hold_test_slot(ceiling, deadline=time.monotonic()):
+            return True
+    except TimeoutError:
+        return False
 
 
 def dead_pid():
@@ -44,8 +72,7 @@ def test_next_parallel_never_goes_below_one():
 @pytest.mark.parametrize("level,expected", [(1, "normal"), (2, "warn"), (4, "critical"),
                                             (None, "normal"), (7, "normal")])
 def test_darwin_pressure_maps_sysctl_levels(monkeypatch, level, expected):
-    monkeypatch.setattr(capacity.sys, "platform", "darwin")
-    monkeypatch.setattr(capacity, "_darwin_pressure_level", lambda: level)
+    fake_sysctl(monkeypatch, level)
 
     def no_subprocess(*args, **kwargs):
         raise AssertionError("memory pressure must not start a subprocess")
@@ -61,19 +88,26 @@ def test_darwin_pressure_level_reads_kernel_in_process(monkeypatch):
         raise AssertionError("memory pressure must not start a subprocess")
 
     monkeypatch.setattr(subprocess, "Popen", no_subprocess)
-    assert capacity._darwin_pressure_level() in {*capacity._DARWIN_PRESSURE, None}
+    real_cdll, names = ctypes.CDLL, []
+
+    def spy(*args, **kwargs):
+        libc = real_cdll(*args, **kwargs)
+
+        def sysctlbyname(name, *rest):
+            names.append(name)
+            return libc.sysctlbyname(name, *rest)
+
+        return SimpleNamespace(sysctlbyname=sysctlbyname)
+
+    monkeypatch.setattr(capacity.ctypes, "CDLL", spy)
+    assert capacity.memory_pressure() in PRESSURE_WORDS
+    assert names == [b"kern.memorystatus_vm_pressure_level"]
 
 
-@pytest.mark.parametrize("result,expected", [(0, 2), (1, None)])
+@pytest.mark.parametrize("result,expected", [(0, "warn"), (1, "normal")])
 def test_darwin_pressure_reads_sysctl_value_and_handles_errors(monkeypatch, result, expected):
-    def sysctl(name, output, size, new_value, new_size):
-        assert name == b"kern.memorystatus_vm_pressure_level"
-        assert size._obj.value == ctypes.sizeof(ctypes.c_int)
-        output._obj.value = 2
-        return result
-
-    monkeypatch.setattr(capacity.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(sysctlbyname=sysctl))
-    assert capacity._darwin_pressure_level() == expected
+    fake_sysctl(monkeypatch, 2, result)
+    assert capacity.memory_pressure() == expected
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -161,11 +195,11 @@ def test_budget_starts_at_initial_value_and_spaces_increases(tmp_path, monkeypat
     monkeypatch.setattr(scheduler, "machine_load", lambda: ("normal", 0.1))
     ready = {f"lane-{n}": [n] for n in range(6)}
     ctx = budget_ctx(tmp_path, NOW)
-    assert scheduler._machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL
-    assert scheduler._machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL
+    assert scheduler.machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL
+    assert scheduler.machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL
     ctx.now = lambda: NOW + capacity.INCREASE_INTERVAL
-    assert scheduler._machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL + 1
-    assert scheduler._machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL + 1
+    assert scheduler.machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL + 1
+    assert scheduler.machine_budget(ctx, ready) == capacity.INITIAL_PARALLEL + 1
     assert capacity.read_state(ctx.store)["changed_at"] == (NOW + capacity.INCREASE_INTERVAL).isoformat()
 
 
@@ -173,15 +207,15 @@ def test_project_ceiling_limits_the_gate_but_not_the_shared_value(tmp_path, monk
     monkeypatch.setattr(scheduler, "machine_load", lambda: ("normal", 0.1))
     capacity.write_state(StateStore(tmp_path / "repo"), 5, NOW - timedelta(hours=1))
     ctx = budget_ctx(tmp_path, NOW, max_parallel=2)
-    budget = scheduler._machine_budget(ctx, {f"lane-{n}": [n] for n in range(8)})
+    budget = scheduler.machine_budget(ctx, {f"lane-{n}": [n] for n in range(8)})
     assert budget == 6 and capacity.read_state(ctx.store)["parallel"] == 6
     other = StateStore(tmp_path / "other")
     for number in (1, 2, 3):
         start(other, number, os.getpid())
-    assert scheduler._has_slot(ctx, budget)  # Runs elsewhere do not count against the ceiling.
+    assert scheduler.has_slot(ctx, budget)  # Runs elsewhere do not count against the ceiling.
     for number in (1, 2):
         start(ctx.store, number, os.getpid())
-    assert not scheduler._has_slot(ctx, budget)
+    assert not scheduler.has_slot(ctx, budget)
 
 
 def test_budget_demand_excludes_busy_and_paused_lanes(tmp_path, monkeypatch):
@@ -198,7 +232,7 @@ def test_budget_demand_excludes_busy_and_paused_lanes(tmp_path, monkeypatch):
     ctx.store.start_run(1, branch="b", worktree=ctx.store.worktree_path(1), lane="busy", pid=os.getpid())
     ctx.store.pause_lane("paused", NOW + timedelta(hours=1))
     # One live run plus every ready issue in unpaused lanes (busy lanes included) caps this tick at 3.
-    assert scheduler._machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 3
+    assert scheduler.machine_budget(ctx, {"busy": [2], "paused": [3], "free": [4]}) == 3
     assert seen["ceiling"] is None and seen["increase_ok"] is False
 
 
@@ -227,7 +261,7 @@ def test_lanes_cap_limits_the_tick_but_not_the_shared_value(tmp_path, monkeypatc
     changed = NOW - timedelta(seconds=30)
     capacity.write_state(StateStore(tmp_path / "repo"), 5, changed)
     ctx = budget_ctx(tmp_path, NOW)
-    assert scheduler._machine_budget(ctx, {"a": [1], "b": [2]}) == 2
+    assert scheduler.machine_budget(ctx, {"a": [1], "b": [2]}) == 2
     assert capacity.read_state(ctx.store) == {"parallel": 5, "changed_at": changed.isoformat()}
 
 
@@ -237,10 +271,10 @@ def test_memory_pressure_never_moves_the_parallel_budget(tmp_path, pressure):
     ctx = budget_ctx(tmp_path, NOW)
     capacity.write_state(ctx.store, 3, NOW)
     ready = {f"lane-{n}": [n] for n in range(8)}
-    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample(pressure, 0.5, 900)) == 3
+    assert scheduler.machine_budget(ctx, ready, capacity.LoadSample(pressure, 0.5, 900)) == 3
     assert not (tmp_path / capacity.HISTORY_FILE).exists()
     ctx.now = lambda: NOW + capacity.INCREASE_INTERVAL
-    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample(pressure, 0.5, 900)) == 4
+    assert scheduler.machine_budget(ctx, ready, capacity.LoadSample(pressure, 0.5, 900)) == 4
     rows = [json.loads(line) for line in (tmp_path / capacity.HISTORY_FILE).read_text().splitlines()]
     assert [(row["from"], row["to"], row["pressure"]) for row in rows] == [(3, 4, pressure)]
 
@@ -250,7 +284,7 @@ def test_parallel_floor_in_machine_yml_is_ignored(tmp_path):
     ctx = budget_ctx(tmp_path, NOW)
     capacity.write_state(ctx.store, 4, NOW - timedelta(hours=1))
     ready = {f"lane-{n}": [n] for n in range(8)}
-    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 2.0, 0)) == 2
+    assert scheduler.machine_budget(ctx, ready, capacity.LoadSample("normal", 2.0, 0)) == 2
     assert capacity.read_state(ctx.store)["parallel"] == 2
 
 
@@ -288,21 +322,20 @@ def test_update_test_slots_waits_between_increases():
 def test_test_slot_is_exclusive_up_to_the_effective_limit(monkeypatch):
     monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0.01)
     with capacity.hold_test_slot(2), capacity.hold_test_slot(2):
-        assert capacity._take_test_slot(2) is None
+        assert not _slot_free(2)
     with capacity.hold_test_slot(1):
-        assert capacity._take_test_slot(1) is None
-    stream = capacity._take_test_slot(1)
-    assert stream is not None
-    stream.close()
+        assert not _slot_free(1)
+    assert _slot_free(1)
 
 
 def test_test_slot_held_above_a_lowered_limit_still_counts():
     write_machine_yml(test_slots=3)  # Above the default machine ceiling of 2 (#365).
     with capacity.hold_test_slot(3), capacity.hold_test_slot(3), capacity.hold_test_slot(3):
         # The AIMD value dropped to 2 while three commands ran; none may join.
-        assert capacity._take_test_slot(2) is None
-        assert capacity._take_test_slot(3) is None
-        assert capacity._take_test_slot(4) is not None
+        assert not _slot_free(2)
+        assert not _slot_free(3)
+        write_machine_yml(test_slots=4)
+        assert _slot_free(4)
 
 
 def test_test_slot_waiter_reports_waiting_then_proceeds(monkeypatch):
@@ -338,16 +371,14 @@ def test_test_slot_of_a_killed_holder_is_released():
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline() == "held\n"
-        assert capacity._take_test_slot(1) is None
+        assert not _slot_free(1)
     finally:
         holder.stdin.write("release\n")
         holder.stdin.flush()
         assert holder.wait(timeout=10) == 9
         holder.stdin.close()
         holder.stdout.close()
-    stream = capacity._take_test_slot(1)
-    assert stream is not None
-    stream.close()
+    assert _slot_free(1)
 
 
 def test_test_slot_held_by_the_parent_command_is_not_taken_twice(monkeypatch):
@@ -372,7 +403,7 @@ def test_test_slot_stays_unclaimed_while_the_kernel_is_critical(monkeypatch):
     with capacity.hold_test_slot(1, waiting=lambda: waits.append(reads[-1])):
         assert reads == ["critical", "critical", "normal"]  # Read again on every poll.
         assert waits == ["critical", "critical"]  # The free slot stayed unclaimed meanwhile.
-        assert capacity._take_test_slot(1) is None  # Now this command holds the slot.
+        assert not _slot_free(1)  # Now this command holds the slot.
 
 
 def test_test_slot_inherited_by_a_nested_command_ignores_critical(monkeypatch):
@@ -594,7 +625,7 @@ def test_budget_decreases_are_rate_limited_across_repositories(tmp_path, monkeyp
     def update(now, context):
         if budget == "parallel":
             context.now = lambda: now
-            return scheduler._machine_budget(context, {f"lane-{i}": [i] for i in range(8)})
+            return scheduler.machine_budget(context, {f"lane-{i}": [i] for i in range(8)})
         return capacity.update_test_slots(8, now, pressure=pressure, load_per_cpu=load, swapins=7)
 
     after = 4 if budget == "parallel" else 7
@@ -654,7 +685,7 @@ def test_machine_max_parallel_caps_the_shared_value_during_decrease_cooldown(tmp
     # A decrease just happened; the clamp to a lower ceiling does not wait for it.
     capacity.write_state(ctx.store, 8, NOW - timedelta(hours=1), decreased_at=NOW.isoformat())
     ready = {f"lane-{n}": [n] for n in range(8)}
-    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
+    assert scheduler.machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
     state = capacity.read_state(ctx.store)
     assert state["parallel"] == 2
     assert state["decreased_at"] == NOW.isoformat()  # A clamp is not an AIMD decrease.
@@ -662,4 +693,4 @@ def test_machine_max_parallel_caps_the_shared_value_during_decrease_cooldown(tmp
     assert [(row["budget"], row["from"], row["to"]) for row in rows] == [("parallel", 8, 2)]
     # The clamp happened alone; AIMD resumes on the next tick within the ceiling.
     ctx.now = lambda: NOW + capacity.INCREASE_INTERVAL
-    assert scheduler._machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
+    assert scheduler.machine_budget(ctx, ready, capacity.LoadSample("normal", 0.5, 0)) == 2
