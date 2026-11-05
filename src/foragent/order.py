@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_replaces
+from foragent import order_cleanup, order_parent, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -631,7 +631,9 @@ def _unconfirmed(issue, mapped: set[int]) -> bool:
     belong to ``legacy_owner``. A labelled issue, or one already in its parent's
     map, is a confirmed member of the order.
     """
-    return OWNED_MARKER in issue.body and not _labelled(issue) and issue.number not in mapped
+    # A parent's contract line sits among its own records, never in the order text it carries.
+    contract = order_parent.records(issue.body) or issue.body
+    return OWNED_MARKER in contract and not _labelled(issue) and issue.number not in mapped
 
 
 def _create_owned(tracker: Tracker, config: Config, owner: str, title: str, body: str, labels: list[str],
@@ -708,7 +710,8 @@ def _publication_targets(plan: dict, all_issues: list):
     """Resolve the same existing children and edits for reads and publication."""
     pattern = re.compile(r"<!-- foragent:plan id=" + re.escape(plan["id"])
                          + r" map=(\{[^\n]*?\})(?: acceptance=(\{[^\n]*\}))? -->")
-    parents = [(issue, pattern.search(issue.body)) for issue in all_issues if pattern.search(issue.body)]
+    parents = [(issue, found) for issue in all_issues
+               if (found := pattern.search(order_parent.records(issue.body)))]
     # A parent is part of its order once it records a child; until then, like a child
     # missing from the map, an unlabelled owner-contract parent is an unconfirmed creation.
     unconfirmed = [issue for issue, marker in parents if marker[1] == "{}" and _unconfirmed(issue, set())]
@@ -974,12 +977,14 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         children = [tracker.get_issue(n) for n in mapping.values()]
         checklist = "\n".join(f"- [{'x' if issue.state == 'closed' else ' '}] #{issue.number} {issue.title}" for issue in children)
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
-        return f"{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+        # Records first, then the order's own text verbatim (see order_parent).
+        return (f"{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
+                f"\n{plan['summary']}\n\n## Spec\n{plan['spec_markdown']}\n\n{checklist}\n")
 
     # An order with no sub-issues (edits or approvals only) is finished once it
     # applies: publish closes its record below, so it never gets a Backlog card.
     childless = not plan["issues"] and not mapping
-    parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
+    parent_owned = parent is None or OWNED_MARKER in order_parent.records(by_number[parent].body)
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
         linked: set[int] = set()
@@ -1316,7 +1321,7 @@ def _affected_owners(issues, own: set[int], files: dict[str, str | bytes], repo:
     if not locked:
         return {}
     for issue in issues:
-        for match in _ANY_PLAN_ACCEPTANCE.finditer(issue.body):
+        for match in _ANY_PLAN_ACCEPTANCE.finditer(order_parent.records(issue.body)):
             try:
                 acceptance = json.loads(match[1])
             except ValueError:

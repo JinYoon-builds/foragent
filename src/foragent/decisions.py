@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+from foragent import order_parent
+
 ID = re.compile(r"D[1-9][0-9]*")
 MARKER = re.compile(r"^<!-- foragent:decisions (\[[^\r\n]*\]) -->\r?$", re.MULTILINE)
 MARKER_LINE = re.compile(MARKER.pattern + r"\n?", re.MULTILINE)
@@ -22,8 +24,7 @@ HEADING = re.compile(r"^### (D[1-9][0-9]*)\.", re.MULTILINE)
 CITATION = re.compile(r"(?<![A-Za-z0-9_])(D[1-9][0-9]*)(?![A-Za-z0-9_])")
 CHILD = re.compile(r"<!-- foragent:plan-child id=([A-Za-z0-9][A-Za-z0-9_-]*) key=")
 # The order record names created children in map and every published child or edit in acceptance.
-PARENT = re.compile(r"<!-- foragent:plan id=([A-Za-z0-9][A-Za-z0-9_-]*) map=(\{[^\n]*?\})"
-                    r"(?: acceptance=(\{[^\n]*\}))? -->")
+PARENT = order_parent.PLAN
 SPEC_LINK = re.compile(r"(?<![A-Za-z0-9_.-])docs/specs/([A-Za-z0-9][A-Za-z0-9_-]*)\.md(?![A-Za-z0-9_])")
 LEDGER = "docs/decisions.md"
 # Citations extracted once from the retired docs/specs files: order id -> decision IDs.
@@ -162,7 +163,7 @@ def _citations(text: str) -> set[str]:
 def _spec_names(row: dict[str, Any], parents: dict[int, set[str]]) -> set[str]:
     # The publisher writes its own marker after the text, so an earlier one is quoted text.
     body = row.get("body") or ""
-    references = set(SPEC_LINK.findall(body)) if PARENT.search(body) else set()
+    references = set(SPEC_LINK.findall(order_parent.order_text(body))) if order_parent.records(body) else set()
     return set(CHILD.findall(body)[-1:]) | references | parents.get(row["number"], set())
 
 
@@ -178,14 +179,13 @@ def _legacy_links(root: Path) -> dict[str, set[str]]:
 
 
 def _parent_specs(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
-    """Citations in each order parent's own text (summary and spec), by order id."""
-    from foragent.run_parent import parent_summary
-
+    """Citations in each order parent's own text (summary, spec and child titles), by order id."""
     found: dict[str, set[str]] = {}
     for row in rows:
         body = row.get("body") or ""
-        for identity, _mapping, _acceptance in PARENT.findall(body)[-1:]:
-            found.setdefault(identity, set()).update(_citations(parent_summary(body)))
+        # Markers quoted in the order text are text; only the parent's own records count.
+        for identity, _mapping, _acceptance in PARENT.findall(order_parent.records(body))[:1]:
+            found.setdefault(identity, set()).update(_citations(order_parent.order_text(body)))
     return found
 
 
@@ -193,7 +193,7 @@ def _parent_map(rows: list[dict[str, Any]]) -> dict[int, set[str]]:
     """Children named in each published order record's issue map, by spec name."""
     found: dict[int, set[str]] = {}
     for row in rows:
-        for identity, mapping, acceptance in PARENT.findall(row.get("body") or "")[-1:]:
+        for identity, mapping, acceptance in PARENT.findall(order_parent.records(row.get("body") or ""))[:1]:
             numbers: list[Any] = []
             for text, read in ((mapping, lambda value: value.values()),
                                (acceptance, lambda value: [int(key) for key in value if key.isdecimal()])):
@@ -242,7 +242,9 @@ def view(root: Path, rows: list[dict[str, Any]], ledger: str) -> list[dict[str, 
     # the link stays, and the missing observation keeps the decision short of done.
     unobserved = [{"number": number, "body": ""} for number in sorted(set(parents) - observed)]
     for row in [*rows, *unobserved]:
-        linked = explicit(row.get("body") or "")
+        body = row.get("body") or ""
+        # A parent's order text may quote a decisions marker; its intent lives in its records.
+        linked = explicit(order_parent.records(body) or body)
         if linked is None:
             linked = set()
             for name in _spec_names(row, parents):

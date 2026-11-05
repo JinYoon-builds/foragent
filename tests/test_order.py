@@ -5119,3 +5119,35 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
         publish(publishing, plan, approve=True)
     assert closes == [], "No close may be written once a target is running"
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
+
+
+def test_a_spec_quoting_another_orders_marker_stays_text(tmp_path):
+    """#2161: the parent carries the spec verbatim, and markers quoted in it never read as records."""
+    from foragent import decisions
+    from foragent.ownership import OWNED_MARKER
+
+    def plan_for(identity, spec, summary="S"):
+        item = {"key": "k", "title": f"T {identity}", "lane": "main", "size": "s", "goal": "G",
+                "out_of_scope": "None.", "done_when": ["true"], "acceptance_files": {}}
+        return {"id": identity, "title": identity, "summary": summary, "spec_markdown": spec,
+                "issues": [item], "edits": []}
+
+    tracker, git, config = FakeTracker(), PublishingGit(tmp_path, []), Config(skill_libraries=[])
+    quoted = '<!-- foragent:plan id=old map={"k": 2} acceptance={"2": {"tests/a.py": "x"}} -->'
+    spec = (f"{quoted}\nThe body must keep the exact line:\n"
+            f'<!-- foragent:decisions ["D7"] -->\n{OWNED_MARKER}\nApplies D74.\n')
+    summary = f"{quoted} summary"
+    order.publish(plan_for("new", spec, summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    order.publish(plan_for("old", "# Old\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
+    parents = {issue.title: issue for issue in tracker.list_issues() if issue.title in {"new", "old"}}
+    assert set(parents) == {"new", "old"}, "Each order publishes its own parent"
+    assert parents["new"].body.count(spec) == 1 and parents["new"].body.count(summary) == 1, "Text stays verbatim"
+    order.publish(plan_for("old", "# Old revised\n"), tmp_path, config, tracker, repo="owner/repo", git=git)
+    assert tracker.get_issue(parents["old"].number).body.count("# Old revised") == 1
+    order.publish(plan_for("new", spec + "More.\n", summary), tmp_path, config, tracker, repo="owner/repo", git=git)
+    assert tracker.get_issue(parents["new"].number).body.count(spec + "More.\n") == 1, "Republication finds its parent"
+    assert len([i for i in tracker.list_issues() if i.title == "new"]) == 1
+    rows = [{"number": issue.number, "body": issue.body, "state": "open"} for issue in tracker.list_issues()]
+    links = {row["id"]: row["issues"] for row in decisions.view(tmp_path, rows, "### D7. X\n### D74. Y\n")}
+    child = next(issue.number for issue in tracker.list_issues() if issue.title == "T new")
+    assert links["D74"] == [child] and links["D7"] == [child], "Citations come from the text, not as records"
