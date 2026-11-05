@@ -616,6 +616,7 @@ def _verify_contents(attempt: Implementation) -> str:
     if not any(not path.startswith(".foragent/") for path in attempt.paths):
         return "The session made no changes."
     staged_tree = git.staged_tree_sha()
+    logged_to_ci = False
     for verification in range(2):
         from foragent.run_implementation import follow_base
         follow_base(attempt)
@@ -649,7 +650,11 @@ def _verify_contents(attempt: Implementation) -> str:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
                 attempt.checks.append(local_units)
-        if unit_tests and unit_command:
+        if unit_tests and getattr(attempt, "related_to_ci", False):
+            if not logged_to_ci:  # One line per refresh, even when the check repeats.
+                _append(log, f"Related unit tests ({len(unit_tests)} files) left to PR CI on the new head")
+                logged_to_ci = True
+        elif unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)
@@ -693,12 +698,13 @@ def _verify_contents(attempt: Implementation) -> str:
 
 
 def _verify_review_head(
-    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str,
+    n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, *, skips=None,
 ) -> str | None:
+    """Run Done when on the PR head; ``skips`` (ci_local.PassSkips for ``head``) applies D124."""
     checks: list[CheckResult] = []
     # The saved bundle changes only once this verification knows the replacement.
     try:
-        return _check_review_head(n, ctx, git, parsed, head, link, checks)
+        return _check_review_head(n, ctx, git, parsed, head, link, checks, skips=skips)
     except BaseException:
         _keep_gathered(ctx.store.root, n, checks)
         raise
@@ -706,11 +712,19 @@ def _verify_review_head(
 
 def _check_review_head(
     n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, head: str, link: str, checks: list[CheckResult],
+    *, skips=None,
 ) -> str | None:
+    from dataclasses import replace
     from foragent import runner
+    from foragent.ci_local import skipping
+    from foragent.issue import acceptance_paths
 
     worktree = git.root
     log = ctx.store.log_path(n)
+    if skips is not None and skips.head != head:
+        skips = None  # Evidence of another commit never skips a check of this one.
+    # D124: the issue's own locked acceptance files always run.
+    locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
         for command in parsed.done_when_commands:
@@ -718,8 +732,10 @@ def _check_review_head(
                 save_failures(ctx.store.root, n, checks, complete=False)
                 return _timeout(n, ctx)
             limit = min(DONE_WHEN_SECONDS, runner._remaining(n, ctx))
-            check = run_done_when(n, ctx, command, worktree, log, limit,
-                                  progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            with skipping(n, ctx, command, skips, locked, root=worktree) as selected:
+                check = run_done_when(n, ctx, selected, worktree, log, limit,
+                                      progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx))
+            check = replace(check, command=command)
             if stopped := harness_guard.before_measurement(worktree):
                 return stopped  # the command committed a harness change: that, not its result, decides
             checks.append(check)

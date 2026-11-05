@@ -60,7 +60,9 @@ def _refresh_reviewed_head(
     if not neutral:
         run_publish.record_base_follow(n, ctx)  # before the merge spends the budget (#1514)
     try:
-        git.merge_base(target_sha)
+        # With ``prepare`` the merge stays uncommitted, so prepare's commit is the merge commit
+        # itself (one checked commit whose parents are the old head and the target).
+        git.merge_base(target_sha, commit=prepare is None)
     except run_publish.GitError:
         if not git.conflict_paths():
             raise

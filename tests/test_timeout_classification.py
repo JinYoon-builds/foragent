@@ -402,8 +402,8 @@ def test_a_base_merge_that_spends_the_last_seconds_still_counts_as_following(git
     case.clock[0] += timedelta(seconds=RUNTIME_MINUTES * 60 - 30)
     original = GitRepo.merge_base
 
-    def slow_merge(git, target):
-        result = original(git, target)
+    def slow_merge(git, target, *args, **kwargs):
+        result = original(git, target, *args, **kwargs)
         case.clock[0] += timedelta(seconds=60)  # the merge itself spends the last 30 seconds
         return result
 

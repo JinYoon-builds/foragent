@@ -13,3 +13,5 @@ Run `fa order publish --approve` alone, confirm the `approved` label, then run `
 
 `fa orch park` removes `approved` (orch_park.py:95) and `unpark` does not restore it, so after an unpark an issue sits `ready` and never starts until it is re-approved through an order edit with a preread. #1158 sat that way for 1.5 hours on 2026-11-01. A park also writes `## Waiting` to the body, which invalidates a preread already running.
 
+
+**11-05 #2103:** my wait-then-publish-then-retry loop ran `fa orch retry` even though the publish failed ('cannot lock ref refs/heads/main', another writer won the race), so the lane restarted on the old Goal. In such loops, retry only when the publish line shows the issue row with 'yes' (or check the new body text) — gate the retry on it.

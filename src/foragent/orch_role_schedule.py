@@ -18,6 +18,15 @@ Each role compares those events with its own completion and stores nothing else:
   orders they name, so an order that finished meanwhile still gets its own request. A note
   with no such request covers every order finished by then.
 
+- a user-view role (its signals declare ``order_finished`` or ``daily``, like the UX researcher)
+  gets one session per finished order, for that order only, and one daily session for the core
+  flows within 24 hours of its last one; an order pass does not count as the daily pass. Orders
+  finished before the role was added are not due. Each session's ``scope`` (order, daily or
+  confirm) sits on its record and its ``<role>-call`` and ``<role>-done`` events, so coverage is
+  derived from those events. A find such a session reports is a ``role-find`` event, not an inbox
+  request; the next session of that role confirms every unconfirmed find, and only what that
+  second session reproduces and reports again becomes one inbox proposal.
+
 Lane dreams use ``orders_finished_at`` too but keep their own start path in ``orch_dream``.
 
 A role wakes only when ``.foragent.yml`` lists it: a config from before roles derives the default
@@ -35,6 +44,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 import re
 from typing import Any
+import uuid
 
 from foragent.file_cache import read_jsonl
 from foragent import orch_architect, orch_inbox, orch_plan
@@ -43,7 +53,7 @@ from foragent.config import Config, in_run_hours
 from foragent.i18n import text
 from foragent.labels import APPROVED
 from foragent.orch_events import append_event
-from foragent.orch_role_prompt import ARCHITECT, _entry
+from foragent.orch_role_prompt import ARCHITECT, _entry, user_view_kinds
 from foragent.state import StateStore
 from foragent.state_observations import stamp
 from foragent.tracker import TrackerError, local_issue_models
@@ -56,6 +66,8 @@ DOCS = "docs"
 ORCHESTRATOR = "orchestrator"
 RETROSPECTIVE = "retrospective"
 SESSION_ROLES = (ARCHITECT, DOCS)  # The order in which an order's finished sessions start.
+FIND = "role-find"
+DAY = timedelta(days=1)
 RETRY_AFTER = timedelta(hours=1)
 KEEP = timedelta(days=30)  # How long the journal keeps an order-finished event.
 _ORDER_ID = re.compile(r"<!-- foragent:plan id=(\S+) ")
@@ -346,12 +358,16 @@ def startable(ctx, sample) -> list[str]:
         item = _session_facts(ctx.store, ctx.config, role, now, events)
         if item["available"] and item["due"] and not item["waiting_retry"] and not item["running"]:
             roles.append(role)
+    roles += [role for role in user_view_roles(ctx.config)
+              if _next_pass(ctx.store, ctx.config, role, now, events) is not None]
     ctx._dream_demand = getattr(ctx, "_dream_demand", 0) + min(1, len(roles))
     return roles
 
 
 def _why(ctx, role: str, now: datetime) -> str:
     events = _events(ctx.store)
+    if role not in SESSION_ROLES:
+        return _pass_why(ctx.config, role, _next_pass(ctx.store, ctx.config, role, now, events) or {}, events)
     item = _session_facts(ctx.store, ctx.config, role, now, events)
     orders = ", ".join(f"#{order}" for order in item["orders"])
     key = "schedule_why_architect" if role == ARCHITECT else "schedule_why_role"
@@ -366,9 +382,12 @@ def _start_session(ctx, roles: list[str], budget: int, report) -> None:
         if not scheduler._has_slot(ctx, budget):
             return
         now = ctx.now()
+        scope = None if role in SESSION_ROLES else _next_pass(ctx.store, ctx.config, role, now, _events(ctx.store))
+        if role not in SESSION_ROLES and scope is None:
+            continue  # Started or held since this tick's check.
         try:
             report.actions.append(orch_architect.call(ctx.repo_root, ctx.store, ctx.config,
-                                                      _why(ctx, role, now), now, role, tier="m"))
+                                                      _why(ctx, role, now), now, role, tier="m", scope=scope))
         except orch_architect.ArchitectRefused as exc:  # No free slot after all: it stays due, with no penalty.
             report.actions.append(f"{role} deferred: {exc}")
             return
@@ -406,3 +425,80 @@ def dispatch(ctx, roles: list[str], budget: int, report) -> None:
     """After this tick's issues and dreams: start one due session, then post the retrospective."""
     _start_session(ctx, roles, budget, report)
     _post_retrospective(ctx, report)
+
+
+def user_view_roles(config: Config) -> list[str]:
+    """Configured roles the gate calls per finished order and once a day, in the config's order."""
+    return [role for role in config.roles if role not in SESSION_ROLES and role != ORCHESTRATOR
+            and user_view_kinds(_entry(config, role))]
+
+
+def _done(events: list[dict], role: str) -> list[dict]:
+    return [event for event in events if event.get("kind") == f"{role}-done" and event.get("exit_code") == 0
+            and isinstance(event.get("scope"), dict)]
+
+
+def unconfirmed_finds(events: list[dict], role: str) -> list[dict]:
+    """The role's finds that no successful confirm session was given yet."""
+    given = {find for event in _done(events, role) if event["scope"].get("pass") == "confirm"
+             for find in event["scope"].get("finds") or []}
+    return [event for event in events if event.get("kind") == FIND and event.get("role") == role
+            and event.get("find") not in given]
+
+
+def _next_pass(store: StateStore, config: Config, role: str, now: datetime, events: list[dict]) -> dict | None:
+    """The user-view session due now: confirm open finds, then the oldest uncovered order, then the day's pass."""
+    entry = _entry(config, role)
+    if (suppression(store, config, now) is not None or role not in config.roles or entry is None
+            or _session_is_live(store, role)):
+        return None
+    retry = _next_retry(store, config, _attempts(events, role)[1], now)
+    if retry is not None and now < retry:
+        return None
+    if finds := unconfirmed_finds(events, role):
+        return {"pass": "confirm", "finds": [event["find"] for event in finds]}
+    kinds, done = user_view_kinds(entry), _done(events, role)
+    added = stamp(entry.get("created_at"))
+    if "order_finished" in kinds:
+        covered = {event["scope"].get("order") for event in done if event["scope"].get("pass") == "order"}
+        for event in sorted(_orders(events), key=lambda event: stamp(event["finished_at"])):
+            if event["order"] not in covered and (added is None or stamp(event["finished_at"]) > added):
+                return {"pass": "order", "order": event["order"]}
+    if "daily" in kinds:
+        last = max((at for event in done if event["scope"].get("pass") == "daily"
+                    and (at := stamp(event.get("started_at"))) is not None), default=None)
+        if last is None or now - last >= DAY:
+            return {"pass": "daily"}
+    return None
+
+
+def _pass_why(config: Config, role: str, scope: dict, events: list[dict]) -> str:
+    language = config.language
+    if scope.get("pass") == "confirm":
+        finds = "\n\n".join(f"- {event['text']}" for event in unconfirmed_finds(events, role)
+                             if event["find"] in scope["finds"])
+        return text("schedule_why_user_view_confirm", language, role=role, finds=finds)
+    if scope.get("pass") == "order":
+        return text("schedule_why_user_view_order", language, role=role, order=f"#{scope['order']}")
+    return text("schedule_why_user_view_daily", language, role=role)
+
+
+def record_reports(store: StateStore, role: str, scope: dict | None, reports: list[str], now: datetime) -> None:
+    """File what a user-view session reported: a confirm session's reports become inbox proposals,
+    any other session's become finds that wait for a second session."""
+    if not reports:
+        return
+    if (scope or {}).get("pass") == "confirm":
+        for report in reports:
+            orch_inbox.add_request(store, role, report, {"role": role, "confirms": list(scope.get("finds") or [])})
+        return
+    for report in reports:
+        record_find(store, role, report, now)
+
+
+def record_find(store: StateStore, role: str, report: str, now: datetime) -> dict:
+    """Keep one unconfirmed find; it never reaches the inbox on its own."""
+    find = f"{role}-find-{uuid.uuid4().hex[:8]}"
+    append_event(store, now, None, FIND, f"{role} find {find} waits for a second session",
+                 role=role, find=find, text=report)
+    return {"id": find, "status": "unconfirmed"}

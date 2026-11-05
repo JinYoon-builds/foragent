@@ -8,7 +8,14 @@ from pathlib import Path
 from foragent import order_references, risks
 from foragent.config import Config
 
-REPLY_SHAPE = '{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], "questions": []}'
+REPLY_SHAPE = ('{"acceptance_files": {"<path>": "<full file text>"}, "done_when": ["<command>"], '
+               '"questions": [], "notes": []}')
+REPLY_GUIDANCE = (
+    "questions is only for an unknown whose answer would change WHAT the issue delivers: its\n"
+    "behaviour statements or scope. Put everything else in notes: verification notes (including\n"
+    "behaviour already passing on main), checklist items for a person, choices you made, and\n"
+    "conflicts with a locked test resolved by updating it without weakening it. notes is a list\n"
+    "of strings and never blocks preparation.\n")
 
 
 def _references(plan: dict, item: dict) -> dict[str, bytes]:
@@ -54,11 +61,12 @@ def writer_prompt(plan: dict, item: dict, config: Config, root: Path, tree: Path
         "  a wrong value, a skipped effect and a doubled effect must each make it fail.\n"
         "- Choose the test tooling from the repository itself.\n"
         "- Process-control behaviour is tested with fake process tables only; never send real signals.\n"
-        "- When a statement cannot become a test (unclear, or no observable result), do not weaken or\n"
-        "  skip it: add a question naming the missing observable behaviour. When a behaviour cannot be\n"
-        "  checked by a machine, ask for it to become a checklist item and still give one runnable check.\n\n"
+        "- Do not weaken or skip a statement. Ask about missing observable behaviour only if the\n"
+        "  answer would change the statement or scope. When a behaviour cannot be checked by a machine,\n"
+        "  put the request for a human checklist item in notes and still give one runnable check.\n\n"
         f"Reply with one JSON object only: {REPLY_SHAPE}\n"
-        "acceptance_files holds the exact text of every file you wrote; done_when the commands that run them.\n\n"
+        "acceptance_files holds the exact text of every file you wrote; done_when the commands that run them.\n"
+        f"{REPLY_GUIDANCE}\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
         f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
         f"New lanes in this order (not created yet): "
