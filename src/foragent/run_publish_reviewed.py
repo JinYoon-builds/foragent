@@ -77,7 +77,7 @@ def _refresh_reviewed_head(
     push_refresh(ctx, n, git, pr.head, head, new_head)
     ctx.tracker.comment(pr.number, f"base merged before merge: {target_sha}")
     run_publish._append(log, f"Pushed verified HEAD: {new_head}")
-    if ctx.tracker.pr_head_sha(pr.number) != new_head:
+    if not run_publish._head_after_push(ctx, pr.number, new_head, head):
         link = f"https://github.com/{ctx.repo}/pull/{pr.number}"
         return new_head, run_publish._hold_changed_head(n, ctx, link)
     return new_head, None

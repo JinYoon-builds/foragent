@@ -519,12 +519,23 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     execute = c.executor.run
     latest = []
     leases = []
+    rebuild_push_starts, pushed_heads = [], []
+    push = GitRepo.push
+
+    def observe_push(git, branch, *, lease=None):
+        head = git.head_sha()
+        result = push(git, branch, lease=lease)
+        pushed_heads.append(head)
+        return result
+
+    monkeypatch.setattr(GitRepo, "push", observe_push)
     rebuild_offsets = []
 
     def implement(**kwargs):
         index = len(c.executor.calls)
         root = kwargs["worktree"]
         if index == 4:
+            rebuild_push_starts.append(len(pushed_heads))
             rebuild_offsets.append(len(c.operations))
             leases.append(c.ctx.git.remote_branch_sha("foragent/issue-1") or "")
             assert (root / "cli.py").read_text() == "commands = ['help', 'base', 'newbase']\n"
@@ -563,6 +574,15 @@ def test_conflict_budget_rebuilds_once_on_latest_target_after_reviews(conflictin
     assert "Conflict attempt 2/2" in log
     assert log.count("Done when command:") == 3
     assert git_command(c.history.origin, "show", "foragent/issue-1:cli.py") == "commands = ['help', 'base', 'newbase', 'issue']"
+    pushes = [args for _, args in c.operations if args[0] == "push"]
+    assert len(rebuild_push_starts) == len(leases) == 1
+    assert len(pushes) == len(pushed_heads)
+    first_rewrite = rebuild_push_starts[0]
+    assert pushes[first_rewrite:], "The rebuilt attempt must publish its verified head"
+    expected_leases = [leases[0], *pushed_heads[first_rewrite:-1]]
+    assert [args[1] for args in pushes[first_rewrite:]] == [
+        f"--force-with-lease=refs/heads/foragent/issue-1:{head}" for head in expected_leases
+    ]
     pushes = [args for _, args in c.operations[rebuild_offsets[0]:] if args[0] == "push"]
     assert pushes
     assert all(args[1].startswith("--force-with-lease=") for args in pushes)
