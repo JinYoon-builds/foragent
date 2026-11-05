@@ -119,3 +119,4 @@ writes this file.
 - Bar/hint check: compare merge time with the retry that would carry it (#2103 merged 7 s before r797: n/a). [detail](lessons_detail.md)
 - Goal 'X = what admission decides' fails on live-read paths; bar = facts replay `_admission`, live reads NOTE (#2125 r810). [detail](lessons_detail.md)
 - 'Keep full text in a body that also holds records' (#2161) yields quoted-marker FAILs; count real inputs in docs/specs (0 of 566), hint publish refusal (r817).
+- A 'process holds state.lock on two fds' claim from lsof is not evidence of self-nesting: lsof 'w' is the open mode, each thread opens its own fd, and macOS cannot show flock owners. Read the `sample` per thread and find which process breaks the cycle when killed (11-05: tick facts _freeze state SH -> capacity vs admit_run capacity -> state, r821).
