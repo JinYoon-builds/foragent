@@ -13,11 +13,15 @@ active voice; in Korean use 해요체. Speak the language in the brief (`languag
 config, else the user's language). Preserve exact commands, URLs and issue numbers.
 
 1. **Report.** On each `/fa`, run `fa brief --report` in the project folder first and
-   show its output to the person word for word, in a code block. It leads with the
-   current judgment, then what finished since the previous report, what is happening
-   now and what the person should do. Running it records the report time, so run it once
-   per `/fa`. With `presence.report: false` in the config it prints the plain briefing
-   instead and records nothing.
+   show its output to the person word for word, in a code block. It is the short report,
+   at most three lines (D127): the counts (working now, merged since the last report,
+   decisions waiting), the one thing that matters most, and what happens next. Add
+   nothing to it: no lists, no decision text. Running it records the report time, so run
+   it once per `/fa`. When the person asks what finished or what is held, run
+   `fa brief --report --full`: the same report with every merge, hold, question and
+   option. It also records the report time, so the next report counts from then.
+   With `presence.report: false` in the config `fa brief --report` prints the plain
+   briefing instead and records nothing.
 
    On the first run in an empty folder (no `.foragent.yml`), `fa brief --report` prints
    the big squirrel and a greeting. Show both exactly as printed (the squirrel in a code
@@ -86,7 +90,23 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    dashboard is already open, it leaves it as it is; then say it is already open.
    Never tell the person to type a dashboard command: opening it is your job.
 
-5. **Ask what to do.** End the briefing with `next.question` and offer `next.choices`
+5. **Ask each waiting decision, then what to do.** When the report counts decisions
+   waiting, ask them right after the report, one at a time, each as its own
+   AskUserQuestion (or the available question tool), never pasted as a block of text or
+   a list. The decisions are the open orchestrator questions (`fa orch questions --json`:
+   each has `id`, `question`, `options` and `recommend`, the 1-based number of the
+   recommended option) and the open `needs-human` issues: run `fa inspect prepare`, then
+   `fa inspect --json`, and take the `items` whose `group` is `decision` (`number`,
+   `summary`, and the gate's options in `details`). Skip a needs-human item whose
+   `answered` is true. For each, show the question in one or two sentences and the
+   gate's options as the choices, with the recommended option first and marked as
+   recommended, plus "Later".
+   Do not invent options or recommendations; without options, take the person's own
+   words. Record each answer where it came from: `fa orch answer <id> --text "<answer>"`
+   for an orchestrator question, `fa inspect answer N --text "<answer>"` for a
+   needs-human issue. "Later" records nothing and moves to the next decision.
+
+   Then end the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as
    given; the words come from the messages registry (`src/foragent/messages/brief.py`).
    In Korean they read: "무엇을 할까요?" [기획 인터뷰] [디자인 인터뷰] [볼 것 처리].
