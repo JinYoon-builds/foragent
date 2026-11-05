@@ -139,7 +139,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     if not attempt.review_hold and runner._remaining(n, ctx) <= 0:
         return run_publish._timeout(n, ctx)
     run_publish._check_publication(git, attempt.target_branch, None if attempt.review_hold else verified_base_sha)
-    run_publish._push_branch(attempt)
+    replaced_head = run_publish._push_branch(attempt)
     run_publish._progress(n, ctx)
     run_publish._append(log, f"Pushed verified HEAD: {verified_head_sha}")
     # The base this push's CI report measures; verified_base_sha is the base this
@@ -162,7 +162,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     run_publish._progress(n, ctx)
     pr_ready_at = ctx.now().timestamp()
     link = f"https://github.com/{ctx.repo}/pull/{pr}"
-    if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+    if not run_publish._head_after_push(ctx, pr, verified_head_sha, replaced_head):
         return run_publish._hold_changed_head(n, ctx, link)
 
     def review_held() -> str:
@@ -195,7 +195,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     def publish_refresh(target_sha: str) -> str | None:
         nonlocal pr_ready_at, ci_wait, verified_base_sha, measured_base_sha
         run_publish._check_publication(git, attempt.target_branch, target_sha)
-        run_publish._push_branch(attempt)
+        replaced_head = run_publish._push_branch(attempt)
         run_publish._progress(n, ctx)
         run_publish._append(log, f"Pushed verified HEAD: {verified_head_sha}")
         run_publish._update_open_pr(attempt, pr, title, pr_body())
@@ -203,7 +203,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
         pr_ready_at = ctx.now().timestamp()
         ci_wait = run_publish._CIWait(pr_ready_at)
         verified_base_sha = measured_base_sha = target_sha
-        if ctx.tracker.pr_head_sha(pr) != verified_head_sha:
+        if not run_publish._head_after_push(ctx, pr, verified_head_sha, replaced_head):
             return run_publish._hold_changed_head(n, ctx, link)
         if attempt.review_hold:
             return review_held()

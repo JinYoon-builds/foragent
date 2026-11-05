@@ -19,7 +19,7 @@ from foragent.config import Config, ConfigError, _comments, _last_line, _pair
 from foragent.paths import repo_path
 
 
-DEFAULT_ROLES = ("orchestrator", "architect", "docs")
+DEFAULT_ROLES = ("orchestrator", "architect", "docs", "ux-researcher")
 # Names of state files a role session record (<name>.json) would collide with.
 STATE_NAMES = frozenset({"plan", "session", "usage", "tidy", "issues", "capacity"})
 IDLE_DAYS = 14
@@ -45,7 +45,10 @@ def memory_dir(name: str, agent: str | None = None, memory: str | None = None) -
 
 def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
     signals = {"architect": [{"paths": [], "kinds": [kind]} for kind in ARCHITECT_KINDS],
-               "docs": [{"paths": list(DOCS_PATHS), "kinds": []}]}.get(name, [])
+               "docs": [{"paths": list(DOCS_PATHS), "kinds": []}],
+               # Declared call conditions; their gate scheduling belongs to Part B (#1654).
+               "ux-researcher": [{"paths": [], "kinds": [kind]}
+                                 for kind in ("order_finished", "daily")]}.get(name, [])
     entry = {"agent": f"fa-{name}", "skills": [f"fa-{name}"] if skills is None else list(skills),
              "memory": memory_dir(name, f"fa-{name}"), "signals": signals}
     if name == "docs":
@@ -57,7 +60,7 @@ def default_entry(name: str, skills: list[str] | None = None) -> dict[str, Any]:
 def load_roles(config: Config) -> dict[str, dict[str, Any]]:
     """Every configured role with its optional fields filled in.
 
-    With no roles key (a config from before roles), the three default entries are derived,
+    With no roles key (a config from before roles), the default entries are derived,
     not stored (D95): re-init leaves the file as is, and the first fa role command writes them.
     """
     stored = config.roles or {name: {**default_entry(name), "created_at": None} for name in DEFAULT_ROLES}

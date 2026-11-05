@@ -26,3 +26,5 @@ Outcome check (2026-11-04, #1651 merged after orders #1746, #1751, #1767): two o
 **Frozen name lists in locks rot (11-04 #1952):** a lock that pinned 501 unit-test names "as of today" failed once main renamed 11 merge-train tests; the lane had to stop on a spec question. For hot files, lock the invariant against something that moves with main, or refresh the list in the same order edit when main changes; and give such issues a glob in Files (tests/test_*.py), since new borrowers appear while they wait.
 
 **11-05 #1856:** a docs Done when pinned a decision number (`'(D109)'`) while the Goal said "use the next free ID"; main took D109 and rules.md moved to link-form citations, so the lane raised a spec-question. Check decisions by heading text with `D[0-9]+`, and citations by the link anchor, never by a fixed number or literal `(Dnn)`.
+
+**11-05 #1514:** when an order edit adds a rule to a Goal, re-run that issue's own locks against the rule's cases: my whole-run rule ('no implementer session after PASS is never too-large') contradicted test_merge_wait_budget's post-wait case, and the lane had to raise a spec-question.

@@ -54,7 +54,7 @@ def run(args) -> int:
     ledger = root / decisions.LEDGER
     if args.decisions_action == "drop":
         try:
-            decisions.drop(root, args.identity, args.why)
+            decisions.drop(root, args.identity, args.why, exact="why" in getattr(args, "from_stdin", ()))
         except (OSError, UnicodeError) as exc:
             print(cli.text("decisions_write_failed", config.language, error=exc), file=cli.sys.stderr)
             return 1

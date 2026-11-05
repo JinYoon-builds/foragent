@@ -25,7 +25,7 @@ class Boundary:
     head: str
     notes: str  # risk-map notes for the whole change and everything since the PASS
     section: str  # the reviewer's facts and scope
-    diff: str | None  # the post-PASS diff; None keeps today's diff and task for an exempt change
+    diff: str  # post-PASS diff, plus the whole change of matched pass_scope_exempt paths
 
 
 def review_facts(n: int, ctx: RunContext, git: GitRepo | None, passed: bool) -> dict[str, str]:
@@ -108,17 +108,31 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     # Read from the base ref: a branch cannot grant itself an exemption.
     matched = risks.matching(risks.load_at(git, base_ref), paths)
     exempt = [risk for risk in matched if risk.get("pass_scope_exempt") is True]
+    full = [path for path in paths if any(risks.touched([path], risk["paths"]) for risk in exempt)]
     facts = f"A reviewer gave PASS to head {head} in round {number}, and the issue body is the same as at that PASS."
     kept = cuts.head(record, 8000, cuts.issue_dir(ctx.store.root, n), f"review-pass-{number}.txt")
     evidence = f"Actual review record of that PASS (verbatim):\n{kept}"
     notes = risks.review_notes(matched, paths)
-    if exempt:
+    diff = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames"]
+    if full:
         entries = "; ".join(", ".join(risk["paths"]) for risk in exempt)
+        named = ", ".join(full)
+        since_pass = git._call([*diff, expected, "--", ".", *(f":(exclude,literal){path}" for path in full)])
+        whole = git._call([*diff, git._own_base(base_ref), "--", *(f":(literal){path}" for path in full)])
         return Boundary(head, notes, "\n".join([
-            "Earlier PASS, exempt from its boundary (setting review_pass_scope: true).", facts,
-            f"This change touches pass_scope_exempt risk-map entries ({entries}), so that PASS does not narrow "
-            "this review: it keeps its usual scope and diff, and a real defect in unchanged code can still block.",
-            evidence]), None)
+            "Earlier PASS boundary with exempt paths (setting review_pass_scope: true).", facts,
+            f"This change touches pass_scope_exempt risk-map entries ({entries}). Exempt paths: {named}. "
+            "On those paths the PASS does not narrow this review: the diff below shows their whole change in this "
+            "PR, and a real defect in their unchanged code can still block.",
+            "Everywhere else, limit blocking findings to code changed after that PASS. For other paths the diff "
+            "below runs from the PASS head, with current main merged in, to the current tree. Code that arrived "
+            "from main only by integrating it is left out, even inside a file this PR changes, because its own "
+            "issue already reviewed it; conflict resolutions and new commits of this PR count as changes and can "
+            "block. CI checks the combined code. Any instruction here to review all changed files means this diff.",
+            "Outside the exempt paths, a defect confined to unchanged code does not block: write it as a "
+            "`NOTE: <path:line> — <defect>` line. A defect a later change causes or exposes belongs to that later "
+            "change. You judge each finding.",
+            evidence]), since_pass + whole)
     return Boundary(head, notes, "\n".join([
         "Earlier PASS boundary (setting review_pass_scope: true; no pass_scope_exempt risk-map entry matches "
         "this change).", facts,
