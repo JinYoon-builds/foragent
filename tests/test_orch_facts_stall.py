@@ -370,3 +370,47 @@ def test_facts_pass_the_configured_repository_to_the_park_lookup(env):
     park_marker(store, 508, "Wait for owner/repo#750")
     facts = orch_facts.collect(store, Config(repo="owner/repo"), root)
     assert facts["kind_numbers"]["park_resolved"] == {"parked": {"#508": ["#750"]}}
+
+
+def _closed_issue(store):
+    store.update_local_issue(600, title="Closed", labels=[], state="closed")
+
+
+def _owner_merged_pr(store):
+    store.update_local_issue(590, title="Merge owner", labels=["lane:heron"], state="open")
+    store.start_run(590, branch="foragent/issue-590", worktree=store.worktree_path(590), lane="heron")
+    store.record_owner_merge(590, store.get_run(590).started_at, {
+        "pr": 600, "target": "main", "head": "abc", "merged_at": (BASE_TIME + timedelta(minutes=1)).isoformat()})
+
+
+def _row_merged_pr(store):
+    store.update_local_issue(590, title="Row merge", labels=[], state="open", pr_number=600, merged=True)
+
+
+def _listed_gate_pr(store):
+    store.record_merged_pr_listing({"watermark": BASE_TIME.isoformat(), "prs": [
+        {"number": 600, "head": "foragent/issue-590", "base": "main", "merged_at": BASE_TIME.isoformat(), "url": "u"}]})
+
+
+SOURCES = {"closed_issue": _closed_issue, "owner_merged_pr": _owner_merged_pr,
+           "row_merged_pr": _row_merged_pr, "listed_gate_pr": _listed_gate_pr}
+# Every way a park reason can name #600 of this repository, owner/repo, and the foreign forms.
+FORMS = {"bare": ("Wait for #600", True), "qualified": ("Wait for owner/repo#600", True),
+         "qualified_other_case": ("Wait for Owner/REPO#600", True),
+         "issue_url": ("Wait for https://github.com/owner/repo/issues/600", True),
+         "pull_url": ("Wait for https://github.com/owner/repo/pull/600", True),
+         "other_repo": ("Wait for other/repo#600", False),
+         "other_repo_url": ("Wait for https://github.com/other/repo/issues/600", False)}
+
+
+@pytest.mark.parametrize("source", list(SOURCES))
+@pytest.mark.parametrize("form", list(FORMS))
+def test_every_reference_form_resolves_through_every_record_source(tmp_path, form, source):
+    """Round 8: every way a park reason names this repository's issue or PR resolves the same,
+    whichever gate record shows it done; another repository's reference never does."""
+    store = store_at(tmp_path, [BASE_TIME])
+    SOURCES[source](store)
+    why, resolves = FORMS[form]
+    park_marker(store, 501, why)
+    expected = {"parked": {"#501": ["#600"]}} if resolves else {}
+    assert orch_facts_stall.park_resolved_numbers(store, "owner/repo") == expected

@@ -231,7 +231,7 @@ def _collect(store: StateStore, config: Config, root, machine: dict[str, Any]) -
         **orch_facts_decided.collect(store, now, RECENT),
         # Free lanes and what admission would start in them; the tick's supply-low hold reads it.
         "supply": supply,
-        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply),
+        **reviews, **orch_facts_kinds.collect(store, config, root, now, rows, running, waiting, supply, config.repo),
     }
 
 

@@ -242,8 +242,10 @@ def waiting_on_person_numbers(store: StateStore, now: datetime) -> dict[str, Any
 
 
 def collect(store: StateStore, config: Config, root, now: datetime, rows, running, waiting,
-            supply: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers)."""
+            supply: dict[str, Any] | None = None, repo: str | None = None) -> dict[str, Any]:
+    """``kinds`` (present kinds, in KINDS order) and ``kind_numbers`` (each present kind's numbers).
+
+    ``repo`` (owner/name) lets a park reason name this repository's work in a qualified form or URL."""
     numbers = {
         "repeated_design_holds": repeated_design_holds_numbers(store, now),
         "hot_overlap_files": hot_overlap_files_numbers(rows, now),
@@ -252,7 +254,7 @@ def collect(store: StateStore, config: Config, root, now: datetime, rows, runnin
         "lane_concentration": lane_concentration_numbers(store, config, now, running),
         "merge_stall": merge_stall_numbers(store, now, running),
         "waiting_on_person": waiting_on_person_numbers(store, now),
-        **orch_facts_stall.collect(store, now, supply or {}, config.repo),
+        **orch_facts_stall.collect(store, now, supply or {}, repo),
     }
     present = [kind for kind in KINDS if numbers[kind]]
     return {"kinds": present, "kind_numbers": {kind: numbers[kind] for kind in present}}
