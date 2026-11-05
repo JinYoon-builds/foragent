@@ -1,4 +1,8 @@
-"""`fa brief --report`: one judgment-first message since the previous report (#756).
+"""`fa brief --report`: a three-line report since the previous report (#756, D127).
+
+`render_short` is the report /fa shows: counts, the one thing that matters most, and
+what happens next. `render` is the full detail (`fa brief --report --full`): every
+merge, resolved hold, open question with its options and needs-human issue.
 
 Reads local state only: gate merge records, the orchestrator journal
 (orch-events.jsonl), the question box, the orchestrator note and the issue
@@ -13,9 +17,10 @@ from datetime import datetime, timedelta
 import json
 import sys
 from typing import Any
+import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_inbox, presence, watch_art
+from foragent import orch_inbox, orch_scorecard, presence, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.update_check import offer_line
@@ -23,6 +28,9 @@ from foragent.state import StateStore
 
 REPORT_FILE = "report.json"
 FIRST_WINDOW = timedelta(hours=24)
+# One terminal row: a longer line is cut and ends in an ellipsis (D127).
+ROW = 100
+ELLIPSIS = "…"
 # Holds and their ends come from the append-only orch-events.jsonl only (overwritten
 # snapshots lose earlier holds). A merge from the gate's merge records also ends a hold.
 HOLD_KINDS = frozenset({"escalate", "retries-exceeded", "stalled", "orchestrator-timeout", "parked"})
@@ -39,10 +47,26 @@ def last_report(store: StateStore, now: datetime) -> datetime | None:
     return at if at is not None and at <= now else None
 
 
-def record_report(store: StateStore, now: datetime) -> None:
-    """The one writer of the report time."""
+def last_window(store: StateStore, now: datetime) -> datetime | None:
+    """The start of the window the previous report covered, for the full detail.
+
+    A record without its window start (written before D127) falls back to its report time.
+    """
+    try:
+        value = json.loads((store.root / REPORT_FILE).read_text(encoding="utf-8")).get("since")
+    except (OSError, ValueError, AttributeError):
+        value = None
+    at = _time(value)
+    return at if at is not None and at <= now else last_report(store, now)
+
+
+def record_report(store: StateStore, now: datetime, since: datetime | None = None) -> None:
+    """The one writer of the report time, with the start of the window it covered."""
     store.root.mkdir(parents=True, exist_ok=True)
-    store._write_json(store.root / REPORT_FILE, {"reported_at": now.isoformat()})
+    record = {"reported_at": now.isoformat()}
+    if since is not None:
+        record["since"] = since.isoformat()
+    store._write_json(store.root / REPORT_FILE, record)
 
 
 def _time(value: Any) -> datetime | None:
@@ -92,8 +116,9 @@ def _resolved_holds(events: list[dict[str, Any]], merges: dict[int, datetime],
     return resolved
 
 
-def collect(store: StateStore, now: datetime) -> dict[str, Any]:
-    since = last_report(store, now) or now - FIRST_WINDOW
+def collect(store: StateStore, now: datetime, since: datetime | None = None) -> dict[str, Any]:
+    """The report facts for the window since the previous report (or since ``since``)."""
+    since = since or last_report(store, now) or now - FIRST_WINDOW
 
     def inside(at: datetime) -> bool:
         return since < at <= now
@@ -116,6 +141,7 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "since": since.isoformat(),
         "judgment": notes[-1]["say"] if notes else None,
         "merged": merged,
+        "merged_count": sum(inside(at) for at in merges.values()),
         "resolved": resolved,
         "working": len(runs),
         "lanes": len({run.lane for run in runs}),
@@ -155,6 +181,41 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(f"- {question['question']}" + (f" {choices}" if choices else ""))
     lines += [text("brief_report_person_issue", language, issue=issue(item)) for item in report["person_issues"]]
     return "\n".join(lines + _update(report, language))
+
+
+def render_short(report: dict[str, Any], language: str = "en") -> str:
+    """The /fa report (D127): counts, the one thing that matters most, what happens next."""
+    waiting = len(report["questions"]) + len(report["person_issues"])
+    lines = [text("brief_report_short_counts", language, working=report["working"],
+                  merged=report["merged_count"], waiting=waiting)]
+    if matters := report.get("judgment") or report.get("scorecard_line"):
+        lines.append(" ".join(matters.splitlines()))
+    lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
+    return "\n".join([cut(line) for line in lines] + _update(report, language))
+
+
+def scorecard_line(store: StateStore, language: str) -> str | None:
+    """The worst-moved scorecard metric, the same line `fa brief --json` carries."""
+    return orch_scorecard.worst_line(orch_scorecard.collect(store), language)
+
+
+def _columns(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def cut(line: str, row: int = ROW) -> str:
+    """Cut a line longer than one terminal row; wide characters take two columns."""
+    if sum(map(_columns, line)) <= row:
+        return line
+    kept, used = [], _columns(ELLIPSIS)
+    for char in line:
+        if used + _columns(char) > row:
+            break
+        kept.append(char)
+        used += _columns(char)
+    return "".join(kept).rstrip() + ELLIPSIS
 
 
 def _update(report: dict[str, Any], language: str) -> list[str]:
