@@ -99,3 +99,4 @@
 - Local-check trimming orders in CI mode (#2146/#2147: post-PASS base refresh leaves related unit tests to PR CI) touch no reader doc; how-foragent-differs.md:44/76 're-verify on latest main' and mechanisms.md:40 stay true at concept level.
 - Install-path changes (#1475 one-line installer) update README in the same merge but not docs/launch/*; grep launch posts for `uv tool install`/`fa init`. Check `npm view <pkg>` before trusting a README `npx` line.
 - 'Re-approve #NNNN' / '#NNNN test correction' orders (#1795/#1846/#2177) carry empty bodies; check the named issue's merge only.
+- Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
