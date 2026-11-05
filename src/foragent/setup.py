@@ -56,12 +56,16 @@ def gh_project_scope(auth_status: str) -> SetupItem:
 
 @dataclass(frozen=True)
 class Facts:
-    """Read-only machine observations shared by every checklist reader."""
+    """Read-only machine observations shared by every checklist reader.
+
+    auth_reason names why gh could not confirm a login when gh says more than
+    "not logged in": "timeout", "token-invalid" or "network"; otherwise "".
+    """
 
     installed: dict[str, bool]
     auth_status: str = ""
     logged_in: bool = False
-    auth_error: str = ""
+    auth_reason: str = ""
     language: str = "en"
 
 
@@ -69,14 +73,19 @@ def installed_tools() -> dict[str, bool]:
     return {tool: shutil.which(tool) is not None for tool in ("git", "gh", "uv")}
 
 
-def _auth_error(exc: OSError | subprocess.SubprocessError) -> str:
-    """Keep the process failure and gh's explanation, including partial timeout output."""
-    parts = [str(exc)]
-    if isinstance(exc, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
-        for output in (exc.stdout, exc.stderr):
-            if output:
-                parts.append(output.decode(errors="replace") if isinstance(output, bytes) else output)
-    return "\n".join(parts)
+def _auth_reason(exc: OSError | subprocess.SubprocessError) -> str:
+    """Read gh's failure facts (exception type, then gh's own words) into a reason code."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return ""
+    said = "\n".join(output.decode(errors="replace") if isinstance(output, bytes) else output
+                     for output in (exc.stdout, exc.stderr) if output).lower()
+    if "token" in said and ("invalid" in said or "expired" in said):
+        return "token-invalid"
+    if any(word in said for word in ("timeout", "timed out", "connect", "network", "no such host", "dial tcp")):
+        return "network"
+    return ""
 
 
 def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None = None,
@@ -84,13 +93,13 @@ def collect(read_auth: Callable[[], str], *, installed: dict[str, bool] | None =
     """Observe prerequisites once, without invoking gh until it is installed."""
     tools = installed if installed is not None else installed_tools()
     if not tools["gh"]:
-        return Facts(tools, auth_error="gh not found on PATH", language=language)
+        return Facts(tools, language=language)
     try:
         return Facts(tools, auth_status=read_auth(), logged_in=True, language=language)
-    except FileNotFoundError as exc:
-        return Facts({**tools, "gh": False}, auth_error=_auth_error(exc), language=language)
+    except FileNotFoundError:
+        return Facts({**tools, "gh": False}, language=language)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        return Facts(tools, auth_error=_auth_error(exc), language=language)
+        return Facts(tools, auth_reason=_auth_reason(exc), language=language)
 
 
 INSTALL_PAGES = {
