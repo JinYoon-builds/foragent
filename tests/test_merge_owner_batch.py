@@ -537,9 +537,9 @@ def test_workflow_changing_member_uses_single_fallback_while_remaining_members_b
     changed_head = case.tracker.pr_head_sha(support.pr_for(case, 5).number)
     fallback, measured = ci_local.fallback_comparison, []
 
-    def local(attempt, base_sha):
+    def local(attempt, base_sha, **kwargs):
         measured.append(attempt.n)
-        return fallback(attempt, base_sha)
+        return fallback(attempt, base_sha, **kwargs)
 
     monkeypatch.setattr(ci_local, "fallback_comparison", local)
     support.gate(case)

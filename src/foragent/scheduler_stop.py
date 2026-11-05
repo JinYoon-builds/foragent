@@ -264,3 +264,57 @@ def _restore_stopped(ctx: TickContext, number: int, why: str, report: TickReport
         scheduler.board.sync_status(ctx, number, "Ready")
         ctx.tracker.remove_labels(number, [scheduler.RUNNING])
         report.actions.append(f"#{number} returned to ready after stop")
+
+
+def _merged_own_issue(ctx: TickContext, run: Run) -> bool:
+    """Whether this execution (or the merge owner for it) made a merge call for its own issue.
+
+    Only records written right before or after the merge call count; a waiting phase or a queued
+    admission only says the run may merge later, so a close during it is an outside close (#2136).
+    Every gate merge path writes its record before calling GitHub, so a merge that closed the issue
+    before the tick listed it always left one: the run's merge-turn row (flow and reviewed paths),
+    the merge owner's job in phase merging or merged (single and train), or the run's merge time.
+    A person's `fa orch merge` writes its own seat, never this execution's.
+    """
+    from foragent import run_merge_turn
+
+    key = (run.number, run.started_at)
+    turns = [row.get("result") for row in run_merge_turn._rows(ctx.store)
+             if (row["n"], row.get("started_at")) == key and row.get("event") == "turn"]
+    if turns and turns[-1] == "merged":
+        return True  # A failed call writes "failed" after it, so only an unresolved or succeeded call counts.
+    for name in (f"merge-owner/{run.number}.json", f"runs/{run.number}.json"):
+        try:
+            saved = json.loads((ctx.store.root / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(saved, dict):
+            continue
+        if name.startswith("merge-owner/") and saved.get("started_at") == run.started_at and (
+                saved.get("phase") in {"merging", "merged"} or saved.get("merge_fact")):
+            return True
+        if name.startswith("runs/") and isinstance(merged := saved.get("merged_at"), str) and (
+                scheduler.datetime.fromisoformat(merged) >= scheduler.datetime.fromisoformat(run.started_at)):
+            return True  # record_merge saves the moment beside the running record's fields.
+    return key in ctx.store.merge_times()
+
+
+def stop_closed_runs(ctx: TickContext, report: TickReport) -> None:
+    """Stop each running issue whose local record shows it closed outside the gate (#2136).
+
+    The same path as `fa orch stop N --keep-work`: the process tree ends, the WIP is saved on
+    foragent/issue-N with the close as its reason, the worktree, slot and claims are freed and
+    the record finishes once. Reads only local state (the tick's own issue record); the issue
+    stays closed and gets no ready, flag or lane hold. A run whose own merge call closed it is left alone.
+    """
+    for run in unfinished_runs(ctx.store):
+        issue = scheduler._local_issue(ctx, run.number)
+        if issue is None or issue.state != "closed" or _merged_own_issue(ctx, run):
+            continue
+        why = f"Issue #{run.number} was closed outside the gate; unfinished work kept on {run.branch}."
+        if not scheduler._kill_run(ctx, run.number, report, outcome="stopped", detail=why):
+            continue
+        scheduler.append_event(ctx.store, ctx.now(), run.number, "stop", why)
+        if scheduler.RUNNING in issue.labels:
+            ctx.tracker.remove_labels(run.number, [scheduler.RUNNING])
+        report.actions.append(f"#{run.number} stopped: closed outside the gate")
