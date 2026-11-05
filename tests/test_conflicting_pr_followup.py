@@ -4,9 +4,9 @@ Reuses the locked conflicting-pr-rework world (real runner, Git, merge owner; fa
 """
 
 from foragent.reasons import Reason  # noqa: F401
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
-from acceptance.test_conflicting_pr_rework import (  # noqa: F401
+from helpers.conflicting_pr import (  # noqa: F401
     BRANCH, N, OWN, RESOLVED, conflicting, conflicts_with_main, contains, git, log, pushes, run,
 )
 

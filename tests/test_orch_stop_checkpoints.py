@@ -5,17 +5,14 @@ and before every publication effect, then saves and finishes the run itself.
 All Git and executor dependencies use the offline acceptance adapters.
 """
 
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from conftest import git_command  # noqa: E402
 from foragent import orch, run_publish  # noqa: E402
 from foragent.runner import run_issue  # noqa: E402
-from test_orch_review_handoff import make_case  # noqa: E402
+from helpers.review_case import make_case  # noqa: E402
 
 WHY = "Jin requested a stop"
 

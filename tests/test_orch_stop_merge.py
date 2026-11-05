@@ -7,14 +7,12 @@ Git and GitHub use the offline merge-owner fixtures; no real process or signal.
 from dataclasses import replace
 from datetime import timedelta
 import json
-from pathlib import Path
 import subprocess
-import sys
 
 import pytest
 
-from acceptance import test_merge_path_real_settings as contract
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers import merge_world as contract
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from foragent import merge_owner, orch, run_publish
 from foragent.runner import run_issue
@@ -22,8 +20,7 @@ from foragent.scheduler import TickReport
 from test_merge_owner_proto import drain, gate, proto, queue_workers  # noqa: F401
 from test_orch_premerge import merge_case  # noqa: F401
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_orch_review_handoff import make_case  # noqa: E402
+from helpers.review_case import make_case  # noqa: E402
 
 WHY = "Jin requested a stop"
 

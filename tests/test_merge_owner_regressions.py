@@ -334,7 +334,7 @@ def test_owner_refresh_exhausted_head_visibility_still_holds(proto, monkeypatch)
 
 
 def test_restarted_owner_refresh_waits_for_its_own_push(proto, monkeypatch):
-    from acceptance.test_own_refresh_head import lagging_reads
+    from helpers.lagging_reads import lagging_reads
 
     case = proto
     support.queue_workers(case, [5])
