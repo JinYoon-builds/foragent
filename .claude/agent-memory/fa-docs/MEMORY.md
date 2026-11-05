@@ -28,6 +28,7 @@
 - r749/r759/r767/r776: closed 2026-11-05 by docs commit 23d3c6f4 (README fa review via /fa, order.md #1206 PATH, review rule D125→D126 incl. gate.md:149); report r777.
 - r780 (2026-11-05): #2093/#2094 (merge 6bf24992, q14 exempt scope per path) — gate.md:129 rewrite (also r338's unapplied part), ask D105 보강 2 + rules.md PASS-scope line. Wait: orchestrator judges/relays.
 - r800 (2026-11-05): orders #2130/#2135 (#1874 merge b0fedd49, #2136 merge b0985e42) — mechanisms.md 'Order completion' add UX researcher order/daily calls + Origins #1654/#1874. Wait: orchestrator judges.
+- r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
@@ -93,3 +94,4 @@
 - A request marked [done] in the inbox can still be unapplied (r338: gate.md:129 and the rules.md line never changed); when a later order touches the same line, fold the old text into the new proposal.
 - CI congestion fixes (#1922: #1923 workflow concurrency cancel, #1924 GitHub queue time off the CI wait, #1925 one refresh on stale-base reports) touch no reader doc; mechanisms.md merge entry says "waits for CI evidence"/"refreshes when target moved" at concept level. Child commits can carry unrelated merge_batch diffs; read the feature lines only.
 - New role callers in orch_role_schedule.py (e.g. #1874 UX researcher per order/daily) belong in docs/mechanisms.md 'Order completion' entry, which names the woken roles. Run-lifecycle fixes in scheduler_stop.py (#2136 stop on outside close) appear in no reader doc.
+- Urgent fix orders that apply an existing dated Dnn (e.g. #2103 applying D124) may be the first code for a decision that never got a rules.md line; grep rules.md for the Dnn on each check.
