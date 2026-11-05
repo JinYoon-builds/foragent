@@ -91,6 +91,9 @@ def _acorn(item: dict[str, Any], language: str, tick: int, ascii_glyphs: bool, *
     return sideways_acorn(item["number"], _word(item, language), style, tick=tick, ascii=ascii_glyphs)
 
 
+CURRENT_ROWS = 2  # Working acorns take at most this many rows in the pixel scene.
+
+
 def _flow(units: list[tuple[Line, Line, str, int]], width: int, rows: int, prefix: Line, mark: str,
           per_row: int | None = None) -> tuple[list[Line], list[tuple[int, int, int, int]]]:
     """Acorns two spaces apart over at most ``rows`` rows, then …N for every one left out.
@@ -220,15 +223,17 @@ def _block(snapshot: Snapshot, config: Config, row: dict[str, Any], current: lis
                 firsts.add(offset)
                 marks.append((start + offset, number))
 
-    def group(items: list[dict[str, Any]], prefix: Line) -> None:
-        place(_flow(units(items), width, max(1, len(items)), prefix, mark, per_row))
+    def group(items: list[dict[str, Any]], prefix: Line, rows: int) -> None:
+        place(_flow(units(items), width, max(1, rows), prefix, mark, per_row))
 
     if current:
-        group(current, [])
+        # The pixel scene keeps working acorns within two rows and counts the rest exactly.
+        group(current, [], CURRENT_ROWS if pixels else len(current))
     if upcoming:
         lines.append([])
         prefix = [(watch.text("lane_blocks_next", language), "dim")]
-        group(upcoming, prefix)
+        # r53: every queued acorn stays listed and selectable; none folds into a count.
+        group(upcoming, prefix, len(upcoming))
     return lines, hits, marks, name_cells
 
 
