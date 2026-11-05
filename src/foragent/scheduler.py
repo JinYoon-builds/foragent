@@ -24,7 +24,7 @@ from foragent.orch_dream import dream_due  # noqa: F401
 from foragent.orch_events import append_event
 from foragent.reasons import Reason, format_approval_comment, format_comment
 from foragent.processes import current_snapshot, kill_process_group, runner_commands_exist
-from foragent.scheduler_stop import runner_process_exists, tick_processes
+from foragent.scheduler_stop import runner_process_exists, stop_closed_runs, tick_processes
 from foragent.runner import _append, _batch_pr, _preserve_failed_implementation
 from foragent.scheduler_start import (
     INCREASE_INTERVAL, INITIAL_PARALLEL, LAUNCH_GRACE, _apply_budgets, _github_pause, _github_wait, _has_slot,
@@ -173,6 +173,7 @@ def _tick_steps(ctx: TickContext) -> TickReport:
         with step("run_recovery"):
             before = {run.number for run in ctx.store.active_runs()}
             try:
+                stop_closed_runs(ctx, report)  # Closed outside the gate: stop, keep its work (#2136).
                 _recover_runs(ctx, report)
             except TrackerError as exc:
                 if exc.is_rate_limit or not ctx._refresh_failed:
