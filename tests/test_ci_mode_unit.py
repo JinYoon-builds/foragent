@@ -1303,6 +1303,15 @@ def test_measurement_cannot_read_publication_credentials(tmp_path, monkeypatch):
     assert not set(secret_names) & step['env'].keys()
     assert 'PYTHONPATH' not in step['env']
     assert workflow['permissions'] == {'contents': 'read'}
+    # Out-of-scope exception (Jin 2026-11-05, q16): the read-only cache listing
+    # token reaches only the provenance step, which runs before any PR code.
+    steps = measurement['steps']
+    holders = [index for index, row in enumerate(steps) if '${{ github.token }}' in json.dumps(row)]
+    provenance = next(index for index, row in enumerate(steps) if row.get('name') == 'Verify base cache branch origin')
+    assert holders == [provenance] and provenance < steps.index(step)
+    assert set(steps[provenance]['env']) & set(secret_names) == {'GH_TOKEN'}
+    assert all(job['permissions'] == {'contents': 'read'}
+               for name, job in workflow['jobs'].items() if name != 'acceptance')
 
 
 def test_head_configuration_cannot_erase_baseline_scope(git_history, tmp_path, monkeypatch):
