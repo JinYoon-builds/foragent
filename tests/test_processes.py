@@ -1173,3 +1173,57 @@ def test_an_unreadable_ancestor_blocks_every_signal_instead_of_unprotecting_olde
 
     assert not [call for call in table.signals if call[1] == grandparent]
     assert [call[2] for call in table.signals] == ([signal.SIGTERM] if stopper == "review-kill" else [])
+
+
+@pytest.mark.parametrize("path", ["kpg-observe", "kpg-list", "stop-first-observe", "lineage-cycle"])
+def test_every_unverified_ownership_path_refuses_to_signal(fake_process_table, tmp_path, monkeypatch, path):
+    """Each way ownership can fail to be verified sends no signal at all (fail closed)."""
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    identities = processes.observe_tree(roots=(root.pid,))
+
+    def unavailable(*args, **kwargs):
+        raise PermissionError("Process table unavailable; ownership cannot be verified")
+
+    if path in {"kpg-observe", "stop-first-observe"}:
+        monkeypatch.setattr(processes, "observe_tree", unavailable)
+    elif path == "kpg-list":
+        monkeypatch.setattr(processes, "list_processes", unavailable)
+    else:  # the parent's recorded parent points back to this process: the walk never reaches pid 1
+        table.rows[table.parent_pid] = replace(table.rows[table.parent_pid], ppid=table.self_pid)
+
+    if path.startswith("kpg"):
+        with pytest.raises(PermissionError):
+            owned_stop(root.pid, identities)
+    elif path == "stop-first-observe":
+        with pytest.raises(PermissionError):
+            review_stop(identities)
+    else:
+        with pytest.raises(PermissionError, match="lineage unreadable"):
+            owned_stop(root.pid, identities)
+        with pytest.raises(ExceptionGroup):
+            review_stop(identities)
+
+    assert table.signals == [] and root.pid in table.live
+
+
+def test_an_unreadable_target_is_skipped_and_reported_while_the_others_stop(fake_process_table, tmp_path, monkeypatch):
+    table = fake_process_table
+    hidden = table.add(42000, cwd=tmp_path, start_time=10)
+    other = table.add(43000, cwd=tmp_path, start_time=10)
+    identities = [*processes.observe_tree(roots=(hidden.pid,)), *processes.observe_tree(roots=(other.pid,))]
+    read = processes.read_process_identity
+
+    def unreadable(pid):
+        if pid == hidden.pid:
+            raise PermissionError(f"identity of {pid} unreadable")
+        return read(pid)
+
+    monkeypatch.setattr(processes, "read_process_identity", unreadable)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        review_stop(identities)
+
+    assert any("unreadable" in str(error) for error in raised.value.exceptions)
+    assert not [call for call in table.signals if call[1] == hidden.pid] and hidden.pid in table.live
+    assert other.pid not in table.live
