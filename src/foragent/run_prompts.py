@@ -274,6 +274,7 @@ def build_prompt(
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
         "(issue sentence; file:line and the code line).\n"
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
+        "- Put scratch files, temporary folders and notes under .foragent/tmp/ (`mkdir -p .foragent/tmp`). Point helpers such as cxdo there with `export TMPDIR=\"$PWD/.foragent/tmp\"`. Nothing under .foragent/ is ever committed.\n"
         "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
         "with `- <point>: <why it is out of scope or not a defect>`.\n"
         '- Write the short change summary as JSON in .foragent/PR.json: {"summary": "one or two complete sentences"}.\n'
