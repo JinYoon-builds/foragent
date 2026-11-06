@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import orch, orch_plan, orch_stop, processes, scheduler, scheduler_start
+from foragent import file_locks, orch, orch_plan, orch_stop, processes, scheduler, scheduler_start
 from foragent.run_attempt import ExecutorStopped
 from foragent.state import StateStore
 
@@ -47,6 +47,52 @@ def test_stop_all_holds_every_lane_including_main_through_the_plan(case):
     requests = (case.store.root / "stop-requests.jsonl").read_text().splitlines()
     assert [json.loads(line) for line in requests] == [
         {"at": NOW.isoformat(), "kind": "stop", "why": "Jin requested a stop", "held": ["api", "view", "main"]}]
+
+
+def test_stop_all_lock_timeout_leaves_lanes_unchanged_and_can_be_retried(case, monkeypatch):
+    orch_plan.pause(case.store, "api", NOW + timedelta(days=30), "earlier human pause")
+    before = orch_plan.load(case.store, NOW)["paused"]
+    monkeypatch.setenv("FORAGENT_LOCK_TIMEOUT_SECONDS", "0")
+    with orch_stop.record_lock(case.store):
+        with pytest.raises(file_locks.LockTimeout, match="stop.lock"):
+            orch.stop_all(case.ctx, WHY)
+    assert orch_plan.load(case.store, NOW)["paused"] == before
+    assert orch_stop.active(case.store) is None
+    assert not (case.store.root / "stop-requests.jsonl").exists()
+    assert orch.release(case.ctx) == "No project stop is in force; nothing was changed."
+
+    orch.stop_all(case.ctx, WHY)
+    assert orch_stop.active(case.store) == WHY
+    orch.release(case.ctx)
+    assert orch_stop.active(case.store) is None
+    assert orch_plan.load(case.store, NOW)["paused"] == before
+
+
+def test_stop_all_partial_pause_timeout_remains_releasable_after_retry(case, monkeypatch):
+    orch_plan.pause(case.store, "api", NOW + timedelta(days=30), "earlier human pause")
+    before = orch_plan.load(case.store, NOW)["paused"]
+    pause, applied = orch_plan.pause, []
+
+    def pause_once(*args, **kwargs):
+        if applied:
+            raise file_locks.LockTimeout("state.lock")
+        result = pause(*args, **kwargs)
+        applied.append(args[1])
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orch_plan, "pause", pause_once)
+        with pytest.raises(file_locks.LockTimeout, match="state.lock"):
+            orch.stop_all(case.ctx, WHY)
+    assert applied == ["view"]
+    assert orch_stop.active(case.store) == WHY
+    assert orch_plan.lane_paused(case.store, "view", NOW)
+    assert not orch_plan.lane_paused(case.store, "main", NOW)
+
+    orch.stop_all(case.ctx, "retry")
+    orch.release(case.ctx)
+    assert orch_stop.active(case.store) is None
+    assert orch_plan.load(case.store, NOW)["paused"] == before
 
 
 def test_stop_all_is_repeatable_and_never_resumes_a_lane(case):
