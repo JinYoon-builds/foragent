@@ -43,6 +43,7 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
     return {
         "setup": True,
         **facts,
+        "main_writes": status["main_writes"],
         "working": _working(status, titles, now),
         "queued": _queued(status),
         "to_see": _to_see(status),
