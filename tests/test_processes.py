@@ -12,6 +12,7 @@ import pytest
 
 from foragent import processes
 from foragent.processes import list_processes as kernel_listing
+from process_fakes import FakeProcessTable
 from foragent.state import StateStore
 
 
@@ -954,3 +955,71 @@ def test_pidfd_unavailable_in_kernel_rechecks_before_numeric_signal(fake_process
     monkeypatch.setattr(processes.os, "pidfd_open", unavailable)
     assert owned_stop(root.pid, identities) == 1
     assert table.calls == [("pid", root.pid, signal.SIGTERM)]
+
+
+# --- #2215: the prompt stop for trees this process launched keeps every kill_process_group guard ---
+
+def review_stop(identities):
+    return processes.stop_recorded_tree(identities, grace_s=0.1)
+
+
+@pytest.mark.parametrize("target", [*FakeProcessTable.unsafe_targets, "grandparent-other-session"])
+def test_review_stop_never_signals_this_process_lineage_or_its_groups(fake_process_table, target):
+    table = fake_process_table
+    if target == "grandparent-other-session":
+        # A recorded ancestor outside this process's group and session is still its lineage.
+        pid = table.grandparent_pid
+        table.rows[pid] = replace(table.rows[pid], pgid=93000, sid=93000)
+    else:
+        pid = table.unsafe_targets[target]
+    identities = [{"pid": pid, "start_time": table.rows[pid].start_time}]
+
+    assert review_stop(identities) == 0
+
+    assert table.calls == [] and pid in table.live
+
+
+@pytest.mark.parametrize("race", ["none", "before-open", "after-verification", "escalation",
+                                  "kill-after-verification"])
+def test_review_stop_signals_are_lifetime_bound(fake_process_table, tmp_path, monkeypatch, race):
+    table = fake_process_table
+    root = table.add(42000, cwd=tmp_path, start_time=10)
+    identities = processes.observe_tree(roots=(root.pid,))
+    if race in {"escalation", "kill-after-verification"}:
+        table.ignore_term.add(root.pid)
+    handles, closed, sent = {}, [], []
+
+    def open_fd(pid, flags):
+        if race == "before-open":
+            table.exit(pid)
+            table.add(pid, cwd=tmp_path, start_time=20)  # a replacement got the PID
+        fd = 100 + len(handles)
+        handles[fd] = table.rows[pid]
+        return fd
+
+    def send_fd(fd, signum):
+        identity = handles[fd]
+        sent.append(signum)
+        if race == "after-verification" or (race == "kill-after-verification" and signum == signal.SIGKILL):
+            table.exit(identity.pid)
+            table.add(identity.pid, cwd=tmp_path, start_time=20)
+        # The kernel binds a pidfd to one lifetime, never to the PID number.
+        if table.rows[identity.pid].start_time != identity.start_time:
+            raise ProcessLookupError(identity.pid)
+        table.kill(identity.pid, signum)
+
+    monkeypatch.setattr(processes.os, "pidfd_open", open_fd)
+    monkeypatch.setattr(processes.signal, "pidfd_send_signal", send_fd)
+    monkeypatch.setattr(processes.os, "close", closed.append)
+    monkeypatch.setattr(processes.os, "kill", lambda *args: pytest.fail("pidfd path used a numeric signal"))
+
+    # The original ignored SIGTERM, then exited; its PID now belongs to a replacement that the
+    # SIGKILL stage must not reach. The stop still counts the one SIGTERM it delivered.
+    assert review_stop(identities) == (1 if race in {"none", "escalation", "kill-after-verification"} else 0)
+
+    assert closed == list(handles)
+    assert sent == {"none": [signal.SIGTERM], "before-open": [], "after-verification": [signal.SIGTERM],
+                    "escalation": [signal.SIGTERM, signal.SIGKILL],
+                    "kill-after-verification": [signal.SIGTERM, signal.SIGKILL]}[race]
+    if race in {"before-open", "after-verification", "kill-after-verification"}:
+        assert root.pid in table.live and table.rows[root.pid].start_time == 20, "the replacement survives"

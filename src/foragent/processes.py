@@ -649,6 +649,57 @@ def recorded_tree(identities):
         _recorded_tree.reset(token)
 
 
+def _eligible(identities, table) -> dict[int, "ProcessIdentity"]:
+    """The recorded identities still alive in ``table`` that may be signalled.
+
+    Never pid 1, this process's whole lineage (parent, grandparent and up) or anything in
+    their groups or sessions, nor this process's own group or session.
+    """
+    rows = {row.pid: row for row in table}
+    lineage, group, session = _protected(rows)
+    return {item["pid"]: rows[item["pid"]] for item in identities
+            if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
+            and item["pid"] > 1 and item["pid"] not in lineage
+            and rows[item["pid"]].pgid not in lineage and rows[item["pid"]].sid not in lineage
+            and rows[item["pid"]].pgid != group and rows[item["pid"]].sid != session}
+
+
+def _signal_verified(target: int, candidate: "ProcessIdentity", signum: int) -> bool:
+    """Signal ``target`` only while it is still ``candidate``; True when the signal was sent.
+
+    On Linux the signal goes through a pidfd opened before the final identity read, so it is
+    bound to that process lifetime. A changed parent, group or session raises PermissionError
+    (not ours: the caller must not escalate or retry); a vanished process returns False.
+    """
+    descriptor = None
+    try:
+        if callable(getattr(os, "pidfd_open", None)) and callable(getattr(signal, "pidfd_send_signal", None)):
+            try:
+                descriptor = os.pidfd_open(target, 0)
+            except OSError as exc:
+                if exc.errno != errno.ENOSYS:
+                    raise
+        # Open before verifying: a PID reused before pidfd_open must
+        # not authorize the replacement's descriptor either.
+        verified = read_process_identity(target)
+        if verified is None or verified.pid != target or verified.start_time != candidate.start_time:
+            return False
+        if (verified.ppid, verified.pgid, verified.sid) != (
+            candidate.ppid, candidate.pgid, candidate.sid,
+        ):
+            raise PermissionError(f"Process identity changed before signaling {target}; not ours")
+        if descriptor is not None:
+            signal.pidfd_send_signal(descriptor, signum)
+        else:
+            os.kill(target, signum)
+        return True
+    except ProcessLookupError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def kill_process_group(pid: int) -> int:
     """Stop a recorded tree by individual identities, never a numeric group.
 
@@ -667,13 +718,7 @@ def kill_process_group(pid: int) -> int:
     signaled = set()
 
     def current():
-        rows = {row.pid: row for row in list_processes()}
-        lineage, group, session = _protected(rows)
-        return {item["pid"]: rows[item["pid"]] for item in identities
-                if item["pid"] in rows and rows[item["pid"]].start_time == item["start_time"]
-                and item["pid"] > 1 and item["pid"] not in lineage
-                and rows[item["pid"]].pgid not in lineage and rows[item["pid"]].sid not in lineage
-                and rows[item["pid"]].pgid != group and rows[item["pid"]].sid != session}
+        return _eligible(identities, list_processes())
 
     def send(signum):
         nonlocal identities
@@ -682,37 +727,8 @@ def kill_process_group(pid: int) -> int:
         for item in reversed(identities):
             target = item["pid"]
             candidate = current().get(target)
-            if candidate is None:
-                continue
-            descriptor = None
-            try:
-                if callable(getattr(os, "pidfd_open", None)) and callable(getattr(signal, "pidfd_send_signal", None)):
-                    try:
-                        descriptor = os.pidfd_open(target, 0)
-                    except OSError as exc:
-                        if exc.errno != errno.ENOSYS:
-                            raise
-                # Open before verifying: a PID reused before pidfd_open must
-                # not authorize the replacement's descriptor either.
-                verified = read_process_identity(target)
-                if verified is None or verified.pid != target or verified.start_time != candidate.start_time:
-                    continue
-                if (verified.ppid, verified.pgid, verified.sid) != (
-                    candidate.ppid, candidate.pgid, candidate.sid,
-                ):
-                    raise PermissionError(f"Process identity changed before signaling {target}; not ours")
-                if descriptor is not None:
-                    signal.pidfd_send_signal(descriptor, signum)
-                else:
-                    os.kill(target, signum)
+            if candidate is not None and _signal_verified(target, candidate, signum):
                 signaled.add(target)
-            except PermissionError:
-                raise  # Not ours: do not escalate or retry another recorded root.
-            except ProcessLookupError:
-                continue
-            finally:
-                if descriptor is not None:
-                    os.close(descriptor)
 
     send(signal.SIGTERM)
     if current():
@@ -733,35 +749,28 @@ def kill_process_group(pid: int) -> int:
 def stop_recorded_tree(identities: list[dict], *, grace_s: float) -> int:
     """Promptly stop process trees this process launched and recorded (a cancelled command).
 
-    One table scan picks up children born since the last report; after that each process is
-    read by its own identity: its start time must match the record, and it is never this
-    process, its parent, or in this process's group or session. SIGTERM goes children first,
-    then SIGKILL to what outlives ``grace_s``. kill_process_group keeps its full per-signal
-    rescan for trees other processes recorded; on macOS both share the brief exit/PID-reuse
-    window between the final read and the signal.
+    The same protections as kill_process_group, through the same helpers: _eligible keeps
+    this process's whole lineage and its groups and sessions out, and _signal_verified binds
+    each signal to the verified process lifetime (a pidfd on Linux). The difference is cost:
+    one process-table scan per signal stage instead of one per target, and the wait reads only
+    the signalled processes. SIGTERM goes children first, then SIGKILL to what outlives
+    ``grace_s``. On macOS both share the brief exit/PID-reuse window kill_process_group names.
     """
     identities = observe_tree(identities)
     if not identities:
         return 0
-    own = {1, os.getpid(), os.getppid()}
-    group, session = os.getpgrp(), os.getsid(0)
     signaled: set[int] = set()
 
     def send(signum):
+        nonlocal identities
+        identities = observe_tree(identities)
+        eligible = _eligible(identities, list_processes())  # one scan for this stage
+        # Children first: preserve ownership before their parents can exit.
         for item in reversed(identities):
             target = item["pid"]
-            try:
-                row = read_process_identity(target)
-            except (OSError, psutil.Error, SystemError):
-                continue
-            if (row is None or row.start_time != item["start_time"] or target in own
-                    or row.pgid in own or row.sid in own or row.pgid == group or row.sid == session):
-                continue
-            try:
-                os.kill(target, signum)
-            except ProcessLookupError:
-                continue
-            signaled.add(target)
+            candidate = eligible.get(target)
+            if candidate is not None and _signal_verified(target, candidate, signum):
+                signaled.add(target)
 
     send(signal.SIGTERM)
     return _await_signaled(identities, signaled, grace_s, send, identities[0]["pid"])
