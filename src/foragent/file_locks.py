@@ -100,9 +100,25 @@ def owner() -> dict:
             "acquired_at": datetime.now(UTC).isoformat()}
 
 
-def adopt(descriptor: int) -> None:
-    """Record the process now owning an exclusive (possibly inherited) hold."""
+def owner_path(path: Path) -> Path:
+    """Where an exclusive holder is recorded: a side file, never the locked file itself.
+
+    Some callers lock a data file directly (a lane's pending lesson notebook); writing the
+    holder into it, or truncating it on release, erased its content (11-06).
+    """
+    return path.with_name(f".{path.name}.owner")
+
+
+def adopt(descriptor: int, path: Path | None = None) -> None:
+    """Record the process now owning an exclusive (possibly inherited) hold.
+
+    With ``path`` the record goes to the side file; without it (a dedicated lock file held
+    by descriptor only, such as the merge owner's) it is written into that lock file.
+    """
     data = json.dumps(owner()).encode() + b"\n"
+    if path is not None:
+        owner_path(path).write_bytes(data)
+        return
     os.ftruncate(descriptor, 0)
     os.lseek(descriptor, 0, os.SEEK_SET)
     os.write(descriptor, data)
@@ -110,7 +126,7 @@ def adopt(descriptor: int) -> None:
 
 def holders(path: Path) -> list[dict]:
     result = []
-    for source in [path, *path.parent.glob(f".{path.name}.reader-*")]:
+    for source in [owner_path(path), path, *path.parent.glob(f".{path.name}.reader-*")]:
         try:
             value = json.loads(source.read_bytes())
             if isinstance(value, dict) and type(value.get("pid")) is int:
@@ -194,7 +210,7 @@ def acquire(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
         break
     if mode == fcntl.LOCK_EX:
         try:
-            adopt(descriptor)
+            adopt(descriptor, path)
         except BaseException:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             raise
@@ -231,7 +247,7 @@ def locked(descriptor: int, path: Path, *, mode: int = fcntl.LOCK_EX,
             if marker is not None:
                 marker.unlink(missing_ok=True)
             if acquired and mode == fcntl.LOCK_EX:
-                os.ftruncate(descriptor, 0)
+                owner_path(path).unlink(missing_ok=True)
         finally:
             try:
                 if acquired:

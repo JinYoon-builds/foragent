@@ -9,10 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from conftest import git_command
-from foragent import orch_role_memory
+from foragent import main_write_requests, orch_role_memory
 from foragent.config import Config
 from foragent.git import GitError, GitRepo
 from foragent.scheduler import TickReport
+from foragent.state import StateStore
 
 FOLDER = ".claude/agent-memory/fa-docs"
 
@@ -22,7 +23,7 @@ def run(cwd: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def case(git_history):
+def case(git_history, tmp_path):
     """Real Git objects; commit is a path-only fast-import and push a fetch into the bare origin."""
     git_history.update({f"{FOLDER}/MEMORY.md": "Old lesson.\n", "README.md": "Project.\n"})
     root = git_history.clone
@@ -59,7 +60,8 @@ def case(git_history):
 
     roles = {"docs": {"agent": "fa-docs", "skills": [], "memory": FOLDER + "/"}}
     config = Config(repo="owner/repo", language="en", skill_libraries=[], roles=roles)
-    ctx = SimpleNamespace(repo_root=root, config=config, git=GitRepo(root, transport))
+    ctx = SimpleNamespace(repo_root=root, config=config, git=GitRepo(root, transport),
+                          store=StateStore(tmp_path / "state"))
     return SimpleNamespace(root=root, origin=git_history.origin, history=git_history, ctx=ctx, offline=offline)
 
 
@@ -101,23 +103,25 @@ def test_merge_train_wait_rebuilds_memory_after_main_advances(case, merge_owner)
     (case.root / path).write_text("Old lesson.\nNew lesson.\n")
     actions = publish(case)
     local = run(case.root, "rev-parse", "HEAD").strip()
-    assert local != before
-    assert head_file(case, path) == b"Old lesson.\nNew lesson.\n"
     if merge_owner:
-        assert len(actions) == 1 and "waiting for merge train" in actions[0]
+        assert local == before and "role memory queued" in " ".join(actions)
         assert origin_file(case, path) == b"Old lesson.\n"
-        assert "waiting for merge train" in " ".join(publish(case))
+        assert publish(case) == []
+        main_write_requests.drain(case.ctx, TickReport())
+        assert len(main_write_requests.pending(case.ctx.store)) == 1
         assert run(case.root, "rev-parse", "HEAD").strip() == local
         case.history.update({"README.md": "Train advanced main.\n"}, message="Train merged")
         run(case.origin, "update-ref", "-d", train)
-        assert publish(case) == ["role memory published to main"]
-        assert run(case.root, "rev-parse", "HEAD").strip() != local
-        assert run(case.root, "rev-parse", "HEAD^").strip() == case.history.tip
+        main_write_requests.drain(case.ctx, TickReport())
+        assert not main_write_requests.pending(case.ctx.store)
+        assert run(case.root, "rev-parse", "HEAD").strip() == local
+        assert run(case.origin, "rev-parse", "main^").strip() == case.history.tip
         assert origin_file(case, "README.md") == b"Train advanced main.\n"
     else:
+        assert local != before
+        assert head_file(case, path) == b"Old lesson.\nNew lesson.\n"
         assert actions == ["role memory published to main"]
         assert run(case.origin, "rev-parse", "main").strip() == local
-    assert run(case.origin, "rev-parse", "main") == run(case.root, "rev-parse", "HEAD")
     assert origin_file(case, path) == b"Old lesson.\nNew lesson.\n"
     assert publish(case) == []
 
@@ -192,4 +196,29 @@ def test_any_byte_in_a_memory_file_name_reaches_the_commit_and_the_retry(case, n
     case.offline.clear()
     assert publish(case) == ["role memory published to main"]
     assert origin_file(case, path) == b"A lesson with an unusual name.\n"
+    assert publish(case) == []
+
+
+@pytest.mark.parametrize("newer_edit", [False, True])
+def test_enabling_owner_transfers_committed_undelivered_memory(case, newer_edit):
+    path = f"{FOLDER}/MEMORY.md"
+    (case.root / path).write_text("Old lesson.\nCommitted lesson.\n")
+    case.offline.append(True)
+    assert "delivery failed" in " ".join(publish(case))
+    local = case.ctx.git.head_sha()
+    assert not case.ctx.git.uncommitted_paths([FOLDER])
+    case.ctx.config = replace(case.ctx.config, merge_owner=True)
+    if newer_edit:
+        (case.root / path).write_text("Old lesson.\nCommitted lesson.\nNewer lesson.\n")
+    assert "queued" in " ".join(publish(case))  # Retention still works while offline.
+    assert publish(case) == []
+    assert len(main_write_requests.pending(case.ctx.store)) == 1
+    case.offline.clear()
+    case.history.update({"README.md": "Main advanced.\n"})
+    main_write_requests.drain(case.ctx, TickReport())
+    assert not main_write_requests.pending(case.ctx.store)
+    expected = b"Old lesson.\nCommitted lesson.\n" + (b"Newer lesson.\n" if newer_edit else b"")
+    assert origin_file(case, path) == expected
+    assert origin_file(case, "README.md") == b"Main advanced.\n"
+    assert case.ctx.git.head_sha() == local
     assert publish(case) == []
