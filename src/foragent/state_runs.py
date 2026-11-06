@@ -226,6 +226,12 @@ class RunRecordsMixin:
             value["review_pass_to_merge_seconds"] = seconds
             self._write_run(_state.load_record(Run, value), value, snapshot=current)
 
+    def record_opened_pr(self, number: int, pr: int) -> None:
+        """Link the current execution to the PR it just opened (its latest, if it opened another)."""
+        run = self.get_run(number)
+        if run is not None and run.pr_number != pr:
+            self.update_run(number, pr_number=pr)
+
     def owner_merge_facts(self) -> dict[tuple[int, str], dict]:
         """GitHub merges the issue cache attributes to an execution, by (number, started_at)."""
         return self.merge_facts()

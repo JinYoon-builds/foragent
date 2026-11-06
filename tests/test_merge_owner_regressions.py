@@ -10,7 +10,7 @@ from threading import Event, Thread, local
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
 from foragent import merge_owner, run_publish, runner
@@ -336,7 +336,7 @@ def test_owner_refresh_exhausted_head_visibility_still_holds(proto, monkeypatch)
 
 
 def test_restarted_owner_refresh_waits_for_its_own_push(proto, monkeypatch):
-    from acceptance.test_own_refresh_head import lagging_reads
+    from helpers.lagging_reads import lagging_reads
 
     case = proto
     support.queue_workers(case, [5])

@@ -1160,3 +1160,38 @@ def test_a_guessed_and_a_recorded_copy_of_one_merge_count_once(store, tmp_path):
     (store.root / "issues.json").write_text(json.dumps(cache))
     assert store.merge_times() == {(7, old.started_at): merged_at}
     assert [record["number"] for record in store.cached_merged_prs()] == [70]
+
+
+def test_a_later_run_never_takes_over_an_earlier_runs_merged_pr(store, tmp_path):
+    from foragent.tracker import Issue, PullRequest
+    from foragent.watch_sections import progress
+
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    labels = frozenset({"approved", "size:s"})
+    old = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "old")
+    store.record_opened_pr(7, 70)
+    clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "merge-queued")
+    clock[0] += timedelta(minutes=1)
+    new = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "new")
+    # The newer run reuses the open PR #70 (find_pr), which records no link: it is still the old run's PR.
+    merged_at = (clock[0] + timedelta(minutes=1)).isoformat()
+    store.update_local_issue(7, title="t", labels=sorted(labels), state="open", body="")
+    # The newer run's own merge record and the listing's guess both point at the newer run.
+    store.record_merge(7, clock[0] + timedelta(minutes=1), pr=70, base="main")
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged_at, "u")
+    clock[0] += timedelta(minutes=2)
+    store.refresh_local_issues([Issue(7, "t", "b", labels, "closed", updated_at=clock[0].isoformat())],
+                               [pr], {}, clock[0])
+    assert store.merge_times() == {(7, old.started_at): merged_at}, "The PR's merge is its opener's"
+    assert not store.run_merged(store.get_run(7)) and store.get_run(7).started_at == new.started_at
+    assert [(number, start) for number, _size, start, _end in progress.merged_work(store)] == [
+        (7, datetime.fromisoformat(old.started_at))]
+    # The newer run's own PR, once opened and merged, is the newer run's.
+    store.record_opened_pr(7, 71)
+    second = (clock[0] + timedelta(minutes=1)).isoformat()
+    store.refresh_local_issues([Issue(7, "t", "b", labels, "closed", updated_at=second)],
+                               [pr, PullRequest(71, "foragent/issue-7", "main", "", "", second, "u")], {},
+                               clock[0] + timedelta(minutes=2))
+    assert store.merge_times() == {(7, old.started_at): merged_at, (7, new.started_at): second}

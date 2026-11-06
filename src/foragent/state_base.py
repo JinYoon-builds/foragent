@@ -134,7 +134,7 @@ class StateBase:
         """Write a fresh dream record.
 
         ``under_machine_lock``: as prepare_run_start's reservation, the tick writes it while
-        holding the machine lock alone (one lock at a time, the order `fa orch facts` relies on).
+        holding the machine lock. Snapshots also take machine before state.
         A new dream record has no other writer then: the tick lock admits one tick, and an
         earlier worker of the lane finished its record as its last act.
         """

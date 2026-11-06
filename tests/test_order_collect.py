@@ -38,7 +38,7 @@ def case(git_history, tmp_path, monkeypatch):
     scratch.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     root = git_history.clone
-    config = Config(test_command=f"{sys.executable} -m pytest", test_slots=1, language="en")
+    config = Config(test_command=f"{sys.executable} -m pytest", language="en")
     return root, config, GitRepo(root), git_history, scratch
 
 

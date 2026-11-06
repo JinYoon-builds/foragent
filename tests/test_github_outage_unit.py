@@ -3,7 +3,6 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import subprocess
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,10 +13,9 @@ from foragent.run_review import passed_head
 from foragent.state import StateStore
 from foragent.tracker import FakeTracker, GhTracker, TrackerError
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_skills_autosync import isolated_home  # noqa: E402,F401
-from runner_support import run_case  # noqa: E402,F401
-from test_merge_wait_limit import waiting_case  # noqa: E402,F401
+from helpers.home import isolated_home  # noqa: F401
+from runner_support import run_case  # noqa: F401
+from helpers.github_outage import waiting_case  # noqa: F401
 
 NOW = datetime(2026, 11, 2, 9, tzinfo=UTC)
 STDOUT_503 = "HTTP/2.0 503 Service Unavailable\nx-github-request-id: ABC"
@@ -178,7 +176,7 @@ def test_only_a_reviewer_pass_of_the_exact_open_pr_head_and_body_resumes(tmp_pat
 
 def resumed(git_history, tmp_path, monkeypatch, entry="run"):
     """A run whose CI read dropped after a reviewer PASS, at the end of its wait."""
-    from test_github_drop import CONNECTION, assert_wait, interrupt, outage_case
+    from helpers.github_outage import CONNECTION, assert_wait, interrupt, outage_case
     from foragent.runner import review_only, run_issue
 
     case = outage_case(git_history, tmp_path, monkeypatch, entry)
@@ -200,7 +198,7 @@ def reviewing(case):
 def test_contents_a_check_changes_after_a_reused_pass_are_reviewed_before_merge(
     git_history, tmp_path, monkeypatch, moved_base,
 ):
-    from test_github_drop import restart_at_wait_end
+    from helpers.github_outage import restart_at_wait_end
     from foragent import run_checks
 
     case = resumed(git_history, tmp_path, monkeypatch)
@@ -222,7 +220,7 @@ def test_contents_a_check_changes_after_a_reused_pass_are_reviewed_before_merge(
 
 
 def test_a_reused_pass_that_then_fails_ci_gets_a_new_implementation_and_review(git_history, tmp_path, monkeypatch):
-    from test_github_drop import restart_at_wait_end
+    from helpers.github_outage import restart_at_wait_end
 
     case = resumed(git_history, tmp_path, monkeypatch)
     pr = case.tracker.created_prs[0].number
@@ -245,7 +243,7 @@ def test_a_reused_pass_that_then_fails_ci_gets_a_new_implementation_and_review(g
 def test_a_server_error_from_the_merge_waits_once_and_merges_once_later(
     git_history, tmp_path, monkeypatch, entry, where,
 ):
-    from test_github_drop import assert_merged_once, assert_wait, outage_case, restart_at_wait_end
+    from helpers.github_outage import assert_merged_once, assert_wait, outage_case, restart_at_wait_end
     from foragent.runner import review_only
 
     case = resumed(git_history, tmp_path, monkeypatch) if entry == "run" else outage_case(
@@ -303,7 +301,7 @@ def test_a_wait_keeps_its_own_failure_when_another_writer_pauses_first(tmp_path,
 @pytest.mark.parametrize("family", ["issue", "pr"])
 @pytest.mark.parametrize("stream", ["stderr", "stdout", "trailer"])
 def test_a_merge_wait_read_that_meets_an_outage_takes_the_shared_pause(waiting_case, family, stream):
-    from test_merge_wait_limit import exercise
+    from helpers.github_outage import exercise
 
     case = waiting_case
     case.facts.fail_family = family

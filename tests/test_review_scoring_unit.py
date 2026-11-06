@@ -2,21 +2,20 @@
 
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
-from conftest import git_command  # noqa: E402
-from foragent.runner import run_issue  # noqa: E402
-from test_order_machine_budget import fake_workloads  # noqa: E402,F401
-from test_review_grounded_fail import (  # noqa: E402
+from conftest import git_command
+from foragent.runner import run_issue
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_scoring import (
     GROUNDS, REAL, TASTE, UNGROUNDED, Script, install, ordinary, records, scoring_request,
 )
-from test_review_perspectives import review_offline  # noqa: E402,F401
-from test_risk_map import entry, offline, risk_case  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from helpers.review_panel import review_offline  # noqa: F401
+from helpers.risk import entry, offline, risk_case  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 INVENTED = "tests/acceptance/test_scorer_invented.py"
 
@@ -56,6 +55,68 @@ def test_a_scorer_edit_is_undone_before_publication(git_history, tmp_path, monke
     assert "Scorer changed repository state" in records(case)
 
 
+@pytest.mark.parametrize("exists,wrong,ordinary,irreversible,expected", [
+    (True, True, True, False, "blocks"),
+    (True, True, False, False, "note"),
+    (True, False, True, False, "note"),
+    (True, False, False, False, "note"),
+    (True, True, True, True, "blocks"),
+    (True, True, False, True, "blocks"),
+    (True, False, True, True, "blocks"),
+    (True, False, False, True, "blocks"),
+    (False, True, True, True, "note"),
+    (False, True, True, False, "note"),
+])
+@pytest.mark.parametrize("critical", [False, True])
+def test_consequence_facts_decide_blocking(exists, wrong, ordinary, irreversible, expected, critical):
+    from foragent.review_scoring import outcome
+
+    reply = {**UNGROUNDED, "exists": exists, "wrong_result": wrong, "ordinary_input": ordinary,
+             "irreversible": irreversible, "critical_path": critical}
+    assert outcome(reply, ["breaking_input"]) == expected
+    assert outcome(reply, []) == "note"
+
+
+@pytest.mark.parametrize("field", ["wrong_result", "ordinary_input", "irreversible", "finding_class"])
+@pytest.mark.parametrize("value", [None, 0, "false", []])
+def test_invalid_consequence_facts_never_authorize_a_pass(field, value):
+    from foragent.review_scoring import parse_reply
+
+    # A string is valid only for the class name; remove it to exercise a missing field instead.
+    reply = {**UNGROUNDED, field: value}
+    if field == "finding_class" and value == "false":
+        reply.pop(field)
+    assert parse_reply(json.dumps(reply)) is None
+
+
+def test_repeated_classes_count_distinct_failed_rounds_in_the_approved_scope(tmp_path):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from foragent import orch_events, review_scoring
+    from foragent.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    store.save_approval(1, body="scope", body_sha="current", acceptance_blobs={},
+                        approved_by="human", approved_at=datetime.now(UTC).isoformat())
+    ctx = SimpleNamespace(store=store)
+
+    def record(issue, number, classes, verdict="FAIL", body="current"):
+        orch_events.append_event(store, datetime.now(UTC), issue, "review", verdict,
+                                 round=number, verdict=verdict, finding_classes=classes, body_sha=body)
+
+    record(2, 1, ["A"])
+    record(1, 1, ["A"], body="old")
+    record(1, 2, ["A", "A"])
+    record(1, 2, ["A"])
+    record(1, 3, ["B"])
+    assert review_scoring.repeated_classes(1, ctx) == []
+    record(1, 4, ["A"])
+    assert review_scoring.repeated_classes(1, ctx) == ["A"]
+    record(1, 5, [], verdict="PASS")
+    record(1, 6, ["A"])
+    assert review_scoring.repeated_classes(1, ctx) == []
+
+
 def test_a_locked_test_the_scorer_wrote_is_not_a_ground(git_history, tmp_path, monkeypatch):
     case, _ = ordinary(git_history, tmp_path, monkeypatch, [], UNGROUNDED)
     reply = {**UNGROUNDED, "locked_test": f"{INVENTED}::test_feature"}
@@ -93,3 +154,12 @@ def test_panel_and_single_scoring_both_restore(git_history, tmp_path, monkeypatc
     assert not extra and not invented and feature != "scorer replacement\n"
     assert INVENTED not in staged.splitlines()
     assert "Scorer changed repository state" in records(case)
+
+
+
+def test_scorer_counts_an_undelivered_goal_behaviour_as_a_wrong_result():
+    """#2209 (11-06): 'shared start state is unimplemented' scored 100 with the goal line quoted,
+    but wrong_result was false, so the issue passed without its main promise."""
+    from foragent.review_scoring import TASK
+
+    assert "a behaviour a Goal line asks for that the change does not deliver" in TASK

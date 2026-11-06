@@ -141,3 +141,21 @@ def test_orphan_label_after_a_late_handoff_is_no_crash(tmp_path, monkeypatch):
     assert (run.outcome, run.started_at) == ("merge-queued", queued.started_at), (
         "A handed-off generation keeps its admission: no new crashed generation")
     assert labels and labels[0][0] == 6
+
+
+def test_the_run_that_opens_a_pr_keeps_that_one_link(git_history, tmp_path, monkeypatch):
+    """The gate's own publication links its run to the PR it opened; the merge is that run's."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+    from test_orch_review_handoff import make_case  # noqa: E402
+    from foragent import runner
+
+    case = make_case(git_history, tmp_path, monkeypatch, skill_libraries=[], test_command="true")
+    assert runner.run_issue(1, case.ctx) == "merged"
+    opened, = case.tracker.created_prs
+    run, = case.store.read_history()
+    assert run.pr_number == opened.number
+    assert set(case.store.merge_times()) == {(1, run.started_at)}
+    assert case.store.owner_merge_facts()[1, run.started_at]["pr"] == opened.number

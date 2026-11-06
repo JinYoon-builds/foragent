@@ -115,6 +115,7 @@ def _open_or_update_pr(attempt: Implementation, title: str, body: str, base_sha:
     pr = attempt.ctx.tracker.find_pr(attempt.branch)
     if pr is None:
         pr = attempt.ctx.tracker.create_pr(head=attempt.branch, base=attempt.target_branch, title=title, body=body)
+        attempt.ctx.store.record_opened_pr(attempt.n, pr)  # This run opened it: its merge is this run's.
         attempt.pr_title = title
         publish_comments(attempt.ctx, pr, body)
     else:

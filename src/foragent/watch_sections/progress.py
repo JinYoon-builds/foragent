@@ -72,8 +72,9 @@ def _finished(run: Any, merged_at: str | None, finished_at: str | None) -> datet
 def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     """Each merged issue of one store once, at its latest merge: (number, size, started, merged).
 
-    The merge starts at the issue's latest recorded run that began before it, for
-    gate and outside merges alike. Each merge uses the facts recorded when it was
+    A merge starts at the run its PR belongs to: the run that opened it (store.merge_facts), so a
+    later run of the issue never takes over an earlier run's merge. Without that link (an outside
+    merge, an older PR) the issue's latest recorded run that began before it stands in. Each merge uses the facts recorded when it was
     first seen, so a later reopening, re-approval or relabelling never adds, removes
     or changes one. A gate merge is a run the store merge rule accepts (run_merged). A merged PR
     counts when, first seen, it closed an approved issue with a recorded run. The
@@ -82,10 +83,6 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
     any later merge, gate or outside, with or without a new run, is the latest."""
     rows = {row["number"]: row for row in store.local_issues()}
     history = store.read_history()
-    starts: dict[int, list[datetime]] = {}
-    for run in [*history, *(run for run in store.active_runs() if run.kind == "issue")]:
-        if (at := _time(run.started_at)) is not None:
-            starts.setdefault(run.number, []).append(at)
     latest: dict[int, tuple[datetime, str, datetime | None]] = {}  # number -> (merged, size, started)
 
     def merged(number: int, end: datetime, size: str, start: datetime | None) -> None:
@@ -100,13 +97,16 @@ def merged_work(store: Any) -> list[tuple[int, str, datetime, datetime]]:
             row = rows.get(run.number, {})
             # Before any refresh has seen the merge, the issue's current size stands in.
             size = (row.get("run_sizes") or {}).get(run.started_at) or size_of(row.get("labels", ()))
-            merged(run.number, end, size, max((at for at in starts.get(run.number, []) if at <= end), default=None))
+            merged(run.number, end, size, _time(run.started_at))
+    # Which run each merged PR belongs to: the run that opened it (store.merge_facts), not a guess.
+    opened_by = {(number, fact["pr"]): start for (number, start), fact in owner_facts.items()}
     for number, row in rows.items():
-        for merge in (row.get("merges") or {}).values():
+        for pr, merge in (row.get("merges") or {}).items():
             if not (merge.get("approved") and merge.get("closed")) or (end := _time(merge.get("merged_at"))) is None:
                 continue
             if merge.get("size") in SIZES:
-                merged(number, end, merge["size"], _time(merge.get("started_at")))
+                start = opened_by.get((number, int(pr) if pr.isdigit() else None))
+                merged(number, end, merge["size"], _time(start))
     return [(number, size, start, end) for number, (end, size, start) in sorted(latest.items())
             if start is not None]
 

@@ -178,7 +178,20 @@ class IssueRefreshMixin:
 
     def merge_facts(self) -> dict[tuple[int, str], dict]:
         """GitHub merges the issue cache attributes to an execution, by (number, started_at)."""
-        return merge_facts_of(self._issue_record())  # Read-only: no detached copy needed.
+        # Raw history rows: a malformed row links nothing and breaks no reader of merge times.
+        runs = [*self._run_history(), *self._current_issue_runs()]
+        return merge_facts_of(self._issue_record(), runs)  # Read-only: no detached copy needed.
+
+    def _current_issue_runs(self) -> list[dict[str, Any]]:
+        values = []
+        for path in (self.root / "runs").glob("[0-9]*.json"):
+            try:
+                value = _state.json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(value, dict):
+                values.append(value)
+        return values
 
     def observe_merge(self, number: int, pr: int | None, *, head: str, base: str, merged_at: str,
                       started_at: str, url: str = "") -> None:
@@ -303,14 +316,32 @@ RUN_MERGE = "run:"  # Key prefix of an execution's merge whose PR the cache has 
 EVIDENCE = "by_run"  # The entry's execution is Foragent's own record of the merge, not a listing's guess.
 
 
-def merge_facts_of(snapshot: Any) -> dict[tuple[int, str], dict]:
-    """Each cached merge with a known execution: {"pr", "merged_at"} by (number, started_at)."""
+def merge_facts_of(snapshot: Any, runs: Any = ()) -> dict[tuple[int, str], dict]:
+    """Each cached merge with its execution: {"pr", "merged_at"} by (number, started_at).
+
+    A PR's merge belongs to the run that opened it (the run history's ``pr_number`` link), never
+    to a later run of the issue. Without that link (a PR older than the link) the cache's recorded
+    execution stands, unless that run opened a different PR. ``runs``: Run records or raw rows."""
+    opener: dict[tuple[int, int], str] = {}
+    opened: dict[tuple[int, str], int] = {}
+    for run in runs:
+        value = run if isinstance(run, dict) else {}
+        number, started, pr = value.get("number"), value.get("started_at"), value.get("pr_number")
+        if type(number) is int and isinstance(started, str) and type(pr) is int:
+            opened[number, started] = pr
+            if (number, pr) not in opener or started < opener[number, pr]:
+                opener[number, pr] = started
     facts: dict[tuple[int, str], dict] = {}
     for row, merges in _issue_merges(snapshot):
         for pr, entry in merges.items():
-            if not (isinstance(entry, dict) and isinstance(started := entry.get("started_at"), str)
-                    and isinstance(at := entry.get("merged_at"), str)):
+            if not (isinstance(entry, dict) and isinstance(at := entry.get("merged_at"), str)):
                 continue
+            number = int(pr) if pr.isdigit() else None
+            started = opener.get((row["number"], number)) if number is not None else None
+            if started is None:
+                started = entry.get("started_at")
+                if not isinstance(started, str) or opened.get((row["number"], started), number) != number:
+                    continue  # No execution, or that run's own PR is another one.
             key, when = (row["number"], started), _merge_time(at)
             known = _merge_time(facts[key]["merged_at"]) if key in facts else None
             if key not in facts or when is not None and (known is None or when > known):

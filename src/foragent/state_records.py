@@ -86,6 +86,9 @@ class Run:
     # the last progress for the stall check. A record from before it reads as 0.
     slept_seconds: float = 0
     slept_since_progress: float = 0
+    # The PR this execution opened (Foragent's fact: every run of an issue shares its branch). Its
+    # merge attaches to this run only; a later run reusing the open PR never takes it over.
+    pr_number: int | None = None
     files_base_branch: str | None = None
     declared_files: list[str] | None = None
     changed_files: list[str] | None = None

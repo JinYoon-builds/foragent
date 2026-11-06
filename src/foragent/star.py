@@ -94,7 +94,8 @@ def local_merges(root: Path | None = None) -> int:
             except (OSError, ValueError):
                 continue  # A run record being rewritten adds nothing its history row lacks.
         try:
-            owner_facts = merge_facts_of(json.loads((history.parent / "issues.json").read_text(encoding="utf-8")))
+            owner_facts = merge_facts_of(json.loads((history.parent / "issues.json").read_text(encoding="utf-8")),
+                                         [run for run in runs if isinstance(run, dict)])
         except (OSError, ValueError):
             owner_facts = {}  # Without the issue cache only the runs' own merged outcomes count.
         for run in runs:

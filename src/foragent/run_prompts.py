@@ -52,6 +52,15 @@ PANEL_MERGE_PROMPT = (
     "format above. Reviewer verdicts do not count; only yours does."
 )
 
+REVIEW_BLOCKING_RULE = (
+    "The review-procedure consequence rule applies to every ground: block only a wrong result, "
+    "lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary "
+    "inputs, or irreversible harm even on rare inputs (work lost, data deleted, something sent outside). "
+    "Rare reversible bugs and findings without a wrong result (slower, less tidy, wording) pass "
+    "with notes or follow-up issues naming the source issue. A Goal quote or high confidence alone "
+    "does not make a finding blocking."
+)
+
 CONFIRM_PROMPT = (
     "Limit this review to confirming that the first-round defect classes below are fixed. "
     "For every class, verify the fix across all instances throughout the changed code, including "
@@ -61,6 +70,7 @@ CONFIRM_PROMPT = (
     "A newly found instance of a first-round defect class is a FAIL only when it quotes a Goal line, "
     "names a locked acceptance test that fails or states a concrete input that really breaks if this merges; "
     "otherwise report it as a NOTE line. "
+    + REVIEW_BLOCKING_RULE + " "
     "Do not edit files. Reply with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` followed by "
     "every remaining finding, each one line with file:line and the concrete failure."
 )
@@ -94,6 +104,7 @@ def review_scope_rules(acceptance_dir: str, language: str = "en") -> str:
         "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
         "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
         "and are never a reason to FAIL.\n"
+        + REVIEW_BLOCKING_RULE + "\n"
         + text("review_class_question", language)
     )
 
@@ -263,6 +274,7 @@ def build_prompt(
         f"  Write it in {language}. Include an `## Evidence` section quoting the exact conflicting lines "
         "(issue sentence; file:line and the code line).\n"
         "- Do not commit, push or switch branches. Leave your changes in the working tree.\n"
+        "- Put scratch files, temporary folders and notes under .foragent/tmp/ (`mkdir -p .foragent/tmp`). Point helpers such as cxdo there with `export TMPDIR=\"$PWD/.foragent/tmp\"`. Nothing under .foragent/ is ever committed.\n"
         "- For each reviewer point either fix it or write `.foragent/REBUTTAL.md` "
         "with `- <point>: <why it is out of scope or not a defect>`.\n"
         '- Write the short change summary as JSON in .foragent/PR.json: {"summary": "one or two complete sentences"}.\n'

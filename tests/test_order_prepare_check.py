@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,8 +17,8 @@ from foragent.git import GitRepo
 CANDIDATE = "tests/acceptance/test_x.py"
 
 
-def _run(git_history, tmp_path, commands):
-    git_history.update({"base.txt": "base\n", ".gitignore": ".cache/\n"})
+def _run(git_history, tmp_path, commands, *, files=None):
+    git_history.update({"base.txt": "base\n", ".gitignore": ".cache/\n", **(files or {})})
     git_command(git_history.clone, "fetch", "origin", "main")
     git = GitRepo(git_history.clone)
     written = {CANDIDATE: "candidate\n"}
@@ -82,6 +83,19 @@ def test_a_wrong_command_reports_its_real_exit_code_and_output(git_history, tmp_
     assert "missing_runner.py" in results[0]["output"]
 
 
+@pytest.mark.parametrize("existing", [False, True])
+def test_regenerated_gitignored_build_info_does_not_void_a_run(git_history, tmp_path, existing):
+    name = "src/foragent/_build.py"
+    files = {".gitignore": f".cache/\n/{name}\n"}
+    if existing:
+        files[name] = "GIT_SHA = 'before'\n"
+    command = f"mkdir -p src/foragent; echo regenerated > {name}; exit 1"
+    _git, _directory, results = _run(git_history, tmp_path, [command], files=files)
+    assert results[0]["exit_code"] == 1
+    assert results[0]["changed"] == []
+    assert order_prepare_check.changed(results) == []
+
+
 def test_the_prompt_carries_the_measured_results():
     item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api"}
     plan = {"title": "P", "issues": [item]}
@@ -94,6 +108,32 @@ def test_the_prompt_carries_the_measured_results():
     assert "`slow` (timed out)" in prompt and "partial" in prompt
     # A swap restored after the run is invisible to any after-the-fact check; the reviewer judges it.
     assert "moves, rewrites, replaces or restores files of the tree" in " ".join(prompt.split())
+
+
+def test_the_reviewer_holds_only_for_major_test_gaps():
+    item = {"key": "a", "title": "A", "goal": "g", "statements": ["s"], "out_of_scope": "o", "lane": "api"}
+    plan = {"title": "P", "issues": [item]}
+    entry = {"written": {}, "done_when": ["check"], "base_revision": "b1"}
+    prompt = " ".join(order_prepare_review.review_prompt(plan, item, Config(), Path("."), entry).split())
+
+    assert "Use verdict hold only for these major defects:" in prompt
+    assert "(a) A behaviour statement has no test at all." in prompt
+    assert "(b) A test passes on current main (no red)." in prompt
+    assert "(c) A test fails on current main for a reason other than the missing observable behaviour" in prompt
+    for invalid_red in ("import", "invented arguments", "missing tool", "zero collected tests"):
+        assert invalid_red in prompt
+    assert "(d) A test would pass for an implementation that does nothing for that statement" in prompt
+    assert ("asserts private internals (helper names, internal layout) so that a correct implementation "
+            "would fail") in prompt
+    assert ("Everything else goes to notes, never holds: more break-it cases (wrong value, skipped effect, "
+            "doubled effect), stronger identity checks, extra scenarios and wording.") in prompt
+    assert "incomplete break-it coverage alone is not a hold reason" in prompt
+    assert "If none of (a)-(e) applies, return verdict pass with any weaknesses in notes." in prompt
+    assert "each statement, with its exact text" in prompt
+    assert "actual counts, the measured exit code, an output excerpt and your reading of why it failed" in prompt
+    assert "behaviour already passing on main" not in prompt  # Writer guidance would contradict (b).
+    assert "Pass only when all of these hold" not in prompt
+    assert "when the tests fall short" not in prompt
 
 
 def test_a_reported_exit_code_that_contradicts_the_measured_one_is_no_pass(tmp_path):
@@ -124,6 +164,7 @@ RED = f"python3 -c \"import runpy, sys; ns = runpy.run_path('tests/acceptance/te
 
 @pytest.mark.parametrize("candidate, command, voided", [
     (FAILING, RED, None),
+    (FAILING, f"mkdir -p src/foragent; echo regenerated > src/foragent/_build.py; {RED}", None),
     # The reproduced bypass: a passing candidate rewritten to fail, then run.
     (PASSING, f"printf 'def test_n():\\n    assert False\\n' > tests/acceptance/test_n.py; {RED}",
      "tests/acceptance/test_n.py"),
@@ -139,7 +180,7 @@ def test_the_reviewer_tree_stays_separate_and_untouched(git_history, tmp_path, m
     from foragent.executors import ExecResult
     from foragent.state import StateStore
 
-    git_history.update({"notice.py": "print(0)\n"})
+    git_history.update({"notice.py": "print(0)\n", ".gitignore": "/src/foragent/_build.py\n"})
     root = git_history.clone
     git_command(root, "fetch", "origin", "main")
     git_command(root, "merge", "--ff-only", "origin/main")
@@ -185,3 +226,50 @@ def test_the_reviewer_tree_stays_separate_and_untouched(git_history, tmp_path, m
     assert "(exit code 1)" in seen["prompt"]
     assert (root / "notice.py").read_text() == "print(0)\n" and not (root / "stray").exists()
     assert not os.path.lexists(root / "stray")
+
+
+def test_measured_python_command_has_a_local_venv_and_reads_scratch_sources(git_history, tmp_path, monkeypatch):
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_PYTHON", sys.executable)
+    monkeypatch.setenv("UV_NO_SYNC", "1")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "wrong-environment"))
+    monkeypatch.setenv("UV_PROJECT", str(tmp_path / "wrong-project"))
+    monkeypatch.setenv("PYTHONPATH", str(git_history.clone))
+    command = '.venv/bin/python -c "import notice; print(notice.VALUE)"'
+    files = {".gitignore": ".venv/\n__pycache__/\n", "notice.py": "VALUE = 'scratch main'\n",
+             "pyproject.toml": '[project]\nname = "toy-prepare"\nversion = "0"\nrequires-python = ">=3.12"\n',
+             "uv.lock": ('version = 1\nrevision = 3\nrequires-python = ">=3.12"\n'
+                         '[[package]]\nname = "toy-prepare"\nversion = "0"\nsource = { virtual = "." }\n')}
+    (git_history.clone / "notice.py").write_text("VALUE = 'dirty checkout'\n")
+    git, directory, results = _run(git_history, tmp_path, [command], files=files)
+    assert results[0]["exit_code"] == 0, results
+    assert results[0]["output"].endswith("scratch main\n"), results
+    assert results[0]["changed"] == []
+    assert not (git.root / ".venv").exists() and not (directory / "check").exists()
+    assert not (tmp_path / "wrong-environment").exists()
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_measured_exit_127_retries_once_and_never_becomes_a_hold(request, capsys, monkeypatch, recovers):
+    from helpers import lane_tests
+
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["hold", "pass"]
+    original = order_prepare_check.run
+    measured = []
+
+    def run(*args, **kwargs):
+        results = original(*args, **kwargs)
+        measured.append(results)
+        if len(measured) == 1 or not recovers:
+            return [result | {"exit_code": 127, "output": "tool: command not found"} for result in results]
+        return results
+
+    monkeypatch.setattr(order_prepare_check, "run", run)
+    row = lane_tests.prepare(case, capsys)
+    assert row["status"] == ("reviewed" if recovers else "interrupted") and row["holds"] == 0
+    assert len(measured) == 2
+    assert [call["role"] for call in case.calls] == ["writer", "reviewer", "reviewer"]
+
+
+from helpers.lane_tests import lane_case, offline_publication  # noqa: E402, F401
