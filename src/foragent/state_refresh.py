@@ -316,12 +316,20 @@ RUN_MERGE = "run:"  # Key prefix of an execution's merge whose PR the cache has 
 EVIDENCE = "by_run"  # The entry's execution is Foragent's own record of the merge, not a listing's guess.
 
 
-def merge_facts_of(snapshot: Any, runs: Any = ()) -> dict[tuple[int, str], dict]:
+class MergeFacts(dict):
+    """Merge facts by execution, plus ``disowned``: executions that claimed a merge the PR link
+    gives to another run. Such a run never counts as merged, whatever its own outcome says."""
+
+    disowned: frozenset = frozenset()
+
+
+def merge_facts_of(snapshot: Any, runs: Any = ()) -> MergeFacts:
     """Each cached merge with its execution: {"pr", "merged_at"} by (number, started_at).
 
     A PR's merge belongs to the run that opened it (the run history's ``pr_number`` link), never
     to a later run of the issue. Without that link (a PR older than the link) the cache's recorded
-    execution stands, unless that run opened a different PR. ``runs``: Run records or raw rows."""
+    execution stands, unless that run opened a different PR. ``runs``: raw run rows. A run the
+    cache recorded for a merge that belongs elsewhere is ``disowned``: one PR, one merged run."""
     opener: dict[tuple[int, int], str] = {}
     opened: dict[tuple[int, str], int] = {}
     for run in runs:
@@ -331,21 +339,26 @@ def merge_facts_of(snapshot: Any, runs: Any = ()) -> dict[tuple[int, str], dict]
             opened[number, started] = pr
             if (number, pr) not in opener or started < opener[number, pr]:
                 opener[number, pr] = started
-    facts: dict[tuple[int, str], dict] = {}
+    facts = MergeFacts()
+    claims: set[tuple[int, str]] = set()
     for row, merges in _issue_merges(snapshot):
         for pr, entry in merges.items():
             if not (isinstance(entry, dict) and isinstance(at := entry.get("merged_at"), str)):
                 continue
             number = int(pr) if pr.isdigit() else None
+            recorded = entry.get("started_at")
+            if isinstance(recorded, str):
+                claims.add((row["number"], recorded))
             started = opener.get((row["number"], number)) if number is not None else None
             if started is None:
-                started = entry.get("started_at")
+                started = recorded
                 if not isinstance(started, str) or opened.get((row["number"], started), number) != number:
                     continue  # No execution, or that run's own PR is another one.
             key, when = (row["number"], started), _merge_time(at)
             known = _merge_time(facts[key]["merged_at"]) if key in facts else None
             if key not in facts or when is not None and (known is None or when > known):
                 facts[key] = {"pr": int(pr) if pr.isdigit() else None, "merged_at": at}
+    facts.disowned = frozenset(claims - facts.keys())
     return facts
 
 

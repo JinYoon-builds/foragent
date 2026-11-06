@@ -896,7 +896,7 @@ def _executions(store: Any) -> list[dict[str, Any]]:
 
     ``seconds`` is the execution's working time: wall time minus the waits and machine sleep the
     run itself credited, so a limit wait does not read as slow work."""
-    finished, merged_at = store.finish_times(), store.merge_times()
+    finished, owner_facts = store.finish_times(), store.owner_merge_facts()
     rows = []
     for run in store.read_history():
         if run.kind != "issue" or run.status != "finished":
@@ -906,12 +906,11 @@ def _executions(store: Any) -> list[dict[str, Any]]:
             continue
         key = (run.number, run.started_at)
         ended = _stamp(finished.get(key))
-        merge = _stamp(merged_at.get(key))
         idle = float(getattr(run, "waited_seconds", 0) or 0) + float(getattr(run, "slept_seconds", 0) or 0)
         rows.append({"number": run.number, "lane": run.lane, "started": started, "skills": set(run.skills_used),
                      "reported": bool(getattr(run, "skills_reported", False)), "outcome": run.outcome,
                      "reviewer_hold": run.outcome == "held" and getattr(run, "hold_reason", None) in REVIEWER_HOLDS,
-                     "hold_reason": getattr(run, "hold_reason", None) if run.outcome == "held" else None, "merged": run.outcome == "merged" or (merge is not None and merge >= started),
+                     "hold_reason": getattr(run, "hold_reason", None) if run.outcome == "held" else None, "merged": store.run_merged(run, owner_facts=owner_facts),
                      "seconds": max(0.0, (ended - started).total_seconds() - idle) if ended and ended >= started else None})
     return rows
 

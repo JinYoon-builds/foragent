@@ -18,11 +18,19 @@ PROCESS_FIELDS = frozenset({"process_identities", "pid", "executor_pgid"})
 
 
 def record_merged(value, owner_facts) -> bool:
-    """The one merge rule on a raw run record: outcome merged, or a cached GitHub merge of it."""
+    """The one merge rule on a raw run record: a cached GitHub merge of it, else outcome merged.
+
+    A PR's merge belongs to the run that opened it (PM q32): a run whose merge the cache gives to
+    another run (``owner_facts.disowned``) is not merged, even with outcome "merged" (a later run
+    that reused and merged a crashed run's PR). Without any cached merge the outcome stands."""
     if not isinstance(value, dict) or type(value.get("number")) is not int:
         return False  # No usable identity: nothing to count, whatever else the record says.
-    return value.get("outcome") == "merged" or (
-        isinstance(value.get("started_at"), str) and (value["number"], value["started_at"]) in owner_facts)
+    key = (value["number"], value.get("started_at"))
+    if isinstance(key[1], str) and key in owner_facts:
+        return True
+    if key in getattr(owner_facts, "disowned", ()):
+        return False
+    return value.get("outcome") == "merged"
 
 
 class RunRecordsMixin:
@@ -237,10 +245,8 @@ class RunRecordsMixin:
         return self.merge_facts()
 
     def run_merged(self, run: Run, *, owner_facts=None) -> bool:
-        if run.outcome == "merged":
-            return True
         facts = self.owner_merge_facts() if owner_facts is None else owner_facts
-        return record_merged({"number": run.number, "started_at": run.started_at}, facts)
+        return record_merged({"number": run.number, "started_at": run.started_at, "outcome": run.outcome}, facts)
 
     def active_runs(self) -> list[Run]:
         paths = list((self.root / "runs").glob("*.json"))  # Issues by number, then dream-<lane> and draft-<n>.

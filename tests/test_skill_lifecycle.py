@@ -39,8 +39,14 @@ def _store(tmp_path: Path, runs: list[tuple], waited: dict[tuple[int, int], floa
                                        hold_reason=reason or None, skills_reported=number not in unreported,
                                        waited_seconds=(waited or {}).get((number, hour), 0), slept_seconds=0))
         finished[number, started] = (T0 + timedelta(hours=hour + 1 + len(used))).isoformat()
+    from foragent.state_runs import record_merged
+
+    # The store's merge reading: no cached merge, so each execution's outcome decides (the real rule).
     return SimpleNamespace(root=tmp_path / "state", read_history=lambda: history,
-                           finish_times=lambda: finished, merge_times=lambda: {})
+                           finish_times=lambda: finished, merge_times=lambda: {}, owner_merge_facts=lambda: {},
+                           run_merged=lambda run, owner_facts=None: record_merged(
+                               {"number": run.number, "started_at": run.started_at, "outcome": run.outcome},
+                               owner_facts or {}))
 
 
 def test_comparison_counts_issues_with_and_without_in_lanes_that_used_the_skill(tmp_path):

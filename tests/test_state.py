@@ -1195,3 +1195,26 @@ def test_a_later_run_never_takes_over_an_earlier_runs_merged_pr(store, tmp_path)
                                [pr, PullRequest(71, "foragent/issue-7", "main", "", "", second, "u")], {},
                                clock[0] + timedelta(minutes=2))
     assert store.merge_times() == {(7, old.started_at): merged_at, (7, new.started_at): second}
+
+
+def test_a_run_that_reuses_and_merges_a_crashed_runs_pr_does_not_count_as_merged(store, tmp_path):
+    from foragent import orch_scorecard_records, skills
+
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    store.update_local_issue(7, title="t", labels=["approved"], state="open", body="")
+    crashed = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "a")
+    store.record_opened_pr(7, 70)
+    clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "crashed")
+    clock[0] += timedelta(minutes=1)
+    reused = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "b")
+    clock[0] += timedelta(minutes=1)
+    store.record_merge(7, clock[0], pr=70, base="main")  # The later run merges the PR it found open.
+    store.finish_run(7, "merged")
+    first, second = store.read_history()
+    assert (first.started_at, second.started_at) == (crashed.started_at, reused.started_at)
+    assert store.run_merged(first) and not store.run_merged(second), "One PR, one merged run: its opener"
+    assert list(store.merge_times()) == [(7, crashed.started_at)]
+    assert [row["merged"] for row in orch_scorecard_records._executions(store, clock[0])] == [True, False]
+    assert [row["merged"] for row in skills._executions(store)] == [True, False]
