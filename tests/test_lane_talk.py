@@ -516,7 +516,7 @@ def test_a_talk_overlapping_a_test_slot_wait_is_credited_once(tmp_path, monkeypa
     talk = []
 
     @contextmanager
-    def slot(slots, waiting):
+    def slot(ceiling, *, waiting):
         waiting()  # Queued for 40 minutes while a person talks for the same 40 minutes.
         talk.append(talk_event(store, clock[0]))
         clock[0] += timedelta(minutes=40)

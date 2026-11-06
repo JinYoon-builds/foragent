@@ -11,3 +11,4 @@
 - [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
 - [Publish help omits closes](broken_publish_help_closes.md) — fa order publish --help schema lacks `closes` (tracked #2169/#2170)
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
+- [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest

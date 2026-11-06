@@ -19,6 +19,7 @@ import sys
 
 from foragent import ci_local, ci_mode, orch_github, orch_queue, orch_stop, processes, run_merge_turn as queue, run_publish, runner
 from foragent.issue import body_hash, parse_body
+from foragent.file_locks import reporting
 from foragent.git import main_write_lock
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, READY, RUNNING
 from foragent.records import load_record
@@ -72,7 +73,10 @@ def run_process(request, lock_fd):
     from foragent.state import StateStore
     from foragent.tracker import GhTracker
 
-    with os.fdopen(lock_fd, "a"):
+    from foragent.file_locks import adopt
+
+    with os.fdopen(lock_fd, "a"), reporting(Path(request["store_root"])):
+        adopt(lock_fd, Path(request["store_root"]) / "merge-owner.lock")
         root = Path(request["repo_root"])
         owner = runner.RunContext(request["repo"], root, GhTracker(request["repo"]),
                                   StateStore(Path(request["store_root"])), Config(**request["config"]),
@@ -678,6 +682,7 @@ def _reconcile(ctx, place, job):
     return pr
 
 
+@reporting()
 def tick(ctx, report):
     """One owner pass; called only while the independent owner lock is held."""
     if not getattr(ctx.config, "merge_owner", False):

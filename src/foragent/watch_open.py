@@ -216,14 +216,16 @@ def _record_attempt(store: StateStore, now: datetime) -> None:
 def _opening(store: StateStore):
     """Serialize openers so each sees the record any other opener just wrote.
 
-    A blocking flock on a separate file: it is held only for one opener's
+    A bounded flock on a separate file: it is held only for one opener's
     checks and terminal commands (each bounded by the 5 s timeout), and the
     kernel releases it if the opener dies.
     """
     store.root.mkdir(parents=True, exist_ok=True)
     fd = os.open(store.root / "watch-open.lock", os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(fd, store.root / "watch-open.lock", journal_root=store.root)
         yield
     finally:
         os.close(fd)

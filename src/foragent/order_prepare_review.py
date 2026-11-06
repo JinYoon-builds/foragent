@@ -234,17 +234,17 @@ def _number(value) -> bool:
 
 
 def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
-    """What a pass lacks of the agreed evidence: each statement mapped to written tests with its
-    break-it evidence, and each command with its actual counts, exit code, output and failure kind."""
+    """What a pass lacks of the agreed evidence: each statement mapped to written tests (break-it
+    evidence is optional), and each command with its actual counts, exit code, output and failure kind."""
     names = set(entry["written"])
     names_test = lambda test: _text(test) and test.split("::", 1)[0] in names  # noqa: E731
     gaps = []
     for line in item["statements"]:
         covers = [cover for cover in facts["coverage"] if cover.get("statement") == line]
+        # Break-it evidence is best effort (#2229): it is recorded when given, never required.
         if not any(isinstance(cover.get("tests"), list) and cover["tests"] and all(map(names_test, cover["tests"]))
-                   and isinstance(cover.get("break_it"), list) and cover["break_it"]
-                   and all(map(_text, cover["break_it"])) for cover in covers):
-            gaps.append(f"coverage of {line!r} (tests among the written files and break-it evidence)")
+                   for cover in covers):
+            gaps.append(f"coverage of {line!r} (tests among the written files)")
     commands = entry.get("done_when", [])
     if not commands:
         gaps.append("done_when commands")
