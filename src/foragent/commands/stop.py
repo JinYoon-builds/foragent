@@ -2,6 +2,7 @@
 
 This entrance only submits the request to `fa orch stop --all --keep-work` and prints the
 recorded result; the runner that owns each run saves and finishes it, as for the bulk command.
+Its pair is `fa orch release`, which starts FA again; the help names it (UX r820).
 """
 
 from foragent.commands import facade
@@ -11,7 +12,12 @@ ORDER = 113
 
 def add(commands) -> None:
     cli = facade()
-    stop = commands.add_parser("stop", help="Stop every lane now; running work is saved and kept")
+    stop = commands.add_parser(
+        "stop",
+        help="Stop every lane now; running work is saved and kept",
+        description="Stop every lane now; running work is saved and kept. "
+        "To start FA again, run `fa orch release`, or ask /fa.",
+    )
     stop.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     stop.add_argument("--why", help="Why you stop FA; kept in the journal (default: you typed fa stop)")
 
