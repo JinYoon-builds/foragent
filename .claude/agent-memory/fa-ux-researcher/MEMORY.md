@@ -13,3 +13,4 @@
 - [Init skill hint example](broken_init_skill_hint_example.md) — ambiguous-skill hint example repeats the already-chosen skill (confirmed)
 - [Childless order closes as applied](broken_order_close_no_children.md) — re-approve order closes in 47 s saying 적용됐고 while its issues are open (confirmed)
 - [npx install 404](broken_npx_install_404.md) — README `npx foragent` fails with npm E404; package not published (confirmed)
+- [Closed parent no card](broken_closed_parent_no_card.md) — 75 closed order parents lack a board card after #1577; some post-merge too (confirmed)
