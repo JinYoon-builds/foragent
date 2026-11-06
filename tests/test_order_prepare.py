@@ -722,6 +722,143 @@ from helpers import lane_tests as _cases
 lane_case, offline_publication = _cases.lane_case, _cases.offline_publication
 
 
+def test_a_held_writer_resumes_previous_tests_without_rewriting_unchanged_files(request, capsys, monkeypatch):
+    from foragent import executors
+    from foragent.executors import ExecResult
+
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["hold", "pass"]
+    helper = "tests/acceptance/data/receipt.txt"
+    original = executors.CodexExecutor.run
+    trees = []
+
+    def run(self, **kwargs):
+        tree = Path(kwargs["worktree"])
+        trees.append(tree)
+        if len(trees) == 1:
+            assert not (tree / _cases.TEST_PATH).exists()
+            assert not (tree / helper).exists()
+            assert "## Your previous tests" not in kwargs["prompt"]
+            result = original(self, **kwargs)
+            (tree / helper).parent.mkdir(parents=True)
+            (tree / helper).write_text("previous receipt\n")
+            message = json.loads(result.last_message)
+            message["acceptance_files"][helper] = "previous receipt\n"
+            result.last_message = json.dumps(message)
+            return result
+        assert tree != trees[0]
+        assert (tree / _cases.TEST_PATH).read_text() == case.candidate
+        assert (tree / helper).read_text() == "previous receipt\n"
+        prompt = kwargs["prompt"]
+        assert _cases.TEST_PATH in prompt and helper in prompt and _cases.CHECK in prompt
+        assert "Delivery observable once; break-it checked." in prompt
+        assert "Change only what the reviewer's reason or the PM's new answer requires" in prompt
+        assert "keep everything else as it is" in prompt
+        assert "revise your previous candidates" in prompt
+        # The unchanged test must remain a candidate even though the writer edits only the helper.
+        (tree / helper).write_text("revised receipt\n")
+        message = {"acceptance_files": {_cases.TEST_PATH: case.candidate, helper: "revised receipt\n"},
+                   "done_when": [_cases.CHECK], "questions": []}
+        return ExecResult(0, False, json.dumps(message), Path(kwargs["log_path"]), session_id="revised-writer")
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    assert _cases.prepare(case, capsys)["status"] == "hold"
+    row = _cases.prepare(case, capsys)
+    assert row["status"] == "reviewed" and row["holds"] == 1
+    assert len(trees) == 2
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {
+        _cases.TEST_PATH: case.candidate, helper: "revised receipt\n"}
+
+
+@pytest.mark.parametrize("change", ["statements", "goal"])
+@pytest.mark.parametrize("stopped", ["question", "reviewing_tests"])
+@pytest.mark.parametrize("wait_for_writer", [False, True])
+def test_a_writer_resumes_previous_tests_after_planning_changes_the_requirements(
+        request, capsys, monkeypatch, change, stopped, wait_for_writer):
+    from contextlib import contextmanager
+
+    from foragent import capacity, executors
+
+    case = request.getfixturevalue("lane_case")
+    old = _cases.STATEMENT
+    if stopped == "question":
+        case.verdicts = ["question", "pass"]
+        assert _cases.prepare(case, capsys)["status"] == "question"
+    else:
+        case.reviewer_exit = 1
+        assert _cases.prepare(case, capsys)["status"] == "waiting"
+        _left_running(case, "reviewing_tests")
+        case.reviewer_exit = 0
+    new = "Sending a notice reports exactly one delivery and writes one receipt line."
+    case.plan["issues"][0][change] = [new] if change == "statements" else new
+    if change == "statements":
+        monkeypatch.setattr(_cases, "STATEMENT", new)
+    case.save()
+    if wait_for_writer:
+        @contextmanager
+        def no_slot(*args, **kwargs):
+            raise TimeoutError("no writer slot")
+            yield
+
+        with monkeypatch.context() as waiting:
+            waiting.setattr(capacity, "hold_workload", no_slot)
+            assert _cases.prepare(case, capsys)["status"] == "waiting"
+    original = executors.CodexExecutor.run
+    prompts = []
+
+    def run(self, **kwargs):
+        tree, prompt = Path(kwargs["worktree"]), kwargs["prompt"]
+        assert (tree / _cases.TEST_PATH).read_text() == case.candidate
+        assert "## Your previous tests" in prompt
+        assert "## Previous behaviour statements" in prompt and "## New behaviour statements (PM answer)" in prompt
+        assert old in prompt and new in prompt
+        assert "Change only" in prompt and "keep everything else as it is" in prompt
+        prompts.append(prompt)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    assert _cases.prepare(case, capsys)["status"] == "reviewed"
+    assert len(prompts) == 1
+    assert _cases.disk_plan(case)["issues"][0]["acceptance_files"] == {_cases.TEST_PATH: case.candidate}
+
+
+def test_previous_statements_in_older_records_are_read_from_review_evidence():
+    from foragent.order_prepare_prompt import _resume_prompt
+
+    previous = {"written": {"tests/acceptance/test_a.py": "assert False\n"},
+                "attempts": [{"role": "reviewer", "coverage": [{"statement": "Old behaviour."}]}]}
+    prompt = _resume_prompt({"statements": ["New behaviour."]}, previous)
+    assert "## Previous behaviour statements\n  - Old behaviour." in prompt
+    assert "## New behaviour statements (PM answer)\n  - New behaviour." in prompt
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_main_input_changes_preserve_tests_unless_the_input_was_removed(
+        request, git_history, capsys, monkeypatch, removed):
+    from foragent import executors
+
+    case = request.getfixturevalue("lane_case")
+    case.verdicts = ["hold", "pass"]
+    assert _cases.prepare(case, capsys)["status"] == "hold"
+    git_history.update({"notice.py": None if removed else _cases.NOTICE + "# Changed input.\n"})
+    original = executors.CodexExecutor.run
+    seen = []
+
+    def run(self, **kwargs):
+        tree = Path(kwargs["worktree"])
+        assert (tree / _cases.TEST_PATH).exists() is not removed
+        assert ("## Your previous tests" in kwargs["prompt"]) is not removed
+        seen.append(tree)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(executors.CodexExecutor, "run", run)
+    # Removing the toy entry point also makes the fake review's red run an environment error.
+    # Only the writer's starting tree matters here; keep that review pending.
+    case.reviewer_exit = 1
+    assert _cases.prepare(case, capsys)["status"] == "waiting"
+    assert len(seen) == 1
+
+
 @pytest.mark.parametrize("existing", [False, True])
 def test_gitignored_build_output_does_not_interrupt_writing_or_review(request, git_history, capsys, existing):
     case = request.getfixturevalue("lane_case")
@@ -1567,7 +1704,7 @@ def test_each_issue_is_prepared_on_main_as_it_is_when_its_turn_comes(request, gi
         tips.append(git_history.tip)
 
     monkeypatch.setattr(order_prepare_cycle, "prepare_issue", turn)
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 1)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     capsys.readouterr()
     _cases.invoke(case, capsys, "prepare", str(case.path), "--json")
     assert [key for key, _ in seen] == ["notice", "second"]
@@ -1625,7 +1762,7 @@ def test_a_helper_of_another_statement_issue_is_reviewed_beside_this_issues_test
     cases = _cases
     case = request.getfixturevalue("lane_case")
     # This fixture routes candidates through mutable globals; its ordering check uses one slot.
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 1)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 1)
     git_history.update({".gitignore": "__pycache__/\n"})  # the shadow import writes bytecode
     git_command(case.root, "fetch", "origin", "main")
     git_command(case.root, "read-tree", "-m", "-u", "HEAD", "origin/main")
@@ -2279,7 +2416,7 @@ def test_issues_prepare_concurrently_up_to_test_capacity_without_losing_records(
     monkeypatch.setattr("foragent.order.validate_plan", lambda *args: {})
     monkeypatch.setattr(order_prepare_owner, "take", lambda *args: True)
     monkeypatch.setattr(order_scratch, "base_revision", lambda *args: "base")
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: slots)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: slots)
     active, peak, lock, barrier = [0], [0], Lock(), Barrier(slots)
 
     def issue(plan, item, root, config, git, path, record, base, store):
@@ -2313,7 +2450,7 @@ def test_parallel_issues_are_promoted_and_reviewed_beside_each_others_tests(requ
     case.plan["issues"].append({**case.plan["issues"][0], "key": "other"})
     case.save()
     barrier, calls = Barrier(2), []
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 2)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
     monkeypatch.setattr(order_prepare_check, "run", lambda *args: [
         {"command": "check", "exit_code": 1, "timed_out": False, "output": "assertion", "changed": []}])
 
@@ -2367,7 +2504,7 @@ def test_parallel_shared_helpers_are_reused_or_sent_back_to_the_later_writer(
     helper = "tests/acceptance/receipt_fixture.txt"
     contents = {keys[0]: "receipt\n", keys[1]: "another receipt\n" if different else "receipt\n"}
     barrier, calls, revisions = Barrier(2), [], []
-    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling: 2)
+    monkeypatch.setattr(capacity, "effective_test_slots", lambda ceiling=None: 2)
 
     def run(executor, **kwargs):
         tree = Path(kwargs["worktree"])

@@ -11,7 +11,7 @@ Record (``<state>/prepare/<order id>.json``)::
     {"plan": "<order id>", "issues": {"<key>": {
         "key", "status", "phase", "questions", "notes", "reason", "updated_at",
         "base_revision", "scratch", "cycle", "written": {path: text}, "done_when": [command],
-        "ignored": [tool output path], "coverage", "red",
+        "ignored": [tool output path], "coverage", "red", "requirements",
         "attempts": [{"attempt", "role": "writer", "cycle", "started_at", "finished_at", "status",
                       "base_revision", "scratch", "executor", "model", "options", "log",
                       "exit_code", "timed_out", "session_id", "written", "done_when",
@@ -189,17 +189,21 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
                  path: Path, record: dict, base: str, cycle: str, asked: str | None = None,
                  store: StateStore | None = None) -> None:
     """One writer attempt in a new scratch tree; the record is saved before and after the agent."""
-    from foragent.order_prepare_cycle import behaviour, revision_notes, same_requirement
+    from foragent.order_prepare_cycle import behaviour, previous_tests, revision_notes
+    from foragent.order_prepare_review import _place
 
     entries = record["issues"]
     entry = entries.setdefault(item["key"], {"key": item["key"], "attempts": []})
-    revision = revision_notes(entry) if same_requirement(entry, cycle, asked) else ""
+    previous = dict(entry)
+    revision = revision_notes(entry)
+    requirements = {name: deepcopy(item.get(name))
+                    for name in ("goal", "statements", "out_of_scope", "checklist", "files")}
     attempt = len(entry["attempts"]) + 1
     home = path.parent / _slug(plan["id"]) / _slug(item["key"])
     # Earlier attempts' trees stay for inspection; each attempt gets its own new tree.
     tree, log = home / f"attempt-{attempt}" / "tree", home / f"attempt-{attempt}" / "writer.log"
     facts = {"attempt": attempt, "role": "writer", "cycle": cycle, "requirement": asked,
-             "started_at": _now(), "base_revision": base,
+             "started_at": _now(), "base_revision": base, "requirements": requirements,
              "scratch": str(tree), "log": str(log)}
     entry["attempts"].append(facts)
     for stale in ("coverage", "red"):
@@ -224,6 +228,11 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
                 say("prepare_context_refused", path=name) for name in context.refused]}
             manifest = None  # no writer ran: the outcome is the refusal itself
             return
+        # Candidates stay outside the main/context baseline: unchanged or revised, they are
+        # still this issue's output. Main and peer files keep their existing read-only boundary.
+        resumed = {name: content for name, content in previous_tests(previous, item, git, base).items()
+                   if name not in manifest}
+        _place(tree, resumed)
         start = setup.writer_setup(lane_config, item, tree)
         options = start.options | setup.permissions(start.executor, tree, protected, config.acceptance_dir,
                                                     tree.parent)
@@ -233,7 +242,9 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
             failure = {"status": "waiting", "reason": say("prepare_missing_skills", skills=", ".join(start.missing_skills))}
             return
         _write(path, record)
-        prompt = start.notes + writer_prompt(plan, item, lane_config, root, tree, base) + revision + start.memory_notice
+        prompt = (start.notes + writer_prompt(plan, item, lane_config, root, tree, base,
+                                              previous=previous | {"written": resumed})
+                  + revision + start.memory_notice)
         before = order_scratch.stamps(tree, manifest)  # taken last, right before the writer starts
         admitted = False
         try:
@@ -258,6 +269,12 @@ def _write_tests(plan: dict, item: dict, root: Path, config: Config, git: GitRep
                 result, failure, tree, git, manifest, config, protected, before)
         except (GitError, OSError, ValueError) as exc:
             outcome = {"status": "interrupted", "reason": say("prepare_error", error=" ".join(str(exc).split())[:300])}
+        if result is not None:
+            entry["requirements"] = requirements
+        elif previous.get("written"):
+            # No writer ran: its previous work and commands still describe the candidates.
+            outcome.setdefault("written", previous["written"])
+            outcome["done_when"] = previous.get("done_when", [])
         facts.update(outcome, finished_at=_now())
         entry.update(status=outcome["status"], questions=outcome.get("questions", []),
                      notes=outcome.get("notes", []),
