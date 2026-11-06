@@ -1,5 +1,6 @@
 # fa-ux-researcher memory
 - [Inspect running as merge decision](broken_inspect_running_as_merge_decision.md) — running (전체 시험 중) PR shown as "awaits a human merge decision" (confirmed 2026-11-06)
+- [Inspect parked as merge decision](broken_inspect_parked_as_merge_decision.md) — parked (보류) issues shown as "awaits a human merge decision" (confirmed 2026-11-06)
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
