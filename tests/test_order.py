@@ -1064,7 +1064,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "interview_progress", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
     assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
@@ -5086,6 +5086,39 @@ def test_cleanup_leaves_an_issue_closed_before_this_order_alone(publishing, plan
     assert tracker.get_issue(41).state_reason == "not_planned" and tracker.list_comments(41) == []
 
 
+@pytest.mark.parametrize("language, closed, live", [
+    ("en", "Already closed, no change: #42.", "Would close as completed: #41"),
+    ("ko", "이미 닫혀 있어 바꾸지 않아요: #42.", "완료로 닫을 이슈: #41"),
+])
+def test_cleanup_dry_run_shows_already_closed_targets_without_a_change(publishing, plan, language, closed, live):
+    root, config, tracker, git, events = publishing
+    config = replace(config, language=language)
+    for number in (40, 41, 42, 43):
+        tracker.add_issue(number, f"Old work {number}", "body")
+    tracker.close_issue(42, reason="completed")
+    tracker.close_issue(43, reason="not_planned")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "commit": _CLEANUP_SHA},
+                      {"number": 43, "into": 40}]
+    lines = publish((root, config, tracker, git, events), plan, approve=True, dry_run=True).summary().splitlines()
+    assert closed in lines and any(line.startswith(live) for line in lines)
+    stale = [line for line in lines if "#43" in line]
+    assert len(stale) == 1 and stale[0].startswith(closed.split(":")[0]) and "#40" in stale[0]
+    assert not any(_CLEANUP_SHA in line for line in lines if "#42" in line)
+    assert plan["closes"][1] == {"number": 42, "commit": _CLEANUP_SHA}, "The plan's own items stay unchanged"
+
+
+def test_dry_run_summary_speaks_the_configured_language_and_published_stays_english():
+    rows = [{"number": 3, "title": "로그인", "size": "s", "blocked_by": [], "lane": "api",
+             "approved": True, "interactive": False}]
+    preview = order.PublishReport("계획", 1, rows, ["a.py"], True, language="ko").summary()
+    assert preview.splitlines()[:3] == ["계획 (미리 보기): 계획", "부모: #1", "파일: a.py"]
+    assert "| 번호 | 제목 | 크기 | 먼저 끝낼 이슈 | 승인 | 대화형 |" in preview
+    assert "| 3 | 로그인 | s | — | 예 | 아니요 |" in preview and "lane:api" in preview
+    published = order.PublishReport("Plan", 1, rows, ["a.py"], False, language="ko").summary()
+    assert published.splitlines()[:3] == ["Published: Plan", "Parent: #1", "Files: a.py"]
+    assert "| 3 | 로그인 | s | — | yes | no |" in published
+
+
 @pytest.mark.parametrize("late", [42, 43], ids=["cleanup-target", "replaced-target"])
 def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publishing, plan, monkeypatch, late):
     """Work that starts after the publication checks but before the first close stops all closes."""
@@ -5110,3 +5143,86 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
         publish(publishing, plan, approve=True)
     assert closes == [], "No close may be written once a target is running"
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
+
+
+@pytest.fixture
+def uv_executable_case(tmp_path, monkeypatch):
+    from foragent import processes
+
+    def tool(name, folder=".venv/bin"):
+        path = tmp_path / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 97\n")
+        path.chmod(0o755)
+        return path
+
+    tool("uv", "bin")
+    tool("path-check", "bin")
+    tool("venv-check")
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    def forbidden(*args, **kwargs):
+        pytest.fail("Executable preflight must not run a command")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    return tmp_path, tool
+
+
+@pytest.mark.parametrize("command", [
+    "uv run venv-check -q", "uv run path-check", "uv run --offline --no-sync venv-check",
+    "uv run -- venv-check", "uv run ./.venv/bin/venv-check", "uv run", "uv run --offline",
+    "uv run --offline && unavailable-later", "uv run venv-check; unavailable-later",
+    "uv sync", "path-check", "true", "cd .",
+])
+def test_done_when_uv_run_resolves_without_running(uv_executable_case, command):
+    root, _ = uv_executable_case
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, root)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("command,missing", [
+    ("uv run pytestx -q", "pytestx"), ("uv run --offline pytestx", "pytestx"),
+    ("uv run cd .", "cd"), ("uv run ./missing", "./missing"),
+])
+def test_done_when_uv_run_reports_inner_executable(uv_executable_case, language, command, missing):
+    root, _ = uv_executable_case
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables({"edits": [{"number": 42, "done_when": [command]}]}, root, language)
+    assert len(caught.value.lines) == 1
+    line = caught.value.lines[0]
+    assert (f"missing executable {missing}:" if language == "en" else f"실행 파일 {missing}을") in line
+    assert "uv run uv run" not in line
+    assert "; try" not in line and "써 보세요" not in line
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("has_pytest", [False, True])
+def test_done_when_uv_suggestion_requires_suggested_venv_executable(uv_executable_case, language, has_pytest):
+    root, tool = uv_executable_case
+    if has_pytest:
+        tool("pytest")
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python -m pytest -q", "pytestx", "venv-check"]}]},
+            root, language)
+    python, typo, venv = caught.value.lines
+    assert ("uv run pytest -q" in python) == has_pytest
+    assert "uv run" not in typo
+    assert ("the name may be wrong" if language == "en" else "이름이 맞는지 확인해 보세요") in typo
+    assert "uv run venv-check" in venv
+
+
+def test_done_when_uv_run_without_venv_keeps_legacy_behavior(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / ".venv/bin/venv-check").unlink()
+    (root / ".venv/bin").rmdir()
+    order.check_done_when_executables(
+        {"issues": [{"key": "one", "done_when": ["uv run pytestx"]}]}, root)
+
+
+def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / "bin/uv").unlink()
+    with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)

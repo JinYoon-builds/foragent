@@ -275,6 +275,8 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         **identity,
         "language": config.language, "lanes": lanes, "tiers": config.tiers,
         "interview": _interview_context(config),
+        # The unfinished interview FA persisted, so the next PM session resumes it (None when none).
+        "interview_progress": _interview_progress(root, config),
         "profile": config.profile,
         "ui": design.ui_context(root),
         "acceptance_dir": config.acceptance_dir, "base_branch": config.base_branch,
@@ -288,6 +290,14 @@ def context(root: Path, config: Config, tracker: Tracker) -> dict:
         "specs": specs, "repo": {"tree": sorted(tree), "languages": sorted(languages),
                                  "test_commands": commands, "has_workflows": (root / ".github/workflows").is_dir()},
     }
+
+
+def _interview_progress(root: Path, config: Config) -> dict | None:
+    try:
+        repo = config.repo or GitRepo(root).remote_slug()
+    except GitError:
+        return None  # No project store to read; there is no persisted interview here.
+    return StateStore.for_repo(repo).order_progress()
 
 
 def _object(value, required: set[str], optional: set[str], label: str) -> dict:
@@ -480,7 +490,13 @@ def _child_marker(identity: str, key: str) -> str:
 
 def _published_body(plan: dict, item: dict, repo: str, config: Config) -> str:
     """The issue body publish writes for a plan child or edit, before any plan-child marker."""
-    return issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    body = issue_body(item, repo, config.base_branch, config.acceptance_dir, order_references.selected(plan, item))
+    if "statements" in item:
+        key = item.get("key", f"#{item.get('number')}")
+        notes = order_reviewed._record(plan, repo).get(key, {}).get("notes", [])
+        if notes:
+            body += "\n## Preparation notes\n" + "".join(f"- {note}\n" for note in notes)
+    return body
 
 
 @dataclass
@@ -499,20 +515,24 @@ class PublishReport:
     def summary(self) -> str:
         if self.waiting_for is not None:
             return text("order_submission_waiting", self.language, id=self.title, boundary=self.waiting_for)
-        lines = [f"{'Plan (dry run)' if self.dry_run else 'Published'}: {self.title}"]
+        # Only the dry-run preview speaks the configured language; "Published:" stays as it was.
+        language = self.language if self.dry_run else "en"
+        lines = [text("publish_preview_heading", language, title=self.title) if self.dry_run
+                 else f"Published: {self.title}"]
         if self.parent is not None:
-            lines.append(f"Parent: #{self.parent}")
+            lines.append(text("publish_parent", language, number=self.parent))
         lines.extend(self.closures)
-        lines.append("Files: " + ", ".join(self.paths))
+        lines.append(text("publish_files", language, paths=", ".join(self.paths)))
         if self.affected:
             lines += ["", text("order_locks_heading", self.language), *_owner_lines(self.affected)]
+        yes, no = text("publish_yes", language), text("publish_no", language)
         for lane in sorted({row["lane"] for row in self.rows}, key=lane_order):
-            lines += [f"\nlane:{lane}", "| Number | Title | Size | Blocked by | Approved? | Interactive? |", "| --- | --- | --- | --- | --- | --- |"]
+            lines += [f"\nlane:{lane}", text("publish_table_header", language), "| --- | --- | --- | --- | --- | --- |"]
             for row in self.rows:
                 if row["lane"] == lane:
                     title = row["title"].replace("|", "\\|").replace("\n", " ")
                     blockers = ", ".join(map(str, row["blocked_by"])) or "—"
-                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {'yes' if row['approved'] else 'no'} | {'yes' if row['interactive'] else 'no'} |")
+                    lines.append(f"| {row['number']} | {title} | {row['size']} | {blockers} | {yes if row['approved'] else no} | {yes if row['interactive'] else no} |")
         return "\n".join(lines)
 
 
@@ -1213,7 +1233,9 @@ def _record_preread(root: Path, directory: Path, digest: str, record: dict) -> N
         raise PlanError(f"{path} must be a regular file, not a symlink")
     lock = os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        from foragent.file_locks import acquire
+
+        acquire(lock, path)
         records = _preread_records(root)
         # Re-inserting moves this answer to the end: file order is write order (see lane_proposal).
         records.pop(digest, None)
@@ -1518,7 +1540,10 @@ def preread(plan: dict, root: Path, config: Config,
                   "at": datetime.now(UTC).isoformat(timespec="seconds")}
         # The estimate is born here, before the record; each run start fixes it from these notes (#1696).
         _recorded(size_signal.note, store, record, digest, config.language)
-        _record_preread(root, directory, digest, record)
+        from foragent.file_locks import reporting
+
+        with reporting(store.root):
+            _record_preread(root, directory, digest, record)
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}

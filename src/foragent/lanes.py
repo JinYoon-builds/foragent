@@ -11,6 +11,7 @@ from foragent.config import Config, LaneSettings, _validate, load_config
 from foragent.git import GitError, GitRepo
 from foragent.paths import repo_path
 from foragent.skills import SkillManager, with_vendored_library
+from foragent.state_locks import _file_lock
 
 
 class LaneError(ValueError):
@@ -164,6 +165,40 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
     settings.save()
     agent.write_text(agent_content, encoding="utf-8")
     return lane
+
+
+_LESSON_ID = re.compile(r"[^\]\s]+")
+
+
+def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str, text: str) -> tuple[Path, bool]:
+    """Append one lesson to the owning lane's pending notebook (MEMORY.new.md); FA's one append path.
+
+    The agent chose the owner and wrote the lesson; this only records it with its provenance (source
+    issue and owning lane). A retried delivery of the same id appends nothing, and a lesson the dream
+    already consumed is not brought back. MEMORY.md and the consumed ids stay the dream's.
+    Returns the notebook path and whether a line was appended.
+    """
+    if lane not in config.lanes:
+        raise LaneError(f"Unknown lane {lane!r}; known lanes: {', '.join(sorted(config.lanes)) or '(none)'}")
+    if not _LESSON_ID.fullmatch(identity or ""):
+        raise LaneError("Lesson id must be one word without spaces or ']'")
+    lesson = " ".join((text or "").split())
+    if not lesson:
+        raise LaneError("Lesson text is empty")
+    folder = repo_path(root, lane_memory.lane_directory(config, lane))
+    path = folder / lane_memory.PENDING
+    consumed = folder / lane_memory.CONSUMED
+    # Lock the notebook itself: concurrent retries check ids and append as one operation.
+    with _file_lock(path):
+        existing = path.read_text(encoding="utf-8", errors="replace")
+        done = lane_memory.consumed_ids(consumed.read_text(encoding="utf-8", errors="replace")
+                                        if consumed.is_file() else None)
+        if identity in done or any(lane_memory.entry_id(line) == identity for line in existing.splitlines()):
+            return path, False
+        separator = "\n" if existing and not existing.endswith("\n") else ""
+        with path.open("a", encoding="utf-8") as notebook:
+            notebook.write(f"{separator}- [id:{identity}] {lesson} (from #{issue}, lane {lane})\n")
+    return path, True
 
 
 def talk(number: int, *, message: str | None = None, store, config: Config, repo_root: Path | None = None,

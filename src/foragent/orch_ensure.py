@@ -52,12 +52,14 @@ def _explicit_lock(store: StateStore):
     """
     store.root.mkdir(parents=True, exist_ok=True)
     fd = os.open(store.root / "watch-open.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    from foragent.file_locks import LockTimeout, acquire
+
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquire(fd, store.root / "watch-open.lock", timeout=0, journal_root=store.root)
             busy = False
-        except BlockingIOError:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        except LockTimeout:
+            acquire(fd, store.root / "watch-open.lock", journal_root=store.root)
             busy = True
         yield busy
     finally:
