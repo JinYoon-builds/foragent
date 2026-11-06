@@ -15,3 +15,4 @@
 - [Closed parent no card](broken_closed_parent_no_card.md) — 75 closed order parents lack a board card after #1577; some post-merge too (confirmed)
 - [Report counts timeouts as decisions](broken_report_decisions_timeouts.md) — orchestrator-timeout items shown as 결정, no options (confirmed)
 - [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
+- [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
