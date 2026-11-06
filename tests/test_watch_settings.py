@@ -246,21 +246,25 @@ def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(ro
         def isatty(self):
             return True
 
+    from foragent import watch_now
+
     seen = []
     monkeypatch.setattr(sys, "stdin", Terminal())
     monkeypatch.setattr(sys, "stdout", Terminal())
-    monkeypatch.setattr(watch, "collect", lambda status, tracker, store, current, now: seen.append(current) or snapshot)
+    # The dashboard reads only the gate's now-snapshot, in the view's current language.
+    monkeypatch.setattr(watch_now, "read", lambda store, now, language: seen.append(language) or snapshot)
+    saved = replace(load_config(root), language="ko")
 
     def terminal(draw, refresh, first, opened, *rest):
-        refresh.config = load_config(root)  # What the settings window does after a save.
+        refresh.config = saved  # What the settings window does after a save.
         refresh()
         return False
 
     monkeypatch.setattr(curses, "wrapper", terminal)
-    opened = replace(load_config(root), claude_quota={**load_config(root).claude_quota, "mode": "keep"})
+    opened = replace(load_config(root), language="en",
+                     claude_quota={**load_config(root).claude_quota, "mode": "keep"})
     watch.run(lambda: {}, None, store, opened, root)
-    assert [current.claude_quota["mode"] for current in seen] == ["keep", "burn"], (
-        "later snapshots read the saved configuration")
+    assert seen == ["en", "ko"], "later snapshots read the saved configuration"
 
 
 def test_runner_unit_tests_automatic_names_the_choice_that_applies(tmp_path):

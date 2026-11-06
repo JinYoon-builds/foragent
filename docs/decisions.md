@@ -974,6 +974,8 @@ an idle factory may then pull waiting work from other people. They are not v1.
 
 ### D113. 단계 이름 (2026-11-04, Jin; 10-27 승인 목록을 바꾼다)
 - 전체 이름 / 도토리 짧은 이름: 코드 쓰는 중 / 작성, 기준 재는 중 / 준비, **목표 시험 중 / 목표**(옛 로컬 시험 중), 리뷰 받는 중 / 리뷰, **전체 시험 중 / 전체**(옛 CI 시험 중), 머지 전 재확인 중 / 머지, 차례 기다리는 중 / 차례. 머지 담당 줄에서 기다리는 PR은 '차례'다. 이름은 위치가 아니라 무엇을 확인하는지로 짓는다.
+- r560 보강 (2026-11-04, Jin, PM r560; #2078): 머지 단계는 **합쳐서 시험 중 / 합침**(옛 머지 전 재확인 중 / 머지)이다. 영어는 writing code/write, measuring the baseline/prep, goal tests/goal, in review/review, full tests/full, testing merged/merge, waiting for a turn/turn. 머지 담당 줄에서 기다리는 PR은 차례/turn이고 질문이 아니다. 다른 이유로 기다리는 도토리는 대기/wait만 말하고, 이유는 도토리를 눌렀을 때 말풍선에 나온다(D112).
+- 머지 기차: 사람에게 보이는 글은 머지 묶음을 **머지 기차 / merge train**이라 부른다. 설정 키는 그대로 `merge_batch`다.
 
 ### D114. 사람의 결정은 저장소에 바로 넣는다 (2026-11-04, Jin)
 - 결정: PM이 사람과 정한 것은 그 세션에서 이 기록(과 지금 규칙인 rules.md)에 넣는다. PM 기억에는 연결만 둔다. 승인할 때 사람에게서 온 근거는 이 기록에 있어야 한다(#1474에 포함).
