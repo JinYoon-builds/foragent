@@ -257,16 +257,17 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
 
 
 def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
-           store=None) -> None:
+           store=None, *, files=None) -> None:
     """Retry an unusable environment/format attempt once, keeping the writer and its cycle."""
     for _ in range(2):
-        _review_once(plan, item, root, config, git, path, record, store)
+        _review_once(plan, item, root, config, git, path, record, store,
+                     **({"files": files} if files is not None else {}))
         if not record["issues"][item["key"]]["attempts"][-1].get("retryable"):
             break
 
 
 def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
-                 store=None) -> None:
+                 store=None, *, files=None) -> None:
     """One review attempt of the recorded candidates; the record is saved before and after it.
 
     Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
@@ -290,6 +291,9 @@ def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: 
     try:
         lane_config, context = setup.lane_context(plan, item, config, root)
         context.files.update(setup.scratch_files(plan, item, root, config, record))
+        if files is not None:
+            context.files.update({name: data.encode("utf-8") if isinstance(data, str) else data
+                                  for name, data in files.items()})
         entry["others"] = setup.others_digest(plan, record, item)  # what this review runs beside
         from foragent.run_implementation import lane_config as resolve
 
