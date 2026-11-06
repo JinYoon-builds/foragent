@@ -9,3 +9,4 @@
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Order close hides replacement](broken_order_close_replaced_child.md) — order roll-up says 적용/완료 for a child closed as replaced
 - [Done when typo hint](broken_done_when_typo_hint.md) — dry-run suggests `uv run <typo>`, which then passes the check but cannot run
+- [Publish help omits closes](broken_publish_help_closes.md) — fa order publish --help schema lacks `closes` (tracked #2169/#2170)
