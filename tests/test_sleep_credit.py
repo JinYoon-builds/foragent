@@ -64,11 +64,15 @@ def test_a_tick_credits_sleep_since_the_previous_tick(case):
     assert case.store.get_run(1).slept_seconds == NIGHT, "Reading does not consume or repeat credit"
 
 
-@pytest.mark.parametrize("wait", ["test-slot-wait", "overlap-wait", "baseline-wait", "until"])
+@pytest.mark.parametrize("wait", ["test-slot-wait", "overlap-wait", "baseline-wait", "until", "region"])
 def test_a_waiting_run_gets_no_sleep_credit(case, wait):
     case.tick()
     if wait == "until":
         case.store.update_run(1, waiting_until=(case.facts.now() + timedelta(days=1)).isoformat())
+    elif wait == "region":
+        case.store.update_run(1, phase="ci")
+        case.store.add_waited(1, key="ci-wait", start=case.facts.now(), end=case.facts.now(),
+                              waiting_until=(case.facts.now() + timedelta(seconds=60)).isoformat())
     else:
         case.store.update_run(1, phase=wait)
     case.facts.sleep(NIGHT)
