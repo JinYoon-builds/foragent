@@ -112,7 +112,10 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     facts = f"A reviewer gave PASS to head {head} in round {number}, and the issue body is the same as at that PASS."
     kept = cuts.head(record, 8000, cuts.issue_dir(ctx.store.root, n), f"review-pass-{number}.txt")
     evidence = f"Actual review record of that PASS (verbatim):\n{kept}"
-    notes = risks.review_notes(matched, paths)
+    # The notes name only what this review covers: changes since the PASS plus exempt paths' whole change.
+    # Listing every PR path there would ask for the whole change again (#2310).
+    scoped = sorted({*filter(None, since), *full})
+    notes = risks.review_notes(risks.matching(risks.load_at(git, base_ref), scoped), scoped)
     diff = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames"]
     if full:
         entries = "; ".join(", ".join(risk["paths"]) for risk in exempt)
@@ -144,6 +147,26 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
         "A defect confined to unchanged code does not block: write it as a `NOTE: <path:line> — <defect>` line. "
         "A defect a later change causes or exposes belongs to that later change. You judge each finding.",
         evidence]), git._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", expected]))
+
+
+def recheck_paths(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> list[str] | None:
+    """Paths a conflict resolution after a PASS or main's new commits touched, or None without a PASS.
+
+    The resolution is the index against the plain merge of the PASS head with main; main's new commits
+    run from that head's merge base with main. Tests related only to other PR paths stay with PR CI.
+    """
+    passed = _latest_pass(n, ctx, git)
+    if passed is None:
+        return None
+    head = passed[0]
+    main = git._call(["rev-parse", f"{base_ref}^{{commit}}"]).strip()
+    resolved = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", _expected_tree(git, head, base_ref)])
+    try:
+        fork = git._call(["merge-base", head, main]).strip()
+        moved = git._call(["diff", "--name-only", "--no-renames", "-z", fork, main])
+    except GitError:
+        return None  # no shared history: the whole related set stays local
+    return sorted({*filter(None, resolved.split("\0")), *filter(None, moved.split("\0"))})
 
 
 def keep_notes(n: int, ctx: RunContext, head: str, notes: tuple[str, ...]) -> None:

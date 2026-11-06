@@ -336,3 +336,30 @@ def test_risk_entry_and_cli_write_and_show_the_mark(git_history, tmp_path, monke
 def test_incident_entries_of_this_repository_carry_the_mark():
     entries = risks.load(Path(__file__).parents[1])
     assert entries and all(risk.get("pass_scope_exempt") is True for risk in entries)
+
+
+def test_scoped_notes_name_only_paths_changed_since_the_pass(git_history, tmp_path, monkeypatch):
+    # #2310: the risk-map note must not list the issue's reviewed files as changed again.
+    git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["**"])])})
+    case = passed_case(git_history, tmp_path, monkeypatch)
+    git = _at_head(case, tmp_path)
+    (git.root / "later.txt").write_text("later\n")
+    git._call(["add", "later.txt"])
+    notes = review_pass_scope.for_review(1, case.ctx, git, "origin/main").notes
+    assert "(changed here: later.txt)" in notes and "feature.txt" not in notes
+
+
+def test_recheck_paths_are_the_resolution_and_mains_new_files(git_history, tmp_path, monkeypatch):
+    case = passed_case(git_history, tmp_path, monkeypatch)
+    git = _at_head(case, tmp_path)
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == []
+    case.history.update({"upstream.txt": "from main\n"})
+    git._call(["fetch", "--quiet", "origin"])
+    git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
+               "merge", "--quiet", "--no-edit", "origin/main"])
+    (git.root / "resolved.txt").write_text("resolution\n")
+    git._call(["add", "resolved.txt"])
+    # The PR's own feature.txt is neither resolved nor touched by main: its tests stay with PR CI.
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == ["resolved.txt", "upstream.txt"]
+    case.ctx = replace(case.ctx, config=replace(case.ctx.config, review_pass_scope=False))
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
