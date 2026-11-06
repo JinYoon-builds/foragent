@@ -574,6 +574,9 @@ def session_title(cwd: Path, agent_type) -> str | None:
     return " ".join("".join(c if c.isprintable() else " " for c in title).split()) or None
 
 
+STATUSLINE_ROW_START = "\x1b[0m"
+
+
 def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
     """The big squirrel's ANSI rows during a session's first minute, else None."""
     from foragent import watch_art
@@ -589,7 +592,9 @@ def squirrel(cwd: Path, session_id: str | None, now: datetime) -> str | None:
             columns = int(os.environ.get("COLUMNS", ""))
         except ValueError:
             columns = None
-        return "\n".join(watch_art.greeting_rows(columns))
+        # Claude Code trims leading spaces from each status line row, which shifts the
+        # indented ear and paw rows (and FORAGENT beside them). A reset code first keeps them.
+        return "\n".join(STATUSLINE_ROW_START + row for row in watch_art.greeting_rows(columns))
     except Exception:  # The user's statusline must keep working whatever the local state holds.
         return None
 

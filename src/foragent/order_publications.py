@@ -1,0 +1,690 @@
+"""Durable publications: the gate checks red facts outside the merge-owner lock.
+
+Prepare owns review; a separate gate process certifies red facts for the exact landing set.
+The owner reuses that set on its target or proved D111 successors, leaving renewal off-owner.
+D85 lands certified sets once; failed combinations retry singly and its journal recovers issues.
+"""
+
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
+from copy import deepcopy
+from hashlib import sha256
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import time
+from uuid import uuid4
+
+from foragent import capacity, order, order_prepare, order_prepare_check, order_prepare_review, order_reviewed, orch_inbox
+from foragent.git import GitError
+from foragent.run_base_move import BaseMove, strict_move_is_neutral
+from foragent.state import StateStore
+
+
+def requests(store):
+    return sorted((json.loads(path.read_text(encoding="utf-8"))
+                   for path in (store.root / "order-publications").glob("*.json")),
+                  key=lambda row: row["sequence"])
+
+
+def pending(store):
+    return [row for row in requests(store) if row["status"] in {"pending", "applying"}]
+
+
+def needs_owner(store):
+    return any(row["status"] in {"pending", "applying"}
+               or row["status"] == "preparation" and not row.get("pm_request") for row in requests(store))
+
+
+def status(store):
+    return [{key: row[key] for key in ("id", "title", "status", "reason")}
+            for row in pending(store)]
+
+
+def _save(store, row):
+    store._write_json(store.root / "order-publications" / f"{row['id']}.json", row)
+
+
+def _load(store, identity):
+    return json.loads((store.root / "order-publications" / f"{identity}.json").read_text(encoding="utf-8"))
+
+
+@contextmanager
+def _request_owner(store, identity):
+    # Checking and landing need the same canonical request. Never wait for its
+    # checker under the merge-owner lock; unrelated requests and batches proceed.
+    lock = store.lock_acceptance_baseline(f"order-publication-{identity}", blocking=False)
+    try:
+        yield lock is not None
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def enqueue(plan, root, config, repo, publication, *, approve, approve_keys, approve_numbers):
+    store = StateStore.for_repo(repo)
+    payload = {"plan": plan, "repo": repo, "approve": approve, "approve_keys": approve_keys or [],
+               "approve_numbers": approve_numbers or [], "target": config.base_branch,
+               # Binary references travel as base64 in the plan itself.
+               "files": {name: data for name, data in publication.files.items() if isinstance(data, str)},
+               "prepared": publication.reviewed_bases,
+               "authoring": {name: (root / name).read_text(encoding="utf-8")
+                             for name in (order.PREREAD_FILE, order.order_observed.FILE)
+                             if (root / name).is_file()}}
+    fingerprint = sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    with store._state_lock():
+        previous = requests(store)
+        same_order = [row for row in previous if row["plan"]["id"] == plan["id"]]
+        latest = same_order[-1] if same_order else None
+        existing = latest if latest is not None and (
+            latest["status"] == "published" and latest["plan"] == plan
+            or latest["status"] in {"pending", "applying"} and latest["fingerprint"] == fingerprint
+        ) else None
+        if existing is None:
+            row = {**payload, "id": uuid4().hex, "fingerprint": fingerprint,
+                   "title": plan["title"], "status": "pending", "reason": None,
+                   "sequence": max((row["sequence"] for row in previous), default=0) + 1}
+            # Retain the replacement before retiring anything it replaces.
+            _save(store, row)
+        else:
+            row = existing
+        for older in same_order:
+            if older["status"] == "pending" and older["id"] != row["id"]:
+                older.update(status="superseded",
+                             reason=f"Superseded by publication request {row['id']} for order {plan['id']}.")
+                _save(store, older)
+        if existing is not None:
+            return existing
+    order.kick_tick(root)
+    return row
+
+
+class RedCheckFailed(order.PlanError):
+    pass
+
+
+def checked_on(git, request, target, files=None):
+    """Consume measured evidence only on its target or a proved D111 successor."""
+    checked = request.get("red_check_commit")
+    return checked == target or bool(checked and strict_move_is_neutral(
+        git, BaseMove(checked, target), request["files"] if files is None else files))
+
+
+def recheck(request, plan, root, config, git, publication, *, combined_files=None):
+    """Renew only prepare's measured commands and structured red facts, off-owner."""
+    store = StateStore.for_repo(request["repo"])
+    directory = store.root / "order-publications" / request["id"] / uuid4().hex
+    directory.mkdir(parents=True)
+    items = [*plan["issues"], *(order.edit_view(item, publication.by_number[item["number"]], config)
+                               for item in plan.get("edits", []))]
+    failures = []
+    checks = {}
+    baselines = request.setdefault("baseline_failing_node_ids", {})
+    from foragent import order_prepare_setup, order_scratch
+
+    for item in items:
+        key = item["key"]
+        admitted = request["prepared"].get(key, {})
+        written = admitted.get("written") or order.order_collect.acceptance_files(
+            {"issues": [item]}, publication.files, config)
+        lane_config, context = order_prepare_setup.lane_context(plan, item, config, root)
+        context.files.update({name: data.encode("utf-8") if isinstance(data, str) else data
+                              for name, data in (publication.files if combined_files is None else combined_files).items()})
+        protected = order_scratch.protected(git, root, store.root)
+        measured_at = directory / order_prepare._slug(key)
+        measured_at.mkdir()
+
+        def measure(base, name):
+            folder = measured_at / name
+            folder.mkdir()
+            with capacity.hold_test_slot(config.test_slots):
+                return order_prepare_check.run(
+                    git, base, context, lambda copy: order_prepare_review._place(copy, written),
+                    lambda copy, built, stamped: order_prepare_review._integrity(
+                        git, copy, built, lane_config, protected, stamped, written),
+                    admitted.get("done_when", item["done_when"]), folder,
+                    order_prepare_review.REVIEW_TIMEOUT_S, collect_node_ids=True)
+
+        expected = baselines.get(key, admitted.get("failing_node_ids"))
+        prepared_base = admitted.get("base_revision")
+        seeded = None
+        if expected is None and prepared_base:
+            seeded = measure(prepared_base, "prepared")
+            _collected, reviewed, _nonred, seed_reason = _red_facts(seeded, context)
+            if seed_reason is not None:
+                checks[key] = {**deepcopy(admitted), "status": "hold", "phase": "writing_tests",
+                               "reason": seed_reason, "measured": seeded}
+                failures.append(f"{key}: {checks[key]['reason']}")
+                continue
+            expected = baselines[key] = sorted(reviewed)
+        measured = seeded if seeded is not None and prepared_base == git.head_sha() else measure(git.head_sha(), "target")
+        checked = {**deepcopy(admitted), "base_revision": git.head_sha(), "measured": measured,
+                   "status": "reviewed", "reason": None}
+        checks[key] = checked
+        # Preserve the measured diagnostic through preparation and its PM notice.
+        # Structured pytest facts decide red; command output is only feedback.
+        diagnostic = "\n".join(run["output"] for run in measured if run.get("output"))
+        collected, failing, nonred, reason = _red_facts(measured, context)
+        if reason is None:
+            locked_files = order.order_collect.acceptance_files({"issues": [item]}, publication.files, config)
+            locked = {node for node in collected if node.split("::", 1)[0] in locked_files}
+            not_red = (locked - failing) | (locked & nonred)
+            checked.update(failing_node_ids=sorted(failing), collected_node_ids=sorted(collected))
+            if not locked or not_red or any(run["exit_code"] != 1 for run in measured):
+                reason = diagnostic or "Locked tests no longer all fail: " + ", ".join(sorted(not_red or locked))
+            if reason is None and expected is not None:
+                missing, extra = set(expected) - failing, failing - set(expected)
+                if extra:
+                    extra -= _plan_added_ids(git, admitted.get("base_revision")
+                                             or request.get("baseline_red_check_commit") or git.head_sha(),
+                                             publication.files, extra, measured_at / "added", config)
+                if missing or extra:
+                    reason = ("Failing test node ids changed; missing: " + ", ".join(sorted(missing))
+                              + "; added outside this plan: " + ", ".join(sorted(extra)))
+            if reason is None:
+                baselines[key] = sorted(failing) if expected is None else expected
+        if reason is not None:
+            checked.update(status="hold", phase="writing_tests", reason=reason)
+            failures.append(f"{key}: {reason}")
+    request["red_checks"] = checks
+    if failures:
+        raise RedCheckFailed("; ".join(failures))
+
+
+def _red_facts(measured, context):
+    """Require complete, unchanged pytest sessions before comparing node sets."""
+    if (not measured or context.refused or order_prepare_check.changed(measured)
+            or any(run["timed_out"] or run["exit_code"] not in {0, 1}
+                   or run.get("collected_node_ids") is None or run.get("failing_node_ids") is None
+                   for run in measured)):
+        diagnostic = "\n".join(run["output"] for run in measured if run.get("output"))
+        return set(), set(), set(), diagnostic or "Could not establish complete, unchanged pytest red evidence."
+    return ({node for run in measured for node in run["collected_node_ids"]},
+            {node for run in measured for node in run["failing_node_ids"]},
+            {node for run in measured for node in run.get("nonred_node_ids", [])}, None)
+
+
+def _plan_added_ids(git, base, files, nodes, directory, config):
+    """Prove extra ids are additions by collecting the immutable pre-plan tree.
+
+    Reuse the existing collection plugin and scratch runner, only when sets differ.
+    Collect before and after overlaying the plan on the same immutable prepare base.
+    """
+    from foragent.run_baseline import COLLECT_PLUGIN
+
+    paths = sorted({node.split("::", 1)[0] for node in nodes} & files.keys())
+    if not paths:
+        return set()
+    existing = set(git._call(["ls-tree", "-r", "--name-only", "-z", base, "--", *paths]).split("\0")) - {""}
+    directory.mkdir()
+
+    def collect(names, overlay, name):
+        if not names:
+            return set()
+        folder = directory / name
+        folder.mkdir()
+        listing = folder / "ids.json"
+        try:
+            code, tree, *_ = order.order_collect.run_copy(
+                git, base, overlay, names, folder, config, config.language,
+                time.monotonic() + order.order_collect.LIMIT_S, before="--collect-only", after="",
+                conftest=order.order_collect._COPY_CONFTEST + COLLECT_PLUGIN.format(listing=str(listing)),
+                timeout="Could not collect pre-plan test ids.", slot_timeout=None)
+            facts = json.loads(listing.read_text(encoding="utf-8"))
+        except (order.order_collect._Unavailable, OSError, ValueError) as exc:
+            raise RedCheckFailed(f"Could not establish added test node ids: {', '.join(sorted(nodes))}") from exc
+        if code not in {0, 5} or facts["errors"]:
+            raise RedCheckFailed(f"Could not establish added test node ids: {', '.join(sorted(nodes))}")
+        ids = set()
+        for node in facts["ids"]:
+            path, separator, rest = node.partition("::")
+            try:
+                path = (Path(facts["rootdir"]) / path).resolve().relative_to(tree.resolve()).as_posix()
+            except ValueError as exc:
+                raise RedCheckFailed(f"Collected test node id is outside the checked tree: {node}") from exc
+            ids.add(path + separator + rest)
+        return ids
+
+    # Both collections use prepare's immutable base. A new parametrization caused
+    # only by main moving is not a test this plan added, even in a carried file.
+    before = collect(sorted(existing), {}, "before")
+    after = collect(paths, files, "after")
+    return nodes & (after - before)
+
+
+def check_pending(ctx, report):
+    """One off-owner pass; independent requests share only the machine test slots."""
+    rows = pending(ctx.store)
+    if not rows:
+        return
+    ctx.git.fetch("origin", ctx.config.base_branch)
+    target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+    workers = max(1, min(len(rows), capacity.effective_test_slots(ctx.config.test_slots)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for action in pool.map(lambda row: _check_request(ctx, row["id"], target), rows):
+            if action:
+                report.actions.append(action)
+    _certify_pending(ctx, report, target)
+
+
+def _check_request(ctx, identity, target):
+    if checked_on(ctx.git, _load(ctx.store, identity), target):
+        return  # Fresh evidence needs no reservation that could make the owner skip it.
+    with _request_owner(ctx.store, identity) as owned:
+        if not owned:
+            return
+        row = _load(ctx.store, identity)
+        if (row["status"] not in {"pending", "applying"} or row["target"] != ctx.config.base_branch
+                or checked_on(ctx.git, row, target)):
+            return
+        if row.get("commit") and ctx.git.is_ancestor(row["commit"], target):
+            return  # A saved intent already landed; only issue effects remain.
+        fields = {}
+        try:
+            with _checkout(ctx, target, row) as (root, git):
+                publication = order._publication_checks(
+                    row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
+                    retained_files=row["files"], reviewed_record=row["prepared"],
+                    **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+                files = dict(publication.files)
+                for name in _install_lanes(row["plan"], root, git):
+                    files[name] = (root / name).read_bytes()
+                # Keep the existing collection/importer protection, outside the owner.
+                with capacity.hold_test_slot(ctx.config.test_slots):
+                    order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
+                recheck(row, row["plan"], root, ctx.config, git, publication, combined_files=files)
+            fields.update(red_check_commit=target,
+                          baseline_red_check_commit=row.get("baseline_red_check_commit", target), reason=None)
+        except order.PlanError as exc:
+            fields.update(status="preparation", reason=str(exc))
+        except (GitError, OSError, ValueError) as exc:
+            # Unknown outcomes retain the request for the next independent pass.
+            return f"Order publication {identity}: red check deferred: {exc}"
+        with ctx.store._state_lock():
+            current = _load(ctx.store, identity)
+            if current["status"] not in {"pending", "applying"}:
+                return  # Enqueue superseded the snapshot while tests ran.
+            for name in ("red_checks", "baseline_failing_node_ids"):
+                if name in row:
+                    fields[name] = row[name]
+            current.update(fields)
+            _save(ctx.store, current)
+        if current["status"] == "preparation":
+            _return_to_preparation(ctx.store, current)
+            _notify(ctx.store, current)
+        return f"Order publication {identity}: red check {current['status']} on {target}"
+
+
+def _certified_on(git, rows, target, files):
+    """Singleton checks compose only after measuring the same exact combined set."""
+    if len(rows) == 1:
+        return checked_on(git, rows[0], target, files)
+    identities = sorted(row["id"] for row in rows)
+    return bool(rows) and all(
+        (certificate := row.get("red_check_set", {})).get("requests") == identities
+        and checked_on(git, {"red_check_commit": certificate.get("commit")}, target, files)
+        for row in rows)
+
+
+def _certify_pending(ctx, report, target):
+    """Measure every member with all landing bytes, retaining failed groups for single landings."""
+    from foragent import order_flush as flush
+
+    rows = [row for row in pending(ctx.store)
+            if row["target"] == ctx.config.base_branch and not row.get("red_check_single_only")
+            and checked_on(ctx.git, row, target)
+            and not (row.get("commit") and ctx.git.is_ancestor(row["commit"], target))]
+    files = {name: data for row in rows for name, data in row["files"].items()}
+    if len(rows) < 2 or _certified_on(ctx.git, rows, target, files):
+        return
+    with ExitStack() as stack:
+        for row in rows:
+            if not stack.enter_context(_request_owner(ctx.store, row["id"])):
+                return
+        rows = [_load(ctx.store, row["id"]) for row in rows]
+        if any(row["status"] not in {"pending", "applying"} or row.get("red_check_single_only")
+               or row["target"] != ctx.config.base_branch or not checked_on(ctx.git, row, target)
+               for row in rows):
+            return
+        try:
+            prepared, files = [], {}
+            for row in rows:
+                root, git = stack.enter_context(_checkout(ctx, target, row))
+                publication = order._publication_checks(
+                    row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
+                    retained_files=row["files"], reviewed_record=row["prepared"],
+                    **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+                flush._merge(files, publication.files, ctx.config.language)
+                prepared.append((row, root, git, publication))
+            if any(row["plan"].get("new_lanes") for row in rows):
+                root, git = stack.enter_context(_landing_tree(ctx, target))
+                paths = set().union(*(_install_lanes(row["plan"], root, git) for row in rows))
+                files.update({name: (root / name).read_bytes() for name in paths})
+            failures = []
+            for row, root, git, publication in prepared:
+                with capacity.hold_test_slot(ctx.config.test_slots):
+                    order.order_collect.check(row["plan"], files, root, ctx.config, git, base=target)
+                try:
+                    recheck(row, row["plan"], root, ctx.config, git, publication, combined_files=files)
+                except RedCheckFailed as exc:
+                    failures.append(f"{row['id']}: {exc}")
+            if failures:
+                raise RedCheckFailed("; ".join(failures))
+            fields = {"red_check_set": {"requests": sorted(row["id"] for row in rows), "commit": target}}
+        except order.PlanError as exc:
+            # Individually valid requests still belong in the queue. Their own
+            # red checks certify single landings, renewed when the target moves.
+            fields = {"red_check_single_only": True, "combined_red_check_reason": str(exc)}
+        except (GitError, OSError, ValueError) as exc:
+            report.actions.append(f"Order publication combined red check deferred: {exc}")
+            return
+        with ctx.store._state_lock():
+            current = [_load(ctx.store, row["id"]) for row in rows]
+            if any(row["status"] not in {"pending", "applying"} for row in current):
+                return
+            for row in current:
+                row.update(fields)
+                _save(ctx.store, row)
+        report.actions.append("Order publication combined red check: "
+                              + ("certified" if "red_check_set" in fields else "retry singly"))
+
+
+def _return_to_preparation(store, row):
+    """Keep feedback in prepare's existing record without replacing a newer preparation."""
+    path = order_prepare._record_path(store, row["plan"])
+    with order_prepare._owner(path) as owned:
+        if not owned:
+            return
+        record = order_prepare._read(path, row["plan"])
+        for key, admitted in row["prepared"].items():
+            current = record["issues"].get(key)
+            if current is None or current != admitted:
+                continue
+            checked = row.get("red_checks", {}).get(key)
+            if checked is None:
+                current.update(status="interrupted", phase="reviewing_tests", reason=row["reason"])
+            elif checked["status"] != "reviewed":
+                record["issues"][key] = checked
+            else:
+                continue
+            current = record["issues"][key]
+            attempts = current.setdefault("attempts", [])
+            if not any(attempt.get("publication") == row["id"] for attempt in attempts):
+                attempts.append({"attempt": len(attempts) + 1, "role": "publication-checker",
+                                 "cycle": current.get("cycle"), "requirement": current.get("requirement"),
+                                 "publication": row["id"], "status": current["status"], "reason": current["reason"],
+                                 "finished_at": order_prepare._now()})
+        order_prepare._write(path, record)
+
+
+def _notify(store, row):
+    # The PM receives the existing durable inbox path, once even if the owner stopped
+    # after creating the inbox entry but before saving its id on this request.
+    notice = next((r for r in orch_inbox.requests(store) if r.get("publication") == row["id"]), None)
+    if notice is None:
+        notice = orch_inbox.add_request(store, "gate",
+            f"Order {row['title']} returned to preparation: {row['reason']}",
+            extra={"publication": row["id"]})
+    row["pm_request"] = notice["id"]
+    _save(store, row)
+
+
+@contextmanager
+def _checkout(ctx, target, row):
+    """Owner writes its own detached tree; the caller's branch and edits stay untouched."""
+    with TemporaryDirectory(prefix="order-publication-", dir=ctx.store.root) as directory:
+        root = Path(directory) / "tree"
+        ctx.git.add_detached_worktree(root, target)
+        try:
+            # Installed lane skills are local, so Git's detached tree alone does
+            # not reproduce the context prepare binds. Use its existing copier.
+            from foragent import order_prepare_setup
+            from foragent.order_scratch_context import Context
+
+            context = Context(ctx.repo_root)
+            lanes = {item["lane"] for item in row["plan"]["issues"]}
+            lanes.update(order.issue_lane(ctx.tracker.get_issue(item["number"]).labels, ctx.config.lanes)
+                         for item in row["plan"].get("edits", []))
+            for lane in lanes:
+                order_prepare_setup._checkout_context(ctx.config, lane, ctx.repo_root, context)
+            context.apply(root)
+            if context.refused:
+                raise order.PlanError("Could not reproduce preparation context: " + ", ".join(context.refused))
+            git = ctx.git.at(root)
+            # The file writer (including proposed lane installation) works on
+            # this request's target. Its private checkout publishes detached HEAD.
+            git.current_branch = lambda: row["target"]
+            git.push_base = lambda branch: git._call(["push", "origin", f"HEAD:refs/heads/{branch}"])
+            for name, data in row["authoring"].items():
+                order.order_references.real_directory(root, ".foragent")
+                order.check_write(root, name, ".foragent")
+                (root / name).write_text(data, encoding="utf-8")
+            yield root, git
+        finally:
+            ctx.git.remove_worktree(root)
+
+
+def apply_next(ctx, report):
+    """Land this pass's fresh requests through D85's single write and issue journal."""
+    from foragent import order_flush_journal as journal, order_flush_recovery as recovery
+    from foragent.merge_owner import may_write_target
+
+    for row in requests(ctx.store):
+        if row["status"] == "preparation" and not row.get("pm_request"):
+            with _request_owner(ctx.store, row["id"]) as owned:
+                if owned:
+                    row = _load(ctx.store, row["id"])
+                    if row["status"] == "preparation" and not row.get("pm_request"):
+                        _return_to_preparation(ctx.store, row)
+                        _notify(ctx.store, row)
+    rows = pending(ctx.store)
+    if not rows or not may_write_target(ctx, ctx.config.base_branch):
+        return False
+    with ExitStack() as locks:
+        owned_rows = []
+        for row in rows:
+            if not locks.enter_context(_request_owner(ctx.store, row["id"])):
+                continue
+            with ctx.store._state_lock():
+                row = _load(ctx.store, row["id"])
+            if row["status"] in {"pending", "applying"}:
+                owned_rows.append(row)
+        if not owned_rows:
+            return True
+        with journal.locked(ctx.store), order_reviewed.publication_gate(ctx.repo):
+            try:
+                ctx.git.fetch("origin", ctx.config.base_branch)
+                target = ctx.git.ref_sha(f"origin/{ctx.config.base_branch}")
+            except (GitError, OSError) as exc:
+                for row in owned_rows:
+                    _failure(ctx, report, row, exc, writing=True)
+                return True
+            records = journal.entries(ctx.store)
+            done = {entry["batch"] for entry in records if entry["kind"] == "done"}
+            recovering = set()
+            available = {row["id"] for row in owned_rows} | {
+                row["id"] for row in requests(ctx.store) if row["status"] == "published"}
+            for batch in records:
+                if batch["kind"] != "selected" or "publications" not in batch or batch["batch"] in done:
+                    continue
+                if not set(batch["publications"]) <= available:
+                    recovering.update(batch["publications"])
+                    continue  # Retain one recovery identity while a member's checker owns its lock.
+                members = [_load(ctx.store, identity) for identity in batch["publications"]]
+                if (batch.get("landed_commit") and ctx.git.is_ancestor(batch["landed_commit"], target)
+                        or recovery._find(ctx.git, f"origin/{ctx.config.base_branch}", batch)):
+                    recovering.update(batch["publications"])
+                    _finish_batch(ctx, report, target, batch, members, sha=batch.get("landed_commit"),
+                                  recovering=bool(batch.get("landed_commit")))
+                else:
+                    # An unpushed detached tree is disposable. The checker must
+                    # admit any new target before these members can be selected again.
+                    journal.append(ctx.store, "done", batch["batch"], abandoned=True)
+            # Adopt push intents retained by the earlier single-request writer.
+            # Their commit title predates D85's batch identity; issue recovery is
+            # still the same journaled finish, with Git proving the push landed.
+            legacy = {}
+            for row in owned_rows:
+                if (row["id"] not in recovering and row.get("commit")
+                        and ctx.git.is_ancestor(row["commit"], target)):
+                    legacy.setdefault(row["commit"], []).append(row)
+            for sha, members in legacy.items():
+                batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
+                         "orders": [], "notes": [], "paths": sorted({name for row in members for name in row["files"]}),
+                         "publications": [row["id"] for row in members], "landed_commit": sha}
+                journal.append(ctx.store, **batch)
+                recovering.update(batch["publications"])
+                _finish_batch(ctx, report, target, batch, members, sha=sha, recovering=True)
+            fresh = []
+            for snapshot in owned_rows:
+                row = _load(ctx.store, snapshot["id"])
+                if row["id"] in recovering or row["status"] not in {"pending", "applying"}:
+                    continue
+                if row["target"] != ctx.config.base_branch:
+                    _failure(ctx, report, row, "Publication target changed; prepare for the configured base branch.")
+                elif checked_on(ctx.git, row, target):
+                    fresh.append(dict(row, entry_id=row["id"], landing_target=target))
+            if fresh:
+                if any(row.get("red_check_single_only") for row in fresh):
+                    fresh = fresh[:1]
+                _land_fresh(ctx, report, target, fresh)
+    return True
+
+
+def _land_fresh(ctx, report, target, fresh):
+    """Feed the admitted members to D85, retaining shared write failures for retry."""
+    from foragent import order_flush as flush, order_flush_journal as journal, order_flush_recovery as recovery
+
+    try:
+        with _landing_tree(ctx, target) as (root, git), git.publish_lock():
+            prepared, files, roots = flush._preflight(
+                fresh, [], root, ctx.config, ctx.tracker, ctx.repo, git,
+                check=lambda row: _apply(ctx, report, row),
+                reject=lambda row, exc: _failure(ctx, report, row, exc))
+            if prepared:
+                if not _certified_on(git, [row for row, _publication in prepared], target, files):
+                    return  # Membership changed; only the off-owner checker can certify it.
+                # Claim all members together against enqueue's replacements.
+                with ctx.store._state_lock():
+                    if any(_load(ctx.store, row["id"])["status"] not in {"pending", "applying"}
+                           for row, _publication in prepared):
+                        return True
+                    for row, _publication in prepared:
+                        row.update(status="applying")
+                        _save(ctx.store, row)
+                try:
+                    _stage_lanes(ctx, report, root, git, prepared, files, roots)
+                except GitError:
+                    return True  # The failed member was reported; others retry in a clean tree.
+                batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": "owner publications",
+                         "orders": [], "notes": [], "paths": sorted(files),
+                         "publications": [row["id"] for row, _publication in prepared]}
+                journal.append(ctx.store, **batch)
+                members = [row for row, _publication in prepared]
+                try:
+                    sha = flush._write(root, git, files, roots, recovery.title(batch))
+                    for row in members:
+                        row.update(commit=sha)
+                        _save(ctx.store, row)
+                    _finish_batch(ctx, report, target, batch, members,
+                                  checkout=(root, git), prepared=prepared, sha=sha)
+                except (order.PlanError, GitError, OSError) as exc:
+                    for row in members:
+                        _failure(ctx, report, row, exc, writing=True)
+    except (order.PlanError, GitError, OSError) as exc:
+        for row in fresh:
+            current = _load(ctx.store, row["id"])
+            if current["status"] in {"pending", "applying"}:
+                _failure(ctx, report, current, exc, writing=True)
+
+
+def _apply(ctx, report, row):
+    """Preflight one immutable admission in its own context; the flush writes all members."""
+    if _load(ctx.store, row["id"])["status"] not in {"pending", "applying"}:
+        return None
+    target = row["landing_target"]
+    with _checkout(ctx, target, row) as (root, git):
+        return order._publication_checks(
+            row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo, git=git, queued=True,
+            retained_files=row["files"], reviewed_record=row["prepared"],
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+
+
+def _failure(ctx, report, row, exc, *, writing=False):
+    row["reason"] = str(exc)
+    if not writing and isinstance(exc, (order.PlanError, ValueError, str)):
+        row["status"] = "preparation"
+        _save(ctx.store, row)
+        _return_to_preparation(ctx.store, row)
+        _notify(ctx.store, row)
+    _save(ctx.store, row)
+    report.actions.append(f"Order publication {row['id']}: {row['status']}")
+
+
+def _finish_batch(ctx, report, target, batch, members, *, checkout=None, prepared=None, sha=None, recovering=False):
+    from foragent import order_flush as flush, order_flush_journal as journal
+
+    try:
+        with ExitStack() as stack:
+            root, git = checkout or stack.enter_context(_landing_tree(ctx, target))
+            flush._finish(root, ctx.config, ctx.tracker, git, ctx.store, ctx.repo, batch,
+                          journal.entries(ctx.store), prepared, sha,
+                          reject=lambda row, exc: _failure(ctx, report, row, exc, writing=True),
+                          wake_root=ctx.repo_root, recovering=recovering,
+                          resume_check=lambda row: _resume_check(ctx, target, row))
+    except (order.PlanError, GitError, OSError) as exc:
+        for row in members:
+            _failure(ctx, report, row, exc, writing=True)
+    finally:
+        completed = {entry["entry"] for entry in journal.entries(ctx.store)
+                     if entry["kind"] == "issues" and entry["batch"] == batch["batch"]}
+        for row in members:
+            if row["id"] in completed:
+                row = _load(ctx.store, row["id"])
+                row.update(status="published", reason=None)
+                _save(ctx.store, row)
+                report.actions.append(f"Order publication {row['id']}: published")
+
+
+def _resume_check(ctx, target, row):
+    with _checkout(ctx, target, row) as (root, _git):
+        return order._publication_checks(
+            row["plan"], root, ctx.config, ctx.tracker, repo=ctx.repo,
+            retained_files=row.get("files"), landed=True,
+            **{key: row[key] for key in ("approve", "approve_keys", "approve_numbers")})
+
+
+def _landing_tree(ctx, target):
+    # Each admission is preflighted separately with its own retained authoring
+    # context. A bad first member must not prevent opening the shared writer.
+    return _checkout(ctx, target, {"target": ctx.config.base_branch, "plan": {"issues": []}, "authoring": {}})
+
+
+def _stage_lanes(ctx, report, root, git, prepared, files, roots):
+    """Use the lane writer without committing ahead of the flush boundary."""
+    paths = set()
+    for row, _publication in prepared:
+        try:
+            paths.update(_install_lanes(row["plan"], root, git))
+        except (ValueError, OSError, GitError) as exc:
+            _failure(ctx, report, row, order.PlanError(str(exc)))
+            raise GitError(str(exc)) from exc
+    for name in paths:
+        files[name] = (root / name).read_bytes()
+        roots[name] = "."
+
+
+def _install_lanes(plan, root, git):
+    """Materialize the lane writer's bytes for both certification and landing."""
+    from foragent.config import load_config
+
+    paths = set()
+    if plan.get("new_lanes"):
+        order._check_new_lanes(plan, root, load_config(root))
+    for lane in plan.get("new_lanes", []):
+        current = load_config(root)
+        if lane["name"] not in current.lanes:
+            order.add_lane(root, lane["name"], lane["paths"], skills=lane["skills"], git=git,
+                           push=False, commit=False)
+        paths.update(order.lane_files(root, lane["name"], load_config(root).lanes[lane["name"]]["skills"]))
+    return paths
