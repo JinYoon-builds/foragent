@@ -1576,6 +1576,7 @@ def preread(plan: dict, root: Path, config: Config,
         record = {"id": secrets.token_hex(16), "key": item["key"], "plan": plan["id"],
                   **_binding(plan, item, config, repo or config.repo, published),
                   "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
+                  "answer": result.last_message,  # The reader's own words, kept as issue evidence (#1488).
                   "at": datetime.now(UTC).isoformat(timespec="seconds")}
         # The estimate is born here, before the record; each run start fixes it from these notes (#1696).
         _recorded(size_signal.note, store, record, digest, config.language)
