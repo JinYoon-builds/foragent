@@ -5293,3 +5293,27 @@ def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
     with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
         order.check_done_when_executables(
             {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)
+
+
+
+@pytest.mark.parametrize("work", ["edits", "closes"])
+def test_childless_record_closes_at_publish_only_without_edited_work(publishing, plan, work):
+    """PM q34: edited issues are the order's work; an order with no work at all finishes on publish."""
+    from foragent.board_parents import plan_references
+    from foragent.i18n import text
+
+    tracker = publishing[2]
+    tracker.add_issue(41, "Existing work", "body")
+    plan["issues"] = []
+    if work == "edits":
+        plan["edits"] = [{"number": 41, "goal": "Edit it", "out_of_scope": "Other work", "done_when": ["true"]}]
+    else:
+        plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}]
+    record = tracker.get_issue(publish(publishing, plan, approve=True).parent)
+    if work == "edits":
+        assert record.state == "open" and tracker.list_comments(record.number) == []
+        assert plan_references(record.body) == {41}, "The tick closes the record once #41 closes"
+    else:
+        assert record.state == "closed"
+        assert [c.body for c in tracker.list_comments(record.number)] == [
+            text("order_record_closed", "en", count=0)]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import os
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
     from foragent.run_attempt import Implementation
 
 
+CHECK_ENVIRONMENT: ContextVar[dict[str, str]] = ContextVar("foragent_check_environment", default={})
+
+
 @dataclass(frozen=True)
 class CheckResult:
     command: str
@@ -70,7 +74,7 @@ def _check(
 
     # Checks run in the implementation worktree, whose changes are staged and
     # published afterwards. Bytecode written by the checks must not join them.
-    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+    environment = {**CHECK_ENVIRONMENT.get(), "PYTHONDONTWRITEBYTECODE": "1"}
 
     elapsed: list[float] = []
 
@@ -717,7 +721,7 @@ def _check_review_head(
     log = ctx.store.log_path(n)
     if skips is not None and skips.head != head:
         skips = None  # Evidence of another commit never skips a check of this one.
-    # D124: the issue's own locked acceptance files always run.
+    # D124 keeps locked files local except on a trusted batch tip (#2172).
     locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
