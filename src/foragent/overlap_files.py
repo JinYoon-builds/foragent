@@ -227,6 +227,10 @@ def can_start(ctx, lane: str, number: int) -> bool:
     approval = ctx.store.load_approval(number)
     parsed = parse_body(approval.body) if approval is not None else None
     holds = admission_holds(ctx, lane, parsed, known, unknown)
+    if not holds:
+        from foragent import overlap_wide
+
+        holds = overlap_wide.holds(ctx, number, parsed)
     note_holds(ctx, number, None, holds)
     return not holds
 

@@ -44,8 +44,8 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                 credit()
                 reports = ctx.tracker.pr_acceptance_reports(combined)
                 try:
-                    lost, duration = ci_mode.comparison(
-                        reports, ctx.repo, base_sha, combined, excluded, expected_scope=scope,
+                    lost, duration = ci_mode.read(
+                        ctx, reports, base_sha, combined, excluded, expected_scope=scope,
                         expected_shards=range(ctx.config.ci_shards))
                     break
                 except (ci_mode.MissingComparison, ci_mode.StaleComparison) as exc:
@@ -123,8 +123,8 @@ class GroupComparisonEvidence:
             if _report_digest(reports) != event.get("reports_sha256"):
                 return ("reports-changed", "the reports differ from the accepted ones") if reports else (
                     "missing", "no acceptance reports at this read")
-            lost, _ = ci_mode.comparison(
-                reports, ctx.repo, event["base_sha"], combined, excluded, expected_scope=scope,
+            lost, _ = ci_mode.read(
+                ctx, reports, event["base_sha"], combined, excluded, expected_scope=scope,
                 expected_shards=range(ctx.config.ci_shards))
             return ("regression", ", ".join(lost)) if lost else None
         except (GitError, OSError, KeyError, TypeError, ValueError, RecursionError, OverflowError,

@@ -1,4 +1,4 @@
-"""Per-issue prerequisite reads, blocker escalation, closed-issue catch-up and batch reconciliation."""
+"""Per-issue prerequisite reads, blocker escalation and closed-issue catch-up."""
 
 from __future__ import annotations
 
@@ -75,7 +75,8 @@ def _check_prerequisites(
         return False
     if (
         scheduler._open_pr(ctx, issue.number, confirmed=confirmed) is not None
-        and (latest_run is None or latest_run.outcome != "limit-wait")
+        # These outcomes return to ready by themselves; the next run continues the same branch and PR (#1514).
+        and (latest_run is None or latest_run.outcome not in {"limit-wait", "base-changed"})
     ):
         if scheduler.READY in issue.labels:
             ctx.tracker.remove_labels(issue.number, [scheduler.READY])
@@ -152,43 +153,7 @@ def _escalate_overdue_blocker(ctx: TickContext, issue: Issue, report: TickReport
     return scheduler.replace(issue, labels=issue.labels | {scheduler.NEEDS_HUMAN})
 
 
-def _reconcile_batches(ctx: TickContext, report: TickReport) -> None:
-    # Housekeeping first, on every tick: issues closed outside the gate since the
-    # last tick (one light read) reach this reconciliation and the board sync.
+def _observe_closed_issues(ctx: TickContext) -> None:
+    """Housekeeping on every tick: one light read records issues closed outside the gate."""
     if (observe := getattr(ctx.tracker, "observe_closed_issues", None)) is not None:
         observe(observed_at=ctx.now())
-    issues = {issue.number: issue for issue in scheduler.local_issue_models(ctx.store) if issue.state == "open"}
-    parents: set[int] = set()
-    rows = ctx.store.local_issues()
-    prs = [scheduler.PullRequest(row["pr_number"], row["pr_head"], row["pr_base"], row["title"], row["body"])
-           for row in rows if row["merged"] and row.get("pr_head") and row.get("pr_base")]
-    # The gate closes an order parent once its children are done (#411), possibly
-    # before its batch PR exists; finalization continues until that PR merged.
-    batch_merged = {row["number"] for row in rows
-                    if row["merged"] and row.get("pr_head") == f"foragent/batch-{row['number']}"}
-    closed_parents = {row["number"] for row in rows if row["state"] == "closed"} - batch_merged
-    for pr in prs:
-        child_match = scheduler.re.fullmatch(r"foragent/issue-(\d+)", pr.head)
-        batch_match = scheduler.re.fullmatch(r"foragent/batch-(\d+)", pr.base)
-        if child_match is None or batch_match is None:
-            continue
-        number, parent = int(child_match[1]), int(batch_match[1])
-        if parent in issues or parent in closed_parents:
-            parents.add(parent)
-        if number not in issues or ctx.tracker.parent_of(number) != parent:
-            continue
-        ctx.tracker.close_issue(number, f"Merged into {pr.base} (PR #{pr.number})")
-        ctx.tracker.remove_labels(number, [scheduler.READY, scheduler.RUNNING])
-        scheduler.board.sync_status(ctx, number, "Done")
-        del issues[number]
-        report.actions.append(f"#{number} closed after batch PR #{pr.number} merged")
-    for parent in sorted(parents):
-        branch = f"foragent/batch-{parent}"
-        if ctx.tracker.find_pr(branch) is not None:
-            continue
-        try:
-            scheduler._batch_pr(parent, ctx)
-        except (scheduler.GitError, scheduler.TrackerError) as exc:
-            if isinstance(exc, scheduler.TrackerError) and exc.is_rate_limit:
-                raise
-            report.actions.append(f"#{parent} batch PR finalization deferred: {exc}")

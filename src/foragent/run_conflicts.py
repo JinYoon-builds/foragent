@@ -1,17 +1,14 @@
-"""Target replay, conflict resolution and the single rebuild budget."""
+"""Base-move conflict resolution and the single rebuild budget."""
 
 from __future__ import annotations
 
-from pathlib import Path
-import tempfile
 from typing import TYPE_CHECKING
 
 from foragent.actions import flag
 from foragent.git import GitError
 from foragent.i18n import text
-from foragent.policy import review_mode_for
 from foragent.reasons import Reason
-from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped, PatchReplayError
+from foragent.run_attempt import ConflictBudgetExhausted, ExecutorStopped
 from foragent.run_checks import _acceptance_matches, _append
 from foragent.run_lane_skills import _inject_lane_skills
 from foragent.run_overlap import conflict_resolution, record_redo
@@ -36,7 +33,7 @@ def _merge_moved_base(attempt: Implementation, target_sha: str) -> list[str]:
     """Merge a pinned base; let the caller release its lock before resolving conflicts."""
     from foragent.ci_mode import commit_exclusions, enabled
 
-    ci = enabled(attempt.ctx, attempt.target_branch)
+    ci = enabled(attempt.ctx)
     _inject_lane_skills(attempt.ctx, attempt.n, attempt.git, target_sha)
     moved = attempt.git.moved_by(target_sha)
     try:
@@ -67,39 +64,6 @@ def _recreate_worktree(attempt: Implementation) -> None:
         path = worktree / ".foragent" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-
-
-def _prepare_target(attempt: Implementation) -> bool:
-    n, ctx, git = attempt.n, attempt.ctx, attempt.git
-    if not attempt.batch_branch:
-        return True
-    paths = git.changed_paths(attempt.start_ref)
-    mode = review_mode_for(paths, ctx.config)
-    destination = attempt.batch_branch if mode == "batch" else ctx.config.base_branch if mode == "fast" else attempt.target_branch
-    if destination == attempt.target_branch:
-        return True
-    # Path overrides can select batch after implementation or generated
-    # files, or return to fast after a retry removes those paths.
-    if destination == attempt.batch_branch:
-        ctx.git.ensure_batch_branch(attempt.batch_branch, attempt.base_ref)
-    with tempfile.NamedTemporaryFile() as patch:
-        git.write_staged_patch(attempt.start_ref, Path(patch.name))
-        source = (git.head_sha(), git.staged_tree_sha(), attempt.target_branch)
-        # The PR's own files are merge base to branch head, not uncommitted staged work.
-        own = _own_paths(attempt, attempt.start_ref)
-        previous = attempt.start_ref
-        attempt.start_ref = git.ref_sha(f"origin/{destination}")
-        _note_moved(attempt, git.moved_between(previous, attempt.start_ref, sorted(set(paths) | set(own))))
-        attempt.target_branch = destination
-        _recreate_worktree(attempt)
-        if not _acceptance_matches(n, ctx, git, attempt.approval):
-            return False
-        try:
-            git.apply_staged_patch(Path(patch.name))
-        except GitError as exc:
-            raise PatchReplayError(str(exc), own_paths=own, source_head=source[0],
-                                   source_tree=source[1], source_target=source[2]) from exc
-    return True
 
 
 def _own_paths(attempt: Implementation, target: str | None = None) -> list[str]:
@@ -158,35 +122,6 @@ def _stop_conflicts(attempt: Implementation, exc: ConflictBudgetExhausted) -> Ex
     return ExecutorStopped("retries-exceeded", details)
 
 
-def _restore_replay_source(attempt: Implementation, exc: PatchReplayError) -> None:
-    """Put back the branch history and staged work from before the replay was attempted."""
-    if exc.source_head is None or exc.source_tree is None:
-        return
-    git = attempt.git
-    try:
-        attempt.start_ref, attempt.target_branch = exc.source_head, exc.source_target
-        _recreate_worktree(attempt)
-        git._call(["read-tree", "--reset", "-u", exc.source_tree])
-        attempt.start_ref = git.ref_sha(f"origin/{exc.source_target}")
-    except GitError as restore:
-        _append(attempt.log, f"Could not restore the PR's changes after the replay failure: {restore}")
-
-
-def _stop_replay(attempt: Implementation, exc: PatchReplayError) -> ExecutorStopped:
-    """Restore the PR's work on its previous target, then stop for the orchestrator."""
-    from foragent.i18n import text
-
-    n, ctx = attempt.n, attempt.ctx
-    language = ctx.config.language
-    destination = attempt.target_branch
-    _restore_replay_source(attempt, exc)
-    summary = text("replay_stop", language, target=destination)
-    details = str(exc)
-    _append(attempt.log, f"{summary}\n{details}")
-    flag(ctx, n, Reason.RETRIES_EXCEEDED, summary, details)
-    return ExecutorStopped("retries-exceeded", details)
-
-
 def _rebuild_after_conflicts(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
     """Rebuild from scratch only when more than half of the PR's own files conflict."""
     reason = _rebuild_reason(attempt, exc)
@@ -194,32 +129,6 @@ def _rebuild_after_conflicts(attempt: Implementation, exc: ConflictBudgetExhaust
         raise _stop_conflicts(attempt, exc)
     _record_rebuild(attempt, reason)
     return _rebuild(attempt, exc)
-
-
-def _recover_replay(attempt: Implementation, exc: PatchReplayError) -> str:
-    """Resolve a three-way replay in place; rebuild from the destination only under the same rule."""
-    failure = f"Could not apply child changes to {attempt.target_branch}: {exc}"
-    conflicts = attempt.git.conflict_paths()
-    if conflicts:
-        try:
-            _resolve_conflicts(attempt, conflicts, own_paths=exc.own_paths, failure=failure)
-        except ConflictBudgetExhausted as budget:
-            reason = _rebuild_reason(attempt, budget)
-            if reason is None:
-                # Stop with the PR's own branch, not a destination tree holding replay markers.
-                stopped = _stop_conflicts(attempt, budget)
-                _restore_replay_source(attempt, exc)
-                raise stopped from exc
-        else:
-            return ""
-    else:
-        # Zero conflicting own files never qualify for a from-scratch rebuild.
-        raise _stop_replay(attempt, exc) from exc
-    _record_rebuild(attempt, reason)
-    # Start the next implementation attempt from the destination's clean tree.
-    _recreate_worktree(attempt)
-    attempt.paths = []
-    return failure
 
 
 def _rebuild(attempt: Implementation, exc: ConflictBudgetExhausted) -> str:
@@ -293,7 +202,7 @@ def _resolve_conflicts_inner(
             check_failure = f"Conflict markers remain in: {', '.join(markers)}"
             continue
         git.stage_changes()
-        if enabled(ctx, attempt.target_branch):
+        if enabled(ctx):
             commit_exclusions(attempt, title)
             pending_merge = False
         elif pending_merge:
@@ -315,7 +224,7 @@ def _resume_implementation(attempt: Implementation) -> bool:
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     conflicts = ctx.store.get_run(n).merge_conflicts
-    # Own-path detection and replay follow the current target; publication
+    # Own-path detection follows the configured base; publication
     # keeps the base associated with verification in its own SHA snapshot.
     attempt.start_ref = git.ref_sha(f"origin/{attempt.target_branch}")
     if conflicts or not git.is_ancestor(attempt.start_ref, git.head_sha()):
@@ -329,7 +238,7 @@ def _resume_implementation(attempt: Implementation) -> bool:
             try:
                 # A saved partial resolution still needs its marker checks,
                 # even when Git can merge the target without index conflicts.
-                ci = enabled(ctx, attempt.target_branch)
+                ci = enabled(ctx)
                 git.merge_base(attempt.start_ref, commit=not conflicts and not ci)
                 if ci and not conflicts and git.merge_in_progress():
                     commit_exclusions(attempt, f"{attempt.issue.title} (#{n})")

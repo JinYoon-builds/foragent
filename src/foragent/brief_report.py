@@ -21,7 +21,7 @@ from typing import Any
 import unicodedata
 
 from foragent.file_cache import read_jsonl
-from foragent import orch_inbox, orch_role_limit, orch_scorecard, presence, watch_art
+from foragent import orch_facts_promises, orch_inbox, orch_role_limit, orch_scorecard, presence, watch_art
 from foragent.i18n import text
 from foragent.labels import NEEDS_HUMAN
 from foragent.update_check import offer_line
@@ -134,6 +134,9 @@ def collect(store: StateStore, now: datetime) -> dict[str, Any]:
         "questions": orch_inbox.questions(store),
         "usage_limits": orch_role_limit.active(store),
         "person_issues": [{"issue": number, "title": titles.get(number)} for number in person],
+        # Closed issues' locked tests failing on main stay listed until main passes them (D122).
+        "broken_promises": [{"test": test, "issue": row["issue"], "since": row.get("since")}
+                            for test, row in sorted(orch_facts_promises.open_promises(store).items())],
     }
 
 
@@ -157,6 +160,7 @@ def render(report: dict[str, Any], language: str = "en") -> str:
         lines.append(text("brief_report_nothing_finished", language))
     now = text("brief_report_now", language, working=report["working"], lanes=report["lanes"])
     lines.append(f"{now} · {report['now']}" if report["now"] else now)
+    lines += _promises(report, language)
     if not turns:
         lines.append(text("brief_report_nothing_needed", language))
         return "\n".join(lines + _update(report, language))
@@ -180,8 +184,15 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     if matters := (orch_role_limit.report_line(report.get("usage_limits") or [], language)
                    or report.get("judgment") or report.get("scorecard_line")):
         lines.append(" ".join(matters.splitlines()))
+    lines += _promises(report, language)
     lines.append(text("brief_report_short_ask" if waiting else "brief_report_short_nothing", language))
     return "\n".join([cut(line) for line in lines] + _update(report, language))
+
+
+def _promises(report: dict[str, Any], language: str) -> list[str]:
+    return [text("brief_report_broken_promise", language, issue=f"#{item['issue']}",
+                 name=item["test"].rsplit("::", 1)[-1], test=item["test"])
+            for item in report.get("broken_promises") or ()]
 
 
 def scorecard_line(store: StateStore, language: str) -> str | None:
