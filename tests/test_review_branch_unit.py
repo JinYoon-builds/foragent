@@ -437,3 +437,38 @@ def test_a_signal_during_the_findings_merge_is_a_stop_not_a_verdict(tmp_path, mo
     assert code == 130, f"A stop during the merge is not UNUSABLE (exit 2)\n{out}\n{err}"
     assert "VERDICT" not in out and "NOTE" not in out and "Traceback" not in out + err
     assert "stopped" in err.lower()
+
+
+def test_a_cancelled_review_stops_waiting_for_a_held_file_lock(tmp_path):
+    """A reviewer thread waiting for a contended state lock (up to 600 s) ends once stopped."""
+    import fcntl
+    import os
+    import threading
+
+    from foragent import file_locks, processes
+
+    path = tmp_path / "state.lock"
+    holder = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    waiter = os.open(path, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    cancelled, outcome = threading.Event(), []
+    try:
+        def wait():
+            with processes.cancel_on(cancelled):
+                try:
+                    file_locks.acquire(waiter, path, timeout=60, journal_root=tmp_path)
+                    outcome.append("acquired")
+                except BaseException as error:
+                    outcome.append(type(error).__name__)
+
+        thread = threading.Thread(target=wait)
+        thread.start()
+        time.sleep(0.3)
+        assert outcome == [], "the lock is held, so the waiter is still waiting"
+        cancelled.set()
+        thread.join(2)
+        assert not thread.is_alive() and outcome == ["Cancelled"], outcome
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        os.close(waiter)

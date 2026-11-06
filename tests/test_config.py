@@ -2,6 +2,7 @@ from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
+import warnings
 import yaml
 
 from foragent.config import Config, ConfigError, DEFAULTS, in_run_hours, load_config, resolved_reviewer
@@ -303,10 +304,29 @@ def test_retired_floor_keys_are_accepted_and_ignored(repo, tmp_path, source, val
     # #497: floors no longer apply; any value loads and Config has no floor fields.
     global_path = tmp_path / "global.yml"
     path = repo / ".foragent.yml" if source == "local" else global_path
-    write_settings(path, {"test_slots": 2, "max_parallel": 2, "test_slots_floor": value, "parallel_floor": value})
+    write_settings(path, {"max_parallel": 2, "test_slots_floor": value, "parallel_floor": value})
     config = load_config(repo, global_path)
-    assert (config.test_slots, config.max_parallel) == (2, 2)
+    assert config.max_parallel == 2
     assert not hasattr(config, "test_slots_floor") and not hasattr(config, "parallel_floor")
+
+
+@pytest.mark.parametrize("source", ["local", "global"])
+@pytest.mark.parametrize("value", [4, 0, -1, None, True, "old", [], {}])
+def test_retired_test_slots_is_ignored_and_warns_once_per_file(repo, tmp_path, source, value):
+    global_path = tmp_path / "global.yml"
+    path = repo / ".foragent.yml" if source == "local" else global_path
+    write_settings(path, {"test_slots": value})
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        first = load_config(repo, global_path)
+        second = load_config(repo, global_path)
+    expected = value if type(value) is int and value > 0 else 2
+    assert first == second == Config(test_slots=expected)
+    assert DEFAULTS["test_slots"] == 2
+    assert len(seen) == 1
+    assert str(path) in str(seen[0].message)
+    assert "test_slots is ignored" in str(seen[0].message)
+    assert "machine.yml" in str(seen[0].message)
 
 
 def test_all_valid_overrides(repo):

@@ -4,8 +4,9 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 import threading
-import time
 from typing import IO, Any
+
+from foragent.file_locks import LockTimeout, acquire, file_lock, reporting
 
 # Tick-lock paths this thread holds through StateStore.hold_tick_lock.
 _TICK_LOCKS_HELD = threading.local()
@@ -17,37 +18,18 @@ def _held_tick_locks() -> set[str]:
 
 @contextmanager
 def _file_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+    with file_lock(path):
+        yield
 
 
-class LockBusy(Exception):
-    """A timed lock stayed held by someone else for the whole wait."""
+LockBusy = LockTimeout
 
 
 @contextmanager
 def _timed_lock(path: Path, timeout: float) -> Iterator[None]:
     """Like ``_file_lock``, but polling a non-blocking lock every 0.1 s for up to ``timeout``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | _state.fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise LockBusy(str(path)) from None
-                time.sleep(0.1)
-        try:
-            yield
-        finally:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+    with file_lock(path, timeout=timeout):
+        yield
 
 
 class StateLocksMixin:
@@ -81,17 +63,20 @@ class StateLocksMixin:
         self.root.mkdir(parents=True, exist_ok=True)
         lock = (self.root / f"{key}.lock").open("a", encoding="utf-8")
         try:
-            _state.fcntl.flock(lock.fileno(), _state.fcntl.LOCK_EX | (0 if blocking else _state.fcntl.LOCK_NB))
-        except BlockingIOError:
+            acquire(lock.fileno(), self.root / f"{key}.lock", timeout=None if blocking else 0,
+                    journal_root=self.root)
+        except LockTimeout:
             lock.close()
-            return None
+            if not blocking:
+                return None
+            raise
         except BaseException:
             lock.close()
             raise
         return lock
 
     def _state_lock(self) -> AbstractContextManager[None]:
-        return _file_lock(self.root / "state.lock")
+        return file_lock(self.root / "state.lock", journal_root=self.root)
 
     def worktree_lock(self, number: int, timeout: float | None = None) -> AbstractContextManager[None]:
         """Serialize an issue's WIP preservation, worktree removal, talk decision and timed stop.
@@ -100,11 +85,11 @@ class StateLocksMixin:
         worktree lock under the state lock, or take the tick lock under a
         worktree lock. These locks are not reentrant; cleanup acquires it
         separately from preservation. Keep lock files after removal so all
-        contenders continue to lock the same inode. ``timeout`` None blocks;
+        contenders continue to lock the same inode. ``timeout`` None uses the global limit;
         0 tries once; a number waits that long; a busy lock raises ``LockBusy``.
         """
         path = self.root / "runs" / f"issue-{number}.worktree.lock"
-        return _file_lock(path) if timeout is None else _timed_lock(path, timeout)
+        return file_lock(path, timeout=timeout, journal_root=self.root)
 
     @contextmanager
     def try_worktree_lock(self, number: int) -> Iterator[bool]:
@@ -116,23 +101,13 @@ class StateLocksMixin:
 
     @contextmanager
     def merge_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "merge.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+        with file_lock(self.root / "merge.lock", journal_root=self.root):
+            yield
 
     @contextmanager
     def notify_lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        with (self.root / "notify.lock").open("a", encoding="utf-8") as stream:
-            _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_UN)
+        with file_lock(self.root / "notify.lock", journal_root=self.root):
+            yield
 
     @contextmanager
     def tick_lock(self) -> Iterator[bool]:
@@ -145,7 +120,7 @@ class StateLocksMixin:
         if str(path.resolve()) in _state._held_tick_locks():
             yield True
             return
-        with self._try_tick_lock(path) as acquired:
+        with reporting(self.root), self._try_tick_lock(path) as acquired:
             yield acquired
 
     @contextmanager
@@ -160,7 +135,7 @@ class StateLocksMixin:
         if key in held:
             yield True
             return
-        with self._try_tick_lock(path) as acquired:
+        with reporting(self.root), self._try_tick_lock(path) as acquired:
             if not acquired:
                 yield False
                 return
@@ -179,8 +154,8 @@ class StateLocksMixin:
     def _try_tick_lock(path: Path) -> Iterator[bool]:
         with path.open("a", encoding="utf-8") as stream:
             try:
-                _state.fcntl.flock(stream.fileno(), _state.fcntl.LOCK_EX | _state.fcntl.LOCK_NB)
-            except BlockingIOError:
+                acquire(stream.fileno(), path, timeout=0)
+            except LockTimeout:
                 yield False
             else:
                 try:

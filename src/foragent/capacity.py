@@ -6,7 +6,7 @@ matters, and it holds new starts and new test slots without changing a budget.
 
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 import ctypes
 from datetime import UTC, datetime, timedelta
@@ -24,6 +24,7 @@ from typing import IO, Any
 import psutil
 
 from foragent import processes
+from foragent.file_locks import LockTimeout, LockWait, file_lock, locked, reporting
 from foragent.state import Run, StateStore
 
 # Below this load per CPU the machine has headroom for one more run.
@@ -455,8 +456,8 @@ def machine_runs(store: StateStore, now: datetime) -> int:
 
 @contextmanager
 def machine_lock(store: StateStore) -> Iterator[None]:
-    """Serialize budget updates and run admission across every repository's gate."""
-    with _flock(store.root.parent / LOCK_FILE):
+    """Serialize admission; precedes every repository state lock, including shared reads."""
+    with file_lock(store.root.parent / LOCK_FILE, journal_root=store.root):
         yield
 
 
@@ -500,13 +501,8 @@ def next_test_slots(
 
 @contextmanager
 def _flock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    with file_lock(path):
+        yield
 
 
 @contextmanager
@@ -516,16 +512,13 @@ def _try_flock(path: Path) -> Iterator[bool]:
     A caller that must wait loops itself, so every wait is reported and bounded there.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
+    with path.open("a", encoding="utf-8") as stream, ExitStack() as stack:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            stack.enter_context(locked(stream.fileno(), path, timeout=0))
+        except LockTimeout:
             yield False
-            return
-        try:
+        else:
             yield True
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def read_test_slots() -> dict[str, Any] | None:
@@ -540,16 +533,20 @@ def read_test_slots() -> dict[str, Any] | None:
 
 
 def effective_test_slots(
-    ceiling: int, *, state: dict[str, Any] | None | bool = False, machine: dict[str, Any] | None = None,
+    ceiling: int | None = None, *, state: dict[str, Any] | None | bool = False,
+    machine: dict[str, Any] | None = None,
 ) -> int:
-    """The shared AIMD value, capped by machine.yml and this repository's lower ceiling.
+    """The shared AIMD value, optionally lowered by a legacy programmatic ceiling.
 
     ``state`` and ``machine`` let a caller that already read test-slots.json and machine.yml
     reuse those values instead of reading the files again.
     """
     from foragent import machine_budget
+    from foragent.config import FileTestSlots
 
-    ceiling = min(ceiling, (machine if machine is not None else machine_budget.values())["test_slots"])
+    machine_ceiling = (machine if machine is not None else machine_budget.values())["test_slots"]
+    ceiling = (machine_ceiling if ceiling is None or isinstance(ceiling, FileTestSlots)
+               else min(ceiling, machine_ceiling))
     if state is False:
         state = read_test_slots()
     return max(1, min(state["slots"], ceiling)) if state else max(1, ceiling)
@@ -649,7 +646,7 @@ def update_test_slots(
     return value
 
 
-def _take_test_slot(limit: int, *, wait: bool = True) -> IO[str] | None:
+def _take_test_slot(limit: int, *, wait: bool = True, lock_wait: LockWait | None = None) -> IO[str] | None:
     """Under the guard lock, hold one free slot file if fewer than limit are held.
 
     ``wait=False`` tries the guard lock once; a busy guard reads as no free slot
@@ -660,6 +657,8 @@ def _take_test_slot(limit: int, *, wait: bool = True) -> IO[str] | None:
     directory.mkdir(parents=True, exist_ok=True)
     guard = _flock(root / TEST_SLOTS_LOCK) if wait else _try_flock(root / TEST_SLOTS_LOCK)
     with guard as locked:
+        if lock_wait is not None:
+            lock_wait.remaining(locked is not False)
         if locked is False:
             return None
         indexes = [int(path.stem.removeprefix("slot-")) for path in directory.glob("slot-*.lock")
@@ -687,7 +686,7 @@ def _take_test_slot(limit: int, *, wait: bool = True) -> IO[str] | None:
 
 @contextmanager
 def hold_test_slot(
-    ceiling: int, *, waiting: Callable[[], None] | None = None, deadline: float | None = None,
+    ceiling: int | None = None, *, waiting: Callable[[], None] | None = None, deadline: float | None = None,
     timed_out: Callable[[], str] | None = None,
 ) -> Iterator[None]:
     """Hold one machine-wide test slot for one test command.
@@ -703,16 +702,23 @@ def hold_test_slot(
         yield
         return
     heartbeat = None
+    guard_wait = LockWait(machine_root() / TEST_SLOTS_LOCK, None, lambda: time.monotonic())
     # While the kernel reports critical memory pressure, a free slot stays unclaimed.
-    while (kernel_pressure() == "critical"
-           or (stream := _take_test_slot(effective_test_slots(ceiling), wait=deadline is None)) is None):
+    while True:
+        if kernel_pressure() == "critical":
+            guard_wait.remaining(True)  # Waiting for memory, rather than the guard lock.
+            stream = None
+        else:
+            stream = _take_test_slot(effective_test_slots(ceiling), wait=deadline is None, lock_wait=guard_wait)
+        if stream is not None:
+            break
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(timed_out() if timed_out is not None else "No machine test slot became free in time")
         if waiting is not None and (heartbeat is None or time.monotonic() - heartbeat >= SLOT_HEARTBEAT_SECONDS):
             heartbeat = time.monotonic()
             waiting()
         pause = SLOT_POLL_SECONDS if deadline is None else min(SLOT_POLL_SECONDS, deadline - time.monotonic())
-        processes.pause(max(0.0, pause), time.sleep)
+        processes.pause(max(0.0, min(pause, guard_wait.seconds_left)), time.sleep)
     taker = os.getpid()
     try:
         yield
@@ -804,11 +810,13 @@ def admit_run(
     ``owner``, asked again on every try, says the run holds a merge turn. An owner takes neither
     the budget nor the machine lock: its progress is what frees capacity, and its work still counts.
     """
+    lock_wait = LockWait(store.root.parent / LOCK_FILE, store.root, lambda: time.monotonic())
     while True:
         if owner():
             store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
             return
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
+            lock_remaining = lock_wait.remaining(locked)
             holders, _ = _machine_scan(store, datetime.now(UTC), live=True)
             if locked and len(holders) < workload_budget(store):
                 store.update_run(number, **identity, phase_started_at=now().astimezone(UTC).isoformat())
@@ -817,7 +825,7 @@ def admit_run(
         if remaining <= 0:
             raise TimeoutError("No machine run slot became free in time")
         waiting()
-        processes.pause(min(WORKLOAD_POLL_SECONDS, remaining), time.sleep)
+        processes.pause(min(WORKLOAD_POLL_SECONDS, remaining, lock_remaining), time.sleep)
 
 
 def _acquire_workload(
@@ -833,12 +841,14 @@ def _acquire_workload(
 
     pid, shown, busy_since = os.getpid(), None, None
     candidate = capacity_sessions.Workload(Path(), pid, kind, issue, role)
+    lock_wait = LockWait(store.root.parent / LOCK_FILE, store.root, lambda: time.monotonic())
     while True:
         sensed = _sensor_block()  # Read outside the lock: waiting holds no lock.
         # One try: the loop below does every wait, so each one is reported and bounded. Threads of
         # this process (concurrent reviewers) queue for the try, so they never see each other's
         # flock as another process's.
         with _ADMISSION, _try_flock(store.root.parent / LOCK_FILE) as locked:
+            lock_remaining = lock_wait.remaining(locked)
             # One scan decides admission: reuse is matched by identity, never by comparing counts.
             holders, reused = _machine_scan(store, now(), live=True, candidate=candidate)
             budget = workload_budget(store)
@@ -859,7 +869,7 @@ def _acquire_workload(
         if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        processes.pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining), time.sleep)
+        processes.pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining, lock_remaining), time.sleep)
 
 
 def _held_test_slots() -> int:
@@ -907,7 +917,7 @@ def _workload_test_slot(store: StateStore, config: Any, language: str, wait_s: f
         _say(message, wait_s)
         return message
 
-    with hold_test_slot(config.test_slots, waiting=waiting, deadline=deadline, timed_out=timed_out):
+    with reporting(store.root), hold_test_slot(config.test_slots, waiting=waiting, deadline=deadline, timed_out=timed_out):
         yield
 
 
