@@ -4,11 +4,11 @@ Legacy Git checkpoint rows remain readable but play no part in recovery.
 """
 
 from contextlib import contextmanager
-import fcntl
 import json
 import os
 
 from foragent import order_notes
+from foragent.file_locks import locked as lock_descriptor
 
 
 JOURNAL = "flush-journal.jsonl"
@@ -34,8 +34,8 @@ def locked(store):
     # Persistent inode: never unlink a lock that another flush may already have opened.
     fd = os.open(store.root / "flush.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        with lock_descriptor(fd, store.root / "flush.lock", journal_root=store.root):
+            yield
     finally:
         os.close(fd)
 
