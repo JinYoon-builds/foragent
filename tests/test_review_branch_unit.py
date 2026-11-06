@@ -263,3 +263,133 @@ def test_review_runs_no_program_any_caller_setup_configures(tmp_path, monkeypatc
     assert seen["file"] == "feature\n", "the checkout holds the branch's blob, unfiltered"
     assert sorted(path.name for path in marks.iterdir()) == [], "caller-configured programs ran"
     assert dict(os.environ) == before
+
+
+# --- #2215: a signal stops the review promptly and is never a verdict -----------------------
+# No OS signal is sent: the installed SIGINT handler runs on the main thread through
+# _thread.interrupt_main, only while review() has its own handler installed. Reviewers are
+# in-process fakes, so no process is signalled.
+
+def _acceptance_helpers():
+    import importlib
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
+    return importlib.import_module("test_review_branch")
+
+
+def _signal_self_once(sent):
+    """Run the installed SIGINT handler on the main thread, as a delivered Ctrl-C would.
+
+    No OS signal is sent: _thread.interrupt_main only simulates its arrival in this process.
+    """
+    import _thread
+    import signal
+
+    if not sent:
+        sent.append(True)
+        _thread.interrupt_main(signal.SIGINT)
+
+
+def _review_threads():
+    import threading
+
+    return [thread for thread in threading.enumerate() if thread.name.startswith("review-")]
+
+
+def _finished_within(threads, seconds):
+    import time
+
+    deadline = time.monotonic() + seconds
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return [thread.name for thread in threads if thread.is_alive()]
+
+
+def test_a_signal_ends_reviewers_waiting_for_machine_admission(tmp_path, monkeypatch, capsys):
+    from foragent import capacity
+
+    helpers = _acceptance_helpers()
+    helpers.build(tmp_path, monkeypatch)
+    helpers.use(monkeypatch, helpers.Script(review="VERDICT: PASS"))
+    sent, waiting = [], []
+
+    def overloaded():
+        # Every admission sees an overloaded machine; once a reviewer is waiting, Ctrl-C.
+        waiting.append(True)
+        if len(waiting) >= 3:
+            _signal_self_once(sent)
+        return "overload"
+
+    monkeypatch.setattr(capacity, "_sensor_block", overloaded)
+    before = set(_review_threads())
+
+    code, out, err = helpers.fa(["review", "feature", "--base", "main"], capsys)
+
+    assert sent and code == 130, f"{code}\n{out}\n{err}"
+    assert "VERDICT" not in out + err and "Traceback" not in out + err
+    alive = _finished_within([thread for thread in _review_threads() if thread not in before], 3)
+    assert alive == [], f"Reviewers still waiting for admission after the stop: {alive}"
+
+
+def test_a_signal_ends_a_reviewer_in_retry_backoff(tmp_path, monkeypatch, capsys):
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    helpers = _acceptance_helpers()
+    helpers.build(tmp_path, monkeypatch)
+    sleeping, outcome = threading.Event(), []
+
+    def backoff(ctx):
+        sleeping.set()
+        try:
+            ctx.sleep(600)  # the executor retry backoff (run_waits._executor_wait) uses ctx.sleep
+        except BaseException as error:
+            outcome.append(type(error).__name__)
+            raise
+        outcome.append("slept")
+
+    def panel(n, ctx, *args, **kwargs):
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-backoff")
+        try:  # as run_review._panel_review shuts its pool down
+            future = pool.submit(contextvars.copy_context().run, backoff, ctx)
+            sleeping.wait(5)
+            _signal_self_once([])
+            pool.shutdown(wait=True)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        return future.result()
+
+    monkeypatch.setattr(review_branch, "_panel_review", panel)
+
+    code, out, err = helpers.fa(["review", "feature", "--base", "main"], capsys)
+
+    assert code == 130 and "Traceback" not in out + err, f"{code}\n{out}\n{err}"
+    alive = _finished_within(_review_threads(), 3)
+    assert alive == [] and outcome == ["Cancelled"], f"backoff did not end: {alive} {outcome}"
+
+
+def test_a_signal_during_the_findings_merge_is_a_stop_not_a_verdict(tmp_path, monkeypatch, capsys):
+    helpers = _acceptance_helpers()
+    helpers.build(tmp_path, monkeypatch)
+    from foragent.run_prompts import PANEL_MERGE_PROMPT
+
+    sent = []
+
+    class Merging(helpers.Script):
+        def run(self, **kwargs):
+            result = super().run(**kwargs)
+            if PANEL_MERGE_PROMPT in kwargs["prompt"]:  # only the findings merge carries it
+                _signal_self_once(sent)
+            return result
+
+    helpers.use(monkeypatch, Merging(review="VERDICT: PASS"))
+
+    code, out, err = helpers.fa(["review", "feature", "--base", "main"], capsys)
+
+    assert sent, f"the merger ran\n{code}\n{out}\n{err}"
+    assert code == 130, f"A stop during the merge is not UNUSABLE (exit 2)\n{out}\n{err}"
+    assert "VERDICT" not in out and "NOTE" not in out and "Traceback" not in out + err
+    assert "stopped" in err.lower()

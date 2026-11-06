@@ -44,6 +44,12 @@ _process_tree_callback: ContextVar[Callable[[list[dict]], None] | None] = Contex
     "process_tree_callback", default=None,
 )
 
+# Extra observers of every launched tree. Unlike the callback above, a nested
+# track_process_group does not replace them, so a caller can see every session it caused.
+_process_tree_observers: ContextVar[tuple[Callable[[list[dict]], None], ...]] = ContextVar(
+    "process_tree_observers", default=(),
+)
+
 # Cumulative paused seconds of the current run (an open talk terminal, D55 addendum).
 # The runner sets it for a whole run, so every command's timeout (executor
 # sessions, Done when and unit checks, baseline capture, local CI) grows by the
@@ -114,6 +120,54 @@ def track_process_group(
     finally:
         _process_tree_callback.reset(tree_token)
         _process_group_callback.reset(token)
+
+
+class Cancelled(BaseException):
+    """A wait or launch refused because the work it belongs to was cancelled.
+
+    A BaseException, like KeyboardInterrupt, so no ``except Exception`` on the way turns
+    the cancellation into an ordinary failure.
+    """
+
+
+_cancel_event: ContextVar[threading.Event | None] = ContextVar("cancel_event", default=None)
+
+
+@contextmanager
+def cancel_on(event: threading.Event) -> Iterator[None]:
+    """Make every pause() and run_logged launch in this context (copied threads included) end
+    once ``event`` is set."""
+    token = _cancel_event.set(event)
+    try:
+        yield
+    finally:
+        _cancel_event.reset(token)
+
+
+def raise_if_cancelled() -> None:
+    event = _cancel_event.get()
+    if event is not None and event.is_set():
+        raise Cancelled()
+
+
+def pause(seconds: float) -> None:
+    """time.sleep, except that it ends with Cancelled as soon as the context is cancelled."""
+    event = _cancel_event.get()
+    if event is None:
+        time.sleep(seconds)
+        return
+    if event.wait(max(0.0, seconds)):
+        raise Cancelled()
+
+
+@contextmanager
+def observe_process_trees(callback: Callable[[list[dict]], None]) -> Iterator[None]:
+    """Also report every tree that run_logged observes in this context, nested trackers included."""
+    token = _process_tree_observers.set((*_process_tree_observers.get(), callback))
+    try:
+        yield
+    finally:
+        _process_tree_observers.reset(token)
 
 
 @dataclass(frozen=True)
@@ -594,7 +648,7 @@ def recorded_tree(identities):
         _recorded_tree.reset(token)
 
 
-def kill_process_group(pid: int) -> int:
+def kill_process_group(pid: int, *, grace_s: float | None = None) -> int:
     """Stop a recorded tree by individual identities, never a numeric group.
 
     The historical name remains for callers. Each signal rechecks start time,
@@ -602,6 +656,8 @@ def kill_process_group(pid: int) -> int:
     bind the signal to that process lifetime. macOS has no equivalent: a
     microsecond exit/PID-reuse window remains between the final read and kill.
     Permission denial refuses the stop immediately, without another attempt.
+    With ``grace_s``, SIGKILL follows only if the tree outlives that many seconds
+    of polling, so a tree that ends on SIGTERM is not waited on for the full pause.
     """
     recorded = _recorded_tree.get()
     if not recorded:
@@ -660,9 +716,16 @@ def kill_process_group(pid: int) -> int:
                     os.close(descriptor)
 
     send(signal.SIGTERM)
-    if current():
-        time.sleep(10)
-        send(signal.SIGKILL)
+    if grace_s is None:
+        if current():
+            time.sleep(10)
+            send(signal.SIGKILL)
+    else:
+        deadline = time.monotonic() + grace_s
+        while current() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if current():
+            send(signal.SIGKILL)
     for _ in range(50):
         for target in signaled:
             try:
@@ -755,8 +818,17 @@ def run_logged(
     child_env = {**(_child_environment(cwd) if inherit_env else {}), **(env or {})}
     child_env = {key: value for key, value in child_env.items() if value is not None}
     on_process_group = _process_group_callback.get()
-    on_process_tree = _process_tree_callback.get()
+    tree_reporters = tuple(callback for callback in (_process_tree_callback.get(), *_process_tree_observers.get())
+                           if callback is not None)
+
+    def on_process_tree(identities):
+        for callback in tree_reporters:
+            callback(identities)
+
+    if not tree_reporters:
+        on_process_tree = None
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    raise_if_cancelled()  # A cancelled caller starts no new session.
     with log_path.open("ab") as log, (
         stdout_path.open("w+b") if stdout_path is not None else tempfile.TemporaryFile()
     ) as output, (stderr_path.open("ab") if stderr_path is not None else nullcontext()) as errors:
@@ -769,6 +841,15 @@ def run_logged(
             bufsize=0,
             start_new_session=True, env=child_env,
         )
+        for observer in _process_tree_observers.get():
+            # Report the root at once: the full tree scan below can take a second, and an
+            # observer that must stop this session may need to before it ends.
+            try:
+                root = read_process_identity(process.pid)
+            except (OSError, psutil.Error, SystemError):
+                root = None
+            if root is not None:
+                observer([{"pid": root.pid, "start_time": root.start_time}])
         prompt_errors = []
         prompt_cancelled = False
 

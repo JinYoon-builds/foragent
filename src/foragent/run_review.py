@@ -374,11 +374,16 @@ def _panel_review(n: int, ctx: RunContext, git: GitRepo, parsed: ParsedIssue, ba
 
     before = git.review_state()
     try:
-        with ThreadPoolExecutor(max_workers=at_once,
-                                thread_name_prefix=f"review-{n}") as pool:
+        pool = ThreadPoolExecutor(max_workers=at_once, thread_name_prefix=f"review-{n}")
+        try:
             # Each reviewer runs in a copy of this context, so the run's pause clock reaches it.
             futures = [pool.submit(contextvars.copy_context().run, held, prompt, path, k)
                        for k, (prompt, path) in enumerate(zip(prompts, logs), start=1)]
+            pool.shutdown(wait=True)
+        except BaseException:
+            # An interrupt while reviewers run: queued reviewers never start.
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
         errors = [future.exception() for future in futures]
     finally:
         edited = restore(before)
