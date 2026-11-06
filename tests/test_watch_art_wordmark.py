@@ -56,6 +56,7 @@ def test_word_has_eight_tapered_letters_three_bands_and_only_offset_shadow():
             groups[-1].append(x)
     assert len(groups) == len("FORAGENT")
     assert len(grid) == len(art.ORCHESTRATOR)
+    assert {len(row) for row in grid} == {64}
     assert {pixel for row in grid for pixel in row} == {None, "W", "O", "R", "K"}
     for y, row in enumerate(grid):
         for x, pixel in enumerate(row):
@@ -65,12 +66,29 @@ def test_word_has_eight_tapered_letters_three_bands_and_only_offset_shadow():
                 assert y > 0 and x > 0 and grid[y - 1][x - 1] in lit
     assert any(pixel == "K" for pixel in grid[-1])
     assert all(pixel not in lit for pixel in grid[-1])
-    for columns in groups:
-        def span(y):
-            xs = [x for x in columns if grid[y][x] in lit]
-            return max(xs) - min(xs) + 1
-        assert span(13) > span(0)
+    for letter, columns in zip("FORAGENT", groups):
+        assert len(columns) == 7
+        upper = {x for y in range(5) for x in columns if grid[y][x] in lit}
+        lower = {x for y in range(5, 14) for x in columns if grid[y][x] in lit}
+        assert (min(upper), max(upper)) == (columns[0], columns[-1])
+        if letter != "T":
+            assert min(lower) == columns[0]
+        if letter in "ORAGEN":
+            assert max(lower) == columns[-1]
         assert all(any(grid[y][x] in lit for x in columns) for y in range(14))
+
+
+@pytest.mark.parametrize("letter, expected", [
+    ("F", ["#######"] * 2 + ["##....."] * 3 + ["#####.."] * 2 + ["##....."] * 7),
+    ("T", ["#######"] * 2 + ["..###.."] * 12),
+    ("E", ["#######"] * 2 + ["##....."] * 3 + ["######."] * 2
+     + ["##....."] * 5 + ["#######"] * 2),
+])
+def test_word_faces_keep_f_stem_t_centred_stem_and_e_bottom_bar(letter, expected):
+    start = "FORAGENT".index(letter) * 8
+    face = ["".join("#" if pixel in {"W", "O", "R"} else "."
+                    for pixel in row[start:start + 7]) for row in art.WORDMARK[:14]]
+    assert face == expected
 
 
 @pytest.mark.parametrize("section", ["stage", "squirrels"])
