@@ -55,6 +55,9 @@ def _word(item: dict[str, Any], language: str) -> str:
     from foragent.messages.squirrel import PHASE_WORDS, phase_word
 
     kind, phase, asked = item["class"], item["phase"], item.get("asked")
+    if kind == "working" and phase == "reviewing" and item.get("round"):
+        # Which reviewer round this is, said in words (#2323): '리뷰 6번째', 'review round 6'.
+        return watch.text("watch_review_round", language, round=item["round"])
     if phase in PHASE_WORDS and (kind == "working" or kind == "wait" and phase == "merge-owner-wait"):
         return phase_word(phase, language, short=True)
     if (kind, asked) in TURNS:

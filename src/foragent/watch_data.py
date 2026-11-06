@@ -65,6 +65,8 @@ class Snapshot:
     run_starts: dict[int, str] = field(default_factory=dict)
     # The phase each issue's latest recorded run was in when it stopped (finish_run keeps it).
     run_phases: dict[int, str | None] = field(default_factory=dict)
+    # The reviewer round each reviewing worker is in (review_rounds); absent when unknown.
+    review_rounds: dict[int, int] = field(default_factory=dict)
     today_done: dict[str, int] | None = None
     # Order preparation facts from ``fa order progress`` (StateStore.order_progress); None when none.
     prep: dict[str, Any] | None = None
@@ -221,6 +223,53 @@ def merge_turns(status: dict[str, Any], rows: dict[int, dict[str, Any]], config:
     return {**status, "lanes": copied}
 
 
+def review_rounds(store: StateStore, runs: list[dict[str, Any]],
+                  events: list[dict[str, Any]] | None) -> dict[int, int]:
+    """The reviewer round each reviewing run is in, numbered as the runner numbers it.
+
+    The runner numbers a reviewer round one past the highest saved
+    ``runs/issue-<n>/review-<round>.txt`` (review_single.next_review_round); journaled
+    verdicts from other sources (an orchestrator PASS) take no reviewer number. It saves that
+    file as soon as the reviewer (or the panel's findings merge) answers, scores the findings,
+    and journals the reviewer's verdict (``kind: review``, source reviewer) only when the round
+    is decided. So the highest saved round is still in progress while it has no reviewer verdict
+    and was saved during this run; otherwise the round after it is. Unknown when the journal or
+    the folder cannot be read.
+    """
+    if events is None:
+        return {}
+    decided: dict[int, set[int]] = {}
+    for event in events:
+        if (event.get("kind") == "review" and type(event.get("issue")) is int
+                and type(event.get("round")) is int and event.get("source", "reviewer") == "reviewer"):
+            decided.setdefault(event["issue"], set()).add(event["round"])
+    found: dict[int, int] = {}
+    for run in runs:
+        number = run.get("number")
+        if run.get("phase") != "reviewing" or type(number) is not int:
+            continue
+        started = _aware(run.get("started_at"))
+        try:
+            saved = {int(path.stem.removeprefix("review-")): path.stat().st_mtime
+                     for path in (store.root / "runs" / f"issue-{number}").glob("review-*.txt")
+                     if path.stem.removeprefix("review-").isdigit()}
+        except OSError:
+            continue  # An unreadable folder leaves the round unknown, never a guess.
+        last = max(saved, default=0)
+        in_progress = (last and last not in decided.get(number, set())
+                       and (started is None or saved[last] >= started.timestamp()))
+        found[number] = last if in_progress else last + 1
+    return found
+
+
+def _aware(value: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    return moment if moment is not None and moment.tzinfo is not None else None
+
+
 def collect(
     status: dict[str, Any], tracker: Tracker, store: StateStore, config: Config, now: datetime,
     *, repo_root: Path | None = None, projection: bool = False,
@@ -317,6 +366,7 @@ def collect(
                               progress.parallel_budget(store, config), now)
     eta, eta_range, basis = (found[0], found[1:3], found[3]) if found else (None, None, {})
     if projection:
+        events = watch_lane_facts.journal(store)  # One read shared by the park and review facts.
         # The gate's scene needs classification and summary facts, never log-derived quota,
         # usage samples, scheduling explanations, role reasons or lane memories.
         try:
@@ -331,7 +381,8 @@ def collect(
             worker_states={run["number"]: issue_state(rows.get(run["number"], {}).get("labels"), True)
                            for run in status["active_runs"]},
             waiting_facts=watch_lane_facts.authored_waits(status, rows, config),
-            park_facts=watch_lane_facts.park_facts(watch_lane_facts.journal(store)),
+            review_rounds=review_rounds(store, status["active_runs"], events),
+            park_facts=watch_lane_facts.park_facts(events),
             role_facts=watch_role_facts.collect(store), **_questions(store, history))
     try:
         requests = orch_inbox.requests(store)
@@ -361,6 +412,7 @@ def collect(
                           requests, orders, recent, progress.quota(store.root / "logs", now), heartbeats, logs,
                           worker_states, eta_range, basis, today, merged_at, orch_panel.collect(store, now),
                           phases, say, titles=titles, run_starts=run_starts, run_phases=run_phases,
+                          review_rounds=review_rounds(store, status["active_runs"], events),
                           today_done=today_done, prep=prep,
                           meter=found_meter,
                           lane_facts=watch_lane_facts.lane_facts(status, store, config, now, repo_root,

@@ -37,10 +37,12 @@ def project(snapshot: Snapshot, config: Config) -> dict:
         upcoming = upcoming + held
 
         def acorns(items):
-            # Every field the acorn draws: its word (phase, class) and, for a question, whose turn it is.
+            # Every field the acorn draws: its word (phase, class, review round) and, for a question, whose turn it is.
             return [{"number": item["number"], "phase": item["phase"],
                      "kind": "wait" if item["class"] == "authored" else item["class"],
-                     "state": item["state"], "asked": item.get("asked")}
+                     "state": item["state"], "asked": item.get("asked"),
+                     **({"round": item["round"], "started": (item.get("run") or {}).get("started_at")}
+                        if item.get("round") else {})}
                     for item in items]
 
         kind = watch_scene.category(current, upcoming)
@@ -114,7 +116,8 @@ def publishing(ctx):
 
 
 def read(store: StateStore, now: datetime, language: str = "en") -> Snapshot:
-    """The complete refresh read: exactly one JSON file, with no raw-state fallback."""
+    """The complete refresh read: one JSON file, with no raw-state fallback; only an acorn in
+    review also reads its round records (``_fresh_rounds``)."""
     try:
         payload = json.loads((store.root / FILENAME).read_text(encoding="utf-8"))
         if payload.get("version") != VERSION or not isinstance(payload.get("lanes"), dict):
@@ -125,6 +128,7 @@ def read(store: StateStore, now: datetime, language: str = "en") -> Snapshot:
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         payload = {"lanes": {}, "summary": {}, "pending": True, "stale": True, "as_of": None}
         captured = now
+    _fresh_rounds(store, payload["lanes"])
     summary = payload.get("summary") or {}
     times = tuple(datetime.fromisoformat(summary[key]) if summary.get(key) else None
                   for key in ("eta_low", "eta_high"))
@@ -138,6 +142,27 @@ def read(store: StateStore, now: datetime, language: str = "en") -> Snapshot:
                     today_done={slug: lane.get("today", 0) for slug, lane in lanes.items()},
                     lane_facts={slug: {"owned_paths": lane.get("paths", [])} for slug, lane in lanes.items()},
                     role_facts=payload.get("roles") or {}, now_view=payload)
+
+
+def _fresh_rounds(store: StateStore, lanes: dict) -> None:
+    """Bring each reviewing acorn's round up to the runner's records since the tick.
+
+    A reviewer answers and a round is decided between ticks, so the round published with the
+    tick lags; the refresh (never a redraw) reads the journal and the saved review files once,
+    and only while an acorn is in review. An unreadable journal keeps the published round.
+    """
+    from foragent import watch_data, watch_lane_facts
+
+    reviewing = [item for lane in lanes.values() if isinstance(lane, dict)
+                 for key in ("current", "next") for item in lane.get(key) or ()
+                 if isinstance(item, dict) and item.get("round") and type(item.get("number")) is int]
+    if not reviewing:
+        return
+    rounds = watch_data.review_rounds(
+        store, [{"number": item["number"], "phase": "reviewing", "started_at": item.get("started")}
+                for item in reviewing], watch_lane_facts.journal(store))
+    for item in reviewing:
+        item["round"] = rounds.get(item["number"], item["round"])
 
 
 def sections():
