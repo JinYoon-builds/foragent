@@ -70,8 +70,9 @@ def proto(world, monkeypatch):
     monkeypatch.setattr(case.tracker, "close_pr", close_transport)
     case.config = replace(case.config, merge_owner=True)
     case.ctx.config = case.config
-    case.store.finish_run(contract.BLOCKER, outcome="merged")
-    for n in contract.NUMBERS:
+    case.store.finish_run(world_module.BLOCKER, outcome="merged")
+    # The world started runs for its own module's members, which a locked test may have narrowed.
+    for n in world_module.NUMBERS:
         case.store.finish_run(n, outcome="fixture-unused")
         case.tracker.remove_labels(n, ["running"])
     case.armed = True

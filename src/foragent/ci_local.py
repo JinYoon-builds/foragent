@@ -179,9 +179,10 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
     """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
 
     Approved command text is unchanged. Each pytest receives options through
-    PYTEST_ADDOPTS and a temporary plugin: an entirely deselected session passes
-    its own shell segment, without ever replaying the command. Real failures
-    and genuinely empty collections retain their status. Trusted locked ids
+    PYTEST_ADDOPTS and a temporary plugin: a session whose remaining tests this
+    skip removed entirely passes its own shell segment, without ever replaying
+    the command. Real failures keep their status, and so does exit 5 from -k,
+    -m, another plugin's deselection or a path with no tests. Trusted locked ids
     are deselected exactly, including ids that prefix an uncredited sibling.
     ``owned`` normalized invocations clear PYTEST_ADDOPTS, so receive the options
     as arguments instead. PASSED summary lines record what this pass ran.
@@ -210,7 +211,7 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
             # CI ids are repository-relative even when pytest discovers an ancestor config/root.
             (Path(directory) / f"{module}.py").write_text(
                 "from pathlib import Path\nimport pytest\n"
-                "_deselected = pytest.StashKey[int]()\n"
+                "_emptied = pytest.StashKey[bool]()\n"
                 f"_original = [Path(p) for p in {list(skips.pythonpath)!r}]\n"
                 f"_bootstrap = [Path(p) for p in {paths!r}]\n"
                 f"_trusted = {set(skips.locked_ci)!r}\n"
@@ -227,21 +228,25 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
                 "        return None\n"
                 "    _, separator, tail = item.nodeid.partition('::')\n"
                 "    return path + '::' + tail if separator else None\n"
-                "@pytest.hookimpl(trylast=True)\n"
-                "def pytest_collection_modifyitems(config, items):\n"
+                # Collection finish follows every pytest_collection_modifyitems
+                # implementation and wrapper (-k, -m, --lf/--lfnf, --deselect, conftest
+                # and other plugins), so ``session.items`` is exactly what would
+                # otherwise run. Only when this skip removes every one of them is the
+                # session marked, so an empty run caused by anything else keeps exit 5.
+                # tryfirst: the terminal reporter then counts these as deselected.
+                "@pytest.hookimpl(tryfirst=True)\n"
+                "def pytest_collection_finish(session):\n"
+                "    items = session.items\n"
                 "    leave = [item for item in items if _node_id(item) in _selected\n"
                 "             or (_node_id(item) in _trusted and item.get_closest_marker('local_only') is None)]\n"
                 "    if leave:\n"
                 "        items[:] = [item for item in items if item not in leave]\n"
-                "        config.hook.pytest_deselected(items=leave)\n"
-                "def pytest_deselected(items):\n"
-                "    if items:\n"
-                "        session = items[0].session\n"
-                "        session.stash[_deselected] = session.stash.get(_deselected, 0) + len(items)\n"
+                "        session.config.hook.pytest_deselected(items=leave)\n"
+                "        session.stash[_emptied] = not items\n"
                 "@pytest.hookimpl(trylast=True)\n"
                 "def pytest_sessionfinish(session, exitstatus):\n"
                 "    if (exitstatus == 5 and session.exitstatus == 5 and session.testscollected == 0\n"
-                "            and session.stash.get(_deselected, 0)):\n"
+                "            and session.stash.get(_emptied, False)):\n"
                 "        session.exitstatus = 0\n", encoding="utf-8")
             environment["PYTHONPATH"] = os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")]))
         arguments.write_text("".join(f"{word}\n" for word in words), encoding="utf-8")

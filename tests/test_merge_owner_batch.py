@@ -2285,6 +2285,55 @@ def test_owned_ci_skip_quotes_space_paths_and_runs_once(tmp_path, monkeypatch, f
     assert len(calls) == 1 and not case.receipt.exists()
 
 
+# A conftest wrapper that deselects everything after the inner selections, like --lf does.
+# It leaves the owner's own --collect-only probe alone, so the skip still credits the tests.
+_LATE_DESELECT = (
+    "import pytest\n"
+    "@pytest.hookimpl(wrapper=True, tryfirst=True)\n"
+    "def pytest_collection_modifyitems(config, items):\n"
+    "    yield\n"
+    "    if config.option.collectonly:\n"
+    "        return\n"
+    "    config.hook.pytest_deselected(items=list(items))\n"
+    "    items[:] = []\n"
+)
+
+
+@pytest.mark.parametrize("selection,status", [
+    ("-k missing", 5), ("-m local_only", 5), ("--deselect {b}::test_ci_passed", 5), ("-k ci_passed", 0),
+    ("--lf --lfnf=none", 5), ("--lf --lfnf=all", 0), ("late-conftest", 5),
+], ids=["keyword-empty", "marker-empty", "user-deselect-empty", "keyword-then-ci-skip",
+        "last-failed-none", "last-failed-all-then-ci-skip", "late-plugin-empty"])
+@pytest.mark.parametrize("credit", ["ci", "trusted-locked"])
+def test_ci_skip_counts_exit_5_as_passed_only_when_the_skip_emptied_the_run(
+        tmp_path, monkeypatch, selection, status, credit):
+    """An empty run caused by -k, -m, --lf, a late plugin or another deselection stays exit 5.
+
+    Orchestrator 2026-11-06: only the owner's own CI-passed skip may turn exit 5 into a pass,
+    for ordinary unit CI credit and for trusted locked credit alike.
+    """
+    from foragent import runner
+
+    case = _skip_verification_case(tmp_path, monkeypatch)
+    cache = "--lf" in selection
+    invocation = shlex.join([sys.executable, "-m", "pytest", "-q",
+                             *([] if cache else ["-p", "no:cacheprovider"]), "--rootdir=.", "-o", "addopts="])
+    if selection == "late-conftest":
+        (case.root / "conftest.py").write_text(_LATE_DESELECT)
+        selection = ""
+    if credit == "ci":
+        command = f"{invocation} {case.a} && {invocation} {case.b} {selection.format(b=case.b)}"
+    else:
+        # The chained segment under test is the trusted locked file alone.
+        selection = selection.replace("--deselect {b}::test_ci_passed", f"--deselect {case.a}::test_portable")
+        selection = selection.replace("-k ci_passed", "-k portable")
+        command = f"{invocation} {case.b} && {invocation} {case.a} {selection}"
+    with ci_local.skipping(1, case.ctx, command, case.skips, [case.a], root=case.root) as selected:
+        result = runner._check(selected, case.root, case.ctx.store.log_path(1), 30)
+    assert result.exit_code == status and not result.timed_out, result.output
+    assert not case.receipt.exists(), "Nothing CI passed may execute again"
+
+
 def test_ci_skip_uses_repo_ids_with_an_ancestor_pytest_root(tmp_path, monkeypatch):
     from foragent import runner
 
