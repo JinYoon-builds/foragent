@@ -70,9 +70,10 @@ def test_fifo_repeated_capture_and_restart_are_once(owner):
     assert case.git.head_sha() == head  # Owner writes never disturb the producer checkout.
 
 
-def test_open_batch_defers_and_current_main_is_preserved(owner, git_history):
+@pytest.mark.parametrize("name", ["src/setting.py", "docs/ideas.md", "docs/rules.md", "docs/decisions.md"])
+def test_open_batch_defers_and_current_main_is_preserved(owner, git_history, name):
     case = owner
-    capture(case, MEMORY, b"Lesson\n")
+    capture(case, name, b"VALUE = 1\n")
     base = git_command(case.origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(case.origin, "update-ref", train, base)
@@ -81,7 +82,7 @@ def test_open_batch_defers_and_current_main_is_preserved(owner, git_history):
     git_command(case.origin, "update-ref", "-d", train)
     assert drain(case)
     assert contents(case, "upstream.txt") == "Batch shipped"
-    assert contents(case, MEMORY) == "Lesson"
+    assert contents(case, name) == "VALUE = 1"
     assert git_command(case.origin, "rev-parse", "main^") == git_history.tip
 
 
@@ -135,16 +136,17 @@ def test_conflict_notification_recovers_after_interruption(owner, git_history, m
     assert len(orch_inbox.requests(owner.store)) == 1
 
 
-def test_memory_remains_d111_neutral(owner):
+@pytest.mark.parametrize("name, neutral", [(MEMORY, True), ("docs/decisions.md", False)])
+def test_only_memory_remains_d111_neutral(owner, name, neutral):
     from foragent.run_base_move import BaseMove, move_is_neutral
 
     before = owner.git.head_sha()
-    capture(owner, MEMORY, b"Learned\n")
+    capture(owner, name, b"Learned\n")
     drain(owner)
     owner.git.fetch("origin", "main")
     after = owner.git.ref_sha("origin/main")
     assert move_is_neutral(owner.git, BaseMove(before, after), ctx=owner.ctx, n=1,
-                           own_locked=(), strict=True)
+                           own_locked=(), strict=True) is neutral
 
 
 def test_queued_creation_then_deletion_is_retained(owner):
@@ -450,13 +452,13 @@ def test_reservation_at_any_push_destination_defers_the_request(owner, tmp_path,
         return original(args)
 
     monkeypatch.setattr(owner.git, "_call", transport)
-    capture(owner, MEMORY, b"Reserved lesson\n")
+    capture(owner, "src/setting.py", b"VALUE = 1\n")
     assert drain(owner) == []
     assert not pushes and writes.pending(owner.store)[0]["status"] == "pending"
     assert git_command(destination, "rev-parse", "main") == base
     git_command(destination, "update-ref", "-d", train)
     assert drain(owner) and not writes.pending(owner.store)
-    assert git_command(destination, "show", f"main:{MEMORY}") == "Reserved lesson"
+    assert git_command(destination, "show", "main:src/setting.py") == "VALUE = 1"
 
 
 def test_dream_wait_for_merge_turn_stays_retryable_and_unblocks_later_writes(owner, monkeypatch):

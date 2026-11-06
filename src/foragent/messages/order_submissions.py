@@ -2,6 +2,8 @@
 
 MESSAGES = {
     "en": {
+        "order_publication_queued": "Publication request {id} recorded; the merge owner will publish it between batches.",
+        "order_publication_pending": "Pending publication: {title} ({id}, {status})",
         "order_submission_waiting": "Order {id} waiting for {boundary}.",
         "order_submission_boundary": "Supply a nonempty publication boundary.",
         "order_submission_io": "Could not retain the order submission: {error}",
@@ -9,6 +11,8 @@ MESSAGES = {
         "order_submission_urgent_help": "Publish immediately after a person or agent judges this order urgent",
     },
     "ko": {
+        "order_publication_queued": "발행 요청 {id}를 기록했어요. merge owner가 batch 사이에 발행해요.",
+        "order_publication_pending": "발행 대기: {title} ({id}, {status})",
         "order_submission_waiting": "주문 {id}가 {boundary} 경계를 기다려요 (waiting).",
         "order_submission_boundary": "발행 경계를 빈칸 없이 적어 주세요.",
         "order_submission_io": "주문을 보관하지 못했어요: {error}",

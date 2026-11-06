@@ -290,10 +290,29 @@ def test_workflow_registration_is_rechecked_after_queue_wait(queued_publish):
     assert case.sleeps == [30]
 
 
-def test_requeuing_same_head_preserves_ci_wait_budget(queued_publish):
+@pytest.mark.parametrize("workflows", [False, True])
+def test_requeuing_same_head_preserves_ci_wait_budget(queued_publish, workflows):
     case = queued_publish
-    case.change = lambda: case.tracker.set_pr_checks(2, "pending")
+    started = case.now[0]
+    sleep = case.ctx.sleep
+
+    def change():
+        if workflows and case.acquisitions == 1:
+            workflow = case.store.worktree_path(1) / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True, exist_ok=True)
+            workflow.write_text("name: CI\n")
+        case.tracker.set_pr_checks(2, "pending")
+
+    def slow_poll(seconds):
+        sleep(seconds)
+        # Delayed polls reach the real deadline without hundreds of Git round trips.
+        case.now[0] += timedelta(seconds=15 * 60 - seconds)
+
+    case.change = change
+    case.ctx.sleep = slow_poll
     assert case.publish() == "timeout"
     assert case.tracker.merged_prs == []
-    assert len(case.sleeps) == 40
-    assert sum(case.sleeps) == 1200
+    allowance = 6 * 60 * 60 if workflows else case.ctx.config.max_runtime_minutes * 60
+    assert case.now[0] - started == timedelta(seconds=allowance)
+    assert case.sleeps == [30] * (allowance // (15 * 60))
+    assert case.store.get_run(1).waited_seconds == (allowance if workflows else 0)
