@@ -2127,7 +2127,16 @@ def test_evidence_does_not_hide_workflow_comment_errors(outbox_context, monkeypa
     ([{"state": "IN_PROGRESS", "startedAt": "invalid"}], None),
     ([{"state": "IN_PROGRESS", "startedAt": "2026-10-20T09:00:00"}], None),
     ([{"state": "QUEUED"}, {"state": "SUCCESS", "startedAt": NOW.isoformat()},
-      {"state": "IN_PROGRESS", "startedAt": (NOW + timedelta(minutes=1)).isoformat()}], NOW),
+      {"state": "IN_PROGRESS", "startedAt": (NOW + timedelta(minutes=1)).isoformat()}], None),
+    ([{"bucket": "skipping", "state": "SKIPPED", "startedAt": NOW.isoformat()}, {"state": "QUEUED"}], None),
+    ([{"bucket": "skipping", "state": "SKIPPED", "startedAt": NOW.isoformat()},
+      {"state": "IN_PROGRESS", "startedAt": (NOW + timedelta(minutes=15)).isoformat()}],
+     NOW + timedelta(minutes=15)),
+    ([{"state": "IN_PROGRESS", "startedAt": NOW.isoformat()},
+      {"bucket": "skipping", "state": "SKIPPED", "startedAt": (NOW + timedelta(minutes=5)).isoformat()}], NOW),
+    ([{"state": "SUCCESS", "startedAt": NOW.isoformat()},
+      {"state": "IN_PROGRESS", "startedAt": (NOW + timedelta(minutes=15)).isoformat()}],
+     NOW + timedelta(minutes=15)),
 ])
 def test_gh_checks_start_comes_from_the_same_listing(exit_code, rows, expected):
     output = json.dumps([{"bucket": "pending", **row} for row in rows])

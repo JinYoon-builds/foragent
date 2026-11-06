@@ -1517,7 +1517,7 @@ class GhTracker:
         return next((item["number"] for item in data), None)
 
     def pr_checks_started(self, pr: int) -> datetime | None:
-        """Earliest actual start in the last checks listing; never makes a GitHub call."""
+        """When the last check left the queue in the last checks listing; never makes a GitHub call."""
         return self._checks_started.get(pr)
 
     def pr_checks(self, pr: int) -> CheckStatus:
@@ -1539,11 +1539,16 @@ class GhTracker:
         else:
             items = _items(output)
             buckets = {item["bucket"] for item in items}
-        starts = [when for item in items
+        # A skipped check never runs: GitHub stamps it at creation, so it starts no wait.
+        ran = [item for item in items
+               if item.get("bucket") != "skipping" and item.get("state") != "SKIPPED"]
+        starts = [when for item in ran
                   if item.get("state") != "QUEUED"
                   and (when := _parse_time(item.get("startedAt"))) is not None
                   and when.year > 1]
-        self._checks_started[pr] = min(starts, default=None)
+        # CI is running only once the last check has left the queue.
+        queued = any(item.get("state") == "QUEUED" for item in ran)
+        self._checks_started[pr] = None if queued else max(starts, default=None)
         if not buckets:
             return "none"
         if buckets & {"fail", "cancel"}:
