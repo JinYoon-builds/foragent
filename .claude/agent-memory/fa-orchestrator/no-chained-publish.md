@@ -19,3 +19,5 @@ Run `fa order publish --approve` alone, confirm the `approved` label, then run `
 **11-06:** two publish-queue scripts running at once raced on `git pull --rebase` ("Cannot rebase onto multiple branches") and on push ("[rejected] main -> main (fetch first)"), leaving local main ahead with unpushed order and memory commits and both publishes failed. Run exactly one queue script at a time (one script lists every plan), and start it by pushing any local commits first.
 
 **Update 2026-11-06:** a preread is clean when every issue's `unknowns` list is empty. Do not grep the output for "QUESTION": the lane's plan text can contain the word (#1488 "On QUESTION, ..."), and the queue stopped on a clean preread. Use drafts/bin/preread-clean.sh. A pull can also fail on an untracked file that upstream now tracks; if it is byte-identical, move it aside.
+
+**11-06 #1488:** before acting on a spec-question, read the issue's latest comments for a `foragent:decision` from the PM. I chose option 2 and retried one minute after the PM recorded option 1; I had to send a correcting retry. A queued script that publishes later must re-check for a newer decision first.
