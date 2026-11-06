@@ -166,6 +166,8 @@ def test_external_retirement_does_not_spend_member_generations(batched, monkeypa
     if reason == "moved":
         case.history.update({"src/neighbor.py": "VALUE = 37\n"})
     elif reason == "deadline":
+        # No completed CI evidence may renew the silence window in this case.
+        case.tracker.set_pr_checks(tip.number, "pending")
         case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     elif reason == "missing-pr":
         case.tracker.close_pr(support.pr_for(case, 5).number, delete_branch=False)
@@ -242,6 +244,7 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
     queue_workers(case, [5, 1])
     published_train(case, monkeypatch)
     if failure == "deadline":
+        case.tracker.set_pr_checks(groups(case)[-1].number, "pending")
         case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     else:
         reports = case.tracker.pr_acceptance_reports
@@ -399,7 +402,7 @@ def test_workflow_exclusion_does_not_send_a_main_conflict_to_lane(batched, monke
     report = TickReport()
     proof = batch.prepare(case.ctx, report, batch_candidates(case))
     assert proof and [n for n, *_ in proof.chain] == [5, 4], report.actions
-    assert any("#1 merge batch excluded: acceptance workflow differs from target" == action
+    assert any("#1 merge train excluded: acceptance workflow differs from target" == action
                for action in report.actions)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1, 4}
     assert case.tracker.get_pr(support.pr_for(case, 1).number).state == "open"

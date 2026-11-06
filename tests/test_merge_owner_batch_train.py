@@ -5,7 +5,7 @@ The offline transport uses fetch/update-ref, never forbidden Git commands.
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 
 import pytest
@@ -14,13 +14,14 @@ from conftest import git_command
 from helpers.merge_world import world  # noqa: F401
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
-from foragent import merge_owner, merge_owner_batch as batch, orch_queue
+from foragent import merge_owner, merge_owner_batch as batch, orch_queue, runner
 from foragent.git import GitError
-from foragent.issue import body_hash
+from foragent.issue import body_hash, parse_body
+from foragent.scheduler import TickReport
 from foragent.state import StateStore
 from foragent.tracker import GhTracker, TrackerError
 from helpers.merge_batch import (  # noqa: F401
-    batched, composed_numbers, events, green, groups, published_train, queue_workers, refs, update_base,
+    batch_candidates, batched, composed_numbers, events, green, groups, published_train, queue_workers, refs, update_base,
 )
 
 
@@ -70,6 +71,7 @@ def test_retirement_cancels_owned_prefix_ci_before_deleting_refs_and_retries(bat
         return transport(argv)
 
     monkeypatch.setattr(case.git, "_run", delete_after_cancel)
+    case.tracker.set_pr_checks(groups(case)[-1].number, "pending")
     case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.gate(case)
     assert failed and refs(case) and cancelled == owned[:1]
@@ -528,6 +530,132 @@ def test_pending_prefix_reserves_green_members_until_ci_or_deadline(batched, out
     assert len(case.target_pushes) == (outcome == "pass")
     assert len(case.store.owner_merge_facts()) == (2 if outcome == "pass" else 0)
     assert events(case)[-1]["result"] == ("used" if outcome == "pass" else "unused")
+
+
+def test_running_tip_at_61_minutes_keeps_reservation_and_then_lands(batched):
+    case = batched
+    case.pending_batch = True
+    support.queue_workers(case, [5, 1])
+    support.gate(case)
+    born = case.clock[0]
+    tip = case.tracker.pr_head_sha(groups(case)[0].number)
+    case.clock[0] += timedelta(minutes=45)
+    green(case)
+    proof = batch.prepare(case.ctx, TickReport(), batch_candidates(case))
+    assert isinstance(proof, batch.Evidence)  # Finished CI is observed without starting member checks.
+    case.tracker.set_pr_checks(groups(case)[0].number, "pending")
+    case.clock[0] = born + timedelta(minutes=61)
+    support.gate(case)
+    assert refs(case) and not events(case) and not batch.retirements(case.ctx)
+    assert len(case.batch_pushes) == 1 and not case.target_pushes
+    green(case)
+    support.gate(case)
+    assert case.history.tip == tip and len(case.target_pushes) == 1
+    assert not refs(case) and events(case)[-1]["reason"] == "train merged"
+
+
+@pytest.mark.parametrize("status", ["pending", "none", "pass"], ids=["queued", "registering", "artifacts"])
+def test_no_progress_for_60_minutes_retires_with_silence_reason(batched, status):
+    case = batched
+    case.pending_batch = True
+    support.queue_workers(case, [5, 1])
+    support.gate(case)
+    tip_pr = groups(case)[0]
+    progress_path = case.store.root / "merge-batch" / f"{case.tracker.pr_head_sha(tip_pr.number)}.json"
+    progressed_at = datetime.fromtimestamp(json.loads(progress_path.read_text())["last_progress"],
+                                          tz=case.clock[0].tzinfo)
+    case.tracker.set_pr_checks(tip_pr.number, status)
+    support.gate(case)
+    # gate advances one second; check immediately before and at the boundary.
+    case.clock[0] = progressed_at + timedelta(seconds=batch.SILENCE_SECONDS - 2)
+    support.gate(case)
+    assert refs(case) and not events(case)
+    support.gate(case)
+    retirement, = batch.retirements(case.ctx)
+    assert "silence" in retirement["reason"] and "60 minutes" in retirement["reason"]
+    assert not retirement["spent"] and not refs(case) and not case.target_pushes
+
+
+def test_repeated_green_ci_without_reports_does_not_renew_silence(batched):
+    case = batched
+    case.pending_batch = True
+    support.queue_workers(case, [5, 1])
+    support.gate(case)
+    case.tracker.set_pr_checks(groups(case)[0].number, "pass")
+    support.gate(case)
+    for _ in range(3):
+        case.clock[0] += timedelta(minutes=15)
+        support.gate(case)
+        assert refs(case) and not events(case)
+    case.clock[0] += timedelta(minutes=15)
+    support.gate(case)
+    assert not refs(case) and "silence" in events(case)[-1]["reason"]
+
+
+def test_completed_member_checks_keep_green_batch_alive_past_birth_silence_window(batched, monkeypatch):
+    case = batched
+    case.pending_batch = True
+    support.queue_workers(case, [5, 1])
+    support.gate(case)
+    born = case.clock[0]
+    tip = case.tracker.pr_head_sha(groups(case)[0].number)
+    case.clock[0] += timedelta(minutes=45)
+    green(case)
+    commands = {command: n for n in (5, 1) for command in
+                parse_body(case.store.load_approval(n).body).done_when_commands}
+    run, completed = runner.run_logged, []
+
+    def measured(argv, **kwargs):
+        result = run(argv, **kwargs)
+        if len(argv) == 3 and argv[:2] == ["/bin/sh", "-c"] and result[:2] == (0, False):
+            for command, n in commands.items():
+                if command in argv[2]:
+                    case.clock[0] += timedelta(minutes=14)
+                    completed.append((n, case.clock[0]))
+        return result
+
+    monkeypatch.setattr(runner, "run_logged", measured)
+    support.gate(case)
+    assert [n for n, _ in completed] == [5, 1]
+    instants = [born, *(at for _, at in completed)]
+    assert all(after - before < timedelta(seconds=batch.SILENCE_SECONDS)
+               for before, after in zip(instants, instants[1:]))
+    assert case.clock[0] - born > timedelta(seconds=batch.SILENCE_SECONDS)
+    assert case.history.tip == tip and len(case.target_pushes) == 1
+    assert not refs(case) and events(case)[-1]["reason"] == "train merged"
+
+
+@pytest.mark.parametrize("change", ["target", "member-head", "tip-ci"])
+def test_invalidation_after_member_check_stops_remaining_owner_checks(batched, monkeypatch, change):
+    case = batched
+    case.pending_batch = True
+    support.queue_workers(case, [5, 1])
+    support.gate(case)
+    green(case)
+    verify, checked = merge_owner._verify_review_head, []
+
+    def invalidate(n, *args, **kwargs):
+        result = verify(n, *args, **kwargs)
+        checked.append(n)
+        assert result is None
+        if change == "target":
+            case.history.update({"src/neighbor.py": "VALUE = 'changed during owner checks'\n"})
+        elif change == "member-head":
+            support.update_pr_branch(case, 1)
+        else:
+            case.tracker.set_pr_checks(groups(case)[0].number, "fail")
+        return result
+
+    monkeypatch.setattr(merge_owner, "_verify_review_head", invalidate)
+    support.gate(case)
+    assert checked == [5]
+    assert not refs(case) and not case.target_pushes and not case.merges
+    retirement, = batch.retirements(case.ctx)
+    assert retirement["reason"]
+    if change == "member-head":
+        assert "member #1" in retirement["reason"]
+    elif change == "tip-ci":
+        assert retirement["reason"] == "tip CI red"
 
 
 def test_new_run_after_landed_train_does_not_erase_the_old_generations_merge_fact(batched):

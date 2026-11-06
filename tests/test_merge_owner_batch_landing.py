@@ -93,7 +93,7 @@ def test_member_already_in_prefix_retires_batch_without_excluding_its_checks(bat
     assert not case.target_attempts and not case.target_pushes and not case.merges, report.actions
     assert case.history.tip == case.base and not case.store.owner_merge_facts()
     assert not case.batch_pushes and not groups(case) and not refs(case)
-    assert not any("#1 merge batch excluded" in action for action in report.actions)
+    assert not any("#1 merge train excluded" in action for action in report.actions)
     retired, = batch.retirements(case.ctx)
     assert retired["reason"] == "member already reachable" and retired["spent"] == []
     assert events(case)[-1]["reason"] == "member already reachable"

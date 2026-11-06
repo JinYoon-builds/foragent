@@ -86,7 +86,7 @@ def test_timed_out_retry_releases_unrelated_batch_on_next_tick(batched):
     assert composed_numbers(case) == [5]
     case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.gate(case)
-    assert not refs(case) and events(case)[-1]["reason"] == "three CI rounds elapsed"
+    assert not refs(case) and "silence" in events(case)[-1]["reason"]
 
     queue_workers(case, [4, 2])
     support.gate(case)
