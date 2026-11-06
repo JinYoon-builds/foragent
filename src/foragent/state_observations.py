@@ -293,9 +293,9 @@ class IssueObservationsMixin:
                 return "stale"  # Already known missing since then: this absence changes nothing.
             return "dropped" if dropped else "applied"
         snapshot.setdefault("absent", {}).pop(key, None)
-        if key not in snapshot["issues"] and key in snapshot.get("unlisted_merges", {}):
-            snapshot["issues"][key] = {**self._new_row(number), "merges": snapshot["unlisted_merges"].pop(key)}
-        row = snapshot["issues"].setdefault(key, self._new_row(number))
+        from foragent.state_refresh import issue_row
+
+        row = issue_row(snapshot, number)  # A new row adopts the merges that waited for it.
         if observed_facts(row) != facts:
             _state._forget_reads(row)
         lane = issue_lane(facts["labels"], lanes) if lanes is not None else row.get("lane", "main")
@@ -350,8 +350,9 @@ class IssueObservationsMixin:
             return  # Observational: the write is already saved and its result must stand.
 
     def _new_row(self, number: int) -> dict[str, Any]:
-        return {"number": number, "title": "", "body": "", "labels": [], "lane": "main",
-                "state": "open", "pr_number": None, "merged": False, "comments": []}
+        from foragent.state_refresh import new_row
+
+        return new_row(number)
 
     def ingest(self, issues: list, started_at: datetime, lanes: dict, *, complete: bool = False) -> list[int]:
         """Ingest what one read that started at ``started_at`` showed.

@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from foragent.state_records import Run
 
 
+
+# Merge facts older run records copied from GitHub; the issue cache now owns them.
+LEGACY_MERGE_COPIES = frozenset({"merged_at", "owner_merge", "owner_merge_started_at"})
+
 class StateBase:
     def __init__(self, root: Path, now: Callable[[], datetime] | None = None):
         self.root = _state.Path(root)
@@ -68,15 +72,20 @@ class StateBase:
 
     def _write_run(self, run: "Run", value: dict[str, Any] | None = None,
                    *, snapshot: bool = True) -> dict[str, Any]:
-        """History commits completion; runs/ keeps a compatibility snapshot, never the authority."""
+        """History commits completion; runs/ keeps a compatibility snapshot, never the authority.
+
+        GitHub merge facts live in the issue cache: a legacy copy in the record is never written again."""
         value = self._run_value(run) if value is None else value
+        value = {key: item for key, item in value.items() if key not in LEGACY_MERGE_COPIES}
         if run.kind == "issue" and run.status == "finished":
             if snapshot and not value.get("run_generation"):
                 saved = _state.json.loads(self._run_path(run).read_text(encoding="utf-8"))
                 generation = saved.get("run_generation") or uuid4().hex
                 if not saved.get("run_generation"):
                     # Adopt the old snapshot before committing any changed completion fields.
-                    self._write_json(self._run_path(run), {**saved, "run_generation": generation})
+                    self._write_json(self._run_path(run), {
+                        **{key: item for key, item in saved.items() if key not in LEGACY_MERGE_COPIES},
+                        "run_generation": generation})
                 value = {**value, "run_generation": generation}
             path = self.root / "runs.jsonl"
             history = path.read_text(encoding="utf-8") if path.exists() else ""

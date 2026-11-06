@@ -8,6 +8,7 @@ from uuid import uuid4
 from foragent import size_signal
 from foragent.state_issues import _copy
 from foragent.state_phases import close_phase, work_event  # noqa: F401
+from foragent.state_base import LEGACY_MERGE_COPIES
 from foragent.state_records import Run, carried_contract
 
 
@@ -215,7 +216,7 @@ class RunRecordsMixin:
             passed = value.get("last_review_pass_at")
             seconds = ((_state.datetime.fromisoformat(fact["merged_at"])
                         - _state.datetime.fromisoformat(passed)).total_seconds() if passed else None)
-            legacy = [key for key in ("owner_merge", "owner_merge_started_at", "merged_at") if key in value]
+            legacy = [key for key in LEGACY_MERGE_COPIES if key in value]
             # A legacy snapshot alone does not prove that the measurement reached history.
             if (value.get("review_pass_to_merge_seconds") == seconds and not legacy
                     and (not current or value.get("run_generation"))):

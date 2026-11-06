@@ -1033,3 +1033,130 @@ def test_phase_changes_and_finish_journal_each_segment(tmp_path, monkeypatch):
         ("phase", "checking -> merged", "checking", 12, None),
     ]
     assert events[-1]["at"] == clock[0].isoformat()
+
+
+def test_refresh_keeps_a_merge_listed_while_its_issue_is_absent(store, tmp_path):
+    from foragent.tracker import Issue, PullRequest
+
+    run = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "w7")
+    merged_at = (NOW + timedelta(minutes=1)).isoformat()
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged_at, "u")
+    # The listing shows the merged PR but not its issue; the merged-PR cursor then moves past it.
+    store.refresh_local_issues([], [pr], {}, NOW + timedelta(minutes=2))
+    assert store.merge_times() == {(7, run.started_at): merged_at}
+    assert [record["number"] for record in store.cached_merged_prs()] == [70]
+    # The issue returns in a later listing whose incremental PR read no longer includes the merge.
+    store.refresh_local_issues([Issue(7, "t", "b", frozenset(), "closed")], [], {}, NOW + timedelta(minutes=3))
+    row, = [row for row in store.local_issues() if row["number"] == 7]
+    assert list(row["merges"]) == ["70"] and store.merge_times() == {(7, run.started_at): merged_at}
+
+
+def test_owner_merge_corrects_a_listing_that_credited_a_later_run(store, tmp_path):
+    from foragent.tracker import Issue, PullRequest
+
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    store.update_local_issue(7, title="t", labels=[], state="open", body="")
+    old = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "old")
+    clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "merge-queued")
+    clock[0] += timedelta(minutes=1)
+    new = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "new")
+    merged_at = (clock[0] + timedelta(minutes=1)).isoformat()
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged_at, "u")
+    # The listing sees the owner's merge first and can only guess the latest run before it.
+    store.refresh_local_issues([Issue(7, "t", "b", frozenset(), "closed")], [pr], {}, clock[0] + timedelta(minutes=2))
+    assert store.run_merged(new) and not store.run_merged(old)
+    store.record_owner_merge(7, old.started_at, {"pr": 70, "target": "main", "head": "h", "merged_at": merged_at})
+    assert store.merge_times() == {(7, old.started_at): merged_at}, "The owner's admitted run is the evidence"
+    assert not store.run_merged(new)
+
+
+def test_a_new_execution_over_a_legacy_record_writes_no_merge_copy(store, tmp_path):
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    old = store.start_run(1, branch="b", worktree=tmp_path / "w")
+    store.finish_run(1, "merged")
+    legacy = {"merged_at": NOW.isoformat(), "owner_merge_started_at": old.started_at,
+              "owner_merge": {"pr": 9, "target": "main", "head": "h", "merged_at": NOW.isoformat()}}
+    snapshot = store.root / "runs/1.json"
+    snapshot.write_text(json.dumps({**json.loads(snapshot.read_text()), **legacy}))
+    history = store.root / "runs.jsonl"
+    history.write_text("".join(json.dumps({**json.loads(line), **legacy}) + "\n"
+                               for line in history.read_text().splitlines() if line.strip()))
+    clock[0] += timedelta(minutes=5)
+    store.start_run(1, branch="b", worktree=tmp_path / "w")
+    assert not legacy.keys() & json.loads((store.root / "runs/1.json").read_text()).keys()
+    clock[0] += timedelta(minutes=5)
+    store.finish_run(1, "error")
+    rows = [json.loads(line) for line in (store.root / "runs.jsonl").read_text().splitlines()]
+    assert not legacy.keys() & rows[-1].keys(), "The new execution's history row copies no merge fact"
+    assert not legacy.keys() & json.loads((store.root / "runs/1.json").read_text()).keys()
+
+
+def test_a_merge_waiting_for_its_issue_row_is_credited_to_one_execution(store, tmp_path):
+    from foragent.tracker import Issue, PullRequest
+
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    old = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "old")
+    clock[0] += timedelta(minutes=1)
+    store.finish_run(7, "merge-queued")
+    clock[0] += timedelta(minutes=1)
+    new = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "new")
+    merged_at = (clock[0] + timedelta(minutes=1)).isoformat()
+    # The owner merges the old run's PR while the cache has no row for #7: the merge waits.
+    store.record_owner_merge(7, old.started_at, {"pr": 70, "target": "main", "head": "h", "merged_at": merged_at})
+    # Another writer creates the row (as RecordingTracker.list_prs records a PR), then a listing shows both.
+    store.update_local_issue(7, pr_number=70, pr_head="foragent/issue-7", merged=True)
+    cache = json.loads((store.root / "issues.json").read_text())
+    assert "unlisted_merges" not in cache and cache["issues"]["7"]["merges"]["70"]["started_at"] == old.started_at
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged_at, "u")
+    store.refresh_local_issues([Issue(7, "t", "b", frozenset(), "closed")], [pr], {}, clock[0] + timedelta(minutes=2))
+    assert store.merge_times() == {(7, old.started_at): merged_at}, "One PR is one merge, of the owner's run"
+    assert store.run_merged(store.read_history()[0]) and not store.run_merged(new)
+    row, = [row for row in store.local_issues() if row["number"] == 7]
+    assert list(row["merges"]) == ["70"]
+
+
+def test_replaying_a_merge_while_its_issue_is_absent_leaves_closed_undecided(store, tmp_path):
+    from foragent.tracker import Issue, PullRequest
+    from foragent.watch_sections import progress
+
+    labels = frozenset({"approved", "size:s"})
+    start = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "w")
+    before, merged_at = NOW + timedelta(minutes=1), (NOW + timedelta(minutes=2)).isoformat()
+    pr = PullRequest(70, "foragent/issue-7", "main", "", "", merged_at, "u")
+    # Listed open (updated before the merge): whether the merge closed it is still unknown.
+    store.refresh_local_issues([Issue(7, "t", "b", labels, "open", updated_at=before.isoformat())], [pr], {},
+                               NOW + timedelta(minutes=3))
+    assert store.local_issues()[0]["merges"]["70"]["closed"] is None
+    # The issue is absent from the next listing, which replays the cached merge.
+    store.refresh_local_issues([], [pr], {}, NOW + timedelta(minutes=4))
+    assert store.cached_merged_prs() and store.local_issues() == []
+    # It returns closed, updated after the merge: now the listing can tell.
+    after = (NOW + timedelta(minutes=5)).isoformat()
+    store.refresh_local_issues([Issue(7, "t", "b", labels, "closed", updated_at=after)], [pr], {},
+                               NOW + timedelta(minutes=6))
+    assert store.local_issues()[0]["merges"]["70"]["closed"] is True
+    assert [(number, size) for number, size, *_ in progress.merged_work(store)] == [(7, "s")]
+    assert start.started_at == store.local_issues()[0]["merges"]["70"]["started_at"]
+
+
+def test_a_guessed_and_a_recorded_copy_of_one_merge_count_once(store, tmp_path):
+    clock = [NOW]
+    store._now = lambda: clock[0]
+    old = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "old")
+    store.finish_run(7, "merge-queued")
+    clock[0] += timedelta(minutes=1)
+    new = store.start_run(7, branch="foragent/issue-7", worktree=tmp_path / "new")
+    merged_at = (clock[0] + timedelta(minutes=1)).isoformat()
+    store.update_local_issue(7, title="t", labels=[], state="closed", body="")
+    # A state an older writer could leave: the row holds a listing's guess, a waiting copy the owner's record.
+    cache = json.loads((store.root / "issues.json").read_text())
+    cache["issues"]["7"]["merges"] = {"70": {"merged_at": merged_at, "started_at": new.started_at, "closed": True}}
+    cache["unlisted_merges"] = {"7": {"70": {"merged_at": merged_at, "started_at": old.started_at,
+                                             "closed": None, "by_run": True}}}
+    (store.root / "issues.json").write_text(json.dumps(cache))
+    assert store.merge_times() == {(7, old.started_at): merged_at}
+    assert [record["number"] for record in store.cached_merged_prs()] == [70]

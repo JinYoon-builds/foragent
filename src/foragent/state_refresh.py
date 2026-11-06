@@ -116,14 +116,21 @@ class IssueRefreshMixin:
                 starts.setdefault(run.number, set()).add(run.started_at)
             pr_facts: dict[str, dict[str, Any]] = {}
             for pr in prs:
-                key = str(pr_issue_number(pr.head))
+                number = pr_issue_number(pr.head)
+                if number is None:
+                    continue
+                key = str(number)
                 if key in fresh and key not in local:
                     row = rows[key]
                     row.update(pr_number=pr.number, pr_head=pr.head, pr_base=pr.base,
                                merged=pr.merged_at is not None)
-                    if pr.merged_at is not None:
-                        _record_merge(row, pr, starts.get(row["number"], set()), facts[key].get("updated_at"))
                     pr_facts[key] = {"pr_number": pr.number, "pr_head": pr.head, "merged": pr.merged_at is not None}
+                if pr.merged_at is not None:
+                    # A merge stays a fact whatever this listing showed of its issue: absent, stale or
+                    # written meanwhile. The cursor moves past it, so no later listing repeats it.
+                    _attach_merge(snapshot, number, pr, starts.get(number, set()),
+                                  updated_at=facts[key].get("updated_at") if key in fresh else None,
+                                  observed=key in fresh)
             owner_facts = self.owner_merge_facts()
             for run in history:
                 if self.run_merged(run, owner_facts=owner_facts) and str(run.number) in fresh:
@@ -187,30 +194,24 @@ class IssueRefreshMixin:
 
         with self._state_lock():
             snapshot = self._issue_snapshot()
-            key = str(number)
-            row = snapshot["issues"].get(key)
+            row = snapshot["issues"].get(str(number))
             if pr is None and row is not None and type(row.get("pr_number")) is int:
                 pr = row["pr_number"]  # The PR the cache already knows for this issue.
             name = str(pr) if pr is not None else f"{RUN_MERGE}{started_at}"
-            holder = row if row is not None else {
-                "number": number, "labels": [], "merges": dict(snapshot.get("unlisted_merges", {}).get(key) or {})}
-            known = holder.get("merges") or {}
-            if name in known or pr is None and any(
-                    key.isdigit() and entry.get("started_at") == started_at for key, entry in known.items()):
-                return  # Already cached, by this key or by the execution's PR.
+            known = (row if row is not None else {}).get("merges") or (
+                snapshot.get("unlisted_merges", {}).get(str(number)) or {})
+            if pr is None and any(key.isdigit() and entry.get("started_at") == started_at
+                                  for key, entry in known.items()):
+                return  # The execution's merge is already cached under its PR.
             observed = SimpleNamespace(number=name, head=head, base=base, merged_at=merged_at, url=url)
-            # The execution is ``started_at`` only if it began by the merge (_record_merge's rule).
-            _record_merge(holder, observed, {started_at}, None)
-            holder["merges"][name]["closed"] = None
-            if row is None:
-                snapshot.setdefault("unlisted_merges", {})[key] = holder["merges"]
-            self._write_json(self.root / "issues.json", snapshot)
+            if _attach_merge(snapshot, number, observed, {started_at}, execution=started_at):
+                self._write_json(self.root / "issues.json", snapshot)
 
     def cached_merged_prs(self) -> list[dict[str, Any]]:
         """Merged PRs the issue cache already saw, as incremental-listing records."""
         records = []
-        for row in self._issue_snapshot()["issues"].values():
-            for number, entry in (row.get("merges") or {}).items():
+        for row, merges in _issue_merges(self._issue_snapshot()):
+            for number, entry in merges.items():
                 if not number.isdigit():
                     continue  # An execution's merge whose PR no listing has shown yet.
                 same = row.get("pr_number") == int(number)
@@ -299,20 +300,13 @@ def _size_of(labels: Any) -> str:
 
 
 RUN_MERGE = "run:"  # Key prefix of an execution's merge whose PR the cache has not seen.
+EVIDENCE = "by_run"  # The entry's execution is Foragent's own record of the merge, not a listing's guess.
 
 
 def merge_facts_of(snapshot: Any) -> dict[tuple[int, str], dict]:
     """Each cached merge with a known execution: {"pr", "merged_at"} by (number, started_at)."""
     facts: dict[tuple[int, str], dict] = {}
-    rows = snapshot.get("issues") if isinstance(snapshot, dict) else None
-    gone = snapshot.get("unlisted_merges") if isinstance(snapshot, dict) else None
-    rows = [*(rows.values() if isinstance(rows, dict) else []),
-            *({"number": int(key), "merges": merges} for key, merges in
-              (gone.items() if isinstance(gone, dict) else []) if key.isdigit())]
-    for row in rows:
-        merges = row.get("merges") if isinstance(row, dict) else None
-        if type(row.get("number") if isinstance(row, dict) else None) is not int or not isinstance(merges, dict):
-            continue
+    for row, merges in _issue_merges(snapshot):
         for pr, entry in merges.items():
             if not (isinstance(entry, dict) and isinstance(started := entry.get("started_at"), str)
                     and isinstance(at := entry.get("merged_at"), str)):
@@ -324,7 +318,91 @@ def merge_facts_of(snapshot: Any) -> dict[tuple[int, str], dict]:
     return facts
 
 
-def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None) -> None:
+def _issue_merges(snapshot: Any):
+    """(row, merges) once per issue: its row's merges joined with any still waiting for the row.
+
+    One PR is one entry (``_merged_entries``), so a merge is never counted for two executions."""
+    if not isinstance(snapshot, dict):
+        return
+    rows = snapshot.get("issues") if isinstance(snapshot.get("issues"), dict) else {}
+    waiting = snapshot.get("unlisted_merges") if isinstance(snapshot.get("unlisted_merges"), dict) else {}
+    for key in sorted({*rows, *waiting}, key=lambda key: (not key.isdigit(), key)):
+        if not key.isdigit():
+            continue
+        row = rows.get(key) if isinstance(rows.get(key), dict) else {"number": int(key)}
+        merges = _merged_entries(row.get("merges") if isinstance(row.get("merges"), dict) else {},
+                                 waiting.get(key) if isinstance(waiting.get(key), dict) else {})
+        yield {**row, "number": int(key)}, merges
+
+
+def new_row(number: int) -> dict[str, Any]:
+    return {"number": number, "title": "", "body": "", "labels": [], "lane": "main",
+            "state": "open", "pr_number": None, "merged": False, "comments": []}
+
+
+def issue_row(snapshot: dict[str, Any], number: int) -> dict[str, Any]:
+    """The issue's cache row, created if missing; the one place a row is born.
+
+    A merge cached while the issue had no row (``unlisted_merges``) moves into the row, so one
+    merge never lives in two places: a later listing then extends that entry instead of guessing
+    a second one."""
+    key = str(number)
+    row = snapshot["issues"].setdefault(key, new_row(number))
+    waiting = (snapshot.get("unlisted_merges") or {}).pop(key, None)
+    if waiting:
+        row["merges"] = _merged_entries(row.get("merges"), waiting)
+    if "unlisted_merges" in snapshot and not snapshot["unlisted_merges"]:
+        snapshot.pop("unlisted_merges")
+    return row
+
+
+def _merged_entries(*sources: Any) -> dict[str, Any]:
+    """Merge entries by key; for one PR, Foragent's execution evidence wins over a listing's guess."""
+    merged: dict[str, Any] = {}
+    for source in sources:
+        for key, entry in (source or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            if key not in merged or entry.get(EVIDENCE) and not merged[key].get(EVIDENCE):
+                merged[key] = entry
+    return merged
+
+
+def _attach_merge(snapshot: dict[str, Any], number: int, pr: Any, starts: set[str],
+                  *, updated_at: str | None = None, observed: bool = False,
+                  execution: str | None = None) -> bool:
+    """Keep one merged PR in the issue's row, or beside the rows (``unlisted_merges``) without one.
+
+    ``observed``: this listing showed the issue itself (updated at ``updated_at``), so it may decide
+    whether the merge closed it; nothing else may. ``execution`` is Foragent's own evidence of the
+    run that merged (the gate's or the merge owner's record): it corrects a listing's guess, which
+    only knows the latest run that started before the merge, and no later guess replaces it. A merge
+    before that run's start is not its own. Returns whether anything changed."""
+    key = str(number)
+    unlisted = snapshot.get("unlisted_merges") or {}
+    if key in snapshot["issues"]:
+        holder = issue_row(snapshot, number)  # Also adopts merges an older writer left waiting.
+    else:
+        holder = {"number": number, "labels": [], "merges": dict(unlisted.get(key) or {})}
+    before = _copy_merges(holder.get("merges"))
+    _record_merge(holder, pr, starts, updated_at, observed=observed)
+    entry = holder["merges"][str(pr.number)]
+    at, start = _merge_time(entry.get("merged_at")), _merge_time(execution)
+    if execution is not None and at is not None and start is not None and start <= at:
+        entry.update(started_at=execution, **{EVIDENCE: True})
+        if str(pr.number).isdigit():
+            holder["merges"].pop(f"{RUN_MERGE}{execution}", None)  # Its PR is known now.
+    if key not in snapshot["issues"]:
+        snapshot.setdefault("unlisted_merges", {})[key] = holder["merges"]
+    return holder["merges"] != before
+
+
+def _copy_merges(merges: Any) -> dict[str, Any]:
+    return {key: dict(entry) for key, entry in (merges or {}).items()}
+
+
+def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: str | None,
+                  *, observed: bool = True) -> None:
     """Keep every merged PR of the issue, in any listing order and across reopening.
 
     merged_at is the newest merge. Each merge is recorded once and never changed
@@ -333,7 +411,8 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
     Whether that merge closed the issue is taken from the first listing of the issue
     updated at or after the merge (closing advances updated_at): an issue listed
     before the PR merged stays undecided (None) instead of recording a stale "open".
-    A later reopening, re-approval, relabelling or re-closing changes none of it."""
+    A later reopening, re-approval, relabelling or re-closing changes none of it.
+    Without ``observed`` (no listing of the issue itself) "closed" stays as it is."""
     at = _merge_time(pr.merged_at)
     latest = _merge_time(row.get("merged_at"))
     if at is not None and (latest is None or at > latest):
@@ -353,7 +432,7 @@ def _record_merge(row: dict[str, Any], pr: Any, starts: set[str], updated_at: st
         }
     # Enough of the PR for a later incremental listing to list it again from this cache.
     entry = {**{"head": pr.head, "base": pr.base, "url": pr.url}, **entry}
-    if entry.get("closed") is None:
+    if observed and entry.get("closed") is None:
         seen = _merge_time(updated_at)
         # Without an update time the listing cannot be placed before the merge.
         if seen is None or at is None or seen >= at:

@@ -86,10 +86,9 @@ class IssueSnapshotMixin:
         self.ingest_absence(number, self._now())
 
     def _local_issue(self, snapshot: dict[str, Any], number: int) -> dict[str, Any]:
-        return snapshot["issues"].setdefault(str(number), {
-            "number": number, "title": "", "body": "", "labels": [], "lane": "main",
-            "state": "open", "pr_number": None, "merged": False, "comments": [],
-        })
+        from foragent.state_refresh import issue_row
+
+        return issue_row(snapshot, number)
 
     def _apply_github_write(self, row: dict[str, Any], entry: dict[str, Any], lanes: dict) -> None:
         """Apply an observed-field intent to the derived view; comments never enter it."""
