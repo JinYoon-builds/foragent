@@ -170,6 +170,36 @@ def set_lane_skills(root: Path, name: str, skills: list[str], *,
 _LESSON_ID = re.compile(r"[^\]\s]+")
 
 
+def _lesson_lock(root: Path, folder: Path) -> Path:
+    """The lock file for one lane notebook, under the checkout's self-ignoring ``.foragent/`` folder.
+
+    It stays out of the memory folder, which the dream reads in full, and out of ``git status``.
+    """
+    from foragent import order_references
+
+    def real(relative: str) -> Path:
+        try:
+            try:
+                return order_references.real_directory(root, relative)
+            except FileExistsError:  # A concurrent send created it first; check it again.
+                return order_references.real_directory(root, relative)
+        except ValueError as exc:
+            raise LaneError(str(exc)) from exc
+
+    state = real(".foragent")
+    locks = real(".foragent/locks")
+    ignore = state / ".gitignore"
+    if ignore.is_symlink():
+        raise LaneError(f"{ignore} must be a real file, not a symlink")
+    if not ignore.exists():
+        try:
+            with ignore.open("x", encoding="utf-8") as stream:
+                stream.write("*\n")
+        except FileExistsError:
+            pass
+    return locks / f"lesson-{folder.name}.lock"
+
+
 def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str, text: str) -> tuple[Path, bool]:
     """Append one lesson to the owning lane's pending notebook (MEMORY.new.md); FA's one append path.
 
@@ -188,14 +218,17 @@ def send_lesson(root: Path, config: Config, lane: str, issue: int, identity: str
     folder = repo_path(root, lane_memory.lane_directory(config, lane))
     path = folder / lane_memory.PENDING
     consumed = folder / lane_memory.CONSUMED
-    # Lock the notebook itself: concurrent retries check ids and append as one operation.
-    with _file_lock(path):
-        existing = path.read_text(encoding="utf-8", errors="replace")
+    # Concurrent retries check ids and append as one operation under a sidecar lock. The notebook
+    # itself is never locked: a lock writes its owner into the locked file (#2267, #2291).
+    with _file_lock(_lesson_lock(root, folder)):
+        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
         done = lane_memory.consumed_ids(consumed.read_text(encoding="utf-8", errors="replace")
                                         if consumed.is_file() else None)
         if identity in done or any(lane_memory.entry_id(line) == identity for line in existing.splitlines()):
             return path, False
         separator = "\n" if existing and not existing.endswith("\n") else ""
+        # The first lesson for a lane may arrive before its memory folder exists.
+        folder.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as notebook:
             notebook.write(f"{separator}- [id:{identity}] {lesson} (from #{issue}, lane {lane})\n")
     return path, True

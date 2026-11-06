@@ -1123,20 +1123,21 @@ def test_send_lesson_serializes_concurrent_retries(tmp_path, monkeypatch):
     path = folder / "MEMORY.new.md"
     earlier = b"- [id:earlier] Keep this.\r\n"
     path.write_bytes(earlier)
+    lock = tmp_path / ".foragent/locks/lesson-fa-view.lock"
     read_text = Path.read_text
     reads = []
 
     def locked_read(current, *args, **kwargs):
         if current == path:
-            # Probe the actual notebook lock, without depending on scheduling or sleeps.
-            with path.open("a") as probe:
+            # Probe the actual delivery lock, without depending on scheduling or sleeps.
+            with lock.open("a") as probe:
                 try:
                     fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     reads.append(current)
                 else:
                     fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
-                    pytest.fail("The delivery must hold the notebook lock before reading its ids")
+                    pytest.fail("The delivery must hold the lesson lock before reading its ids")
         return read_text(current, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", locked_read)
@@ -1152,3 +1153,37 @@ def test_send_lesson_serializes_concurrent_retries(tmp_path, monkeypatch):
     assert results.count((path, True)) == 1
     assert results.count((path, False)) == 5
     assert path.read_bytes() == earlier + b"- [id:same-delivery] Use a locale. (from #7, lane view)\n"
+    # The lock lives outside the memory folder (the dream reads all of it) and git ignores it.
+    assert sorted(item.name for item in folder.iterdir()) == ["MEMORY.new.md"]
+    assert (tmp_path / ".foragent/.gitignore").read_text() == "*\n"
+
+
+def test_send_lesson_creates_missing_memory_folder_and_notebook(tmp_path):
+    from foragent.lanes import send_lesson
+
+    config = Config(lanes={"view": {"paths": ["view/**"], "agent": "fa-view"}})
+    folder = tmp_path / ".claude/agent-memory/fa-view"
+    assert not folder.exists()
+    path, added = send_lesson(tmp_path, config, "view", 7, "first", "First lesson.")
+    assert added and path == folder / "MEMORY.new.md"
+    assert path.read_text() == "- [id:first] First lesson. (from #7, lane view)\n"
+    assert send_lesson(tmp_path, config, "view", 7, "first", "First lesson.") == (path, False)
+    assert path.read_text().count("\n") == 1
+
+
+def test_send_lesson_lock_leaves_no_untracked_file(tmp_path):
+    import subprocess
+
+    from foragent.lanes import send_lesson
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    config = Config(lanes={"view": {"paths": ["view/**"], "agent": "fa-view"}})
+    folder = tmp_path / ".claude/agent-memory/fa-view"
+    folder.mkdir(parents=True)
+    send_lesson(tmp_path, config, "view", 7, "one", "First.")
+    send_lesson(tmp_path, config, "view", 8, "two", "Second.")
+    status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=tmp_path,
+                            check=True, capture_output=True, text=True).stdout.splitlines()
+    assert status == ["?? .claude/agent-memory/fa-view/MEMORY.new.md"], status
+    assert (folder / "MEMORY.new.md").read_text().splitlines() == [
+        "- [id:one] First. (from #7, lane view)", "- [id:two] Second. (from #8, lane view)"]
