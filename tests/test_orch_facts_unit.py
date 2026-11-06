@@ -45,6 +45,15 @@ def test_admitted_test_slots_include_the_machine_default_ceiling(env):
     assert slots["current"] == 4 and slots["admitted"] == capacity.effective_test_slots(4) == 2
 
 
+def test_admitted_test_slots_match_programmatic_ceiling_and_ignore_file_ceiling(env):
+    from foragent.config import FileTestSlots
+
+    store, root = env
+    assert collect(store, root, test_slots=1)["resources"]["test_slots"]["admitted"] == 1
+    slots = collect(store, root, test_slots=FileTestSlots(1))["resources"]["test_slots"]
+    assert slots["current"] == 1 and slots["admitted"] == 2
+
+
 def test_overlap_within_overlap_per_file_is_not_a_hold(env):
     store, root = env
     capacity.write_state(store, 4, NOW)

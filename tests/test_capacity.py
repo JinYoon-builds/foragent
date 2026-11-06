@@ -43,10 +43,10 @@ def fake_sysctl(monkeypatch, level, result=0):
     monkeypatch.setattr(capacity.ctypes, "CDLL", cdll)
 
 
-def _slot_free(ceiling):
-    """Whether a command with this ceiling could take a machine test slot right now."""
+def _slot_free():
+    """Whether the machine admits one more test command right now."""
     try:
-        with capacity.hold_test_slot(ceiling, deadline=time.monotonic()):
+        with capacity.hold_test_slot(deadline=time.monotonic()):
             return True
     except TimeoutError:
         return False
@@ -305,12 +305,14 @@ def test_next_test_slots_stays_between_one_and_ceiling():
 
 def test_effective_test_slots_reads_shared_value_capped_by_ceiling():
     write_machine_yml(test_slots=3)  # Above the default machine ceiling of 2 (#365).
-    assert capacity.effective_test_slots(3) == 3
+    assert capacity.effective_test_slots() == 3
     capacity.update_test_slots(3, NOW, pressure="normal", load_per_cpu=2.0)
-    assert capacity.effective_test_slots(3) == 2
-    assert capacity.effective_test_slots(1) == 1
+    assert capacity.effective_test_slots() == 2
+    write_machine_yml(test_slots=1)
+    assert capacity.effective_test_slots() == 1
+    write_machine_yml(test_slots=3)
     (capacity.machine_root() / capacity.TEST_SLOTS_FILE).write_text("{not json")
-    assert capacity.effective_test_slots(3) == 3
+    assert capacity.effective_test_slots() == 3
 
 
 def test_update_test_slots_waits_between_increases():
@@ -321,34 +323,38 @@ def test_update_test_slots_waits_between_increases():
 
 def test_test_slot_is_exclusive_up_to_the_effective_limit(monkeypatch):
     monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0.01)
-    with capacity.hold_test_slot(2), capacity.hold_test_slot(2):
-        assert not _slot_free(2)
-    with capacity.hold_test_slot(1):
-        assert not _slot_free(1)
-    assert _slot_free(1)
+    with capacity.hold_test_slot(), capacity.hold_test_slot():
+        assert not _slot_free()
+    write_machine_yml(test_slots=1)
+    with capacity.hold_test_slot():
+        assert not _slot_free()
+    assert _slot_free()
 
 
 def test_test_slot_held_above_a_lowered_limit_still_counts():
     write_machine_yml(test_slots=3)  # Above the default machine ceiling of 2 (#365).
-    with capacity.hold_test_slot(3), capacity.hold_test_slot(3), capacity.hold_test_slot(3):
-        # The AIMD value dropped to 2 while three commands ran; none may join.
-        assert not _slot_free(2)
-        assert not _slot_free(3)
+    with capacity.hold_test_slot(), capacity.hold_test_slot(), capacity.hold_test_slot():
+        # The machine ceiling dropped while three commands ran; none may join.
+        write_machine_yml(test_slots=2)
+        assert not _slot_free()
+        write_machine_yml(test_slots=3)
+        assert not _slot_free()
         write_machine_yml(test_slots=4)
-        assert _slot_free(4)
+        assert _slot_free()
 
 
 def test_test_slot_waiter_reports_waiting_then_proceeds(monkeypatch):
+    write_machine_yml(test_slots=1)
     import threading
 
     monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0.01)
     reported, entered = threading.Event(), threading.Event()
 
     def waiter():
-        with capacity.hold_test_slot(1, waiting=reported.set):
+        with capacity.hold_test_slot(waiting=reported.set):
             entered.set()
 
-    with capacity.hold_test_slot(1):
+    with capacity.hold_test_slot():
         thread = threading.Thread(target=waiter)
         thread.start()
         assert reported.wait(5)
@@ -358,6 +364,7 @@ def test_test_slot_waiter_reports_waiting_then_proceeds(monkeypatch):
 
 
 def test_test_slot_of_a_killed_holder_is_released():
+    write_machine_yml(test_slots=1)
     directory = capacity.machine_root() / capacity.TEST_SLOTS_DIR
     directory.mkdir(parents=True)
     holder = subprocess.Popen([
@@ -371,25 +378,26 @@ def test_test_slot_of_a_killed_holder_is_released():
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline() == "held\n"
-        assert not _slot_free(1)
+        assert not _slot_free()
     finally:
         holder.stdin.write("release\n")
         holder.stdin.flush()
         assert holder.wait(timeout=10) == 9
         holder.stdin.close()
         holder.stdout.close()
-    assert _slot_free(1)
+    assert _slot_free()
 
 
 def test_test_slot_held_by_the_parent_command_is_not_taken_twice(monkeypatch):
     monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
-    with capacity.hold_test_slot(1):
+    with capacity.hold_test_slot():
         # A Done-when command that runs `fa test` inherits the slot instead of waiting forever.
-        with capacity.hold_test_slot(1):
+        with capacity.hold_test_slot():
             pass
 
 
 def test_test_slot_stays_unclaimed_while_the_kernel_is_critical(monkeypatch):
+    write_machine_yml(test_slots=1)
     levels = ["critical", "critical", "normal"]
     reads, waits = [], []
 
@@ -400,16 +408,16 @@ def test_test_slot_stays_unclaimed_while_the_kernel_is_critical(monkeypatch):
     monkeypatch.setattr(capacity, "kernel_pressure", kernel)
     monkeypatch.setattr(capacity, "SLOT_POLL_SECONDS", 0)
     monkeypatch.setattr(capacity, "SLOT_HEARTBEAT_SECONDS", 0)
-    with capacity.hold_test_slot(1, waiting=lambda: waits.append(reads[-1])):
+    with capacity.hold_test_slot(waiting=lambda: waits.append(reads[-1])):
         assert reads == ["critical", "critical", "normal"]  # Read again on every poll.
         assert waits == ["critical", "critical"]  # The free slot stayed unclaimed meanwhile.
-        assert not _slot_free(1)  # Now this command holds the slot.
+        assert not _slot_free()  # Now this command holds the slot.
 
 
 def test_test_slot_inherited_by_a_nested_command_ignores_critical(monkeypatch):
     monkeypatch.setattr(capacity, "kernel_pressure", lambda: "critical")
     monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
-    with capacity.hold_test_slot(1, waiting=lambda: pytest.fail("a held slot must not wait")):
+    with capacity.hold_test_slot(waiting=lambda: pytest.fail("a held slot must not wait")):
         pass
 
 
@@ -676,7 +684,7 @@ def test_memory_pressure_never_moves_test_slots(pressure):
 def test_test_slots_floor_in_machine_yml_is_ignored():
     write_machine_yml(test_slots=3, test_slots_floor=3)
     assert capacity.update_test_slots(3, NOW, pressure="normal", load_per_cpu=2.0) == 2
-    assert capacity.effective_test_slots(3) == 2
+    assert capacity.effective_test_slots() == 2
 
 
 def test_machine_max_parallel_caps_the_shared_value_during_decrease_cooldown(tmp_path):
