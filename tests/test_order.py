@@ -2,11 +2,11 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, timedelta
-import fcntl
 import hashlib
 from itertools import count
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 from types import SimpleNamespace
@@ -14,12 +14,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from foragent import cli, main_write, order, size_signal
+from foragent import cli, main_write, order, order_prepare_review, order_publications, size_signal
 from foragent.config import Config, load_config
 from foragent.git import GitError, GitRepo
 from foragent.issue import parse_body
 from foragent.reasons import Reason, format_comment
-from foragent.scheduler import TickContext, tick
+from foragent.scheduler import TickContext, TickReport, tick
 from foragent.skills import SkillManager
 from foragent.state import StateStore
 from foragent.ownership import OwnershipError, effective_orderer
@@ -128,28 +128,40 @@ def offline_publication(git_history):
     (root / ".foragent.yml").write_text("lanes: {api: {paths: ['api/**'], agent: fa-api}}\n")
 
     def run(args):
+        worktree = root
+        while args[:1] == ["-C"]:
+            worktree = worktree / Path(args[1])
+            args = args[2:]
         calls.append(args)
         if "commit" in args:
-            parent = git_command(root, "rev-parse", "HEAD")
+            parent = git_command(worktree, "rev-parse", "HEAD")
+            branch = git_command(worktree, "rev-parse", "--symbolic-full-name", "HEAD")
+            ref = branch if branch != "HEAD" else "refs/foragent-tests/publication"
             title = args[args.index("-m") + 1]
-            stream = ["commit refs/heads/main\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
+            stream = [f"commit {ref}\n", "committer Offline Tests <tests@example.com> 1792483200 +0000\n",
                       f"data {len(title.encode())}\n{title}\n",
                       f"from {parent}\n"]
             for name in args[args.index("--") + 1:]:
                 if name == ":!CLAUDE.local.md":
                     continue
-                entry = git_command(root, "ls-files", "--stage", "-z", "--", name)
+                entry = git_command(worktree, "ls-files", "--stage", "-z", "--", name)
                 metadata, filename = entry.rstrip("\0").split("\t", 1)
                 mode, sha, stage = metadata.split()
                 assert stage == "0"
                 stream.append(f"M {mode} {sha} {json.dumps(filename)}\n")
-            git_command(root, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+            git_command(worktree, "fast-import", "--quiet", input="".join(stream) + "\ndone\n")
+            if branch == "HEAD":
+                # Advance only the owner's detached HEAD, preserving the caller's branch.
+                head = git_command(worktree, "rev-parse", ref)
+                git_command(worktree, "update-ref", "HEAD", head, parent)
+                git_command(worktree, "update-ref", "-d", ref)
             return ""
         if args[0] == "push":
             source, destination = args[-1].split(":")
-            git_command(git_history.origin, "fetch", str(root), f"{source}:{destination}")
+            head = git_command(worktree, "rev-parse", source)
+            git_command(git_history.origin, "fetch", str(worktree), f"{head}:{destination}")
             return ""
-        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *args], cwd=worktree, check=True, capture_output=True, text=True).stdout
 
     git = GitRepo(root, run)
     return root, load_config(root), FakeTracker(actor="human"), git, calls, git_history.origin
@@ -701,9 +713,23 @@ def test_push_failure_prevents_any_issue_creation(publishing, plan, monkeypatch)
     assert publishing[2].issues == {}
 
 
+@pytest.fixture
+def publication_owner(offline_publication, monkeypatch):
+    """Use real owner worktrees and a fake independent reviewer, without model calls."""
+    root, config, tracker, git, _, _ = offline_publication
+
+    def review(plan, item, root, config, git, path, record, store, *, files=None):
+        record["issues"][item["key"]].update(status="reviewed", reason="Still red on current main")
+
+    monkeypatch.setattr(order_prepare_review, "review", review)
+    return SimpleNamespace(repo="owner/repo", repo_root=root, config=replace(config, merge_owner=True),
+                           tracker=tracker, git=git, store=StateStore.for_repo("owner/repo"))
+
+
 @pytest.mark.parametrize("merge_owner", [False, True])
+@pytest.mark.parametrize("options", [{}, {"urgent": True}, {"approve": True}])
 def test_immediate_order_waits_before_committing_during_a_merge_train(
-    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner,
+    offline_publication, plan, git_history, monkeypatch, capsys, merge_owner, options, publication_owner,
 ):
     root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=merge_owner)
@@ -711,45 +737,53 @@ def test_immediate_order_waits_before_committing_during_a_merge_train(
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
     before = git_command(root, "status", "--porcelain")
-    elapsed, sleeps = [0], []
-    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
+    sleeps = []
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
 
-    def sleep(seconds):
-        assert seconds == 30
-        with open(git.common_dir() / "foragent-publish.lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git, **options)
+    assert sleeps == []
+    assert capsys.readouterr().err == ""
+    if merge_owner:
+        row, = order_publications.pending(publication_owner.store)
+        assert row["id"] == report.publication_request
+        assert row["plan"] == plan and row["approve"] == options.get("approve", False)
+        assert row["files"][FILE] == plan["issues"][0]["acceptance_files"][FILE]
+        assert not order_publications.apply_next(publication_owner, TickReport())
         assert git.head_sha() == base
+        assert git_command(origin, "rev-parse", "main") == base
         assert git_command(root, "status", "--porcelain") == before
         assert not any("commit" in args or args[0] == "push" for args in calls)
         assert not tracker.issues
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-        if len(sleeps) == 2:
-            git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
-            git_command(origin, "update-ref", "-d", train)
 
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-
-    order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
-    assert sleeps == ([30, 30] if merge_owner else [])
-    assert capsys.readouterr().err.splitlines() == (["waiting for merge train (0 min)"] * 2 if merge_owner else [])
-    if merge_owner:
-        assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
-        assert (root / "upstream.txt").read_text() == "Train advanced main.\n"
+        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+        git_command(origin, "update-ref", "-d", train)
+        assert order_publications.apply_next(publication_owner, TickReport())
+        row, = order_publications.requests(publication_owner.store)
+        assert row["status"] == "published"
+        assert git_command(origin, "rev-parse", "main") == row["commit"]
+        assert git_command(origin, "rev-parse", "main^") == git_history.tip
+        assert git_command(origin, "show", "main:upstream.txt") == "Train advanced main."
+        assert git_command(origin, "show", f"main:{FILE}") == "assert True"
+        assert git.head_sha() == base
+        assert git_command(root, "status", "--porcelain") == before
     else:
+        assert report.publication_request is None
+        assert not order_publications.requests(publication_owner.store)
+        assert git_command(origin, "rev-parse", "main") == git.head_sha() != base
         assert not any(args[0] == "ls-remote" for args in calls)
         assert git_command(origin, "rev-parse", train) == base
     assert tracker.issues
+    assert sleeps == []
 
 
 def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
-    offline_publication, plan, monkeypatch, capsys,
+    offline_publication, plan, monkeypatch, capsys, publication_owner,
 ):
     root, config, tracker, git, calls, origin = offline_publication
     config = replace(config, merge_owner=True)
     base = git.head_sha()
-    git_command(origin, "update-ref", f"refs/heads/foragent/batch-merge-{base[:8]}-1", base)
+    train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+    git_command(origin, "update-ref", train, base)
     unrelated = root / "unrelated.txt"
     unrelated.write_text("Staged\n")
     git_command(root, "add", "--", "unrelated.txt")
@@ -758,24 +792,33 @@ def test_immediate_order_train_timeout_leaves_head_index_and_files_unchanged(
     elapsed, sleeps = [0], []
     monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
 
-    def sleep(seconds):
-        assert seconds == 30
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-    with pytest.raises(GitError, match="timed out after 40 minutes.*retry publication"):
-        order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
-    assert elapsed[0] == 40 * 60 and len(sleeps) == 80
-    assert capsys.readouterr().err.splitlines()[-1] == "waiting for merge train (39 min)"
+    monkeypatch.setattr(main_write.time, "sleep", sleeps.append)
+    report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    elapsed[0] = 40 * 60 + 1
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.pending(publication_owner.store)
+    assert row["id"] == report.publication_request and row["status"] == "pending"
+    assert sleeps == [] and capsys.readouterr().err == ""
     assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
     assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
     assert unrelated.read_text() == "Unstaged\n"
     assert not any("commit" in args or args[0] == "push" for args in calls)
     assert not tracker.issues
 
+    git_command(origin, "update-ref", "-d", train)
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["status"] == "published"
+    assert git_command(origin, "rev-parse", "main") == row["commit"] != base
+    assert git.head_sha() == base
+    assert (git_command(root, "status", "--porcelain"), git_command(root, "ls-files", "--stage", "-z")) == before
+    assert unrelated.read_text() == "Unstaged\n"
 
-def test_immediate_order_train_lookup_failure_stops_before_writes(offline_publication, plan, monkeypatch):
+
+def test_immediate_order_train_lookup_failure_stops_before_writes(
+    offline_publication, plan, monkeypatch, publication_owner,
+):
     root, config, tracker, git, calls, _origin = offline_publication
     base = git.head_sha()
     before = git_command(root, "status", "--porcelain")
@@ -787,16 +830,26 @@ def test_immediate_order_train_lookup_failure_stops_before_writes(offline_public
         return call(args)
 
     monkeypatch.setattr(git, "_call", unreadable)
+    report = order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
     with pytest.raises(GitError, match="remote unavailable"):
-        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+        order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.pending(publication_owner.store)
+    assert row["id"] == report.publication_request and row["status"] == "pending"
     assert git.head_sha() == base
     assert git_command(root, "status", "--porcelain") == before
     assert not any("commit" in args or args[0] == "push" for args in calls)
     assert not tracker.issues
 
+    monkeypatch.setattr(git, "_call", call)
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["status"] == "published" and tracker.issues
+
 
 @pytest.mark.parametrize("change", ["human-edit", "replacement-started"])
-def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_publication, plan, monkeypatch, change):
+def test_immediate_order_checks_mutable_issue_facts_after_waiting(
+    offline_publication, plan, change, publication_owner,
+):
     root, config, tracker, git, calls, origin = offline_publication
     report = order.publish(plan, root, config, tracker, repo="owner/repo", git=git)
     target = report.rows[0]["number"]
@@ -809,23 +862,29 @@ def test_immediate_order_checks_mutable_issue_facts_after_waiting(offline_public
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(origin, "update-ref", train, base)
 
-    def sleep(seconds):
-        assert seconds == 30
-        if change == "human-edit":
-            issue = tracker.get_issue(target)
-            tracker.update_issue(target, title="Edited while waiting", body=issue.body)
-        else:
-            tracker.add_labels(target, ["running"])
-        git_command(origin, "update-ref", "-d", train)
+    report = order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
+    assert report.publication_request
+    assert not order_publications.apply_next(publication_owner, TickReport())
+    if change == "human-edit":
+        issue = tracker.get_issue(target)
+        tracker.update_issue(target, title="Edited while waiting", body=issue.body)
+    else:
+        tracker.add_labels(target, ["running"])
+    before = deepcopy(tracker.list_issues())
+    git_command(origin, "update-ref", "-d", train)
 
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-    with pytest.raises(order.PlanError, match=f"#{target}"):
-        order.publish(plan, root, replace(config, merge_owner=True), tracker, repo="owner/repo", git=git)
-    assert git.head_sha() == base
+    assert order_publications.apply_next(publication_owner, TickReport())
+    row, = order_publications.requests(publication_owner.store)
+    assert row["id"] == report.publication_request
+    assert row["status"] == "preparation" and f"#{target}" in row["reason"]
+    assert git.head_sha() == git_command(origin, "rev-parse", "main") == base
     assert not any("commit" in args or args[0] == "push" for args in calls)
+    assert tracker.list_issues() == before
     assert tracker.get_issue(target).state == "open"
     if change == "human-edit":
         assert tracker.get_issue(target).title == "Edited while waiting"
+    else:
+        assert "running" in tracker.get_issue(target).labels
 
 
 @pytest.mark.parametrize("options,approved", [
@@ -1064,7 +1123,7 @@ def test_context_all_sections_and_gate_groups(tmp_path):
         (tmp_path / name / "hidden.js").write_text("")
     config = Config(language="ko", lanes={"api": {"paths": ["api/**"], "agent": "fa-api", "skills": ["testing"]}})
     result = order.context(tmp_path, config, tracker)
-    assert set(result) == {"language", "lanes", "tiers", "interview", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
+    assert set(result) == {"language", "lanes", "tiers", "interview", "interview_progress", "profile", "ui", "acceptance_dir", "base_branch", "feedback", "decisions", "other_orders", "open_issues", "pull_requests", "specs", "repo"}
     assert result["other_orders"] == []
     assert result["language"] == "ko" and result["tiers"] == config.tiers
     assert result["lanes"]["api"]["skills"] == ["testing"]
@@ -5143,3 +5202,86 @@ def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publi
         publish(publishing, plan, approve=True)
     assert closes == [], "No close may be written once a target is running"
     assert all(tracker.list_comments(n) == [] for n in (41, 42, 43))
+
+
+@pytest.fixture
+def uv_executable_case(tmp_path, monkeypatch):
+    from foragent import processes
+
+    def tool(name, folder=".venv/bin"):
+        path = tmp_path / folder / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 97\n")
+        path.chmod(0o755)
+        return path
+
+    tool("uv", "bin")
+    tool("path-check", "bin")
+    tool("venv-check")
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    monkeypatch.setattr(processes, "_child_environment", lambda root: {"PATH": "bin"})
+    def forbidden(*args, **kwargs):
+        pytest.fail("Executable preflight must not run a command")
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    return tmp_path, tool
+
+
+@pytest.mark.parametrize("command", [
+    "uv run venv-check -q", "uv run path-check", "uv run --offline --no-sync venv-check",
+    "uv run -- venv-check", "uv run ./.venv/bin/venv-check", "uv run", "uv run --offline",
+    "uv run --offline && unavailable-later", "uv run venv-check; unavailable-later",
+    "uv sync", "path-check", "true", "cd .",
+])
+def test_done_when_uv_run_resolves_without_running(uv_executable_case, command):
+    root, _ = uv_executable_case
+    order.check_done_when_executables({"issues": [{"key": "one", "done_when": [command]}]}, root)
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("command,missing", [
+    ("uv run pytestx -q", "pytestx"), ("uv run --offline pytestx", "pytestx"),
+    ("uv run cd .", "cd"), ("uv run ./missing", "./missing"),
+])
+def test_done_when_uv_run_reports_inner_executable(uv_executable_case, language, command, missing):
+    root, _ = uv_executable_case
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables({"edits": [{"number": 42, "done_when": [command]}]}, root, language)
+    assert len(caught.value.lines) == 1
+    line = caught.value.lines[0]
+    assert (f"missing executable {missing}:" if language == "en" else f"실행 파일 {missing}을") in line
+    assert "uv run uv run" not in line
+    assert "; try" not in line and "써 보세요" not in line
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+@pytest.mark.parametrize("has_pytest", [False, True])
+def test_done_when_uv_suggestion_requires_suggested_venv_executable(uv_executable_case, language, has_pytest):
+    root, tool = uv_executable_case
+    if has_pytest:
+        tool("pytest")
+    with pytest.raises(order.DoneWhenExecutableError) as caught:
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["python -m pytest -q", "pytestx", "venv-check"]}]},
+            root, language)
+    python, typo, venv = caught.value.lines
+    assert ("uv run pytest -q" in python) == has_pytest
+    assert "uv run" not in typo
+    assert ("the name may be wrong" if language == "en" else "이름이 맞는지 확인해 보세요") in typo
+    assert "uv run venv-check" in venv
+
+
+def test_done_when_uv_run_without_venv_keeps_legacy_behavior(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / ".venv/bin/venv-check").unlink()
+    (root / ".venv/bin").rmdir()
+    order.check_done_when_executables(
+        {"issues": [{"key": "one", "done_when": ["uv run pytestx"]}]}, root)
+
+
+def test_done_when_uv_run_still_requires_uv_on_path(uv_executable_case):
+    root, _ = uv_executable_case
+    (root / "bin/uv").unlink()
+    with pytest.raises(order.DoneWhenExecutableError, match="missing executable uv:"):
+        order.check_done_when_executables(
+            {"issues": [{"key": "one", "done_when": ["uv run venv-check"]}]}, root)

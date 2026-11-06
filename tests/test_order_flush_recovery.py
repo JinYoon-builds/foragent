@@ -1,15 +1,17 @@
 """Recovery cases around the plumbing rebuild, in addition to locked edge checks."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 import fcntl
 
 import pytest
 
 from conftest import git_command
-from foragent import main_write, order_flush, order_flush_journal as journal, order_notes
+from foragent import main_write, main_write_requests, order_flush, order_flush_journal as journal, order_notes
 from foragent.git import GitError
 from foragent.order import PlanError
 from foragent.state import StateStore
+from foragent.scheduler import TickReport
 from test_order import offline_publication  # noqa: F401
 
 
@@ -65,6 +67,32 @@ def test_flush_waits_before_committing_until_the_merge_train_finishes(
                      "checklist": [], "lane": "main", "size": "s", "blocked_by": [], "acceptance_files": {}}]}
         order_submissions.retain(plan, "owner/repo", "chosen", approve=True, approve_keys=[], approve_numbers=[],
                                  language=config.language, files={"docs/specs/2026-11-04-train-wait.md": "# Retained\n"})
+    if merge_owner:
+        base = git.head_sha()
+        train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
+        git_command(git_history.origin, "update-ref", train, base)
+        def finish_train(_seconds):
+            # Only the separate order publication still waits for this train.
+            assert with_order
+            git_history.update({"upstream.txt": "Train advanced main.\n"})
+            git_command(git_history.origin, "update-ref", "-d", train)
+        monkeypatch.setattr(order_flush, "wait_for_merge_train", lambda *_: finish_train(30))
+        result = flush(case)
+        assert result["status"] == ("published" if with_order else "waiting")
+        assert (root / "docs/decisions.md").read_text() == "# Decisions\n"
+        assert len(main_write_requests.pending(store)) == 1
+        if not with_order:
+            assert git.head_sha() == base
+            assert git_command(git_history.origin, "rev-parse", "main") == base
+            git_command(git_history.origin, "update-ref", "-d", train)
+        ctx = SimpleNamespace(git=git, config=case[1], store=store)
+        main_write_requests.drain(ctx, TickReport())
+        assert not main_write_requests.pending(store)
+        assert git_command(git_history.origin, "show", "main:docs/decisions.md").count("One retained decision") == 1
+        assert bool(tracker.issues) == with_order
+        assert (root / "unrelated.txt").read_text() == "Unstaged\n"
+        assert git_command(root, "show", ":unrelated.txt") == "Staged"
+        return
     base = git_command(git_history.origin, "rev-parse", "main")
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(git_history.origin, "update-ref", train, base)
@@ -115,29 +143,22 @@ def test_flush_train_timeout_preserves_files_index_head_and_journal(waiting, git
     records = journal.entries(store)
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(git_history.origin, "update-ref", train, base)
-    elapsed, sleeps = [0], []
-
-    def sleep(seconds):
-        assert seconds == 30
-        assert_train_can_publish(git)
-        sleeps.append(seconds)
-        elapsed[0] += seconds
-
-    monkeypatch.setattr(main_write.time, "monotonic", lambda: elapsed[0])
-    monkeypatch.setattr(main_write.time, "sleep", sleep)
-    with pytest.raises(GitError, match="timed out after 40 minutes waiting for merge train"):
-        flush(case)
-    assert sum(sleeps) == 40 * 60
+    monkeypatch.setattr(order_flush, "wait_for_merge_train", lambda *_: pytest.fail("notes flush must return at once"))
+    assert flush(case)["status"] == "waiting"
     assert git.head_sha() == base
     assert git_command(git_history.origin, "rev-parse", "main") == base
     assert git_command(root, "ls-files", "--stage") == index
     assert {path: path.read_bytes() for path in root.rglob("*")
             if path.is_file() and ".git" not in path.parts} == files
-    assert journal.entries(store) == records
     assert not tracker.issues
+    ctx = SimpleNamespace(git=git, config=case[1], store=store)
+    main_write_requests.drain(ctx, TickReport())
+    assert len(main_write_requests.pending(store)) == 1
     git_command(git_history.origin, "update-ref", "-d", train)
-    assert flush(case)["status"] == "published"
-    intact(case)
+    main_write_requests.drain(ctx, TickReport())
+    assert not main_write_requests.pending(store)
+    assert git_command(git_history.origin, "show", "main:docs/decisions.md").count("One retained decision") == 1
+    assert flush(case)["status"] == "empty"
 
 
 @pytest.mark.parametrize("unpushed", [False, True], ids=["published-head", "unpushed-commit"])
@@ -166,25 +187,23 @@ def test_uncommitted_resume_waits_then_refreshes_after_train_advances(waiting, g
     train = f"refs/heads/foragent/batch-merge-{base[:8]}-1"
     git_command(git_history.origin, "update-ref", train, base)
 
-    def finish_train(seconds):
-        assert seconds == 30
-        assert_train_can_publish(git)
-        assert git.head_sha() == local
-        assert git_command(root, "ls-files", "--stage") == index
-        assert (root / "docs/decisions.md").read_bytes() == partial
-        assert journal.entries(store) == records
-        git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
-        git_command(git_history.origin, "update-ref", "-d", train)
-
-    monkeypatch.setattr(main_write.time, "sleep", finish_train)
-    assert flush(case)["status"] == "published"
-    assert git_command(root, "rev-parse", "HEAD^") == git_history.tip
+    monkeypatch.setattr(order_flush, "wait_for_merge_train", lambda *_: pytest.fail("notes flush must return at once"))
+    assert flush(case)["status"] == "waiting"
+    assert git.head_sha() == local
+    assert git_command(root, "ls-files", "--stage") == index
+    assert (root / "docs/decisions.md").read_bytes() == partial
+    git_history.update({"upstream.txt": "Train advanced main.\n"}, message="Train merged")
+    git_command(git_history.origin, "update-ref", "-d", train)
+    main_write_requests.drain(SimpleNamespace(git=git, config=case[1], store=store), TickReport())
+    assert git.head_sha() == local
     assert git_command(git_history.origin, "show", "main:upstream.txt") == "Train advanced main."
     if unpushed:
+        # The notes owner neither publishes nor loses another writer's retained commit.
         assert (root / memory).read_text() == "Retained local lesson.\n"
-        assert git_command(git_history.origin, "show", f"main:{memory}") == "Retained local lesson."
+        assert git_command(root, "show", f"HEAD:{memory}") == "Retained local lesson."
     assert len([row for row in journal.entries(store) if row["kind"] == "selected"]) == 1
-    intact(case)
+    assert git_command(git_history.origin, "show", "main:docs/decisions.md").count("One retained decision") == 1
+    assert order_notes.pending(store)["notes"][0]["status"] == "published"
 
 
 def fail_push(case, monkeypatch):
@@ -582,3 +601,47 @@ def test_legacy_git_checkpoints_are_ignored_without_rewriting(waiting, monkeypat
     assert flush(waiting)["sha"] == sha
     assert (store.root / journal.JOURNAL).read_bytes().startswith(before)
     intact(waiting)
+
+
+@pytest.mark.parametrize("lost_done", [False, True], ids=["completed", "lost-done"])
+@pytest.mark.parametrize("queued_first", [False, True], ids=["direct-first", "queued-first"])
+@pytest.mark.parametrize("fresh_tracking", [False, True], ids=["stale-tracking", "fresh-tracking"])
+def test_notes_keep_batch_identity_across_owner_mode_changes(
+    waiting, git_history, monkeypatch, lost_done, queued_first, fresh_tracking,
+):
+    root, config, tracker, git, store = waiting
+    owned = root, replace(config, merge_owner=True), tracker, git, store
+    if queued_first:
+        assert flush(owned)["status"] == "waiting"
+    if lost_done:
+        append = journal.append
+
+        def interrupted_done(store, kind, batch, **values):
+            if kind == "done":
+                raise Interrupted()
+            return append(store, kind, batch, **values)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(journal, "append", interrupted_done)
+            with pytest.raises(Interrupted):
+                flush(waiting)
+    else:
+        assert flush(waiting)["status"] == "published"
+    landed = git_command(git_history.origin, "rev-parse", "main")
+    assert git_command(git_history.origin, "show", "main:docs/decisions.md").count("One retained decision") == 1
+    # The offline transport leaves the tracking ref stale until an explicit fetch.
+    if fresh_tracking:
+        git.fetch("origin", "main")
+    result = flush(owned)
+    if fresh_tracking and lost_done:
+        assert result["status"] == "published"
+        if not queued_first:
+            assert not main_write_requests.requests(store)
+    ctx = SimpleNamespace(git=git, config=owned[1], store=store)
+    main_write_requests.drain(ctx, TickReport())
+    main_write_requests.drain(ctx, TickReport())
+    assert not main_write_requests.pending(store)
+    assert git_command(git_history.origin, "rev-parse", "main") == landed
+    assert order_notes.pending(store)["notes"][0]["status"] == "published"
+    assert len([row for row in journal.entries(store) if row["kind"] == "done"]) == 1
+    assert flush(owned)["status"] == "empty"

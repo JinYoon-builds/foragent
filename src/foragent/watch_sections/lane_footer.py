@@ -24,6 +24,8 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     from foragent import watch
 
     width = max(1, context.get("width") or 120)
+    if snapshot.now_view is not None:
+        return [watch._fit(watch._line(watch.text("lane_footer_now_hints", config.language), "dim"), width)]
     parts, _ = _parts(snapshot, config, context, include_capacity=False)
     usage = watch._fit(watch._line(" · ".join(parts)), width)
     hints = watch._fit(watch._line(watch.text("lane_footer_hints", config.language), "dim"), width)

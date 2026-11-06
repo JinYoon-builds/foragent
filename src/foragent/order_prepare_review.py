@@ -234,17 +234,17 @@ def _number(value) -> bool:
 
 
 def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
-    """What a pass lacks of the agreed evidence: each statement mapped to written tests with its
-    break-it evidence, and each command with its actual counts, exit code, output and failure kind."""
+    """What a pass lacks of the agreed evidence: each statement mapped to written tests (break-it
+    evidence is optional), and each command with its actual counts, exit code, output and failure kind."""
     names = set(entry["written"])
     names_test = lambda test: _text(test) and test.split("::", 1)[0] in names  # noqa: E731
     gaps = []
     for line in item["statements"]:
         covers = [cover for cover in facts["coverage"] if cover.get("statement") == line]
+        # Break-it evidence is best effort (#2229): it is recorded when given, never required.
         if not any(isinstance(cover.get("tests"), list) and cover["tests"] and all(map(names_test, cover["tests"]))
-                   and isinstance(cover.get("break_it"), list) and cover["break_it"]
-                   and all(map(_text, cover["break_it"])) for cover in covers):
-            gaps.append(f"coverage of {line!r} (tests among the written files and break-it evidence)")
+                   for cover in covers):
+            gaps.append(f"coverage of {line!r} (tests among the written files)")
     commands = entry.get("done_when", [])
     if not commands:
         gaps.append("done_when commands")
@@ -257,16 +257,17 @@ def _evidence_gaps(item: dict, entry: dict, facts: dict) -> list[str]:
 
 
 def review(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
-           store=None) -> None:
+           store=None, *, files=None) -> None:
     """Retry an unusable environment/format attempt once, keeping the writer and its cycle."""
     for _ in range(2):
-        _review_once(plan, item, root, config, git, path, record, store)
+        _review_once(plan, item, root, config, git, path, record, store,
+                     **({"files": files} if files is not None else {}))
         if not record["issues"][item["key"]]["attempts"][-1].get("retryable"):
             break
 
 
 def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: Path, record: dict,
-                 store=None) -> None:
+                 store=None, *, files=None) -> None:
     """One review attempt of the recorded candidates; the record is saved before and after it.
 
     Every attempt gets a new scratch copy of the candidates' base with exactly the recorded
@@ -290,6 +291,9 @@ def _review_once(plan: dict, item: dict, root: Path, config: Config, git, path: 
     try:
         lane_config, context = setup.lane_context(plan, item, config, root)
         context.files.update(setup.scratch_files(plan, item, root, config, record))
+        if files is not None:
+            context.files.update({name: data.encode("utf-8") if isinstance(data, str) else data
+                                  for name, data in files.items()})
         entry["others"] = setup.others_digest(plan, record, item)  # what this review runs beside
         from foragent.run_implementation import lane_config as resolve
 
