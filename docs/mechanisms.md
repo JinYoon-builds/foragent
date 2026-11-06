@@ -27,8 +27,11 @@ rejections reach the next writer through preparation history. Saved push intent 
 
 This repository has `merge_owner: true` in `.foragent.yml` (switched on 2026-11-04).
 The product default remains off. This repository also enables `merge_batch`: the owner builds
-a combined candidate for eligible PRs, checks its tip with CI and each member's completion
-commands, then repeats the final checks and updates the target once if its base is unchanged. PRs that
+a combined candidate for eligible PRs and checks its tip with CI. With a trusted tip workflow,
+the owner credits the tests CI passed, including locked acceptance tests, in each member's
+completion commands. Uncovered tests and machine-only checks still run; approved acceptance
+files must match on the tip. The owner then repeats the final checks and updates the target
+once if its base is unchanged. PRs that
 change CI workflows take the single-PR path. The worker-side merge-group path still exists
 for configurations with the owner off.
 
@@ -52,12 +55,15 @@ D120 (whole-batch merge) and D95 in [decisions](decisions.md).
 The runner executes the issue's Done-when commands and protects the acceptance checks that passed
 before the change. In CI mode, it uses CI reports tied to the relevant commits for that comparison;
 checks marked local still run on the machine. A moved target needs evidence for the new combination.
+An owner pytest session with no tests succeeds only when the owner's own CI/passed-test selection
+removed every remaining test; an empty selection from the command itself still fails.
 On the worker-side group path, a combined check can cover several ready changes instead of
 repeating the same work for each one.
 
 PR CI waits use GitHub's current head checks and do not spend the implementation budget. The
-existing wait-time ledger credits CI and artifact-registration waits, as it does for merge-turn
-waits. One six-hour safety net bounds a wait. GitHub ends hung measurement jobs with the existing
+existing wait-time ledger credits individual CI, group CI and artifact-registration waits, as it does
+for merge-turn waits. Open ledger waits also prevent machine sleep from being credited twice.
+One six-hour safety net bounds a wait. GitHub ends hung measurement jobs with the existing
 30-minute timeout; newly bounded jobs use 45 minutes.
 
 Code: `src/foragent/run_checks.py`, `src/foragent/run_checks_approved.py`,
