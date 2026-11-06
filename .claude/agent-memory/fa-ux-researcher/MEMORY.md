@@ -15,3 +15,4 @@
 - [Publish help example JSON](broken_publish_help_example_json.md) — PLAN.json example in publish --help fails to parse (raw newline, confirmed)
 - [Init env token dead end](broken_init_env_token_dead_end.md) — bad GH_TOKEN: fa init says "saved login", gh auth login refused (confirmed)
 - [CI base cache misses](broken_ci_base_cache_misses.md) — PR runs almost never restore the main base record (1/17); pushes cancel or finish late (confirmed)
+- [Dashboard --once fixed width](broken_dashboard_once_fixed_width.md) — --once prints 120 cols in a 40-col pane (UNCONFIRMED 2026-11-07)
