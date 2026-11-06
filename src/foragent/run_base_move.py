@@ -102,6 +102,23 @@ def moved_paths(git: GitRepo, move: BaseMove) -> set[str]:
     return {path for _, path in _moved_changes(git, move)}
 
 
+def result_neutral_changes(changes: Collection[tuple[str, str]]) -> bool:
+    """D111's exact path/status rule, shared by queued writes and base moves."""
+    return all(status in {"A", "M"} and path.startswith(".claude/agent-memory/")
+               for status, path in changes)
+
+
+def strict_move_is_neutral(git: GitRepo, move: BaseMove, own_paths: Collection[str]) -> bool:
+    """Prove every intervening commit is neutral and disjoint from verified work."""
+    try:
+        if move.head_sha == move.target_sha or not git.is_ancestor(move.head_sha, move.target_sha):
+            return False
+        changes = _moved_changes(git, move)
+        return result_neutral_changes(changes) and not {path for _, path in changes} & set(own_paths)
+    except GitError:
+        return False
+
+
 def _moved_changes(git: GitRepo, move: BaseMove) -> set[tuple[str, str]]:
     """Exact status/path pairs for every commit, with renames reported as D + A."""
     commits = _git_bytes(git, ["rev-list", f"{move.head_sha}..{move.target_sha}"]).decode("ascii").split()
@@ -234,13 +251,7 @@ def move_is_neutral(git: GitRepo, move: BaseMove, *, ctx: RunContext, n: int,
     """Shared path rules; strict owner ranges start at the evidence's measured base."""
     if strict:
         try:
-            if move.head_sha == move.target_sha or not git.is_ancestor(move.head_sha, move.target_sha):
-                return False
-            changes = _moved_changes(git, move)
-            if any(status not in {"A", "M"} or not path.startswith(".claude/agent-memory/")
-                   for status, path in changes):
-                return False
-            return not {path for _, path in changes} & _own_paths(git, move.target_sha)
+            return strict_move_is_neutral(git, move, _own_paths(git, move.target_sha))
         except GitError:
             # A recorded evidence SHA may have been pruned. Failed proof must
             # reach the normal refresh path rather than retry the same read.

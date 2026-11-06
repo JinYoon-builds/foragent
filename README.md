@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/foragent-logo.png" alt="Foragent squirrel and wordmark" width="720"></p>
+
 # Foragent
 
 > Your agent forages for the next task.
