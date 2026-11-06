@@ -271,11 +271,57 @@ def _merges_since_tidy(store: StateStore) -> int:
 
 
 def _test_slots(config: Config, running: list[Run], rows: list[dict[str, Any]], machine) -> dict[str, Any]:
-    """The shared slot value (bounded by this project's test_slots), queue and waits."""
+    """Legacy configured/shared count; resources.test_slots.admitted reports actual admission."""
     state = machine["test_slots"]
-    return {"current": max(1, min(state["slots"], config.test_slots) if state else config.test_slots),
+    ceiling = config.test_slots if config.test_slots is not None else machine["budget"]["test_slots"]
+    return {"current": max(1, min(state["slots"], ceiling) if state else ceiling),
             "queue_length": sum(run.phase == "test-slot-wait" for run in running),
             "total_wait_seconds": sum(row["test_slot_wait_seconds"] or 0 for row in rows)}
 
 
 # plan.json may carry a throughput goal; facts copy only its plan keys (orch_plan.plan_fields) and never show a goal.
+
+
+def cross_lane_orders(store: StateStore, config: Config, executions: list[_Execution],
+                      orders: dict[int, set[int]], sensitive: bool | None) -> list[dict[str, Any]]:
+    """Each finished order's issues whose merged runs changed another lane's paths, and the lane pairs.
+
+    ``orders`` are the finished orders (order number to child numbers) by the order-finish rule. A
+    child's lane is the lane its merged run recorded; its paths are the files those runs changed, so
+    declared Files alone never count. A path is another lane's when that lane's configured paths
+    match it and the run's own lane's do not. Paths and pairs are sets: a retried or reread
+    execution adds nothing twice. Read-only; nothing here is stored.
+    """
+    from glob import escape
+    from types import SimpleNamespace
+
+    from foragent.overlap_files import any_overlap
+
+    lanes = {name: list(lane.get("paths", [])) for name, lane in sorted(config.lanes.items())}
+    rows = [{"issue": item.run.number, "started_at": item.run.started_at, "outcome": item.run.outcome}
+            for item in executions]
+    merged = merged_keys(store, rows)
+    landed: dict[int, list[Run]] = {}
+    for item in executions:
+        if (item.run.number, item.run.started_at) in merged:
+            landed.setdefault(item.run.number, []).append(item.run)
+    ctx = SimpleNamespace(case_sensitive=sensitive)
+
+    def owners(path: str) -> set[str]:
+        return {name for name, paths in lanes.items() if any_overlap(ctx, [escape(path)], paths)}
+
+    found = []
+    for order, children in sorted(orders.items()):
+        issues, pairs = [], set()
+        for number in sorted(children):
+            runs = landed.get(number) or []
+            lane = next((run.lane for run in reversed(runs) if run.lane), None)
+            if lane is None:
+                continue  # No merged run with a lane: nothing landed that could cross.
+            paths = {path for run in runs for path in run.changed_files or ()}
+            others = sorted({name for path in paths if lane not in (hit := owners(path)) for name in hit})
+            if others:
+                issues.append({"number": number, "lane": lane, "other_lanes": others})
+                pairs.update(tuple(sorted((lane, other))) for other in others)
+        found.append({"order": order, "issues": issues, "lane_pairs": [list(pair) for pair in sorted(pairs)]})
+    return found

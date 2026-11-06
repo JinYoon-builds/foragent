@@ -4,10 +4,12 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
+from functools import cache
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
+import warnings
 
 import yaml
 
@@ -22,6 +24,17 @@ SKILL_ROLES = {"style", "review", "tool", "domain"}
 # The sessions `default_skills` assigns to; one role never falls back to another (#1619).
 DEFAULT_SKILL_ROLES = ("workers", "reviewers", "orchestrator", "architect", "docs")
 PRESENCE_DEFAULTS = {"statusline": True, "session_start": True, "report": True}
+
+
+class FileTestSlots(int):
+    """Legacy settings value, readable as an int but not an admission ceiling.
+
+    Keep its origin through deepcopy/asdict and dataclasses.replace; replacing
+    it with a plain int explicitly opts into the legacy in-process ceiling.
+    """
+
+
+yaml.SafeDumper.add_representer(FileTestSlots, lambda dumper, value: dumper.represent_int(int(value)))
 
 
 @dataclass(frozen=True)
@@ -66,7 +79,7 @@ class Config:
     # measured: a live per-file plan limit (fa orch plan --overlap, chosen from recorded overlap
     # facts) replaces overlap_per_file for its file; fixed: overlap_per_file applies to every file.
     overlap_mode: str = "measured"
-    test_slots: int = 2  # Machine-wide test command ceiling; AIMD lowers it under load (#243).
+    test_slots: int | None = 2  # Legacy programmatic ceiling; file values defer to machine.yml.
     transient_max_wait_minutes: int = 30
     limit_wait_minutes: int = 60
     usage_recheck_minutes: int = 10  # How often an exhausted executor's free usage source is re-read.
@@ -444,6 +457,13 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return _parse_yaml(content, path)
 
 
+@cache
+def _warn_test_slots(path: str) -> None:
+    """A retired setting is reported once per source file in this process."""
+    warnings.warn(f"{path}: test_slots is ignored; test-slot capacity is owned by machine.yml",
+                  UserWarning, stacklevel=3)
+
+
 def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
     try:
         value = yaml.safe_load(content)
@@ -456,6 +476,11 @@ def _parse_yaml(content: str, path: Path | str) -> dict[str, Any]:
     for key in value:
         if key not in DEFAULTS and key not in IGNORED_KEYS and key not in FILE_KEYS:
             raise ConfigError(f"unknown configuration key: {key}")
+    if "test_slots" in value:
+        _warn_test_slots(str(path))
+        # Preserve valid legacy values for readers, but tolerate obsolete invalid settings.
+        if type(value["test_slots"]) is not int or value["test_slots"] < 1:
+            value = {key: item for key, item in value.items() if key != "test_slots"}
     if "max_parallel" in value and value["max_parallel"] is None:
         # null is the default (no ceiling), as when the key is left out; a dump of Config writes it.
         value = {key: item for key, item in value.items() if key != "max_parallel"}
@@ -501,7 +526,12 @@ def load_config(repo_root: Path, global_path: Path | None = None) -> Config:
     _personal_notify_filter(values, global_values)
     _apply_executors(values, global_values, local)
     _validate(values)
-    return Config(**values)
+    return _loaded_config(values)
+
+
+def _loaded_config(values: dict[str, Any]) -> Config:
+    """File loading never supplies a repository ceiling, even when the key is absent."""
+    return Config(**{**values, "test_slots": FileTestSlots(values["test_slots"])})
 
 
 def _personal_glyphs(values: dict[str, Any], global_values: dict[str, Any]) -> None:
@@ -586,7 +616,7 @@ def load_committed_config(local: Config, content: str | None, source: str,
         ignored = [key for key in ("repo", "base_branch") if key in committed and values[key] != getattr(local, key)]
         values.update({key: getattr(local, key) for key in LOCAL_ONLY_KEYS})
         _validate(values)
-        return Config(**values), ignored
+        return _loaded_config(values), ignored
     except (ConfigError, TypeError, ValueError):
         return None, []
 
@@ -623,7 +653,7 @@ def load_global_config(global_path: Path | None = None) -> Config:
     _overlay(values, global_values)
     _apply_executors(values, global_values, {})
     _validate(values)
-    return Config(**values)
+    return _loaded_config(values)
 
 
 def _global_path() -> Path:

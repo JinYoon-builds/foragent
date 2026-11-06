@@ -22,6 +22,7 @@ from typing import IO, TYPE_CHECKING
 import xml.etree.ElementTree as ET
 
 from foragent import cuts
+from foragent.config import FileTestSlots
 from foragent.git import GitError
 from foragent.run_attempt import AttemptFailure
 from foragent.run_baseline_limits import _duration, load_reusable, recorded_duration, record_timeout, repository_limit
@@ -110,7 +111,8 @@ def start_baseline_process(ctx: RunContext, build: BaselineBuild, lock: IO[str])
 
     request = {
         "repo_root": str(ctx.repo_root.resolve()), "store_root": str(ctx.store.root.resolve()),
-        "acceptance_dir": ctx.config.acceptance_dir, "test_slots": ctx.config.test_slots, "repo": ctx.config.repo,
+        "acceptance_dir": ctx.config.acceptance_dir, "repo": ctx.config.repo,
+        "test_slots": None if isinstance(ctx.config.test_slots, FileTestSlots) else ctx.config.test_slots,
         "machine_root": str(capacity.machine_root().resolve()),
         "build": asdict(build),
     }

@@ -4,8 +4,10 @@ A parent is an open, unapproved issue with sub-issues. Its own labels say
 nothing about progress, so the gate derives its column from the children on
 each tick that read the issue listing, and closes it once no child is open.
 A child closed as not planned (for example replaced by a newer order) has
-ended too; the one closing comment names completed and cancelled children in
-separate groups. An approved issue with sub-issues stays ordinary work.
+ended too; the one closing comment names completed, cancelled and replaced
+children in separate groups. A replaced child is one `fa orch close
+--superseded-by` closed; the comment names it with its replacement, and says
+the order was applied only when at least one child completed. An approved issue with sub-issues stays ordinary work.
 
 An order record (plan marker, no lane label) also owns every issue its plan
 marker references: the map values and the issues in its acceptance (edit)
@@ -31,7 +33,7 @@ from typing import Any
 from foragent import board, order_parent
 from foragent.i18n import text
 from foragent.labels import APPROVED, BLOCKED, NEEDS_HUMAN, RUNNING
-from foragent.orch_events import append_event
+from foragent.orch_events import append_event, events
 from foragent.tracker import Issue, TrackerError
 
 log = logging.getLogger(__name__)
@@ -169,12 +171,33 @@ def _closed_references(ctx, references: set[int], rows: dict[int, dict[str, Any]
     return closed
 
 
-def closing_comment(language: str, completed: list[int], cancelled: list[int]) -> str:
-    """The one closing comment: the shared record line, then each non-empty group of children."""
-    parts = [text("order_record_closed", language, count=len(completed) + len(cancelled))]
+def superseded(store, n: int) -> int | None:
+    """The issue that replaced #n, from the newest "closed" event `fa orch close` wrote."""
+    found = None
+    for event in events(store, "closed"):
+        if event.get("issue") == n and isinstance(event.get("superseded_by"), int):
+            found = event["superseded_by"]
+    return found
+
+
+
+def closing_comment(language: str, completed: list[int], cancelled: list[int],
+                    replaced: Iterable[tuple[int, int]] = ()) -> str:
+    """The one closing comment: the record line, then each non-empty group of children.
+
+    The shared record line says the order was applied, so it is used only when a
+    child completed, or for an edit-only order (no children, count 0, fa order publish).
+    """
+    replaced = list(replaced)
+    count = len(completed) + len(cancelled) + len(replaced)
+    lead = "order_record_closed" if completed or not count else "order_record_closed_unapplied"
+    parts = [text(lead, language, count=count)]
     for key, group in (("order_closed_completed", completed), ("order_closed_cancelled", cancelled)):
         if group:
             parts.append(text(key, language, children=", ".join(f"#{child}" for child in group)))
+    if replaced:
+        parts.append(text("order_closed_replaced", language,
+                          children=", ".join(f"#{old} -> #{new}" for old, new in replaced)))
     return " ".join(parts)
 
 
@@ -394,10 +417,17 @@ def follow_children(ctx, report) -> None:
                 report.actions.append(summary)
         if closes:
             completed = sorted(child for child, gone in ended.items() if not gone)
-            cancelled = sorted(child for child, gone in ended.items() if gone)
-            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled))
+            cancelled, replaced = [], []
+            for child in sorted(child for child, gone in ended.items() if gone):
+                by = superseded(ctx.store, child)  # The local journal `fa orch close` writes.
+                if by is None:
+                    cancelled.append(child)
+                else:
+                    replaced.append((child, by))
+            ctx.tracker.close_issue(number, closing_comment(language, completed, cancelled, replaced))
+            # The tick's one-line summary keeps today's two counts: a replaced child counts as cancelled.
             report.actions.append(text("parent_closed_report", language, number=number,
-                                       completed=len(completed), cancelled=len(cancelled)))
+                                       completed=len(completed), cancelled=len(cancelled) + len(replaced)))
             state = "Done"
         if state is not None and state != moved:
             board.sync_status(view, number, state, parent=True)
