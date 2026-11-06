@@ -12,4 +12,4 @@
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
 - [Orch facts lock crash](broken_orch_facts_lock_order.md) — fa orch facts exits 1, lock order inversion with sandbox store (#2283)
 - [Init ambiguous skill](broken_init_ambiguous_skill.md) — fa init exits 1 "ambiguous skill" when two plugins ship one skill name
-- [Childless order closes as applied](broken_order_close_no_children.md) — re-approve order closes in 47 s saying 적용됐고 while its issues are open
+- [Childless order closes as applied](broken_order_close_no_children.md) — re-approve order closes in 47 s saying 적용됐고 while its issues are open (confirmed)

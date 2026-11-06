@@ -7,5 +7,5 @@ metadata:
 Goal: the owner reads the order issue to learn whether the ordered work shipped.
 Start: a re-approve order with plan map={} (example #1846, re-approving #1475 #1491 #1791 #1793).
 Repro: `gh issue view 1846 --json createdAt,closedAt,subIssues` → closed 47 s after creation, 0 sub-issues; last comment '이 주문은 적용됐고 열린 하위 이슈가 없어서(끝남 0개) 주문 기록을 닫았어요.' The four issues closed 11–43 h later.
-Failure: the report says "applied" before anything shipped, and the order-ended UX check fires early. Reported 2026-11-06 UNCONFIRMED (needs a second session). Different cause from [[broken-order-close-replaced-child]].
+Failure: the report says "applied" before anything shipped, and the order-ended UX check fires early. Confirmed by a second session 2026-11-06; the visible order body also never names the four issues. Different cause from [[broken-order-close-replaced-child]].
 **How to apply:** recheck on the next re-approve or close-only order; remove once such an order stays open or names its still-open issues.
