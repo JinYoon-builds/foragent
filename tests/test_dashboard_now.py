@@ -574,3 +574,22 @@ def test_merge_turn_is_the_dashboards_reading_and_leaves_shared_status_alone(tmp
         assert word == "차례", word
     else:
         assert word != "차례", word
+
+
+def test_a_failing_projection_never_stops_the_gate_tick(tmp_path, monkeypatch):
+    """#2078: the dashboard is an optional view of the tick; any error while projecting
+    keeps the previous frame and lets the tick finish (the 11-05 replay raised TypeError)."""
+    config, store, _ = regression_fixture(tmp_path)
+    ctx = SimpleNamespace(config=config, store=store, now=lambda: NOW, repo_root=tmp_path)
+    with watch_now.publishing(ctx):
+        pass
+    prior = (tmp_path / "now.json").read_bytes()
+
+    def broken(snapshot, config):
+        raise TypeError("'<' not supported between instances of 'NoneType' and 'str'")
+
+    monkeypatch.setattr(watch_now, "project", broken)
+    finished = []
+    with watch_now.publishing(ctx):
+        finished.append(True)
+    assert finished == [True] and (tmp_path / "now.json").read_bytes() == prior

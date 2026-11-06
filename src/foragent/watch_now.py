@@ -86,8 +86,9 @@ def publishing(ctx):
     finally:
         try:
             publish(ctx)
-        except (OSError, ValueError):
-            # Preserve the previous atomic frame and the scheduling outcome on a failed read/write.
+        except Exception:  # noqa: BLE001 - the dashboard is an optional view of the tick.
+            # Preserve the previous atomic frame and the scheduling outcome on any failed read,
+            # projection or write: the dashboard never decides whether the gate tick succeeds.
             logging.getLogger(__name__).exception("Could not publish dashboard now.json")
 
 
