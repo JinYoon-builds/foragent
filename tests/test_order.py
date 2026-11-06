@@ -5095,6 +5095,39 @@ def test_cleanup_leaves_an_issue_closed_before_this_order_alone(publishing, plan
     assert tracker.get_issue(41).state_reason == "not_planned" and tracker.list_comments(41) == []
 
 
+@pytest.mark.parametrize("language, closed, live", [
+    ("en", "Already closed, no change: #42.", "Would close as completed: #41"),
+    ("ko", "이미 닫혀 있어 바꾸지 않아요: #42.", "완료로 닫을 이슈: #41"),
+])
+def test_cleanup_dry_run_shows_already_closed_targets_without_a_change(publishing, plan, language, closed, live):
+    root, config, tracker, git, events = publishing
+    config = replace(config, language=language)
+    for number in (40, 41, 42, 43):
+        tracker.add_issue(number, f"Old work {number}", "body")
+    tracker.close_issue(42, reason="completed")
+    tracker.close_issue(43, reason="not_planned")
+    plan["closes"] = [{"number": 41, "commit": _CLEANUP_SHA}, {"number": 42, "commit": _CLEANUP_SHA},
+                      {"number": 43, "into": 40}]
+    lines = publish((root, config, tracker, git, events), plan, approve=True, dry_run=True).summary().splitlines()
+    assert closed in lines and any(line.startswith(live) for line in lines)
+    stale = [line for line in lines if "#43" in line]
+    assert len(stale) == 1 and stale[0].startswith(closed.split(":")[0]) and "#40" in stale[0]
+    assert not any(_CLEANUP_SHA in line for line in lines if "#42" in line)
+    assert plan["closes"][1] == {"number": 42, "commit": _CLEANUP_SHA}, "The plan's own items stay unchanged"
+
+
+def test_dry_run_summary_speaks_the_configured_language_and_published_stays_english():
+    rows = [{"number": 3, "title": "로그인", "size": "s", "blocked_by": [], "lane": "api",
+             "approved": True, "interactive": False}]
+    preview = order.PublishReport("계획", 1, rows, ["a.py"], True, language="ko").summary()
+    assert preview.splitlines()[:3] == ["계획 (미리 보기): 계획", "부모: #1", "파일: a.py"]
+    assert "| 번호 | 제목 | 크기 | 먼저 끝낼 이슈 | 승인 | 대화형 |" in preview
+    assert "| 3 | 로그인 | s | — | 예 | 아니요 |" in preview and "lane:api" in preview
+    published = order.PublishReport("Plan", 1, rows, ["a.py"], False, language="ko").summary()
+    assert published.splitlines()[:3] == ["Published: Plan", "Parent: #1", "Files: a.py"]
+    assert "| 3 | 로그인 | s | — | yes | no |" in published
+
+
 @pytest.mark.parametrize("late", [42, 43], ids=["cleanup-target", "replaced-target"])
 def test_a_target_that_starts_running_after_the_checks_refuses_every_close(publishing, plan, monkeypatch, late):
     """Work that starts after the publication checks but before the first close stops all closes."""
