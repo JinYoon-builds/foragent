@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import json
 from math import isfinite
 
+from foragent import orch_facts_promises
 from foragent.actions import flag
 from foragent.ci_workflow import EXCLUSIONS_TRAILER, WORKFLOW, acceptance_command, measurement_scope, read_exclusions
 from foragent.git import GitError
@@ -364,6 +365,14 @@ def comparison(artifacts, repo, base_sha, head_sha, excluded, *, expected_scope,
     return sorted(lost), duration
 
 
+def read(ctx, reports, base_sha, head_sha, excluded, *, expected_scope, expected_shards):
+    """The one reader of CI acceptance reports: ``comparison`` plus main's results (D122)."""
+    result = comparison(reports, ctx.repo, base_sha, head_sha, excluded, expected_scope=expected_scope,
+                        expected_shards=expected_shards)
+    orch_facts_promises.observe(ctx, reports)  # the base side is main as CI measured it
+    return result
+
+
 def _refusal(exc):
     """The refused branch as one word; the exception's text stays detail and decides nothing."""
     if isinstance(exc, MissingComparison):
@@ -462,9 +471,8 @@ def require_comparison(attempt, pr, head, infrastructure="", *, base_sha=None, s
                 if changed_workflows(attempt.git, trusted_sha, measured_head):
                     raise WorkflowChanged("prefix acceptance workflow differs from the default branch")
             try:
-                lost, duration = comparison(reports, ctx.repo, measured_base, measured_head, excluded,
-                                           expected_scope=scope,
-                                           expected_shards=range(ctx.config.ci_shards))
+                lost, duration = read(ctx, reports, measured_base, measured_head, excluded,
+                                      expected_scope=scope, expected_shards=range(ctx.config.ci_shards))
                 if source is not None and any(not scope_covers(item["report"]["scope"], scope)
                         for item in reports):
                     raise StaleComparison("prefix measurement scope no longer covers the current one")

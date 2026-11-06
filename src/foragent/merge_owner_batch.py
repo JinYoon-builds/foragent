@@ -289,8 +289,8 @@ class Evidence:
             return "fail"
         excluded = self.judged_exclusions(ctx)
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-        lost, _ = ci_mode.comparison(reports, ctx.repo, origin, sha, excluded, expected_scope=scope,
-                                    expected_shards=range(ctx.config.ci_shards))
+        lost, _ = ci_mode.read(ctx, reports, origin, sha, excluded, expected_scope=scope,
+                               expected_shards=range(ctx.config.ci_shards))
         if any(not ci_mode.scope_covers(item["report"]["scope"], scope) for item in reports):
             raise ci_mode.StaleComparison("tip measurement scope no longer covers the current one")
         self.passed = not lost
