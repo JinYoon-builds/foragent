@@ -257,6 +257,22 @@ def render(snapshot: Snapshot, config: Config, repo_root: Path, **context: Any) 
     return box + _bar(snapshot, config.language, width, mark, ascii=ascii)
 
 
+def _goal(state: dict | None, number: int) -> str:
+    """The first line of the issue's recorded Goal, or "" when no local record has one."""
+    from foragent import watch
+    from foragent.issue import parse_body
+
+    store = (state or {}).get("store")
+    if store is None:
+        return ""
+    try:
+        row = next((row for row in store.local_issues() if row.get("number") == number), None)
+    except (OSError, ValueError):
+        return ""
+    goal = parse_body((row or {}).get("body") or "").goal
+    return watch._clean(goal.splitlines()[0]) if goal else ""
+
+
 def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Config, repo_root: Path, *,
             now: datetime, width: int, state: dict | None) -> list[Line] | None:
     """An acorn's rows: #N and title (one row), its lane, what it is doing and for how long,
@@ -286,6 +302,9 @@ def explain(target: tuple[str, int | str | None], snapshot: Snapshot, config: Co
     paths = watch_scene.owned_paths(snapshot, config, slug)
     rows = [watch_scene.fit_marked([(watch._clean(f"#{number} {item['title']}".rstrip()), "bold")],
                                    width, _ellipsis(config))]
+    goal = _goal(state, number)
+    if goal:
+        rows.append(watch_scene.fit_marked([(goal, "")], width, _ellipsis(config)))
     rows.append([(t("lane_bubble_lane_paths", lane=name, paths=", ".join(paths)) if paths
                   else t("lane_bubble_lane", lane=name), "")])
     kind, run, phase = item["class"], item["run"], item["phase"]

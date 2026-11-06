@@ -25,7 +25,7 @@ def main(argv: list[str]) -> None:
     # Every setting the build reads crosses the process boundary in the request.
     context = SimpleNamespace(
         repo_root=root, store=StateStore(Path(request["store_root"])), git=GitRepo(root),
-        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request["test_slots"],
+        config=Config(acceptance_dir=request["acceptance_dir"], test_slots=request.get("test_slots"),
                       repo=request.get("repo")),
         now=lambda: datetime.now(UTC), monotonic=monotonic,
     )

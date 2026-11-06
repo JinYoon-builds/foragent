@@ -4,7 +4,6 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, ExitStack
 from dataclasses import dataclass
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -903,14 +902,14 @@ def main_write_lock(git: object) -> Iterator[None]:
         finally:
             held[key] -= 1
         return
-    with open(key, "a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    from foragent.file_locks import file_lock
+
+    with file_lock(Path(key)):
         held[key] = 1
         try:
             yield
         finally:
             del held[key]
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def slug_from_url(url: str) -> str | None:
