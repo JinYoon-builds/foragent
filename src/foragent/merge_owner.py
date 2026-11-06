@@ -36,7 +36,10 @@ def start(ctx, report):
     """Reserve and transfer the owner lock; never wait for network, Git or checks."""
     if not getattr(ctx.config, "merge_owner", False):
         return
+    from foragent import main_write_requests
+
     if (not getattr(ctx.config, "merge_batch", False) and not admissions(ctx.store)
+            and not main_write_requests.pending(ctx.store)
             and not any((ctx.store.root / "merge-owner").glob("*.json"))):
         return
     if orch_stop.active(ctx.store) is not None:
@@ -702,6 +705,9 @@ def tick(ctx, report):
 
 def _tick(owner, report):
     ctx = owner
+    from foragent import main_write_requests
+
+    main_write_requests.drain(ctx, report)
     entries = admissions(ctx.store)
     candidates = {}
     for key, row in entries.items():
