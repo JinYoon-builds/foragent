@@ -4,7 +4,6 @@
 - [Init ambiguous skill](broken_init_ambiguous_skill.md) — fa init exits 1 on duplicate plugin skill names, no way to choose
 - [Closes preview already closed](broken_closes_preview_already_closed.md) — dry run promises to close an already-closed issue
 - [Init setup failure output](broken_init_setup_failure_output.md) — fa init flattens checklist fix to one line, Korean with language en
-- [Stop has no person restart](broken_stop_no_person_release.md) — fa stop's undo is only internal fa orch release, unnamed in help
 - [Review empty diff silent PASS](broken_review_empty_diff.md) — fa review on no-change branch: 4 min silence, PASS, Ctrl-C hangs (confirmed)
 - [Greeting wordmark letters](broken_greeting_wordmark_letters.md) — FORAGENT pixel word reads EORAGENI (F/T bottom bars)
 - [Order close hides replacement](broken_order_close_replaced_child.md) — order roll-up says 적용/완료 for a child closed as replaced
