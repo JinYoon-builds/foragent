@@ -17,6 +17,13 @@ target has moved. It verifies the refreshed head and waits for its own CI eviden
 merging, it holds the merge and main-write locks and reads the approval, issue, PR head, target,
 policy and evidence again. It merges only the checked head. Failed checks return the work for
 repair; a lost response is reconciled against the PR before another action.
+For order publications, the owner consumes a red check for the exact request set on its recorded
+commit or a forward move proved result-neutral by D111. Certified requests share D85's flush write,
+one commit and one push; failed combinations retry singly in later passes. The flush journal and Git
+history resume incomplete issues with each member's lane context. Refused requests keep their diagnostics.
+Other moves stay pending for the independent checker while main writes
+and batches proceed. Missing node baselines are measured on the prepared commit before the target;
+rejections reach the next writer through preparation history. Saved push intent survives a crash.
 
 This repository has `merge_owner: true` in `.foragent.yml` (switched on 2026-11-04).
 The product default remains off. This repository also enables `merge_batch`: the owner builds
@@ -53,9 +60,12 @@ commands that demonstrate completion. A lane drafts acceptance checks before app
 them. The approval records the agreed issue and acceptance files, so an implementation cannot
 silently change what passing means. The planning session decides what to build; the lane chooses
 how to implement it within that agreement.
+The gate starts a separate red-check process outside the owner lock, using the machine's test slots.
+It records target-bound failing test node ids and certifies all members with their combined files,
+without another review; changed individual failures return to preparation. Neutral moves reuse evidence.
 
 Code: `skills/fa-order/SKILL.md`, `src/foragent/order.py`, `src/foragent/scheduler_approval.py`,
-`src/foragent/run_checks_approved.py`.
+`src/foragent/run_checks_approved.py`, `src/foragent/order_publications.py`.
 Origins: #1570 (whole authored issue reaches workers and reviewers), #1679 (approval across retries);
 D98, D100 and D103 in [decisions](decisions.md).
 
