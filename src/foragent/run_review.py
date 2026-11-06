@@ -30,7 +30,7 @@ from foragent.run_prompts import (
     build_review_prompt, lane_decisions_section, review_scope_rules,
 )
 from foragent.review_single import first_review_findings, next_review_round as _next_review_round, single_review
-from foragent.run_waits import _phase, _progress, _timeout
+from foragent.run_waits import _phase, _progress, _timeout, record_pass
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -259,6 +259,7 @@ def _finish_review(n: int, ctx: RunContext, review: ReviewResult, round_number: 
     passed = review.verdict == "PASS" and not review.conflicts
     if passed:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        record_pass(n, ctx)
     facts = review_pass_scope.review_facts(n, ctx, git, passed)
     log = ctx.store.log_path(n)
     _append(log, f"Review: VERDICT: {review.verdict}\n{review.findings}"
@@ -626,6 +627,7 @@ def _review_only(n: int, ctx: RunContext, worktree: Path, verdict_head: str | No
         return _hold_changed_head(n, ctx, link)
     if verdict_head is not None:
         ctx.store.update_run(n, last_review_pass_at=ctx.now().isoformat())
+        record_pass(n, ctx)
         # The orchestrator's verdict for this exact head stands in for a reviewer round.
         _journal_review(n, ctx, "PASS", "", _next_review_round(n, ctx), source="orchestrator",
                         body_sha=approval.body_sha)
