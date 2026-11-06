@@ -13,3 +13,5 @@
 - [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
 - [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
 - [Orch facts lock crash](broken_orch_facts_lock_order.md) — fa orch facts exits 1, lock order inversion with sandbox store (#2283)
+- [Init ambiguous skill](broken_init_ambiguous_skill.md) — fa init exits 1 "ambiguous skill" when two plugins ship one skill name
+- [Stop has no person release](broken_stop_no_person_release.md) — fa stop's undo is hidden as fa orch release; help never names it
