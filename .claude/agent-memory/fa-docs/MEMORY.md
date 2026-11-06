@@ -31,6 +31,7 @@
 - r804 (2026-11-05): order #2102 (#2103, merge 14c7afc3) — rules.md add D124 line after :59 (+ optional mechanisms.md:23 clause). Wait: orchestrator judges.
 - r449: closed by #1856 (merge 04a16091, D125 review-scoring lines in rules.md/gate.md).
 - r819 (2026-11-06): orders #1785/#1795/#1846/#2177/#2181 — npx foragent E404 (npm unpublished, Jin A publish/B curl-only); then launch posts hn/geeknews en+ko install lines → one-line install + /fa. Wait: orchestrator relays.
+- r838 (2026-11-06): orders #1033..#2193 — mechanisms.md 'Facts and the architect' add #2125 orchestrator stall signals sentence + orch_facts_stall.py/Origins. Wait: orchestrator judges, then docs applies.
 - r324/r383/r420: closed 2026-11-04 by order #1826 (child #1827, merge 9f883b2), docs/order.md end paragraphs.
 
 ## Lessons
@@ -100,3 +101,4 @@
 - Install-path changes (#1475 one-line installer) update README in the same merge but not docs/launch/*; grep launch posts for `uv tool install`/`fa init`. Check `npm view <pkg>` before trusting a README `npx` line.
 - 'Re-approve #NNNN' / '#NNNN test correction' orders (#1795/#1846/#2177) carry empty bodies; check the named issue's merge only.
 - Test-layout orders (#1951/#1952 tests/helpers split, #1990 its lock fix) touch no reader doc; docs only name `tests/acceptance/` (gate.md/contract.md acceptance_dir). Check the merge --stat is tests/ only.
+- Orders that write their own Dnn plus rules.md line (#2128 → D127) need only a dup-ID check. Library-only landings (#1040 skills.py, wiring later) get no doc line until wired. New orchestrator signal kinds (#2125 stall) go in mechanisms.md 'Facts and the architect'.

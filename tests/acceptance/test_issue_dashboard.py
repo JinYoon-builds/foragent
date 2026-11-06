@@ -3,7 +3,8 @@
 A lane run is headless, so a person who opens its worktree sees no tab, only the raw
 machine log. `fa dashboard <N> --once` (or `fa dashboard --once` inside the issue's lane
 worktree) prints the dashboard focused on that one issue: its phase, the latest step,
-the last review verdict and the CI state. It is read-only.
+and the last review verdict. It is read-only. (Jin 2026-11-06, q21: the CI line
+is left out of this view; it comes in a later issue after the merge-path cleanup.)
 
 Wording and layout are the lane's: facts are checked by number and by the output changing
 when only that fact changes, never by fixed words.
@@ -84,20 +85,6 @@ def test_dashboard_for_one_issue_shows_that_issue_with_phase_review_and_ci(
     # Last review verdict: the same first round, only the newest round's verdict differs.
     _reviews(case, ["FAIL", "FAIL"])
     assert _show(main, capsys, "1")[1] != out, "the last review verdict (not an earlier one) must be shown"
-
-
-def test_dashboard_for_one_issue_shows_a_recorded_ci_failure(git_history, tmp_path, monkeypatch, capsys):
-    case, main = _case(git_history, tmp_path, monkeypatch)
-    _reviews(case, ["PASS"])
-    # After a CI failure the runner returns the issue to implementing for another attempt.
-    case.store.update_run(1, phase="implementing", attempts=2)
-    code, before, err = _show(main, capsys, "1")
-    assert code == 0, err
-    run = case.store.get_run(1)
-    case.store.record_flow("ci-failure", issue=1, run_started_at=run.started_at, pr=41, head="abc1234")
-    after = _show(main, capsys, "1")[1]
-    assert "#1" in after
-    assert after != before, "the CI state of the issue's pull request (here: failed) must be shown"
 
 
 def test_dashboard_inside_a_lane_worktree_needs_no_issue_number(git_history, tmp_path, monkeypatch, capsys):
