@@ -106,8 +106,9 @@ def tick(ctx: TickContext) -> TickReport:
                 with step("reap_inactive_runs"):
                     _reap_inactive_runs(ctx, cleanup)
             if getattr(ctx.config, "merge_owner", False):
-                from foragent import merge_owner
+                from foragent import merge_owner, order_publications_process
 
+                order_publications_process.start(ctx, cleanup)
                 merge_owner.start(ctx, cleanup)
             timed("usage_recheck", usage_recheck.recheck, ctx)  # Free usage reads, also during a GitHub wait; frees this tick's starts.
             timed("plan_expiry", orch_plan.record_expiry, ctx.store, ctx.now())  # Local journal, also during a GitHub wait.

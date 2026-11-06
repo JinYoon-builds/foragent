@@ -132,6 +132,12 @@ def revision_notes(entry: dict | None) -> str:
              + "".join(f"- {reason}\n" for reason in reasons)) if reasons else ""
     if entry and entry.get("status") == "conflict":
         notes += "\n## Candidate file conflict\n" + entry["reason"] + "\n"
+    if entry:
+        checks = [attempt["reason"] for attempt in entry.get("attempts", [])
+                  if attempt.get("role") == "publication-checker" and _scoped(entry, attempt)]
+        if checks:
+            notes += "\n## Earlier publication checks\nRevise the tests using these measured diagnostics:\n"
+            notes += "".join(f"- {reason}\n" for reason in checks)
     return notes
 
 
