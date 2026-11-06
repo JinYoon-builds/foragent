@@ -594,6 +594,7 @@ def _verify_contents(attempt: Implementation) -> str:
     from foragent.run_publish import _check_publication
     from foragent.ci_mode import enabled
     from foragent.ci_local import verify_local_only_units
+    from foragent import review_pass_scope
 
     n, ctx, git = attempt.n, attempt.ctx, attempt.git
     worktree, log = attempt.worktree, attempt.log
@@ -636,7 +637,11 @@ def _verify_contents(attempt: Implementation) -> str:
         unit_command = _pytest_command(test_command) if test_command else None
         own_only = ctx.config.runner_unit_tests != "all" and (
             enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config))
-        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir, own_only=own_only)
+        # A conflict resolution after a PASS re-checks only what it or main's new commits touched (#2310).
+        recheck = (review_pass_scope.recheck_paths(n, ctx, git, attempt.start_ref)
+                   if getattr(attempt, "post_pass_resolution", False) else None)
+        unit_tests = _related_unit_tests(worktree, attempt.paths if recheck is None else recheck,
+                                         ctx.config.acceptance_dir, own_only=own_only)
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:

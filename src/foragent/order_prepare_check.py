@@ -14,6 +14,9 @@ voids the measurement. The copy lives at ``review-N/check`` and is removed after
 
 from __future__ import annotations
 
+import json
+import os
+import shlex
 import shutil
 from pathlib import Path
 
@@ -21,21 +24,143 @@ from foragent import capacity, order_scratch, processes
 
 OUTPUT_TAIL = 20_000  # the end holds pytest's summary and the runner's last line
 
+# Pytest owns node ids and outcomes. Keep its reports outside the measured tree,
+# with one file per session so a shell command can invoke pytest more than once.
+_NODE_REPORTER = '''
+import json
+import os
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+
+
+def pytest_sessionstart(session):
+    global _session
+    _session = session
+    session._foragent_red = {"collected": None, "reports": [], "collection_error": False}
+
+
+def _nodeid(nodeid, path=None):
+    name, separator, suffix = nodeid.partition("::")
+    source = Path(path) if path is not None else Path(_session.config.rootpath) / name
+    try:
+        relative = source.resolve().relative_to(Path(os.environ["FORAGENT_RED_TREE"]).resolve())
+    except ValueError:
+        _session._foragent_red["collection_error"] = True
+        return nodeid
+    return relative.as_posix() + separator + suffix
+
+
+def pytest_collection_finish(session):
+    session._foragent_red["collected"] = [_nodeid(item.nodeid, item.path) for item in session.items]
+
+
+def pytest_collectreport(report):
+    if report.failed:
+        _session._foragent_red["collection_error"] = True
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_node_collection_finished(node, ids):
+    facts = _session._foragent_red
+    ids = [_nodeid(nodeid) for nodeid in ids]
+    if facts["collected"] is None:
+        facts["collected"] = list(ids)
+    elif set(facts["collected"]) != set(ids):
+        facts["collection_error"] = True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = (yield).get_result()
+    # xdist serializes report attributes and delivers them to the controller.
+    report.foragent_red = (report.when == "call" and report.failed and call.excinfo is not None
+                           and not hasattr(report, "wasxfail"))
+
+
+def pytest_runtest_logreport(report):
+    _session._foragent_red["reports"].append({
+        "nodeid": _nodeid(report.nodeid), "when": report.when, "outcome": report.outcome,
+        "red": getattr(report, "foragent_red", False),
+    })
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if hasattr(session.config, "workerinput"):
+        return  # Workers execute subsets; only the controller has all outcomes.
+    facts = session._foragent_red
+    facts.update(exit_code=int(exitstatus))
+    path = Path(os.environ["FORAGENT_RED_REPORTS"]) / (uuid4().hex + ".json")
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(facts), encoding="utf-8")
+    temporary.replace(path)
+'''
+
+
+def _node_facts(directory: Path) -> dict:
+    """Only complete pytest sessions prove collection and actual failing calls."""
+    unavailable = dict.fromkeys(("failing_node_ids", "collected_node_ids", "nonred_node_ids"))
+    collected, failing, nonred = set(), set(), set()
+    paths = list(directory.glob("*.json"))
+    if not paths:
+        return unavailable
+    try:
+        for path in paths:
+            session = json.loads(path.read_text(encoding="utf-8"))
+            selected = session["collected"]
+            reports = session["reports"]
+            if (session["exit_code"] not in (0, 1) or session["collection_error"]
+                    or not selected or any(report["when"] in {"setup", "teardown"}
+                                           and report["outcome"] == "failed" for report in reports)):
+                return unavailable
+            calls = {report["nodeid"]: report for report in reports if report["when"] == "call"}
+            # Early stopping, skips in setup, or a crash do not prove all selected tests ran.
+            if set(calls) != set(selected):
+                return unavailable
+            collected.update(selected)
+            failing.update(node for node, report in calls.items() if report["red"])
+            nonred.update(node for node, report in calls.items() if not report["red"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return unavailable
+    return {"failing_node_ids": sorted(failing - nonred), "collected_node_ids": sorted(collected),
+            "nonred_node_ids": sorted(nonred)}
+
 
 def run(git, base: str, context, place, verify, commands: list[str], directory: Path,
-        timeout_s: int) -> list[dict]:
+        timeout_s: int, *, collect_node_ids: bool = False) -> list[dict]:
     """``{"command", "exit_code", "timed_out", "output", "changed"}`` per command.
 
-    Each command gets its own new copy at ``directory/check``, so nothing one command leaves behind
+    Each command gets its own new copy under ``directory``, so nothing one command leaves behind
     reaches the next. ``place(tree)`` adds the candidates exactly as the reviewer's tree has them;
     ``verify(tree, manifest, before)`` is the reviewer tree's own integrity check, run on the copy
     after the command: a run that changed, removed or touched a candidate or any other file of base
     measured something else, so its ``changed`` paths void it. The prepare caller already holds a
     test slot, so ``capacity.HELD_ENV`` keeps an inner `fa test` from waiting for a second one.
+    ``collect_node_ids`` additionally records pytest's exact collection and call failures for
+    off-owner publication checks, without interpreting terminal output or starting a reviewer.
     """
     copy, log = directory / "check", directory / "check.log"
+    if collect_node_ids:
+        plugin = directory / "pytest-reporter"
+        plugin.mkdir()
+        # Pytest discovers this parent conftest by path, even if a command assigns
+        # PYTHONPATH or uses its own interpreter. Keep instrumentation outside
+        # the measured tree and preserve the project's own pytest configuration.
+        (plugin / "conftest.py").write_text(_NODE_REPORTER, encoding="utf-8")
+        copy = plugin / "check"
     results = []
-    for command in commands:
+    for number, command in enumerate(commands):
+        environment = {**capacity.HELD_ENV, "UV_PROJECT": None, "UV_WORKING_DIRECTORY": None,
+                       "UV_WORKING_DIR": None, "UV_PROJECT_ENVIRONMENT": None, "UV_NO_SYNC": None,
+                       "PYTHONPATH": None}
+        if collect_node_ids:
+            reports = directory / f"pytest-reports-{number}"
+            reports.mkdir()
+            environment.update(PYTEST_ADDOPTS=(os.environ.get("PYTEST_ADDOPTS", "")
+                                              + " --confcutdir=" + shlex.quote(str(plugin.resolve()))),
+                               FORAGENT_RED_REPORTS=str(reports.resolve()), FORAGENT_RED_TREE=str(copy.resolve()),
+                               PYTHONDONTWRITEBYTECODE="1")
         try:
             manifest = order_scratch.build(git, base, copy, context)
             place(copy)
@@ -45,9 +170,7 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
                 start = handle.tell()
             code, timed_out, _ = processes.run_logged(
                 order_scratch.command_argv(copy, command), cwd=copy, timeout_s=timeout_s, log_path=log,
-                env={**capacity.HELD_ENV, "UV_PROJECT": None, "UV_WORKING_DIRECTORY": None,
-                     "UV_WORKING_DIR": None, "UV_PROJECT_ENVIRONMENT": None, "UV_NO_SYNC": None,
-                     "PYTHONPATH": None})
+                env=environment)
             changed = verify(copy, manifest, before)
         finally:
             shutil.rmtree(copy, ignore_errors=True)
@@ -55,7 +178,8 @@ def run(git, base: str, context, place, verify, commands: list[str], directory: 
             handle.seek(start)
             output = handle.read().decode("utf-8", "replace")
         results.append({"command": command, "exit_code": code, "timed_out": timed_out,
-                        "output": output[-OUTPUT_TAIL:], "changed": changed})
+                        "output": output[-OUTPUT_TAIL:], "changed": changed,
+                        **(_node_facts(reports) if collect_node_ids else {})})
     return results
 
 

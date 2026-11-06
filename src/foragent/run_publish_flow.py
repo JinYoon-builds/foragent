@@ -107,6 +107,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             attempt.base_refresh = False
             attempt.related_to_ci = False
             attempt.main_changed = None
+            attempt.post_pass_resolution = False
 
     def refresh_moved_base(move: BaseMove, conflicts: list[str] | None, neutral: bool | None,
                            related_local: bool) -> str:
@@ -127,6 +128,8 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
             conflicts = _merge_moved_base(attempt, move.target_sha)
         changed = covered = False
         if conflicts:
+            # After a PASS only the resolution and main's new commits are re-checked here; PR CI runs all.
+            attempt.post_pass_resolution = review_pass_scope.applies(n, ctx, git)
             _resolve_conflicts(attempt, conflicts)
         else:
             # Only the base merged in: a reviewer PASS of the previous head still covers the code (#2147).
