@@ -184,31 +184,73 @@ class GitRepo:
         output = self._call(["status", "--porcelain", "--ignored", "--untracked-files=all", "-z"])
         return [entry[3:] for entry in output.split("\0") if len(entry) > 3]
 
-    def keep_unsaved_copy(self, dest: Path) -> list[str]:
-        """Copy every non-ignored changed or untracked file no commit holds into ``dest``.
+    def _git_bytes(self, args: list[str]) -> bytes:
+        """Raw stdout: no text decoding, so CR and other bytes in path names survive."""
+        try:
+            return subprocess.run(["git", "-c", "core.precomposeUnicode=false", "--literal-pathspecs", *args],
+                                  cwd=self.root, check=True, capture_output=True, timeout=120).stdout
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise GitError(os.fsdecode(getattr(exc, "stderr", b"") or b"") or str(exc)) from exc
 
-        Files keep their worktree-relative paths, as plain bytes (a symlink stays a link).
-        Deletions, directories (submodules) and Foragent's own `.foragent/` files are left out;
-        ``dest`` is created only when there is something to copy. Returns the copied paths.
+    def unsaved_files(self) -> list[str]:
+        """Non-ignored files on disk whose bytes no commit holds: changed, staged, untracked.
+
+        Deleted paths, directories (submodules), Foragent's own `.foragent/` files and paths
+        under a symlinked directory (their bytes live outside the worktree) are left out.
+        Files the index marks assume-unchanged or skip-worktree are compared by content.
         """
-        entries = iter(self._call(["status", "--porcelain=v1", "-z", "--untracked-files=all"]).split("\0"))
-        names: list[str] = []
-        for entry in entries:
-            if len(entry) < 4:
-                continue
-            if "R" in entry[:2] or "C" in entry[:2]:
-                next(entries, None)  # The source path of a rename or copy follows; its bytes are not kept.
-            name = entry[3:]
-            if name.split("/", 1)[0] in ARTIFACT_PATHS or name in names:
+        def names(raw: bytes) -> list[str]:
+            return [os.fsdecode(name) for name in raw.split(b"\0") if name]
+
+        found = names(self._git_bytes(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"]))
+        found += names(self._git_bytes(["ls-files", "--others", "--exclude-standard", "-z"]))
+        flagged = [entry[2:] for entry in names(self._git_bytes(["ls-files", "-v", "-z"]))
+                   if entry[:1].islower() or entry[:1] == "S"]
+        if flagged := [name for name in flagged if (self.root / name).is_file()]:
+            heads = {}
+            for entry in self._git_bytes(["ls-tree", "-z", "HEAD", "--", *flagged]).split(b"\0"):
+                if entry:
+                    meta, _, name = entry.partition(b"\t")
+                    heads[os.fsdecode(name)] = meta.split()[2].decode()
+            hashes = self._git_bytes(["hash-object", "--", *flagged]).decode().split()
+            found += [name for name, sha in zip(flagged, hashes) if heads.get(name) != sha]
+        kept: list[str] = []
+        for name in dict.fromkeys(found):
+            parts = name.split("/")
+            if parts[0] in ARTIFACT_PATHS or any(
+                    (self.root.joinpath(*parts[:i])).is_symlink() for i in range(1, len(parts))):
                 continue
             source = self.root / name
-            if os.path.lexists(source) and (source.is_symlink() or source.is_file()):
-                names.append(name)
+            if source.is_symlink() or source.is_file():
+                kept.append(name)
+        return kept
+
+    def copy_files(self, names: Iterable[str], dest: Path) -> tuple[list[str], list[tuple[str, str]]]:
+        """Copy each file's bytes (a symlink as a link) to the same relative path under ``dest``.
+
+        One file's failure does not stop the others; it is returned with its reason. A target
+        whose parent inside ``dest`` is not a real directory is refused, so nothing is written
+        outside ``dest``.
+        """
+        copied: list[str] = []
+        failed: list[tuple[str, str]] = []
         for name in names:
-            target = dest / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(self.root / name, target, follow_symlinks=False)
-        return names
+            try:
+                parent = dest
+                for part in name.split("/")[:-1]:
+                    parent = parent / part
+                    if not parent.exists() and not parent.is_symlink():
+                        parent.mkdir()
+                    if parent.is_symlink() or not parent.is_dir():
+                        raise OSError(f"{parent} is not a directory inside the backup")
+                target = parent / name.split("/")[-1]
+                if target.exists() or target.is_symlink():
+                    raise FileExistsError(f"{target} already exists")
+                shutil.copy2(self.root / name, target, follow_symlinks=False)
+                copied.append(name)
+            except OSError as exc:
+                failed.append((name, str(exc)))
+        return copied, failed
 
     def add_worktree(self, path: Path, branch: str, base_ref: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
@@ -936,33 +937,89 @@ def test_keep_unsaved_copy_copies_changed_untracked_staged_and_renamed_bytes_onl
     (root / ".foragent" / "TRY.md").write_text("runner scratch\n")
     (root / "deep" / "dir").mkdir(parents=True)
     (root / "deep" / "dir" / "new file.txt").write_bytes(b"untracked\n")
+    (root / "draft\rname.txt").write_bytes(b"carriage return in the name\n")
+    (root / "HEAD").write_bytes(b"a file named like a revision\n")
     (root / "link").symlink_to("staged.txt")
     dest = tmp_path / "backup"
+    dest.mkdir()
 
-    kept = git.keep_unsaved_copy(dest)
+    names = git.unsaved_files()
+    copied, failed = git.copy_files(names, dest)
 
-    assert sorted(kept) == [".gitignore", "deep/dir/new file.txt", "link", "renamed.py", "staged.txt"]
+    assert failed == [] and copied == names
+    assert sorted(names) == sorted([".gitignore", "HEAD", "deep/dir/new file.txt", "draft\rname.txt", "link",
+                                    "renamed.py", "staged.txt"])
     assert (dest / "renamed.py").read_bytes() == b"renamed and edited\n"
     assert (dest / "staged.txt").read_bytes() == b"staged, never committed \xea\xb0\x80\n"
-    assert (dest / "deep" / "dir" / "new file.txt").read_bytes() == b"untracked\n"
+    assert (dest / "draft\rname.txt").read_bytes() == b"carriage return in the name\n"
+    assert (dest / "HEAD").read_bytes() == b"a file named like a revision\n"
     assert (dest / "link").is_symlink() and (dest / "link").readlink() == Path("staged.txt")
     assert not (dest / ACCEPTANCE).exists() and not (dest / "cache").exists() and not (dest / ".foragent").exists()
-    assert sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if not p.is_dir()) == sorted(kept)
+    assert sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if not p.is_dir()) == sorted(names)
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_keep_unsaved_copy_reads_files_the_index_marks_unchanged(git_history, tmp_path, flag):
+    root = git_history.clone
+    git = GitRepo(root)
+    git_command(root, "update-index", flag, ACCEPTANCE)
+    assert GitRepo(root).unsaved_files() == []  # Flagged but unchanged: nothing to keep.
+    (root / ACCEPTANCE).write_bytes(b"edited behind the index flag\n")
+    assert git_command(root, "status", "--porcelain") == ""  # Git itself hides the edit.
+    assert git.unsaved_files() == [ACCEPTANCE]
+
+
+def test_keep_unsaved_copy_never_writes_through_a_symlinked_directory(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "test_feature.py").write_bytes(b"outside bytes\n")
+    tracked_dir = root / ACCEPTANCE.rsplit("/", 1)[0]
+    shutil.rmtree(tracked_dir)
+    tracked_dir.symlink_to(outside)  # A tracked directory replaced by a symlink to elsewhere.
+    git_command(root, "add", "-A")
+    dest = tmp_path / "backups" / "new"
+    dest.mkdir(parents=True)
+    names = git.unsaved_files()
+    assert names == [ACCEPTANCE.rsplit("/", 1)[0]]  # The link itself, not files reached through it.
+    copied, failed = git.copy_files(names + [ACCEPTANCE], dest)  # Even a forced name cannot escape.
+    assert copied == names and [name for name, _ in failed] == [ACCEPTANCE]
+    assert (outside / "test_feature.py").read_bytes() == b"outside bytes\n"
+    assert (dest / names[0]).is_symlink()
+    empty = tmp_path / "elsewhere"
+    empty.mkdir()
+    (dest / "evil").symlink_to(empty)  # A link already in the backup, with nothing behind it.
+    (root / "evil").mkdir()
+    (root / "evil" / "x.txt").write_bytes(b"must stay inside the backup\n")
+    copied, failed = git.copy_files(["evil/x.txt"], dest)
+    assert copied == [] and [name for name, _ in failed] == ["evil/x.txt"] and list(empty.iterdir()) == []
+
+
+def test_keep_unsaved_copy_one_unreadable_file_does_not_stop_the_others(git_history, tmp_path):
+    root = git_history.clone
+    git = GitRepo(root)
+    (root / "a-no-read.txt").write_bytes(b"secret\n")
+    (root / "a-no-read.txt").chmod(0)
+    (root / "z-good.txt").write_bytes(b"good\n")
+    dest = tmp_path / "backup"
+    dest.mkdir()
+    try:
+        copied, failed = git.copy_files(sorted(git.unsaved_files()), dest)
+    finally:
+        (root / "a-no-read.txt").chmod(0o644)
+    assert copied == ["z-good.txt"] and [name for name, _ in failed] == ["a-no-read.txt"]
+    assert (dest / "z-good.txt").read_bytes() == b"good\n"
 
 
 def test_keep_unsaved_copy_skips_deletions_and_makes_nothing_for_a_clean_tree(git_history, tmp_path):
     root = git_history.clone
     git = GitRepo(root)
-    dest = tmp_path / "backup"
-    assert git.keep_unsaved_copy(dest) == [] and not dest.exists()
+    assert git.unsaved_files() == []
     (root / ACCEPTANCE).unlink()  # A deletion holds no bytes to keep.
-    assert git.keep_unsaved_copy(dest) == [] and not dest.exists()
+    assert git.unsaved_files() == []
 
 
 def test_keep_unsaved_copy_status_failure_raises_git_error(tmp_path):
-    def broken(args):
-        raise subprocess.CalledProcessError(128, ["git", *args], stderr="fatal: index file corrupt")
-
-    with pytest.raises(GitError, match="index file corrupt"):
-        GitRepo(tmp_path, broken).keep_unsaved_copy(tmp_path / "backup")
-    assert not (tmp_path / "backup").exists()
+    with pytest.raises(GitError, match="(?i)not a git repository"):
+        GitRepo(tmp_path).unsaved_files()
