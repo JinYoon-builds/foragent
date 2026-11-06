@@ -356,7 +356,7 @@ def _publish_in_turn(attempt: Implementation, place: merge_turn.Seat) -> str:
     while True:
         run_publish._phase(n, ctx, "ci")
         try:
-            with activity(n, ctx, "ci", ci_cause):
+            with activity(n, ctx, "ci", ci_cause, head=verified_head_sha):
                 stopped = run_publish._wait_for_ci(n, ctx, git, pr, verified_head_sha, pr_ready_at,
                                                    ci_wait, ci_failed, queued_status,
                                                    comparison_mode=run_publish.enabled(ctx, attempt.target_branch),

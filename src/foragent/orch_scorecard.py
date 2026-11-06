@@ -17,6 +17,7 @@ from typing import Any
 
 from foragent import orch_facts_decided as decided, orch_roles, orch_scorecard_flow as flow, orch_scorecard_main_tests as main_tests
 from foragent import orch_scorecard_reverts as reverts
+from foragent import orch_scorecard_lead as lead
 from foragent.config import Config
 from foragent.orch_binding import scorecard as binding
 from foragent.i18n import text
@@ -180,10 +181,11 @@ def _decided(store: StateStore, now: datetime, days: int) -> tuple[dict[str, Any
 
 
 def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
-            revert_times: list[datetime] | None = None) -> dict[str, Any]:
+            revert_times: list[datetime] | None = None, *, repo_root: Path | None = None) -> dict[str, Any]:
     """The card; ``lanes`` (the config's lanes) places issues in lanes for plan pauses.
 
     ``revert_times`` are the default branch's revert commit times; None leaves reverts unknown.
+    ``repo_root`` dates linked decisions from the working tree; None leaves that stage unknown.
     """
     now = store._now()
     runs, events = _runs(store, now, days, _issues(store, lanes or {})), _events(store, now, days)
@@ -203,7 +205,7 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
         value = _median([day[name] for day in daily[1:] if day[name] is not None])
         previous[name] = _half_up(value) if name in INTEGERS and value is not None else value
     previous["phase_minutes"], previous["load"] = _phases([event for index, event in events if index > 0])
-    flows = flow.daily(store, now, days, lanes)
+    flows = flow.daily(store, now, days, lanes, repo_root=repo_root)
     today.update(flows[0])
     previous.update(flow.previous(flows[1:]))
     previous["merges"] = _half_up(previous["merges"]) if previous["merges"] is not None else None
@@ -214,11 +216,16 @@ def collect(store: StateStore, days: int = 7, lanes: dict | None = None,
     today.update(now_decided)
     previous.update(before_decided)
     worse = _worse(today, previous) + flow.worse_names(today, previous)
+    now_efficiency, before_efficiency = today["flow_efficiency"]["median"], previous["flow_efficiency"]["median"]
+    if now_efficiency is not None and before_efficiency is not None and now_efficiency < before_efficiency:
+        worse.append("flow_efficiency")
+    worse += lead.worse_names(today["lead_time"], previous["lead_time"])
     now_count, before_count = today["main_tests"]["count"], previous["main_tests"]["count"]
     if now_count is not None and before_count is not None and now_count > before_count:
         worse.append("main_tests")
     repeated, unexplained = _failures([run for index, run in runs if index == 0])
     return {"now": now.isoformat(), "days": days, "window": {"today": today, "previous": previous},
+            "lead_time_daily": [day["lead_time"]["medians"] for day in flows],
             "worse": worse, "repeated_failures": repeated,
             "unexplained_failures": unexplained}
 
@@ -234,8 +241,8 @@ def _minutes(value: float | None) -> str:
 
 
 def _shown(name: str, value: Any) -> str:
-    """A metric for people: the merge rate as a percentage, the rest as numbers."""
-    return _number(None if value is None else value * 100, "%") if name == "merge_rate" else _number(value)
+    """Rates and efficiencies as percentages; other metrics as numbers."""
+    return _number(None if value is None else value * 100, "%") if name in {"merge_rate", "flow_efficiency"} else _number(value)
 
 
 def _reverts_text(value: int | None, language: str) -> str:
@@ -296,6 +303,10 @@ def _pair(card: dict[str, Any], name: str) -> tuple[Any, Any]:
     """(before, now) for a metric in ``card["worse"]``, phases included."""
     today, previous = card["window"]["today"], card["window"]["previous"]
     group, _, key = name.partition(".")
+    if group == "lead_time":
+        return previous[group]["medians"][key], today[group]["medians"][key]
+    if name == "flow_efficiency":
+        return previous[name]["median"], today[name]["median"]
     if key:
         return previous[group][key], today[group][key]
     if name == "main_tests":
@@ -318,6 +329,8 @@ def worst(card: dict[str, Any]) -> str | None:
 
 def label(name: str, language: str) -> str:
     """A readable metric name from the registry; an unlabelled phase reads '<phase> minutes'."""
+    if name.startswith("lead_time."):
+        return text("scorecard_label_lead_time", language, stage=name.split(".", 1)[1])
     if name.startswith("phase_minutes."):
         phase = name.split(".", 1)[1]
         try:
@@ -345,6 +358,10 @@ def human(card: dict[str, Any], language: str) -> str:
              _flow_line("scorecard_flow_previous", previous, language),
              _split_line("scorecard_split_today", today, language),
              _split_line("scorecard_split_previous", previous, language)]
+    lines.append(text("scorecard_flow_efficiency", language,
+                      today=_shown("flow_efficiency", today["flow_efficiency"]["median"]),
+                      previous=_shown("flow_efficiency", previous["flow_efficiency"]["median"]),
+                      utilization=_shown("flow_efficiency", today["flow_efficiency"]["utilization"])))
     if "binding" in card:
         lines.append(_binding_line(card["binding"], language))
     if "decision_to_approval_minutes" in today:
@@ -392,6 +409,13 @@ def add_parser(orch_actions) -> None:
                            help="Record an export of observed main-branch check results, then exit")
 
 
+def card(store: StateStore, config: Config, repo_root: Path | None, days: int = 7) -> dict[str, Any]:
+    """The same contextual scorecard for the CLI and every briefing consumer."""
+    revert_times = reverts.times(repo_root, config.base_branch) if repo_root is not None else None
+    return orch_roles.scorecard(store, config, collect(store, days, config.lanes, revert_times,
+                                                       repo_root=repo_root))
+
+
 def command(args, store: StateStore, config: Config) -> None:
     if getattr(args, "record_main_tests", None) is not None:
         try:
@@ -400,7 +424,6 @@ def command(args, store: StateStore, config: Config) -> None:
             raise SystemExit(f"fa orch scorecard: {error}") from error
         print(text("scorecard_main_recorded", config.language, count=fresh))
         return
-    revert_times = reverts.times(args.repo_root, config.base_branch)
-    card = orch_roles.scorecard(store, config, collect(store, args.days, config.lanes, revert_times))
-    card["binding"] = binding(store, config, args.repo_root, card)
-    print(json.dumps(card, ensure_ascii=False) if args.json else human(card, config.language))
+    result = card(store, config, args.repo_root, args.days)
+    result["binding"] = binding(store, config, args.repo_root, result)
+    print(json.dumps(result, ensure_ascii=False) if args.json else human(result, config.language))

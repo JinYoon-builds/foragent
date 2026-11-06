@@ -207,7 +207,7 @@ def _publish_reviewed_in_turn(
 
     while True:
         run_publish._phase(n, ctx, "ci")
-        with activity(n, ctx, "ci", ci_cause):
+        with activity(n, ctx, "ci", ci_cause, head=head):
             stopped = run_publish._wait_for_ci(
                 n, ctx, git, pr.number, head, started, ci_wait,
                 lambda: run_publish._ci_failure(n, ctx, pr.number, head, pr.base), queued_status,

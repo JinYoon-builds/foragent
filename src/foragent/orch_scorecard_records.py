@@ -21,12 +21,12 @@ def _phase_intervals(store: StateStore, now: datetime) -> list[tuple[int | None,
     for event in _jsonl(store.root / "orch-events.jsonl"):
         opened, closed = _time(event.get("phase_started_at")), _time(event.get("at"))
         if event.get("kind") == "phase" and isinstance(event.get("phase"), str) and opened and closed:
-            unique[(event.get("issue"), event.get("phase_started_at"))] = (
+            unique[(event.get("issue"), event["phase"], event.get("phase_started_at"))] = (
                 event.get("issue"), event["phase"], (opened, closed))
     for run in store.active_runs():
         opened = _time(run.phase_started_at)
         if run.status == "running" and run.phase and opened:
-            unique.setdefault((run.number, run.phase_started_at), (run.number, run.phase, (opened, now)))
+            unique.setdefault((run.number, run.phase, run.phase_started_at), (run.number, run.phase, (opened, now)))
     return list(unique.values())
 
 

@@ -41,7 +41,7 @@ def poll_executor[T](execute: Callable[[], T], poll: Callable[[], None]) -> T:
         watcher.join()
 
 
-def note_activity(n: int, ctx: RunContext, name: str, cause: str, started: datetime, finished: datetime) -> None:
+def note_activity(n: int, ctx: RunContext, name: str, cause: str, started: datetime, finished: datetime, **fields) -> None:
     """Keep one known interval's cause in the local flow record; an instant one explains no time."""
     try:
         if finished <= started:
@@ -49,13 +49,13 @@ def note_activity(n: int, ctx: RunContext, name: str, cause: str, started: datet
         run = ctx.store.get_run(n)
         ctx.store.record_flow("activity", issue=n, run_started_at=run.started_at if run is not None else None,
                               activity=name, cause=cause, started_at=started.astimezone(UTC).isoformat(),
-                              finished_at=finished.astimezone(UTC).isoformat())
+                              finished_at=finished.astimezone(UTC).isoformat(), **fields)
     except Exception:  # noqa: BLE001 - an observation never replaces the work's own result
         return
 
 
 @contextmanager
-def activity(n: int, ctx: RunContext, name: str, cause: str):
+def activity(n: int, ctx: RunContext, name: str, cause: str, **fields):
     """Record the block as one ``name`` interval caused by ``cause``, however it ends."""
     try:
         started = ctx.now()
@@ -66,7 +66,7 @@ def activity(n: int, ctx: RunContext, name: str, cause: str):
     finally:
         try:
             if started is not None:
-                note_activity(n, ctx, name, cause, started, ctx.now())
+                note_activity(n, ctx, name, cause, started, ctx.now(), **fields)
         except Exception:  # noqa: BLE001
             pass
 

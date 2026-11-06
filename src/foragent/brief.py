@@ -33,7 +33,8 @@ def unconfigured() -> dict[str, Any]:
     return {"setup": False}
 
 
-def collect(store: StateStore, config: Config | None = None, now: datetime | None = None) -> dict[str, Any]:
+def collect(store: StateStore, config: Config | None = None, now: datetime | None = None, *,
+            root: Path | None = None) -> dict[str, Any]:
     """The briefing facts; without a config only the question count is known."""
     facts: dict[str, Any] = {"questions_open": len(orch_inbox.questions(store))}
     if config is None or now is None:
@@ -57,7 +58,7 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "as_of": status["as_of"],
         "stale": status["stale"],
         # The worst metric against recent days, from the same local scorecard as `fa orch scorecard`.
-        "scorecard_line": orch_scorecard.worst_line(orch_scorecard.collect(store), config.language),
+        "scorecard_line": orch_scorecard.worst_line(orch_scorecard.card(store, config, root), config.language),
         "next": next_step(config.language),
     }
 

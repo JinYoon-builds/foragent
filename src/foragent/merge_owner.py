@@ -212,6 +212,42 @@ def _save(ctx, place, job):
         ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
 
 
+def _ci_activity(job, now):
+    """The refreshed head's CI interval, once its successful result is observed."""
+    head = job.get("head")
+    if not job.get("previous_head") or not head or job.get("ci_noted") == head:
+        return None
+    return {"activity": "ci", "cause": "base-changed", "head": head,
+            "started_at": datetime.fromtimestamp(job["ready_at"], UTC).isoformat(),
+            "finished_at": now.isoformat(), "source": "merge-owner"}
+
+
+def _note_ci(ctx, place, job):
+    # Accounting must never change the publication result.
+    try:
+        if data := _ci_activity(job, ctx.now()):
+            ctx.store.record_flow("activity", issue=place.n, run_started_at=place.started_at, **data)
+            job["ci_noted"] = job["head"]
+            _save(ctx, place, job)
+    except Exception:
+        pass
+
+
+def _merge_pr(ctx, place, job, pr, subject):
+    try:
+        started = ctx.now()
+    except Exception:
+        started = None
+    ctx.tracker.merge_pr(pr, expected_head_sha=job["head"], delete_branch=False, **subject)
+    try:
+        if started is not None:
+            ctx.store.record_flow("activity", issue=place.n, run_started_at=place.started_at,
+                                  activity="merging", cause="initial", started_at=started.isoformat(),
+                                  finished_at=ctx.now().isoformat(), source="merge-owner")
+    except Exception:
+        pass
+
+
 @contextmanager
 def _track_checks(ctx, place, job):
     def observed(identities):
@@ -555,6 +591,8 @@ def _advance(ctx, place, job, pr, comparison=None):
             if not getattr(comparison, "substitutes_ci", False):
                 job["comparison"] = asdict(comparison)
         _save(ctx, place, job)
+        if status == "pass":
+            _note_ci(ctx, place, job)
         with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
             if not _ready(ctx, place, job, pr, git, base, comparison):
                 return False
@@ -567,7 +605,7 @@ def _advance(ctx, place, job, pr, comparison=None):
             with orch_stop.merging(ctx, n):
                 job.update(phase="merging", merge_base=base)
                 _save(ctx, place, job)
-                ctx.tracker.merge_pr(pr.number, expected_head_sha=job["head"], delete_branch=False, **subject)
+                _merge_pr(ctx, place, job, pr.number, subject)
         with ctx.reads.fresh():
             _complete(ctx, place, job, ctx.tracker.get_pr(pr.number))
         return True

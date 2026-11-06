@@ -1,6 +1,7 @@
 """D96 flow metrics for `fa orch scorecard`: idle time, waste, waits, lead time, person interventions.
 
-Every metric is worse when higher. Each one is computed per 24-hour bucket (the same
+Legacy metrics are worse when higher; flow efficiency is worse when lower.
+Each metric is computed per 24-hour bucket (the same
 buckets as orch_scorecard: bucket k holds ``now - (k+1) day < time <= now - k day``);
 intervals are clipped to the buckets they overlap. Only local records are read.
 """
@@ -12,7 +13,8 @@ from statistics import median
 from types import SimpleNamespace
 from typing import Any
 
-from foragent import capacity, orch_scorecard_history as history, orch_scorecard_split as split
+from foragent import capacity, orch_scorecard_four as four, orch_scorecard_history as history
+from foragent import orch_scorecard_lead as lead, orch_scorecard_split as split
 from foragent.orch_facts_resources import _jsonl, _time
 from foragent.orch_scorecard_records import (
     Interval, TEST_PHASES, _budgets, _executions, _inside, _issue_view, _issues, _machine_at, _occupancy,
@@ -28,7 +30,7 @@ CAUSE_ORDER = ("slot", "overlap", "merge", "quota")
 INTERVENTIONS = {"ask", "escalate", "person-found"}
 HOLDING = history.HOLDING
 NAMES = ("idle_minutes", "waste_share", "wait_minutes_by_cause", "lead_time_minutes", "person_interventions")
-EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge")  # Reported, never compared.
+EXTRA = ("run_slot_idle_minutes", "test_slot_idle_minutes", "approval_to_merge", "flow_efficiency", "lead_time")
 
 
 def _minutes(start: datetime, end: datetime, now: datetime, days: int) -> list[float]:
@@ -138,7 +140,8 @@ def _idle(store: StateStore, now: datetime, days: int, issues: dict[int, dict[st
     return [idle, run_idle, test_idle]
 
 
-def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None) -> list[dict[str, Any]]:
+def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None, *,
+          repo_root=None) -> list[dict[str, Any]]:
     """Each bucket's flow metrics, today first."""
     issues = _issues(store, lanes or {})
     executions, phases = _executions(store, now), _phase_intervals(store, now)
@@ -168,8 +171,11 @@ def daily(store: StateStore, now: datetime, days: int, lanes: dict | None = None
             people[bucket] += 1
     idle, run_idle, test_idle = _idle(store, now, days, issues, executions, phases)
     approval = split.windows(store, now, days, issues, executions, phases)
+    efficiency = four.windows(store, now, days, issues, executions, phases)
+    lead_time = lead.windows(store, now, days, executions, repo_root)
     return [{"merges": merges[k], "idle_minutes": idle[k], "run_slot_idle_minutes": run_idle[k],
              "test_slot_idle_minutes": test_idle[k], "approval_to_merge": approval[k],
+             "flow_efficiency": efficiency[k], "lead_time": lead_time[k],
              "waste_share": wasted[k] / runtime[k] if runtime[k] else None,
              "wait_minutes_by_cause": waits[k],
              "lead_time_minutes": median(leads[k]) if leads[k] else None,
@@ -190,6 +196,8 @@ def previous(days: list[dict[str, Any]]) -> dict[str, Any]:
     for name in ("idle_minutes", "person_interventions"):
         result[name] = result[name] or 0
     result["approval_to_merge"] = split.previous([day["approval_to_merge"] for day in days])
+    result["flow_efficiency"] = four.previous([day["flow_efficiency"] for day in days])
+    result["lead_time"] = lead.previous([day["lead_time"] for day in days])
     return result
 
 

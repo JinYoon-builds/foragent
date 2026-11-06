@@ -179,9 +179,11 @@ def render_short(report: dict[str, Any], language: str = "en") -> str:
     return "\n".join([cut(line) for line in lines] + _update(report, language))
 
 
-def scorecard_line(store: StateStore, language: str) -> str | None:
+def scorecard_line(store: StateStore, language: str, *, config=None, repo_root=None) -> str | None:
     """The worst-moved scorecard metric, the same line `fa brief --json` carries."""
-    return orch_scorecard.worst_line(orch_scorecard.collect(store), language)
+    card = (orch_scorecard.card(store, config, repo_root) if config is not None
+            else orch_scorecard.collect(store))
+    return orch_scorecard.worst_line(card, language)
 
 
 def _columns(char: str) -> int:
