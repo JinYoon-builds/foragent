@@ -121,7 +121,7 @@ def test_tick_memory_pressure_leaves_shared_budgets_alone(ctx, monkeypatch, pres
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(pressure, 0.5, 60))
     capacity.write_state(ctx.store, 4, NOW)
     assert tick(ctx).skipped is None
-    assert capacity.effective_test_slots(2) == 2
+    assert capacity.effective_test_slots() == 2
     assert capacity.read_state(ctx.store)["parallel"] == 4
     assert not (capacity.machine_root() / capacity.HISTORY_FILE).exists()
     assert not (ctx.store.root.parent / capacity.HISTORY_FILE).exists()
@@ -132,7 +132,7 @@ def test_tick_critical_memory_holds_new_starts_and_records_one_row(ctx, monkeypa
     from foragent import capacity
 
     lanes = {f"lane-{number}": {} for number in range(1, 5)}
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, lanes=lanes)
     for number in range(1, 5):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
@@ -158,7 +158,7 @@ def test_tick_critical_memory_records_nothing_when_files_overlap_already_hold_th
 
     # Work that a running issue's files already hold back was not stopped by memory.
     lanes = {f"lane-{number}": {} for number in range(1, 3)}
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1, lanes=lanes)
+    ctx.config = replace(ctx.config, max_parallel=3, lanes=lanes)
     for number in range(1, 3):
         approve(ctx, number, labels=[f"lane:lane-{number}"])
     capacity.write_state(ctx.store, 3, NOW)
@@ -3087,7 +3087,7 @@ def test_rate_limit_error_after_budgets_does_not_apply_them_twice(ctx, monkeypat
 def test_tick_memory_hold_history_records_cpu_measurements(ctx, monkeypatch, busy):
     from foragent import capacity
 
-    ctx.config = replace(ctx.config, max_parallel=3, test_slots=1)
+    ctx.config = replace(ctx.config, max_parallel=3)
     approve(ctx)
     capacity.write_state(ctx.store, 3, NOW)
     monkeypatch.setattr("foragent.scheduler.machine_load", lambda: capacity.LoadSample(

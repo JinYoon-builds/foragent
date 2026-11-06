@@ -1,4 +1,7 @@
-"""Publish one explicit boundary in one commit/push, then apply issue controls.
+"""Publish an explicit boundary, then apply issue controls.
+
+The merge owner queues notes; order publication retains its existing boundary.
+With the owner disabled, the entire boundary uses one commit/push as before.
 
 Waiting logs belong to planning. Only this module advances the flush journal.
 Interrupted batches resume from their explicit intent and Git history.
@@ -184,6 +187,27 @@ def _finish(root, config, tracker, git, store, repo, batch, records, prepared=No
     return {"boundary": batch["boundary"], "batch": batch["batch"], "status": "published", "sha": sha}
 
 
+def _queue_notes(config, store, batch, notes, git):
+    from foragent import main_write_requests
+
+    # A direct flush may have pushed this batch before its done checkpoint.
+    # Use the already-observed tracking history here; drain reconciles after fetch.
+    try:
+        landed = recovery._find(git, f"origin/{config.base_branch}", batch)
+    except GitError:
+        landed = None  # Missing local history must not prevent durable retention.
+    if landed:
+        journal.append(store, "done", batch["batch"])
+        return {"boundary": batch["boundary"], "batch": batch["batch"],
+                "status": "published", "sha": landed}
+    request = main_write_requests.submit(
+        store, config.base_branch, recovery.title(batch), "orchestrator notes",
+        {"kind": "notes", "notes": notes, "batch": batch["batch"]},
+        identity=f"notes:{batch['batch']}")
+    return {"boundary": batch["boundary"], "batch": batch["batch"],
+            "status": "waiting", "main_write": request["id"]}
+
+
 def flush(root, config, tracker, git, store, *, repo, boundary):
     # Before lock creation or checkpoint reads: a wrong-branch invocation has no effects.
     _require_base(git, config)
@@ -195,6 +219,10 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
         result = {"boundary": boundary, "status": "empty"}
         if pending:
             for batch in pending:
+                if config.merge_owner and not batch["orders"]:
+                    _rows, retained = _members(store, batch)
+                    result = _queue_notes(config, store, batch, retained, git)
+                    continue
                 wait_for_merge_train(git, config)
                 with git.publish_lock():
                     result = _finish(root, config, tracker, git, store, repo, batch, records)
@@ -204,6 +232,14 @@ def flush(root, config, tracker, git, store, *, repo, boundary):
                   if row["boundary"] == boundary and row["entry_id"] not in selected]
         notes = [row for row in order_notes.entries(store, with_offsets=True)
                  if row["boundary"] == boundary and row["entry_id"] not in selected]
+        if config.merge_owner and notes:
+            batch = {"kind": "selected", "batch": uuid4().hex[:12], "boundary": boundary,
+                     "orders": [], "notes": [row["entry_id"] for row in notes],
+                     "paths": sorted({{"decision": "docs/decisions.md", "idea": "docs/ideas.md",
+                                       "rule": "docs/rules.md"}[row["kind"]] for row in notes})}
+            journal.append(store, **batch)
+            result = _queue_notes(config, store, batch, notes, git)
+            notes = []
         if not orders and not notes:
             return result
         latest = {row["id"]: row for row in orders}

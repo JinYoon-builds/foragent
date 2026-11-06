@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from conftest import BASE_TIME, git_command
-from foragent.config import Config
+from foragent.config import Config, FileTestSlots
 from foragent.git import GitRepo
 from foragent.run_attempt import AttemptFailure
 from foragent.runner import RunContext, capture_acceptance_baseline
@@ -467,6 +467,31 @@ def test_prebuild_caches_all_files_excluded_without_starting_pytest(baseline_cas
     assert not (c.cache / f"{build.key}.xml").exists()
 
 
+@pytest.mark.parametrize("slots,expected", [(1, 1), (None, None), (FileTestSlots(1), None)])
+def test_detached_prebuild_keeps_programmatic_ceiling_but_not_file_ceiling(baseline_case, monkeypatch,
+                                                                        slots, expected):
+    from foragent import capacity, run_baseline
+
+    c = baseline_case
+    c.ctx.config = replace(c.ctx.config, test_slots=slots)
+    build = run_baseline.BaselineBuild("base", COMMAND, [], "key", "acceptance")
+    cache = StateStore(c.ctx.store.root.parent / "baselines")
+    lock = cache.lock_acceptance_baseline(build.key)
+    calls = []
+    monkeypatch.setattr(run_baseline, "subprocess", SimpleNamespace(
+        DEVNULL=subprocess.DEVNULL, Popen=lambda argv, **kwargs: calls.append((argv, kwargs)),
+    ))
+    monkeypatch.setenv(capacity.TEST_SLOT_ENV, "held")
+    try:
+        run_baseline.start_baseline_process(c.ctx, build, lock)
+    finally:
+        lock.close()
+    argv, kwargs = calls.pop()
+    assert json.loads(argv[3])["test_slots"] == expected
+    assert capacity.TEST_SLOT_ENV not in kwargs["env"]
+    assert lock.closed
+
+
 def test_detached_prebuild_outlives_scheduler_and_retains_reservation(baseline_case, tmp_path):
     c = baseline_case
     release, entered = tmp_path / "release", tmp_path / "entered"
@@ -491,7 +516,7 @@ def test_detached_prebuild_outlives_scheduler_and_retains_reservation(baseline_c
         f"capacity.machine_root = lambda: Path({str(tmp_path / 'slots')!r})",
         f"root = Path({str(c.root)!r})",
         f"ctx = SimpleNamespace(repo_root=root, store=StateStore(Path({str(c.ctx.store.root)!r})),",
-        f"    config=Config(test_command={COMMAND!r}, acceptance_dir={ACCEPTANCE_DIR!r}, test_slots=1),",
+        f"    config=Config(test_command={COMMAND!r}, acceptance_dir={ACCEPTANCE_DIR!r}),",
         "    git=GitRepo(root), now=lambda: datetime.now(UTC))",
         "prebuild_acceptance_baseline(ctx, 'origin/main', start_baseline_process)",
     ])
