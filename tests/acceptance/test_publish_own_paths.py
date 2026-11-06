@@ -54,7 +54,6 @@ def draft_plan(directory, value):
 
 def owned_files(value):
     return {
-        f"docs/specs/{value['id']}.md": value["spec_markdown"],
         **{name: content for issue in value["issues"]
            for name, content in issue.get("acceptance_files", {}).items()},
     }
