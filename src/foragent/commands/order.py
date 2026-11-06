@@ -116,6 +116,8 @@ def add(commands) -> None:
     preread.add_argument("plan", type=cli.Path)
     preread.add_argument("--repo-root", type=cli.Path, default=cli.Path.cwd())
     preread.add_argument("--json", action="store_true")
+    preread.add_argument("--background", action="store_true", help=cli.text("order_job_background_help", _help_language()))
+    preread.add_argument("--approve-if-clean", action="store_true", help=cli.text("order_job_approve_help", _help_language()))
     say = lambda key: cli.text(key, _help_language())  # noqa: E731
     note = order_actions.add_parser("note", help=say("order_notes_help"))
     note.add_argument("--defer", required=True, help=say("order_notes_defer_help"))
@@ -271,7 +273,10 @@ def run(args) -> int:
         from foragent import size_signal
         return size_signal.run(args, root)
     if args.action == "preread":
-        return _preread(args, root)
+        from foragent import order_jobs
+        if args.approve_if_clean and not args.background:
+            raise cli.order.PlanError(cli.text("order_job_needs_background", cli.load_config(root).language))
+        return order_jobs.run(args, root) if args.background else _preread(args, root)
     if args.action == "perspectives":
         return _perspectives(args, root)
     if args.action == "prepare":
@@ -281,7 +286,9 @@ def run(args) -> int:
     repo = config.repo or git.remote_slug()
     tracker = cli.GhTracker(repo)
     if args.action == "context":
-        print(cli.json.dumps(cli.order.context(root, config, tracker), ensure_ascii=False))
+        from foragent import order_jobs  # Work FA still owes this project, whoever submitted it.
+        background = {"background_work": order_jobs.pending(cli.StateStore.for_repo(repo))}
+        print(cli.json.dumps({**cli.order.context(root, config, tracker), **background}, ensure_ascii=False))
         return 0
     if args.action == "edit":
         from foragent import order_done_when
