@@ -1,23 +1,19 @@
 """Boundary tests for per-issue review panels (#533) beyond the locked acceptance file."""
 
 from dataclasses import replace
-from pathlib import Path
-import sys
 import time
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
-from foragent import orch_reviewers, review_perspectives  # noqa: E402
-from foragent.config import Config  # noqa: E402
-from foragent.executors import ExecResult  # noqa: E402
-from foragent.runner import run_issue  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from test_review_parallel import PanelExecutor, install_panel  # noqa: E402
-from test_review_perspectives import perspective_case, review_offline  # noqa: E402,F401
-from test_risk_map import copy_history, offline  # noqa: E402,F401
-from test_skills_autosync import isolated_home  # noqa: E402,F401
+from foragent import orch_reviewers, review_perspectives
+from foragent.config import Config
+from foragent.executors import ExecResult
+from foragent.runner import run_issue
+from foragent.state import StateStore
+from helpers.review_panel import PanelExecutor, install_panel
+from helpers.review_panel import perspective_case, review_offline  # noqa: F401
+from helpers.risk import copy_history, offline  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 
 @pytest.fixture(autouse=True)

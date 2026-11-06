@@ -4,17 +4,14 @@ Git runs through the offline acceptance adapter (commits by fast-import); no rea
 """
 
 import json
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from conftest import git_command  # noqa: E402
 from foragent import orch  # noqa: E402
-from test_orch_review_handoff import bind_cli, make_case  # noqa: E402
-from test_one_entrance_seat import invoke  # noqa: E402
+from helpers.review_case import bind_cli, make_case  # noqa: E402
+from helpers.cli_invoke import invoke  # noqa: E402
 
 WHY = "Jin requested a stop"
 

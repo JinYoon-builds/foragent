@@ -174,6 +174,8 @@ def set_done_when(case, commands):
 # A scripted reviewer FAIL stands for a real defect: its scoring session (#1651) grounds it and
 # scores it 100, so the finding still blocks. Tests of demotion script their own scorer.
 GROUNDED_SCORE = json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                             "wrong_result": True, "ordinary_input": True, "irreversible": False,
+                             "finding_class": "scripted defect",
                              "locked_test": None, "breaking_input": "the input the scripted finding names",
                              "spec_question": None})
 
@@ -187,13 +189,16 @@ def scoring_request(prompt):
     return request if isinstance(request, dict) and isinstance(request.get("finding"), str) else None
 
 
-def enable_reviewer(case, messages, edit=None):
+def enable_reviewer(case, messages, edit=None, *, finding_classes=None):
     calls = []
     messages = iter(messages)
+    classes = iter(finding_classes) if finding_classes is not None else None
 
     def review(**kwargs):
         if scoring_request(kwargs.get("prompt")) is not None:
-            return ExecResult(0, False, GROUNDED_SCORE, kwargs["log_path"])
+            reply = GROUNDED_SCORE if classes is None else json.dumps(
+                {**json.loads(GROUNDED_SCORE), "finding_class": next(classes)})
+            return ExecResult(0, False, reply, kwargs["log_path"])
         calls.append(kwargs)
         if edit:
             edit(kwargs["worktree"])
@@ -281,6 +286,12 @@ def expected_review_rules(acceptance_dir):
         "Write root-cause and structure findings (why the defect could happen, a better design) as separate "
         "plain lines `NOTE: <finding>`, beside the findings. NOTE lines are recorded for the orchestrator "
         "and are never a reason to FAIL.\n"
+        "The review-procedure consequence rule applies to every ground: block only a wrong result, "
+        "lost work, unverified code reaching main, a stalled gate or a broken locked test on ordinary "
+        "inputs, or irreversible harm even on rare inputs (work lost, data deleted, something sent outside). "
+        "Rare reversible bugs and findings without a wrong result (slower, less tidy, wording) pass "
+        "with notes or follow-up issues naming the source issue. A Goal quote or high confidence alone "
+        "does not make a finding blocking.\n"
         "For each finding, say whether it is one instance of a broader defect class "
         "and where else to look in the change."
     )
