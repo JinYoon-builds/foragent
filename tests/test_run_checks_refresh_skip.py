@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from foragent import ci_local, ci_mode, harness_guard, run_checks, runner, run_conflicts, run_implementation, run_publish
+from foragent import ci_local, ci_mode, harness_guard, run_checks, runner, run_implementation, run_publish
 from foragent.run_checks import CheckResult
 
 
@@ -58,10 +58,9 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(run_checks, "_related_unit_tests", lambda *a, **k: ["tests/test_demo.py"])
     monkeypatch.setattr(run_checks, "save_failures", lambda *a, **k: "")
     monkeypatch.setattr(harness_guard, "guard_staged", lambda attempt: None)
-    monkeypatch.setattr(run_conflicts, "_prepare_target", lambda attempt: True)
     monkeypatch.setattr(run_implementation, "follow_base", lambda attempt: None)
     monkeypatch.setattr(run_publish, "_check_publication", lambda *a, **k: None)
-    monkeypatch.setattr(ci_mode, "enabled", lambda ctx, branch: state.mode)
+    monkeypatch.setattr(ci_mode, "enabled", lambda ctx: state.mode)
     monkeypatch.setattr(ci_local, "verify_local_only_units", local)
     monkeypatch.setattr(runner, "_remaining", lambda n, ctx: 900)
 

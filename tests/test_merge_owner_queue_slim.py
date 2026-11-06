@@ -28,8 +28,8 @@ def admission(tmp_path, monkeypatch):
     evidence = ci_mode.ComparisonEvidence("base", "head", {}, None, "pass", "")
     # Only the already-tested admission policy read is substituted in this storage test.
     monkeypatch.setattr(run_publish, "_final_merge_inputs", lambda *a, **kw: SimpleNamespace(
-        stop=None, decision=None, batch_branch=None, status="pass", base_sha="base", comparison_current=True))
-    monkeypatch.setattr(run_publish, "_policy_allows", lambda *a, **kw: True)
+        stop=None, decision=None, status="pass", base_sha="base", comparison_current=True))
+    monkeypatch.setattr(run_publish, "_policy_allows", lambda decision, *, authorization=None: True)
     ctx = SimpleNamespace(store=store, now=lambda: NOW, merge_authorization=None,
                           tracker=SimpleNamespace(remove_labels=lambda *a: None))
     return ctx, approval, evidence
@@ -96,7 +96,7 @@ def test_owner_merges_with_job_file_evidence_without_remeasurement(proto, monkey
     assert not merge_owner.pending(case.store, 5)
 
 
-@pytest.mark.parametrize("job_state", ["missing", "other-start", "no-comparison"])
+@pytest.mark.parametrize("job_state", ["missing", "other-start", "no-comparison", "legacy-fallback"])
 def test_absent_job_evidence_remeasures_and_never_merges_without_it(proto, monkeypatch, job_state):
     case = proto
     support.queue_workers(case, [5])
@@ -112,7 +112,11 @@ def test_absent_job_evidence_remeasures_and_never_merges_without_it(proto, monke
     elif job_state == "other-start":
         case.store._write_json(path, {**job, "started_at": "another-execution", "pr": -1})
     else:
-        del job["comparison"]
+        if job_state == "legacy-fallback":
+            job["comparison"]["reports"] = None
+            job["comparison"].pop("fallback_reports", None)
+        else:
+            del job["comparison"]
         case.store._write_json(path, job)
     reports = case.tracker.pr_acceptance_reports
     requested = []

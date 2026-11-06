@@ -521,13 +521,6 @@ class GitRepo:
                 path.write_bytes(content)
                 path.chmod(stat.S_IMODE(mode))
 
-    def ensure_batch_branch(self, branch: str, base_ref: str) -> None:
-        """Create a remote batch once; never force-push an existing batch."""
-        remote_ref = f"refs/heads/{branch}"
-        if not self._call(["ls-remote", "--heads", "origin", remote_ref]).strip():
-            self._call(["push", "origin", f"{base_ref}:{remote_ref}"])
-        self.fetch("origin", branch)
-
     def head_sha(self) -> str:
         return self._call(["rev-parse", "HEAD"]).strip()
 

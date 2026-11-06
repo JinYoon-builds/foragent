@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
 from foragent import decisions as decision_links
-from foragent import order_cleanup, order_replaces
+from foragent import order_cleanup, order_preread, order_replaces
 from foragent.config import Config
 from foragent.executors import executor_for
 from foragent.git import GitError, GitRepo
@@ -1040,9 +1040,11 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
         return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
-    # An order with no sub-issues (edits or approvals only) is finished once it
-    # applies: publish closes its record below, so it never gets a Backlog card.
+    # An order with no sub-issues never gets a Backlog card. Its edited issues are
+    # its work (plan marker), so the gate tick closes it once they all close; only
+    # an order with no work to wait for (no children, no edits) is finished here.
     childless = not plan["issues"] and not mapping
+    nothing_to_wait_for = childless and not edit_numbers
     parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
@@ -1153,7 +1155,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     order_cleanup.close(plan, cleanups, tracker, approve, selected_numbers, config.language)
     if approved_numbers:
         kick_tick(wake_root or root)
-    if childless and (parent not in by_number or by_number[parent].state == "open"):
+    if nothing_to_wait_for and (parent not in by_number or by_number[parent].state == "open"):
         tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
     for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
         row["number"] = mapping[item["key"]] if "key" in item else item["number"]
@@ -1175,8 +1177,13 @@ def edit_view(item: dict, issue, config: Config) -> dict:
             "interactive": "interactive" in issue.labels, "edit": True}
 
 
-def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None) -> str:
-    """What the implementer would receive, asked read-only for its unknowns."""
+def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Path | None = None,
+                   rules: bool = True) -> str:
+    """What the implementer would receive, asked read-only for its unknowns.
+
+    ``rules=False`` leaves out the one-round rules (order_preread.RULES): the evidence key is
+    built without them, like the size request, so rewording them keeps earlier clean prereads.
+    """
     commands = "\n".join(item.get("done_when", []))
     tests = "".join(f"\n### {path}\n```\n{content}\n```\n"
                     for path, content in item.get("acceptance_files", {}).items()) or "\n(none)\n"
@@ -1197,6 +1204,7 @@ def preread_prompt(plan: dict, item: dict, root: Path | None = None, reader: Pat
         "DECIDE: <a reversible detail you will settle yourself and follow>.\n"
         "QUESTION: <an unknown, only when the WHAT is unclear: a wrong guess would fail a locked test, break a\n"
         "contract with another issue, or change behaviour the person notices>.\n"
+        f"{order_preread.RULES if rules else ''}"
         "If you have nothing to add, reply with exactly NONE.\n\n"
         f"# Order: {plan['title']}\n{plan.get('summary', '')}\n\n"
         f"## Spec\n{plan.get('spec_markdown', '')}\n\n"
@@ -1237,8 +1245,8 @@ def preread_target(plan: dict, item: dict, config: Config, root: Path, reader: P
 
     run_config = lane_config(config, item["lane"])
     setup = implementer_setup(run_config, item["lane"], item["size"], root)
-    prompt = preread_prompt(plan, item, root)
-    sent = setup.notes + (prompt if reader is None else preread_prompt(plan, item, root, reader)) + size_signal.PROMPT + setup.memory_notice
+    prompt = preread_prompt(plan, item, root, rules=False)
+    sent = setup.notes + preread_prompt(plan, item, root, reader) + size_signal.PROMPT + setup.memory_notice
     # The whole plan is part of the key: any change to any issue needs a new preread.
     digest = hashlib.sha256(json.dumps(
         [setup.executor, setup.model, setup.options, prompt, plan, _lane_instructions(run_config, item["lane"], root)],
@@ -1574,6 +1582,7 @@ def preread(plan: dict, root: Path, config: Config,
         record = {"id": secrets.token_hex(16), "key": item["key"], "plan": plan["id"],
                   **_binding(plan, item, config, repo or config.repo, published),
                   "unknowns": unknowns, "decisions": decisions, "approach": approach, "size": size,
+                  "answer": result.last_message,  # The reader's own words, kept as issue evidence (#1488).
                   "at": datetime.now(UTC).isoformat(timespec="seconds")}
         # The estimate is born here, before the record; each run start fixes it from these notes (#1696).
         _recorded(size_signal.note, store, record, digest, config.language)
@@ -1581,6 +1590,7 @@ def preread(plan: dict, root: Path, config: Config,
 
         with reporting(store.root):
             _record_preread(root, directory, digest, record)
+        order_preread.count_round(store, item["key"])
         if observed is not None:
             order_observed.save(root, plan["id"], {str(observed.number): order_observed.fields(observed)}, config.language)
         results.append({"key": item["key"], "unknowns": unknowns}

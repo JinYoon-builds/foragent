@@ -321,8 +321,8 @@ class Evidence:
             return "fail"
         excluded = self.judged_exclusions(ctx)
         scope = measurement_scope(ctx.config, ctx.repo_root, excluded)
-        lost, _ = ci_mode.comparison(reports, ctx.repo, origin, sha, excluded, expected_scope=scope,
-                                    expected_shards=range(ctx.config.ci_shards))
+        lost, _ = ci_mode.read(ctx, reports, origin, sha, excluded, expected_scope=scope,
+                               expected_shards=range(ctx.config.ci_shards))
         if any(not ci_mode.scope_covers(item["report"]["scope"], scope) for item in reports):
             raise ci_mode.StaleComparison("tip measurement scope no longer covers the current one")
         self.passed = not lost
@@ -576,7 +576,7 @@ def land(ctx, report, candidates, proof):
 
             with owner.timed_checks(ctx, f"{_name(proof.base, len(proof.chain))} ({members_named})", tip_sha):
                 # D124: skip exactly what CI passed on the tip these checks run on.
-                skips = ci_local.PassSkips.read(ctx, tip_sha)
+                skips = ci_local.PassSkips.read(ctx, tip_sha, trusted_tip=True)
                 for member, (place, job, _, _, _) in zip(proof.chain, prepared):
                     checking = member
                     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
