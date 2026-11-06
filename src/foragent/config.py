@@ -60,6 +60,9 @@ class Config:
         "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
         "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25},
     })
+    # Most changed files one issue's preread may expect (#2352); a wider issue is refused at
+    # publish until the plan splits it. Every changed path counts, mechanical moves included.
+    issue_max_files: int = 10
     # Usable quota share of the run's executor at which s and m issues start at tier l (#238).
     tiers_headroom_ample: float = 0.5
     skill_libraries: list[Any] = field(default_factory=lambda: [{

@@ -14,7 +14,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, ownership, size_signal
+from foragent import board, capacity, design, order_collect, order_done_when, order_observed, order_references, order_reviewed, order_waiting, order_wide, ownership, size_signal
 from foragent import decisions as decision_links
 from foragent import order_cleanup, order_replaces
 from foragent.config import Config
@@ -845,7 +845,16 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                                     else [dep.number for dep in tracker.blocked_by(issue.number)]),
                      "approved": approve or issue.number in selected_numbers})
     try:
-        closures = order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
+        if not landed:  # A landed batch already passed this; refuse wide issues before any write.
+            records, read = _preread_records(root), [
+                *(item for item in plan["issues"] if "statements" not in item),
+                *(edit_view(item, by_number[item["number"]], config) for item in plan.get("edits", [])
+                  if "statements" not in item)]
+            waiting = _uncreated_lanes(plan, config, read)[0]  # not prereaded until the lane exists
+            order_wide.check([item for item in read if item["key"] not in waiting],
+                             lambda item: records.get(preread_target(plan, item, config, root)[2]),
+                             config.issue_max_files)
+        closures =order_replaces.plan_closures(plan, tracker, parent, mapping, config.language)
         cleanups = order_cleanup.plan_cleanup(plan, tracker, parent, mapping, config.language)
     except ValueError as exc:
         raise PlanError(str(exc)) from exc

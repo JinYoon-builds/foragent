@@ -216,6 +216,8 @@ def _validate(values: dict[str, Any]) -> None:
         from foragent.i18n import text
         raise ConfigError(text("config_size_limits_invalid",
                                values["language"] if isinstance(values["language"], str) else "en"))
+    if type(values["issue_max_files"]) is not int or values["issue_max_files"] < 1:
+        raise ConfigError("issue_max_files must be a whole number of at least 1")
     ample = values["tiers_headroom_ample"]
     if not isinstance(ample, (int, float)) or isinstance(ample, bool) or not ample >= 0:
         raise ConfigError("tiers_headroom_ample must be a number of at least 0")

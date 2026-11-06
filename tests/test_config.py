@@ -90,6 +90,7 @@ def test_exact_defaults(repo):
         "size_limits": {"s": {"source_lines": 199, "test_lines": 193, "file_count": 10},
                         "m": {"source_lines": 524, "test_lines": 437, "file_count": 17},
                         "l": {"source_lines": 1579, "test_lines": 782, "file_count": 25}},
+        "issue_max_files": 10,
         "skill_libraries": [{"name": "knowledge-work-plugins",
                              "repo": "https://github.com/anthropics/knowledge-work-plugins"},
                             {"name": "skills", "repo": "https://github.com/anthropics/skills"}],
@@ -623,4 +624,15 @@ def test_size_limits_merge_per_label_and_reject_bad_values(repo):
                 "size_limits:\n  s:\n    file_count: true\n"):
         (repo / ".foragent.yml").write_text(bad)
         with pytest.raises(ConfigError, match="size_limits"):
+            load_config(repo)
+
+
+def test_issue_max_files_defaults_to_ten_and_rejects_bad_values(repo):
+    assert load_config(repo).issue_max_files == 10
+    (repo / ".foragent.yml").write_text("issue_max_files: 25\n")
+    assert load_config(repo).issue_max_files == 25
+    for bad in ("issue_max_files: 0\n", "issue_max_files: -3\n", "issue_max_files: true\n",
+                "issue_max_files: 2.5\n", "issue_max_files: ten\n"):
+        (repo / ".foragent.yml").write_text(bad)
+        with pytest.raises(ConfigError, match="issue_max_files"):
             load_config(repo)

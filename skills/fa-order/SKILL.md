@@ -411,7 +411,9 @@ planning approval and no loop to remove every guess; the lane records them in it
 Each row also shows the lane's expected size (`expected_size`: source lines, test lines,
 files), or `size: unknown` when it gave none. A `size_note` means an estimate is above the
 issue's size label limit (`size_limits`); show it beside the design and let the person judge
-a split. It never blocks publishing or approval. `fa order sizes --json` shows merged issues'
+a split. Only one count refuses: an issue expecting more changed files than `issue_max_files`
+(default 10; moves count too) is refused at publish, naming the issue and the count. Split it
+into issues of at most that many files, preread again and publish. `fa order sizes --json` shows merged issues'
 expected and real size and the share of wrong estimates.
 `--approve` refuses issues whose latest preread of the current content is missing or still
 has open questions; any plan edit needs a new preread. The dry-run is never blocked.
