@@ -394,6 +394,8 @@ def init_repo(
     # Before anything is written: one default without license facts stops the whole setup.
     skill_scope = config if config_path.exists() else replace(load_global_config(), default_skills=config.default_skills)
     skill_manager, default_skills = _checked_default_skills(root, skill_scope)
+    for name, (picked, others) in (skill_manager.picks.items() if skill_manager else ()):
+        notes.append(text("init_skill_picked", config.language, name=name, picked=picked, others=", ".join(others)))
     default_ignore = any(skill is not None and skill_manager.default_needs_ignore(skill, root)
                          for skill in default_skills.values())
 
