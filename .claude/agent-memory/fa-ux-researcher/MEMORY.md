@@ -12,3 +12,4 @@
 - [Decisions help SUPPRESS leak](broken_decisions_help_suppress.md) — fa decisions --help shows _sweep ==SUPPRESS==
 - [Report --full after short](broken_report_full_after_short.md) — UNCONFIRMED; needs a merge between reports to retest
 - [Orch role help pointer](broken_orch_role_help_pointer.md) — fa orch role help says "listed by fa role", which cannot list
+- [Owner check no start time](broken_owner_check_no_start_time.md) — merge-owner.log start lines have no clock time; running vs stuck unknowable
