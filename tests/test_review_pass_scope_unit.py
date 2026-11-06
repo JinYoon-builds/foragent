@@ -8,6 +8,7 @@ import yaml
 
 from conftest import git_command
 from foragent import orch_events, review_pass_scope, risks
+from foragent.git import GitError
 from foragent.issue import body_hash
 from foragent.run_review import _journal_review
 from foragent.runner import review_only, run_issue
@@ -338,28 +339,71 @@ def test_incident_entries_of_this_repository_carry_the_mark():
     assert entries and all(risk.get("pass_scope_exempt") is True for risk in entries)
 
 
-def test_scoped_notes_name_only_paths_changed_since_the_pass(git_history, tmp_path, monkeypatch):
-    # #2310: the risk-map note must not list the issue's reviewed files as changed again.
+def resolved_after_pass(git_history, tmp_path, monkeypatch, outside=None):
+    """A published PASS (feature.txt plus own_only.txt), then main conflicts on feature.txt's first
+    lines and adds upstream.txt; the index holds a resolution, optionally with one edit outside."""
     git_history.update({".foragent-risks.yml": yaml.safe_dump([entry(["**"])])})
-    case = passed_case(git_history, tmp_path, monkeypatch)
+    case = case_for(git_history, tmp_path, monkeypatch, review="careful")
+
+    def first(call):
+        (call["worktree"] / "own_only.txt").write_text("own\n")
+        return implement(content())(call)
+
+    case.implementer.steps = [first]
+    capture_review(case, [PASS] * (len(DEFAULT_PERSPECTIVES) + 1))
+    assert run_issue(1, case.ctx) == "pr-open"
     git = _at_head(case, tmp_path)
-    (git.root / "later.txt").write_text("later\n")
-    git._call(["add", "later.txt"])
+    case.history.update({"feature.txt": content("upstream", 0, 1), "upstream.txt": "from main\n"})
+    git._call(["fetch", "--quiet", "origin"])
+    with pytest.raises(GitError):
+        git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
+                   "merge", "--quiet", "--no-edit", "origin/main"])
+    assert "<<<<<<<" in (git.root / "feature.txt").read_text()
+    text = content("resolved", 1, 1)
+    if outside == "line":
+        text = text.replace("padding_15 = 15", "padding_15 = 99")
+    (git.root / "feature.txt").write_text(text)
+    if outside == "file":
+        (git.root / "extra.txt").write_text("extra\n")
+    if outside == "delete":
+        (git.root / "own_only.txt").unlink()
+    git._call(["add", "-A", "--", "."])
+    return case, git
+
+
+def changed_here(notes):
+    return [line for line in notes.splitlines() if "changed here" in line]
+
+
+def test_scoped_notes_name_only_paths_changed_since_the_pass(git_history, tmp_path, monkeypatch):
+    # #2310: a resolution confined to the conflict blocks does not list the issue's reviewed files again.
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    boundary = review_pass_scope.for_review(1, case.ctx, git, "origin/main")
+    assert changed_here(boundary.notes) == ["- Paths: ** (changed here: feature.txt)"]
+    assert "+accepted = 'resolved'" in boundary.diff and "own_only" not in boundary.diff
+
+
+@pytest.mark.parametrize("outside", ["line", "file", "delete"])
+def test_resolution_edit_outside_the_conflict_keeps_the_whole_review_and_recheck(
+    git_history, tmp_path, monkeypatch, outside,
+):
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch, outside)
     notes = review_pass_scope.for_review(1, case.ctx, git, "origin/main").notes
-    assert "(changed here: later.txt)" in notes and "feature.txt" not in notes
+    assert any("own_only.txt" in line for line in changed_here(notes)), notes
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
+
+
+def test_unknown_plain_merge_keeps_the_whole_review_and_recheck(git_history, tmp_path, monkeypatch):
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    monkeypatch.setattr(review_pass_scope, "_expected_tree", lambda git, head, base_ref: head)
+    notes = review_pass_scope.for_review(1, case.ctx, git, "origin/main").notes
+    assert any("own_only.txt" in line for line in changed_here(notes)), notes
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
 
 
 def test_recheck_paths_are_the_resolution_and_mains_new_files(git_history, tmp_path, monkeypatch):
-    case = passed_case(git_history, tmp_path, monkeypatch)
-    git = _at_head(case, tmp_path)
-    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == []
-    case.history.update({"upstream.txt": "from main\n"})
-    git._call(["fetch", "--quiet", "origin"])
-    git._call(["-c", "user.name=Tests", "-c", "user.email=tests@example.com",
-               "merge", "--quiet", "--no-edit", "origin/main"])
-    (git.root / "resolved.txt").write_text("resolution\n")
-    git._call(["add", "resolved.txt"])
-    # The PR's own feature.txt is neither resolved nor touched by main: its tests stay with PR CI.
-    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == ["resolved.txt", "upstream.txt"]
+    case, git = resolved_after_pass(git_history, tmp_path, monkeypatch)
+    # The PR's own own_only.txt is neither resolved nor touched by main: its tests stay with PR CI.
+    assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") == ["feature.txt", "upstream.txt"]
     case.ctx = replace(case.ctx, config=replace(case.ctx.config, review_pass_scope=False))
     assert review_pass_scope.recheck_paths(1, case.ctx, git, "origin/main") is None
