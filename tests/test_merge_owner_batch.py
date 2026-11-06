@@ -64,7 +64,7 @@ def batched(proto, monkeypatch):
                 if case.target_failure:
                     raise GitError(case.target_failure)
                 head = git_command(root, "rev-parse", source)
-                git_command(case.history.origin, "merge-base", "--is-ancestor", expected, head)
+                git_command(root, "merge-base", "--is-ancestor", expected, head)
                 git_command(case.history.origin, "fetch", str(root), source)
                 git_command(case.history.origin, "update-ref", "refs/heads/main", head, expected)
                 case.history.tip = head
@@ -772,7 +772,9 @@ def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(ba
     @contextmanager
     def moved(store):
         with lock(store):
-            case.history.update({})
+            # The net tree is identical, but each intervening commit matters.
+            case.history.update({"src/transient.py": "VALUE = 1\n"})
+            case.history.update({"src/transient.py": None})
             yield
 
     monkeypatch.setattr(StateStore, "merge_lock", moved)
