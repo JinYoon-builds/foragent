@@ -1033,9 +1033,11 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
         owned = f"{OWNED_MARKER}\n" if parent_owned else ""
         return f"{plan['summary']}\n\n{checklist}\n\n{_plan_marker(plan['id'], mapping, recorded_blobs)}\n{owned}"
 
-    # An order with no sub-issues (edits or approvals only) is finished once it
-    # applies: publish closes its record below, so it never gets a Backlog card.
+    # An order with no sub-issues never gets a Backlog card. Its edited issues are
+    # its work (plan marker), so the gate tick closes it once they all close; only
+    # an order with no work to wait for (no children, no edits) is finished here.
     childless = not plan["issues"] and not mapping
+    nothing_to_wait_for = childless and not edit_numbers
     parent_owned = parent is None or OWNED_MARKER in by_number[parent].body
     if parent is None:
         parent = _create_owned(tracker, config, owner, plan["title"], parent_body(), [])
@@ -1146,7 +1148,7 @@ def _publish_issues(plan: dict, root: Path, config: Config, tracker: Tracker, *,
     order_cleanup.close(plan, cleanups, tracker, approve, selected_numbers, config.language)
     if approved_numbers:
         kick_tick(wake_root or root)
-    if childless and (parent not in by_number or by_number[parent].state == "open"):
+    if nothing_to_wait_for and (parent not in by_number or by_number[parent].state == "open"):
         tracker.close_issue(parent, text("order_record_closed", config.language, count=0))
     for item, row in zip([*plan["issues"], *plan.get("edits", [])], rows):
         row["number"] = mapping[item["key"]] if "key" in item else item["number"]
