@@ -31,7 +31,7 @@ import yaml
 from foragent import __version__, adopt, bench, brief, brief_report, capacity, design, design_session, gates, gh, inspect_actions, inspect_data, launchd, machine_budget, notify, orch, orch_dream, orch_facts, orch_inbox, orch_queue, orch_tick_outcome, order, star, tidy, update_check, watch, watch_open
 from foragent.config import Config, ConfigError, load_config, load_global_config, set_profile
 from foragent.git import GitError, GitRepo
-from foragent.init import init_repo
+from foragent.init import SetupStop, init_repo
 from foragent.i18n import text
 from foragent.kick import kick_tick
 from foragent.labels import READY, RUNNING
@@ -311,6 +311,10 @@ def main(argv: list[str] | None = None) -> int:
         return group.run(args)
     try:
         return group.run(args)
+    except SetupStop as exc:
+        first, *rest = str(exc).splitlines() or [""]
+        print("\n".join([f"foragent: {first}", *rest]), file=sys.stderr)
+        return 1
     except order.DoneWhenExecutableError as exc:
         for line in exc.lines:
             print(f"foragent: {line}", file=sys.stderr)
