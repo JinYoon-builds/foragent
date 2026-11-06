@@ -331,8 +331,9 @@ class _SuiteRun:
 def _suite_process(ctx: RunContext, n: int, command: str, worktree: Path,
                    log_path: Path, label: str, slot: AbstractContextManager) -> CheckResult:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as stream:
-        stream.write(f"\nPre-merge PR #{n} {label}\n$ {command}\n")
+    from foragent.shelf_io import append_log
+
+    append_log(log_path, f"\nPre-merge PR #{n} {label}\n$ {command}")
     with slot:
         code, timed_out, output = run_logged(
             ["/bin/sh", "-c", command], cwd=worktree,

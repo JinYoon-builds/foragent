@@ -32,6 +32,7 @@ from foragent.run_checks_approved import DONE_WHEN_SECONDS, acceptance_mismatche
 from foragent.run_execution import _claude_run_dir
 from foragent.run_waits import _phase, _progress, _test_slot, _timeout, activity, in_phase
 from foragent.state import Approval
+from foragent.shelf_io import append_log as _append
 
 if TYPE_CHECKING:
     from foragent.runner import RunContext
@@ -47,12 +48,6 @@ class CheckResult:
     output: str
     # Elapsed command time (excluding any test-slot queue) when a clock was supplied.
     seconds: float | None = None
-
-
-def _append(log: Path, text: str) -> None:
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as stream:
-        stream.write(text + "\n")
 
 
 def _check(
