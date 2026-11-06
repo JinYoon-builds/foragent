@@ -634,18 +634,25 @@ def _verify_contents(attempt: Implementation) -> str:
         if test_command is None:
             test_command = next(iter(runner.detect_test_commands(worktree)), None)
         unit_command = _pytest_command(test_command) if test_command else None
-        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir,
-                                         own_only=ctx.config.runner_unit_tests != "all"
-                                         and (enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config)))
+        own_only = ctx.config.runner_unit_tests != "all" and (
+            enabled(ctx, attempt.target_branch) or trusts_ci(worktree, ctx.config))
+        unit_tests = _related_unit_tests(worktree, attempt.paths, ctx.config.acceptance_dir, own_only=own_only)
         if unit_command:
             local_units = verify_local_only_units(attempt, unit_command)
             if local_units is not None:
                 attempt.checks.append(local_units)
         if unit_tests and getattr(attempt, "related_to_ci", False):
+            # A post-PASS refresh re-checks only issue files main changed since the last check.
+            changed = getattr(attempt, "main_changed", None) or set()
+            both = [path for path in attempt.paths if path in changed]
+            overlap = _related_unit_tests(worktree, both, ctx.config.acceptance_dir, own_only=own_only) if both else ()
             if not logged_to_ci:  # One line per refresh, even when the check repeats.
-                _append(log, f"Related unit tests ({len(unit_tests)} files) left to PR CI on the new head")
+                left = len(set(unit_tests) - set(overlap))
+                _append(log, f"Related unit tests ({left} files) left to PR CI on the new head"
+                        + (f"; {len(overlap)} files run here: main also changed {', '.join(both)}" if overlap else ""))
                 logged_to_ci = True
-        elif unit_tests and unit_command:
+            unit_tests = overlap
+        if unit_tests and unit_command:
             limit = max(900, runner._remaining(n, ctx))
             result = run_related_check(n, ctx, worktree, unit_command, unit_tests, len(attempt.paths), limit)
             attempt.checks.append(result)

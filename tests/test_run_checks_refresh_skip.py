@@ -162,3 +162,28 @@ def test_reviewer_pass_of_this_tree_counts(pass_world):
 def test_only_a_reviewer_pass_of_this_tree_and_body_counts(pass_world, kwargs):
     pass_world.review(**kwargs)
     assert run_publish_flow.reviewed(1, pass_world.ctx, pass_world.git, "head") is False
+
+
+def test_refresh_runs_related_units_of_issue_files_main_also_changed(world, monkeypatch):
+    # #2354: main changed src/demo.py, which this issue also changes: its related units run here.
+    seen = []
+
+    def related_units(worktree, paths, acceptance_dir, *, own_only=False):
+        seen.append(list(paths))
+        return ["tests/test_demo.py"] if "src/demo.py" in paths else []
+
+    monkeypatch.setattr(run_checks, "_related_unit_tests", related_units)
+    attempt = world.attempt(to_ci=True)
+    attempt.main_changed = {"src/demo.py", "src/neighbor.py"}
+    assert run_checks._verify_contents(attempt) == ""
+    assert world.calls["related"] == 1
+    assert seen[-1] == ["src/demo.py"], "Only issue files that main also changed select related units"
+
+
+def test_refresh_without_overlap_runs_no_related_units(world):
+    # #2354: main changed only files this issue does not touch.
+    attempt = world.attempt(to_ci=True)
+    attempt.main_changed = {"src/neighbor.py"}
+    assert run_checks._verify_contents(attempt) == ""
+    assert world.calls["related"] == 0
+    assert _ci_lines(world.log) == ["Related unit tests (1 files) left to PR CI on the new head"]

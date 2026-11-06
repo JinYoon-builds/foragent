@@ -710,8 +710,11 @@ def test_runner_carries_current_exclusions_on_its_base_merge(git_history, tmp_pa
     commands.clear()
     assert run_conflicts._merge_moved_base(attempt, attempt.start_ref) == []
     commit_exclusions(attempt, 'Issue title (#1)')
-    commits = [args for args in commands if 'commit' in args]
+    # #2354: a pending base merge is concluded with `merge --continue`, which
+    # clears it, so the next base merge does not find it unfinished.
+    commits = [args for args in commands if 'commit' in args or args[-2:] == ['merge', '--continue']]
     assert len(commits) == 1 and '--allow-empty' not in commits[0]
+    assert not attempt.git.merge_in_progress()
     parents = git_command(attempt.worktree, 'rev-list', '--parents', '-1', 'HEAD').split()[1:]
     assert parents == [previous_head, git_history.tip]
     assert read_exclusions(attempt.git, attempt.start_ref) == excluded
