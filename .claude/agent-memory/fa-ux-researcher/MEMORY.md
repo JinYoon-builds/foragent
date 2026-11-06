@@ -19,3 +19,5 @@
 - [Orch timeout after reply](broken_orch_timeout_after_reply.md) — "no response in 30 min" despite orch reply (CONFIRMED 2026-11-07); D89 CI hold unconfirmed
 - [D49 backlog missing](broken_d49_backlog_missing.md) — D49 kept on 10-31 but no open issue; inbox says in progress (reported, awaiting orch)
 - [Config batch dead end](broken_config_batch_dead_end.md) — review: batch blocks dashboard + fa init --review fast, error names no file/fix (confirmed; r919 accepted, rechecked 2026-11-07)
+- [Issue dashboard merged](broken_issue_dashboard_merged.md) — fa dashboard <N> shows merged issue as "병합 담당에게 넘겼어요" (confirmed 2026-11-07)
+- [Init no origin hides checklist](broken_init_no_origin_hides_checklist.md) — no origin: init shows one flat remote error, no gh/uv items, suggests gh (confirmed 2026-11-07)
