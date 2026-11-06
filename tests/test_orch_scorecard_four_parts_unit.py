@@ -381,7 +381,7 @@ def test_owner_does_not_attribute_the_workers_ci_to_an_unrefreshed_job():
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_owner_records_only_a_successful_merge_interval(tmp_path, fails):
+def test_owner_records_the_merge_interval_even_when_the_merge_fails(tmp_path, fails):
     from foragent import merge_owner
 
     clock = [at(10)]
@@ -399,15 +399,28 @@ def test_owner_records_only_a_successful_merge_interval(tmp_path, fails):
     if fails:
         with pytest.raises(RuntimeError, match="merge failed"):
             merge_owner._merge_pr(ctx, place, {"head": "b"}, 9, {"subject": "title"})
-        assert store.flow_records() == []
     else:
         merge_owner._merge_pr(ctx, place, {"head": "b"}, 9, {"subject": "title"})
-        rows = store.flow_records()
-        assert len(rows) == 1
-        assert (rows[0]["issue"], rows[0]["run_started_at"], rows[0]["data"]) == (1, place.started_at, {
-            "activity": "merging", "cause": "initial", "source": "merge-owner",
-            "started_at": at(10).isoformat(), "finished_at": at(12).isoformat()})
+    rows = store.flow_records()
+    assert len(rows) == 1, "a merge attempt is merging time whether or not it succeeds"
+    assert (rows[0]["issue"], rows[0]["run_started_at"], rows[0]["data"]) == (1, place.started_at, {
+        "activity": "merging", "cause": "initial", "source": "merge-owner",
+        "started_at": at(10).isoformat(), "finished_at": at(12).isoformat()})
     assert received == [(9, {"expected_head_sha": "b", "delete_branch": False, "subject": "title"})]
+
+
+def test_batch_ci_ends_before_the_owners_checks_and_landing(tmp_path):
+    """The merge-batch record is written after landing; tip CI ran before the owner's checks."""
+    owner = {"source": "merge-owner", "cause": "initial"}
+    members = [{"n": 1, "head": "a", "started_at": at(0).isoformat()}]
+    records = [activity("checking", 14, 16, **owner), activity("merging", 16, 18, **owner),
+               {"kind": "merge-batch", "issue": None, "at": at(18).isoformat(),
+                "data": {"members": members, "result": "used", "used_members": 1, "ci_minutes": 6}}]
+    store, _ = history(tmp_path, [("ci", (0, 4))], run_end=4, merged=18, records=records)
+    issue = orch_scorecard.collect(store, days=2)["window"]["today"]["flow_efficiency"]["issues"][0]
+    # Worker CI 4 + batch tip CI 8..14 = 10 value; owner re-check 2 wasted; landing push 2 necessary.
+    assert {part: issue[part] for part in four.PARTS} == {
+        "value_work": 10, "wasted_work": 2, "necessary_waiting": 2, "wasted_waiting": 4}
 
 
 @pytest.mark.parametrize("broken", ["record", "clock"])
@@ -525,3 +538,16 @@ def test_shared_card_preserves_lane_pauses_reverts_and_role_metrics(tmp_path, mo
     assert orch_scorecard.collect(store, days=2)["window"]["today"]["idle_minutes"] == 30
     assert result["window"]["today"]["reverts_after_merge"] == 1
     assert "roles" in result["window"]["today"] and "roles" in result["window"]["previous"]
+
+
+def test_a_recorded_merging_interval_wins_over_an_inferred_batch_ci_interval(tmp_path):
+    """A merging record without the owner's source tag does not move the batch CI end; it still wins."""
+    members = [{"n": 1, "head": "a", "started_at": at(0).isoformat()}]
+    records = [activity("merging", 16, 18, cause="initial"),
+               {"kind": "merge-batch", "issue": None, "at": at(18).isoformat(),
+                "data": {"members": members, "result": "used", "used_members": 1, "ci_minutes": 6}}]
+    store, _ = history(tmp_path, [("ci", (0, 4))], run_end=4, merged=18, records=records)
+    issue = orch_scorecard.collect(store, days=2)["window"]["today"]["flow_efficiency"]["issues"][0]
+    # Inferred batch CI 12..18 loses 16..18 to the recorded merge: value 4 + 4, necessary 2.
+    assert {part: issue[part] for part in four.PARTS} == {
+        "value_work": 8, "wasted_work": 0, "necessary_waiting": 2, "wasted_waiting": 8}

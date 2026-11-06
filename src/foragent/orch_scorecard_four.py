@@ -64,7 +64,9 @@ def _spans(phases, activities, approved, merged, failures=(), first_pass=None):
             if continues:
                 part = prior[1]
             else:
-                first = prior is None and (name != "checking" or first_pass is None or span[0] < first_pass)
+                # A check after a review PASS or after CI ran re-checks what was already checked.
+                first = prior is None and (name != "checking" or (
+                    (first_pass is None or span[0] < first_pass) and "ci" not in previous))
                 part = "value_work" if first else "wasted_work"
         if name == "ci":
             ci = [data for activity, (a, b), data in activities
@@ -150,23 +152,36 @@ def parts(approved: datetime, merged: datetime, phases: list[tuple[str, Interval
             if holds:
                 part = "necessary_waiting" if _peer_running(holds, executions, low, high) else "wasted_waiting"
         batch = [part for (a, b), part in batches if a <= low and high <= b]
-        if batch:
+        # A recorded work or merging interval is evidence; the batch CI interval is inferred.
+        if batch and not (covering and covering[-1][0] in WORK_PHASES | {"merging"}):
             part = batch[-1]
         totals[part] += (high - low).total_seconds() / 60
     return totals
 
 
 def _batch_spans(records, number):
-    spans = []
-    for row in records:
-        data = row["data"]
-        if row["kind"] != "merge-batch" or not data.get("ci_minutes") or (end := _time(row["at"])) is None:
-            continue
-        for index, member in enumerate(data.get("members", [])):
-            if member.get("n") == number:
-                used = data.get("result") == "used" and index < data.get("used_members", 0)
-                spans.append(((end - timedelta(minutes=data["ci_minutes"]), end),
-                              "value_work" if used else "wasted_work"))
+    """Each batch's tip CI for one member, ending before the owner's own work on that batch.
+
+    A ``merge-batch`` record is written at retirement, after the owner's final checks and
+    the landing push, so its time only bounds the end of tip CI. The owner's final checks
+    start after tip CI passed, so the member's first merge-owner check or merge after the previous
+    batch it belonged to ends this batch's CI interval instead."""
+    owner = sorted(start for row in records
+                   if row["kind"] == "activity" and row.get("issue") == number
+                   and row["data"].get("source") == "merge-owner"
+                   and row["data"].get("activity") in {"checking", "merging"}
+                   and (start := _time(row["data"].get("started_at"))) is not None)
+    batches = sorted((at, row["data"]) for row in records
+                     if row["kind"] == "merge-batch" and (at := _time(row["at"])) is not None
+                     and any(member.get("n") == number for member in row["data"].get("members", [])))
+    spans, before = [], None
+    for at, data in batches:
+        index = next(i for i, member in enumerate(data.get("members", [])) if member.get("n") == number)
+        if data.get("ci_minutes"):
+            used = data.get("result") == "used" and index < data.get("used_members", 0)
+            end = min([at, *(start for start in owner if (before is None or start > before) and start <= at)])
+            spans.append(((end - timedelta(minutes=data["ci_minutes"]), end), "value_work" if used else "wasted_work"))
+        before = at
     return spans
 
 

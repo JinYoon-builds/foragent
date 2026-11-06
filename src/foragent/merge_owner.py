@@ -211,8 +211,37 @@ def _save(ctx, place, job):
         ctx.store._write_json(_path(ctx, place.n), {"started_at": place.started_at, **job})
 
 
+def note_activity(ctx, places, name, cause, started, **fields):
+    """One owner interval per member place, from ``started`` to now; accounting never changes results."""
+    try:
+        if started is None:
+            return
+        finished = ctx.now()
+        if finished <= started:
+            return
+        for place in places:
+            ctx.store.record_flow("activity", issue=place.n, run_started_at=place.started_at, activity=name,
+                                  cause=cause, started_at=started.astimezone(UTC).isoformat(),
+                                  finished_at=finished.astimezone(UTC).isoformat(), source="merge-owner", **fields)
+    except Exception:
+        pass
+
+
+@contextmanager
+def owner_activity(ctx, places, name, cause, **fields):
+    """Record the block as ``name`` for every member place, however it ends."""
+    try:
+        started = ctx.now()
+    except Exception:
+        started = None
+    try:
+        yield
+    finally:
+        note_activity(ctx, places, name, cause, started, **fields)
+
+
 def _ci_activity(job, now):
-    """The refreshed head's CI interval, once its successful result is observed."""
+    """The refreshed head's CI interval, once its final result (pass or fail) is observed."""
     head = job.get("head")
     if not job.get("previous_head") or not head or job.get("ci_noted") == head:
         return None
@@ -233,18 +262,9 @@ def _note_ci(ctx, place, job):
 
 
 def _merge_pr(ctx, place, job, pr, subject):
-    try:
-        started = ctx.now()
-    except Exception:
-        started = None
-    ctx.tracker.merge_pr(pr, expected_head_sha=job["head"], delete_branch=False, **subject)
-    try:
-        if started is not None:
-            ctx.store.record_flow("activity", issue=place.n, run_started_at=place.started_at,
-                                  activity="merging", cause="initial", started_at=started.isoformat(),
-                                  finished_at=ctx.now().isoformat(), source="merge-owner")
-    except Exception:
-        pass
+    # A failed merge attempt is still merging time (necessary waiting).
+    with owner_activity(ctx, [place], "merging", "initial"):
+        ctx.tracker.merge_pr(pr, expected_head_sha=job["head"], delete_branch=False, **subject)
 
 
 @contextmanager
@@ -403,7 +423,7 @@ def _reverify(ctx, place, job, git, head):
     n, target = place.n, job["target"]
     approval = load_record(Approval, job["approval"])
     link = f"https://github.com/{ctx.repo}/pull/{job['pr']}"
-    with timed_checks(ctx, f"#{n}", head):
+    with timed_checks(ctx, f"#{n}", head), owner_activity(ctx, [place], "checking", "merge-check"):
         # D124 for the exact refreshed commit; before its push it normally has no CI yet.
         skips = ci_local.PassSkips.read(ctx, head, published=False)
         if stopped := _verify_review_head(n, ctx, git, parse_body(approval.body), head, link, skips=skips):
@@ -573,6 +593,8 @@ def _advance(ctx, place, job, pr, comparison=None):
                 comparison = None
         if status == "pending":
             return False
+        # The refreshed head's CI ended: record it before any exit (CI failure, comparison failure, hold).
+        _note_ci(ctx, place, job)
         if status == "fail":
             logs = ctx.tracker.pr_failed_logs(pr.number)
             run_publish._hold_if_not_started(n, ctx, pr.number, logs)
@@ -590,8 +612,6 @@ def _advance(ctx, place, job, pr, comparison=None):
             if not getattr(comparison, "substitutes_ci", False):
                 job["comparison"] = asdict(comparison)
         _save(ctx, place, job)
-        if status == "pass":
-            _note_ci(ctx, place, job)
         with ctx.store.merge_lock(), main_write_lock(ctx.git), ctx.reads.fresh():
             if not _ready(ctx, place, job, pr, git, base, comparison):
                 return False
