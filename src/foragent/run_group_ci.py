@@ -16,9 +16,8 @@ def _report_digest(reports):
 
 def check(n, ctx, target, base_sha, combined, *, excluded):
     """Compare using the same exclusions captured for the combined commit's trailer."""
-    from foragent import runner
     from foragent.run_checks import _append
-    from foragent.run_publish_ci import _CIWait
+    from foragent.run_publish_ci import _CIWait, ci_wait_credit
     from foragent.run_waits import _phase, _progress, in_phase
 
     _phase(n, ctx, "checking")
@@ -40,8 +39,9 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
         pr = ctx.tracker.create_pr(head=branch, base=target, title=f"Foragent group check: {n}",
                                    body=compose([f"Temporary acceptance comparison on {base_sha}."]))
         metadata["pr"] = pr
-        with in_phase(n, ctx, "ci"):
+        with in_phase(n, ctx, "ci"), ci_wait_credit(n, ctx) as credit:
             while True:
+                credit()
                 reports = ctx.tracker.pr_acceptance_reports(combined)
                 try:
                     lost, duration = ci_mode.comparison(
@@ -50,7 +50,7 @@ def check(n, ctx, target, base_sha, combined, *, excluded):
                     break
                 except (ci_mode.MissingComparison, ci_mode.StaleComparison) as exc:
                     ci_mode._note_evidence(ctx, n, base_sha, combined, ci_mode._refusal(exc), str(exc))
-                    remaining = min(wait.deadline - ctx.now().timestamp(), runner._remaining(n, ctx))
+                    remaining = wait.deadline - ctx.now().timestamp()
                     if remaining <= 0:
                         raise ci_mode.UnusableComparison("group CI evidence timed out")
                     _progress(n, ctx)

@@ -56,6 +56,23 @@ def test_a_round_an_earlier_run_left_undecided_is_passed_over_like_the_runner_do
     assert watch_data.review_rounds(store, [_run(1)], _journal(1, 1)) == {1: 3}
 
 
+def test_an_orchestrator_verdict_takes_no_reviewer_round(tmp_path):
+    # An orchestrator PASS is journaled with a round number but saves no review file; the
+    # repair's reviewer round is still the runner's first (review_single.next_review_round).
+    store = _store(tmp_path, 1, [])
+    orchestrator = [{"kind": "review", "issue": 1, "round": 1, "verdict": "PASS", "source": "orchestrator"}]
+    assert watch_data.review_rounds(store, [_run(1)], orchestrator) == {1: 1}
+    _store(tmp_path, 1, ["review-1.txt"], at=START + timedelta(minutes=1))
+    assert watch_data.review_rounds(store, [_run(1)], orchestrator) == {1: 1}
+    decided = [*orchestrator, {"kind": "review", "issue": 1, "round": 1, "verdict": "FAIL"}]
+    assert watch_data.review_rounds(store, [_run(1)], decided) == {1: 2}
+
+
+def test_an_older_undecided_round_does_not_hold_back_a_later_decided_one(tmp_path):
+    store = _store(tmp_path, 1, ["review-1.txt", "review-2.txt", "review-3.txt"], at=START + timedelta(minutes=1))
+    assert watch_data.review_rounds(store, [_run(1)], _journal(1, 1, 3)) == {1: 4}
+
+
 def test_an_unreadable_journal_leaves_the_round_unknown(tmp_path):
     store = _store(tmp_path, 1, ["review-1.txt"])
     assert watch_data.review_rounds(store, [_run(1)], None) == {}

@@ -212,7 +212,7 @@ def test_interactive_view_removes_pid_on_return_or_error(tmp_path, monkeypatch, 
     pid_file = store.root / "watch.pid"
     monkeypatch.setattr(watch.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(watch.sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr(watch, "collect", lambda *args: object())
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: object())
 
     def terminal(*args):
         assert int(pid_file.read_text()) == os.getpid()
@@ -232,8 +232,8 @@ def test_once_leaves_an_interactive_views_pid_untouched(tmp_path, monkeypatch, c
     store = StateStore(tmp_path)
     pid_file = tmp_path / "watch.pid"
     pid_file.write_text("123\n")
-    monkeypatch.setattr(watch, "collect", lambda *args: object())
-    monkeypatch.setattr(watch, "render_frame", lambda *args: "one frame")
+    monkeypatch.setattr("foragent.watch_now.read", lambda *args: object())
+    monkeypatch.setattr(watch, "render_frame", lambda *args, **kwargs: "one frame")
     watch.run(lambda: {}, FakeTracker(), store, Config(), tmp_path, once=True)
     assert capsys.readouterr().out == "one frame\n"
     assert pid_file.read_text() == "123\n"

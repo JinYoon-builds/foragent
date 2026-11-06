@@ -79,7 +79,7 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     rows = [{"status": "processing", "text": "D75 order\nsecond line"}, {"status": "done", "text": "old"},
             {"status": "new", "text": "later"}]
     frame = watch.render_frame(snapshot(rows), config, tmp_path, width=160, now=NOW)
-    assert "requests 1 active · 1 done" in frame
+    assert "requests 1 active · 1 done" not in frame  # Removed from r53 main.
     bubble = [line for line in frame.splitlines() if "Planning request: D75 order" in line]
     assert len(bubble) == 1 and "▀" in bubble[0] and "second line" not in frame
     stacked = watch.render_frame(snapshot(rows), config, tmp_path, width=50, now=NOW).splitlines()
@@ -88,7 +88,7 @@ def test_request_line_and_bubble_in_english_and_width_tiers(tmp_path):
     top = next(index for index, value in enumerate(stacked) if value.startswith("╭"))
     assert top < line < top + 7 and not any("▀" in value or "▄" in value for value in stacked[top:top + 8])
     text = watch.render_frame(snapshot(rows), config, tmp_path, width=40, now=NOW)
-    assert "Planning request" in text and "▀" not in text
+    assert "Planning request" in text and "▀" in text  # The squirrel now stacks above the narrow bubble.
     idle = watch.render_frame(snapshot([]), config, tmp_path, width=160, now=NOW)
     # Without a request the stage is gone; the idle header's squirrel has no bubble.
     assert "requests" not in idle and "Planning request" not in idle

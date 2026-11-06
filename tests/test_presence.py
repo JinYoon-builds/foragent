@@ -1097,7 +1097,8 @@ def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(pr
     else:
         monkeypatch.setenv("COLUMNS", columns)
     output = presence.squirrel(project, "greeting", now)
-    rows = output.splitlines()
+    assert all(row.startswith(presence.STATUSLINE_ROW_START) for row in output.splitlines())
+    rows = [row.removeprefix(presence.STATUSLINE_ROW_START) for row in output.splitlines()]
     assert len(rows) == 8
     widths = [len(re.sub(r"\x1b\[[0-9;]*m", "", row)) for row in rows]
     if columns in ("84", "120"):
@@ -1105,3 +1106,23 @@ def test_greeting_uses_only_explicit_columns_and_keeps_unknown_width_squirrel(pr
     else:
         assert rows == watch_art.ansi_rows(watch_art.ORCHESTRATOR, watch_art.PALETTE)
         assert max(widths) == 18
+
+
+@pytest.mark.parametrize("columns", [None, "84", "120"])
+def test_statusline_squirrel_rows_survive_leading_space_trimming(project, monkeypatch, columns):
+    from datetime import UTC, datetime
+
+    from foragent import presence, watch_art
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(presence, "_started_at", lambda path: now)
+    if columns is None:
+        monkeypatch.delenv("COLUMNS", raising=False)
+    else:
+        monkeypatch.setenv("COLUMNS", columns)
+    rows = presence.squirrel(project, "greeting", now).splitlines()
+    expected = watch_art.greeting_rows(int(columns) if columns else None)
+    plain = [re.sub(r"\x1b\[[0-9;]*m", "", row) for row in expected]
+    assert any(line != line.lstrip(" ") for line in plain)  # the art really is indented
+    trimmed = [row.lstrip(" ") for row in rows]  # what Claude Code's status line does
+    assert [re.sub(r"\x1b\[[0-9;]*m", "", row) for row in trimmed] == plain
