@@ -5,21 +5,18 @@ Processes and Git use the offline fixtures of the existing scheduler, dream and 
 
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
-import sys
 import time
 from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
 
 from conftest import git_command  # noqa: E402
 from foragent import orch, orch_architect, orch_dream, orch_dream_worker, orch_role_schedule, orch_stop  # noqa: E402
 from foragent import run_publish, scheduler  # noqa: E402
 from foragent.runner import review_only, run_issue  # noqa: E402
 from test_orch_dream_unit import KEY, MEMORY, dreaming, world, worker_world  # noqa: E402,F401
-from test_orch_review_handoff import make_case  # noqa: E402
+from helpers.review_case import make_case  # noqa: E402
 from test_scheduler_flow import _add, _reasons, _tick, lane  # noqa: E402,F401
 from test_scheduler import ctx  # noqa: E402,F401
 

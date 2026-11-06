@@ -2,29 +2,25 @@
 
 from dataclasses import replace
 from pathlib import Path
-import sys
 
 import pytest
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "acceptance"))
-
 from conftest import git_command
-from foragent import orch_events, review_pass_scope, risks  # noqa: E402
-from foragent.issue import body_hash  # noqa: E402
-from foragent.run_review import _journal_review  # noqa: E402
-from foragent.runner import review_only, run_issue  # noqa: E402
-from foragent.state import StateStore  # noqa: E402
-from test_order_machine_budget import fake_workloads  # noqa: F401
-from test_review_pass_scope import (
+from foragent import orch_events, review_pass_scope, risks
+from foragent.issue import body_hash
+from foragent.run_review import _journal_review
+from foragent.runner import review_only, run_issue
+from foragent.state import StateStore
+from helpers.workloads import fake_workloads  # noqa: F401
+from helpers.review_scope import (
     FIRST_FINDING, NEW_FINDING, OLD_FINDING, PASS, capture_review, case_for, content, implement,
 )
 from foragent.review_perspectives import DEFAULT_PERSPECTIVES
 from runner_support import GROUNDED_SCORE, scoring_request
-from test_review_perspectives import review_offline  # noqa: F401
-from test_risk_map import entry, offline  # noqa: F401
-from test_skills_autosync import isolated_home  # noqa: F401
-
+from helpers.review_panel import review_offline  # noqa: F401
+from helpers.risk import entry, offline  # noqa: F401
+from helpers.home import isolated_home  # noqa: F401
 
 LIMITED = "Limit blocking findings to code changed after that PASS"
 
@@ -207,9 +203,9 @@ def test_off_switch_keeps_todays_confirmation_after_a_pass(git_history, tmp_path
 def test_later_fail_on_the_same_body_leaves_the_boundary(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
     head = case.tracker.pr_head_sha(2)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         later = capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
         assert head in later[0] and LIMITED in later[0]
 
 
@@ -284,9 +280,9 @@ def _at_head(case, tmp_path):
 
 def test_scoped_note_reaches_the_issue_once(git_history, tmp_path, monkeypatch):
     case = passed_case(git_history, tmp_path, monkeypatch)
-    for _ in range(2):
+    for expected in ("review-failed", "held"):
         capture_review(case, ["VERDICT: FAIL\n" + NEW_FINDING + "\nNOTE: " + OLD_FINDING])
-        assert review_only(1, case.ctx) == "review-failed"
+        assert review_only(1, case.ctx) == expected
     comments = [c.body for c in case.tracker.list_comments(1) if c.body.startswith("Review notes")]
     assert len(comments) == 1 and "NOTE: " + OLD_FINDING in comments[0]
 

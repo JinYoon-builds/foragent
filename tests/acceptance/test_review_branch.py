@@ -40,8 +40,10 @@ FAIL = f"VERDICT: FAIL\n{FINDING}"
 PROJECT = {"name": "observability", "focus": "FOCUS-observability: lost diagnostic context"}
 
 UNGROUNDED = {"score": 90, "critical_path": False, "exists": False, "goal_line": None,
+              "wrong_result": True, "ordinary_input": True, "irreversible": False,
+              "finding_class": "upload retries",
               "locked_test": None, "breaking_input": None, "spec_question": None}
-GROUNDED = {**UNGROUNDED, "breaking_input": "An upload to a server that never answers"}
+GROUNDED = {**UNGROUNDED, "exists": True, "breaking_input": "An upload to a server that never answers"}
 
 FAKE_GH = r'''
 import json, os, sys

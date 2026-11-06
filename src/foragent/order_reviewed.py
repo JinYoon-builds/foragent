@@ -156,7 +156,8 @@ def _language(config: Config) -> str:
 
 
 def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
-                           items: list[dict], files: dict[str, str | bytes] | None = None) -> dict[str, dict]:
+                           items: list[dict], files: dict[str, str | bytes] | None = None, *,
+                           record: dict | None = None) -> dict[str, dict]:
     """The reviewed record entry of each statement issue; refuses unless every one has current evidence.
 
     ``files`` is the manifest publication read once and will write. The evidence is checked against
@@ -171,7 +172,7 @@ def require_reviewed_tests(plan: dict, root: Path, config: Config, repo: str,
     if not items:
         return {}
     language = _language(config)
-    full = {"issues": _record(plan, repo)}
+    full = {"issues": _record(plan, repo) if record is None else record}
     record = full["issues"]
     missing, stale, differ, bases, changed, changed_keys, alone = [], [], [], {}, [], [], []
     for item in items:

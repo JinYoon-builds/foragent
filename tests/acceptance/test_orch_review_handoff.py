@@ -5,6 +5,8 @@ import json as _json
 # #1651 public scoring session: the prompt starts with one JSON request carrying "finding";
 # the reply is one JSON object. This one confirms a real defect with a concrete breaking input.
 CONFIRMED_SCORE = _json.dumps({"score": 100, "critical_path": False, "exists": True, "goal_line": None,
+                               "wrong_result": True, "ordinary_input": True, "irreversible": False,
+                               "finding_class": "scripted defect",
                                "locked_test": None, "breaking_input": "the input this fixture's reviewer reports",
                                "spec_question": None})
 
@@ -237,6 +239,7 @@ def test_repeated_normalized_finding_after_rebuttal_blocks_dispute(git_history, 
     run_issue(1, case.ctx)
     assert "blocked" in case.tracker.get_issue(1).labels
     assert "needs-human" not in case.tracker.get_issue(1).labels
-    assert any(c.body.startswith("<!-- foragent:blocked reason=review-dispute -->")
+    assert len(case.implementer.calls) == len(case.reviewer.calls) == 2
+    assert any(c.body.startswith("<!-- foragent:blocked reason=review-defects -->")
                for c in case.tracker.list_comments(1))
     assert case.tracker.merged_prs == []

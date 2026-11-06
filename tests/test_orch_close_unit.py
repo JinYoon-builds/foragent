@@ -1,15 +1,12 @@
 """Superseded closure boundaries using the same real local history as the CLI lock."""
 
 from dataclasses import replace
-from pathlib import Path
-import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent / 'acceptance'))
 from conftest import git_command
 from foragent.tracker import GhTracker, TrackerError
-from test_orch_close_superseded import (
+from helpers.orch_close import (
     BRANCH, OWN, approve, assert_nothing_changed, base_files, base_tip, close, superseded_case,
 )
 
@@ -19,6 +16,7 @@ def test_unapproved_issue_closes_without_touching_base(git_history, tmp_path, mo
     assert case.store.load_approval(2) is None
     assert close(case, n=2, by=1) == 0
     assert case.tracker.get_issue(2).state == 'closed'
+    assert case.tracker.get_issue(2).state_reason == 'not_planned'
     assert len(case.tracker.list_comments(2)) == 1
     assert_nothing_changed(case)
 
@@ -214,3 +212,33 @@ def test_shared_close_without_a_pr_closes_only_the_issue():
     close_with_pr(tracker, issue)
     assert tracker.get_issue(issue).state == 'closed'
     assert tracker.deleted_branches == []
+
+
+def test_close_records_the_replacement_once_for_the_order_comment(git_history, tmp_path, monkeypatch):
+    from foragent.board_parents import superseded
+    from foragent.orch_events import events
+
+    case = superseded_case(git_history, tmp_path, monkeypatch)
+    assert close(case) == 0
+    assert superseded(case.store, 1) == 2
+    assert close(case) == 0, 'A repeated close is a no-op'
+    assert [e['superseded_by'] for e in events(case.store, 'closed') if e['issue'] == 1] == [2]
+
+
+def test_retry_records_a_replacement_the_first_run_did_not(git_history, tmp_path, monkeypatch):
+    from foragent import orch_close
+    from foragent.board_parents import superseded
+
+    case = superseded_case(git_history, tmp_path, monkeypatch)
+    original = orch_close.append_event
+
+    def crash(*args, **kwargs):
+        raise OSError('journal write failed')
+
+    monkeypatch.setattr(orch_close, 'append_event', crash)
+    assert close(case) == 1
+    assert case.tracker.get_issue(1).state == 'closed'
+    monkeypatch.setattr(orch_close, 'append_event', original)
+    assert close(case) == 0
+    assert superseded(case.store, 1) == 2
+    assert len(case.tracker.list_comments(1)) == case.before['comments'] + 1
