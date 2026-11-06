@@ -40,7 +40,7 @@ class ReviewStopped(BaseException):
         self.signum = signum
 
 
-STOP_GRACE_S = 3
+STOP_GRACE_S = 2
 
 
 class _Sessions:
@@ -57,11 +57,15 @@ class _Sessions:
     def seen(self, identities: list[dict]) -> None:
         if not identities:
             return
+        root = (identities[0]["pid"], identities[0]["start_time"])
         with self._lock:
-            self._trees[(identities[0]["pid"], identities[0]["start_time"])] = list(identities)
+            new = root not in self._trees
+            self._trees[root] = list(identities)
             stopping = self.stopping
-        if stopping:
-            # A session that started after the stop began (a queued reviewer) ends at once.
+        if stopping and new:
+            # A session that started after the stop began (a queued reviewer) ends at once. A tree
+            # the stop already covers is not ended twice: the stop's own kill follows its children,
+            # and a second whole-table scan per late report only slows the exit.
             self._end(identities)
 
     def stop(self) -> list[BaseException]:
@@ -76,8 +80,7 @@ class _Sessions:
         if not identities:
             return []
         try:
-            with processes.recorded_tree(identities):
-                processes.kill_process_group(identities[0]["pid"], grace_s=STOP_GRACE_S)
+            processes.stop_recorded_tree(identities, grace_s=STOP_GRACE_S)
         except Exception as error:
             return [error]
         return []

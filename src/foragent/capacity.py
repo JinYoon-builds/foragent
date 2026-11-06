@@ -712,7 +712,7 @@ def hold_test_slot(
             heartbeat = time.monotonic()
             waiting()
         pause = SLOT_POLL_SECONDS if deadline is None else min(SLOT_POLL_SECONDS, deadline - time.monotonic())
-        processes.pause(max(0.0, pause))
+        processes.pause(max(0.0, pause), time.sleep)
     taker = os.getpid()
     try:
         yield
@@ -817,7 +817,7 @@ def admit_run(
         if remaining <= 0:
             raise TimeoutError("No machine run slot became free in time")
         waiting()
-        processes.pause(min(WORKLOAD_POLL_SECONDS, remaining))
+        processes.pause(min(WORKLOAD_POLL_SECONDS, remaining), time.sleep)
 
 
 def _acquire_workload(
@@ -859,7 +859,7 @@ def _acquire_workload(
         if not brief and (reason, tuple(holders)) != shown:
             shown = (reason, tuple(holders))
             _say(_workload_text("workload_wait", language, reason, holders, budget, seconds=f"{wait_s:g}"), wait_s)
-        processes.pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining))
+        processes.pause(min(LOCK_RETRY_SECONDS if reason == "busy" else WORKLOAD_POLL_SECONDS, remaining), time.sleep)
 
 
 def _held_test_slots() -> int:

@@ -150,11 +150,12 @@ def raise_if_cancelled() -> None:
         raise Cancelled()
 
 
-def pause(seconds: float) -> None:
-    """time.sleep, except that it ends with Cancelled as soon as the context is cancelled."""
+def pause(seconds: float, sleep: Callable[[float], None] | None = None) -> None:
+    """``sleep`` (default time.sleep), except that it ends with Cancelled once the context is
+    cancelled. Callers pass their own module's sleep so a test's fake clock still governs them."""
     event = _cancel_event.get()
     if event is None:
-        time.sleep(seconds)
+        (sleep or time.sleep)(seconds)
         return
     if event.wait(max(0.0, seconds)):
         raise Cancelled()
@@ -648,7 +649,7 @@ def recorded_tree(identities):
         _recorded_tree.reset(token)
 
 
-def kill_process_group(pid: int, *, grace_s: float | None = None) -> int:
+def kill_process_group(pid: int) -> int:
     """Stop a recorded tree by individual identities, never a numeric group.
 
     The historical name remains for callers. Each signal rechecks start time,
@@ -656,8 +657,6 @@ def kill_process_group(pid: int, *, grace_s: float | None = None) -> int:
     bind the signal to that process lifetime. macOS has no equivalent: a
     microsecond exit/PID-reuse window remains between the final read and kill.
     Permission denial refuses the stop immediately, without another attempt.
-    With ``grace_s``, SIGKILL follows only if the tree outlives that many seconds
-    of polling, so a tree that ends on SIGTERM is not waited on for the full pause.
     """
     recorded = _recorded_tree.get()
     if not recorded:
@@ -716,16 +715,9 @@ def kill_process_group(pid: int, *, grace_s: float | None = None) -> int:
                     os.close(descriptor)
 
     send(signal.SIGTERM)
-    if grace_s is None:
-        if current():
-            time.sleep(10)
-            send(signal.SIGKILL)
-    else:
-        deadline = time.monotonic() + grace_s
-        while current() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if current():
-            send(signal.SIGKILL)
+    if current():
+        time.sleep(10)
+        send(signal.SIGKILL)
     for _ in range(50):
         for target in signaled:
             try:
@@ -736,6 +728,79 @@ def kill_process_group(pid: int, *, grace_s: float | None = None) -> int:
             return len(signaled)
         time.sleep(0.1)
     raise TimeoutError(f"Runner process tree {pid} did not terminate")
+
+
+def stop_recorded_tree(identities: list[dict], *, grace_s: float) -> int:
+    """Promptly stop process trees this process launched and recorded (a cancelled command).
+
+    One table scan picks up children born since the last report; after that each process is
+    read by its own identity: its start time must match the record, and it is never this
+    process, its parent, or in this process's group or session. SIGTERM goes children first,
+    then SIGKILL to what outlives ``grace_s``. kill_process_group keeps its full per-signal
+    rescan for trees other processes recorded; on macOS both share the brief exit/PID-reuse
+    window between the final read and the signal.
+    """
+    identities = observe_tree(identities)
+    if not identities:
+        return 0
+    own = {1, os.getpid(), os.getppid()}
+    group, session = os.getpgrp(), os.getsid(0)
+    signaled: set[int] = set()
+
+    def send(signum):
+        for item in reversed(identities):
+            target = item["pid"]
+            try:
+                row = read_process_identity(target)
+            except (OSError, psutil.Error, SystemError):
+                continue
+            if (row is None or row.start_time != item["start_time"] or target in own
+                    or row.pgid in own or row.sid in own or row.pgid == group or row.sid == session):
+                continue
+            try:
+                os.kill(target, signum)
+            except ProcessLookupError:
+                continue
+            signaled.add(target)
+
+    send(signal.SIGTERM)
+    return _await_signaled(identities, signaled, grace_s, send, identities[0]["pid"])
+
+
+def _await_signaled(identities, signaled: set[int], grace_s: float, send, pid: int) -> int:
+    """Wait at most ``grace_s`` for the signalled processes to end, then SIGKILL and wait again.
+
+    Only the processes this stop signalled are read, each by its own identity, so a stop under
+    machine load does not rescan the whole process table on every poll.
+    """
+    starts = {item["pid"]: item["start_time"] for item in identities}
+
+    def running() -> bool:
+        for target in signaled:
+            try:
+                os.waitpid(target, os.WNOHANG)  # reap our own child so it is not left a zombie
+            except ChildProcessError:
+                pass
+            try:
+                row = read_process_identity(target)
+            except (OSError, psutil.Error, SystemError):
+                return True  # unreadable: not proven gone
+            if row is not None and row.start_time == starts.get(target):
+                return True
+        return False
+
+    for final in (False, True):
+        deadline = time.monotonic() + grace_s
+        while running():
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        else:
+            return len(signaled)
+        if final:
+            raise TimeoutError(f"Runner process tree {pid} did not terminate")
+        send(signal.SIGKILL)
+    raise AssertionError("unreachable")
 
 
 def _child_environment(cwd: Path) -> dict[str, str]:
