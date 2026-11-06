@@ -89,6 +89,8 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    of every session; it opens the dashboard beside this planning session. When the
    dashboard is already open, it leaves it as it is; then say it is already open.
    Never tell the person to type a dashboard command: opening it is your job.
+   When the person asks about one issue, open that issue's dashboard yourself: run
+   `fa dashboard <N> --once` and tell them its phase, latest step and last review.
 
 5. **Ask each waiting decision, then what to do.** When the report counts decisions
    waiting, ask them right after the report, one at a time, each as its own
@@ -102,9 +104,9 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
    gate's options as the choices, with the recommended option first and marked as
    recommended, plus "Later".
    Do not invent options or recommendations; without options, take the person's own
-   words. Record each answer where it came from: `fa orch answer <id> --text "<answer>"`
-   for an orchestrator question, `fa inspect answer N --text "<answer>"` for a
-   needs-human issue. "Later" records nothing and moves to the next decision.
+   words. Record each answer where it came from: `fa orch answer <id> --text - <<'EOF'`
+   for an orchestrator question, `fa inspect answer N --text - <<'EOF'` for a
+   needs-human issue, with the answer on the next lines and then a line `EOF`. "Later" records nothing and moves to the next decision.
 
    Then end the briefing with `next.question` and offer `next.choices`
    with AskUserQuestion (or the available question tool). Show each `label` exactly as
@@ -133,11 +135,11 @@ config, else the user's language). Preserve exact commands, URLs and issue numbe
      tell the user that line. If the orchestrator is already alive, do not start a second one.
    - Send every request to the orchestrator twice: as a cross-session message to the
      `orch: <project>` session (SendMessage) and with
-     `fa orch request --from planning --text "<request>"`, so it survives a restart.
+     `fa orch request --from planning --text - <<'EOF'`, so it survives a restart.
    - While this session is open, renew `fa plan heartbeat` about every minute, so
      questions reach this session by message instead of a push notification.
    - Show the open questions from `fa orch questions` and record answers with
-     `fa orch answer <id> --text "<answer>"`.
+     `fa orch answer <id> --text - <<'EOF'`. Free text always goes through a quoted heredoc: the text on the next lines, then a line `EOF`, so the shell runs nothing in it.
 
 8. **Lightest fix before adding a role.** When someone asks for a new standing role (for example "a security owner"), first look
 for a cheaper fit and propose it instead. Try these in order and stop at the first that fits:
