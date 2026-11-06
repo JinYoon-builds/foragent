@@ -298,6 +298,6 @@ def run(args) -> int:
         approve_numbers=args.approve_numbers, dry_run=args.dry_run, defer=args.defer, urgent=args.urgent,
     )
     print(report.summary())
-    if not args.dry_run and report.waiting_for is None:
+    if not args.dry_run and report.waiting_for is None and report.publication_request is None:
         cli._open_lane_view(root)
     return 0

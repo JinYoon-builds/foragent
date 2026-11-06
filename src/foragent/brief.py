@@ -47,6 +47,7 @@ def collect(store: StateStore, config: Config | None = None, now: datetime | Non
         "queued": _queued(status),
         "to_see": _to_see(status),
         "planning": _planning(store),
+        "pending_publications": status["pending_publications"],
         # Requests stuck in processing (#2088), as the gate's flow-stall signal counts them.
         "stalled_requests": orch_facts_stall.stuck_requests(store, now),
         "team": _team(store, config),
