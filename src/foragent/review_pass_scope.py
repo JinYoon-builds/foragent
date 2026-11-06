@@ -96,6 +96,51 @@ def _expected_tree(git: GitRepo, head: str, base_ref: str) -> str:
         return head  # no merge possible: compare with the PASS head, which only widens the input
 
 
+def _marker_regions(text: str) -> list[tuple[int, int]]:
+    """1-based inclusive line ranges of conflict blocks, from `<<<<<<< ` to `>>>>>>> `."""
+    regions, start = [], None
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("<<<<<<< ") and start is None:
+            start = number
+        elif line.startswith(">>>>>>> ") and start is not None:
+            regions.append((start, number))
+            start = None
+    return regions
+
+
+def _within_conflicts(git: GitRepo, expected: str, head: str) -> bool:
+    """True when the index differs from the plain merge only inside its conflict blocks.
+
+    Any other edit (a line outside a block, a new, deleted or binary file, a mode change) or an unknown
+    plain merge means the resolution is not confined, so the review and re-check stay whole (#2310).
+    """
+    if expected == head:
+        return False  # merge-tree failed: the plain merge, and so the conflict blocks, are unknown
+    text = git._call(["diff", "--cached", "-U0", "--no-ext-diff", "--no-textconv", "--no-renames", expected])
+    regions: list[tuple[int, int]] = []
+    hunks = 0
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            path = line.split(" b/", 1)[-1]
+            try:
+                regions = _marker_regions(git._call(["show", f"{expected}:{path}"]))
+            except GitError:
+                return False
+        elif line.startswith(("new file", "deleted file", "old mode", "new mode", "Binary files", "GIT binary")):
+            return False
+        elif line.startswith("@@ "):
+            old = line.split(" ", 2)[1][1:].split(",")
+            start, count = int(old[0]), int(old[1]) if len(old) > 1 else 1
+            hunks += 1
+            if count:
+                inside = any(low <= start and start + count - 1 <= high for low, high in regions)
+            else:  # a pure insertion after line `start`
+                inside = any(low <= start < high for low, high in regions)
+            if not inside:
+                return False
+    return hunks > 0
+
+
 def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary | None:
     """The applicable boundary for a review of this index, or None for today's review."""
     passed = _latest_pass(n, ctx, git)
@@ -113,6 +158,11 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
     kept = cuts.head(record, 8000, cuts.issue_dir(ctx.store.root, n), f"review-pass-{number}.txt")
     evidence = f"Actual review record of that PASS (verbatim):\n{kept}"
     notes = risks.review_notes(matched, paths)
+    if _within_conflicts(git, expected, head):
+        # A resolution confined to the conflict blocks: the notes name only what it and exempt paths
+        # cover, since every PR path there would ask for the whole change again (#2310).
+        scoped = sorted({*filter(None, since), *full})
+        notes = risks.review_notes(risks.matching(risks.load_at(git, base_ref), scoped), scoped)
     diff = ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames"]
     if full:
         entries = "; ".join(", ".join(risk["paths"]) for risk in exempt)
@@ -144,6 +194,31 @@ def for_review(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> Boundary
         "A defect confined to unchanged code does not block: write it as a `NOTE: <path:line> — <defect>` line. "
         "A defect a later change causes or exposes belongs to that later change. You judge each finding.",
         evidence]), git._call(["diff", "--cached", "--no-ext-diff", "--no-textconv", expected]))
+
+
+def recheck_paths(n: int, ctx: RunContext, git: GitRepo, base_ref: str) -> list[str] | None:
+    """Paths a conflict resolution after a PASS or main's new commits touched; None means re-check all.
+
+    None comes without a PASS, or when the resolution edits anything outside the conflict blocks.
+
+    The resolution is the index against the plain merge of the PASS head with main; main's new commits
+    run from that head's merge base with main. Tests related only to other PR paths stay with PR CI.
+    """
+    passed = _latest_pass(n, ctx, git)
+    if passed is None:
+        return None
+    head = passed[0]
+    main = git._call(["rev-parse", f"{base_ref}^{{commit}}"]).strip()
+    expected = _expected_tree(git, head, base_ref)
+    if not _within_conflicts(git, expected, head):
+        return None
+    resolved = git._call(["diff", "--cached", "--name-only", "--no-renames", "-z", expected])
+    try:
+        fork = git._call(["merge-base", head, main]).strip()
+        moved = git._call(["diff", "--name-only", "--no-renames", "-z", fork, main])
+    except GitError:
+        return None  # no shared history: the whole related set stays local
+    return sorted({*filter(None, resolved.split("\0")), *filter(None, moved.split("\0"))})
 
 
 def keep_notes(n: int, ctx: RunContext, head: str, notes: tuple[str, ...]) -> None:
