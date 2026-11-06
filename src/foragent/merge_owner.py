@@ -695,6 +695,34 @@ def tick(ctx, report):
             orch_github.pause(owner, exc)
 
 
+def _single_turn_order(ctx, order, candidates, rows):
+    """A previous holder yields when another waiting publication is already green on its target."""
+    previous = next(((row["n"], row.get("started_at")) for row in reversed(rows)
+                     if row.get("event") == "owner-single-turn"), None)
+    if previous not in candidates or previous not in order:
+        return order
+    for key in order:
+        if ctx.store.github_wait_until(ctx.now()):
+            break
+        if key == previous or key not in candidates:
+            continue
+        place, job, pr = candidates[key]
+
+        def ready():
+            return (job["phase"] == "waiting" and pr.head_sha == job["head"]
+                    and job["base"] == ctx.git.ref_sha(f"origin/{pr.base}")
+                    and ctx.tracker.pr_checks(pr.number) == "pass")
+
+        if _try_admission(ctx, place, job, ready):
+            return [key for key in order if key != previous] + [previous]
+    return order
+
+
+def _record_single_turn(ctx, place):
+    with ctx.store._state_lock():
+        queue._append(ctx.store, queue._row(ctx, place, "owner-single-turn"))
+
+
 def _tick(owner, report):
     ctx = owner
     entries = admissions(ctx.store)
@@ -734,6 +762,8 @@ def _tick(owner, report):
     if batch:
         merge_owner_batch.land(ctx, report, list(candidates.values()), batch)
         return
+    turn_order = _single_turn_order(ctx, turn_order, candidates, rows)
+    turn = None
     for key in turn_order:
         if ctx.store.github_wait_until(ctx.now()):
             return
@@ -743,10 +773,15 @@ def _tick(owner, report):
         if live:
             # Batch preparation can have repaired or held a candidate in this pass.
             if key in candidates and candidates[key][1]["phase"] in {"waiting", "publishing", "merging"}:
+                if turn is None:
+                    _record_single_turn(ctx, candidates[key][0])
+                    turn = key
                 advanced = advance_members(owner, [candidates[key]])
                 if ctx.store.github_wait_until(ctx.now()):
                     return
                 if advanced:
+                    if turn != key:
+                        _record_single_turn(ctx, candidates[key][0])
                     report.actions.append(f"#{key[0]} merge owner advanced")
                     break
             elif not waiting[key].get("merge_owner"):

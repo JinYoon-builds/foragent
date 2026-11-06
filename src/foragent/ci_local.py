@@ -32,6 +32,9 @@ class PassSkips:
     run_id: object = None  # The exact-head CI run that passed ``ci``.
     # Per test file at ``head``: its collected ids and its local_only ids (None: not collectable).
     layout: dict = field(default_factory=dict, repr=False)
+    # Only a fully validated, trusted batch comparison can credit locked paths.
+    locked_ci: frozenset[str] = frozenset()
+    pythonpath: tuple[str, ...] = field(default=(), repr=False)
 
     @classmethod
     def read(cls, ctx, head, *, published=True):
@@ -39,7 +42,7 @@ class PassSkips:
         return cls(head, evidence[1] if evidence else None, run_id=evidence[0] if evidence else None)
 
     def passed(self) -> set[str]:
-        return set(self.ci or ()) | self.ran
+        return set(self.ci or ()) | self.locked_ci | self.ran
 
 
 def ci_passing_set(ctx, head, *, published=True):
@@ -94,11 +97,12 @@ _NODE_LINE = re.compile(r"^(.+?\.py)::\S")
 _PASSED_LINE = re.compile(r"^PASSED (\S.*?\.py::.+)$")
 
 
-def _collect_ids(n, ctx, root, invocation, files, extra, log):
+def _collect_ids(n, ctx, root, invocation, files, extra, log, *, probe=None):
     """Node ids foragent's own pytest invocation collects in ``files``; [] when none; None when not clean."""
     from foragent import runner
 
-    command = f"{invocation} --collect-only -q {extra}{shlex.join(sorted(files))}"
+    selection = [*sorted(files), *([str(probe)] if probe is not None else [])]
+    command = f"{invocation} --collect-only -q {extra}{shlex.join(selection)}"
     log.unlink(missing_ok=True)
     result = runner._check(command, root, log, max(1, runner._remaining(n, ctx)), progress=lambda: _progress(n, ctx),
                            slot=_test_slot(n, ctx), clock=ctx.monotonic)
@@ -112,19 +116,19 @@ def _collect_ids(n, ctx, root, invocation, files, extra, log):
 
 
 def _deselections(n, ctx, root, skips, locked, directory):
-    """The exact ids to leave out (D124): CI-passed or already passed in this pass, never locked or local_only.
+    """CI-passed or already passed ids; locked paths require trusted batch evidence.
 
-    foragent's own pytest invocation collects the candidate files once per commit,
-    so local_only markers and every sibling id are known: ``--deselect`` matches
-    by prefix, and an id that prefixes another id that must run is not deselected.
+    Collection preserves the existing conservative prefix selection for ordinary
+    CI and identifies local_only tests. Trusted locked ids also receive exact
+    matching in the plugin, so their uncredited siblings can still run.
     """
     from foragent import runner
 
     def is_locked(path):
         return any(path == item or path.startswith(item.rstrip("/") + "/") for item in locked)
 
-    # CI evidence never covers locked paths; a test this pass already passed on this commit is never repeated.
-    ci = {node for node in skips.ci or () if "::" in node and not is_locked(node.split("::", 1)[0])}
+    ci = {node for node in (skips.ci or frozenset()) | skips.locked_ci
+          if "::" in node and (node in skips.locked_ci or not is_locked(node.split("::", 1)[0]))}
     ran = {node for node in skips.ran if "::" in node}
     files = {node.split("::", 1)[0] for node in ci | ran}
     missing = {path for path in files - skips.layout.keys() if (root / path).is_file()}
@@ -132,7 +136,28 @@ def _deselections(n, ctx, root, skips, locked, directory):
         test_command = ctx.config.test_command or next(iter(runner.detect_test_commands(root)), None)
         invocation = _pytest_command(test_command) if test_command else None
         log = Path(directory) / "collect.log"
-        ids = _collect_ids(n, ctx, root, invocation, missing, "", log) if invocation else None
+        # Ask pytest for its configured paths during the existing collection.
+        # The plugin must remain importable with Python -I/-E or inline PYTHONPATH,
+        # while retaining the project's own pythonpath setting and plugins.
+        settings = Path(directory) / "pythonpath.json"
+        # Keep the probe beside an existing selection. An out-of-tree selector
+        # changes pytest's common ancestor and can make it discover another config.
+        parent = (root / min(missing)).parent
+        ids = None
+        if invocation and parent.resolve().is_relative_to(root.resolve()):
+            with tempfile.TemporaryDirectory(prefix=".owner-collect-", dir=parent) as probes:
+                probe = Path(probes) / ("test_" + Path(probes).name.replace("-", "_").replace(".", "_") + ".py")
+                probe.write_text(
+                    "import json\nfrom pathlib import Path\n"
+                    "def pytest_generate_tests(metafunc):\n"
+                    f"    Path({str(settings)!r}).write_text(json.dumps([str(p) for p in metafunc.config.getini('pythonpath')]))\n"
+                    "def test_config():\n    pass\ntest_config.__test__ = True\n", encoding="utf-8")
+                ids = _collect_ids(n, ctx, root, invocation, missing, "", log, probe=probe)
+        if ids is not None:
+            try:
+                skips.pythonpath = tuple(json.loads(settings.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                ids = None
         local = _collect_ids(n, ctx, root, invocation, missing, "-m local_only ", log) if ids else None
         for path in missing:
             skips.layout[path] = None if ids is None or local is None else (
@@ -153,15 +178,15 @@ def _deselections(n, ctx, root, skips, locked, directory):
 def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owned=False):
     """Yield ``command`` so that every pytest it starts leaves out what ``skips`` covers (D124).
 
-    The command text is never parsed or rewritten. pytest reads the extra
-    arguments (``-rp`` and one ``--deselect`` per test) from a file named in
-    ``PYTEST_ADDOPTS``, set by one line in front of the command, so every shell
-    form and launcher keeps its meaning and nothing is imported into the
-    interpreter. ``owned`` commands are foragent's own normalized pytest
-    invocations, which clear ``PYTEST_ADDOPTS``: they get the file as their last
-    argument instead. The ``PASSED`` summary lines record what this pass ran.
+    Approved command text is unchanged. Each pytest receives options through
+    PYTEST_ADDOPTS and a temporary plugin: an entirely deselected session passes
+    its own shell segment, without ever replaying the command. Real failures
+    and genuinely empty collections retain their status. Trusted locked ids
+    are deselected exactly, including ids that prefix an uncredited sibling.
+    ``owned`` normalized invocations clear PYTEST_ADDOPTS, so receive the options
+    as arguments instead. PASSED summary lines record what this pass ran.
     """
-    from foragent.run_checks import _append
+    from foragent.run_checks import _append, verification_environment
 
     if skips is None:
         yield command
@@ -172,25 +197,63 @@ def skipping(n, ctx, command, skips, locked=(), label="Done when", *, root, owne
     with tempfile.TemporaryDirectory(prefix="owner-skip-", dir=runs) as directory:
         out = _deselections(n, ctx, root, skips, locked, directory)
         arguments = Path(directory) / "arguments.txt"
-        arguments.write_text("".join(f"{word}\n" for word in ["-rp", *(
-            word for node in out for word in ("--deselect", node))]), encoding="utf-8")
+        words = ["-rp"]
+        options = []
+        environment = {}
+        if out or skips.locked_ci:
+            module = "fa_" + Path(directory).name.replace("-", "_")
+            paths = [directory, *skips.pythonpath]
+            words += ["-o", "pythonpath=" + shlex.join(paths)]
+            # -p must be visible in addopts/argv, not hidden inside the argument
+            # file: pytest's early plugin loader does not expand @files itself.
+            options += ["-p", module]
+            # CI ids are repository-relative even when pytest discovers an ancestor config/root.
+            (Path(directory) / f"{module}.py").write_text(
+                "from pathlib import Path\nimport pytest\n"
+                "_deselected = pytest.StashKey[int]()\n"
+                f"_original = [Path(p) for p in {list(skips.pythonpath)!r}]\n"
+                f"_bootstrap = [Path(p) for p in {paths!r}]\n"
+                f"_trusted = {set(skips.locked_ci)!r}\n"
+                f"_selected = {set(out)!r}\n"
+                f"_root = Path({str(root.resolve())!r})\n"
+                "def pytest_addoption(parser, pluginmanager):\n"
+                "    config = pluginmanager.get_plugin('pytestconfig')\n"
+                "    if config.getini('pythonpath') == _bootstrap:\n"
+                "        config._inicache['pythonpath'] = _original\n"
+                "def _node_id(item):\n"
+                "    try:\n"
+                "        path = item.path.relative_to(_root).as_posix()\n"
+                "    except ValueError:\n"
+                "        return None\n"
+                "    _, separator, tail = item.nodeid.partition('::')\n"
+                "    return path + '::' + tail if separator else None\n"
+                "@pytest.hookimpl(trylast=True)\n"
+                "def pytest_collection_modifyitems(config, items):\n"
+                "    leave = [item for item in items if _node_id(item) in _selected\n"
+                "             or (_node_id(item) in _trusted and item.get_closest_marker('local_only') is None)]\n"
+                "    if leave:\n"
+                "        items[:] = [item for item in items if item not in leave]\n"
+                "        config.hook.pytest_deselected(items=leave)\n"
+                "def pytest_deselected(items):\n"
+                "    if items:\n"
+                "        session = items[0].session\n"
+                "        session.stash[_deselected] = session.stash.get(_deselected, 0) + len(items)\n"
+                "@pytest.hookimpl(trylast=True)\n"
+                "def pytest_sessionfinish(session, exitstatus):\n"
+                "    if (exitstatus == 5 and session.exitstatus == 5 and session.testscollected == 0\n"
+                "            and session.stash.get(_deselected, 0)):\n"
+                "        session.exitstatus = 0\n", encoding="utf-8")
+            environment["PYTHONPATH"] = os.pathsep.join(filter(None, [directory, os.environ.get("PYTHONPATH")]))
+        arguments.write_text("".join(f"{word}\n" for word in words), encoding="utf-8")
+        options.append(f"@{arguments}")
         _append(log, f"{label}: leaving out {len(out)} tests CI passed on {skips.head}")
         offset = log.stat().st_size if log.exists() else 0
-        # pytest splits PYTEST_ADDOPTS like a shell: the value carries its own quoting of the path.
-        option = shlex.quote(f"@{arguments}")
-        if owned:
-            # Every listed test already passed on this commit when pytest reports none collected (5).
-            yield (f"{command} {option}\nstatus=$?\n[ \"$status\" -eq 5 ] && exit 0\nexit \"$status\""
-                   if out else f"{command} {option}")
-        elif out:
-            # A pytest session whose tests were all left out reports 5 and would stop `&&` or fail the
-            # check; then the command runs once more exactly as written (every test, the accepted fallback).
-            yield (f"(\nPYTEST_ADDOPTS=\"${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}\"{shlex.quote(option)}\n"
-                   f"export PYTEST_ADDOPTS\n{command}\n)\nstatus=$?\n"
-                   f"if [ \"$status\" -eq 5 ]; then\n{command}\nelse\nexit \"$status\"\nfi")
-        else:
-            yield (f'PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}"{shlex.quote(option)}\n'
-                   f"export PYTEST_ADDOPTS\n{command}")
+        # pytest splits PYTEST_ADDOPTS as shell words; preserve the @path's
+        # quoting in the environment value even when the state folder has spaces.
+        option = shlex.join(options)
+        environment["PYTEST_ADDOPTS"] = " ".join(filter(None, [os.environ.get("PYTEST_ADDOPTS"), option]))
+        with verification_environment(environment):
+            yield f"{command} {option}" if owned else command
         try:
             with log.open(encoding="utf-8", errors="replace") as stream:
                 stream.seek(offset)

@@ -3,13 +3,16 @@
 The offline transport uses fetch/update-ref, never forbidden Git commands.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import fcntl
 import json
 from pathlib import Path
 import subprocess
+import shlex
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -281,7 +284,7 @@ def test_timed_out_retry_releases_unrelated_batch_on_next_tick(batched):
     assert composed_numbers(case) == [5]
     case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.gate(case)
-    assert not refs(case) and events(case)[-1]["reason"] == "three CI rounds elapsed"
+    assert not refs(case) and events(case)[-1]["reason"] == f"no progress for {batch.DEADLINE_SECONDS} seconds"
 
     queue_workers(case, [4, 2])
     support.gate(case)
@@ -602,9 +605,12 @@ def test_workflow_comparison_failure_falls_back_to_single_path(batched, monkeypa
 
     monkeypatch.setattr(ci_mode, "pr_changes_workflows", unavailable_once)
     report = support.gate(case)
-    assert failed and not groups(case) and not case.target_pushes
-    assert len(case.merges) == 1
+    assert failed and len(groups(case)) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1] and not case.merges
     assert any("workflow diff unavailable" in action for action in report.actions)
+    support.drain(case, count=2)
+    assert len(case.target_pushes) == 2 and not case.merges
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_remote_only_candidate_does_not_block_locally_available_batch(batched, monkeypatch, tmp_path):
@@ -760,7 +766,9 @@ def test_rejected_target_push_retires_train_and_members_resume_single_path(batch
     assert failure in events(case)[-1]["reason"] and not batch.retirements(case.ctx)[0]["spent"]
     case.target_failure = None
     support.drain(case, count=2)
-    assert len(case.merges) == 2 and not case.target_pushes
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert composed_numbers(case) == [1]
+    assert len(case.store.owner_merge_facts()) == 2
 
 
 def test_target_moving_under_lock_is_rejected_even_when_its_tree_is_identical(batched, monkeypatch):
@@ -968,7 +976,7 @@ def test_target_workflow_change_retires_train_without_spending_members(batched, 
     base, _ = batch._decode(case.git, tip.head, case.tracker.pr_head_sha(tip.number))
     assert base != case.history.tip
     retirement, = batch.retirements(case.ctx)
-    assert retirement["reason"] == "member head or target changed"
+    assert retirement["reason"] == "target changed"
     assert retirement["spent"] == []
     assert not case.target_pushes and not case.merges and not refs(case)
     assert {n for n, _ in merge_owner.admissions(case.store)} == {5, 1}
@@ -1013,7 +1021,13 @@ def test_unusable_candidate_stops_evidence_and_members_resume_single_path(batche
             assert refs(case) and not events(case) and not case.target_pushes and not case.merges
             case.clock[0] += timedelta(seconds=batch.DEADLINE_SECONDS)
     support.drain(case, count=2)
-    assert not refs(case) and len(groups(case)) == 1 and not case.target_pushes
+    assert not refs(case) and not case.target_pushes
+    # The remainder and its refreshed replacement are separate singleton identities.
+    retired = batch.retirements(case.ctx)
+    assert len(groups(case)) == len(retired) == 3
+    assert [[member["n"] for member in row["members"]] for row in retired] == [[5, 1], [1], [1]]
+    assert retired[1]["members"][0]["head"] != retired[2]["members"][0]["head"]
+    assert all(not row["spent"] for row in retired)
     assert events(case)[-1]["result"] == "unused"
     assert all(case.tracker.get_issue(n).state == "closed" for n in [5, 1])
 
@@ -1312,11 +1326,18 @@ def test_all_but_one_conflicting_gives_no_batch_or_retirement_on_retry(batched, 
     edit_member_shared_file(case, monkeypatch, {5, 1, 4, 2})
     queue_workers(case, [5, 1, 4, 2])
     candidates = batch_candidates(case)
+    previous = None
     for _ in range(3):
         report = TickReport()
-        assert batch.prepare(case.ctx, report, candidates) is None, report.actions
-        assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
-    assert not groups(case) and not refs(case) and not events(case)
+        proof = batch.prepare(case.ctx, report, candidates)
+        assert proof and [n for n, *_ in proof.chain] == [5], report.actions
+        if previous is None:
+            assert all(len([a for a in report.actions if f"#{n}" in a]) == 1 for n in [1, 4, 2])
+        else:
+            assert proof.chain == previous.chain and proof.pr == previous.pr
+            assert not report.actions
+        previous = proof
+    assert len(groups(case)) == len(case.batch_pushes) == 1 and refs(case) and not events(case)
     assert not batch.retirements(case.ctx)
     assert len(merge_owner.admissions(case.store)) == 4
 
@@ -1345,7 +1366,8 @@ def test_member_composition_failure_leaves_single_path_available(batched, monkey
     assert [place[0] for place in merge_owner.admissions(case.store)] == [1]
     monkeypatch.setattr(case.git, "_call", call)
     support.drain(case, count=1)
-    assert [row["pr"] for row in case.merges] == [support.pr_for(case, 1).number]
+    assert not case.merges and len(case.target_pushes) == 2
+    assert composed_numbers(case) == [1] and len(case.store.owner_merge_facts()) == 4
 
 
 def test_retired_identity_uses_only_composed_members(batched, monkeypatch):
@@ -1457,7 +1479,9 @@ def test_retargeted_prefix_is_retained_by_the_owner_close_guard(batched, monkeyp
     assert case.tracker.get_pr(pr.number).state == "open"
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
     support.drain(case, count=2)
-    assert len(case.store.owner_merge_facts()) == 2 and not case.target_pushes
+    assert len(case.store.owner_merge_facts()) == 2
+    assert len(case.merges) == len(case.target_pushes) == 1
+    assert case.target_pushes[0][0] != pr.head_sha
     assert case.git.remote_branch_sha(pr.head) == pr.head_sha
 
 
@@ -2081,3 +2105,148 @@ def test_tip_outcome_ignores_the_moving_open_issue_set(batched, monkeypatch):
     assert proof.excluded and proof.outcome(case.ctx) == "pass"
     monkeypatch.setattr(batch, "_exclusions", lambda *a: pytest.fail("recomputed from open issues"))
     assert proof.outcome(case.ctx) == "pass"
+
+
+@pytest.mark.parametrize("renewal", ["member", "ci"])
+def test_progress_survives_restart_without_poll_renewal(tmp_path, monkeypatch, renewal):
+    from foragent.ci_workflow import measurement_scope
+    from foragent.config import Config
+
+    born = datetime(2026, 11, 6, tzinfo=UTC)
+    window = timedelta(seconds=batch.DEADLINE_SECONDS)
+    clock = [born]
+    config = Config(merge_owner=True, merge_batch=True, checks="ci", test_command="python -m pytest")
+    scope = measurement_scope(config, tmp_path, [])
+    reports = [{"run": {"id": 7}, "artifact": {"id": 90},
+                "report": {"base_sha": "base", "scope": scope,
+                           "head": {"complete": True, "collected_ids": [], "passing_ids": []}}}]
+    chain = [(5, "member", "tip", "started")]
+    pr = SimpleNamespace(head_sha="tip", head=batch._name("base", 1), base=config.base_branch,
+                         state="open", merged_at=None)
+    ctx = SimpleNamespace(
+        config=config, repo="owner/repo", repo_root=tmp_path, now=lambda: clock[0],
+        store=StateStore(tmp_path / "state", now=lambda: clock[0]),
+        git=SimpleNamespace(remote_branch_sha=lambda branch: "tip", _call=lambda args: ""),
+        tracker=SimpleNamespace(get_pr=lambda number: pr, pr_checks=lambda number: "pass",
+                                pr_acceptance_reports=lambda head: reports),
+    )
+    # Clock/bookkeeping unit: the independent comparison contract has its own real-Git tests.
+    monkeypatch.setattr(ci_mode, "comparison", lambda *args, **kwargs: ([], 0))
+
+    def fresh_owner():
+        ctx.store = StateStore(ctx.store.root, now=lambda: clock[0])
+        return batch.Evidence("base", chain, 9, born.timestamp(), [])
+
+    clock[0] = born + window * 3 / 4
+    assert fresh_owner().outcome(ctx) == "pass"
+    clock[0] = born + window * 5 / 4
+    if renewal == "member":
+        fresh_owner().record_progress(ctx, "member-check")
+    else:
+        reports[0]["artifact"]["id"] = 91  # Same workflow run, a genuinely finished new attempt.
+        assert fresh_owner().outcome(ctx) == "pass"
+    for multiple in (3 / 2, 2):
+        clock[0] = born + window * multiple
+        assert fresh_owner().outcome(ctx) == "pass"
+    facts = [row for row in merge_owner.queue._rows(ctx.store) if row.get("event") == "batch-progress"]
+    assert len(facts) == 2 and [row["at"] for row in facts] == [
+        (born + window * 3 / 4).isoformat(), (born + window * 5 / 4).isoformat()]
+    clock[0] = born + window * 9 / 4
+    with pytest.raises(batch.BatchInvalidated, match=f"no progress for {batch.DEADLINE_SECONDS} seconds"):
+        fresh_owner().outcome(ctx)
+
+
+def _skip_verification_case(tmp_path, monkeypatch, mode="ci"):
+    from foragent import runner
+
+    root = tmp_path / "repo"
+    (root / "tests/acceptance").mkdir(parents=True)
+    (root / "src").mkdir()
+    (root / "src/owner_probe.py").write_text("VALUE = 1\n")
+    (root / "pytest.ini").write_text("[pytest]\npythonpath = src\nmarkers = local_only: machine\n")
+    receipt = root / "executions.txt"
+    header = "import pytest\nfrom owner_probe import VALUE\n"
+
+    def test_body(name, marker, effect, *, failing=False):
+        return (f"{marker}def {name}():\n    assert VALUE == 1\n"
+                f"    with open({str(receipt)!r}, 'a') as stream:\n"
+                f"        stream.write({effect!r} + '\\n')\n"
+                + ("    assert False, 'machine rejects'\n" if failing else ""))
+
+    a = "tests/acceptance/test_portable.py"
+    b = "tests/test_second.py"
+    a_body = test_body("test_portable", "", "locked")
+    if mode == "prefix":
+        a_body += test_body("test_portable_extra", "@pytest.mark.local_only\n", "machine", failing=True)
+    (root / a).write_text(header + a_body)
+    b_body = test_body("test_ci_passed", "", "portable")
+    unit = {f"{b}::test_ci_passed"}
+    if mode == "local":
+        b_body += test_body("test_machine", "@pytest.mark.local_only\n", "machine", failing=True)
+        unit.add(f"{b}::test_machine")  # A unit receipt still cannot waive a machine marker.
+    (root / b).write_text("" if mode == "empty" else header + b_body)
+    store = StateStore(tmp_path / "owner state")
+    ctx = SimpleNamespace(store=store, monotonic=lambda: 0.0,
+                          config=SimpleNamespace(test_command=f"{shlex.quote(sys.executable)} -m pytest"))
+    monkeypatch.setattr(ci_local, "_test_slot", lambda *args: nullcontext())
+    monkeypatch.setattr(ci_local, "_progress", lambda *args: None)
+    monkeypatch.setattr(runner, "_remaining", lambda *args: 600)
+    skips = ci_local.PassSkips("tip", frozenset(unit), locked_ci=frozenset({f"{a}::test_portable"}))
+    return SimpleNamespace(root=root, ctx=ctx, skips=skips, a=a, b=b, receipt=receipt)
+
+
+@pytest.mark.parametrize("flag", ["", "-I", "-E"], ids=["ordinary", "isolated", "ignore-python-env"])
+@pytest.mark.parametrize("mode,status", [("ci", 0), ("local", 1), ("empty", 5), ("shell", 5), ("prefix", 1)])
+def test_ci_skips_preserve_each_segment_and_execute_the_shell_once(tmp_path, monkeypatch, flag, mode, status):
+    from foragent import runner
+
+    case = _skip_verification_case(tmp_path, monkeypatch, mode)
+    invocation = shlex.join([sys.executable, *([flag] if flag else []), "-m", "pytest",
+                             "-q", "-p", "no:cacheprovider", "--rootdir=.", "-o", "addopts="])
+    prefix = case.root / "invocations.txt"
+    second = "exit 5" if mode == "shell" else f"{invocation} {case.b}"
+    command = f"printf 'once\\n' >> {shlex.quote(str(prefix))} && {invocation} {case.a} && {second}"
+    with ci_local.skipping(1, case.ctx, command, case.skips, [case.a], root=case.root) as selected:
+        assert selected == command
+        result = runner._check(selected, case.root, case.ctx.store.log_path(1), 30)
+    assert result.exit_code == status and not result.timed_out, result.output
+    assert prefix.read_text().splitlines() == ["once"]
+    executed = case.receipt.read_text().splitlines() if case.receipt.exists() else []
+    assert executed == (["machine"] if mode in {"local", "prefix"} else [])
+    assert case.skips.pythonpath == (str(case.root / "src"),)
+
+
+@pytest.mark.parametrize("flag", ["", "-I", "-E"], ids=["ordinary", "isolated", "ignore-python-env"])
+def test_owned_ci_skip_quotes_space_paths_and_runs_once(tmp_path, monkeypatch, flag):
+    from foragent import runner
+
+    case = _skip_verification_case(tmp_path, monkeypatch)
+    invocation = shlex.join([sys.executable, *([flag] if flag else []), "-m", "pytest",
+                             "-q", "-p", "no:cacheprovider", "--rootdir=.", "-o", "addopts="])
+    command = f"PYTEST_ADDOPTS= {invocation} {case.a}"
+    run, calls, wanted = runner.run_logged, [], []
+
+    def observed(argv, **kwargs):
+        if wanted and argv == ["/bin/sh", "-c", wanted[0]]:
+            calls.append(argv)
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(runner, "run_logged", observed)
+    with ci_local.skipping(1, case.ctx, command, case.skips, [case.a], root=case.root, owned=True) as selected:
+        wanted.append(selected)
+        result = runner._check(selected, case.root, case.ctx.store.log_path(1), 30)
+    assert result.exit_code == 0 and not result.timed_out, result.output
+    assert len(calls) == 1 and not case.receipt.exists()
+
+
+def test_ci_skip_uses_repo_ids_with_an_ancestor_pytest_root(tmp_path, monkeypatch):
+    from foragent import runner
+
+    case = _skip_verification_case(tmp_path, monkeypatch)
+    invocation = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider --rootdir=.."
+    command = f"{invocation} {case.a} && {invocation} {case.b}"
+    with ci_local.skipping(1, case.ctx, command, case.skips, [case.a], root=case.root) as selected:
+        assert selected == command
+        result = runner._check(selected, case.root, case.ctx.store.log_path(1), 30)
+    assert result.exit_code == 0 and not result.timed_out, result.output
+    assert not case.receipt.exists(), "CI ids are relative to the checked repository, not pytest's root"

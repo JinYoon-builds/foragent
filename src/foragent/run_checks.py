@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
-from contextlib import AbstractContextManager, ExitStack
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import os
@@ -49,6 +50,30 @@ class CheckResult:
     seconds: float | None = None
 
 
+_VERIFICATION_ENV = ContextVar("verification_environment", default=None)
+_CHECK_OBSERVERS = ContextVar("check_observers", default=(None, None))
+
+
+@contextmanager
+def verification_environment(environment):
+    """Mark an actual verification and supply its environment without rewriting its command."""
+    token = _VERIFICATION_ENV.set({**(_VERIFICATION_ENV.get() or {}), **environment})
+    try:
+        yield
+    finally:
+        _VERIFICATION_ENV.reset(token)
+
+
+@contextmanager
+def observing_checks(before, after):
+    """Observe command boundaries, including collection; distinguish completed verifications."""
+    token = _CHECK_OBSERVERS.set((before, after))
+    try:
+        yield
+    finally:
+        _CHECK_OBSERVERS.reset(token)
+
+
 def _append(log: Path, text: str) -> None:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as stream:
@@ -70,11 +95,15 @@ def _check(
 
     # Checks run in the implementation worktree, whose changes are staged and
     # published afterwards. Bytecode written by the checks must not join them.
-    environment = {"PYTHONDONTWRITEBYTECODE": "1"}
+    verification = _VERIFICATION_ENV.get()
+    environment = {"PYTHONDONTWRITEBYTECODE": "1", **(verification or {})}
+    before, after = _CHECK_OBSERVERS.get()
 
     elapsed: list[float] = []
 
     def timed(env):
+        if before is not None:
+            before()
         started = clock() if clock is not None else None
         try:
             return runner.run_logged(["/bin/sh", "-c", command], cwd=worktree, timeout_s=timeout_s, log_path=log,
@@ -95,7 +124,10 @@ def _check(
     code, timed_out, _ = runner.poll_executor(execute, progress) if progress is not None else execute()
     tail = cuts.read_tail(log, offset, 4000, "check", full_text_dir)
     _append(log, f"\nCheck exit_code={code}, timed_out={timed_out}\nOutput tail:\n{tail}")
-    return CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
+    result = CheckResult(command, code, timed_out, tail, elapsed[0] if elapsed else None)
+    if after is not None:
+        after(result, verification is not None)
+    return result
 
 
 def _pytest_command(command: str) -> str | None:
@@ -335,9 +367,10 @@ def run_related_check(
             (Path(directory) / f"{plugin}.py").write_text(
                 RELATED_SELECTION_PLUGIN.format(listing=str(listing)), encoding="utf-8")
             command = _with_python_path(f"{command} -p {plugin}", directory)
-        result = runner._check(command, worktree, ctx.store.log_path(n), limit,
-                               progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
-                               full_text_dir=cuts.issue_dir(ctx.store.root, n))
+        with verification_environment({}):
+            result = runner._check(command, worktree, ctx.store.log_path(n), limit,
+                                   progress=lambda: _progress(n, ctx), slot=_test_slot(n, ctx), clock=ctx.monotonic,
+                                   full_text_dir=cuts.issue_dir(ctx.store.root, n))
     _record_related_check(n, ctx, changed, unit_tests, report, result)
     _progress(n, ctx)
     return result
@@ -712,7 +745,7 @@ def _check_review_head(
     log = ctx.store.log_path(n)
     if skips is not None and skips.head != head:
         skips = None  # Evidence of another commit never skips a check of this one.
-    # D124: the issue's own locked acceptance files always run.
+    # Locked files run unless a trusted batch tip supplies their passing CI ids.
     locked = acceptance_paths(parsed.done_when_commands, ctx.config.acceptance_dir)
     # Done when on the PR head is checking time, as in an implementation's verification.
     with in_phase(n, ctx, "checking"):
