@@ -137,6 +137,12 @@ def revision_notes(entry: dict | None) -> str:
         notes += ("\n## Questions the PM answered\nThe earlier attempt stopped on these questions; the "
                   "issue above now holds the answers. Change only what those answers affect:\n"
                   + "".join(f"- {question}\n" for question in entry["questions"]))
+    if entry:
+        checks = [attempt["reason"] for attempt in entry.get("attempts", [])
+                  if attempt.get("role") == "publication-checker" and _scoped(entry, attempt)]
+        if checks:
+            notes += "\n## Earlier publication checks\nRevise the tests using these measured diagnostics:\n"
+            notes += "".join(f"- {reason}\n" for reason in checks)
     return notes
 
 

@@ -790,6 +790,17 @@ def _publication_targets(plan: dict, all_issues: list):
     return parent, mapping, saved_blobs, unconfirmed, by_number, edit_numbers
 
 
+def _check_new_lanes(plan, root, config, manager=None):
+    for lane in plan.get("new_lanes", []):
+        if lane["name"] in config.lanes:
+            existing = config.lanes[lane["name"]]
+            if (existing.get("paths", []) != lane["paths"] or existing.get("agent") != f"fa-{lane['name']}"
+                    or existing.get("skills", []) != [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]]):
+                raise PlanError(f"existing lane differs from plan: {lane['name']}")
+        else:
+            validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)
+
+
 def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: str,
             manager: SkillManager | None = None,
             approve: bool = False, approve_keys: list[str] | None = None,
@@ -822,14 +833,7 @@ def _publication_checks(plan: dict, root: Path, config: Config, tracker: Tracker
                        - order_cleanup.numbers(plan))
     if unknown_numbers & by_number.keys() or (unknown_numbers and keys <= mapping.keys()):
         raise PlanError("approve numbers must refer to this plan's existing children, edits or closes")
-    for lane in plan.get("new_lanes", []):
-        if lane["name"] in config.lanes:
-            existing = config.lanes[lane["name"]]
-            if (existing.get("paths", []) != lane["paths"] or existing.get("agent") != f"fa-{lane['name']}"
-                    or existing.get("skills", []) != [skill.split(":", 1)[-1].rsplit("/", 1)[-1] for skill in lane["skills"]]):
-                raise PlanError(f"existing lane differs from plan: {lane['name']}")
-        else:
-            validate_lane(root, config, lane["name"], lane["paths"], lane["skills"], manager=manager)
+    _check_new_lanes(plan, root, config, manager)
     rows = []
     for item in plan["issues"]:
         number = mapping.get(item["key"])
@@ -947,8 +951,15 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
     with order_reviewed.publication_gate(repo):
         with git.publish_lock():
             # The base is collected before the checkout moves, and the checkout moves only onto it.
-            collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected,
-                                             **({"base": git.head_sha()} if publication_request is not None else {}))
+            if publication_request is None:
+                collected = order_collect.check(plan, publication.files, root, config, git, earlier=publication.collected)
+            else:
+                from foragent.order_publications import checked_on
+
+                # Consume the check on its commit or a proved D111 successor.
+                if not checked_on(git, publication_request, git.head_sha(), publication.files):
+                    raise GitError("Publication target moved after its red check")
+                collected = order_collect.Collected(git.head_sha(), 0)
             order_collect.land(git, config.base_branch, collected.commit if collected else None)
             # A preparation that started or finished since the first checks is visible now, and none
             # can start until this publication's issues are written: it claims them under the gate.
@@ -966,10 +977,6 @@ def publish(plan: dict, root: Path, config: Config, tracker: Tracker, *, repo: s
                 if publication_request is None:
                     order_reviewed.require_tested_base(git, config, reviewed,
                                                        order_reviewed.landing(git, config.base_branch, refreshed=True))
-            if publication_request is not None:
-                from foragent import order_publications
-
-                order_publications.recheck(publication_request, plan, root, config, git, publication)
             affected = _affected_owners(listed, publication.own, publication.files,
                                         repo, config, lambda: git, fetch=False)
             if affected:
