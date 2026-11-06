@@ -19,8 +19,8 @@ from uuid import uuid4
 
 import pytest
 
-from acceptance import test_merge_path_real_settings as contract
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers import merge_world as contract
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from foragent import merge_owner, orch_queue, runner
 from foragent.config import Config, ConfigError, load_config
@@ -34,9 +34,12 @@ from foragent.tracker import FakeTracker, GhTracker, TrackerError
 @pytest.fixture
 def proto(world, monkeypatch):
     case = world()
+    # Patch the module whose world built this case: tests/helpers here, the
+    # locked contract when a locked acceptance test supplies its own world.
+    world_module = sys.modules[world.__module__]
     # The shared factual adapter handles branch commits. Extend its external
     # commit transport to detached owner checkouts without executing git commit.
-    import_index = contract.import_index
+    import_index = world_module.import_index
 
     def detached_import(root, title):
         root = Path(root)
@@ -54,7 +57,7 @@ def proto(world, monkeypatch):
         else:
             import_index(root, title)
 
-    monkeypatch.setattr(contract, "import_index", detached_import)
+    monkeypatch.setattr(world_module, "import_index", detached_import)
     close_pr = case.tracker.close_pr
 
     def close_transport(pr, comment=None, *, delete_branch=True):
@@ -710,7 +713,11 @@ def test_restart_reaps_durable_owner_checks_before_launching_more(proto, monkeyp
         checkpoints.append(checkpoint)
 
     command = parse_body(case.store.load_approval(5).body).done_when_commands[0]
-    install_popen(monkeypatch, table, matches=lambda argv: argv == ["/bin/sh", "-c", command],
+    def done_when(argv):
+        # The owner runs the command as written, after one line that sets PYTEST_ADDOPTS (D124).
+        return argv[:2] == ["/bin/sh", "-c"] and (argv[2] == command or argv[2].endswith("\n" + command))
+
+    install_popen(monkeypatch, table, matches=done_when,
                   children=(42001,), communicate=during_check)
     gate(case)
     assert checkpoints

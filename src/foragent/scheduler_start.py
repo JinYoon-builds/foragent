@@ -42,10 +42,14 @@ def _lane_hold(ctx: TickContext, lane: str, now: datetime, number: int | None = 
     return "quota" if scheduler_quota.decide(ctx.store, ctx.config, lane, now, number).held else None
 
 
-def _at_plan_width(ctx: TickContext, lane: str) -> bool:
-    """A live plan width caps the lane's running runs; without one the lane has no fixed cap."""
+def _at_plan_width(ctx: TickContext, lane: str, started: tuple = ()) -> bool:
+    """A live plan width caps the lane's running runs; without one the lane has no fixed cap.
+
+    ``started``: runs this tick started that the store does not show yet (a read-only replay's
+    simulated starts; the tick's own starts are already in the store)."""
     width = orch_plan.width(ctx.store, lane, ctx.now())
-    return width is not None and sum(run.lane == lane and run.kind != "draft" for run in ctx.store.active_runs()) >= width
+    runs = [*ctx.store.active_runs(), *started]
+    return width is not None and sum(run.lane == lane and run.kind != "draft" for run in runs) >= width
 
 
 def _apply_budgets(
@@ -185,6 +189,124 @@ def _ranked(ctx: TickContext, ready: dict[str, list[int]], claims: list | None =
     return [(lane, number) for _, lane, number in sorted(keyed)]
 
 
+PLAN_WIDTH = "plan_width"
+INELIGIBLE = "ineligible"
+BLOCKED_BY = "blocked_by"
+
+
+def labels_eligible(issue: Issue, lane: str, lane_for: Callable[[Issue], str]) -> bool:
+    """The start loop's label rule: open, approved and ready, not blocked, awaiting a person or running."""
+    return (
+        issue.state == "open" and not issue.is_pull_request
+        and {scheduler.APPROVED, scheduler.READY}.issubset(issue.labels)
+        and not issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN, scheduler.RUNNING} and lane_for(issue) == lane
+    )
+
+
+def local_hold(ctx: TickContext, lane: str, number: int, local: Issue | None,
+               lane_for: Callable[[Issue], str], started: tuple = ()) -> str | None:
+    """Why the start loop passes over a ranked candidate before any GitHub read, from local records only.
+
+    In the loop's order: the lane's hold (``plan_pause``, ``dream``, ``quota``), the plan's lane
+    width, then the issue's labels as last recorded. None: the loop goes on to its live checks.
+    The tick's start loop and the read-only admission replay (`fa orch facts`) both decide here;
+    the replay passes its simulated starts as ``started`` (see ``_at_plan_width``).
+    """
+    if (hold := _lane_hold(ctx, lane, ctx.now(), number)) is not None:
+        return hold
+    if _at_plan_width(ctx, lane, started):
+        return PLAN_WIDTH
+    if local is not None and not labels_eligible(local, lane, lane_for):
+        return INELIGIBLE
+    return None
+
+
+MERGED = "merged"
+NO_MACHINE_CHECK = "no_machine_check"
+OUTBOX = "outbox"
+PROJECT_STOP = "project_stop"
+RUN_HOURS = "run_hours"
+GITHUB = "github"
+MACHINE = "machine"
+
+
+def tick_hold(store, config, now: datetime) -> str | None:
+    """Why the tick starts no issue at all this tick, from local records, in the tick's order.
+
+    A GitHub pause (``_github_wait`` before the start), a project stop and run hours (the tick's
+    stop check), then undelivered workflow writes (``_start_ready``'s first return). Critical memory
+    holds inside the loop at the first issue that passes every check (``_memory_holds``).
+    """
+    if scheduler.orch_github.wait_text(store, now):
+        return GITHUB
+    if scheduler.orch_stop.active(store) is not None:
+        return PROJECT_STOP
+    if not scheduler.in_run_hours(now.astimezone(), config.run_hours):
+        return RUN_HOURS
+    if store.github_blocking_outbox():
+        return OUTBOX
+    return None
+
+
+APPROVAL_CHANGED = "approval_changed"
+OPEN_PR = "open_pr"
+
+
+def approval_current(approval, events, approvers) -> bool:
+    """The start check's approval rule: the latest approver's ``approved`` label event is the one
+    the stored approval was taken from (``_start_checks``; a read-only replay asks the same)."""
+    event, _ = scheduler._latest_approval(events, approvers)
+    return approval is not None and event is not None and event.created_at == approval.approved_at
+
+
+def _remembered(row: dict, name: str):
+    """A per-issue GitHub read the tick remembered (``_confirmed_read``), as ``(value,)``; None if never read."""
+    entry = (row.get("reads") or {}).get(name)
+    return (entry["value"],) if isinstance(entry, dict) and "value" in entry else None
+
+
+def recorded_start_hold(store, config, root, number: int, approval) -> str | None:
+    """What the tick's start checks would hold an issue for, decided on what the tick last read.
+
+    In ``_start_checks``' order after the file rule: the approval label events (``approval_current``),
+    then ``_check_prerequisites``: an earlier run merged since this approval, an open PR, a Done when
+    without a machine check, a blocker open or closed as not planned. GitHub facts come from the
+    reads the tick remembers on the issue row each tick. A fact the tick has not read yet, or label
+    events that hold no ``approved`` event at all (no evidence about approval), hold nothing; the
+    tick decides it on its next read. Integrity is left to the tick: a changed body or acceptance
+    file makes its next consider step invalidate the approval, which the labels then show.
+    """
+    from foragent.records import load_record
+
+    rows = {row["number"]: row for row in store.local_issues()}
+    row = rows.get(number) or {}
+    if (events := _remembered(row, "label_events")) is not None:
+        events = [load_record(scheduler.LabelEvent, event) for event in events[0] or []]
+        if (any(event.label == scheduler.APPROVED for event in events)
+                and not approval_current(approval, events, config.approvers)):
+            return APPROVAL_CHANGED
+    latest = next((run for run in reversed(store.read_history()) if run.number == number), None)
+    if (latest is not None and store.run_merged(latest)
+            and scheduler.datetime.fromisoformat(approval.approved_at)
+            <= scheduler.datetime.fromisoformat(latest.started_at)):
+        return MERGED
+    if ((pr := _remembered(row, "open_pr")) is not None and pr[0] is not None
+            and (latest is None or latest.outcome != "limit-wait")):
+        return OPEN_PR
+    if not scheduler.has_machine_check(parse_body(approval.body)):
+        return NO_MACHINE_CHECK
+    edges = list(row.get("blocked_by") or [])
+    if (read := _remembered(row, "blocked_by")) is not None:
+        edges += read[0] or []
+    for edge in edges:
+        state, reason = edge.get("state"), edge.get("state_reason")
+        if edge.get("repository") is None and (other := rows.get(edge.get("number"))) is not None:
+            state, reason = other.get("state", state), other.get("state_reason", reason)
+        if state == "open" or (state == "closed" and reason == "not_planned"):
+            return BLOCKED_BY
+    return None
+
+
 def _start_checks(
     ctx: TickContext, number: int, lane: str, eligible: Callable[[Issue, str], bool], base_ref: str,
     report: TickReport,
@@ -207,8 +329,7 @@ def _start_checks(
         scheduler_flow.note(ctx, number, "file-overlap")
         return None
     approval = ctx.store.load_approval(number)
-    event, _ = scheduler._latest_approval(ctx.tracker.label_events(number), ctx.config.approvers)
-    if approval is None or event is None or event.created_at != approval.approved_at:
+    if not approval_current(approval, ctx.tracker.label_events(number), ctx.config.approvers):
         scheduler_flow.note(ctx, number, "approval-changed")
         return None
     if not scheduler._check_integrity(ctx, issue, approval, base_ref, report):
@@ -226,11 +347,7 @@ def _start_ready(
 ) -> bool | None:
     """Start ranked ready issues across lanes within the machine budget; None means a GitHub wait began."""
     def eligible(issue: Issue, lane: str) -> bool:
-        return (
-            issue.state == "open" and not issue.is_pull_request
-            and {scheduler.APPROVED, scheduler.READY}.issubset(issue.labels)
-            and not issue.labels & {scheduler.BLOCKED, scheduler.NEEDS_HUMAN, scheduler.RUNNING} and lane_for(issue) == lane
-        )
+        return labels_eligible(issue, lane, lane_for)
 
     sample = sample if sample is not None else scheduler.machine_load()
     budget = scheduler._machine_budget(ctx, ready, sample)
@@ -247,15 +364,14 @@ def _start_ready(
         if not scheduler._has_slot(ctx, budget):
             scheduler_flow.hold_slots(ctx, candidates)
             break
-        if _lane_held(ctx, lane, ctx.now(), number):
-            scheduler_flow.note(ctx, number, "lane-held")
-            continue
-        if _at_plan_width(ctx, lane):
-            scheduler_flow.note_free_slot(ctx, number)  # The check above measured a free slot.
-            continue
         local = scheduler._local_issue(ctx, number)
-        if local is not None and not eligible(local, lane):
-            scheduler_flow.note_ineligible(ctx, number, local.labels)
+        if (hold := local_hold(ctx, lane, number, local, lane_for)) is not None:
+            if hold == PLAN_WIDTH:
+                scheduler_flow.note_free_slot(ctx, number)  # The check above measured a free slot.
+            elif hold == INELIGIBLE:
+                scheduler_flow.note_ineligible(ctx, number, local.labels)
+            else:
+                scheduler_flow.note(ctx, number, "lane-held")
             continue
         try:
             issue = _start_checks(ctx, number, lane, eligible, base_ref, report)

@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from acceptance.test_merge_path_real_settings import world  # noqa: F401
+from helpers.merge_world import world  # noqa: F401
 from conftest import git_command
 from test_merge_owner_proto import proto  # noqa: F401
 import test_merge_owner_proto as support
@@ -353,9 +353,9 @@ def test_replacement_fallback_refreshes_before_measuring_a_neutral_base(proto, m
     fallback = ci_local.fallback_comparison
     measurements = []
 
-    def measured(attempt, base):
+    def measured(attempt, base, **kwargs):
         measurements.append((attempt.git.head_sha(), base))
-        return fallback(attempt, base)
+        return fallback(attempt, base, **kwargs)
 
     monkeypatch.setattr(ci_local, "fallback_comparison", measured)
     case.history.update({".claude/agent-memory/new-base.md": "note\n"})
@@ -398,10 +398,10 @@ def test_changed_excluded_contract_with_fallback_cannot_inherit_neutrality(proto
     fallback = ci_local.fallback_comparison
     measurements = []
 
-    def withdraw_and_measure(attempt, base):
+    def withdraw_and_measure(attempt, base, **kwargs):
         measurements.append((attempt.git.head_sha(), base))
         case.store.clear_approval(88)
-        return fallback(attempt, base)
+        return fallback(attempt, base, **kwargs)
 
     monkeypatch.setattr(ci_local, "fallback_comparison", withdraw_and_measure)
     target = case.history.tip

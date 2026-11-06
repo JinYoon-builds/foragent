@@ -39,6 +39,9 @@ def test_github_preflight_exits_with_copyable_fix_before_writes(
                 return "https://gitlab.com/example/project.git"
         return original_git(args)
 
+    # The gh install fix is the platform's checklist fix; "brew install gh" is the macOS one (#2197).
+    import foragent.setup as checklist
+    monkeypatch.setattr(checklist.sys, "platform", "darwin")
     monkeypatch.setattr(setup, "run_gh", gh_run)
     monkeypatch.setattr(setup, "run_git", git_run)
     monkeypatch.setattr(shutil, "which", lambda name, *a, **kw:

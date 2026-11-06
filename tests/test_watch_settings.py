@@ -1,9 +1,8 @@
 """Unit tests for the lane view's settings window and `fa settings get` without a key (#173)."""
 
 import json
-import sys
 from dataclasses import replace
-from pathlib import Path
+import sys
 
 import pytest
 import yaml
@@ -13,8 +12,7 @@ from foragent.config import ConfigError, load_config
 from foragent.state import StateStore
 from foragent.watch import handle_key, render_frame, settings_view
 
-sys.path.insert(0, str(Path(__file__).parent / "acceptance"))
-from test_view_done_state import done_snapshot  # noqa: E402
+from helpers.lane_view import done_snapshot
 
 
 @pytest.fixture
@@ -229,8 +227,11 @@ def test_short_screen_keeps_header_tabs_prompt_and_help_around_the_window(root, 
     assert "위에" in text and "더 있어요" in text, "the hidden rows are named"
 
 
-def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(root, store):
-    from foragent.watch import _Refresh
+def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(root, store, monkeypatch):
+    import curses
+    import io
+
+    from foragent import watch
 
     snapshot, _ = done_snapshot()
     snapshot.meter["mode"] = "keep"  # Read before the save.
@@ -240,11 +241,26 @@ def test_quota_save_shows_on_the_last_line_before_and_after_the_next_snapshot(ro
     handle_key("s", store, load_config(root), state=state, repo_root=root)
     last = render_frame(snapshot, load_config(root), root, width=120, state=state).splitlines()[-2]
     assert "burn" in last and "keep 80%" not in last
+    # The live view: its terminal saves the settings, then asks for the next snapshot.
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
     seen = []
-    refresh = _Refresh(seen.append, "old")
-    refresh.config = "saved"
-    refresh()
-    assert seen == ["saved"], "later snapshots read the saved configuration"
+    monkeypatch.setattr(sys, "stdin", Terminal())
+    monkeypatch.setattr(sys, "stdout", Terminal())
+    monkeypatch.setattr(watch, "collect", lambda status, tracker, store, current, now: seen.append(current) or snapshot)
+
+    def terminal(draw, refresh, first, opened, *rest):
+        refresh.config = load_config(root)  # What the settings window does after a save.
+        refresh()
+        return False
+
+    monkeypatch.setattr(curses, "wrapper", terminal)
+    opened = replace(load_config(root), claude_quota={**load_config(root).claude_quota, "mode": "keep"})
+    watch.run(lambda: {}, None, store, opened, root)
+    assert [current.claude_quota["mode"] for current in seen] == ["keep", "burn"], (
+        "later snapshots read the saved configuration")
 
 
 def test_runner_unit_tests_automatic_names_the_choice_that_applies(tmp_path):
