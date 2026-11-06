@@ -80,6 +80,9 @@ Look for what this input changed structurally, with these facts when `fa orch fa
 - Structure: hot files, co-changed files, line counts and slow tests, measured as above.
 - Spend versus size: the time and review rounds a run used against what its declared size usually takes.
 - Scope drift: the files a run changed against its declared Files.
+- Lane crossings: `cross_lane_orders` names each finished order's issues whose merged changes touched
+  another lane's paths, and the lane pairs. A pair that recurs across orders is evidence for a boundary
+  change; judge it yourself and only propose.
 
 Facts are evidence, not triggers: judge them yourself and keep every Proposals rule above. Send proposals
 with `fa orch request --from architect`. "Nothing to change" stays a valid result, and no order is

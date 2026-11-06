@@ -93,8 +93,9 @@ USER_VIEW_NOTE = """## What you see
 
 You work as a person would: your working folder holds only the project's README, your agent,
 skills and memory. Use the product as the README tells a person to; never read its source.
-Report with `fa orch request --repo-root {root} --from {role} --text "<find>"`; a separate session
-confirms each find before it reaches the orchestrator.
+Report with `fa orch request --repo-root {root} --from {role} --text - <<'EOF'`, with the find on the
+next lines and then a line `EOF` (a quoted heredoc, so the shell runs nothing in it); a separate
+session confirms each find before it reaches the orchestrator.
 {readme}"""
 
 
