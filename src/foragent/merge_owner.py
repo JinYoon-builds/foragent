@@ -702,8 +702,7 @@ def tick(ctx, report):
 
         # Order publication re-reads issues under its write lock and after its
         # own writes. Keep those reads live, outside PR reconciliation's cache.
-        if order_publications.apply_next(owner, report):
-            return
+        order_publications.apply_next(owner, report)
         with reads.fresh():
             _tick(owner, report)
     except TrackerError as exc:
