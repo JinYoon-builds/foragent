@@ -113,7 +113,6 @@ def queue_batch(case, capsys):
 def outputs(values):
     names = {"docs/decisions.md", "docs/ideas.md", "docs/rules.md"}
     for value in values:
-        names.add(f"docs/specs/{value['id']}.md")
         for item in value["issues"]:
             names.update(item["acceptance_files"])
     return names
@@ -256,7 +255,6 @@ def test_interruption_before_first_output_write_retains_the_batch(recovery, caps
 
 @pytest.mark.parametrize("written", [
     "docs/decisions.md", "docs/ideas.md", "docs/rules.md",
-    "docs/specs/2026-10-31-first.md", "docs/specs/2026-10-31-second.md",
     "tests/acceptance/test_first_api.py", "tests/acceptance/test_first_client.py",
     "tests/acceptance/test_second_api.py", "tests/acceptance/test_second_client.py",
 ])

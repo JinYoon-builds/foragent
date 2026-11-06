@@ -6,6 +6,7 @@ run history or scheduling explanations are serialized into this file.
 """
 
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 import json
 import logging
@@ -20,7 +21,7 @@ VERSION = 1
 
 
 def project(snapshot: Snapshot, config: Config) -> dict:
-    from foragent import watch_scene
+    from foragent import status, watch_scene
     from foragent.watch_sections import lane_bubble
 
     lanes = {}
@@ -61,7 +62,9 @@ def project(snapshot: Snapshot, config: Config) -> dict:
                "request": lane_bubble.processing_request(snapshot),
                "orch_off": lane_bubble.orchestrator_off(snapshot, snapshot.captured_at)}
     return {"version": VERSION, "captured_at": iso(snapshot.captured_at),
-            "stale": bool(snapshot.status.get("stale")), "as_of": snapshot.status.get("as_of"),
+            # The gate's verdict on whether the numbers may be wrong (status.unknown), so the view
+            # warns exactly when the collected frame would, whatever the record lacks.
+            "stale": status.unknown(snapshot.status), "as_of": snapshot.status.get("as_of"),
             "gate_age": (snapshot.heartbeats or {}).get("gate"), "lanes": lanes, "summary": summary,
             "roles": {role: {key: fact.get(key) for key in ("alive", "last_called_at")}
                       for role, fact in snapshot.role_facts.items()}}
@@ -108,7 +111,8 @@ def read(store: StateStore, now: datetime, language: str = "en") -> Snapshot:
     times = tuple(datetime.fromisoformat(summary[key]) if summary.get(key) else None
                   for key in ("eta_low", "eta_high"))
     lanes = payload["lanes"]
-    return Snapshot({"lanes": lanes, "as_of": payload.get("as_of"), "stale": payload.get("stale")},
+    # "stale" already carries the verdict; a missing observation time must not warn a second time.
+    return Snapshot({"lanes": lanes, "as_of": payload.get("as_of") or "", "stale": payload.get("stale")},
                     {}, None, summary.get("today", 0), summary.get("total", 0), times[0], [], captured,
                     recent=summary.get("recent", 0), today=summary.get("today", 0),
                     eta_range=times if all(times) else None,
@@ -144,6 +148,19 @@ def details(target: tuple, snapshot: Snapshot, config: Config, repo_root: Path, 
             found = watch_data.collect_details(target, snapshot, store, config, now, repo_root)
         except (OSError, ValueError):
             found = snapshot  # The saved phase still explains an unreadable local record.
+        if target[0] == "acorn" and not _draws(found, target[1]):
+            # The records moved on since the tick (or never held this acorn): explain the acorn
+            # the person clicked as the tick drew it, with whatever the records still say.
+            found = replace(found, status=snapshot.status, now_view=snapshot.now_view)
         cached = {"key": key, "snapshot": found}
         state["explanation_detail"] = cached
     return cached["snapshot"]
+
+
+def _draws(snapshot: Snapshot, number: int) -> bool:
+    """Whether ``snapshot`` has an acorn for issue ``number`` in some lane."""
+    from foragent import watch_scene
+
+    needs = watch_scene.question_numbers(snapshot)
+    return any(item["number"] == number for row in watch_scene.lane_rows(snapshot.status)
+               for items in watch_scene.lane_items(snapshot, row, needs) for item in items)

@@ -593,3 +593,42 @@ def test_a_failing_projection_never_stops_the_gate_tick(tmp_path, monkeypatch):
     with watch_now.publishing(ctx):
         finished.append(True)
     assert finished == [True] and (tmp_path / "now.json").read_bytes() == prior
+
+
+@pytest.mark.parametrize("as_of, warns", [("absent", False), (None, True), ("stale", True)])
+def test_now_snapshot_warns_exactly_when_the_collected_view_would(tmp_path, as_of, warns):
+    config, _, _, _ = regression_snapshot(tmp_path)
+    facts = watch_data.collect(status.collect(StateStore(tmp_path), config, NOW), FakeTracker(),
+                               StateStore(tmp_path), config, NOW, repo_root=tmp_path)
+    found = {key: value for key, value in facts.status.items() if key not in ("as_of", "stale")}
+    if as_of is None:
+        found["as_of"] = None
+    elif as_of == "stale":
+        found.update(as_of=NOW.isoformat(), stale=True)
+    facts = replace(facts, status=found)
+    warning = watch.text("status_unknown", config.language)
+    assert (warning in watch.render_frame(facts, config, tmp_path, width=100)) is warns
+    (tmp_path / watch_now.FILENAME).write_text(json.dumps(watch_now.project(facts, config)), encoding="utf-8")
+    frame = watch.render_frame(watch_now.read(StateStore(tmp_path), NOW), config, tmp_path, width=100)
+    assert (warning in frame) is warns
+
+
+def test_clicked_acorn_is_explained_from_the_tick_when_records_moved_on(tmp_path, monkeypatch):
+    config, store, snapshot, _ = regression_snapshot(tmp_path)
+    loads, collect_details = [], watch_data.collect_details
+
+    def moved_on(target, *args):
+        # The run ended after the tick: the fresh records still name it but draw no acorn for it.
+        loads.append(target)
+        found = collect_details(target, *args)
+        return replace(found, status={**found.status, "lanes": {}})
+
+    monkeypatch.setattr(watch_data, "collect_details", moved_on)
+    state, layout = {"store": store}, {}
+    watch.render_frame(snapshot, config, tmp_path, width=100, state=state, layout=layout)
+    x, y, *_ = next(hit for hit in layout["hits"] if hit[-1] == ("acorn", 1860))
+    watch.handle_mouse("left", x, y, layout, store, config, state=state)
+    frame = watch.render_frame(snapshot, config, tmp_path, width=100, state=state)
+    assert loads == [("acorn", 1860)]
+    assert frame.count("#1860 진행 중인 작업") == 1
+    assert "이슈 2개를 작업하고 있어요" not in frame

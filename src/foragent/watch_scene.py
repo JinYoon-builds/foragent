@@ -171,7 +171,9 @@ def lane_items(snapshot: Snapshot, row: dict[str, Any], needs: set[int] | None =
     if snapshot.now_view is not None:
         def items(key):
             return [{"number": item["number"], "phase": item.get("phase"), "class": item["kind"],
-                     "state": item.get("state") or item["kind"], "title": "", "run": None,
+                     "state": item.get("state") or item["kind"],
+                     # now.json holds no issue text; a selection's loaded records may name it.
+                     "title": (snapshot.titles or {}).get(item["number"], ""), "run": None,
                      "authored": None, "asked": item.get("asked")}
                     for item in row.get(key, [])]
         return items("current"), items("next")
