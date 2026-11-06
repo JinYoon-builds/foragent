@@ -1,6 +1,6 @@
-"""The dashboard focused on one issue: the acorn explanation plus its last review and CI state.
+"""The dashboard focused on one issue: the acorn explanation plus its last review verdict.
 
-Reads local facts only (the status snapshot, the journal, the flow log); writes nothing.
+Reads local facts only (the status snapshot, run records, the journal); writes nothing.
 """
 
 from collections.abc import Callable
@@ -17,6 +17,8 @@ from foragent.watch_cells import Line
 from foragent.watch_data import Snapshot
 
 BRANCH = re.compile(r"foragent/issue-(\d+)")
+
+
 def infer(folder: Path) -> int | None:
     """The issue whose lane branch is checked out in ``folder``, if any."""
     try:
@@ -54,35 +56,6 @@ def latest_run(store: StateStore, number: int):
     return next((run for run in reversed(store.read_history()) if run.number == number), None)
 
 
-def _failure_recorded(store: StateStore, number: int, started_at: str) -> bool:
-    """Whether this execution wrote its per-run ``ci-failure`` record (run_publish_ci._record_failure)."""
-    return any(record["kind"] == "ci-failure" and record["issue"] == number
-               and record["run_started_at"] == started_at for record in store.flow_records())
-
-
-def ci_state(store: StateStore, number: int) -> str:
-    """The CI line for the issue's newest run, from the one CI fact the run recorded.
-
-    A live run in its CI step: running. Otherwise the run's own ``ci_result`` (state_runs.CI_RESULTS),
-    read as is: it lives in the run record, so no later record or history length changes it. Without
-    one: a live run has not reached CI yet; a finished run recorded no CI result (or, by its own
-    outcome, failed CI). finish_run keeps the last step, so no step ever stands for a result.
-    """
-    run = latest_run(store, number)
-    if run is None:
-        return "none"
-    live = run.status == "running"
-    if live and run.phase == "ci":
-        return "running"
-    if (recorded := store.ci_result(number, run.started_at)) is not None:
-        return recorded
-    if _failure_recorded(store, number, run.started_at):
-        return "failed"  # the run's ci-failure record is the same fact, for runs that predate ci_result
-    if run.outcome == "ci-failed":
-        return "failed"  # the runner's own terminal fact: CI failed after every attempt
-    return "none" if live else "unrecorded"
-
-
 def _title(store: StateStore, number: int) -> str:
     row = next((row for row in store.local_issues() if row.get("number") == number), {})
     return str(row.get("title") or "")
@@ -90,7 +63,7 @@ def _title(store: StateStore, number: int) -> str:
 
 def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path, number: int, *,
          now: datetime, width: int) -> list[Line]:
-    """The issue's rows: the acorn explanation (or its recorded state), last review, CI."""
+    """The issue's rows: the acorn explanation (or what a finished run ended with), last review."""
     from foragent import watch
     from foragent.watch_sections import lane_bubble
 
@@ -109,7 +82,6 @@ def rows(snapshot: Snapshot, store: StateStore, config: Config, repo_root: Path,
     review = last_review(store, number)
     found.append([(text("issue_view_review", language, verdict=review[0], round=review[1]) if review
                    else text("issue_view_review_none", language), "")])
-    found.append([(text(f"issue_view_ci_{ci_state(store, number)}", language), "")])
     return found
 
 

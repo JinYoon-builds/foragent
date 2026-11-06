@@ -1,21 +1,13 @@
 """Strings for the dashboard focused on one issue (`fa dashboard <N>`).
 
-CI lines state a recorded result only. Whether the lane is working again is said by the
-live run's own step (the acorn explanation), never by a CI line.
+Whether the lane is working is said only by a live run's own step (the acorn explanation);
+a finished run is described by what it ended with.
 """
 
 MESSAGES = {
     "en": {
         "issue_view_review": "Last review: {verdict} (round {round})",
         "issue_view_review_none": "Last review: none yet",
-        "issue_view_ci_running": "CI: running",
-        "issue_view_ci_failed": "CI: failed",
-        "issue_view_ci_passed": "CI: passed",
-        "issue_view_ci_none": "CI: not started",
-        "issue_view_ci_not_started": "CI: the jobs never started on GitHub",
-        "issue_view_ci_no_checks": "CI: no checks ran for this PR",
-        "issue_view_ci_unrecorded": "CI: this run recorded no CI result; check the PR",
-        "issue_view_ci_timed_out": "CI: did not finish in time",
         "issue_view_state": "State: {state}",
         "issue_view_lane": "Lane: {lane}",
         "issue_view_ended": "The last run ended: {outcome}",
@@ -43,14 +35,6 @@ MESSAGES = {
     "ko": {
         "issue_view_review": "마지막 리뷰: {verdict} ({round}번째)",
         "issue_view_review_none": "마지막 리뷰: 아직 없어요",
-        "issue_view_ci_running": "CI: 도는 중이에요",
-        "issue_view_ci_failed": "CI: 실패했어요",
-        "issue_view_ci_passed": "CI: 통과했어요",
-        "issue_view_ci_none": "CI: 아직 시작 전이에요",
-        "issue_view_ci_not_started": "CI: GitHub에서 작업이 시작되지 않았어요",
-        "issue_view_ci_no_checks": "CI: 이 PR에는 돌린 검사가 없어요",
-        "issue_view_ci_unrecorded": "CI: 이 실행에는 기록된 CI 결과가 없어요. PR에서 확인해 주세요",
-        "issue_view_ci_timed_out": "CI: 시간 안에 끝나지 않았어요",
         "issue_view_state": "상태: {state}",
         "issue_view_lane": "레인: {lane}",
         "issue_view_ended": "마지막 실행 결과: {outcome}",
