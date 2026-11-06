@@ -41,6 +41,7 @@ def tick_again(case):
 BACKLOG = "🗂 Backlog"
 IN_PROGRESS = "🐿 In progress"
 YOUR_TURN = "✋ Your turn"
+DONE = "📦 Done"
 
 
 @dataclass(frozen=True)
@@ -276,3 +277,187 @@ class Latency:
                 "Routine parent closes must stay inside the existing optional budget"
             )
         return report
+
+class SequenceLatency(Latency):
+    """Observe completed external calls, without replacing any parent behavior."""
+
+    def __init__(self, tracker, monkeypatch):
+        super().__init__(tracker, monkeypatch)
+        self.completed = []
+        self.listing = None
+        listing = tracker.list_issues
+
+        def observe_listing(*args, **kwargs):
+            issues = listing(*args, **kwargs)
+            self.listing = tuple(sorted(issues, key=lambda issue: issue.number))
+            return issues
+
+        monkeypatch.setattr(tracker, "list_issues", observe_listing)
+        for name in PER_ISSUE:
+            original = getattr(tracker, name)
+
+            def observe(*args, _name=name, _original=original, **kwargs):
+                outer = not self.depth
+                start = len(self.calls)
+                result = _original(*args, **kwargs)
+                if outer and self.calls[start][2]:
+                    key = (_name, repr(args), repr(sorted(kwargs.items())))
+                    read = (_name in {"get_issue", "sub_issues", "parent_of", "parent_issue",
+                                      "blocked_by", "label_events", "list_comments"}
+                            or _name == "graphql" and args[0].lstrip().startswith("query"))
+                    self.completed.append((key, read))
+                return result
+
+            monkeypatch.setattr(tracker, name, observe)
+
+    def gate_tick(self, case, **kwargs):
+        self.completed.clear()
+        report = super().gate_tick(case, **kwargs)
+        assert all(bounded for name, number, bounded, _ in self.calls
+                   if name == "close_issue" and number == 10), (
+            "A longer parent action must not escape the shared optional budget"
+        )
+        return report
+
+
+def sequence_case(case, monkeypatch, states, references, board_mode, *, race=False):
+    """Start from observed open work, then expose a stable actionable listing."""
+    case.config = case.ctx.config = replace(case.config, language="en")
+    children = add_parent(case, ["unapproved"] * len(states))
+    extra = list(range(9001, 9001 + references))
+    for number in extra:
+        case.tracker.add_issue(number, f"Referenced work {number}")
+    mapping = ", ".join(f'"work-{n}": {n}' for n in children + extra)
+    parent = case.tracker.issues[10]
+    case.tracker.issues[10] = replace(
+        parent, body='Ship the order.\n\n<!-- foragent:plan id=sequence map={'
+        + mapping + '} acceptance={} -->',
+    )
+    listing = case.tracker.list_issues
+    hidden = set(extra)
+
+    def listed(state="all"):
+        issues = []
+        for issue in listing(state):
+            if issue.number in hidden:
+                continue
+            if issue.number == 10:
+                ended = sum(case.tracker.issues[n].state == "closed" for n in children)
+                issue = replace(issue, sub_issues_summary=(
+                    ("total", len(children)), ("completed", ended),
+                    ("percent_completed", 100 * ended // len(children) if children else 0),
+                ))
+            issues.append(issue)
+        return issues
+
+    monkeypatch.setattr(case.tracker, "list_issues", listed)
+    closed_since = case.tracker.issues_closed_since
+    monkeypatch.setattr(case.tracker, "issues_closed_since", lambda since: [
+        issue for issue in closed_since(since) if issue.number not in hidden
+    ])  # Unlisted references must also be absent from the recent-close listing.
+    gate_tick(case)
+    gate_tick(case, refresh=True)
+
+    # Change public GitHub facts, not the gate's stored progress or read cache.
+    for number, state in zip(children, states, strict=True):
+        ended = state in {"completed", "not_planned"}
+        case.tracker.issues[number] = replace(
+            case.tracker.issues[number], state="closed" if ended else "open",
+            state_reason=state if ended else None,
+            labels=frozenset({"needs-human"} if state == "needs-human" else ()),
+        )
+    for number in extra:
+        case.tracker.issues[number] = replace(
+            case.tracker.issues[number], state="closed", state_reason="completed",
+        )
+    # Also exercise invalidation by a new parent listing, including cases whose
+    # native completion count did not change.
+    case.tracker.issues[10] = replace(
+        case.tracker.issues[10], updated_at=(case.clock[0] + timedelta(seconds=1)).isoformat(),
+    )
+
+    if race:
+        assert len(children) == 2
+        hidden.add(children[-1])
+        sub_issues = case.tracker.sub_issues
+        first = True
+
+        def raced_edges(number):
+            nonlocal first
+            result = sub_issues(number)
+            if number == 10 and first:
+                first = False
+                return result[:1]  # The listing says two; this edge response still says one.
+            return result
+
+        monkeypatch.setattr(case.tracker, "sub_issues", raced_edges)
+
+    # The existing offline fake has no board/field/card deletion API. These are
+    # fixture changes to GitHub's board, never edits to the gate's own state.
+    project = case.tracker._projects.projects[case.board_id]
+    status = next(field for field in project["fields"].values() if field["name"] == "Status")
+    if board_mode == "no-board":
+        case.config = case.ctx.config = replace(case.config, board=None)
+    elif board_mode == "missing-done":
+        status["options"] = [option for option in status["options"] if option["name"] != board.COLUMNS[-1]]
+    elif board_mode == "missing-status":
+        del project["fields"][status["id"]]
+        for item in project["items"].values():
+            item["values"].pop(status["id"], None)
+    elif board_mode == "deleted-board":
+        del case.tracker._projects.projects[case.board_id]
+    elif board_mode == "missing-card":
+        project["items"] = {key: item for key, item in project["items"].items()
+                            if item["contentId"] != "I_owner/repo#10"}
+    elif board_mode == "return-to-backlog":
+        seed_card(case.tracker, case.board_id, 10, IN_PROGRESS)
+    else:
+        assert board_mode == "available"
+    return children, extra
+
+
+def finish_sequence(case, latency, sequence, *, closes, column=None):
+    """One rule for every path: retain unchanged reads and make progress each tick.
+
+    The table describes the work, not a required implementation call order.
+    Deriving a result from existing listing facts may eliminate calls entirely.
+    """
+    previous_listing = None
+    reads, successes = set(), set()
+    limit = len(sequence) + 3  # Allow discovery reads as well as the listed work.
+    for turn in range(1, limit + 1):
+        assert latency.gate_tick(case).skipped is None
+        if latency.listing != previous_listing:
+            reads.clear()
+            successes.clear()
+            previous_listing = latency.listing
+        completed = {key for key, _ in latency.completed}
+        assert completed - successes, (
+            f"Tick {turn} restarted {sequence} without completing a new call: {latency.calls}"
+        )
+        for key, read in latency.completed:
+            if read:
+                assert key not in reads, (
+                    f"Tick {turn} repeated a completed read with an unchanged listing: {key}; "
+                    f"remaining work must advance for every sequence, including {sequence}"
+                )
+                reads.add(key)
+        successes.update(completed)
+        if closes:
+            done = case.tracker.issues[10].state == "closed"
+        else:
+            assert case.tracker.issues[10].state == "open", "Open work must keep its parent open"
+            done = True
+        if column is not None:
+            try:
+                done = done and card_column(case.tracker, case.board_id, 10) == column
+            except StopIteration:  # The card or its column does not exist yet: not finished.
+                done = False
+        if done:
+            break
+    else:
+        pytest.fail(f"Parent action {sequence} did not finish within {limit} refresh ticks")
+    assert len([n for n, _ in case.tracker.closures if n == 10]) == int(closes)
+    comments = case.tracker.comments.get(10, [])
+    assert len(comments) == int(closes), "A completed sequence must leave exactly one closing summary"
+    return comments
